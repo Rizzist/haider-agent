@@ -16,10 +16,22 @@ pub(crate) const PEER_EVENT_SCHEMA: &str = "haider.peer.event.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PeerCommand {
-    List { json: bool },
-    Send { to: String, message: String },
-    Name { name: String },
+    List {
+        json: bool,
+    },
+    Send {
+        session: Option<String>,
+        to: String,
+        message: String,
+    },
+    Name {
+        session: Option<String>,
+        name: String,
+    },
     Watch,
+    WaitIdle {
+        to: String,
+    },
 }
 
 enum PeerCommandOutcome {
@@ -38,6 +50,8 @@ pub(crate) struct PeerListDocument<'a> {
 pub(crate) enum PeerEventDocument<'a> {
     Received {
         schema: &'static str,
+        speaker: &'static str,
+        authority: &'static str,
         message: &'a haider_client::PeerMessage,
     },
     DeliveryChanged {
@@ -52,18 +66,28 @@ pub(crate) fn parse_peer_command(rest: &[String]) -> Result<PeerCommand, String>
         [command, flag] if command == "list" && flag == "--json" => {
             Ok(PeerCommand::List { json: true })
         }
-        [command, to, message] if command == "send" && !to.is_empty() && !message.is_empty() => {
+        [command, to, message] if command == "send" && to != "--session" && !to.is_empty() && !message.is_empty() => {
             Ok(PeerCommand::Send {
+                session: None,
                 to: to.clone(),
                 message: message.clone(),
             })
         }
-        [command, name] if command == "name" && !name.is_empty() => {
-            Ok(PeerCommand::Name { name: name.clone() })
+        [command, flag, session, to, message] if command == "send" && flag == "--session" && !session.is_empty() && !to.is_empty() && !message.is_empty() => {
+            Ok(PeerCommand::Send { session: Some(session.clone()), to: to.clone(), message: message.clone() })
+        }
+        [command, name] if command == "name" && name != "--session" && !name.is_empty() => {
+            Ok(PeerCommand::Name { session: None, name: name.clone() })
+        }
+        [command, flag, session, name] if command == "name" && flag == "--session" && !session.is_empty() && !name.is_empty() => {
+            Ok(PeerCommand::Name { session: Some(session.clone()), name: name.clone() })
         }
         [command] if command == "watch" => Ok(PeerCommand::Watch),
+        [command, to] if command == "wait-idle" && !to.is_empty() => {
+            Ok(PeerCommand::WaitIdle { to: to.clone() })
+        }
         _ => Err(
-            "usage: peer list [--json] | peer send <name> <message|-> | peer name <new-name> | peer watch"
+            "usage: peer list [--json] | peer send [--session <id>] <address> <message|-> | peer name [--session <id>] <new-name> | peer watch | peer wait-idle <address>"
                 .into(),
         ),
     }
@@ -95,6 +119,11 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
     options
         .required_features
         .insert(haider_rpc::FEATURE_PEER_MESSAGING_V1.to_owned());
+    if matches!(command, PeerCommand::WaitIdle { .. }) {
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1.to_owned());
+    }
     let ensured = match ensure_daemon(&profile, options).await {
         Ok(ensured) => ensured,
         Err(error) => {
@@ -106,6 +135,40 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
         eprintln!("haider peer: daemon does not advertise peer_messaging_v1");
         let _ = ensured.client.close();
         return ExitCode::from(EX_UNAVAILABLE);
+    };
+
+    // Sender attribution comes from a control attachment, never from the
+    // target address or a guessed roster entry. Drain replay on this short-lived
+    // command connection so an established sender's history cannot stall RPC.
+    let replay_drain = if matches!(command, PeerCommand::Send { .. } | PeerCommand::Name { .. }) {
+        let sender = match &command {
+            PeerCommand::Send { session, .. } | PeerCommand::Name { session, .. } => session
+                .clone()
+                .or_else(|| std::env::var("HAIDER_SESSION_ID").ok()),
+            _ => None,
+        };
+        let Some(sender) = sender.filter(|value| !value.trim().is_empty()) else {
+            eprintln!(
+                "haider peer: sending or renaming requires --session <id> or HAIDER_SESSION_ID for the sender session"
+            );
+            let _ = ensured.client.close();
+            return ExitCode::from(EX_USAGE);
+        };
+        let drain = ensured
+            .client
+            .take_events()
+            .map(|mut events| tokio::spawn(async move { while events.recv().await.is_some() {} }));
+        if let Err(error) = attach_sender(&ensured.client, sender).await {
+            eprintln!("haider peer: {error}");
+            let _ = ensured.client.close();
+            if let Some(drain) = drain {
+                drain.abort();
+            }
+            return ExitCode::from(peer_error_exit(&error));
+        }
+        drain
+    } else {
+        None
     };
 
     let result = match command {
@@ -120,16 +183,22 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
             }
             Ok(PeerCommandOutcome::Complete)
         }),
-        PeerCommand::Send { to, message } => peers.send(to, message, None).await.map(|receipt| {
-            println!("{} {}", receipt.msg_id, delivery_label(receipt.delivery));
-            if receipt.delivery == PeerDelivery::Refused {
-                PeerCommandOutcome::RefusedDelivery(receipt)
-            } else {
-                PeerCommandOutcome::Complete
-            }
-        }),
-        PeerCommand::Name { name } => peers.set_name(name).await.map(|agent| {
+        PeerCommand::Send { to, message, .. } => {
+            peers.send(to, message, None).await.map(|receipt| {
+                println!("{} {}", receipt.msg_id, delivery_label(receipt.delivery));
+                if receipt.delivery == PeerDelivery::Refused {
+                    PeerCommandOutcome::RefusedDelivery(receipt)
+                } else {
+                    PeerCommandOutcome::Complete
+                }
+            })
+        }
+        PeerCommand::Name { name, .. } => peers.set_name(name).await.map(|agent| {
             println!("{}", agent.name);
+            PeerCommandOutcome::Complete
+        }),
+        PeerCommand::WaitIdle { to } => peers.notify_when_idle(to).await.map(|agent| {
+            println!("{} idle", agent.address());
             PeerCommandOutcome::Complete
         }),
         PeerCommand::Watch => match peers.subscribe().await {
@@ -139,6 +208,8 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
                     let encoded = match &event {
                         PeerEvent::Received(message) => print_json(&PeerEventDocument::Received {
                             schema: PEER_EVENT_SCHEMA,
+                            speaker: "agent",
+                            authority: haider_rpc::haider_protocol::peer::PEER_AUTHORITY_STATEMENT,
                             message,
                         }),
                         PeerEvent::DeliveryChanged(receipt) => {
@@ -159,6 +230,9 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
         },
     };
     let _ = ensured.client.close();
+    if let Some(drain) = replay_drain {
+        drain.abort();
+    }
     match result {
         Ok(PeerCommandOutcome::Complete) => ExitCode::SUCCESS,
         Ok(PeerCommandOutcome::RefusedDelivery(receipt)) => {
@@ -176,9 +250,42 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
     }
 }
 
+async fn attach_sender(
+    client: &haider_client::RpcClient,
+    sender: String,
+) -> Result<(), PeerClientError> {
+    match client
+        .request(haider_rpc::RequestBody::SessionAttach {
+            session_id: haider_protocol::ids::SessionId::new(sender),
+            after_seq: 0,
+            mode: haider_rpc::AttachMode::Control,
+            sealed_replay: false,
+        })
+        .await?
+    {
+        haider_rpc::ResponseBody::SessionAttach { .. } => Ok(()),
+        haider_rpc::ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => Err(PeerClientError::Refused {
+            code,
+            message,
+            retryable,
+            data,
+        }),
+        _ => Err(PeerClientError::UnexpectedBody),
+    }
+}
+
 fn read_stdin_message(command: PeerCommand) -> io::Result<PeerCommand> {
     match command {
-        PeerCommand::Send { to, message } if message == "-" => {
+        PeerCommand::Send {
+            session,
+            to,
+            message,
+        } if message == "-" => {
             let mut message = String::new();
             io::stdin().read_to_string(&mut message)?;
             if message.is_empty() {
@@ -187,7 +294,11 @@ fn read_stdin_message(command: PeerCommand) -> io::Result<PeerCommand> {
                     "stdin message is empty",
                 ));
             }
-            Ok(PeerCommand::Send { to, message })
+            Ok(PeerCommand::Send {
+                session,
+                to,
+                message,
+            })
         }
         command => Ok(command),
     }
@@ -200,10 +311,11 @@ fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<(), PeerClientError> {
 }
 
 fn print_peer_table(agents: &[PeerDescriptor]) {
-    println!("NAME\tKIND\tWORKSPACE\tSTATE\tLAST SEEN");
+    println!("ADDRESS\tNAME\tKIND\tWORKSPACE\tSTATE\tLAST SEEN");
     for agent in agents {
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            agent.address(),
             agent.name,
             kind_label(agent.kind),
             agent.workspace,
@@ -252,6 +364,11 @@ fn peer_error_exit(error: &PeerClientError) -> u8 {
             if code.contains("permission") || code.contains("refused") =>
         {
             EX_BLOCKED
+        }
+        PeerClientError::Refused { code, .. }
+            if code == haider_rpc::ERROR_CODE_PEER_UNAVAILABLE =>
+        {
+            EX_UNAVAILABLE
         }
         PeerClientError::Client(_) => EX_UNAVAILABLE,
         PeerClientError::Refused { .. } | PeerClientError::UnexpectedBody => EX_PROTOCOL,

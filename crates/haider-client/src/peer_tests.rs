@@ -1,8 +1,9 @@
 #![allow(clippy::expect_used)]
 
 use super::peer::{
-    PeerEvent, peer_event_from_frame, peer_list_response, peer_messaging_available,
-    peer_name_response, peer_send_response,
+    PeerEvent, peer_agent_injection_available, peer_event_from_frame, peer_list_response,
+    peer_messaging_available, peer_name_response, peer_notify_when_idle_response,
+    peer_send_response,
 };
 use haider_rpc::haider_protocol::peer::{
     PeerDelivery, PeerDescriptor, PeerKind, PeerMessage, PeerReceipt, PeerSender, PeerState,
@@ -30,12 +31,21 @@ fn feature_absence_makes_the_peer_surface_absent_without_an_error() {
     assert!(!peer_messaging_available(&welcome));
     welcome.features.insert(FEATURE_PEER_MESSAGING_V1.into());
     assert!(peer_messaging_available(&welcome));
+    assert!(
+        !peer_agent_injection_available(&welcome),
+        "legacy peers do not gain the new method"
+    );
+    welcome
+        .features
+        .insert(haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1.into());
+    assert!(peer_agent_injection_available(&welcome));
 }
 
 #[test]
 fn typed_peer_responses_preserve_contract_fields() {
     let descriptor = PeerDescriptor {
         id: "peer-1".into(),
+        device_id: String::new(),
         name: "reviewer".into(),
         kind: PeerKind::External,
         workspace: "/work".into(),
@@ -50,6 +60,13 @@ fn typed_peer_responses_preserve_contract_fields() {
         })
         .expect("peer list"),
         std::slice::from_ref(&descriptor)
+    );
+    assert_eq!(
+        peer_notify_when_idle_response(ResponseBody::PeerNotifyWhenIdle {
+            agent: descriptor.clone()
+        })
+        .expect("idle notice"),
+        descriptor
     );
     let receipt = PeerReceipt {
         msg_id: "msg-1".into(),
@@ -82,6 +99,8 @@ fn received_and_delivery_frames_map_to_typed_subscription_events() {
         msg_id: "msg-1".into(),
         from: PeerSender {
             id: "peer-1".into(),
+            device_id: String::new(),
+            mode: "prompting".into(),
             name: "reviewer".into(),
             kind: PeerKind::External,
             trust: PeerTrust::UntrustedExternal,
@@ -108,5 +127,18 @@ fn received_and_delivery_frames_map_to_typed_subscription_events() {
             receipt: receipt.clone()
         }),
         Some(PeerEvent::DeliveryChanged(receipt))
+    );
+}
+
+#[test]
+fn idle_notice_preserves_typed_non_live_refusal() {
+    let result = peer_notify_when_idle_response(ResponseBody::Error {
+        code: haider_rpc::ERROR_CODE_PEER_UNAVAILABLE.into(),
+        message: "target is not live".into(),
+        retryable: false,
+        data: None,
+    });
+    assert!(
+        matches!(result, Err(super::peer::PeerClientError::Refused { code, retryable: false, .. }) if code == haider_rpc::ERROR_CODE_PEER_UNAVAILABLE)
     );
 }

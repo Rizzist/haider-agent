@@ -297,6 +297,7 @@ fn request_payload_maps_system_tools_results_and_inline_images() {
     let request = TurnRequest {
         messages: vec![
             Message {
+                input_origin: None,
                 role: MessageRole::User,
                 blocks: vec![
                     Block::Attachment(AttachmentBlock::Image {

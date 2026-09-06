@@ -83,6 +83,73 @@ def fake_download_environment(root: Path, prefix: Path, version: str) -> dict[st
     return dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"], INSTALL_FIXTURE=str(root), HAIDER_INSTALL_DIR=str(prefix), HAIDER_VERSION=version)
 
 
+class DownloadBudgetTests(unittest.TestCase):
+    def test_npm_stalled_body_and_redirects_share_each_attempt_deadline(self):
+        code = r'''
+const assert = require('assert');
+const http = require('http');
+const {download} = require(process.argv[1]);
+(async () => {
+  let requests = 0;
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    requests++;
+    if (req.url === '/redirect') {
+      setTimeout(() => {res.writeHead(302, {location: '/stall'}); res.write('redirect body never ends');}, 15);
+    } else {res.writeHead(200); res.write('partial');}
+  });
+  server.on('connection', socket => {sockets.add(socket); socket.on('close', () => sockets.delete(socket));});
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const start = performance.now();
+    await assert.rejects(download(`http://127.0.0.1:${server.address().port}/redirect`, {get: http.get, attemptMs: 80}), /timed out/);
+    const elapsed = performance.now() - start;
+    assert.equal(requests, 4, 'exactly two attempts, each following one redirect');
+    assert(elapsed < 600, `attempts exceeded their shared deadline: ${elapsed}`);
+    assert(elapsed >= 140, `unexpected early timeout: ${elapsed}`);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(sockets.size, 0, 'all redirect and terminal sockets must close before return');
+  } finally {for (const socket of sockets) socket.destroy(); server.close();}
+})().catch(error => {console.error(error); process.exitCode = 1;});
+'''
+        result = subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js")], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_shell_retry_discards_partial_body_and_fetches_resources_concurrently(self):
+        if os.name == "nt":
+            self.skipTest("POSIX shell fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_archive(root, windows=False, spy=True)
+            prefix = root / "prefix"
+            env = fake_download_environment(root, prefix, VERSION)
+            call = root / "helper-call.json"
+            env["INSTALL_CALL"] = str(call)
+            curl = root / "commands" / "curl"
+            curl.write_text(f'''#!{sys.executable}
+import os, pathlib, sys, time
+root = pathlib.Path(os.environ['INSTALL_FIXTURE'])
+name = sys.argv[-1].rsplit('/', 1)[-1]
+assert sys.argv[sys.argv.index('--max-time') + 1] == ('31' if name.endswith('.sha256') else '158')
+marker = root / (name + '.started')
+marker.touch()
+other = name[:-7] if name.endswith('.sha256') else name + '.sha256'
+for _ in range(200):
+    if (root / (other + '.started')).exists(): break
+    time.sleep(.01)
+else: sys.exit(91)
+retry = root / (name + '.retry')
+if not retry.exists():
+    retry.touch()
+    sys.stdout.write('partial body must be discarded')
+    sys.exit(56)
+sys.stdout.buffer.write((root / name).read_bytes())
+''')
+            result = subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(call.exists())
+
+
 class NpmBundleTests(unittest.TestCase):
     def test_zip_and_tar_delegate_complete_source_and_exact_destination(self):
         for windows in ([True] if os.name == "nt" else [False, True]):

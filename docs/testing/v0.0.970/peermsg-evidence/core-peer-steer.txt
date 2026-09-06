@@ -1,0 +1,14 @@
+   Compiling haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-platform)
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-protocol)
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-provider)
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-store)
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-tools)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-core)
+    Finished `test` profile [unoptimized] target(s) in 33.60s
+     Running tests/runtime_tests.rs (/private/tmp/peermsg-target/debug/deps/runtime_tests-b8534720f80ec33b)
+
+running 1 test
+test peer_nudges_and_promotions_keep_agent_provenance_at_provider_boundary ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 0.01s

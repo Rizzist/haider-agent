@@ -1,0 +1,54 @@
+{
+  "merge_ref": "5468dec1",
+  "held_commit": "59ce1bb8",
+  "test_count": 5134,
+  "workspace": {
+    "exit_code": 0,
+    "libtest_groups": 355,
+    "summed_passes": 5617,
+    "failures": 0,
+    "existing_ignores": 13
+  },
+  "clippy": {
+    "exit_code": 0,
+    "command": "cargo clippy --workspace --tests -- -D warnings"
+  },
+  "routing": {
+    "process_tests_passed": 6,
+    "parser_tests_passed": 4
+  },
+  "python_regressions": {
+    "passed": 60
+  },
+  "native_packaging_first": {
+    "passed": 2,
+    "errors": 3,
+    "cause": "120-second TimeoutExpired",
+    "concurrent_cargo_test_compilation": true
+  },
+  "native_packaging_serial": {
+    "passed": 3,
+    "errors": 2,
+    "elapsed_seconds": 421.148,
+    "failed_tests": [
+      "test_direct_installer_fresh_prefix_contains_matching_runtime_siblings",
+      "test_npm_installs_with_real_shared_helper"
+    ],
+    "cause": "120-second TimeoutExpired",
+    "concurrent_cargo_from_this_task": false
+  },
+  "verifier": {
+    "findings": 0,
+    "real": 0,
+    "noise": 0
+  },
+  "source_sha256": {
+    "crates/haider-cli/src/main.rs": "ccf7d583579897aed37bfb27220c0f5d2f64ec88e7caf9d2664002dc775919f3",
+    "crates/haider-cli/src/lib.rs": "3f59e779e8b2b4f6b610e5d36e623230309a3a65fc4379078fe1e7324b06c71d",
+    "crates/haider-cli/src/routing.rs": "85195ae2dde8d6e57032571796596b7e65f00b9a780eb513effe11228f58e3f2",
+    "crates/haider-cli/tests/payload_routing_tests.rs": "ce5d71e2fdd9bf6d6ba8bbd6657b3b94ee59b74d9c93e7060e9c6c309d5a5228",
+    "test-baseline.txt": "08495d11c9a34695616dedf7c599e80805c9bdf789d19217aa3d059a710199a4"
+  },
+  "verdict": "NO_SHIP",
+  "reason": "Native shell/npm fresh installation still times out with the unchanged watchdog on the merged debug siblings."
+}

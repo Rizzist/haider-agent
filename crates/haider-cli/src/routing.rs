@@ -38,7 +38,6 @@ pub enum Command<'a> {
     Graph(&'a [String]),
     Export(&'a [String]),
     Hooks(&'a [String]),
-    Peer(&'a [String]),
     Ssh(&'a [String]),
     Shell(&'a [String]),
     Update(&'a [String]),
@@ -90,7 +89,6 @@ pub fn parse_command(args: &[String]) -> Result<Command<'_>, String> {
         [c, r @ ..] if c == "graph" => Command::Graph(r),
         [c, r @ ..] if c == "export" => Command::Export(r),
         [c, r @ ..] if c == "hooks" => Command::Hooks(r),
-        [c, r @ ..] if c == "peer" => Command::Peer(r),
         [c, r @ ..] if c == "ssh" && ssh::is_interactive_shell(r) => {
             Command::Interactive(InteractiveCommand::Ssh(r))
         }
@@ -160,7 +158,6 @@ mod tests {
             | Command::Graph(_)
             | Command::Export(_)
             | Command::Hooks(_)
-            | Command::Peer(_)
             | Command::Ssh(_)
             | Command::Shell(_)
             | Command::Update(_)
@@ -224,7 +221,6 @@ mod tests {
             vec!["graph"],
             vec!["export"],
             vec!["hooks"],
-            vec!["peer"],
             vec!["ssh", "list"],
             vec!["ssh", "shell", "host", "--", "echo hi"],
             vec!["shell"],
@@ -237,6 +233,13 @@ mod tests {
                 !interactive(parse_command(&args(&argv)).expect("headless route")),
                 "{argv:?}"
             );
+        }
+    }
+    #[test]
+    fn removed_peer_verbs_are_unknown() {
+        for verb in ["list", "send", "name", "watch", "wait-idle"] {
+            let argv = args(&["peer", verb]);
+            assert!(matches!(parse_command(&argv), Ok(Command::Unknown("peer"))));
         }
     }
     #[test]

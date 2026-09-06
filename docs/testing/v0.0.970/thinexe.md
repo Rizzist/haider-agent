@@ -1,11 +1,12 @@
 # thinexe — thin control executable and on-demand interactive payload
 
-Branch `lane-970-thinexe`; workspace version `0.0.970`. Verdict: **NO_SHIP**.
-The final merged source gate passes, and the thin executable is 34.9% smaller,
-but no accepted paired RSS measurement exists; the installed runtime grows
-15.8%. Public installation, the historical auto-spawn upgrade, and installer
-watchdog provenance retain the additional acceptance blockers detailed below.
-The original worktree remains uncommitted and preserved.
+Branch `lane-970-thinexe`; workspace version `0.0.970`. Continuation 3 fixes the installer watchdog mechanism; the current evidence and verdict are in the final section below. Earlier failed runs remain historical evidence and are not relabeled as passes.
+The orchestrator measured linger client peak RSS reductions of 21% maximum
+and 26% median, TTL=0 parity and equal wall time. The earlier measured release
+CLI shrank 34.9%, while its installed runtime total grew 15.8%. Historical
+public-installation, auto-spawn-upgrade and watchdog-provenance limitations
+remain recorded below. This continuation reruns the requested merged gates;
+the orchestrator owns staging and committing the existing merge.
 The common rules, brief, `turnperf/`, and `turnperf2/` inputs were read first and
 are unchanged and excluded from the held delivery.
 
@@ -196,22 +197,26 @@ is an additional legacy delivery mechanism, not part of the fresh three-member
 installed total. These are local arm64 release executables with the repository's
 normal release profile, not notarized/compressed release download sizes.
 
-| Required paired measurement | Before → after | Accepted pairs | Status |
-| --- | --- | ---: | --- |
-| `--version` peak RSS and CPU/wall floor | unmeasured → unmeasured | 0 | ENVIRONMENT-BLOCKED |
-| One-shot sampled client peak RSS/CPU | unmeasured → unmeasured | 0 | ENVIRONMENT-BLOCKED |
-| Warm sampled client peak RSS/CPU | unmeasured → unmeasured | 0 | ENVIRONMENT-BLOCKED |
-| Conformance client rows | unmeasured → unmeasured | 0 | ENVIRONMENT-BLOCKED |
+| Orchestrator paired measurement | Before | After | Result |
+| --- | ---: | ---: | --- |
+| Linger client peak RSS, maximum | 17.6 MiB | 13.9 MiB | −21% |
+| Linger client peak RSS, median | 14.1 MiB | 10.5 MiB | −26% |
+| TTL=0 client peak RSS | — | — | Parity |
+| Wall time | — | — | Equal |
+| CLI executable size (rounded, supplied units) | 34 MB | 22 MB | Smaller |
 
-The final fixed ABBA command exited 75 before any sample: one-minute load
-3.24755859375 exceeded the unchanged 3.0 limit. See
-`thinexe-evidence/abba-final/abba.json` and `abba-final-driver.log`. A subsequent
-quiet-host retry reached the process-inventory check but was denied with EPERM
-before any binary was launched (`abba-final-quiet-retry/abba.json`). The earlier
-4.52978515625-load rejection remains in `abba/abba.json`. No guard was bypassed,
-sample count changed, or rejected result relabeled. No null value is treated
-as zero and no historical sample is substituted for this missing pair. The
-HOLD-OUT verdict is **NO_SHIP** without accepted same-machine RSS evidence.
+**MEASURED by the orchestrator:** release builds, ABBA, same machine, old
+benchmark; source `tmp/thinexe-ab/`. These are the supplied Continuation 2
+results, not a new local measurement. The raw directory is not present in this
+worktree; sample counts, CPU values and separate `--version` RSS were not
+supplied and are not inferred. The orchestrator accepted the RSS hold-out.
+
+Earlier local attempts remain rejected evidence: the fixed ABBA command exited
+75 at load 3.24755859375 above its unchanged 3.0 ceiling
+(`thinexe-evidence/abba-final/abba.json`); the quiet retry hit EPERM during
+process inventory (`abba-final-quiet-retry/abba.json`). The earlier load
+4.52978515625 rejection is retained too. None is relabeled as an accepted pair.
+The supplied orchestrator measurement supersedes the held, missing-RSS verdict.
 
 ```sh
 export RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
@@ -292,8 +297,9 @@ counts and ABBA order; the peer benchmark is unchanged.
   both frozen artifact sets remain unchanged after all probes, and only the TUI
   among the three runtime siblings contains the contiguous payload marker
   (`final-artifact-audit.json`).
-- Fixed ABBA attempts: ENVIRONMENT-BLOCKED before any sample; zero accepted
-  pairs, NO_SHIP. The quiet retry establishes the denied process-inventory proof.
+- Historical local ABBA attempts: ENVIRONMENT-BLOCKED before any sample.
+  Continuation 2 orchestrator ABBA above passes the RSS hold-out; the rejected
+  local attempts remain separate evidence.
 
 Exact validation commands (run from this worktree):
 
@@ -456,4 +462,284 @@ inputs are excluded from both the commit and patch.
   public installation, historical auto-spawn upgrade and watchdog-provenance
   acceptance blockers remain explicitly recorded above.
 
+## Merge with wave-970
+
+Continuation 2 resolves the working files for held commit `59ce1bb8` merged
+with `origin/wave-970` (`5468dec1`). Only file edits are made; the orchestrator
+must stage the resolved files and commit the existing merge. Git's unmerged
+index entry for `main.rs` is intentionally left for that staging step.
+
+Source inspection found a brief/ref discrepancy: the actual
+`git diff 6c42fc02 origin/wave-970 -- crates/haider-cli/src/main.rs` changes
+only peer help wording; wave still contains its peer module and dispatcher.
+The explicit continuation requirement of **no peer verbs** takes precedence.
+The thin four-line `main.rs` is retained; peer module registration, command
+enum/parser, dispatcher and usage advertisement are removed from the library.
+The historical peer source files remain unreferenced; daemon/client peer RPC
+behavior is outside this CLI removal and remains in the merged wave.
+
+`agent`/`workflow` and `session_retract` were already ported in the held library.
+Each keeps one parser/dispatcher path. Wave's module list, dispatch behavior,
+constants and exit mappings were compared with the library and payload;
+no other missing wave-side changes were found. The old main.rs line citations
+in the turnperf lenses have drifted: current routing is in
+`crates/haider-cli/src/routing.rs`, control runtime/dispatch is in
+`crates/haider-cli/src/lib.rs`, and interactive implementation is in
+`crates/haider-tui-exe/src/main.rs`. Their earlier image-size/timing estimates
+are historical; the accepted table above is the performance evidence.
+
+Added `removed_peer_verbs_are_unknown` and strengthened the observable-payload
+integration loop: all five former peer verbs must return 2, report an unknown
+command, omit peer help, and never execute the payload. Existing interactive
+argv/exit-status and headless-family routing assertions remain intact.
+
+Executed on this merged source under the complete requested ENV LAW, with
+`CARGO_BUILD_JOBS=2` and
+`CARGO_TARGET_DIR=/private/tmp/haider-thinexe-target`:
+
+- Prebuilt CLI, daemon, payload and tools binaries: PASS. `haiderd` is
+  203,268,512 bytes, above 10 MiB.
+- `cargo test -q --workspace --no-fail-fast`: PASS, 5,617 summed libtest
+  passes, zero failures, 13 unchanged pre-existing ignores.
+- `cargo clippy --workspace --tests -- -D warnings`: PASS (4m11s).
+- Explicit `payload_routing_tests`: 6 PASS; `routing::tests`: 4 PASS.
+- Source test-count update: **5,134**. Conflict-marker scan empty;
+  `git diff --check` clean.
+- Python packaging, installer, ABBA, legacy-fixture and turnperf regressions:
+  **60 PASS**. Native dependency/artifact boundary proof: PASS.
+- Native installer suite against rebuilt debug siblings during test compilation:
+  2 PASS, 3 errors (unchanged 120-second watchdog). The complete-archive cases
+  timed out: direct fresh install, npm installation and npm recovery-marker
+  refusal. Missing/wrong-payload cases passed. Direct CLI offline self-test
+  separately passed. Serial retry without any Cargo process from this task:
+  **3 PASS, 2 errors**, 421.148s. Fresh shell and npm installation again hit
+  the unchanged 120-second watchdog; recovery-marker refusal now passed.
+  Both runs are retained. No native release installer rerun on this merged
+  source is claimed.
+
+Exact script, logs, boundary proof and summary are in
+`thinexe-evidence/merge-wave-970/`. The test-gate command script records the
+requested environment and checks disk space before every build. The serial
+native retry adds only timeout-output reporting, retaining the original test
+methods, binaries, assertions and deadlines.
+
+Independent verifier: source, exit mappings and routing/packaging coverage
+inspected, zero findings. Windows/Linux execution remains by inspection in
+this local macOS continuation. Prior public-release and historical-updater
+fixture limitations above are retained as historical evidence; this merge
+rerun does not claim those external fixtures were executed again.
+
+The continuation's performance hold-out passes, and all required Rust gates
+pass. Native packaging does not: two installation-success cases still time
+out on the rebuilt debug siblings when run serially. Repeated hashing of the
+larger debug bundle is plausible by inspection, but the timeout logs do not
+prove the exact slow stage. No code defect is asserted from timing alone;
+no deadline, assertion, ignore or platform gate was weakened. These persistent
+native installer failures retain **NO_SHIP** for this continuation.
+
+VERIFIER: findings=0 real=0 noise=0 — no findings
 NO_SHIP
+
+
+## Continuation 3 — watchdog mechanism and final merged gate
+
+Read `LANE-COMMON.md`, `LANE-BRIEF-thinexe.md`, `turnperf/` and the round-2
+lens tables first. Their historical `main.rs` citations still point to the
+pre-split architecture; current routing/library/payload locations and the
+citation audit above remain applicable. These supplied files are unchanged.
+
+### Root cause and implementation
+
+The 120-second value was a literal in
+`scripts/tests/test_install_bundle_native.py`, not a shell/npm production
+watchdog. The previous report's “serial retry” was a serial rerun of tests:
+there was no member retry loop in the shared Rust transaction. Both wrappers
+fetch one archive and one sidecar, rather than fetching each member separately.
+Shell fetches had no wall limit, and npm requests had no wall limit either.
+
+A baseline direct `--install-bundle` process completed successfully without
+retries in **175.241192458 seconds**, progressing through private staging,
+immutable files, canonical publication and transaction-marker removal.
+Production-linked SHA-256 profiling measured **24.699 seconds** for one
+three-member pass (daemon 13.601, payload 6.418, thin 4.680). This identifies
+repeated debug hashing as the expensive stage. The seven-pass work estimate
+is **172.893 seconds**, not a reconstruction of baseline wall time. Host work
+and builds overlapped these diagnostic samples; the baseline directory was
+not frozen atomically, and an earlier standalone SHA library calibration is
+not substituted for the production-linked measurement. Exact diagnostic
+provenance is in `continuation-3/watchdog-baseline.txt`.
+
+Independent private member copies/hashes, quarantine/signature work, version
+smokes, freeze operations and immutable checks now execute concurrently.
+Every member finishes signature verification before any smoke can execute a
+sibling. All workers join, including on error, before staging can be removed.
+The ordered source manifest and serial durable publication sequence remain
+unchanged. All existing SHA, mode/ownership, signature, exact version,
+offline self-test, rollback and recovery checks remain authoritative.
+
+`gate/install_budget.py` derives the harness `BudgetSum` from member count
+and bytes. Let B be incoming bytes, O incumbent bytes and N member count:
+
+- SHA allowance: `(7 * B + O) / (8 MiB/s)`. The seventh pass is finalization's
+  canonical recheck; replacement also hashes the old members.
+- Archive/read/extract/copy/durable-I/O allowance: `8 * B / (16 MiB/s)`.
+- Staged/installed version probes: `2 * N * VERSION_QUERY`.
+- Aggregate signature/quarantine allowance: `N * VERSION_QUERY`.
+- One staged CLI offline self-test: `VERSION_QUERY`.
+
+These are explicit conservative **harness resource allowances**, not claims
+that each product phase has an enforced deadline or guaranteed disk service
+rate. The 8 MiB/s SHA policy is below the measured production-linked 13–15
+MiB/s range. Native fixtures account for their actual member sizes and any
+old prefix. The static T1 declaration uses Rust's 256 MiB/member input capacity
+and includes Linux's fourth Wayland companion. It does not assume a remote
+release archive has the local debug executable sizes.
+
+Shell archive and sidecar fetches now overlap; npm already overlapped them.
+Each attempt gets `30s + ceil(resource_capacity / 1 MiB/s)`: archive
+capacity 128 MiB gives 158s, checksum capacity 16 KiB gives 31s. Two attempts
+yield a 316s maximum for concurrent archive/sidecar retrieval, separate from
+member verification. Latest-release metadata has a 1 MiB capacity allowance;
+pinned-version T1 does not fetch it. This byte derivation avoids imposing a
+30s whole-download cap on legitimate large transfers. Redirects/body trickles
+cannot reset an attempt deadline.
+A failed shell attempt's partial bytes are discarded before retry. Wget gets
+an outer wall timer because its timeout alone only bounds idle I/O. Npm owns
+and destroys every redirect request/response on attempt completion or failure.
+Both resources must succeed before checksum verification or extraction.
+Native fixture expiry kills the exact owned wrapper/helper process group
+(Windows tree cleanup by inspection), preventing a failed run's children
+from contending with a subsequent serial retry.
+
+### Repeated forward merge and packaging
+
+The original worktree fetch was refused because its Git metadata is outside
+the writable sandbox. A new successful `fetch origin wave-970` in the existing
+writable temporary checkout still returned
+`5468dec1fd4d7b09c2f704d5d408c3f9e19a4374`. A repeated `merge --no-commit`
+there reconstructed the same merge; its three source conflicts were resolved
+using the existing resolved working files. All other incoming files compare
+byte-for-byte with the worktree. There is **no new incoming delta** and no
+`packaging/installers/**` tree at that remote head. The existing shell,
+PowerShell, npm, Homebrew/Scoop/Chocolatey member lists, Chocolatey uninstall,
+and release post-pack verifier cover `haider-tui`. Historical Winget's pinned
+0.0.934 two-member archive remains historical. `merge-forward.json`,
+`merge-forward.log` and `merge-differences.json` retain this check.
+
+Only file edits are left in the original worktree. Its existing unmerged
+`main.rs` index entry requires the orchestrator's staging; no commit, checkout,
+reset or stash was performed. No generated golden was hand-merged.
+
+### Verification results
+
+The final installer source is fixed and independently reviewed. Exact native
+macOS debug-artifact timings (seconds, monotonic) are:
+
+| Check | Result | Seconds |
+| --- | --- | ---: |
+| T1 `install.paths`, exact local candidate archive transport | PASS | 171.446399917 |
+| T1 `previous_release_upgrade`, public pinned v966 → v970 | PASS | 35.947909291 |
+| Native shell fresh prefix | PASS | 173.097302 |
+| Native shell missing payload refuses/preserves incumbent | PASS | 6.167959 |
+| Native shell wrong payload identity refuses before publication | PASS | 49.022647 |
+| Native npm fresh vendor directory | PASS | 169.278014 |
+| Native npm recovery marker refusal preserves all old bytes | PASS | 155.138027 |
+| Complete final native suite, including archive setup/assertions | 5 PASS | 603.651 |
+
+The final native fresh-install budget is **782.810596 seconds**, derived from
+member sizes **69,006,688 / 95,949,344 / 203,235,680 bytes**. The incumbent
+bytes contribute to refusal/replacement case budgets. Native and T1 installation
+ran while workspace checks were active, so these are measured correctness-run
+wall times, not an accepted isolated performance comparison. Final native
+archive/member hashes are frozen in `native-final-artifact-hashes.json`.
+Cargo's workspace feature-union build produced slightly different bytes from
+the earlier prebuilt T1 archive; both are the same final Rust source.
+`candidate-transport.json` separately identifies the exact T1 artifact.
+
+The T1 candidate run invokes the official check unchanged, substituting only
+an explicitly recorded transport for the exact candidate archive/sidecar URLs.
+Checksum, shared helper verification, all three versions, daemon ready/status,
+clean shutdown and PID disappearance assertions all execute normally. The
+public v970 URL run remains **FAIL: HTTP 404**, **2.325045458 seconds**, with
+`timed_out=false`: the split asset is unpublished. No public-download PASS is
+claimed or fabricated. The historical prepublication limitation is separate
+from the now-passing candidate installation mechanism. The previous-release
+upgrade downloaded the pinned public v966 asset, verified its fixed SHA, kept
+two sessions, completed a new turn, matched the upgraded schema to a fresh
+profile and proved no orphan daemons.
+
+Earlier measurements are retained separately: candidate T1 paths 142.986191333s;
+native suite 5 PASS, 443.962s under the initial smaller 769.014416s allowance.
+The final native suite reran all five cases after corrected budget accounting
+and the byte-derived downloader policy, so the smaller-cap run is not presented
+as the final-source gate.
+
+Other completed checks: installer wrapper/budget regressions 17 PASS, 15.888s;
+QA runner harness 36 PASS, 0.342s; independent packaging 9 PASS, 0.049s; regenerated
+JSONL/request goldens 4 PASS; instruct-pipe 6,244 → 6,244 PASS; authoritative source
+test-count 5,134 → 5,135; rebuilt daemon above 10 MiB. The new
+`concurrent_staging_verifies_all_signatures_before_any_smoke` regression protects
+the sibling signature barrier. Additional regressions cover stalled/trickling
+redirect downloads, partial retry isolation, owned descendant timeout cleanup,
+resource-budget scaling and Linux portal accounting. No test is newly ignored
+or skipped on another platform.
+
+The first full workspace attempt is retained: it ran alongside installer work
+and failed the unchanged auto-spawn 950 ms assertion at 1.12148275s. No threshold
+was relaxed and no CI environment escape hatch was enabled. The first attempt took **1,156.209567292 seconds**. The second (**540.327973708 seconds**), without
+installer load, passed the auto-spawn suite but failed the pre-existing
+`oauth::tests::device_flow_runner_continues_and_honors_slow_down_interval`:
+its 2,000-iteration paused-clock real-I/O polling loop received no start
+response. Both protected OAuth files remain unchanged; independent review
+found no installer/staging dependency in that path. Its log is retained in
+`quiet-final/`. The final full gate uses the same ENV LAW plus
+`RUST_TEST_THREADS=2`, reducing competing independent libtest workers while
+retaining every test, deadline, clock assertion and internal concurrency
+scenario. This is resource control, not a threshold change. Final results on the identical source:
+
+- `cargo test -q --workspace --no-fail-fast`: **PASS**, **694.906014792 seconds**;
+  **5,618 summed libtest passes**, zero failures, **13 unchanged existing ignores**.
+  This includes 5,606 unfiltered passes plus nested subprocess probes. The
+  source counter is **5,135**, up one from 5,134. Earlier combined stdout can
+  interleave nested result lines; `test-count-accounting.json` retains that
+  audit rather than interpreting missing complete nested lines as removed tests.
+- `cargo clippy --workspace --tests -- -D warnings`: **PASS**, **15.292936958 seconds**.
+- Complete ENV LAW: `RUST_MIN_STACK=8388608`, `HAIDER_DISCOVERY_DISABLED=1`,
+  `HAIDER_TEST_DEVICE_NAME=test-mac`, `CARGO_INCREMENTAL=0`,
+  `CARGO_PROFILE_DEV_DEBUG=0`, `HAIDER_TEST_SIBLINGS_PREBUILT=1`,
+  `CARGO_TARGET_DIR=/private/tmp/haider-thinexe-target`, `CARGO_BUILD_JOBS=2`,
+  plus the explicit harness resource limit `RUST_TEST_THREADS=2`.
+- Disk checked before every build/test/Clippy/count command; no check ran below
+  the 700 MiB stop floor. Native daemon sizes in both recorded builds exceed
+  10 MiB. Formatting and whitespace checks **PASS**.
+- Final SHA-256 source manifest: **1,057 files**, **zero drift** across the final
+  gate. Exact commands, environments, exit statuses, times and totals are in
+  `limited-final/gates.json` and `summary.json`.
+- A further pre-final-gate fetch still returned **5468dec1**;
+  `fetch-before-quiet-final.log` retains it. No additional installer lane landed.
+  Native Linux/Windows execution remains **by inspection** locally.
+
+### Current verdict and independent verifier
+
+**SHIP for the merged candidate implementation.** The prior native-watchdog
+blocker is closed by the mechanism fix and final installer/T1 candidate gates;
+the accepted earlier performance hold-out is unchanged. Public v970 asset
+publication remains the orchestrator's release operation, not a fabricated
+public-install pass. All files remain uncommitted, with the existing merge
+index owned by the orchestrator.
+
+Independent review accepted two findings and rejected none: the new npm
+redirect chain initially retained an earlier response socket; it now tracks
+and destroys every attempt resource, with a real loopback regression. The
+initial budget omitted finalization's seventh hash pass and miscounted
+self-tests; incoming/incumbent byte accounting and one staged self-test now
+match the actual transaction. The reviewer also confirmed that limiting
+independent libtest workers preserves all tests and internal concurrency.
+
+Registry #94 is now addressed by the explicit resource sums and per-attempt
+network bounds; #95 adds no negotiated RPC wait; #76/#77 retain every bundle
+member and verification/recovery assertion; #20/#64 retain the source recount
+and real sibling-binary floor. No protected OAuth file was edited.
+
+VERIFIER: findings=2 real=2 noise=0 — fixed npm redirect socket cleanup with a regression; corrected hash-pass, incumbent-byte and self-test budget accounting
+SHIP

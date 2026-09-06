@@ -785,9 +785,9 @@ impl SessionProjection {
             }
             EventPayload::PeerMessage(message) => self.push_peer_message(
                 message.msg_id.clone(),
-                message.from.name.clone(),
+                message.from.display_identity(),
                 peer_kind_label(message.from.kind).to_owned(),
-                message.message.clone(),
+                message.message.to_owned_string(),
             ),
             EventPayload::Item(event) => self.apply_item(event),
             EventPayload::ToolResult { call_id, result } => self.apply_tool_result(call_id, result),
@@ -1351,7 +1351,8 @@ impl SessionProjection {
                 .entries
                 .iter()
                 .rposition(|entry| matches!(entry, TranscriptEntry::User { .. })),
-            haider_protocol::history::NodeKind::PeerTurn { .. } => self
+            haider_protocol::history::NodeKind::PeerTurn { .. }
+            | haider_protocol::history::NodeKind::Agent { .. } => self
                 .entries
                 .iter()
                 .rposition(|entry| matches!(entry, TranscriptEntry::Peer { .. })),

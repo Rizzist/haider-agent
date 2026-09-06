@@ -176,6 +176,7 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
         cache_metadata: None,
         messages: vec![
             Message {
+                input_origin: None,
                 role: MessageRole::User,
                 blocks: vec![
                     Block::Attachment(AttachmentBlock::Image {
@@ -196,6 +197,7 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                 ],
             },
             Message {
+                input_origin: None,
                 role: MessageRole::Assistant,
                 blocks: vec![Block::ToolCall {
                     call_id: "toolu_sanitized".into(),
@@ -204,6 +206,7 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                 }],
             },
             Message {
+                input_origin: None,
                 role: MessageRole::Tool,
                 blocks: vec![Block::ToolResult {
                     call_id: "toolu_sanitized".into(),
@@ -406,6 +409,7 @@ fn native_pdf_enforces_anthropics_complete_request_size_limit() {
         }],
         cache_metadata: None,
         messages: vec![Message {
+            input_origin: None,
             role: MessageRole::User,
             blocks: vec![Block::Attachment(AttachmentBlock::Pdf {
                 artifact,
@@ -437,6 +441,7 @@ fn missing_image_data_is_a_typed_invalid_request() {
         attachments: Vec::new(),
         cache_metadata: None,
         messages: vec![Message {
+            input_origin: None,
             role: MessageRole::User,
             blocks: vec![Block::Attachment(AttachmentBlock::Image {
                 artifact: ArtifactRef::new("blake3:missing"),
@@ -787,6 +792,7 @@ fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_reject
         messages: vec![
             Message::user_text("read the file"),
             Message {
+                input_origin: None,
                 role: MessageRole::Assistant,
                 blocks: vec![
                     Block::ProviderOpaque {
@@ -1098,6 +1104,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
         messages: vec![
             Message::user_text("search the web"),
             Message {
+                input_origin: None,
                 role: MessageRole::Assistant,
                 blocks: vec![
                     opaque(&server_use),

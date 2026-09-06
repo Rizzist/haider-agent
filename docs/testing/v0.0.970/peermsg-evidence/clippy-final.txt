@@ -1,0 +1,4 @@
+    Checking haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-tui)
+    Checking haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-cli)
+    Checking haider-daemond v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 37.65s

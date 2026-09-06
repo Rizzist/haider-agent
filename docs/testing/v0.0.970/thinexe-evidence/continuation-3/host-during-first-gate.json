@@ -1,0 +1,13 @@
+{
+  "utc": "2026-09-06T09:05:05.145866+00:00",
+  "disk": {
+    "exit_code": 0,
+    "stdout": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     13240    48%  458732 135581560    0%   /\n",
+    "stderr": ""
+  },
+  "memory": {
+    "exit_code": 0,
+    "stdout": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    41268.\nPages active:                                 354159.\nPages inactive:                               338198.\nPages speculative:                             14922.\nPages throttled:                                   0.\nPages wired down:                             179147.\nPages purgeable:                                2634.\n\"Translation faults\":                    25372616737.\nPages copy-on-write:                       889576562.\nPages zero filled:                       10077368409.\nPages reactivated:                        3677293934.\nPages purged:                              107284865.\nFile-backed pages:                            251819.\nAnonymous pages:                              455460.\nPages stored in compressor:                   407673.\nPages occupied by compressor:                  81156.\nDecompressions:                           3983401052.\nCompressions:                             4446645534.\nPageins:                                   589175714.\nPageouts:                                    3239535.\nSwapins:                                    85271374.\nSwapouts:                                   91588377.\n",
+    "stderr": ""
+  }
+}

@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized] target(s) in 0.06s
+     Running `/private/tmp/peermsg-target/debug/xtask test-count --update`
+test-count: baseline updated to 5093

@@ -2,7 +2,8 @@
 //!
 //! The journal IS the transcript; export never captures anything new. It reads
 //! the committed conversation-tree facts (`NodeCommitted` user/assistant/tool
-//! nodes) for a session and renders them to a chosen format:
+//! nodes and their peer-message facts) for a session and renders them to a
+//! chosen format:
 //!
 //! - `markdown` (default) — a readable, shareable transcript;
 //! - `json` — the fact list projected to a stable public schema;
@@ -27,6 +28,7 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorPresentation;
 use haider_protocol::history::NodeKind;
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::peer::{PEER_AUTHORITY_STATEMENT, PeerMessage};
 use haider_protocol::pipe::{TranscriptJoiner, TranscriptProjector, escape_pipe_field};
 use serde_json::{Value, json};
 
@@ -52,6 +54,11 @@ pub enum Turn {
         at_ms: u64,
         /// The journal seq of the producing envelope — the row identity a
         /// live subscriber keys by, so cold-rebuilt rows match live rows.
+        seq: u64,
+    },
+    Agent {
+        message: Box<PeerMessage>,
+        at_ms: u64,
         seq: u64,
     },
     Assistant {
@@ -86,6 +93,7 @@ impl Turn {
     pub fn seq(&self) -> u64 {
         match self {
             Self::User { seq, .. }
+            | Self::Agent { seq, .. }
             | Self::Assistant { seq, .. }
             | Self::AssistantIncomplete { seq, .. }
             | Self::Error { seq, .. }
@@ -96,6 +104,7 @@ impl Turn {
     fn at_ms(&self) -> u64 {
         match self {
             Self::User { at_ms, .. }
+            | Self::Agent { at_ms, .. }
             | Self::Assistant { at_ms, .. }
             | Self::AssistantIncomplete { at_ms, .. }
             | Self::Error { at_ms, .. }
@@ -196,8 +205,10 @@ impl std::fmt::Display for ExportError {
 impl SessionExport {
     /// Project the durable envelopes into a transcript. Only committed
     /// conversation-tree nodes (`UserTurn` / `AssistantCommit` / `ToolExchange`)
-    /// become turns; every other fact is skipped (an export is a transcript,
-    /// not a raw journal dump). Envelopes are read in `seq` order.
+    /// and self-sufficient `peer.message` facts become turns. Agent/legacy peer
+    /// nodes anchor that same fact and must not produce a duplicate row. Other
+    /// facts are skipped: an export is a transcript, not a raw journal dump.
+    /// Envelopes are read in `seq` order.
     #[must_use]
     pub fn project(meta: ExportMeta, events: &[RawEnvelope]) -> Self {
         let hidden_nodes: std::collections::HashSet<_> = events
@@ -222,6 +233,11 @@ impl SessionExport {
             let at_ms = envelope.committed_at_ms;
             let seq = envelope.seq;
             match payload {
+                EventPayload::PeerMessage(message) => turns.push(Turn::Agent {
+                    message: Box::new(message),
+                    at_ms,
+                    seq,
+                }),
                 EventPayload::NodeCommitted(node) if !hidden_nodes.contains(&node.node) => {
                     match node.kind {
                         NodeKind::UserTurn { text, .. } => {
@@ -336,6 +352,23 @@ impl SessionExport {
         apply_mask(&raw.to_string(), masked)
     }
 
+    /// Mask dynamic fields before framing: masking an already-rendered
+    /// envelope can erase its `from` attribute at the address's `@` character.
+    fn peer_message(&self, message: &PeerMessage, masked: bool) -> PeerMessage {
+        let mut message = message.clone();
+        if masked {
+            message.msg_id = mask_text(&message.msg_id);
+            message.from.id = mask_text(&message.from.id);
+            message.from.device_id = mask_text(&message.from.device_id);
+            message.from.name = mask_text(&message.from.name);
+            message.from.mode = mask_text(&message.from.mode);
+            message.to = mask_text(&message.to);
+            message.message = mask_text(&message.message.to_owned_string()).into();
+            message.summary = message.summary.as_deref().map(mask_text);
+        }
+        message
+    }
+
     fn foreign_assistant_text(&self, turn: &Turn, masked: bool) -> Option<String> {
         match turn {
             Turn::Assistant { text, .. } => Some(self.text(text, masked)),
@@ -352,7 +385,7 @@ impl SessionExport {
                 self.text(&presentation.detail, masked),
                 presentation.subcode.as_str()
             )),
-            Turn::User { .. } | Turn::Tool { .. } => None,
+            Turn::User { .. } | Turn::Agent { .. } | Turn::Tool { .. } => None,
         }
     }
 
@@ -428,6 +461,28 @@ impl SessionExport {
                     format!(
                         "U  {seq} {at_ms} {}",
                         escape_pipe_field(&self.text(text, masked))
+                    )
+                }
+                Turn::Agent {
+                    message,
+                    at_ms,
+                    seq,
+                } => {
+                    let message = self.peer_message(message, masked);
+                    format!(
+                        "P  {seq} {at_ms} {} {} kind={} trust={} id={} role=agent",
+                        escape_pipe_field(&message.from.display_identity()),
+                        escape_pipe_field(&message.render_for_prompt()),
+                        match message.from.kind {
+                            haider_protocol::peer::PeerKind::HaiderSession => "haider_session",
+                            haider_protocol::peer::PeerKind::External => "external",
+                        },
+                        match message.from.trust {
+                            haider_protocol::peer::PeerTrust::VerifiedHaider => "verified_haider",
+                            haider_protocol::peer::PeerTrust::UntrustedExternal =>
+                                "untrusted_external",
+                        },
+                        escape_pipe_field(&message.msg_id),
                     )
                 }
                 Turn::Assistant { text, at_ms, seq } => {
@@ -512,6 +567,21 @@ impl SessionExport {
                     out.push_str(&format!("## User · {}\n\n", iso8601_ms(*at_ms)));
                     out.push_str(&self.text(text, masked));
                     out.push_str("\n\n");
+                }
+                Turn::Agent { message, at_ms, .. } => {
+                    out.push_str(&format!("## Agent · {}\n\n", iso8601_ms(*at_ms)));
+                    // An indented code block keeps arbitrary peer Markdown,
+                    // including backtick fences, inside the untrusted row.
+                    for line in self
+                        .peer_message(message, masked)
+                        .render_for_prompt()
+                        .lines()
+                    {
+                        out.push_str("    ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    out.push('\n');
                 }
                 Turn::Assistant { text, at_ms, .. } => {
                     out.push_str(&format!("## Assistant · {}\n\n", iso8601_ms(*at_ms)));
@@ -621,6 +691,36 @@ impl SessionExport {
                     "at_ms": at_ms,
                     "seq": seq,
                 }),
+                Turn::Agent {
+                    message,
+                    at_ms,
+                    seq,
+                } => {
+                    let message = self.peer_message(message, masked);
+                    let mut row = json!({
+                        "kind": "peer_message",
+                        "role": "agent",
+                        "authority": PEER_AUTHORITY_STATEMENT,
+                        "msg_id": message.msg_id,
+                        "sender_id": message.from.id,
+                        "sender_device_id": message.from.device_id,
+                        "sender_address": message.from.address(),
+                        "sender_mode": message.from.mode,
+                        "sender": message.from.name,
+                        "sender_kind": message.from.kind,
+                        "sender_trust": message.from.trust,
+                        "to": message.to,
+                        "text": message.message,
+                        "queued_at": message.queued_at,
+                        "expires_at": message.expires_at,
+                        "at_ms": at_ms,
+                        "seq": seq,
+                    });
+                    if let Some(summary) = message.summary {
+                        row["summary"] = summary.into();
+                    }
+                    row
+                }
                 Turn::Assistant { text, at_ms, seq } => json!({
                     "role": "assistant",
                     "text": self.text(text, masked),
@@ -772,6 +872,26 @@ impl SessionExport {
                         .to_string(),
                     );
                 }
+                Turn::Agent { message, .. } => {
+                    // Foreign providers also have no agent input role. Keep
+                    // one separately framed user message, without adding it
+                    // to the human's command-history/picker entries.
+                    lines.push(
+                        json!({
+                            "timestamp": iso,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": self.peer_message(message, masked).render_for_prompt(),
+                                }],
+                            }
+                        })
+                        .to_string(),
+                    );
+                }
                 Turn::Assistant { .. } | Turn::AssistantIncomplete { .. } | Turn::Error { .. } => {
                     let text = self
                         .foreign_assistant_text(turn, masked)
@@ -860,6 +980,13 @@ impl SessionExport {
                     "user",
                     json!({ "role": "user", "content": self.text(text, masked) }),
                 ),
+                Turn::Agent { message, .. } => (
+                    "user",
+                    json!({
+                        "role": "user",
+                        "content": self.peer_message(message, masked).render_for_prompt(),
+                    }),
+                ),
                 Turn::Assistant { .. } | Turn::AssistantIncomplete { .. } | Turn::Error { .. } => (
                     "assistant",
                     json!({
@@ -934,6 +1061,10 @@ impl SessionExport {
             let part_id = format!("prt_{}", short_hash(&format!("{seed}:part")));
             let (role, text) = match turn {
                 Turn::User { text, .. } => ("user", self.text(text, masked)),
+                Turn::Agent { message, .. } => (
+                    "user",
+                    self.peer_message(message, masked).render_for_prompt(),
+                ),
                 Turn::Assistant { .. } | Turn::AssistantIncomplete { .. } | Turn::Error { .. } => (
                     "assistant",
                     self.foreign_assistant_text(turn, masked)

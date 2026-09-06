@@ -1277,3 +1277,71 @@ impl Drop for Decoder {
         }
     }
 }
+
+/// Decode a complete JSON body received into a shared allocation. Peer input
+/// text without JSON escapes becomes a range of that allocation; escaped text
+/// is decoded once into its own arena. Ordinary frames use the shared codec.
+pub fn decode_owned_json(bytes: bytes::Bytes, frame_limit: usize) -> Result<WireFrame, CodecError> {
+    if bytes.len() > frame_limit {
+        return Err(CodecError::FrameLimitExceeded {
+            frame_limit,
+            announced_len: Some(bytes.len()),
+        });
+    }
+    #[derive(Deserialize)]
+    struct Input<'a> {
+        msg_id: String,
+        from: haider_protocol::peer::PeerSender,
+        to: String,
+        #[serde(borrow)]
+        message: std::borrow::Cow<'a, str>,
+        #[serde(default)]
+        summary: Option<String>,
+        queued_at: u64,
+        expires_at: u64,
+    }
+    #[derive(Deserialize)]
+    struct Body<'a> {
+        method: &'a str,
+        #[serde(borrow)]
+        message: Input<'a>,
+    }
+    #[derive(Deserialize)]
+    struct Request<'a> {
+        v: u32,
+        kind: &'a str,
+        request_id: RequestId,
+        #[serde(borrow)]
+        body: Body<'a>,
+    }
+    if let Ok(request) = serde_json::from_slice::<Request<'_>>(&bytes)
+        && request.v == WIRE_PROTOCOL_VERSION
+        && request.kind == "request"
+        && request.body.method == "peer.inject"
+    {
+        let input = request.body.message;
+        let message = match input.message {
+            std::borrow::Cow::Borrowed(text) => {
+                let start = text.as_ptr() as usize - bytes.as_ptr() as usize;
+                ReplyText::from_utf8_bytes(bytes.slice(start..start + text.len()))
+                    .map_err(CodecError::InvalidUtf8)?
+            }
+            std::borrow::Cow::Owned(text) => text.into(),
+        };
+        return Ok(WireFrame::Request {
+            request_id: request.request_id,
+            body: crate::RequestBody::PeerInject {
+                message: haider_protocol::peer::PeerMessage {
+                    msg_id: input.msg_id,
+                    from: input.from,
+                    to: input.to,
+                    message,
+                    summary: input.summary,
+                    queued_at: input.queued_at,
+                    expires_at: input.expires_at,
+                },
+            },
+        });
+    }
+    decode_json(&bytes, frame_limit)
+}

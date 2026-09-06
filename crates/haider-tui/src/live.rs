@@ -392,7 +392,7 @@ pub enum LiveCommand {
     /// `peer.list` — connection-scoped read of the live profile registry.
     PeerList,
     /// `peer.send` — a direct user-authored TUI message. The daemon owns
-    /// durable delivery; no local transcript row is fabricated for a send.
+    /// boundary injection; no local transcript row is fabricated for a send.
     PeerSend {
         to: String,
         message: String,
@@ -3405,9 +3405,9 @@ impl LiveDriver {
                 let kind = peer_kind_label(message.from.kind);
                 model.projection.push_peer_message(
                     message.msg_id,
-                    message.from.name.clone(),
+                    message.from.display_identity(),
                     kind.to_owned(),
-                    message.message,
+                    message.message.to_owned_string(),
                 );
                 if model.turn_active {
                     model.flash = Some(format!(

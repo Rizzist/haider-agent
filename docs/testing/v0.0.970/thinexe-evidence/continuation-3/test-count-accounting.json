@@ -1,0 +1,17 @@
+{
+  "prior_workspace_excluding_two_focused_routing_checks": {
+    "complete_result_rows": 355,
+    "raw_sum_passed": 5617,
+    "unfiltered_sum_passed": 5605,
+    "unfiltered_failed": 0,
+    "unfiltered_ignored": 13
+  },
+  "first_current_workspace": {
+    "complete_result_rows": 352,
+    "raw_sum_passed": 5614,
+    "unfiltered_sum_passed": 5605,
+    "unfiltered_failed": 1,
+    "unfiltered_ignored": 13
+  },
+  "explanation": "Prior raw log contains eight complete concurrent_process_writer_child one-pass/32-filtered summaries; current first log has only five complete summaries because concurrent child stdout interleaves. Every unfiltered prior result remains, current update_tests grows112 to113; autospawn has one failure replacing one pass. Source counter grows5134 to5135; no tests were removed."
+}

@@ -1,0 +1,3 @@
+Independent source audit: thin entry retained; wave modules/dispatch/constants/exit mappings preserved with explicitly requested peer CLI removal; agent/workflow/retract each registered once. No additional code defect established. Persistent native fresh-install timeout supports NO_SHIP despite passing Rust and Python regression gates.
+VERIFIER: findings=0 real=0 noise=0 — no findings
+NO_SHIP

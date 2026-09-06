@@ -28,37 +28,71 @@ function artifactForCurrentPlatform() {
   return artifacts[key] || null;
 }
 
-function download(url, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(
-      url,
-      { headers: { "User-Agent": `HaiderNpmInstaller/${VERSION}` } },
-      (response) => {
-        const location = response.headers.location;
-        if (
-          response.statusCode >= 300 &&
-          response.statusCode < 400 &&
-          location &&
-          redirects < 5
-        ) {
-          response.resume();
-          resolve(download(new URL(location, url).toString(), redirects + 1));
-          return;
-        }
+// Match install.sh and the shared updater capacities. A 1 MiB/s transfer
+// floor plus connection setup gives each attempt its own finite wall budget;
+// redirects/body trickles never restart it or consume the installer watchdog.
+const FETCH_ATTEMPTS = 2;
+const FETCH_CONNECT_SECONDS = 30;
+const FETCH_TRANSFER_BYTES_PER_SECOND = 1024 * 1024;
+const FETCH_ARCHIVE_BYTES = 128 * 1024 * 1024;
+const FETCH_CHECKSUM_BYTES = 16 * 1024;
+function downloadAttemptMs(maxBytes) {
+  return (FETCH_CONNECT_SECONDS + Math.ceil(maxBytes / FETCH_TRANSFER_BYTES_PER_SECOND)) * 1000;
+}
 
-        if (response.statusCode !== 200) {
-          response.resume();
-          reject(new Error(`HTTP ${response.statusCode} for ${url}`));
-          return;
-        }
-
-        const chunks = [];
-        response.on("data", (chunk) => chunks.push(chunk));
-        response.on("end", () => resolve(Buffer.concat(chunks)));
-      }
-    );
-    request.on("error", reject);
-  });
+async function download(url, { maxBytes = FETCH_ARCHIVE_BYTES, attemptMs = downloadAttemptMs(maxBytes), get = https.get } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await new Promise((resolve, reject) => {
+        let activeRequest;
+        let activeResponse;
+        const resources = new Set();
+        let settled = false;
+        const finish = (error, value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          // Includes every redirect body, even when it never ends. Replacing
+          // only the latest request would leave earlier sockets alive.
+          for (const resource of resources) resource.destroy();
+          if (error) reject(error);
+          else resolve(value);
+        };
+        const timer = setTimeout(() => finish(new Error(`Download attempt timed out for ${url}`)), attemptMs);
+        const visit = (currentUrl, redirects) => {
+          if (settled) return;
+          try {
+            activeRequest = get(currentUrl, {
+              headers: { "User-Agent": `HaiderNpmInstaller/${VERSION}` }
+            }, (response) => {
+              activeResponse = response;
+              resources.add(activeResponse);
+              response.on("error", (error) => finish(error));
+              response.on("aborted", () => finish(new Error(`Download aborted for ${currentUrl}`)));
+              const location = response.headers.location;
+              if (response.statusCode >= 300 && response.statusCode < 400 && location && redirects < 5) {
+                response.resume();
+                visit(new URL(location, currentUrl).toString(), redirects + 1);
+                return;
+              }
+              if (response.statusCode !== 200) {
+                finish(new Error(`HTTP ${response.statusCode} for ${currentUrl}`));
+                return;
+              }
+              const chunks = [];
+              response.on("data", (chunk) => chunks.push(chunk));
+              response.on("end", () => finish(null, Buffer.concat(chunks)));
+            });
+            resources.add(activeRequest);
+            activeRequest.on("error", (error) => finish(error));
+          } catch (error) { finish(error); }
+        };
+        visit(url, 0);
+      });
+    } catch (error) { lastError = error; }
+  }
+  throw lastError;
 }
 
 function sha256(buffer) {
@@ -229,7 +263,7 @@ async function main() {
 
   const [archive, sidecar] = await Promise.all([
     download(artifactUrl),
-    download(sidecarUrl)
+    download(sidecarUrl, { maxBytes: FETCH_CHECKSUM_BYTES })
   ]);
   const expected = expectedHash(sidecar, artifact);
   if (!expected) {
@@ -256,6 +290,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  download,
+  downloadAttemptMs,
   installArchive,
   artifactForCurrentPlatform,
   expectedHash,

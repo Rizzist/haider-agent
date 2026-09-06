@@ -1,0 +1,15 @@
+{
+  "transport": "local fixture serving exact candidate asset+sidecar URLs; all shell checksum/helper/signature/version/ready/status/stop assertions unchanged",
+  "archive": [
+    {
+      "path": "/private/tmp/thinexe-970-install-candidate/haider-v0.0.970-aarch64-apple-darwin-split.tar.xz",
+      "bytes": 83016316,
+      "sha256": "43c9e7c7ada8e038942009b98886e5cd81e295b80a5ba4e833c1a4cb0524c6c2"
+    },
+    {
+      "path": "/private/tmp/thinexe-970-install-candidate/haider-v0.0.970-aarch64-apple-darwin-split.tar.xz.sha256",
+      "bytes": 116,
+      "sha256": "f8f1550fe1e93206d7933bd5a8946aafaf479c674bd14839902f146a9fab74cf"
+    }
+  ]
+}

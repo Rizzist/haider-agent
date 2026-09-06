@@ -15,10 +15,10 @@ from gate import (
     PROCESS_EXIT_GRACE,
     STATUS_REQUEST,
     VERSION_QUERY,
-    BudgetPart,
     Evidence,
 )
 from gate.context import parse_single_json, wait_pid_gone
+from gate.install_budget import INSTALL_FETCH, MAX_INSTALL
 
 id = "t1.install.paths"
 tier = "t1"
@@ -28,24 +28,12 @@ script = [{"step": "finish", "reason": "end_turn"}]
 turns_expected = 0
 timed = True
 
-INSTALL_FETCH_OUTER = BudgetPart(
-    "installer two-fetch outer ceiling",
-    120.0,
-    "qa-gate 60s allowance per fetch; scripts/install.sh:18-25 has no internal timeout "
-    "and scripts/install.sh:74-75 performs the archive and checksum fetches",
-)
-INSTALL_EXTRACT_COPY = BudgetPart(
-    "installer checksum extraction and prefix copy",
-    30.0,
-    "scripts/install.sh:77-119 checksum, tar extraction, and executable copies",
-)
-# Registry #94: source version 30; installer outer 120+30; installed version
-# CLI/payload/daemon 3*30; ready 30; status 60; stop 20+2 and PID observation 2; cleanup status
-# 60 + stop 20+2 + historical PID observation 2. Total = 468s.
+# Registry #94: installer = bounded parallel fetches + member-count/byte
+# resource sum; remaining probes/daemon lifecycle retain their product bounds.
 budget = (
     VERSION_QUERY
-    + INSTALL_FETCH_OUTER
-    + INSTALL_EXTRACT_COPY
+    + INSTALL_FETCH
+    + MAX_INSTALL
     + VERSION_QUERY
     + VERSION_QUERY
     + VERSION_QUERY
@@ -155,7 +143,7 @@ def run(ctx) -> list[Evidence]:
     install_prefix.mkdir(parents=True, mode=0o700)
     install = ctx.run_command(
         ["/bin/sh", install_script],
-        timeout=INSTALL_FETCH_OUTER + INSTALL_EXTRACT_COPY,
+        timeout=INSTALL_FETCH + MAX_INSTALL,
         env_overrides={
             "HOME": install_home,
             "USERPROFILE": install_home,

@@ -1,0 +1,56 @@
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemon)
+    Finished `test` profile [unoptimized] target(s) in 1m 44s
+     Running unittests src/lib.rs (/private/tmp/peermsg-target/debug/deps/haider_daemon-a28fe88b6e2f83d6)
+
+running 29 tests
+test peer_tests::default_name_suffix_is_stable_and_disambiguates_shared_id_prefixes ... ok
+test peer_tests::durable_address_selects_the_exact_device_and_session ... ok
+test peer_tests::a_socket_published_haider_manifest_is_still_untrusted_input ... ok
+test peer_tests::peer_events_require_explicit_connection_opt_in ... ok
+test peer_tests::ambiguous_bare_name_returns_every_candidate ... ok
+test peer_tests::qualified_peer_address_keeps_name_and_prefix_separate ... ok
+test peer_tests::manifest_creation_stays_full_while_heartbeat_uses_plain_sync ... ok
+test peer_tests::verified_haider_descriptor_wins_an_external_id_collision ... ok
+test peer_tests::retired_peer_persistence_surfaces_are_absent ... ok
+test connection::connection_tests::kernel_reported_different_uid_peer_is_rejected_before_framing ... ok
+test peer_tests::peer_maintenance_is_event_armed_with_heartbeat_and_audit_repair ... ok
+test connection::connection_tests::pinging_peer_stays_attached_across_quiescence ... ok
+test connection::connection_tests::silent_negotiated_peer_is_closed_at_the_read_idle_deadline ... ok
+test peer_tests::peer_event_route_excludes_an_attached_legacy_connection ... ok
+test peer_tests::canonical_maximum_length_address_reaches_resolution_not_invalid_length ... ok
+test peer_tests::peer_endpoint_refuses_approval_frames_and_notifies_idle_once ... ok
+test session_hub::peer_injection_tests::peer_admission_survives_requester_cancellation_through_worker_handoff ... ok
+
+thread 'session_hub::peer_injection_tests::peer_approval_attempt_queues_without_answering_permission_or_changing_active_run' (40110445) panicked at crates/haider-daemon/src/session_hub/../peer_injection_tests.rs:258:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test session_hub::peer_injection_tests::peer_rpc_rejects_primary_injection_and_requires_view_for_idle_subscription ... ok
+test worker::worker_tool_catalog_tests::peer_send_ask_default_is_enforced_by_the_effect_broker ... ok
+test worker::worker_tool_catalog_tests::peer_tool_surface_is_manifest_and_digest_pinned ... ok
+test session_hub::peer_injection_tests::peer_injection_refuses_missing_historical_and_deleting_targets_without_writes ... ok
+test session_hub::peer_injection_tests::peer_idle_notice_refuses_target_removed_from_live_registry ... ok
+test session_hub::peer_injection_tests::peer_idle_subscription_releases_dispatcher_and_cancels_on_connection_close ... ok
+test session_hub::peer_injection_tests::peer_approval_attempt_queues_without_answering_permission_or_changing_active_run ... FAILED
+
+thread 'peer_tests::two_daemon_rpc_injection_uses_only_the_transcript_queue_and_private_roster' (40110440) panicked at crates/haider-daemon/src/peer_tests.rs:650:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+test session_hub::peer_injection_tests::peer_list_and_send_share_bounded_deferred_dispatch_and_cancel_on_close ... ok
+test session_hub::peer_injection_tests::peer_idle_notice_delivers_once_when_busy_target_becomes_idle ... ok
+test peer_tests::two_daemon_rpc_injection_uses_only_the_transcript_queue_and_private_roster ... FAILED
+test session_hub::peer_injection_tests::peer_injection_journals_agent_speaker_and_replays_identically ... ok
+PEER_STORE_RT agents=3 quiet_ms=1200 quiet_rts=0 explicit_list_rts=19
+test session_hub::peer_store_rt_tests::peer_store_round_trip_baseline_probe ... ok
+
+failures:
+
+failures:
+    peer_tests::two_daemon_rpc_injection_uses_only_the_transcript_queue_and_private_roster
+    session_hub::peer_injection_tests::peer_approval_attempt_queues_without_answering_permission_or_changing_active_run
+
+test result: FAILED. 27 passed; 2 failed; 0 ignored; 0 measured; 1066 filtered out; finished in 0.52s
+
+error: test failed, to rerun pass `-p haider-daemon --lib`

@@ -10,7 +10,7 @@ fn peer_artifact_names_are_fixed_and_portably_short() {
         super::PeerEndpointKind::Haider,
     )
     .expect("peer paths fit their budgets");
-    for path in [&paths.socket, &paths.manifest, &paths.mailbox] {
+    for path in [&paths.socket, &paths.manifest] {
         assert!(
             path.file_name()
                 .and_then(|name| name.to_str())

@@ -87,8 +87,9 @@ pub use observe::{
 pub use peer::{
     PeerClientError, PeerDelivery, PeerDeliveryReason, PeerDescriptor, PeerEvent,
     PeerEventSubscription, PeerKind, PeerMessage, PeerMessaging, PeerReceipt, PeerSender,
-    PeerState, PeerTrust, peer_event_from_frame, peer_list_response, peer_messaging,
-    peer_messaging_available, peer_name_response, peer_send_response,
+    PeerState, PeerTrust, peer_agent_injection_available, peer_event_from_frame,
+    peer_list_response, peer_messaging, peer_messaging_available, peer_name_response,
+    peer_notify_when_idle_response, peer_send_response,
 };
 pub use permission::{
     ComputerPermissionClientError, open_permission_settings, open_permission_settings_request,

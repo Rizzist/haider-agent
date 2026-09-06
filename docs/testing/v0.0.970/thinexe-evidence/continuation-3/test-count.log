@@ -1,0 +1,3 @@
+Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on
+/dev/disk3s1s1    233752  12062     20260    38%  458732 207468240    0%   /
+test-count: baseline updated to 5135

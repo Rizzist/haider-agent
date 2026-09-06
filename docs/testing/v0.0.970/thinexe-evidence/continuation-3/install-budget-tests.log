@@ -1,0 +1,9 @@
+test_budget_scales_with_member_count_and_bytes (scripts.tests.test_install_budget.InstallBudgetTests.test_budget_scales_with_member_count_and_bytes) ... ok
+test_linux_budget_includes_required_portal_bytes (scripts.tests.test_install_budget.InstallBudgetTests.test_linux_budget_includes_required_portal_bytes) ... ok
+test_shell_npm_and_qa_share_capacity_derived_fetch_budgets (scripts.tests.test_install_budget.InstallBudgetTests.test_shell_npm_and_qa_share_capacity_derived_fetch_budgets) ... ok
+test_watchdog_kills_nested_helper_and_preserves_diagnostics (scripts.tests.test_install_budget.InstallBudgetTests.test_watchdog_kills_nested_helper_and_preserves_diagnostics) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 1.480s
+
+OK

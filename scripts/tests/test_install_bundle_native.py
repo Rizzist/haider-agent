@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from scripts.tests.test_install_bundle import (
@@ -20,15 +22,35 @@ from scripts.tests.test_install_bundle import (
 
 sys.path.insert(0, str(ROOT / "scripts" / "qa-gate"))
 from gate.contract import VERSION_QUERY
+from gate.install_budget import install_budget, native_member_sizes
 
-# Preserve this suite's original whole-fixture watchdog. It covers local
-# archive extraction, copied/staged member verification, and publication.
-# This is not a sum of enforced inner deadlines: staging bounds subprocess
-# output bytes only. Even the six staged/installed version probes would get
-# 6 * VERSION_QUERY.seconds = 180 s using the shared per-probe allowance,
-# before hashing, copying, signatures, and offline self-test. A 120 s phase
-# derivation is therefore unproven; do not invent allocations or relax the cap.
-INSTALL_WATCHDOG_SECONDS = 120
+
+def run_owned_install(command, *, timeout, env=None, capture_output=True, text=True):
+    """A failed watchdog must reap its wrapper and all helper descendants."""
+    options = {"start_new_session": True} if os.name != "nt" else {
+        "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+    }
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=text, **options) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               capture_output=True, timeout=VERSION_QUERY.seconds, check=False)
+                process.kill()
+            else:
+                # Session was created by this harness, so this PGID authorizes
+                # only this invocation's wrapper, helper and spawned probes.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            stdout, stderr = process.communicate()
+            error.output = stdout
+            error.stderr = stderr
+            raise
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class NativeBundleInstallationTests(unittest.TestCase):
@@ -48,6 +70,8 @@ class NativeBundleInstallationTests(unittest.TestCase):
         result = subprocess.run([str(cls.binaries / ("haider" + cls.extension)), "--version"], capture_output=True, text=True, timeout=VERSION_QUERY.seconds, check=True)
         if not result.stdout.startswith("haider "):
             raise RuntimeError(f"unexpected native CLI version: {result.stdout!r}")
+        cls.install_budget = install_budget(native_member_sizes(cls.binaries, cls.extension))
+        print(f"native install BudgetSum={cls.install_budget.seconds:.6f}s bytes={native_member_sizes(cls.binaries, cls.extension)}", flush=True)
         cls.version = result.stdout.strip().removeprefix("haider ")
         cls.temporary = tempfile.TemporaryDirectory(prefix="haider-native-install-")
         cls.fixtures = Path(cls.temporary.name)
@@ -114,6 +138,18 @@ class NativeBundleInstallationTests(unittest.TestCase):
         if not self.windows and os.uname().sysname == "Linux":
             self.assertTrue((prefix / "haider-wayland-portal").is_file())
 
+    def watchdog(self, prefix):
+        old_bytes = sum(path.stat().st_size for path in prefix.glob("*")
+                        if path.is_file() and path.name in {name + self.extension for name in (*BINARIES, "haider-wayland-portal")})
+        return install_budget(native_member_sizes(self.binaries, self.extension), old_bytes=old_bytes)
+
+    def timed_install(self, label, command, **kwargs):
+        started = time.monotonic()
+        try:
+            return run_owned_install(command, **kwargs)
+        finally:
+            print(f"native install {label}: {time.monotonic() - started:.6f}s", flush=True)
+
     def npm_install(self, prefix, variant):
         code = r'''
 const fs = require('fs');
@@ -121,14 +157,14 @@ const path = require('path');
 const installer = require(process.argv[1]);
 installer.installArchive(fs.readFileSync(process.argv[2]), path.basename(process.argv[2]), process.argv[3]);
 '''
-        return subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js"), str(self.archives[variant]), str(prefix)], capture_output=True, text=True, timeout=INSTALL_WATCHDOG_SECONDS)
+        return self.timed_install("npm/" + variant, ["node", "-e", code, str(ROOT / "packaging/npm/install.js"), str(self.archives[variant]), str(prefix)], capture_output=True, text=True, timeout=self.watchdog(prefix).seconds)
 
     def direct_install(self, root, prefix, variant):
         artifact = self.archives[variant]
         if not self.windows:
             env = fake_download_environment(root, prefix, self.version)
             env["INSTALL_FIXTURE"] = str(artifact.parent)
-            return subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=INSTALL_WATCHDOG_SECONDS)
+            return self.timed_install("shell/" + variant, ["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=self.watchdog(prefix).seconds)
         wrapper = root / "fixture.ps1"
         wrapper.write_text(r'''
 $ErrorActionPreference = 'Stop'
@@ -145,7 +181,7 @@ try {
 }
 ''')
         env = dict(os.environ, INSTALL_FIXTURE=str(artifact.parent), INSTALL_SCRIPT=str(ROOT / "scripts/install.ps1"), HAIDER_INSTALL_DIR=str(prefix), HAIDER_VERSION=self.version, PROCESSOR_ARCHITECTURE="AMD64")
-        return subprocess.run(["pwsh", "-NoProfile", "-File", str(wrapper)], env=env, capture_output=True, text=True, timeout=INSTALL_WATCHDOG_SECONDS)
+        return self.timed_install("powershell/" + variant, ["pwsh", "-NoProfile", "-File", str(wrapper)], env=env, capture_output=True, text=True, timeout=self.watchdog(prefix).seconds)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ const XATTR: &str = "/usr/bin/xattr";
 #[cfg(target_os = "macos")]
 const CODESIGN: &str = "/usr/bin/codesign";
 
-pub trait StageVerifier {
+pub trait StageVerifier: Sync {
     fn remove_quarantine(&self, path: &Path) -> Result<(), UpdateError>;
     fn sign(&self, path: &Path) -> Result<(), UpdateError>;
     fn verify_signature(&self, path: &Path) -> Result<(), UpdateError>;
@@ -208,7 +208,7 @@ impl VerifiedStagedPair {
 
     /// Revalidates every member immediately before transaction entry.
     pub fn verify_immutable(&self) -> Result<(), UpdateError> {
-        for member in self.members() {
+        parallel_members(&self.members().collect::<Vec<_>>(), |member| {
             let path = self.path(member);
             let name = member.name();
             let metadata = fs::symlink_metadata(path)
@@ -227,38 +227,66 @@ impl VerifiedStagedPair {
                     "verified staged `{name}` digest changed before commit"
                 )));
             }
-        }
+            Ok(())
+        })?;
         Ok(())
     }
+}
+
+/// Only private, distinct member paths may be processed concurrently. Join all
+/// workers before propagating any error so staging cleanup cannot race a writer.
+/// Results retain publication order; transaction writes remain serial.
+fn parallel_members<T: Send>(
+    members: &[BundleMember],
+    operation: impl Fn(BundleMember) -> Result<T, UpdateError> + Sync,
+) -> Result<Vec<T>, UpdateError> {
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = members
+            .iter()
+            .map(|&member| {
+                let operation = &operation;
+                scope.spawn(move || operation(member))
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(UpdateError::Internal(
+                        "bundle verification worker panicked".into(),
+                    ))
+                })
+            })
+            .collect();
+        results.into_iter().collect()
+    })
 }
 
 fn freeze_binaries(
     directory: &Path,
     members: &[BundleMember],
 ) -> Result<Vec<StagedBinary>, UpdateError> {
-    let mut binaries: Vec<_> = members
-        .iter()
-        .map(|&member| StagedBinary {
-            member,
-            path: directory.join(member.file_name()),
-            digest: String::new(),
-        })
-        .collect();
-    for binary in &mut binaries {
+    let binaries = parallel_members(members, |member| {
+        let path = directory.join(member.file_name());
         // Hold a writable flush handle before setting the immutable/read-only
         // attribute; Windows FlushFileBuffers requires write access.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&binary.path)
+            .open(&path)
             .map_err(|error| UpdateError::io("open staged binary for durability", error))?;
-        haider_platform::set_mode(&binary.path, 0o500)
+        haider_platform::set_mode(&path, 0o500)
             .map_err(|error| UpdateError::io("protect staged binary", error))?;
         file.sync_all()
             .map_err(|error| UpdateError::io("fsync staged binary", error))?;
         drop(file);
-        binary.digest = sha256_file(&binary.path)?;
-    }
+        let digest = sha256_file(&path)?;
+        Ok(StagedBinary {
+            member,
+            path,
+            digest,
+        })
+    })?;
     sync_dir(directory)?;
     Ok(binaries)
 }
@@ -528,8 +556,7 @@ pub fn stage_directory_bundle(
         .into_iter()
         .filter(|member| *member != BundleMember::WaylandPortal || has_portal)
         .collect();
-    let mut source_manifest = String::new();
-    for &member in &members {
+    let source_entries = parallel_members(&members, |member| {
         let original = source.join(member.file_name());
         let metadata = fs::symlink_metadata(&original)
             .map_err(|error| UpdateError::io("inspect installer source executable", error))?;
@@ -555,11 +582,9 @@ pub fn stage_directory_bundle(
         }
         haider_platform::set_mode(&destination, 0o700)
             .map_err(|error| UpdateError::io("make directory stage executable", error))?;
-        use std::fmt::Write as _;
-        writeln!(&mut source_manifest, "{} {source_digest}", member.name()).map_err(|error| {
-            UpdateError::Internal(format!("encode directory source manifest: {error}"))
-        })?;
-    }
+        Ok(format!("{} {source_digest}\n", member.name()))
+    })?;
+    let source_manifest = source_entries.concat();
     let manifest = stage.path.join("directory-sources.sha256");
     create_private_file(&manifest)?;
     fs::write(&manifest, source_manifest.as_bytes())
@@ -594,15 +619,15 @@ fn verify_and_freeze<V: StageVerifier>(
 ) -> Result<Vec<StagedBinary>, UpdateError> {
     // Sign the entire bundle before any smoke: the CLI self-test can execute
     // the staged daemon sibling, so every dependency must already be verified.
-    for &member in members {
+    parallel_members(members, |member| {
         let binary = directory.join(member.file_name());
         verifier.remove_quarantine(&binary)?;
         verifier.sign(&binary)?;
-        verifier.verify_signature(&binary)?;
-    }
-    for &member in members {
-        verifier.smoke_binary(&directory.join(member.file_name()), member, version)?;
-    }
+        verifier.verify_signature(&binary)
+    })?;
+    parallel_members(members, |member| {
+        verifier.smoke_binary(&directory.join(member.file_name()), member, version)
+    })?;
     freeze_binaries(directory, members)
 }
 

@@ -1884,3 +1884,57 @@ fn has_entry(dir: &Path, prefix: &str) -> bool {
                 .is_some_and(|name| name.starts_with(prefix))
         })
 }
+
+struct AllSignaturesBeforeSmoke {
+    verified: AtomicUsize,
+    smoked: AtomicUsize,
+}
+
+impl StageVerifier for AllSignaturesBeforeSmoke {
+    fn remove_quarantine(&self, _path: &Path) -> Result<(), UpdateError> {
+        Ok(())
+    }
+
+    fn sign(&self, _path: &Path) -> Result<(), UpdateError> {
+        Ok(())
+    }
+
+    fn verify_signature(&self, _path: &Path) -> Result<(), UpdateError> {
+        self.verified.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn smoke_binary(
+        &self,
+        _path: &Path,
+        _member: BundleMember,
+        _target: &str,
+    ) -> Result<(), UpdateError> {
+        assert_eq!(self.verified.load(Ordering::SeqCst), BUNDLE_MEMBERS.len());
+        self.smoked.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Running each member's sign and smoke in one concurrent worker violates the
+/// dependency barrier: CLI smoke may execute a sibling still being signed.
+#[test]
+fn concurrent_staging_verifies_all_signatures_before_any_smoke() {
+    let install = install_fixture();
+    let (selection, mut transport) = selection_and_transport(
+        install.path(),
+        &expected_members("9.0.0", fixture_target()),
+        None,
+    );
+    let verifier = AllSignaturesBeforeSmoke {
+        verified: AtomicUsize::new(0),
+        smoked: AtomicUsize::new(0),
+    };
+    let bundle = stage_release(&mut transport, &verifier, install.path(), &selection)
+        .expect("complete signature barrier before smoke");
+    assert_eq!(verifier.smoked.load(Ordering::SeqCst), BUNDLE_MEMBERS.len());
+    assert_eq!(bundle.members().collect::<Vec<_>>(), BUNDLE_MEMBERS);
+    bundle
+        .verify_immutable()
+        .expect("all frozen member digests");
+}

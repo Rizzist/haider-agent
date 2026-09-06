@@ -158,7 +158,11 @@ fn every_headless_verb_never_executes_the_observable_payload() {
         vec!["graph", "--invalid"],
         vec!["export", "--invalid"],
         vec!["hooks", "invalid"],
-        vec!["peer", "invalid"],
+        vec!["peer", "list"],
+        vec!["peer", "send", "address", "message"],
+        vec!["peer", "name", "new-name"],
+        vec!["peer", "watch"],
+        vec!["peer", "wait-idle", "address"],
         vec!["ssh", "invalid"],
         vec!["ssh", "shell", "host", "--", "echo hi"],
         vec!["shell", "invalid"],
@@ -172,6 +176,15 @@ fn every_headless_verb_never_executes_the_observable_payload() {
             .args(&args)
             .output()
             .expect("headless output");
+        if args[0] == "peer" {
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("unknown or incomplete command `peer`"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("peer list"), "{stderr}");
+        }
         assert_ne!(output.status.code(), Some(37), "{args:?}");
         assert!(
             !String::from_utf8_lossy(&output.stdout).contains("payload-pid:"),

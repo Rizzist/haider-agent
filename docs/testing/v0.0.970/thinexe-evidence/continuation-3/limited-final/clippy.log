@@ -1,0 +1,6 @@
+Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on
+/dev/disk3s1s1    233752  12062     12922    49%  458732 132330800    0%   /
+    Checking haider-cli v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli)
+    Checking haider-tui-exe v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui-exe)
+    Checking haider-compat v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-compat)
+    Finished `dev` profile [unoptimized] target(s) in 15.10s

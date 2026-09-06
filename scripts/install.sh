@@ -15,15 +15,53 @@ fail() {
   exit 1
 }
 
-fetch() {
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: HaiderInstaller" "$1"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --header="Accept: application/vnd.github+json" --header="User-Agent: HaiderInstaller" "$1"
-  else
-    fail "curl or wget is required"
-  fi
-}
+# Registry #94: each attempt reserves connection setup plus resource capacity
+# at a conservative 1 MiB/s transfer floor. The archive capacity is the shared
+# updater's MAX_ARCHIVE_BYTES, checksum is MAX_CHECKSUM_BYTES. Two independent
+# attempts never inherit the overall install/member-verification watchdog.
+FETCH_ATTEMPTS=2
+FETCH_CONNECT_SECONDS=30
+FETCH_TRANSFER_BYTES_PER_SECOND=$((1024 * 1024))
+FETCH_ARCHIVE_BYTES=$((128 * 1024 * 1024))
+FETCH_CHECKSUM_BYTES=$((16 * 1024))
+FETCH_METADATA_BYTES=$((1024 * 1024))
+fetch() (
+  fetch_capacity=${2:-$FETCH_METADATA_BYTES}
+  FETCH_ATTEMPT_SECONDS=$((FETCH_CONNECT_SECONDS + (fetch_capacity + FETCH_TRANSFER_BYTES_PER_SECOND - 1) / FETCH_TRANSFER_BYTES_PER_SECOND))
+  fetch_tmp=$(mktemp "${TMPDIR:-/tmp}/haider-fetch.XXXXXX")
+  trap 'rm -f "$fetch_tmp"' 0
+  attempt=0
+  while [ "$attempt" -lt "$FETCH_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsSL --max-time "$FETCH_ATTEMPT_SECONDS" --connect-timeout "$FETCH_CONNECT_SECONDS" -H "Accept: application/vnd.github+json" -H "User-Agent: HaiderInstaller" "$1" > "$fetch_tmp"; then
+        cat "$fetch_tmp"
+        exit 0
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      # wget --timeout only bounds idle IO, not total wall time. A separate
+      # timer bounds the whole attempt, including a peer sending a slow trickle.
+      wget -qO- --tries=1 --timeout="$FETCH_ATTEMPT_SECONDS" --header="Accept: application/vnd.github+json" --header="User-Agent: HaiderInstaller" "$1" > "$fetch_tmp" &
+      fetch_pid=$!
+      (
+        sleep "$FETCH_ATTEMPT_SECONDS" &
+        sleep_pid=$!
+        trap 'kill "$sleep_pid" 2>/dev/null || :; wait "$sleep_pid" 2>/dev/null || :; exit' TERM INT
+        wait "$sleep_pid"
+        kill "$fetch_pid" 2>/dev/null || :
+      ) &
+      timer_pid=$!
+      result=0
+      wait "$fetch_pid" || result=$?
+      kill "$timer_pid" 2>/dev/null || :
+      wait "$timer_pid" 2>/dev/null || :
+      if [ "$result" -eq 0 ]; then cat "$fetch_tmp"; exit 0; fi
+    else
+      fail "curl or wget is required"
+    fi
+  done
+  fail "download failed after $FETCH_ATTEMPTS bounded attempts: $1"
+)
 
 checksum() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -106,8 +144,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "Downloading $ARTIFACT"
-fetch "$BASE_URL/$ARTIFACT" > "$TMP/$ARTIFACT"
-fetch "$BASE_URL/$ARTIFACT.sha256" > "$TMP/$ARTIFACT.sha256"
+# Independent resources can arrive concurrently; both must succeed before hash
+# validation, extraction, or execution. Always reap both before scratch cleanup.
+fetch "$BASE_URL/$ARTIFACT" "$FETCH_ARCHIVE_BYTES" > "$TMP/$ARTIFACT" &
+archive_pid=$!
+fetch "$BASE_URL/$ARTIFACT.sha256" "$FETCH_CHECKSUM_BYTES" > "$TMP/$ARTIFACT.sha256" &
+sidecar_pid=$!
+fetch_failed=0
+wait "$archive_pid" || fetch_failed=1
+wait "$sidecar_pid" || fetch_failed=1
+[ "$fetch_failed" -eq 0 ] || fail "archive or checksum download failed"
 
 EXPECTED=$(awk -v file="$ARTIFACT" '
   /^[[:space:]]*$/ { next }

@@ -15335,7 +15335,12 @@ impl AppModel {
                 };
                 self.projection.push_note(format!(
                     "  {} · {} · {} · {} · last seen {} — /peer {} <message>",
-                    peer.name, kind, peer.workspace, state, peer.last_seen, peer.id
+                    peer.name,
+                    kind,
+                    peer.workspace,
+                    state,
+                    peer.last_seen,
+                    peer.address()
                 ));
             }
         }

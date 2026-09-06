@@ -115,13 +115,13 @@ pub const ROUTE_REPLAY_EVENT_EXTENSION_KIND: &str = "haider.route_replay_event.v
 /// Frames one boundary-delivered peer message for the provider tail.
 ///
 /// The whole frame is deliberately a new user-role message because provider
-/// APIs do not have a peer role, but the protocol-owned rendering applies the
-/// exact trust label and makes clear that it is neither a user nor system
-/// instruction. Callers append this message at the next turn boundary; they
+/// APIs do not have an agent input role. The protocol-owned envelope carries
+/// the durable sender and fixed authority statement. Callers append this
+/// message at the next turn boundary; they
 /// must never splice it into an earlier history entry.
 #[must_use]
 pub fn peer_message_for_provider(message: &PeerMessage) -> Message {
-    Message::user_text(message.render_for_prompt())
+    Message::peer_input(message)
 }
 
 /// Appends a peer frame after the already-compiled conversation. This is the
@@ -2142,6 +2142,22 @@ impl HarnessHandle {
         self.deliver_mid_turn(text.into(), DeliveryMode::Steer)
     }
 
+    /// Queues an already-journaled peer steer at the ordinary request boundary.
+    /// Identity and provenance remain typed; peer text never becomes human input.
+    pub fn nudge_peer(&self, message: PeerMessage) -> Result<(), HaiderError> {
+        self.commands
+            .try_send(ActorCommand::PeerNudge {
+                input: Message::peer_input(&message),
+            })
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Busy,
+                    format!("session actor could not accept peer steer: {error}"),
+                    true,
+                )
+            })
+    }
+
     /// Queues user input for the next resolved tool-call boundary. The
     /// pending call is held before dispatch and the provider is re-prompted
     /// with this input so it can revise or confirm the call first.
@@ -2159,7 +2175,16 @@ impl HarnessHandle {
         text: impl Into<String>,
     ) -> Result<PromotedSteerReservation, HaiderError> {
         self.promoted_steers
-            .reserve(text.into(), self.commands.clone())
+            .reserve(Message::user_text(text.into()), self.commands.clone())
+    }
+
+    /// Reserves a peer queue promotion without losing its agent speaker.
+    pub fn reserve_promoted_peer_steer(
+        &self,
+        message: PeerMessage,
+    ) -> Result<PromotedSteerReservation, HaiderError> {
+        self.promoted_steers
+            .reserve(Message::peer_input(&message), self.commands.clone())
     }
 
     fn deliver_mid_turn(&self, text: String, mode: DeliveryMode) -> Result<(), HaiderError> {
@@ -2306,6 +2331,9 @@ enum ActorCommand {
         text: String,
         mode: DeliveryMode,
     },
+    PeerNudge {
+        input: Message,
+    },
     PromotedSteerWake {
         reservation_id: u64,
     },
@@ -2415,8 +2443,8 @@ struct PromotedSteerMailbox {
 struct PromotedSteerMailboxState {
     accepting: bool,
     next_id: u64,
-    reserved: HashMap<u64, String>,
-    committed: VecDeque<(u64, String)>,
+    reserved: HashMap<u64, Message>,
+    committed: VecDeque<(u64, Message)>,
 }
 
 impl PromotedSteerMailbox {
@@ -2442,7 +2470,7 @@ impl PromotedSteerMailbox {
 
     fn reserve(
         self: &Arc<Self>,
-        text: String,
+        text: Message,
         commands: mpsc::Sender<ActorCommand>,
     ) -> Result<PromotedSteerReservation, HaiderError> {
         let id = {
@@ -2495,7 +2523,7 @@ impl PromotedSteerMailbox {
         }
     }
 
-    fn take_committed(&self, id: u64) -> Option<String> {
+    fn take_committed(&self, id: u64) -> Option<Message> {
         let mut state = self.state();
         let position = state
             .committed
@@ -2504,7 +2532,7 @@ impl PromotedSteerMailbox {
         state.committed.remove(position).map(|(_, text)| text)
     }
 
-    fn drain_committed(&self) -> Vec<String> {
+    fn drain_committed(&self) -> Vec<Message> {
         self.state()
             .committed
             .drain(..)
@@ -2515,7 +2543,7 @@ impl PromotedSteerMailbox {
     /// Completes the terminal promotion fence without waiting when every
     /// reservation has already resolved. `None` means a caller must preserve
     /// any pending durable facts before awaiting [`Self::finish_boundary`].
-    fn try_finish_boundary(&self) -> Option<Vec<String>> {
+    fn try_finish_boundary(&self) -> Option<Vec<Message>> {
         let mut state = self.state();
         if !state.committed.is_empty() {
             return Some(state.committed.drain(..).map(|(_, text)| text).collect());
@@ -2527,7 +2555,7 @@ impl PromotedSteerMailbox {
         None
     }
 
-    async fn finish_boundary(&self) -> Vec<String> {
+    async fn finish_boundary(&self) -> Vec<Message> {
         loop {
             // Register before inspecting the reservation set so commit/drop
             // cannot land between the predicate and the wait.
@@ -2627,7 +2655,7 @@ pub struct HarnessActor {
     tree_head_initialized: bool,
     tree_head: Option<NodeId>,
     deferred_commands: VecDeque<ActorCommand>,
-    pending_nudges: Vec<String>,
+    pending_nudges: Vec<Message>,
     pending_subturns: Vec<String>,
     /// G1: the OPEN `todo_write` plan lifecycle. One `TurnItem::Plan` item id
     /// per lifecycle: the first write of a run Starts it, later writes emit
@@ -2974,7 +3002,7 @@ impl HarnessActor {
                         false,
                     )));
                 }
-                ActorCommand::Nudge { .. } => {
+                ActorCommand::Nudge { .. } | ActorCommand::PeerNudge { .. } => {
                     // The target turn crossed its terminal boundary before
                     // this command was observed. Durable run state wins; a
                     // stale nudge must not create a new logical turn.
@@ -3899,11 +3927,7 @@ impl HarnessActor {
                 previous_cache_request = Some(completed);
             }
             let newest_volatile_history_start = messages.len();
-            messages.extend(
-                std::mem::take(&mut self.pending_nudges)
-                    .into_iter()
-                    .map(Message::user_text),
-            );
+            messages.extend(std::mem::take(&mut self.pending_nudges));
             let request_projection_compacted = match self
                 .enforce_context_policy(
                     &run_id,
@@ -6820,7 +6844,7 @@ impl HarnessActor {
                                         .await;
                                 }
                             }
-                            messages.extend(promoted.into_iter().map(Message::user_text));
+                            messages.extend(promoted);
                             provider_attempt = 0;
                             thinking_pending = true;
                             replay.reset_for_next_request();
@@ -8664,7 +8688,9 @@ impl HarnessActor {
                     self.defer_submit_or_reject(command);
                 }
                 MenuWake::Command(
-                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                    command @ (ActorCommand::Nudge { .. }
+                    | ActorCommand::PeerNudge { .. }
+                    | ActorCommand::PromotedSteerWake { .. }),
                 ) => {
                     self.service_command_without_menu(command);
                 }
@@ -8771,7 +8797,9 @@ impl HarnessActor {
                     continue;
                 }
                 MenuWake::Command(
-                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                    command @ (ActorCommand::Nudge { .. }
+                    | ActorCommand::PeerNudge { .. }
+                    | ActorCommand::PromotedSteerWake { .. }),
                 ) => {
                     self.service_command_without_menu(command);
                     continue;
@@ -9395,7 +9423,9 @@ impl HarnessActor {
                     continue;
                 }
                 MenuWake::Command(
-                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                    command @ (ActorCommand::Nudge { .. }
+                    | ActorCommand::PeerNudge { .. }
+                    | ActorCommand::PromotedSteerWake { .. }),
                 ) => {
                     self.service_command_without_menu(command);
                     continue;
@@ -9627,7 +9657,9 @@ impl HarnessActor {
                     continue;
                 }
                 MenuWake::Command(
-                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                    command @ (ActorCommand::Nudge { .. }
+                    | ActorCommand::PeerNudge { .. }
+                    | ActorCommand::PromotedSteerWake { .. }),
                 ) => {
                     self.service_command_without_menu(command);
                     continue;
@@ -11580,7 +11612,8 @@ impl HarnessActor {
             ActorCommand::Nudge {
                 text,
                 mode: DeliveryMode::Steer,
-            } => self.pending_nudges.push(text),
+            } => self.pending_nudges.push(Message::user_text(text)),
+            ActorCommand::PeerNudge { input } => self.pending_nudges.push(input),
             ActorCommand::Nudge {
                 text,
                 mode: DeliveryMode::Subturn,

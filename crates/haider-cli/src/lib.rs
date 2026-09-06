@@ -10,7 +10,6 @@ pub(crate) mod hooks;
 pub(crate) mod lockdown;
 pub(crate) mod models;
 pub(crate) mod observe;
-pub(crate) mod peer;
 pub(crate) mod provider;
 pub(crate) mod run;
 pub(crate) mod session_config;
@@ -164,7 +163,6 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
         Command::Graph(rest) => graph::graph_command(rest).await,
         Command::Export(rest) => export::export_command(rest).await,
         Command::Hooks(rest) => hooks::hooks_command(rest).await,
-        Command::Peer(rest) => peer::peer_command(rest).await,
         Command::Ssh(rest) => ssh::ssh_command(rest).await,
         Command::Shell(rest) => shell_registry::shell_command(rest).await,
         Command::Update(rest) => update::update_command(rest).await,
@@ -223,7 +221,6 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
                  graph abandon <session-id> [why], \
                  export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
-                 peer list [--json], peer send <name> <message|->, peer name <new-name>, peer watch, \
                  update [--check], \
                  tui [--theme system|light|dark|desert|oasis] [--session <id>] [--no-update-check], tui --demo [--plain], \
                  import [codex|claude-code], [--session <id>] [--no-update-check], --ready)"

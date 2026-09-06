@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{
-    TEST_FRAME_LIMIT, account_source_transcript, provider_rebind_transcript, transcript,
-    turn_retract_transcript,
+    TEST_FRAME_LIMIT, account_source_transcript, peer_agent_injection_transcript,
+    provider_rebind_transcript, transcript, turn_retract_transcript,
 };
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_rpc::{
@@ -745,7 +745,9 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "monitor.register",
         "monitor.remove",
         "monitor.watch",
+        "peer.inject",
         "peer.list",
+        "peer.notify_when_idle",
         "peer.name",
         "peer.send",
         "provider.configure",
@@ -822,8 +824,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        134,
-        "126 pre-v0.0.970 methods plus four account source registry methods, monitor.mutate, provider rebind, custom model probes and turn.retract"
+        136,
+        "133 merged methods plus turn.retract and two peer injection methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -837,6 +839,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .into_iter()
         .chain(account_source_transcript())
         .chain(provider_rebind_transcript())
+        .chain(peer_agent_injection_transcript())
         .chain(turn_retract_transcript())
     {
         match frame {
@@ -862,8 +865,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     }
     assert_eq!(
         covered.len(),
-        66,
-        "60 pre-v0.0.970 request pairs plus four account source registry pairs, provider rebind and turn.retract"
+        68,
+        "65 merged request pairs plus turn.retract and two peer injection pairs"
     );
 
     let fixture: ContractMethodFixture = serde_json::from_str(
@@ -1527,7 +1530,7 @@ fn peer_messaging_methods_and_events_are_tail_appended() {
     assert!(
         message
             .render_for_prompt()
-            .contains("NOT A USER INSTRUCTION")
+            .ends_with(haider_protocol::peer::PEER_AUTHORITY_STATEMENT)
     );
     assert!(matches!(
         &frames[138],
@@ -6080,6 +6083,65 @@ fn customprov_models_probe_is_feature_gated_and_has_no_durable_or_secret_fields(
     assert_eq!(encoded["method"], "provider.models_probe");
     assert!(encoded.get("revision").is_none());
     assert!(encoded.get("secret").is_none());
+}
+
+/// New peer methods reuse Request/Response on both codecs and preserve the
+/// historical union fixture. Identity fields are additive and feature gated.
+#[test]
+fn peer_agent_injection_frames_are_golden_and_feature_gated() {
+    let frames = peer_agent_injection_transcript();
+    assert_eq!(
+        haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1,
+        "peer_agent_injection_v1"
+    );
+    let actual = frames
+        .iter()
+        .map(|frame| GoldenWireBytes {
+            ws_body: ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode peer WS"),
+            uds_stream_hex: bytes_to_hex(
+                &uds_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode peer UDS"),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/peer_agent_injection_wire.json");
+    if std::env::var("UPDATE_FIXTURES").is_ok() {
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&actual).expect("serialize peer fixture")
+            ),
+        )
+        .expect("write peer fixture");
+    }
+    let golden: Vec<GoldenWireBytes> = serde_json::from_str(
+        &std::fs::read_to_string(path).expect("generate peer fixture with UPDATE_FIXTURES=1"),
+    )
+    .expect("read peer fixture");
+    assert_eq!(actual, golden);
+    for (frame, wire) in frames.iter().zip(golden) {
+        assert_eq!(
+            ws_codec::decode(&wire.ws_body, TEST_FRAME_LIMIT).expect("decode peer WS"),
+            *frame
+        );
+        let mut decoder = uds_codec::Decoder::new(TEST_FRAME_LIMIT);
+        let decoded = decoder.push(&hex_to_bytes(&wire.uds_stream_hex));
+        assert!(decoded.error.is_none());
+        assert_eq!(decoded.frames, vec![frame.clone()]);
+        if let WireFrame::Request { body, .. } = frame {
+            assert_eq!(
+                body.additive_shape_feature(),
+                Some(haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1)
+            );
+        }
+    }
+    let legacy: haider_protocol::peer::PeerSender = serde_json::from_value(serde_json::json!({
+        "id":"sender", "name":"reviewer", "kind":"haider_session", "trust":"verified_haider"
+    }))
+    .expect("old sender remains readable");
+    assert_eq!(legacy.device_id, "");
+    assert_eq!(legacy.mode, "prompting");
 }
 
 #[test]

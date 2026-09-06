@@ -92,13 +92,16 @@ fn render_plain_impl(
                 ..
             } => {
                 out.push_str(&format!(
-                    "@ {sender}› · {sender_kind} · UNTRUSTED PEER INPUT\n"
+                    "@ {sender}› · agent · {sender_kind} · UNTRUSTED PEER INPUT\n"
                 ));
                 for line in text.split('\n') {
                     out.push_str("  ▏ ");
                     out.push_str(line);
                     out.push('\n');
                 }
+                out.push_str("    ");
+                out.push_str(haider_protocol::peer::PEER_AUTHORITY_STATEMENT);
+                out.push('\n');
                 if let Some(receipt) = receipt {
                     out.push_str("    receipt · ");
                     out.push_str(match receipt {

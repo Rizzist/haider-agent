@@ -98,6 +98,8 @@ enum ReplyPath {
     ItemSummary,
     DeltaText,
     NodeText,
+    PeerMessage,
+    AgentNodeMessage,
     ProviderOpaque(String),
 }
 
@@ -108,6 +110,8 @@ impl ReplyPath {
             Self::ItemSummary => &["item", "summary"],
             Self::DeltaText => &["delta", "text"],
             Self::NodeText => &["kind", "text"],
+            Self::PeerMessage => &["message"],
+            Self::AgentNodeMessage => &["kind", "message", "message"],
             Self::ProviderOpaque(_) => &[],
         }
     }
@@ -311,8 +315,12 @@ fn reply_leaf_mut(payload: &mut EventPayload) -> Option<(&mut ReplyText, ReplyPa
         }) => Some((text, ReplyPath::DeltaText)),
         EventPayload::NodeCommitted(node) => match &mut node.kind {
             NodeKind::AssistantCommit { text, .. } => Some((text, ReplyPath::NodeText)),
+            NodeKind::Agent { message } | NodeKind::PeerTurn { message } => {
+                Some((&mut message.message, ReplyPath::AgentNodeMessage))
+            }
             _ => None,
         },
+        EventPayload::PeerMessage(message) => Some((&mut message.message, ReplyPath::PeerMessage)),
         _ => None,
     }
 }
@@ -413,15 +421,16 @@ fn reply_path(value: &Value) -> Option<ReplyPath> {
             },
             _ => None,
         },
-        Some("node_committed")
-            if value
-                .get("kind")
-                .and_then(|kind| kind.get("kind"))
-                .and_then(Value::as_str)
-                == Some("assistant_commit") =>
+        Some("peer.message") => Some(ReplyPath::PeerMessage),
+        Some("node_committed") => match value
+            .get("kind")
+            .and_then(|kind| kind.get("kind"))
+            .and_then(Value::as_str)
         {
-            Some(ReplyPath::NodeText)
-        }
+            Some("assistant_commit") => Some(ReplyPath::NodeText),
+            Some("agent" | "peer_turn") => Some(ReplyPath::AgentNodeMessage),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -935,7 +944,42 @@ mod tests {
 
     fn reply_events(text: &ReplyText) -> Vec<(&'static str, EventPayload)> {
         let item_id = ItemId::new("item-1");
+        let peer = crate::peer::PeerMessage {
+            msg_id: "peer-1".into(),
+            from: crate::peer::PeerSender {
+                id: "sender".into(),
+                device_id: "device".into(),
+                name: "reviewer".into(),
+                kind: crate::peer::PeerKind::HaiderSession,
+                trust: crate::peer::PeerTrust::VerifiedHaider,
+                mode: "prompting".into(),
+            },
+            to: "target".into(),
+            message: text.clone(),
+            summary: None,
+            queued_at: 1,
+            expires_at: 0,
+        };
         vec![
+            ("peer_message", EventPayload::PeerMessage(peer.clone())),
+            (
+                "agent_node",
+                EventPayload::NodeCommitted(TreeNode {
+                    node: NodeId::new("agent-node"),
+                    parent: None,
+                    kind: NodeKind::Agent {
+                        message: peer.clone(),
+                    },
+                }),
+            ),
+            (
+                "legacy_peer_node",
+                EventPayload::NodeCommitted(TreeNode {
+                    node: NodeId::new("peer-node"),
+                    parent: None,
+                    kind: NodeKind::PeerTurn { message: peer },
+                }),
+            ),
             (
                 "delta_text",
                 EventPayload::Item(ItemEvent::Delta {

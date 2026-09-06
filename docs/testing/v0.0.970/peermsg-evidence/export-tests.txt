@@ -1,0 +1,29 @@
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 5.24s
+     Running tests/wc_export_tests.rs (/private/tmp/peermsg-target/debug/deps/wc_export_tests-e51874b3149b846c)
+
+running 22 tests
+test codex_pair_rolls_back_the_rollout_when_history_fails ... ok
+test codex_rollout_id_equals_filename_uuid ... ok
+test codex_tool_turn_emits_a_paired_call_and_output ... ok
+test json_renders_a_stable_public_schema ... ok
+test markdown_renders_from_a_fixture_journal ... ok
+test codex_export_is_deterministic ... ok
+test codex_session_meta_source_is_an_accepted_interactive_value ... ok
+test claude_code_slug_and_uuid_chain ... ok
+test masked_hides_identity ... ok
+test parse_defaults_to_markdown_and_reads_flags ... ok
+test opencode_refuses_a_missing_db ... ok
+test pipe_export_holds_the_line_law_and_is_append_only ... ok
+test replay_buffer_is_bounded ... ok
+test never_overwrites_an_existing_foreign_file ... ok
+test since_cursor_yields_the_exact_suffix ... ok
+test write_new_file_refuses_to_follow_a_symlink ... ok
+test agent_exports_preserve_replay_retraction_and_incremental_row_identity ... ok
+test agent_and_legacy_peer_exports_keep_one_framed_speaker_in_native_and_foreign_formats ... ok
+test opencode_requires_confirmation ... ok
+test opencode_inserts_and_reads_back ... ok
+test opencode_refuses_a_locked_db ... ok
+test opencode_refuses_a_session_collision ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

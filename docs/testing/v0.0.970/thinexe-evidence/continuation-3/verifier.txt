@@ -1,0 +1,4 @@
+Final independent source, installer manifest, budget, concurrency, documentation and evidence review complete. Native/T1 candidate and full workspace/Clippy gates PASS. Public v970 HTTP404 is explicitly retained as prepublication evidence. No protected OAuth edit, assertion relaxation, test removal or new platform skip.
+
+VERIFIER: findings=2 real=2 noise=0 — fixed npm redirect socket cleanup with regression coverage; corrected hash-pass, incumbent-byte and self-test budget accounting
+SHIP

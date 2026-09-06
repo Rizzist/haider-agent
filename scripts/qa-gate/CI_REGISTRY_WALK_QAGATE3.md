@@ -521,6 +521,31 @@ Both lane walks are retained verbatim below, ordered by first registry number.
   the lane gate summary. After the final CLI test build, another unchanged
   matrix pass is 52/52 with hashes matching the delivered artifacts.
 
+## v0.0.970 peermsg continuation — final merged gate
+
+Full class 1–102 applicability and evidence walk:
+[peermsg report](../../docs/testing/v0.0.970/peermsg.md#ci-error-registry-walk).
+
+- Wave `6c42fc02` was merged before the final gate; earlier retraction and
+  packaging additions are retained. The only new merge conflict was the
+  baseline, resolved by `xtask test-count --update`: 5,080 → 5,093.
+- Required full workspace tests with `--no-fail-fast`, workspace Clippy with
+  `--tests -- -D warnings`, formatting, repository guards, and locked sibling
+  prebuild pass under ENV LAW. Unsafe counts remain 189 / 20.
+- Provider-request golden regenerated through its test; instruct-pipe pin
+  remains 6,244 bytes (full prefix 20,770). Feature/method/pair pins: 119/136/68.
+- Actual approval mutation fails its wire-refusal assertion; restored code
+  passes. Missing peer queue projections and an invalid compaction fixture
+  order were fixed without weakening tests. Exports retain agent identity.
+- Migration explains legacy transcript replay, ignored pending `.q` files,
+  explicit resend, and mixed-version transport refusal. Linux/Windows are
+  by inspection; executed socket/subprocess coverage is macOS arm64.
+- Protected linked Git metadata prevented a direct lane commit. The isolated
+  verified bundle preserves wave ancestry and excludes investigation inputs,
+  temporary tools, and binaries. No push; adopt with a literal branch refspec.
+- Verifier totals: 15 findings, 13 real, 2 rejected with reasons documented in
+  the report. The final gate is independent of those inspection verdicts.
+
 ### v0.0.970 thinexe — thin control executable and sibling payload (HOLD-OUT)
 
 - #1–#18/#22/#29/#30/#33/#38/#49/#75/#76: one typed command grammar,
@@ -570,3 +595,39 @@ Both lane walks are retained verbatim below, ordered by first registry number.
   remaining acceptance blocker. The shared serde authority preserves historical
   error names, and the auto-spawn fixture warms all three sibling inodes before
   its unchanged limit and forbids nested Cargo builds.
+
+
+### v0.0.970 thinexe continuation 3 — installer watchdog
+
+- #94 corrected: the old native 120-second fixture literal interrupted a
+  progressing real install (175.241s, exit 0 without retries). Installer fixture
+  budgets now sum member-count, incoming/incumbent bytes, seven SHA passes,
+  I/O, signature, version and one staged self-test allowance. The policy
+  service rates are explicit harness assumptions, not fictional enforced
+  product deadlines. Independent member verification overlaps safely, with
+  all signatures checked before any smoke and all workers joined before
+  cleanup; durable publication remains serial. Fetch retries have separate
+  resource deadlines, discard partial bytes, and clean redirect sockets.
+- #76/#77: thin/payload/daemon remain in every current split installer and
+  post-pack gate; Linux's portal also contributes to the resource budget.
+  No identity, signature, digest, rollback/recovery assertion or platform
+  coverage was removed. Timeout cleanup regression runs on every platform;
+  native Linux/Windows execution is by inspection on this macOS host.
+- #20/#64: test-count regenerated to 5,135; rebuilt daemon remains above 10 MiB
+  (exact byte count and final gate results in continuation-3 evidence).
+- #95: no negotiated RPC wait was introduced by private file verification.
+- Repeated merge-forward fetch still returns 5468dec1; original resolved merge
+  files are preserved and the orchestrator owns staging/commit. Detailed
+  timings, initial and final attempts, and the final gate verdict are in
+  docs/testing/v0.0.970/thinexe.md and thinexe-evidence/continuation-3/.
+
+- Final thinexe continuation-3 gate: workspace 5,618 summed passes, zero
+  failures, 13 unchanged ignores in 694.906014792s; strict workspace/tests
+  Clippy PASS 15.292936958s. Complete ENV LAW plus RUST_TEST_THREADS=2 retains
+  every assertion while avoiding independent-test oversubscription. Initial
+  autospawn and subsequent protected-OAuth polling failures remain recorded;
+  no protected file or threshold changed. Native 5/5 PASS, 603.651s, shell
+  173.097302s and npm 169.278014s; candidate T1 paths 171.446399917s and pinned
+  previous-release upgrade 35.947909291s PASS, no watchdog hit. Public 970
+  unpublished-asset 404 remains explicitly separate. Source baseline 5,135;
+  1,057-file final source manifest unchanged; formatter/diff checks PASS.

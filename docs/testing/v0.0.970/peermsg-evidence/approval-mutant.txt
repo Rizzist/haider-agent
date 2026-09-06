@@ -1,0 +1,41 @@
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-protocol)
+   Compiling haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-platform)
+   Compiling haider-pdf v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-pdf)
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemon)
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-provider)
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-store)
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-rpc)
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-tools)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-core)
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-client)
+warning: unused import: `haider_provider::Provider`
+  --> crates/haider-daemon/src/peer_tests.rs:26:13
+   |
+26 |         use haider_provider::Provider as _;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `haider-daemon` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized] target(s) in 3m 05s
+     Running unittests src/lib.rs (/private/tmp/peermsg-target/debug/deps/haider_daemon-a28fe88b6e2f83d6)
+
+running 1 test
+
+thread 'peer_tests::peer_endpoint_refuses_approval_frames_and_notifies_idle_once' (40104613) panicked at crates/haider-daemon/src/peer_tests.rs:800:5:
+assertion failed: matches!(refusal, haider_rpc::WireFrame::Response
+    { body: ResponseBody::Error { code, message, retryable: false, .. }, .. }
+    if code == haider_rpc::ERROR_CODE_PEER_INVALID &&
+    message.contains("cannot approve"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test peer_tests::peer_endpoint_refuses_approval_frames_and_notifies_idle_once ... FAILED
+
+failures:
+
+failures:
+    peer_tests::peer_endpoint_refuses_approval_frames_and_notifies_idle_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1094 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `-p haider-daemon --lib`

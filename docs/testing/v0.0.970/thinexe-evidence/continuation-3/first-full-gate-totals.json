@@ -1,0 +1,8 @@
+{
+  "libtest_groups": 352,
+  "passes": 5614,
+  "failures": 1,
+  "ignored": 13,
+  "failed_target": "haider-cli autospawn_tests",
+  "assertion": "parent_exit_leaves_the_daemon_running: 1.12148275s >= unchanged950ms"
+}

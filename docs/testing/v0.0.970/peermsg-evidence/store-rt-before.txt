@@ -1,0 +1,19 @@
+   Compiling haider-protocol v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-protocol)
+   Compiling haider-platform v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-platform)
+   Compiling haider-pdf v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-pdf)
+   Compiling haider-daemon v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-daemon)
+   Compiling haider-accounts v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-provider)
+   Compiling haider-store v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-store)
+   Compiling haider-tools v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-tools)
+   Compiling haider-rpc v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-rpc)
+   Compiling haider-core v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-core)
+   Compiling haider-client v0.0.969 (/private/tmp/peermsg-baseline/crates/haider-client)
+    Finished `test` profile [unoptimized] target(s) in 2m 40s
+     Running unittests src/lib.rs (/private/tmp/peermsg-target/debug/deps/haider_daemon-a026225e55aa3ca6)
+
+running 1 test
+PEER_STORE_RT agents=3 quiet_ms=1200 quiet_rts=0 explicit_list_rts=19
+test session_hub::peer_store_rt_tests::peer_store_round_trip_baseline_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1097 filtered out; finished in 0.16s
