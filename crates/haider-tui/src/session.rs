@@ -368,6 +368,23 @@ impl SessionState {
                 // background too — the attached twin does the same, so a
                 // later checkout carries the decision chip and firings.
                 self.hook_facts.note_envelope(envelope);
+                // escretract: and so are the retraction facts, for the same
+                // reason. A first-response boundary that lands while this
+                // session is parked still closes ITS editing window, or a
+                // later checkout would offer a retraction the daemon has
+                // already refused; and a retraction that lands here still has
+                // to drop the prompt from THIS session's chooser, because
+                // nothing re-delivers the fact when the user comes back.
+                if envelope.agent_id.is_none()
+                    && !route_response_boundary(&mut self.projection, envelope)
+                    && let Some(fact) =
+                        haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                            &envelope.payload,
+                        )
+                {
+                    self.prompt_history
+                        .retain(|entry| entry.seq != Some(fact.prompt_seq));
+                }
                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
                     // The fork this session itself issued: the receipt is
                     // already in and armed activation — the JOURNAL fact is
@@ -830,6 +847,31 @@ pub fn route_permission_event(projection: &mut SessionProjection, envelope: &Raw
             projection.resolve_permission_card(&resolved.request_id);
         }
     }
+    true
+}
+
+/// escretract: record the daemon's committed FIRST-RESPONSE boundary.
+///
+/// The boundary rides a `render.ui == false` envelope — display state never
+/// moves for it — so this router is deliberately a COMMAND-STATE hook in the
+/// sense the branch registry and the hook-fact recorder already established:
+/// it runs for admitted-and-skipped envelopes alike, because the retraction
+/// window is turn-control truth, not a transcript row.
+///
+/// Returns whether the payload WAS the boundary. The raw-envelope hook may
+/// ignore it: the boundary is committed `render.ui == false`, so it is admitted
+/// as `Skip` and never reaches the decode chain that counts unknown payloads.
+/// The value is here for callers that DO route by it, and for tests.
+pub fn route_response_boundary(projection: &mut SessionProjection, envelope: &RawEnvelope) -> bool {
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("response_started")
+    {
+        return false;
+    }
+    projection.note_response_started();
     true
 }
 
