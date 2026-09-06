@@ -129,13 +129,27 @@ mod tests {
             .expect("writable install");
         let metadata = lock.metadata().expect("lock metadata");
         assert!(metadata.is_file());
+        assert!(haider_platform::metadata_is_current_user(&metadata));
         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
-        drop(lock);
         let exclusive = OpenOptions::new()
             .read(true)
             .write(true)
             .open(dir.path().join(".haider-update.lock"))
             .expect("updater open");
+        assert!(matches!(
+            exclusive.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        // Parallel daemon tests fork before their pre_exec descriptor sweep.
+        // CLOEXEC does not close a fork's inherited descriptor until exec;
+        // dropping our File alone need not release that shared flock yet.
+        // Keep a duplicate alive to exercise this lifetime deterministically,
+        // and explicitly unlock through the descriptor that took the lock.
+        let inherited = lock.try_clone().expect("inherited lock descriptor");
+        lock.unlock().expect("release launch lock synchronously");
+        drop(lock);
         exclusive.try_lock().expect("launch lock released");
+        exclusive.unlock().expect("release updater lock");
+        drop(inherited);
     }
 }

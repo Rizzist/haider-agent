@@ -15,7 +15,7 @@ pub fn run(thin: &[u8], payload: &[u8]) -> ExitCode {
         println!("haider {}", haider_cli::VERSION);
         return ExitCode::SUCCESS;
     }
-    let result = (|| {
+    let result = (|| -> io::Result<i32> {
         let executable = std::env::current_exe()?;
         let install_dir = executable
             .parent()
