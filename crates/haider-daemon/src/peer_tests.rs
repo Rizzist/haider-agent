@@ -8,9 +8,10 @@ use super::peer::{
     write_manifest_blocking,
 };
 use haider_protocol::peer::{
-    PEER_WIRE_VERSION, PeerDelivery, PeerDescriptor, PeerKind, PeerManifest, PeerMessage,
-    PeerReceipt, PeerSender, PeerState, PeerTrust,
+    PEER_WIRE_VERSION, PeerDelivery, PeerDescriptor, PeerKind, PeerManifest, PeerReceipt, PeerState,
 };
+#[cfg(unix)]
+use haider_protocol::peer::{PeerMessage, PeerSender, PeerTrust};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
