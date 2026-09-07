@@ -107,10 +107,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_RUN_ID: ${{ needs.ship-gate-evidence.outputs.artifact_run_id }}
           GATE_REUSED: ${{ needs.ship-gate-evidence.outputs.satisfied }}
+          CALL_ARTIFACT_RUN_ID: ${{ needs.ship-gate-run.outputs.artifact_run_id }}
         run: |
           # A reusable workflow uploads into this caller's run. A reused verdict
           # may outlive its artifact; only that absence permits local compilation.
-          if [ "$GATE_REUSED" != true ]; then ARTIFACT_RUN_ID="$GITHUB_RUN_ID"; fi
+          if [ "$GATE_REUSED" != true ]; then ARTIFACT_RUN_ID="$CALL_ARTIFACT_RUN_ID"; fi
           if [ -n "$ARTIFACT_RUN_ID" ]; then
             python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA" \
               --artifact "release-build-aarch64-apple-darwin-$GITHUB_SHA" \

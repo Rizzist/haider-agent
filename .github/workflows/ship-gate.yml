@@ -1,19 +1,23 @@
 name: ship-gate
 on:
   workflow_call:
+    outputs:
+      artifact_run_id:
+        description: Run holding the exact-SHA unsigned macOS release artifact
+        value: ${{ jobs.verdict.outputs.artifact_run_id }}
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [wave-*, main]
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  # Static workflow name avoids sharing the caller's group when release.yml
-  # invokes this reusable workflow.
-  group: ship-gate-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+  # Serialize the same candidate across wave/main/reusable calls, then reuse
+  # completed evidence. Never cancel the measurement that a tag is waiting on.
+  group: ship-gate-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,7 +25,24 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+  reuse:
+    name: completed ship-gate evidence for this SHA
+    runs-on: ubuntu-latest
+    outputs:
+      satisfied: ${{ steps.lookup.outputs.satisfied }}
+      artifact_run_id: ${{ steps.lookup.outputs.artifact_run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA"
+          --artifact "release-build-aarch64-apple-darwin-$GITHUB_SHA"
+
   evidence:
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
     name: exact-SHA cross-platform and CI evidence
     runs-on: ubuntu-latest
     # 2 workflows * 120 polls * 60 s = 240 min, plus 5 min setup/API margin.
@@ -38,7 +59,8 @@ jobs:
         run: bash scripts/release/require-evidence.sh "$EVIDENCE_SHA"
 
   build-macos-release:
-    needs: evidence
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
     name: shared macOS release build (aarch64)
     runs-on: macos-15
     steps:
@@ -65,7 +87,8 @@ jobs:
           retention-days: 14
 
   behaviour:
-    needs: evidence
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
     name: probe ladder (demo + live, CI profile)
     runs-on: macos-15
     steps:
@@ -91,7 +114,8 @@ jobs:
               "$GITHUB_WORKSPACE/target/ci/haiderd"
 
   render-benchmark:
-    needs: evidence
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
     name: render benchmark (true release profile)
     runs-on: macos-15
     steps:
@@ -228,3 +252,28 @@ jobs:
           path: ${{ runner.temp }}/client-footprint
           if-no-files-found: error
           retention-days: 90
+
+  verdict:
+    name: verdict
+    if: always()
+    needs: [reuse, evidence, build-macos-release, behaviour, render-benchmark, daemon-footprint, client-footprint]
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_run_id: ${{ steps.verdict.outputs.artifact_run_id }}
+    steps:
+      - name: require every gate or completed exact-SHA reuse
+        id: verdict
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          REUSED: ${{ needs.reuse.outputs.satisfied }}
+          ARTIFACT_RUN_ID: ${{ needs.reuse.outputs.artifact_run_id }}
+        run: |
+          if [ "$REUSED" = true ]; then
+            jq -e '.reuse.result == "success"' <<< "$RESULTS"
+          else
+            # Skipped/cancelled dependencies are failures too. The existing
+            # client job retains its documented registry-#80 advisory policy.
+            jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+            ARTIFACT_RUN_ID="$GITHUB_RUN_ID"
+          fi
+          echo "artifact_run_id=$ARTIFACT_RUN_ID" >> "$GITHUB_OUTPUT"
