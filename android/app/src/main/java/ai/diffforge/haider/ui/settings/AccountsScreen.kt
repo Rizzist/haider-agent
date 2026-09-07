@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -62,10 +63,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -698,6 +701,7 @@ private fun LabelledField(
 ) {
     val colors = Forge.colors
     val type = Forge.type
+    val focus = LocalFocusManager.current
     Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs)) {
         // Sentence case: uppercase tracked labels are the drawer's alone
         // (addition F, G2).
@@ -723,9 +727,13 @@ private fun LabelledField(
                 } else {
                     VisualTransformation.None
                 },
+                // A single-line field with no Done action left the keyboard up
+                // with nothing to dismiss it but the back gesture.
                 keyboardOptions = KeyboardOptions(
                     keyboardType = if (masked) KeyboardType.Password else KeyboardType.Text,
+                    imeAction = ImeAction.Done,
                 ),
+                keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
                 modifier = Modifier
                     .weight(1f)
                     .padding(vertical = ForgeSpace.md)

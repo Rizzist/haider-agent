@@ -17,7 +17,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -52,21 +51,26 @@ fun ForgeButton(
 ) {
     val colors = Forge.colors
     val type = Forge.type
+    // Disabled state is expressed in the COLOURS, not with Modifier.alpha.
+    // The alpha modifier introduces a graphics layer, and on both emulators the
+    // Save button lost its fill entirely across an enabled/keyboard transition
+    // — a filled accent button that paints as nothing is worse than a dim one.
+    val dim = if (enabled) 1f else DISABLED_ALPHA
     val fill = when (kind) {
-        ForgeButtonKind.Filled -> colors.accent
-        ForgeButtonKind.Ghost -> colors.surfaceControl
-        ForgeButtonKind.Destructive -> colors.red.copy(alpha = 0.16f)
+        ForgeButtonKind.Filled -> colors.accent.copy(alpha = dim)
+        ForgeButtonKind.Ghost -> colors.surfaceControl.copy(alpha = dim)
+        ForgeButtonKind.Destructive -> colors.red.copy(alpha = 0.16f * dim)
     }
     val ink = when (kind) {
         ForgeButtonKind.Filled -> colors.accentInk
         ForgeButtonKind.Ghost -> colors.textSoft
         ForgeButtonKind.Destructive -> colors.red
-    }
+    }.copy(alpha = if (enabled) 1f else 0.7f)
     val outline = when (kind) {
         ForgeButtonKind.Filled -> colors.accent
         ForgeButtonKind.Ghost -> colors.borderStrong
         ForgeButtonKind.Destructive -> colors.red.copy(alpha = 0.55f)
-    }
+    }.copy(alpha = dim)
     Box(
         modifier = modifier
             .defaultMinSize(minWidth = ForgeSize.touch, minHeight = ForgeSize.touch)
@@ -87,7 +91,6 @@ fun ForgeButton(
                 .clip(ForgeShapes.pill)
                 .background(fill)
                 .border(ForgeSize.hairline, outline, ForgeShapes.pill)
-                .alpha(if (enabled) 1f else DISABLED_ALPHA)
                 .padding(horizontal = ForgeSpace.xl),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm, Alignment.CenterHorizontally),
