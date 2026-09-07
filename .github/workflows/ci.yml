@@ -54,6 +54,8 @@ jobs:
         run: python3 -m unittest scripts/tests/test_release_packaging.py
       - name: release evidence policy regression tests
         run: bash scripts/release/tests/require-evidence-test.sh
+      - name: pipeline reuse, artifact integrity and shard regression tests
+        run: python3 -m unittest scripts/tests/test_find_evidence.py scripts/tests/test_macos_build_artifact.py scripts/tests/test_ci_test_shards.py
       - name: self-test
         env:
           # The CLI dispatches its offline actor self-test to the daemon and
