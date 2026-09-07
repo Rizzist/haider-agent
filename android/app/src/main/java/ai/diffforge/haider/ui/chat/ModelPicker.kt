@@ -1,6 +1,9 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.components.ForgeButton
+import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
@@ -38,18 +41,25 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+
+/** Test handle for the refusal panel. */
+const val MODEL_REFUSAL_TAG = "model_refusal"
 
 @Composable
 fun ModelPicker(
     config: SessionConfig?,
     error: String?,
     busy: Boolean,
+    refusal: SelectionRefusal?,
     onSelectModel: (String, String) -> Unit,
     onSelectEffort: (String?) -> Unit,
+    onConfirmRefused: () -> Unit,
+    onDismissRefusal: () -> Unit,
     onRefresh: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -95,6 +105,30 @@ fun ModelPicker(
 
             val pendingSelection = pending
             when {
+                // What the daemon said, with the only button that may set
+                // confirm_new_epoch (lane 971-3 handoff).
+                refusal != null -> Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(ForgeSpace.xxl)
+                        .testTag(MODEL_REFUSAL_TAG),
+                    verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+                ) {
+                    Text("The daemon refused that change", style = type.h4, color = colors.text)
+                    Text(refusal.code, style = type.sessionMeta, color = colors.amber)
+                    Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+                        ForgeButton(
+                            text = "Change it anyway",
+                            onClick = onConfirmRefused,
+                            kind = ForgeButtonKind.Filled,
+                        )
+                        ForgeButton(
+                            text = "Keep the current one",
+                            onClick = onDismissRefusal,
+                            kind = ForgeButtonKind.Ghost,
+                        )
+                    }
+                }
                 pendingSelection != null -> CacheChangeConfirmation(
                     selection = pendingSelection,
                     onConfirm = {

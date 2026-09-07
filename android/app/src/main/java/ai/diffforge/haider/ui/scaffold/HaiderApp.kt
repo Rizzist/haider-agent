@@ -465,8 +465,11 @@ private fun Overlays(
             config = state.models,
             error = state.catalogError,
             busy = state.selectionBusy,
-            onSelectModel = viewModel::selectModel,
-            onSelectEffort = viewModel::selectEffort,
+            refusal = state.selectionRefusal,
+            onSelectModel = { provider, model -> viewModel.selectModel(provider, model) },
+            onSelectEffort = { viewModel.selectEffort(it) },
+            onConfirmRefused = viewModel::confirmRefusedSelection,
+            onDismissRefusal = viewModel::dismissSelectionRefusal,
             onRefresh = { viewModel.refreshModels() },
             onDismiss = viewModel::closeOverlay,
         )

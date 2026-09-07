@@ -118,6 +118,7 @@ class AccountsScreenTest {
         rule.onNodeWithText("Save").performClick()
         rule.waitForIdle()
         assertEquals(before, repository.snapshot.value.accounts.size)
+        // Save is what validates now, so a short key is refused there.
         rule.onNodeWithText("invalid_api_key").assertIsDisplayed()
     }
 

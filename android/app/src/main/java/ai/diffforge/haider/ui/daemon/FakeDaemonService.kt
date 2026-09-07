@@ -9,6 +9,8 @@ import ai.diffforge.haider.ui.chat.Message
 import ai.diffforge.haider.ui.chat.Role
 import ai.diffforge.haider.ui.chat.ToolCall
 import ai.diffforge.haider.ui.chat.ToolStatus
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -403,7 +405,9 @@ class FakeDaemonService(
         }
     }
 
-    override suspend fun selectModel(provider: String, model: String) {
+    override suspend fun selectModel(provider: String, model: String, confirmNewEpoch: Boolean) {
+        if (confirmNewEpoch) confirmedSelections++
+        nextSelectionFailure?.let { nextSelectionFailure = null; throw IllegalStateException(it) }
         calls += "selectModel:$provider/$model"
         val current = _models.value ?: return
         // The daemon re-derives effort when the model changes: an effort the
@@ -420,7 +424,9 @@ class FakeDaemonService(
         )
     }
 
-    override suspend fun selectEffort(effort: String?) {
+    override suspend fun selectEffort(effort: String?, confirmNewEpoch: Boolean) {
+        if (confirmNewEpoch) confirmedSelections++
+        nextSelectionFailure?.let { nextSelectionFailure = null; throw IllegalStateException(it) }
         val current = _models.value ?: return
         // The daemon refuses an unsupported effort; so does the fake, or the
         // UI would look correct against a catalog that would reject it.
@@ -482,6 +488,30 @@ class FakeDaemonService(
             }
         }
     }
+
+    /**
+     * True only because this fake installs an authoritative fixture and knows
+     * it. A real facade has to hydrate first (lane 971-3 handoff).
+     */
+    private val _rosterReady = MutableStateFlow(true)
+    override val rosterReady: StateFlow<Boolean> = _rosterReady.asStateFlow()
+
+    /** Set to make the next selection refuse, the way the daemon can. */
+    private var nextSelectionFailure: String? = null
+
+    /** How many selections carried the user's explicit confirmation. */
+    var confirmedSelections = 0
+        private set
+
+    fun failNextSelection(code: String) {
+        nextSelectionFailure = code
+    }
+
+    /** Overridable so a live scenario can push folded updates into a test. */
+    var transcriptStream: ((String) -> Flow<TranscriptLoad>)? = null
+
+    override fun transcriptUpdates(sessionId: String): Flow<TranscriptLoad> =
+        transcriptStream?.invoke(sessionId) ?: flow { emit(transcript(sessionId)) }
 
     override suspend fun transcript(sessionId: String): TranscriptLoad {
         calls += "session.attach:$sessionId"

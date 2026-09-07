@@ -19,17 +19,28 @@ import kotlinx.coroutines.flow.StateFlow
  * a snapshot, saved state or search index, and never rendered back.
  */
 
-enum class AuthKind { ApiKey, OAuth }
+/**
+ * [Unknown] is a real answer. The frozen descriptor does not always say how an
+ * account authenticates, and the old parser filled that silence with ApiKey —
+ * a guess the UI then presented as fact (lane 971-3 handoff, UI-12).
+ */
+enum class AuthKind { ApiKey, OAuth, Unknown }
 
-/** Authorization-code providers use the loopback capture; device flows do not. */
-enum class OAuthStyle { AuthorizationCode, Device }
+/**
+ * Authorization-code providers use the loopback capture; device flows do not.
+ *
+ * `ProviderSummaryWire` carries no `oauth_style`, so [Unknown] is the honest
+ * default: the returned authorization URL is the correct destination for both
+ * styles, and nothing else about the flow may be invented.
+ */
+enum class OAuthStyle { AuthorizationCode, Device, Unknown }
 
 data class ProviderDescriptor(
     val id: String,
     val label: String,
     val supportsApiKey: Boolean,
     val supportsOAuth: Boolean,
-    val oauthStyle: OAuthStyle = OAuthStyle.AuthorizationCode,
+    val oauthStyle: OAuthStyle = OAuthStyle.Unknown,
     val available: Boolean = true,
     val unavailableReason: String? = null,
     /** `ProviderSummaryWire.models`; the composer's model picker reads these. */
@@ -58,8 +69,13 @@ data class Account(
     val status: String,
 )
 
+/**
+ * [revision] is null when the daemon did not state one. Absent is not zero: a
+ * missing revision compared equal to a real first revision and made a stale
+ * snapshot look current (lane 971-3 handoff, UI-12).
+ */
 data class AccountsSnapshot(
-    val revision: Long,
+    val revision: Long?,
     val accounts: List<Account>,
 )
 
@@ -76,7 +92,15 @@ sealed interface OAuthFlow {
         /** Device flows only. */
         val userCode: String?,
         val expiresAtMs: Long?,
-    ) : OAuthFlow
+    ) : OAuthFlow {
+        /**
+         * The authorization URL is a one-use capability. A default data-class
+         * toString drops it into any log line, crash report or debugger view
+         * that happens to print the object (lane 971-3 handoff, UI-12).
+         */
+        override fun toString(): String =
+            "OAuthFlow.Started(provider=$provider, alias=$alias, style=$style, redacted)"
+    }
 
     data class Unavailable(val provider: String, val reason: String?) : OAuthFlow
 }
@@ -89,7 +113,10 @@ sealed interface OAuthStatus {
     data object Exchanging : OAuthStatus
 
     /** The only state that yields the opaque reference `account.add` takes. */
-    data class Ready(val oauthReference: String, val identity: String?) : OAuthStatus
+    data class Ready(val oauthReference: String, val identity: String?) : OAuthStatus {
+        /** The reference is a bearer capability; it is never printed. */
+        override fun toString(): String = "OAuthStatus.Ready(redacted)"
+    }
 
     data class Failed(val publicCode: String?, val terminalKind: String) : OAuthStatus
 
@@ -135,6 +162,14 @@ interface AccountsRepository {
     ): AccountResult
 
     /** Stages and validates without committing, for the field's inline check. */
+    /**
+     * Always `Failed("validate_only_unavailable")`.
+     *
+     * The frozen wire validates as part of `account.login_api`, which also
+     * commits. There is no validation-only door, and the round-4 interface
+     * promised one — so this states the refusal rather than letting a caller
+     * believe a key was checked (lane 971-3 handoff, UI-14).
+     */
     suspend fun validateApiKey(provider: String, apiKey: CharArray): AccountResult
 
     /** `provider.list`, the inventory both the pickers and this screen read. */

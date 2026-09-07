@@ -210,12 +210,17 @@ object AccountsRpcAdapter {
             ProviderDescriptor(
                 id = id,
                 label = item.optStringOrNull("label") ?: id,
-                supportsApiKey = methods.isEmpty() || methods.contains(AUTH_METHOD_API_KEY),
+                // An empty auth_methods list is silence, not consent: it used
+                // to be read as "API key supported" (lane 971-3, UI-12).
+                supportsApiKey = methods.contains(AUTH_METHOD_API_KEY),
                 supportsOAuth = methods.contains(AUTH_METHOD_OAUTH),
-                oauthStyle = if (item.optString("oauth_style") == "device") {
-                    OAuthStyle.Device
-                } else {
-                    OAuthStyle.AuthorizationCode
+                // ProviderSummaryWire carries no oauth_style. The returned
+                // authorization URL is the right destination for both styles,
+                // so the style stays Unknown rather than being guessed.
+                oauthStyle = when (item.optStringOrNull("oauth_style")) {
+                    "device" -> OAuthStyle.Device
+                    "authorization_code" -> OAuthStyle.AuthorizationCode
+                    else -> OAuthStyle.Unknown
                 },
                 available = availability == "available" && item.optBoolean("enabled", true),
                 unavailableReason = item.optStringOrNull("availability_reason"),
@@ -238,10 +243,13 @@ object AccountsRpcAdapter {
                 alias = item.getString("alias"),
                 provider = item.getString("provider"),
                 label = item.optStringOrNull("label"),
-                authKind = if (item.optString("auth_method") == AUTH_METHOD_OAUTH) {
-                    AuthKind.OAuth
-                } else {
-                    AuthKind.ApiKey
+                // An absent or unrecognised auth_method is Unknown. Mapping it
+                // to ApiKey made the row claim a fact the daemon never sent
+                // (lane 971-3 handoff, UI-12).
+                authKind = when (item.optStringOrNull("auth_method")) {
+                    AUTH_METHOD_OAUTH -> AuthKind.OAuth
+                    AUTH_METHOD_API_KEY -> AuthKind.ApiKey
+                    else -> AuthKind.Unknown
                 },
                 active = item.optBoolean("active", false),
                 identity = item.optStringOrNull("identity"),
@@ -250,8 +258,10 @@ object AccountsRpcAdapter {
             )
         }
         return AccountsSnapshot(
-            // Older daemons omit the revision; absent is 0, never a lie.
-            revision = if (body.isNull("revision")) 0L else body.optLong("revision", 0L),
+            // Absent is null, not zero. Zero is a value a daemon can send,
+            // and collapsing the two made a snapshot that stated no revision
+            // compare equal to one that stated the first (971-3, UI-12).
+            revision = if (body.isNull("revision")) null else body.optLong("revision"),
             accounts = accounts,
         )
     }

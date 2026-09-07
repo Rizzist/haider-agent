@@ -112,7 +112,7 @@ class DeviceRegressionTest {
     }
 
     @Test
-    fun `validating consumes the key instead of leaving it in the field`() {
+    fun `saving consumes the key instead of leaving it in the field`() {
         accounts()
         rule.onNodeWithText("Add account").performClick()
         rule.waitForIdle()
@@ -120,13 +120,15 @@ class DeviceRegressionTest {
         rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
-        rule.onNodeWithText("Validate").performClick()
+        rule.onNodeWithText("Save").performClick()
         rule.waitForIdle()
-        // "Key validated" used to leave the masked key sitting there.
-        rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).assertTextEquals("")
-        rule.onNodeWithText("Key validated.").assertExists()
-        // It was staged, so Save has something to commit without the plaintext.
-        assertTrue(repository.calls.contains("vault.stage"))
+        // Staged first, then committed from that reference: the plaintext is
+        // sent once, and there is no validate-only call between them
+        // (lane 971-3, UI-14). A successful save closes the form, which is why
+        // the field is gone rather than merely empty.
+        assertEquals(1, repository.calls.count { it == "vault.stage" })
+        assertTrue(repository.calls.contains("account.login_api"))
+        assertTrue(repository.snapshot.value.accounts.any { it.provider == "openai" })
     }
 
     @Test
@@ -138,8 +140,6 @@ class DeviceRegressionTest {
         rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
-        rule.onNodeWithText("Validate").performClick()
-        rule.waitForIdle()
         rule.onNodeWithText("Save").performClick()
         rule.waitForIdle()
         assertTrue(repository.calls.contains("account.login_api"))
@@ -149,7 +149,7 @@ class DeviceRegressionTest {
     }
 
     @Test
-    fun `cancelling after validation discards the staged reference`() {
+    fun `cancelling before saving discards the key`() {
         accounts()
         rule.onNodeWithText("Add account").performClick()
         rule.waitForIdle()
@@ -157,8 +157,6 @@ class DeviceRegressionTest {
         rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
-        rule.onNodeWithText("Validate").performClick()
-        rule.waitForIdle()
         rule.onNodeWithText("Cancel").performClick()
         rule.waitForIdle()
         assertFalse(repository.calls.contains("account.login_api"))

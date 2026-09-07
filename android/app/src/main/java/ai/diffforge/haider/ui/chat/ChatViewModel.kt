@@ -11,6 +11,7 @@ import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.state.PermissionSnapshot
 import ai.diffforge.haider.ui.state.SessionFilter
+import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.state.SessionListState
 import ai.diffforge.haider.ui.state.SetupPlan
 import androidx.lifecycle.ViewModel
@@ -21,6 +22,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 
 /**
@@ -46,6 +51,13 @@ class ChatViewModel(
     private var batterySkipped = false
     private var searchJob: Job? = null
     private var commandSeq = 0L
+
+    /**
+     * Declared before `init`, because the status collector below can call
+     * [ensureActiveSession] during construction — a mutex declared after it is
+     * still null when the first Running arrives.
+     */
+    private val creationGate = Mutex()
 
     init {
         viewModelScope.launch {
@@ -84,9 +96,17 @@ class ChatViewModel(
             service.paging.collect { paging -> update { it.copy(paging = paging) } }
         }
         viewModelScope.launch {
-            service.activeSessionId.collect { id ->
+            // collectLatest: switching sessions cancels the previous session's
+            // stream rather than folding two transcripts into one screen.
+            service.activeSessionId.collectLatest { id ->
                 update { it.copy(activeSessionId = id, draft = drafts[id].orEmpty()) }
-                if (id != null) loadTranscript(id)
+                if (id == null) return@collectLatest
+                update { it.copy(transcriptLoading = true) }
+                // The stream performs the initial load itself and then emits
+                // each folded push. Round 6 called the one-shot transcript()
+                // and only reloaded after explicit actions, so assistant output
+                // that arrived on its own never reached the screen.
+                service.transcriptUpdates(id).collect { load -> applyTranscript(id, load) }
             }
         }
         viewModelScope.launch {
@@ -273,19 +293,67 @@ class ChatViewModel(
 
     // ---------- model catalog ----------
 
-    fun selectModel(provider: String, model: String) = viewModelScope.launch {
-        // The chip's deadline anchors on whatever is in flight, so a selection
-        // that never returns expires exactly like a catalog that never arrives.
-        update { it.copy(selectionBusy = true, catalogRequestedAtMs = clock()) }
-        runCatching { service.selectModel(provider, model) }
-        update { it.copy(selectionBusy = false) }
+    fun selectModel(provider: String, model: String, confirmNewEpoch: Boolean = false) =
+        viewModelScope.launch {
+            // The chip's deadline anchors on whatever is in flight, so a
+            // selection that never returns expires exactly like a catalog that
+            // never arrives.
+            update {
+                it.copy(
+                    selectionBusy = true,
+                    catalogRequestedAtMs = clock(),
+                    selectionRefusal = null,
+                )
+            }
+            // The refusal is rendered, not swallowed: runCatching used to drop
+            // it and the chip then showed a model the daemon had not accepted.
+            val failure = runCatching { service.selectModel(provider, model, confirmNewEpoch) }
+                .exceptionOrNull()
+            update {
+                it.copy(
+                    selectionBusy = false,
+                    selectionRefusal = failure?.let { error ->
+                        SelectionRefusal(
+                            code = error.message ?: "selection_refused",
+                            provider = provider,
+                            model = model,
+                        )
+                    },
+                )
+            }
+        }
+
+    fun selectEffort(effort: String?, confirmNewEpoch: Boolean = false) = viewModelScope.launch {
+        update {
+            it.copy(selectionBusy = true, catalogRequestedAtMs = clock(), selectionRefusal = null)
+        }
+        val failure = runCatching { service.selectEffort(effort, confirmNewEpoch) }.exceptionOrNull()
+        update {
+            it.copy(
+                selectionBusy = false,
+                selectionRefusal = failure?.let { error ->
+                    SelectionRefusal(code = error.message ?: "selection_refused", effort = effort)
+                },
+            )
+        }
     }
 
-    fun selectEffort(effort: String?) = viewModelScope.launch {
-        update { it.copy(selectionBusy = true, catalogRequestedAtMs = clock()) }
-        runCatching { service.selectEffort(effort) }
-        update { it.copy(selectionBusy = false) }
+    /**
+     * Retry the refused selection *with* the user's confirmation.
+     *
+     * Only this path may set `confirm_new_epoch`, and only because somebody
+     * pressed the button that calls it (lane 971-3 handoff).
+     */
+    fun confirmRefusedSelection() {
+        val refusal = _state.value.selectionRefusal ?: return
+        when {
+            refusal.model != null && refusal.provider != null ->
+                selectModel(refusal.provider, refusal.model, confirmNewEpoch = true)
+            else -> selectEffort(refusal.effort, confirmNewEpoch = true)
+        }
     }
+
+    fun dismissSelectionRefusal() = update { it.copy(selectionRefusal = null) }
 
     fun refreshModels() = viewModelScope.launch { service.refreshModels() }
 
@@ -365,19 +433,26 @@ class ChatViewModel(
      * Lanes 1/2/3 only have to make the facade truthful; this path is wired.
      */
     fun ensureActiveSession() = viewModelScope.launch {
-        // The service's own value, not the mirrored state: the status flow can
-        // arrive before the active-session flow has hydrated, and reading the
-        // half-built copy would replace the session the daemon already has.
-        if (service.activeSessionId.value != null) return@launch
-        val current = _state.value
-        if (current.activeSessionId != null) return@launch
-        if (current.daemon !is DaemonStatus.Running) return@launch
-        val candidate = SessionListState.order(service.sessions.value, null).firstOrNull()
-        val id = candidate?.id ?: service.createSession()
-        service.activate(id)
-        service.markSeen(id)
-        loadTranscript(id)
+        // Several Running emissions arrive in a row on a real connection, and
+        // each used to race the others into createSession(). The mutex makes
+        // this one operation at a time, and every fact it decides on is read
+        // *inside* the lock — a roster read taken before waiting is already
+        // stale by the time the wait ends (lane 971-3 handoff).
+        creationGate.withLock {
+            if (service.activeSessionId.value != null) return@withLock
+            if (_state.value.daemon !is DaemonStatus.Running) return@withLock
+            // Nothing may be created against a roster that has not hydrated
+            // against this epoch's baseline: that is how a second session
+            // appears beside one that already existed.
+            service.rosterReady.first { it }
+            if (service.activeSessionId.value != null) return@withLock
+            val candidate = SessionListState.order(service.sessions.value, null).firstOrNull()
+            val id = candidate?.id ?: service.createSession()
+            service.activate(id)
+            service.markSeen(id)
+        }
     }
+
 
     /**
      * A replay can be genuinely partial: `session.read` ranges are capped at
@@ -385,26 +460,31 @@ class ChatViewModel(
      * The notice is surfaced, never swallowed.
      */
     private fun loadTranscript(sessionId: String) {
-        viewModelScope.launch {
-            update { it.copy(transcriptLoading = true) }
-            val load = service.transcript(sessionId)
-            transcripts[sessionId] = load.messages
-            val notice = when (load) {
-                is TranscriptLoad.Complete -> null
-                is TranscriptLoad.Partial ->
-                    "History up to ${load.loadedThroughSeq} of ${load.headSeq} — ${load.reason}"
-                is TranscriptLoad.Unavailable -> load.reason
-            }
-            update {
-                if (it.activeSessionId == sessionId) {
-                    it.copy(
-                        messages = load.messages,
-                        transcriptLoading = false,
-                        transcriptNotice = notice,
-                    )
-                } else {
-                    it.copy(transcriptLoading = false)
-                }
+        viewModelScope.launch { applyTranscript(sessionId, service.transcript(sessionId)) }
+    }
+
+    /**
+     * Complete, Partial and Unavailable all stay visible. An unsupported tool
+     * or display payload is deliberately Partial: it is not hidden behind a
+     * Complete result (lane 971-3 handoff).
+     */
+    private fun applyTranscript(sessionId: String, load: TranscriptLoad) {
+        transcripts[sessionId] = load.messages
+        val notice = when (load) {
+            is TranscriptLoad.Complete -> null
+            is TranscriptLoad.Partial ->
+                "History up to ${load.loadedThroughSeq} of ${load.headSeq} — ${load.reason}"
+            is TranscriptLoad.Unavailable -> load.reason
+        }
+        update {
+            if (it.activeSessionId == sessionId) {
+                it.copy(
+                    messages = load.messages,
+                    transcriptLoading = false,
+                    transcriptNotice = notice,
+                )
+            } else {
+                it.copy(transcriptLoading = false)
             }
         }
     }
@@ -428,7 +508,13 @@ class ChatViewModel(
 
     companion object {
         const val SEARCH_DEBOUNCE_MS = 150L
-        const val ALREADY_RESOLVED = "ERROR_CODE_ALREADY_RESOLVED"
+        /**
+         * The stable code the daemon actually sends. Round 4 compared the name
+         * of the Rust constant, which no frame ever carries, so a menu that had
+         * already been answered elsewhere read as an unexplained failure
+         * (lane 971-3 handoff).
+         */
+        const val ALREADY_RESOLVED = "already_resolved"
 
         fun factory(
             service: DaemonService,

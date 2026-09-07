@@ -79,6 +79,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.launch
 
+/** Staging failed for a reason that is not the key: connection, expiry, capacity. */
+const val STAGING_UNAVAILABLE = "staging_unavailable"
+
 const val ACCOUNTS_KEY_FIELD_TAG = "accounts_key_field"
 const val ACCOUNTS_OAUTH_WAITING_TAG = "accounts_oauth_waiting"
 
@@ -289,38 +292,11 @@ fun AccountsScreen(
                         color = if (stagedHint) colors.accent else colors.textMuted,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-                        ForgeButton(
-                            text = stringResource(R.string.accounts_validate),
-                            onClick = {
-                                val chosen = provider ?: return@ForgeButton
-                                busy = true
-                                scope.launch {
-                                    try {
-                                        val result = secret.use { repository.validateApiKey(chosen, it) }
-                                        if (result is AccountResult.Ok) {
-                                            // Stage it, keep only the handle,
-                                            // and drop the key on the spot.
-                                            stagedReference = secret.use { repository.stageApiKey(it) }
-                                        }
-                                        localNotice = when (result) {
-                                            AccountResult.Ok -> if (stagedReference != null) {
-                                                "Key validated."
-                                            } else {
-                                                "invalid_api_key"
-                                            }
-                                            is AccountResult.Failed -> result.publicCode
-                                        }
-                                    } finally {
-                                        // Validated or refused, the plaintext
-                                        // does not outlive this handler.
-                                        clearSecret()
-                                        busy = false
-                                    }
-                                }
-                            },
-                            kind = ForgeButtonKind.Ghost,
-                            enabled = provider != null && keyText.isNotBlank() && !busy,
-                        )
+                        // No Validate button. The frozen wire has no
+                        // validation-only door: account.login_api is what
+                        // checks a key, and it commits at the same time. A
+                        // button that answered "Key validated." was describing
+                        // a call that does not exist (lane 971-3, UI-14).
                         ForgeButton(
                             text = stringResource(R.string.action_save),
                             onClick = {
@@ -332,7 +308,7 @@ fun AccountsScreen(
                                         val reference = stagedReference
                                             ?: secret.use { repository.stageApiKey(it) }
                                         result = if (reference == null) {
-                                            AccountResult.Failed("invalid_api_key")
+                                            AccountResult.Failed(STAGING_UNAVAILABLE)
                                         } else {
                                             repository.commitStagedApiKey(
                                                 chosen,
@@ -536,7 +512,13 @@ private fun AccountRow(account: Account, onOpen: () -> Unit) {
             Text(
                 listOfNotNull(
                     account.identity,
-                    if (account.authKind == AuthKind.OAuth) "sign-in" else "API key",
+                    // An unknown auth kind says so; it does not default to a
+                    // credential type the daemon never named (971-3, UI-12).
+                    when (account.authKind) {
+                        AuthKind.OAuth -> "sign-in"
+                        AuthKind.ApiKey -> "API key"
+                        AuthKind.Unknown -> "sign-in method unknown"
+                    },
                 ).joinToString(" · "),
                 style = type.sessionMeta,
                 color = colors.textMuted,

@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.chat.Message
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -89,7 +90,12 @@ data class SessionRow(
     val title: String? = null,
     val state: SessionVisualState = SessionVisualState.Unknown,
     /** Raw ObserveRunStateWire string, kept for diagnostics. */
-    val runState: String = "unknown",
+    /**
+     * The daemon's own word, unmapped, or null when the row carried none.
+     * The literal "unknown" was this field's default, so an absent run state
+     * and a daemon that really said "unknown" were the same value.
+     */
+    val runState: String? = null,
     val provider: String? = null,
     val model: String? = null,
     val effort: String? = null,
@@ -145,7 +151,8 @@ data class ProviderOption(
 /** The `provider.list` snapshot plus its revision. */
 data class ProviderInventory(
     val providers: List<ProviderOption> = emptyList(),
-    val revision: Long = 0,
+    /** Null when `provider.list` stated none. Absent is not revision zero. */
+    val revision: Long? = null,
     val error: String? = null,
 ) {
     fun provider(id: String?): ProviderOption? = providers.firstOrNull { it.id == id }
@@ -340,8 +347,16 @@ interface DaemonService {
      * an answer may carry. The plaintext never leaves this call.
      */
     suspend fun stageMenuSecret(secret: CharArray): String
-    suspend fun selectModel(provider: String, model: String)
-    suspend fun selectEffort(effort: String?)
+    /**
+     * [confirmNewEpoch] is the user's own answer, never inferred.
+     *
+     * Switching model or effort can invalidate the prompt cache, and the daemon
+     * refuses until the caller says it understands that. The facade sends false
+     * unless a person has answered a refusal, so consent cannot be manufactured
+     * by a retry loop (lane 971-3 handoff).
+     */
+    suspend fun selectModel(provider: String, model: String, confirmNewEpoch: Boolean = false)
+    suspend fun selectEffort(effort: String?, confirmNewEpoch: Boolean = false)
     suspend fun refreshModels()
 
     /** `provider.list`; also the door the provider picker refreshes through. */
@@ -359,6 +374,27 @@ interface DaemonService {
      * unavailable path instead of silent truncation presented as complete.
      */
     suspend fun transcript(sessionId: String): TranscriptLoad
+
+    /**
+     * The same replay, followed by the folded live pushes for that session.
+     *
+     * One-shot [transcript] plus a reload after each explicit action was how
+     * round 6 read history, so assistant output that arrived on its own — the
+     * normal case — never reached the screen. Collect this with `collectLatest`
+     * on the active session id: it emits the initial load first and then each
+     * folded update (lane 971-3 handoff).
+     */
+    fun transcriptUpdates(sessionId: String): Flow<TranscriptLoad>
+
+    /**
+     * True once the roster is hydrated against the current epoch's baseline.
+     *
+     * Nothing may create a session before this: the real facade withholds its
+     * first Running until its rows agree with the baseline, and a create issued
+     * against an unhydrated roster invents a second session next to one that
+     * already existed (lane 971-3 handoff).
+     */
+    val rosterReady: StateFlow<Boolean>
 
     /** Progress of the local transcript index that drawer search reads. */
     val searchIndex: StateFlow<SearchIndexState>
