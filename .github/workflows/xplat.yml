@@ -91,6 +91,9 @@ jobs:
       - name: split archive and wrapper delegation regression tests
         if: matrix.phase == 'check'
         run: python -m unittest scripts/tests/test_release_packaging.py scripts/tests/test_install_bundle.py
+      - name: pipeline regression tests (POSIX Bash driver)
+        if: matrix.phase == 'check' && runner.os == 'Linux'
+        run: python -m unittest scripts/tests/test_find_evidence.py scripts/tests/test_macos_build_artifact.py scripts/tests/test_ci_test_shards.py
       - name: clippy (all targets; report every reachable error)
         if: matrix.phase == 'clippy'
         run: cargo clippy --workspace --all-targets --locked --keep-going --target ${{ matrix.target }} -- -D warnings

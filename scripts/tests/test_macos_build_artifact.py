@@ -17,6 +17,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 SHA = 'a' * 40
 RUSTC = 'rustc 1.95.0 (fixture 2026-04-14)\nhost: aarch64-apple-darwin\nrelease: 1.95.0\n'
+UUID = '01234567-89AB-CDEF-0123-456789ABCDEF'
 
 
 class ArtifactTests(unittest.TestCase):
@@ -34,8 +35,14 @@ class ArtifactTests(unittest.TestCase):
             'import os, subprocess\n'
             'original = subprocess.check_output\n'
             'def check_output(command, **kwargs):\n'
-            '    if command[0] != "rustc": return original(command, **kwargs)\n'
-            '    return os.environ["RUSTC_FIXTURE"]\n'
+            '    if command[0] == "rustc": return os.environ["RUSTC_FIXTURE"]\n'
+            '    if command[:3] == ["xcrun", "dwarfdump", "--uuid"]:\n'
+            '        code = int(os.environ.get("DWARFDUMP_EXIT", "0"))\n'
+            '        if code: raise subprocess.CalledProcessError(code, command)\n'
+            '        key = "SYMBOL_UUID" if command[3].endswith(".dSYM") else "BINARY_UUID"\n'
+            '        value = os.environ[key]\n'
+            '        return "UUID: " + value + " (arm64) " + command[3] + "\\n" if value else ""\n'
+            '    return original(command, **kwargs)\n'
             'subprocess.check_output = check_output\n'
             # Like posix_mode_fixture.py: Windows cannot set POSIX execute bits.
             # Only these generated macOS fixture paths receive synthetic modes.
@@ -50,7 +57,8 @@ class ArtifactTests(unittest.TestCase):
             '        return result\n'
             '    Path.stat = fixture_stat\n')
         self.env = dict(os.environ, PYTHONPATH=str(self.root),
-                        CARGO_INCREMENTAL='0', RUSTC_FIXTURE=RUSTC)
+                        CARGO_INCREMENTAL='0', RUSTC_FIXTURE=RUSTC,
+                        BINARY_UUID=UUID, SYMBOL_UUID=UUID, DWARFDUMP_EXIT='0')
         for binary in MODULE.BINARIES:
             path = self.release / binary
             path.write_bytes(b'unsigned fixture bytes: ' + binary.encode())
@@ -59,7 +67,14 @@ class ArtifactTests(unittest.TestCase):
             symbols = self.release / f'{binary}.dSYM/Contents'
             dwarf = symbols / 'Resources/DWARF'
             dwarf.mkdir(parents=True)
-            (dwarf / binary).write_bytes(b'line tables')
+            # Observed with native Rust 1.95.0, --target aarch64-apple-darwin,
+            # packed line tables + strip=symbols, both thin/16 and fat/1 LTO.
+            # Cargo renames the outer bundle, not the hashed rustc members.
+            member = binary.replace('-', '_') + '-0123456789abcdef'
+            (dwarf / member).write_bytes(b'line tables')
+            relocations = symbols / 'Resources/Relocations/aarch64'
+            relocations.mkdir(parents=True)
+            (relocations / (member + '.yml')).write_bytes(b'fixture relocations')
             (symbols / 'Info.plist').write_bytes(b'fixture plist')
 
     def cli(self, command, *, sha=SHA, env=None):
@@ -127,7 +142,32 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotEqual(self.cli('pack').returncode, 0)
         (self.release / 'haiderd.dSYM/Contents/Info.plist').write_text('restored')
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX executable permission bit')
+    def test_missing_dwarf_rejected_by_pack_and_restore(self):
+        self.pack()
+        name = 'haiderd.dSYM/Contents/Resources/DWARF/haiderd-0123456789abcdef'
+        (self.release / name).unlink()
+        self.assertIn('missing DWARF member', self.cli('pack').stderr)
+        manifest_path = self.bundle / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        del manifest['files'][name]
+        manifest_path.write_text(json.dumps(manifest))
+        self.rewrite_archive(lambda entries: [(m, d) for m, d in entries if m.name != name])
+        self.assertIn('missing DWARF member', self.cli('restore').stderr)
+        self.assertFalse(self.restored.exists())
+
+    def test_symbol_uuid_mismatch_missing_uuid_and_tool_failure_rejected(self):
+        self.pack()
+        for changes in [dict(SYMBOL_UUID='FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF'),
+                        dict(SYMBOL_UUID=''), dict(BINARY_UUID=''), dict(DWARFDUMP_EXIT='1')]:
+            for command in ['pack', 'restore']:
+                with self.subTest(changes=changes, command=command):
+                    result = self.cli(command, env=dict(self.env, **changes))
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertFalse(self.restored.exists())
+
+    @unittest.skipUnless(os.name == 'posix',
+                         'POSIX execute bits are not writable on Windows; covered by '
+                         "xplat-check Linux check leg's pipeline regression tests")
     def test_nonexecutable_payload_rejected(self):
         (self.release / 'haider').chmod(0o644)
         self.assertNotEqual(self.cli('pack').returncode, 0)
