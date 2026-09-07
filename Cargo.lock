@@ -1741,6 +1741,7 @@ dependencies = [
  "haider-provider",
  "haider-rpc",
  "haider-store",
+ "haider-tools",
  "rusqlite",
  "serde",
  "serde_json",
