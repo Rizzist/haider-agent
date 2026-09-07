@@ -33,17 +33,23 @@ class ComposerTest {
     fun `the model chip resolves rather than sitting on loading`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         rule.setHaiderApp(service)
-        assertTrue(rule.onAllNodesWithTextSafe("Sonnet 4.5 · high") > 0)
+        // The chip is the value now, with the effort on its own chip (F, S5).
+        assertTrue(rule.onAllNodesWithTextSafe("Sonnet 4.5") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("high") > 0)
+        assertEquals(0, rule.onAllNodesWithTextSafe("MODEL"))
         // The literal that used to be permanent (D4) appears nowhere.
         assertEquals(0, rule.onAllNodesWithTextSafe("loading…"))
     }
 
     @Test
-    fun `with no daemon the chip says start haider, not loading`() {
+    fun `with no daemon the composer says what to do, and never loading`() {
+        // The picker row is hidden until the daemon is ready (F, F2), so the
+        // instruction moves to the placeholder where the user is looking.
         val service = ComposeHost.install(FakeScenario.FirstRun)
         rule.setHaiderApp(service)
-        assertTrue(rule.onAllNodesWithTextSafe("Start Haider first") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Start Haider to begin") > 0)
         assertEquals(0, rule.onAllNodesWithTextSafe("loading…"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Sonnet 4.5"))
     }
 
     @Test
@@ -87,11 +93,13 @@ class ComposerTest {
     }
 
     @Test
-    fun `a running turn swaps send for stop`() {
+    fun `a running turn adds Stop beside Send, and there is exactly one Stop`() {
         val service = ComposeHost.install(FakeScenario.TurnRunning)
         rule.setHaiderApp(service)
-        rule.onAllNodes(hasContentDescription("Stop this turn")).onFirst().assertIsDisplayed()
-        assertEquals(0, rule.onAllNodesWithContentDescriptionSafe("Send message"))
+        // Addition E: one Stop control in the whole app, and it is the
+        // composer's. The centred sticky chip is gone.
+        assertEquals(1, rule.onAllNodesWithContentDescriptionSafe("Stop this turn"))
+        assertEquals(1, rule.onAllNodesWithContentDescriptionSafe("Send message"))
     }
 
     @Test
@@ -107,10 +115,12 @@ class ComposerTest {
     }
 
     @Test
-    fun `a paused turn disables the composer and says why`() {
+    fun `a paused turn disables the composer and says so in the placeholder`() {
         val service = ComposeHost.install(FakeScenario.InputRequiredHere)
         rule.setHaiderApp(service)
-        assertTrue(rule.onAllNodesWithTextSafe("The turn is paused.") > 0)
+        // The helper sentence is gone; the placeholder carries it (F, G5).
+        assertEquals(0, rule.onAllNodesWithTextSafe("The turn is paused."))
+        assertTrue(rule.onAllNodesWithTextSafe("Answer above to continue…") > 0)
     }
 }
 

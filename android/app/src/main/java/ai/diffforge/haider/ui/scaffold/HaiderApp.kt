@@ -1,5 +1,6 @@
 package ai.diffforge.haider.ui.scaffold
 
+import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.accounts.AccountsRepository
 import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.chat.PickerKind
@@ -9,7 +10,8 @@ import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.InputRequiredCard
 import ai.diffforge.haider.ui.chat.ModelPicker
-import ai.diffforge.haider.ui.chat.StickyStopChip
+import ai.diffforge.haider.ui.chat.SessionViewHeader
+import ai.diffforge.haider.ui.chat.ShellView
 import ai.diffforge.haider.ui.chat.Transcript
 import ai.diffforge.haider.ui.drawer.RenameSheet
 import ai.diffforge.haider.ui.drawer.SessionActionsSheet
@@ -27,6 +29,7 @@ import ai.diffforge.haider.ui.state.NeedsInputElsewhere
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.state.RelativeTime
 import ai.diffforge.haider.ui.state.SendButtonMatrix
+import ai.diffforge.haider.ui.state.SessionViewTab
 import ai.diffforge.haider.ui.state.SetupStepId
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeSize
@@ -63,6 +66,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -155,12 +159,24 @@ fun HaiderApp(
             viewModel.closeOverlay()
         }
 
+        val accountsSnapshot by accounts.snapshot.collectAsState()
+        val accountsSummary = if (accountsSnapshot.accounts.isEmpty()) {
+            stringResource(R.string.accounts_status_empty)
+        } else {
+            stringResource(
+                R.string.accounts_status_line,
+                accountsSnapshot.accounts.size,
+                accountsSnapshot.accounts.joinToString(", ") { it.provider },
+            )
+        }
+
         when (state.overlay) {
             Overlay.Settings -> {
                 SettingsScreen(
                     state = state,
                     themeMode = themeMode,
                     appVersion = appVersion,
+                    accountsSummary = accountsSummary,
                     elapsedRealtimeMs = elapsedRealtimeProvider(),
                     onBack = viewModel::closeOverlay,
                     onThemeMode = onThemeMode,
@@ -263,9 +279,20 @@ fun HaiderApp(
                     onDismiss = { rank -> dismissals.dismiss(rank, nowMs) },
                 )
 
+                // The session surface's own slim row: Chat | Shell.
+                if (state.activeSessionId != null) {
+                    SessionViewHeader(
+                        tab = state.viewTab,
+                        shellAvailable = state.shell.available,
+                        onSelect = viewModel::selectViewTab,
+                    )
+                }
+
                 Box(Modifier.fillMaxWidth().weight(1f)) {
                     val needsInput = state.activeSession?.needsInput
-                    if (state.messages.isEmpty() && needsInput == null) {
+                    if (state.viewTab == SessionViewTab.Shell) {
+                        ShellView(availability = state.shell, modifier = Modifier.fillMaxSize())
+                    } else if (state.messages.isEmpty() && needsInput == null) {
                         StartSurface(
                             state = state,
                             appVersion = appVersion,
@@ -333,27 +360,17 @@ fun HaiderApp(
                                     ),
                                 )
                             }
-                            Box(Modifier.fillMaxSize()) {
-                                Transcript(
-                                    messages = state.messages,
-                                    onRetry = { viewModel.send() },
-                                    modifier = Modifier.fillMaxSize(),
-                                )
-                                // Nothing is streaming while the turn is parked
-                                // on a question: the answer is the affordance.
-                                if (state.turnRunning && !state.needsInputHere) {
-                                    StickyStopChip(
-                                        onStop = { viewModel.stopTurn() },
-                                        modifier = Modifier
-                                            .align(Alignment.BottomCenter)
-                                            .padding(bottom = ForgeSpace.md),
-                                    )
-                                }
-                            }
+                            // One Stop control, and it lives in the composer.
+                            Transcript(
+                                messages = state.messages,
+                                onRetry = { viewModel.send() },
+                                modifier = Modifier.fillMaxSize(),
+                            )
                         }
                     }
                 }
 
+                val setupPending = !state.setup.complete && state.sessions.isEmpty()
                 val composerState = SendButtonMatrix.resolve(
                     daemon = state.daemon,
                     turnRunning = state.turnRunning,
@@ -371,19 +388,21 @@ fun HaiderApp(
                 )
                 Box(Modifier.fillMaxWidth().imePadding(), contentAlignment = Alignment.Center) {
                     Composer(
+                        // The picker row is meaningless before the daemon can
+                        // answer; the input stays visible and disabled so the
+                        // shape of the screen does not jump (addition F, F2).
+                        showPickers = !setupPending,
                         text = state.draft,
                         onTextChange = viewModel::setDraft,
                         composer = composerState,
                         chip = chip,
                         contextTokens = state.activeSession?.footprintTokens,
                         contextExact = state.activeSession?.footprintExact,
-                        provider = state.models?.current?.provider,
                         effort = state.models?.current?.effort,
                         onSend = { viewModel.send() },
                         onStop = { viewModel.stopTurn() },
                         onStartDaemon = { viewModel.startDaemon() },
                         onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
-                        onOpenProvider = { viewModel.openOverlay(Overlay.Picker(PickerKind.Provider)) },
                         onOpenEffort = { viewModel.openOverlay(Overlay.Picker(PickerKind.Effort)) },
                         onRetryModels = { viewModel.refreshModels() },
                         onAttach = { viewModel.openOverlay(Overlay.Attach) },
@@ -439,7 +458,6 @@ private fun Overlays(
                 viewModel.refreshModels()
             },
             onDismiss = viewModel::closeOverlay,
-            onSelectProvider = viewModel::selectProvider,
             onSelectModel = viewModel::selectModel,
             onSelectEffort = viewModel::selectEffort,
         )

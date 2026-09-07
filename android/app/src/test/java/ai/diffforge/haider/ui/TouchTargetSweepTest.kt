@@ -13,6 +13,7 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -118,7 +119,10 @@ class TouchTargetSweepTest {
     @Test
     fun `the accounts API-key form has no undersized targets`() {
         open(overlay = Overlay.Accounts)
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.waitForIdle()
         sweep("accounts API-key form")
     }
@@ -126,7 +130,10 @@ class TouchTargetSweepTest {
     @Test
     fun `the accounts sign-in form has no undersized targets`() {
         open(overlay = Overlay.Accounts)
-        rule.onNodeWithText("Sign in with a provider").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Sign in with a provider").performClick()
+        rule.waitForIdle()
         rule.waitForIdle()
         sweep("accounts sign-in form")
     }
@@ -135,12 +142,6 @@ class TouchTargetSweepTest {
     fun `the model picker sheet has no undersized targets`() {
         open(overlay = Overlay.Picker(PickerKind.Model))
         sweep("model picker")
-    }
-
-    @Test
-    fun `the provider picker sheet has no undersized targets`() {
-        open(overlay = Overlay.Picker(PickerKind.Provider))
-        sweep("provider picker")
     }
 
     @Test

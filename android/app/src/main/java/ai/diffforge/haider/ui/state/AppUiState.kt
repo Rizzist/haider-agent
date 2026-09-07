@@ -7,6 +7,7 @@ import ai.diffforge.haider.ui.daemon.RosterPaging
 import ai.diffforge.haider.ui.daemon.SearchIndexState
 import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.SearchOutcome
+import ai.diffforge.haider.ui.daemon.ShellAvailability
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.TurnCancel
 import ai.diffforge.haider.transport.SessionConfig
@@ -105,6 +106,9 @@ data class AppUiState(
     val providers: ProviderInventory = ProviderInventory(),
     /** Non-null exactly while the drawer is open, freezing the rendered order. */
     val orderSnapshot: SessionListState.OrderSnapshot? = null,
+    /** Chat or Shell, per addition E's segmented switch. */
+    val viewTab: SessionViewTab = SessionViewTab.Chat,
+    val shell: ShellAvailability = ShellAvailability(),
     val answeredElsewhere: Set<String> = emptySet(),
 ) {
     val activeSession: SessionRow?
@@ -155,3 +159,6 @@ data class AppUiState(
 }
 
 enum class AttentionBadgeKind { None, NeedsInput, Running, Errored }
+
+/** The session surface's tabs. No Traj on a phone. */
+enum class SessionViewTab { Chat, Shell }

@@ -59,7 +59,10 @@ class DeviceRegressionTest {
     @Test
     fun `validating consumes the key instead of leaving it in the field`() {
         accounts()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
         rule.onNodeWithText("Validate").performClick()
@@ -74,7 +77,10 @@ class DeviceRegressionTest {
     @Test
     fun `a validated key saves from its staged reference alone`() {
         accounts()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
         rule.onNodeWithText("Validate").performClick()
@@ -90,7 +96,10 @@ class DeviceRegressionTest {
     @Test
     fun `cancelling after validation discards the staged reference`() {
         accounts()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
         rule.onNodeWithText("Validate").performClick()
@@ -183,7 +192,12 @@ class DeviceRegressionTest {
         assertFalse(viewModel.state.value.environment.notificationsPermanentlyDenied)
         assertEquals(
             0,
-            rule.onAllNodesWithTextSafe("Android will not ask again. Turn them on in app settings."),
+            rule.onAllNodes(
+                androidx.compose.ui.test.hasContentDescription(
+                    "Android will not ask again",
+                    substring = true,
+                ),
+            ).fetchSemanticsNodes().size,
         )
         // The step is still the ordinary ask, not a trip to app settings.
         assertTrue(rule.onAllNodesWithTextSafe("Let Haider notify you") > 0)
@@ -203,10 +217,16 @@ class DeviceRegressionTest {
         )
         rule.waitForIdle()
         assertTrue(viewModel.state.value.environment.notificationsPermanentlyDenied)
+        // The strip is one line; the detail reaches the screen reader (F, S2).
         assertTrue(
-            rule.onAllNodesWithTextSafe(
-                "Android will not ask again. Turn them on in app settings.",
-            ) > 0,
+            rule.onAllNodes(
+                androidx.compose.ui.test.hasContentDescription(
+                    "Android will not ask again",
+                    substring = true,
+                ),
+            ).fetchSemanticsNodes().isNotEmpty(),
         )
     }
+
+
 }

@@ -103,6 +103,9 @@ class ChatViewModel(
         viewModelScope.launch {
             service.providers.collect { inventory -> update { it.copy(providers = inventory) } }
         }
+        viewModelScope.launch {
+            service.shell.collect { availability -> update { it.copy(shell = availability) } }
+        }
     }
 
     // ---------- daemon lifecycle ----------
@@ -299,6 +302,9 @@ class ChatViewModel(
     fun closeOverlay() = update { it.copy(overlay = Overlay.None) }
 
     fun setFilter(filter: SessionFilter) = update { it.copy(filter = filter) }
+
+    fun selectViewTab(tab: ai.diffforge.haider.ui.state.SessionViewTab) =
+        update { it.copy(viewTab = tab) }
 
     /**
      * Metadata filtering is immediate; the full-roster transcript search runs

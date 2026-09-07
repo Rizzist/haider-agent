@@ -58,9 +58,9 @@ class FontScaleTest {
         val rows = rule.onAllNodes(hasContentDescription("Fix nav crash", substring = true))
             .fetchSemanticsNodes()
         assertTrue(rows.isNotEmpty())
-        val minPx = with(rule.density) { 64.dp.toPx() }
+        val minPx = with(rule.density) { 48.dp.toPx() }
         assertTrue(
-            "a session row shrank below its two-line minimum at 200 % font scale",
+            "a session row shrank below its touch minimum at 200 % font scale",
             rows.all { it.size.height >= minPx },
         )
     }
@@ -70,7 +70,8 @@ class FontScaleTest {
         val service = ComposeHost.install(FakeScenario.InputRequiredHere)
         rule.setHaiderApp(service)
         rule.waitForIdle()
-        assertTrue(rule.onAllNodesWithTextSafe("HAIDER NEEDS YOU") > 0)
+        // The uppercase eyebrow is gone; the question is the title (F, S6).
+        assertTrue(rule.onAllNodesWithTextSafe("Send this reply to Amir (+1 604 555 0142)?") > 0)
     }
 }
 

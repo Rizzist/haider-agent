@@ -33,16 +33,17 @@
     <string name="step_model_body">Sign in to a provider or paste a key. You can change it per session later.</string>
     <string name="step_model_action">Choose a model</string>
     <string name="step_model_done">%1$s · %2$s</string>
-    <string name="suggestions_header">WHEN YOU ARE READY</string>
+    <string name="suggestions_header">Try</string>
     <string name="suggestion_sms">Summarise the texts I missed today</string>
     <string name="suggestion_screen">What is on my screen right now?</string>
     <string name="suggestion_settings">Open Settings and turn on Wi-Fi calling</string>
     <string name="ready_line">Ready. Ask for anything on this phone.</string>
-    <string name="recent_sessions_header">RECENT SESSIONS</string>
+    <string name="recent_sessions_header">Recent</string>
     <string name="see_all_sessions">See all %1$d sessions</string>
 
     <!-- Drawer -->
     <string name="drawer_new_session">New session</string>
+    <string name="drawer_new_chat">New chat</string>
     <string name="drawer_new_session_with">New session with…</string>
     <string name="drawer_group_needs_you">NEEDS YOU</string>
     <string name="drawer_group_active">ACTIVE</string>
@@ -97,7 +98,8 @@
     <string name="banner_stopped_action">Start</string>
     <string name="banner_starting_title">Starting Haider…</string>
     <string name="banner_starting_body">First start takes a few seconds.</string>
-    <string name="banner_needs_you_title">“%1$s” needs you</string>
+    <string name="banner_needs_you_title">“%1$s”</string>
+    <string name="banner_needs_you_suffix">needs you</string>
     <string name="banner_needs_you_body">Waiting %1$s — %2$s</string>
     <string name="banner_needs_you_action">Open</string>
     <string name="banner_notify_title">Notifications are off</string>
@@ -114,9 +116,11 @@
     <string name="cd_dismiss_banner">Dismiss</string>
 
     <!-- Composer -->
-    <string name="chip_model_label">MODEL</string>
-    <string name="chip_provider_label">PROVIDER</string>
-    <string name="chip_effort_label">EFFORT</string>
+    <string name="tab_chat">Chat</string>
+    <string name="tab_shell">Shell</string>
+    <string name="shell_ready">Shell is ready.</string>
+    <string name="shell_unavailable_title">No shell on this device</string>
+    <string name="shell_unavailable_body">Haider runs its tools in-app, and the on-device policy does not allow it to start processes. Use a computer for a shell until this ships.</string>
     <string name="picker_provider_title">Provider</string>
     <string name="picker_model_title">Model</string>
     <string name="picker_effort_title">Effort</string>
@@ -144,8 +148,7 @@
     <string name="attach_title">Attach</string>
 
     <!-- Input required -->
-    <string name="ask_eyebrow">HAIDER NEEDS YOU</string>
-    <string name="ask_waiting">Waiting %1$s · notification sent</string>
+    <string name="ask_waiting">waiting %1$s</string>
     <string name="ask_answered_elsewhere">Answered elsewhere.</string>
     <string name="ask_secret_elsewhere">Answer this on your computer — secrets cannot be typed here.</string>
     <string name="ask_secret_masked">Typed here, stored in the on-device vault. Only a reference is sent — never the secret itself.</string>
@@ -172,12 +175,22 @@
 
     <!-- Settings -->
     <string name="settings_title">Settings</string>
-    <string name="settings_section_daemon">DAEMON</string>
-    <string name="settings_section_accounts">ACCOUNTS</string>
-    <string name="settings_section_permissions">PERMISSIONS</string>
-    <string name="settings_section_appearance">APPEARANCE</string>
-    <string name="settings_section_updates">UPDATES</string>
-    <string name="settings_section_about">ABOUT</string>
+    <string name="settings_section_daemon">Daemon</string>
+    <string name="settings_section_accounts">Accounts</string>
+    <string name="settings_section_permissions">Permissions</string>
+    <string name="settings_section_appearance">Appearance</string>
+    <string name="settings_section_updates">Updates</string>
+    <string name="settings_section_about">About</string>
+    <string name="permission_granted">Granted</string>
+    <string name="permission_not_granted">Not granted</string>
+    <string name="permission_ask_each_time">Ask each time</string>
+    <string name="accounts_status_line">%1$d account · %2$s</string>
+    <string name="accounts_status_empty">No accounts</string>
+    <string name="accounts_add">Add account</string>
+    <string name="accounts_option_api_key">API key</string>
+    <string name="accounts_option_sign_in">Sign in with a provider</string>
+    <string name="accounts_delete_confirm">Remove this account? Haider will stop using it immediately.</string>
+    <string name="start_composer_disabled">Start Haider to begin</string>
     <string name="settings_permission_accessibility">Accessibility</string>
     <string name="settings_permission_accessibility_body">Read the on-screen UI tree and inject taps and swipes that you authorise.</string>
     <string name="settings_permission_accessibility_action">Open Accessibility settings</string>
@@ -218,7 +231,7 @@
     <string name="accounts_oauth_claiming">Linking the account…</string>
     <string name="accounts_oauth_failed">Sign-in failed — %1$s</string>
     <string name="accounts_signed_in">Signed in: %1$s</string>
-    <string name="accounts_active">ACTIVE</string>
+    <string name="accounts_active">Active account</string>
     <string name="accounts_set_active">Use this account</string>
     <string name="accounts_unavailable">%1$s is unavailable — %2$s</string>
     <string name="accounts_key_never_leaves">The key is stored in the on-device vault. It is never written to a log or a transcript.</string>

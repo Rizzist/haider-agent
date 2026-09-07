@@ -7,6 +7,7 @@ import ai.diffforge.haider.ui.theme.ThemeMode
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
@@ -175,7 +176,10 @@ class NarrowScreenshotTest {
         )
         viewModel.openOverlay(Overlay.Accounts)
         rule.waitForIdle()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.waitForIdle()
         rule.onRoot().captureRoboImage("src/test/screenshots/$name.png")
     }

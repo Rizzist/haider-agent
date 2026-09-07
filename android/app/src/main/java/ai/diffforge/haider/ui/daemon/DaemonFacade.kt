@@ -171,6 +171,19 @@ data class ProviderInventory(
     }
 }
 
+/**
+ * Whether the session's shell view can do anything.
+ *
+ * The android-standalone tool policy disables `ProcessExec` outright
+ * (contracts-v1 C4), so on this platform the Shell tab has nothing to drive
+ * until a later lane ships an on-device shell. It says so, with the daemon's
+ * own reason, rather than presenting an inert terminal.
+ */
+data class ShellAvailability(
+    val available: Boolean = false,
+    val reason: String? = null,
+)
+
 /** Roster page state, so the drawer can scroll hundreds of sessions honestly. */
 data class RosterPaging(
     val loading: Boolean = false,
@@ -287,6 +300,9 @@ interface DaemonService {
 
     /** `provider.list` inventory, for the composer's provider/model pickers. */
     val providers: StateFlow<ProviderInventory>
+
+    /** Derived from `tools.inventory`: can this device run a shell at all? */
+    val shell: StateFlow<ShellAvailability>
     val catalogError: StateFlow<String?>
 
     /** When the catalog request went out; drives the model chip's 6 s deadline. */

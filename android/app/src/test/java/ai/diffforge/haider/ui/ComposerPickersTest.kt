@@ -35,45 +35,34 @@ class ComposerPickersTest {
     val rule = createAndroidComposeRule<MainActivity>()
 
     @Test
-    fun `all three chips are on the composer bar`() {
+    fun `two compact chips are on the composer bar`() {
+        // The provider folds into the model sheet, which is grouped by
+        // provider anyway, so two chips fit one row at 360 dp (F, S5).
         rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
-        rule.onAllNodes(hasContentDescription("Change provider", substring = true))
-            .onFirst()
-            .assertIsDisplayed()
         rule.onAllNodes(hasContentDescription("Change model", substring = true))
             .onFirst()
             .assertIsDisplayed()
         rule.onAllNodes(hasContentDescription("Change effort", substring = true))
             .onFirst()
             .assertIsDisplayed()
+        assertEquals(
+            0,
+            rule.onAllNodes(hasContentDescription("Change provider", substring = true))
+                .fetchSemanticsNodes().size,
+        )
     }
 
     @Test
-    fun `the provider picker lists the inventory and marks the unavailable`() {
+    fun `the model sheet groups by provider and names an unavailable one`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         rule.setHaiderApp(service)
-        rule.onAllNodes(hasContentDescription("Change provider", substring = true))
+        rule.onAllNodes(hasContentDescription("Change model", substring = true))
             .onFirst()
             .performClick()
         rule.waitForIdle()
-        rule.onNodeWithText("Provider").assertIsDisplayed()
-        rule.onNodeWithContentDescription("Anthropic").assertIsDisplayed()
-        // provider.list says OpenAI has no account, so it cannot be chosen.
-        rule.onNodeWithContentDescription("OpenAI").assertIsNotEnabled()
+        rule.onNodeWithText("Anthropic").assertIsDisplayed()
+        // provider.list says OpenAI has no account, and the group header says so.
         assertTrue(rule.onAllNodesWithTextSafe("OpenAI — No account configured") > 0)
-    }
-
-    @Test
-    fun `choosing a provider goes through the canonical selection call`() {
-        val service = ComposeHost.install(FakeScenario.Populated)
-        rule.setHaiderApp(service)
-        rule.onAllNodes(hasContentDescription("Change provider", substring = true))
-            .onFirst()
-            .performClick()
-        rule.waitForIdle()
-        rule.onNodeWithContentDescription("Anthropic").performClick()
-        rule.waitForIdle()
-        assertTrue(service.calls.contains("selectProvider:anthropic"))
     }
 
     @Test
@@ -84,7 +73,7 @@ class ComposerPickersTest {
             .onFirst()
             .performClick()
         rule.waitForIdle()
-        rule.onNodeWithText("ANTHROPIC").assertIsDisplayed()
+        rule.onNodeWithText("Anthropic").assertIsDisplayed()
         rule.onNodeWithContentDescription("Opus 4.1").performClick()
         rule.waitForIdle()
         // The short name is display only; the wire gets the full id.

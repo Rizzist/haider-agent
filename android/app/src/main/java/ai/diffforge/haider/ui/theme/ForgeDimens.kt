@@ -49,6 +49,7 @@ object ForgeSize {
     val badgeDot = 9.dp
     val chip = 32.dp
     val filterChip = 30.dp
+    val segmented = 36.dp
     val bannerAction = 34.dp
     val footerRow = 52.dp
     val newSessionRow = 46.dp

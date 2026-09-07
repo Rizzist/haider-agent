@@ -9,7 +9,6 @@ import ai.diffforge.haider.ui.components.ForgeIconButton
 import ai.diffforge.haider.ui.components.StateDot
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.AttentionBadgeKind
-import ai.diffforge.haider.ui.state.ModelNames
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -262,19 +261,21 @@ private fun subtitle(state: AppUiState, session: SessionRow?): Subtitle? {
         is DaemonStatus.Failed -> stringResource(R.string.daemon_stopped)
         is DaemonStatus.Running -> null
     }
-    if (daemonWord != null) return Subtitle(daemonWord, colors.textMuted)
+    // Same slot, same voice: the session states below are lowercase, so the
+    // daemon word is too (addition F, G3).
+    if (daemonWord != null) return Subtitle(daemonWord.lowercase(), colors.textMuted)
     if (session == null) return null
 
+    // The state word and nothing else: the model and the effort are composer
+    // chips, and repeating them here was the header saying what the composer
+    // already says (addition F, S1/G4).
     val stateWord = when (session.state) {
         SessionVisualState.Running -> stringResource(R.string.state_running).lowercase()
         SessionVisualState.NeedsInput -> stringResource(R.string.state_needs_input).lowercase()
         SessionVisualState.Errored -> stringResource(R.string.state_errored).lowercase()
         SessionVisualState.WaitingForNetwork -> stringResource(R.string.state_waiting_network).lowercase()
         SessionVisualState.Idle, SessionVisualState.Unknown -> null
-    }
-    val model = ModelNames.short(session.model).ifBlank { null }
-    val segments = listOfNotNull(stateWord, model, session.effort)
-    if (segments.isEmpty()) return null
+    } ?: return null
     val dot = when (session.state) {
         SessionVisualState.Running -> colors.stateRunning
         SessionVisualState.NeedsInput -> colors.stateNeedsInput
@@ -282,7 +283,7 @@ private fun subtitle(state: AppUiState, session: SessionRow?): Subtitle? {
         SessionVisualState.WaitingForNetwork -> colors.amber
         else -> null
     }
-    return Subtitle(segments.joinToString(" · "), dot)
+    return Subtitle(stateWord, dot)
 }
 
 @Composable

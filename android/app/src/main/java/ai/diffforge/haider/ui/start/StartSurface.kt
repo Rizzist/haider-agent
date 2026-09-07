@@ -54,7 +54,7 @@ const val START_FIRST_CHILD_TAG = "start_first_child"
 @Composable
 fun StartSurface(
     state: AppUiState,
-    appVersion: String,
+    @Suppress("UNUSED_PARAMETER") appVersion: String,
     nowMs: Long,
     elapsedRealtimeMs: Long,
     onStepAction: (SetupStepId) -> Unit,
@@ -76,57 +76,16 @@ fun StartSurface(
             .padding(top = ForgeSize.startFirstChildInset, bottom = ForgeSpace.xxl),
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag(START_FIRST_CHILD_TAG),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(ForgeSize.markLg)
-                    .clip(ForgeShapes.card)
-                    .background(colors.accentWash)
-                    .border(ForgeSize.hairline, colors.accent, ForgeShapes.card),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("H", style = type.h4, color = colors.accent)
-            }
-            Column(
-                Modifier
-                    .weight(1f)
-                    .padding(start = ForgeSpace.lg),
-            ) {
-                Text(
-                    if (setup.complete) {
-                        stringResource(R.string.app_name)
-                    } else {
-                        stringResource(R.string.start_title)
-                    },
-                    style = type.h1,
-                    color = colors.text,
-                )
-                Text(
-                    stringResource(R.string.start_subtitle, appVersion),
-                    style = type.numeric,
-                    color = colors.textMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-
-        if (setup.complete) {
-            Text(stringResource(R.string.ready_line), style = type.chatBody, color = colors.textMuted)
-        } else {
+        // No hero: the logo, the version line and "Ready. Ask for anything on
+        // this phone." were three ways of filling a screen whose content is
+        // either the checklist or the suggestions (addition F, F1/S7). The
+        // version lives in Settings.
+        if (!setup.complete) {
             Text(
-                if (setup.total >= 4) {
-                    stringResource(R.string.start_lede)
-                } else {
-                    stringResource(R.string.start_lede_three)
-                },
-                style = type.chatBody,
-                color = colors.textMuted,
+                stringResource(R.string.start_title),
+                style = type.h1,
+                color = colors.text,
+                modifier = Modifier.testTag(START_FIRST_CHILD_TAG),
             )
             Column(
                 Modifier
@@ -158,8 +117,16 @@ fun StartSurface(
         // One brand-new session is not a "recent sessions" list; it is the
         // session the user is looking at. Suggestions are more use than a
         // one-row roster of itself.
-        if (state.sessions.size <= 1) {
-            SuggestionList(onSuggestion = onSuggestion)
+        // Suggestions are the content once there is nothing left to set up.
+        // Before that they are a list of things the app cannot do yet
+        // (addition F, F2).
+        if (!setup.complete) {
+            Unit
+        } else if (state.sessions.size <= 1) {
+            SuggestionList(
+                onSuggestion = onSuggestion,
+                modifier = Modifier.testTag(START_FIRST_CHILD_TAG),
+            )
         } else {
             RecentSessions(
                 state = state,
@@ -184,7 +151,7 @@ private fun RecentSessions(
     Column(Modifier.fillMaxWidth()) {
         Text(
             stringResource(R.string.recent_sessions_header),
-            style = type.drawerSection,
+            style = type.sessionMeta,
             color = colors.textMuted,
             modifier = Modifier.padding(top = ForgeSpace.xxl, bottom = ForgeSpace.md),
         )

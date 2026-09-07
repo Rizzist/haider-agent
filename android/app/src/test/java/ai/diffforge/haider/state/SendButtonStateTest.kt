@@ -31,13 +31,26 @@ class SendButtonStateTest {
     }
 
     @Test
-    fun `a running turn offers stop, whatever the text says`() {
-        listOf(true, false).forEach { hasText ->
-            val state = SendButtonMatrix.resolve(running, turnRunning = true, inputRequired = false, hasText = hasText)
-            assertEquals(SendButtonState.Stop, state.button)
-            assertEquals(R.string.cd_stop_turn, state.contentDescriptionRes)
-            assertEquals(R.string.composer_helper_running, state.helperRes)
-        }
+    fun `a running turn offers Stop in addition to Send, never instead of it`() {
+        // Addition E: mid-turn Send is how a follow-up is queued, so replacing
+        // it with Stop would make that keyboard-only exactly when it matters
+        // (SessionComposer.jsx:684).
+        val typed = SendButtonMatrix.resolve(running, turnRunning = true, inputRequired = false, hasText = true)
+        assertTrue(typed.showStop)
+        assertEquals(SendButtonState.Send, typed.button)
+
+        val empty = SendButtonMatrix.resolve(running, turnRunning = true, inputRequired = false, hasText = false)
+        assertTrue(empty.showStop)
+        assertEquals(SendButtonState.Disabled, empty.button)
+
+        // Addition F, G5: the running sentence is gone — the Stop control says it.
+        assertNull(typed.helperRes)
+    }
+
+    @Test
+    fun `no run means no Stop control at all`() {
+        val state = SendButtonMatrix.resolve(running, turnRunning = false, inputRequired = false, hasText = true)
+        assertFalse("Stop must never be a guess", state.showStop)
     }
 
     @Test
@@ -45,8 +58,11 @@ class SendButtonStateTest {
         val state = SendButtonMatrix.resolve(running, turnRunning = true, inputRequired = true, hasText = true)
         assertEquals(SendButtonState.Paused, state.button)
         assertFalse(state.inputEnabled)
-        assertEquals(R.string.composer_helper_paused, state.helperRes)
+        // The placeholder carries it; the helper sentence is gone (F, G5).
+        assertNull(state.helperRes)
         assertEquals(R.string.composer_placeholder_paused, state.placeholderRes)
+        // The run is still live, so Stop is still offered.
+        assertTrue(state.showStop)
     }
 
     @Test
@@ -86,7 +102,7 @@ class SendButtonStateTest {
     }
 
     @Test
-    fun `unfinished setup points at the step instead of the button`() {
+    fun `unfinished setup disables the input and says so in the placeholder`() {
         val state = SendButtonMatrix.resolve(
             DaemonStatus.Stopped,
             turnRunning = false,
@@ -95,6 +111,7 @@ class SendButtonStateTest {
             setupComplete = false,
         )
         assertEquals(SendButtonState.Disabled, state.button)
-        assertEquals(R.string.composer_helper_setup, state.helperRes)
+        assertFalse(state.inputEnabled)
+        assertEquals(R.string.start_composer_disabled, state.placeholderRes)
     }
 }

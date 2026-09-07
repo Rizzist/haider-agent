@@ -13,7 +13,8 @@ import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
 import ai.diffforge.haider.ui.components.ForgeIconButton
-import ai.diffforge.haider.ui.components.StatePill
+import ai.diffforge.haider.ui.components.SessionGlyph
+import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
@@ -39,10 +40,16 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -62,6 +69,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.launch
 
@@ -111,6 +122,8 @@ fun AccountsScreen(
     // `account.login_api` claims. Holding the key past staging is the whole
     // finding — "Key validated" left the masked field populated.
     var stagedReference by remember { mutableStateOf<String?>(null) }
+    var addSheet by remember { mutableStateOf(false) }
+    var openAccount by remember { mutableStateOf<String?>(null) }
     val notice = localNotice ?: controllerNotice
 
     // The buffer never outlives the screen, however the screen ends.
@@ -194,40 +207,23 @@ fun AccountsScreen(
                 )
             } else {
                 snapshot.accounts.forEach { account ->
-                    AccountCard(
-                        account = account,
-                        onSetActive = {
-                            scope.launch { repository.setActive(account.alias); repository.refresh() }
-                        },
-                        onRemove = {
-                            scope.launch {
-                                repository.remove(account.alias)
-                                localNotice = "Account removed."
-                                repository.refresh()
-                            }
-                        },
-                    )
+                    AccountRow(account = account, onOpen = { openAccount = account.alias })
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+            // One action, two options behind it (addition F, A2).
+            if (mode == AddMode.None) {
                 ForgeButton(
-                    text = stringResource(R.string.accounts_add_api_key),
-                    onClick = {
-                        mode = if (mode == AddMode.ApiKey) AddMode.None else AddMode.ApiKey
-                        localNotice = null
-                        oauth.clearNotice()
+                    text = stringResource(R.string.accounts_add),
+                    onClick = { addSheet = true },
+                    leading = {
+                        Icon(
+                            Icons.Rounded.Add,
+                            contentDescription = null,
+                            tint = colors.accentInk,
+                            modifier = Modifier.size(ForgeSize.iconSm),
+                        )
                     },
-                    kind = if (mode == AddMode.ApiKey) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
-                )
-                ForgeButton(
-                    text = stringResource(R.string.accounts_sign_in),
-                    onClick = {
-                        mode = if (mode == AddMode.OAuth) AddMode.None else AddMode.OAuth
-                        localNotice = null
-                        oauth.clearNotice()
-                    },
-                    kind = if (mode == AddMode.OAuth) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
                 )
             }
 
@@ -456,41 +452,166 @@ fun AccountsScreen(
             }
         }
     }
+
+    if (addSheet) {
+        AddAccountSheet(
+            onDismiss = { addSheet = false },
+            onApiKey = { addSheet = false; mode = AddMode.ApiKey; localNotice = null },
+            onSignIn = { addSheet = false; mode = AddMode.OAuth; localNotice = null },
+        )
+    }
+    openAccount?.let { alias ->
+        snapshot.accounts.firstOrNull { it.alias == alias }?.let { account ->
+            AccountDetailSheet(
+                account = account,
+                onDismiss = { openAccount = null },
+                onSetActive = {
+                    openAccount = null
+                    scope.launch { repository.setActive(account.alias); repository.refresh() }
+                },
+                onRemove = {
+                    openAccount = null
+                    scope.launch {
+                        repository.remove(account.alias)
+                        localNotice = "Account removed."
+                        repository.refresh()
+                    }
+                },
+            )
+        }
+    }
+}
+
+/** The one Add action's two options. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddAccountSheet(
+    onDismiss: () -> Unit,
+    onApiKey: () -> Unit,
+    onSignIn: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+        containerColor = colors.surfaceRaised,
+        shape = ForgeShapes.sheet,
+    ) {
+        Column(
+            Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, bottom = ForgeSpace.xxxl),
+            verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+        ) {
+            Text(stringResource(R.string.accounts_add), style = type.h4, color = colors.text)
+            listOf(
+                stringResource(R.string.accounts_option_api_key) to onApiKey,
+                stringResource(R.string.accounts_option_sign_in) to onSignIn,
+            ).forEach { (label, action) ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = ForgeSize.touch)
+                        .clip(ForgeShapes.row)
+                        .clickable(onClick = action)
+                        .padding(horizontal = ForgeSpace.lg)
+                        .semantics { contentDescription = label; role = Role.Button },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(label, style = type.button, color = colors.text)
+                }
+            }
+        }
+    }
 }
 
 private enum class AddMode { None, ApiKey, OAuth }
 
+/**
+ * Provider glyph, label, identity line, and a check when it is the one in use.
+ * No ACTIVE badge (the check says it) and no Delete button on the row — a
+ * destructive action does not belong on a list row that is one mis-tap wide
+ * (addition F, A1/G3).
+ */
 @Composable
-private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () -> Unit) {
+private fun AccountRow(account: Account, onOpen: () -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
-    Card {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    account.label ?: account.identity ?: account.alias,
-                    style = type.sessionTitle,
-                    color = colors.text,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    listOfNotNull(
-                        account.provider,
-                        if (account.authKind == AuthKind.OAuth) "sign-in" else "API key",
-                        account.identity,
-                    ).joinToString(" · "),
-                    style = type.numeric,
-                    color = colors.textMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            if (account.active) {
-                StatePill(stringResource(R.string.accounts_active), colors.accent)
-            }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = ForgeSize.touch)
+            .clip(ForgeShapes.row)
+            .clickable(onClick = onOpen)
+            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SessionGlyph(
+            provider = account.provider,
+            state = SessionVisualState.Idle,
+            animate = false,
+        )
+        Column(
+            Modifier
+                .weight(1f)
+                .padding(start = ForgeSpace.lg),
+        ) {
+            Text(
+                account.label ?: account.alias,
+                style = type.sessionTitle,
+                color = colors.text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                listOfNotNull(
+                    account.identity,
+                    if (account.authKind == AuthKind.OAuth) "sign-in" else "API key",
+                ).joinToString(" · "),
+                style = type.sessionMeta,
+                color = colors.textMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+        if (account.active) {
+            Icon(
+                Icons.Rounded.Check,
+                contentDescription = stringResource(R.string.accounts_active),
+                tint = colors.accent,
+                modifier = Modifier.size(ForgeSize.iconSm),
+            )
+        }
+    }
+}
+
+/** Delete lives here, behind a confirmation (addition F, A1). */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AccountDetailSheet(
+    account: Account,
+    onDismiss: () -> Unit,
+    onSetActive: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    var confirming by remember { mutableStateOf(false) }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+        containerColor = colors.surfaceRaised,
+        shape = ForgeShapes.sheet,
+    ) {
+        Column(
+            Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, bottom = ForgeSpace.xxxl),
+            verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
+        ) {
+            Text(account.label ?: account.alias, style = type.h4, color = colors.text)
+            Text(
+                listOfNotNull(account.provider, account.identity).joinToString(" · "),
+                style = type.sessionMeta,
+                color = colors.textMuted,
+            )
             if (!account.active) {
                 ForgeButton(
                     text = stringResource(R.string.accounts_set_active),
@@ -498,11 +619,31 @@ private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () 
                     kind = ForgeButtonKind.Ghost,
                 )
             }
-            ForgeButton(
-                text = stringResource(R.string.action_delete),
-                onClick = onRemove,
-                kind = ForgeButtonKind.Destructive,
-            )
+            if (confirming) {
+                Text(
+                    stringResource(R.string.accounts_delete_confirm),
+                    style = type.sessionMeta,
+                    color = colors.red,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+                    ForgeButton(
+                        text = stringResource(R.string.action_cancel),
+                        onClick = { confirming = false },
+                        kind = ForgeButtonKind.Ghost,
+                    )
+                    ForgeButton(
+                        text = stringResource(R.string.action_delete),
+                        onClick = onRemove,
+                        kind = ForgeButtonKind.Destructive,
+                    )
+                }
+            } else {
+                ForgeButton(
+                    text = stringResource(R.string.action_delete),
+                    onClick = { confirming = true },
+                    kind = ForgeButtonKind.Destructive,
+                )
+            }
         }
     }
 }
@@ -517,7 +658,7 @@ private fun ProviderPicker(
     val colors = Forge.colors
     val type = Forge.type
     Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-        Text(stringResource(R.string.accounts_provider), style = type.label, color = colors.textMuted)
+        Text(stringResource(R.string.accounts_provider), style = type.sessionMeta, color = colors.textMuted)
         // A fixed Row squeezed the fifth provider to a four-pixel sliver on a
         // 360 dp phone. Wrapping keeps every label its own full width.
         FlowRow(
@@ -558,7 +699,9 @@ private fun LabelledField(
     val colors = Forge.colors
     val type = Forge.type
     Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs)) {
-        Text(label.uppercase(), style = type.label, color = colors.textMuted)
+        // Sentence case: uppercase tracked labels are the drawer's alone
+        // (addition F, G2).
+        Text(label, style = type.sessionMeta, color = colors.textMuted)
         Row(
             modifier = Modifier
                 .fillMaxWidth()

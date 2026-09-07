@@ -147,9 +147,10 @@ class SessionRowTest {
     }
 
     @Test
-    fun `a row with no title falls back to its id, never to a product name`() {
+    fun `an untitled row reads as New session, never as a raw id`() {
         val spoken = render(SessionRow(id = "abcdef123456", title = null)).joinToString(" ")
-        assertTrue(spoken.contains("Session abcdef"))
+        assertTrue(spoken.contains("New session"))
+        assertFalse("a raw id must not reach the user", spoken.contains("abcdef"))
     }
 
     @Test

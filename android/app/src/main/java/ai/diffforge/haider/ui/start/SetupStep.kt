@@ -58,8 +58,10 @@ fun SetupStepRow(
         ) {
             Text(stringResource(titleRes(step.id)), style = type.sessionTitle, color = colors.text)
             if (step.done) {
+                // One line of status, in regular type: this is not machine
+                // output (addition F, G1/F3).
                 doneDetail?.let {
-                    Text(it, style = type.numeric, color = colors.green)
+                    Text(it, style = type.sessionMeta, color = colors.green)
                 }
             } else if (step.current) {
                 Text(stringResource(bodyRes(step.id)), style = type.sessionMeta, color = colors.textMuted)

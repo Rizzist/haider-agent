@@ -9,7 +9,6 @@ import ai.diffforge.haider.ui.chat.Message
 import ai.diffforge.haider.ui.chat.Role
 import ai.diffforge.haider.ui.chat.ToolCall
 import ai.diffforge.haider.ui.chat.ToolStatus
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -57,6 +56,11 @@ class FakeDaemonService(
     private val _catalogRequestedAtMs = MutableStateFlow<Long?>(null)
     private val _searchIndex = MutableStateFlow(SearchIndexState())
     private val _providers = MutableStateFlow(ProviderInventory())
+    private val _shell = MutableStateFlow(
+        // What `tools.inventory` reports on an android-standalone daemon:
+        // ProcessExec is neither advertised nor dispatchable (C4).
+        ShellAvailability(available = false, reason = "process_exec_disabled"),
+    )
 
     override val status: StateFlow<DaemonStatus> = _status.asStateFlow()
     override val environment: StateFlow<DaemonEnvironment> = _environment.asStateFlow()
@@ -68,6 +72,7 @@ class FakeDaemonService(
     override val catalogRequestedAtMs: StateFlow<Long?> = _catalogRequestedAtMs.asStateFlow()
     override val searchIndex: StateFlow<SearchIndexState> = _searchIndex.asStateFlow()
     override val providers: StateFlow<ProviderInventory> = _providers.asStateFlow()
+    override val shell: StateFlow<ShellAvailability> = _shell.asStateFlow()
 
     private val transcripts = mutableMapOf<String, MutableList<Message>>()
     private var hiddenPages: List<List<SessionRow>> = emptyList()
@@ -246,6 +251,11 @@ class FakeDaemonService(
         _providers.value = inventory
     }
 
+    /** So a later lane's on-device shell can be exercised before it exists. */
+    fun setShell(availability: ShellAvailability) {
+        _shell.value = availability
+    }
+
     override suspend fun start() {
         calls += "start"
         _status.value = DaemonStatus.Starting
@@ -285,7 +295,6 @@ class FakeDaemonService(
         }
         calls += "loadMoreSessions"
         _paging.value = _paging.value.copy(loading = true)
-        delay(1)
         val page = hiddenPages.first()
         hiddenPages = hiddenPages.drop(1)
         _sessions.value = _sessions.value + page

@@ -65,6 +65,14 @@ class StartSurfaceTest {
         rule.setHaiderApp(service)
         rule.onNodeWithText("Haider runs on this phone").assertIsDisplayed()
         rule.onNodeWithText("Run Haider in the background").assertIsDisplayed()
+        // The lede paragraph and the monospace version line are gone (F, F1).
+        assertEquals(
+            0,
+            rule.onAllNodesWithTextSafe(
+                "The agent, its sessions and its transcripts live in this app. " +
+                    "Four steps and it is yours.",
+            ),
+        )
         // The 970 connect form is gone (D9).
         assertEquals(0, rule.onAllNodesWithTextSafe("Host"))
         assertEquals(0, rule.onAllNodesWithTextSafe("Port"))
@@ -95,17 +103,24 @@ class StartSurfaceTest {
     }
 
     @Test
-    fun `a completed setup drops the checklist for the ready line`() {
+    fun `a completed setup drops the checklist and the hero for the suggestions`() {
         val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
         rule.setHaiderApp(service)
-        rule.onNodeWithText("Ready. Ask for anything on this phone.").assertIsDisplayed()
+        rule.onNodeWithText("Try").assertIsDisplayed()
         assertEquals(0, rule.onAllNodesWithTextSafe("Keep it alive on One UI"))
+        // Addition F, F1/S7: no logo, no version line, no "Ready." sentence.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Ready. Ask for anything on this phone."))
+        assertEquals(0, rule.onAllNodesWithTextSafe("v0.0.971 · no server, no Termux"))
     }
 
     @Test
-    fun `with sessions the suggestions give way to recent sessions`() {
-        val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
+    fun `suggestions are hidden until the daemon is ready`() {
+        // Before that they are a list of things the app cannot do (F, F2).
+        val service = ComposeHost.install(FakeScenario.FirstRun)
         rule.setHaiderApp(service)
-        assertTrue(rule.onAllNodesWithTextSafe("WHEN YOU ARE READY") > 0)
+        assertEquals(0, rule.onAllNodesWithTextSafe("Try"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Summarise the texts I missed today"))
+        // And the composer says what to do instead of a helper sentence.
+        assertTrue(rule.onAllNodesWithTextSafe("Start Haider to begin") > 0)
     }
 }

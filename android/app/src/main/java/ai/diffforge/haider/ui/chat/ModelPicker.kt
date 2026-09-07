@@ -142,9 +142,9 @@ private fun CacheChangeConfirmation(
         is PendingSelection.Effort -> selection.effort ?: "provider-default effort"
     }
     Column(modifier = Modifier.fillMaxWidth().padding(ForgeSpace.xxl)) {
-        Text("CONFIRM CACHE EPOCH", style = type.label, color = colors.amber)
-        Spacer(Modifier.size(ForgeSpace.md))
-        Text("Switch to $target?", style = type.h4, color = colors.text)
+        // The question is the title; the uppercase eyebrow above it said the
+        // same thing in a shout (addition F, G2).
+        Text("Switch to $target?", style = type.h4, color = colors.amber)
         Spacer(Modifier.size(ForgeSize.stateDot))
         Text(
             "This can invalidate stable prompt tokens and start a new context-cache epoch. " +
@@ -198,8 +198,8 @@ private fun CatalogList(
     ) {
         item {
             Text(
-                "EFFORT",
-                style = type.label,
+                "Effort",
+                style = type.sessionMeta,
                 color = colors.textMuted,
                 modifier = Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, top = ForgeSpace.xl, bottom = ForgeSpace.sm),
             )
@@ -241,7 +241,9 @@ private fun CatalogList(
                 ) {
                     BrandMark(provider.id)
                     Spacer(Modifier.width(ForgeSpace.md))
-                    Text(provider.id.uppercase(), style = type.label, color = colors.textSoft)
+                    // The id is already the brand as it is written everywhere else
+                    // — "anthropic", not "ANTHROPIC" (addition F, G2).
+                    Text(provider.id, style = type.sessionTitle, color = colors.textSoft)
                     Spacer(Modifier.weight(1f))
                     Box(
                         Modifier.size(ForgeSize.stateDot).clip(CircleShape).background(
@@ -250,8 +252,8 @@ private fun CatalogList(
                     )
                     Spacer(Modifier.width(ForgeSpace.xs))
                     Text(
-                        if (available) "AVAILABLE" else provider.availability.uppercase(),
-                        style = type.label,
+                        if (available) "available" else provider.availability,
+                        style = type.sessionMeta,
                         color = if (available) colors.green else colors.textMuted,
                     )
                 }

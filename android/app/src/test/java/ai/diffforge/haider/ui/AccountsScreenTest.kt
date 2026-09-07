@@ -61,13 +61,18 @@ class AccountsScreenTest {
     fun `an existing account shows its provider and masked identity`() {
         render()
         rule.onNodeWithText("Work").assertIsDisplayed()
-        assertTrue(rule.onAllNodesWithTextSafe("anthropic · sign-in · you@anthropic") > 0)
+        // Glyph + label + identity line; the ACTIVE badge is a check now (A1).
+        assertTrue(rule.onAllNodesWithTextSafe("you@anthropic · sign-in") > 0)
+        assertEquals(0, rule.onAllNodesWithTextSafe("ACTIVE"))
     }
 
     @Test
     fun `adding an api key stages, validates and clears the field`() {
         render()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("sk-live-abcdefgh9999")
         rule.onNodeWithText("Save").performClick()
@@ -83,7 +88,10 @@ class AccountsScreenTest {
     @Test
     fun `the key never appears in the semantics tree in clear text`() {
         render()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("sk-live-abcdefgh9999")
         rule.waitForIdle()
@@ -101,7 +109,10 @@ class AccountsScreenTest {
     fun `a short key is refused and no account is created`() {
         render()
         val before = repository.snapshot.value.accounts.size
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("short")
         rule.onNodeWithText("Save").performClick()
@@ -113,7 +124,10 @@ class AccountsScreenTest {
     @Test
     fun `starting a sign-in opens the daemon-supplied url and waits`() {
         render()
-        rule.onNodeWithText("Sign in with a provider").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Sign in with a provider").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("Anthropic").performClick()
         rule.onNodeWithText("Start sign-in").performClick()
         rule.waitForIdle()
@@ -129,7 +143,10 @@ class AccountsScreenTest {
     @Test
     fun `a device flow shows its user code instead of a redirect`() {
         render()
-        rule.onNodeWithText("Sign in with a provider").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Sign in with a provider").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("Kimi").performClick()
         rule.onNodeWithText("Start sign-in").performClick()
         rule.waitForIdle()
@@ -137,8 +154,14 @@ class AccountsScreenTest {
     }
 
     @Test
-    fun `removing an account calls the remove door`() {
+    fun `removing an account is behind its detail sheet and a confirmation`() {
         render()
+        // No destructive button on a list row (A1).
+        assertEquals(0, rule.onAllNodesWithTextSafe("Delete"))
+        rule.onNodeWithText("Work").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithText("Delete").performClick()
+        rule.waitForIdle()
         rule.onNodeWithText("Delete").performClick()
         rule.waitForIdle()
         assertTrue(repository.calls.contains("account.remove"))
