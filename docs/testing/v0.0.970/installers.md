@@ -1,5 +1,75 @@
 # v0.0.970 installer lane
 
+## Release run 4 repair — lane 970-winiss
+
+This update supersedes the historical Windows inspection-only verdict below.
+Candidate `71c4f45e130e13a197b1020b9b35c71542bdbd51` (fourth `v0.0.970`
+tag) reached Windows installer compilation in release run `34094765449`.
+The `Build sign and inspect Windows installer` step failed at `windows.iss:35`:
+`Unknown type 'HKEY'`. The preceding absent-signing-input SKIP was expected;
+ISCC aborted before the native lifecycle gate. Nothing was published in that run.
+Earlier Python source scans never compiled the Pascal Script.
+
+The repair uses `Integer` for the external registry root, matching Inno Setup 6.
+The live [support reference](https://jrsoftware.org/ishelp/topic_scriptfunctions.htm)
+now contains newer signatures; the versioned
+[Inno 6.7.3 reference source](https://github.com/jrsoftware/issrc/blob/is-6_7_3/ISHelp/isxfunc.xml)
+and [DLL examples](https://github.com/jrsoftware/issrc/blob/is-6_7_3/Examples/CodeDll.iss)
+were used to check compatibility. `Cardinal` DWORDs, `var` outputs, Unicode
+strings, `stdcall`, and the null data pointer remain appropriate for Inno 6's
+32-bit Setup/Uninstall. `RegGetValueW` remains necessary: the built-in string
+query accepts both string types, the DWORD query reads only DWORD data, and
+value existence does not distinguish `REG_SZ` from `REG_EXPAND_SZ`.
+
+The type query now checks its status and rejects unexpected types before PATH
+mutation; a missing PATH still defaults to `REG_EXPAND_SZ`. The original type
+is read once for saving/writing, and a dead assignment is removed. See the
+[DLL reference](https://jrsoftware.org/ishelp/topic_scriptdll.htm) and
+[RegGetValueW contract](https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-reggetvaluew).
+An additional audited edge case is fixed: restoring a saved `REG_SZ` when
+the current value is `REG_EXPAND_SZ` first removes that value, because
+[RegWriteStringValue preserves an existing expandable type](https://jrsoftware.org/ishelp/topic_isxfunc_regwritestringvalue.htm).
+The owner key, ARP configuration, PATH token cleanup order, and silent versus
+interactive state-removal behavior retain their contracts.
+
+`xplat-check` now runs `Windows installer compile check (advisory)` immediately
+after checkout in `check (x86_64-pc-windows-msvc)` only. It installs Inno Setup
+6 if absent with the release workflow's Chocolatey snippet and invokes
+`packaging/installers/windows-compile-check.ps1`. Per registry #80 the step
+has `continue-on-error: true` until its first green CI run, after which it must
+be made required. The release owner must inspect this individual step's actual
+result on the new candidate before retagging; a green advisory job alone is
+not compiler evidence.
+
+The compile script creates disposable `haider.exe`, `haiderd.exe`, and
+`haider-tui.exe` stubs in a checksummed ZIP, calls `installer_payload.prepare`
+to produce the release-format manifest, and uses the same hash-validating
+`scripts/windows_installer_inputs.py` renderer as `windows-build.ps1`.
+It runs [ISCC `/Qp`](https://jrsoftware.org/ishelp/topic_compilercmdline.htm)
+on the real template, throws on preparation/compilation errors, and removes
+all temporary output. It neither signs nor executes the stubs/installer,
+runs no lifecycle gate, and produces no retained release assets.
+Python tests exercise this real renderer, exact generated members/definitions,
+and rejection of altered bytes, bad manifest hashes, coordinates and members.
+
+Local repair validation passed all **53 Python tests** using Python 3.12.14
+and `HAIDER_INSTALL_TEST_BIN_DIR` pointing to the checksum-verified macOS ARM64
+split payload from run `34094765449`, artifact `10013247348`, at the exact
+`71c4f45e` candidate. The initial Python 3.9 run failed an existing use of
+`Path.write_text(newline=...)` and lacked the required native sibling directory;
+no test was skipped or changed to bypass those requirements. YAML parsing
+passed with PyYAML 6.0.3 in a temporary venv. The new fixture/render CLI was
+also exercised directly, including a nonzero hash-mismatch refusal before
+any compiler inputs were written. Full command/exit-code logs are in the
+lane's external evidence directory, `state/evidence/970-winiss/1-impl`.
+
+The native Windows install → upgrade → uninstall gate still runs **only in the
+release installers job**, through `windows-build.ps1`, before signature checks,
+sidecars and asset upload. It is unchanged and required. This Mac has no
+Windows, Wine, ISCC or PowerShell; local renderer/test evidence is not native
+compiler or lifecycle evidence. This repair is **pending Windows CI and
+independent verification, not SHIP**. No commit, push or tag is made by this lane.
+
 ## Scope and source audit
 
 Base and live fetched wave: `5468dec1fd4d7b09c2f704d5d408c3f9e19a4374`.
@@ -180,7 +250,7 @@ which is now explicit in docs. The package-manager no-user-state-hooks rule is
 preserved; no claim is made that Unix unlink terminates a live process. This
 changed documentation only, not code, tests or the verdict.
 
-## Verdict
+## Historical verdict (superseded by release run 4 repair status above)
 
 SHIP for the lane implementation and source bundle: all required local gates
 pass and independent code reviews return SHIP by inspection. Native Windows/Linux

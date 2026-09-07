@@ -12,28 +12,14 @@ $Payload = (Resolve-Path $Payload).Path
 $Manifest = (Resolve-Path $Manifest).Path
 New-Item -ItemType Directory -Force $Output | Out-Null
 $Output = (Resolve-Path $Output).Path
-$metadata = Get-Content -Raw $Manifest | ConvertFrom-Json
-if ($metadata.version -ne $Version -or $metadata.target -ne $Target) { throw 'Manifest release mismatch' }
 $work = Join-Path ([IO.Path]::GetTempPath()) ('haider-inno-' + [guid]::NewGuid())
 New-Item -ItemType Directory $work | Out-Null
 $cert = $null
 try {
-    $files = @()
-    foreach ($member in $metadata.members.PSObject.Properties) {
-        if ($member.Name -notmatch '^haider[a-zA-Z0-9_-]*\.exe$') { throw "Invalid binary member: $($member.Name)" }
-        $source = Join-Path $Payload $member.Name
-        if ((Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne $member.Value) { throw "Payload hash mismatch: $source" }
-        $files += ('Source: "{0}"; DestDir: "{{app}}"; Flags: ignoreversion' -f $source)
-    }
-    if ($files.Count -lt 2 -or !$metadata.members.PSObject.Properties['haider.exe'] -or !$metadata.members.PSObject.Properties['haiderd.exe']) { throw 'Missing required binaries' }
-    $files += ('Source: "{0}"; DestDir: "{{app}}"; DestName: "installer-manifest.json"; Flags: ignoreversion' -f $Manifest)
-    $files | Set-Content (Join-Path $work 'members.iss') -Encoding utf8
-    @(
-        "#define ReleaseVersion `"$Version`"",
-        "#define ReleaseTarget `"$Target`"",
-        "#define OutputPath `"$Output`""
-    ) | Set-Content (Join-Path $work 'generated.iss') -Encoding utf8
-    Copy-Item (Join-Path $PSScriptRoot 'windows.iss') (Join-Path $work 'windows.iss')
+    # Share the hash-checked renderer with the pre-tag compile check.
+    & python (Join-Path $PSScriptRoot '../../scripts/windows_installer_inputs.py') render `
+        --payload $Payload --manifest $Manifest --version $Version --target $Target --output $Output --work $work
+    if ($LASTEXITCODE -ne 0) { throw 'Windows installer input preparation failed' }
     $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
     if (!(Test-Path $iscc)) { throw 'Inno Setup 6 is required' }
     $compileArgs = @('/Qp')

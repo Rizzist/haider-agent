@@ -32,22 +32,43 @@ SignedUninstaller=yes
 const
   OwnerKey = 'Software\HaiderInstaller';
 
-function RegGetValue(RootKey: HKEY; SubKey, Name: String; Flags: Cardinal;
+{ Inno Setup 6 runs 32-bit Setup/Uninstall even in 64-bit install mode.
+  Integer is its registry root type; Cardinal is a DWORD and can carry the
+  NULL data pointer (0). Kind and Size pass DWORDs by reference.
+  RegQueryStringValue accepts both string kinds without reporting which one. }
+function RegGetValue(RootKey: Integer; SubKey, Name: String; Flags: Cardinal;
   var Kind: Cardinal; Data: Cardinal; var Size: Cardinal): Integer;
   external 'RegGetValueW@advapi32.dll stdcall';
 
 function PathKind: Cardinal;
-var Size: Cardinal;
+var
+  Size, Kind: Cardinal;
+  Status: Integer;
 begin
   Size := 0;
+  Kind := 0;
   Result := 2;
-  RegGetValue(HKCU, 'Environment', 'Path', $1000FFFF, Result, 0, Size);
+  { RRF_RT_ANY or RRF_NOEXPAND; query type/size only, with pvData = NULL. }
+  Status := RegGetValue(HKCU, 'Environment', 'Path', $1000FFFF, Kind, 0, Size);
+  if Status = 2 then exit; { ERROR_FILE_NOT_FOUND: new PATH is REG_EXPAND_SZ. }
+  if Status <> 0 then RaiseException('Could not query the user PATH type');
+  if (Kind <> 1) and (Kind <> 2) then
+    RaiseException('The user PATH must be REG_SZ or REG_EXPAND_SZ');
+  Result := Kind;
 end;
 
 procedure WritePath(Value: String; Kind: Cardinal);
 var Written: Boolean;
 begin
-  if Kind = 1 then Written := RegWriteStringValue(HKCU, 'Environment', 'Path', Value)
+  if Kind = 1 then begin
+    { RegWriteStringValue preserves an existing REG_EXPAND_SZ type. Remove
+      that value first only when restoring an explicitly saved REG_SZ. }
+    if RegValueExists(HKCU, 'Environment', 'Path') then
+      if PathKind = 2 then
+        if not RegDeleteValue(HKCU, 'Environment', 'Path') then
+          RaiseException('Could not restore the user PATH type');
+    Written := RegWriteStringValue(HKCU, 'Environment', 'Path', Value);
+  end
   else Written := RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Value);
   if not Written then RaiseException('Could not update the user PATH');
 end;
@@ -60,20 +81,21 @@ end;
 procedure CurStepChanged(Step: TSetupStep);
 var
   Value, Original: String;
+  Kind: Cardinal;
 begin
   if Step <> ssPostInstall then exit;
   if not RegQueryStringValue(HKCU, OwnerKey, 'AddedPath', Original) then begin
     RegQueryStringValue(HKCU, 'Environment', 'Path', Value);
     if not PathContains(Value, ExpandConstant('{app}')) then begin
+      Kind := PathKind;
       RegWriteStringValue(HKCU, OwnerKey, 'OriginalPath', Value);
-      RegWriteDWordValue(HKCU, OwnerKey, 'OriginalKind', PathKind);
+      RegWriteDWordValue(HKCU, OwnerKey, 'OriginalKind', Kind);
       if RegValueExists(HKCU, 'Environment', 'Path') then
         RegWriteDWordValue(HKCU, OwnerKey, 'PathExisted', 1)
       else RegWriteDWordValue(HKCU, OwnerKey, 'PathExisted', 0);
-      Original := Value;
       if Value <> '' then Value := Value + ';';
       Value := Value + ExpandConstant('{app}');
-      WritePath(Value, PathKind);
+      WritePath(Value, Kind);
       RegWriteStringValue(HKCU, OwnerKey, 'AddedPath', ExpandConstant('{app}'));
       RegWriteStringValue(HKCU, OwnerKey, 'WrittenPath', Value);
     end;

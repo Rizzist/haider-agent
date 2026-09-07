@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -154,6 +155,95 @@ class InstallerPackagingTests(unittest.TestCase):
         self.assertIn("RegDeleteValue(HKCU, 'Environment', 'Path')", cleanup)
         self.assertIn('RegDeleteKeyIncludingSubkeys(HKCU, OwnerKey)', cleanup)
         self.assertNotIn('usPostUninstall', cleanup)
+
+    def windows_inputs(self, *args):
+        return subprocess.run([sys.executable, str(ROOT / 'scripts/windows_installer_inputs.py'),
+                               *map(str, args)], capture_output=True, text=True)
+
+    def windows_fixture(self):
+        work = self.root / 'Inno compile inputs ü'
+        result = self.windows_inputs('fixture', '--work', work)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return work
+
+    def render_windows_fixture(self, work, **overrides):
+        values = dict(payload=work / 'payload', manifest=work / 'payload/manifest.json',
+                      version='0.0.970', target='x86_64-pc-windows-msvc',
+                      output=work / 'output', work=work / 'rerendered')
+        values.update(overrides)
+        args = [arg for name, value in values.items() for arg in (f'--{name}', value)]
+        return self.windows_inputs('render', *args)
+
+    def test_windows_compile_fixture_renders_verified_members_and_definitions(self):
+        work = self.windows_fixture()
+        manifest_path = work / 'payload/manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(set(manifest['members']), {'haider.exe', 'haiderd.exe', 'haider-tui.exe'})
+        expected = []
+        for name, digest in sorted(manifest['members'].items()):
+            source = work / 'payload' / name
+            self.assertEqual(digest, payload.digest(source.read_bytes()))
+            expected.append(f'Source: "{source.resolve()}"; DestDir: "{{app}}"; Flags: ignoreversion')
+        expected.append(f'Source: "{manifest_path.resolve()}"; DestDir: "{{app}}"; '
+                        'DestName: "installer-manifest.json"; Flags: ignoreversion')
+        self.assertEqual((work / 'members.iss').read_text(encoding='utf-8-sig').splitlines(), expected)
+        self.assertEqual((work / 'generated.iss').read_text(encoding='utf-8-sig').splitlines(), [
+            '#define ReleaseVersion "0.0.970"',
+            '#define ReleaseTarget "x86_64-pc-windows-msvc"',
+            f'#define OutputPath "{(work / "output").resolve()}"'])
+        self.assertEqual((work / 'windows.iss').read_bytes(),
+                         (ROOT / 'packaging/installers/windows.iss').read_bytes())
+        # Preparation does not execute stubs or create an installer/release asset.
+        self.assertEqual(list((work / 'output').iterdir()), [])
+        result = self.render_windows_fixture(work)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((work / 'members.iss').read_bytes(),
+                         (work / 'rerendered/members.iss').read_bytes())
+
+    def test_windows_compile_renderer_refuses_changed_payload_and_manifest_hash(self):
+        work = self.windows_fixture()
+        member = work / 'payload/haider-tui.exe'
+        original = member.read_bytes()
+        member.write_bytes(b'changed payload')
+        result = self.render_windows_fixture(work)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Payload hash mismatch', result.stderr)
+        self.assertFalse((work / 'rerendered').exists())
+        member.write_bytes(original)
+        manifest_path = work / 'payload/manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest['members']['haider.exe'] = '0' * 64
+        manifest_path.write_text(json.dumps(manifest))
+        result = self.render_windows_fixture(work)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Payload hash mismatch', result.stderr)
+        self.assertFalse((work / 'rerendered').exists())
+
+    def test_windows_compile_renderer_refuses_invalid_coordinates_and_members(self):
+        work = self.windows_fixture()
+        for values, error in [({'version': '0.0.969'}, 'Manifest release mismatch'),
+                              ({'version': '0.0.970;bad'}, 'Invalid Windows release coordinates'),
+                              ({'target': 'aarch64-apple-darwin'}, 'Invalid Windows release coordinates')]:
+            with self.subTest(values=values):
+                result = self.render_windows_fixture(work, **values)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+        manifest_path = work / 'payload/manifest.json'
+        original = manifest_path.read_text()
+        for invalid_name in ('../haider.exe', 'haider.exe"; DestDir: "elsewhere'):
+            manifest = json.loads(original)
+            manifest['members'][invalid_name] = '0' * 64
+            manifest_path.write_text(json.dumps(manifest))
+            result = self.render_windows_fixture(work)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Invalid binary member', result.stderr)
+        manifest = json.loads(original)
+        del manifest['members']['haiderd.exe']
+        manifest_path.write_text(json.dumps(manifest))
+        result = self.render_windows_fixture(work)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Missing required binaries', result.stderr)
+        self.assertFalse((work / 'rerendered').exists())
 
     @unittest.skipIf(os.name == 'nt', 'POSIX shell uninstaller runs on macOS/Linux')
     def test_tarball_uninstall_refuses_changed_binary_before_any_removal(self):
