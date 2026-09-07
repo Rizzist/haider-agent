@@ -35,7 +35,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 
-enum class SessionRowAction { Rename, Fork, StopTurn, CopyId }
+enum class SessionRowAction { Rename, Fork, CopyId }
 
 /**
  * One line: the provider glyph and the title. That is the whole row.
@@ -80,11 +80,8 @@ fun SessionRowItem(
         add(CustomAccessibilityAction(stringResource(R.string.action_fork)) {
             onAction(SessionRowAction.Fork); true
         })
-        if (row.runId != null) {
-            add(CustomAccessibilityAction(stringResource(R.string.action_stop_turn)) {
-                onAction(SessionRowAction.StopTurn); true
-            })
-        }
+        // No Stop custom action: TalkBack must not offer a second turn Stop
+        // that the screen does not have (E2, verify-6 O2).
         add(CustomAccessibilityAction(stringResource(R.string.action_copy_session_id)) {
             onAction(SessionRowAction.CopyId); true
         })

@@ -19,6 +19,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,6 +34,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.material.icons.rounded.Accessibility
+import androidx.compose.material.icons.rounded.Screenshot
+import androidx.compose.material.icons.rounded.Sms
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.BatteryFull
+import ai.diffforge.haider.ui.state.PermissionStanding
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -178,22 +187,28 @@ fun SettingsScreen(
             // Rows, not paragraphs: title, one-line status, chevron. The
             // explanation and the action live on the row's detail sheet
             // (addition F, T2).
+            // Every status below is read back from Android, not printed from
+            // a literal (verify-6 O3).
             PermissionRow(
+                icon = Icons.Rounded.Accessibility,
                 title = stringResource(R.string.settings_permission_accessibility),
-                status = stringResource(R.string.permission_ask_each_time),
+                status = standing(state.permissions.accessibility),
                 onClick = { detail = PermissionDetail.Accessibility },
             )
             PermissionRow(
+                icon = Icons.Rounded.Screenshot,
                 title = stringResource(R.string.settings_permission_screen),
-                status = stringResource(R.string.permission_ask_each_time),
+                status = standing(state.permissions.screenCapture),
                 onClick = { detail = PermissionDetail.ScreenCapture },
             )
             PermissionRow(
+                icon = Icons.Rounded.Sms,
                 title = stringResource(R.string.settings_permission_sms),
-                status = stringResource(R.string.permission_not_granted),
+                status = standing(state.permissions.sms),
                 onClick = { detail = PermissionDetail.Sms },
             )
             PermissionRow(
+                icon = Icons.Rounded.Notifications,
                 title = stringResource(R.string.settings_permission_notifications),
                 status = stringResource(
                     if (state.environment.notificationsGranted) {
@@ -205,6 +220,7 @@ fun SettingsScreen(
                 onClick = { detail = PermissionDetail.Notifications },
             )
             PermissionRow(
+                icon = Icons.Rounded.BatteryFull,
                 title = stringResource(R.string.settings_permission_battery),
                 status = stringResource(
                     if (state.environment.batteryRestricted) {
@@ -265,9 +281,27 @@ internal fun Card(content: @Composable () -> Unit) {
 internal enum class PermissionDetail { Accessibility, ScreenCapture, Sms, Notifications, Battery }
 
 @Composable
-private fun PermissionRow(title: String, status: String, onClick: () -> Unit) {
-    NavigationRow(title = title, subtitle = status, onClick = onClick)
+private fun PermissionRow(
+    icon: ImageVector,
+    title: String,
+    status: String,
+    onClick: () -> Unit,
+) {
+    // T2 asks for a leading icon; without it every row is a wall of text and
+    // the list cannot be scanned (verify-6 O9).
+    NavigationRow(title = title, subtitle = status, onClick = onClick, icon = icon)
 }
+
+/** The word for what Android said. An unobserved status says so. */
+@Composable
+private fun standing(value: PermissionStanding): String = stringResource(
+    when (value) {
+        PermissionStanding.Granted -> R.string.permission_granted
+        PermissionStanding.NotGranted -> R.string.permission_not_granted
+        PermissionStanding.AskEachTime -> R.string.permission_ask_each_time
+        PermissionStanding.Unknown -> R.string.permission_unknown
+    },
+)
 
 /** The explanation and the action, on the row that asked for them. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -326,7 +360,12 @@ private fun PermissionDetailSheet(
 }
 
 @Composable
-internal fun NavigationRow(title: String, subtitle: String?, onClick: () -> Unit) {
+internal fun NavigationRow(
+    title: String,
+    subtitle: String?,
+    onClick: () -> Unit,
+    icon: ImageVector? = null,
+) {
     val colors = Forge.colors
     val type = Forge.type
     Row(
@@ -340,6 +379,17 @@ internal fun NavigationRow(title: String, subtitle: String?, onClick: () -> Unit
             .padding(horizontal = ForgeSpace.xl),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        icon?.let {
+            Icon(
+                it,
+                contentDescription = null,
+                tint = colors.textSoft,
+                modifier = Modifier
+                    .size(ForgeSize.iconMd)
+                    .padding(end = ForgeSpace.xxs),
+            )
+            Spacer(Modifier.width(ForgeSpace.lg))
+        }
         Column(Modifier.weight(1f)) {
             Text(title, style = type.sessionTitle, color = colors.text)
             subtitle?.let {

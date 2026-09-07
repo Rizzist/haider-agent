@@ -77,11 +77,14 @@ class HaiderTopBarTest {
     }
 
     @Test
-    fun `stop turn is disabled when the snapshot carries no run id`() {
+    fun `the overflow has no Stop at all, enabled or otherwise`() {
+        // It used to carry a Stop that was merely disabled without a run_id.
+        // E2 says the composer owns the only one, so the entry is gone rather
+        // than greyed (verify-6 O2).
         val service = ComposeHost.install(FakeScenario.ErroredTurn)
         rule.setHaiderApp(service)
         rule.onNodeWithContentDescription("More options").performClick()
-        rule.onNodeWithContentDescription("Stop turn").assertIsNotEnabled()
+        assertEquals(0, rule.onAllNodesWithTextSafe("Stop turn"))
     }
 
     @Test
@@ -91,7 +94,8 @@ class HaiderTopBarTest {
         rule.onNodeWithContentDescription("More options").performClick()
         // Matched by contentDescription: "Settings" is also a drawer footer row,
         // and the drawer is composed even while closed.
-        listOf("Session details", "Rename", "Fork session", "Clear transcript", "Settings")
+        // No Clear transcript (verify-6 O1) and no Stop (O2).
+        listOf("Session details", "Rename", "Fork session", "Settings")
             .forEach { rule.onNodeWithContentDescription(it).assertIsDisplayed() }
     }
 

@@ -83,6 +83,8 @@ object SetupPlan {
 data class AppUiState(
     val daemon: DaemonStatus = DaemonStatus.Stopped,
     val environment: DaemonEnvironment = DaemonEnvironment(),
+    /** Android-side permission facts the Activity observed (verify-6 O3). */
+    val permissions: PermissionSnapshot = PermissionSnapshot(),
     val sessions: List<SessionRow> = emptyList(),
     val paging: RosterPaging = RosterPaging(),
     val activeSessionId: String? = null,

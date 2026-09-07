@@ -527,7 +527,6 @@ fun ChatViewModel.applyRowAction(sessionId: String, action: SessionRowAction) {
             Overlay.Rename(sessionId, session(sessionId)?.title.orEmpty()),
         )
         SessionRowAction.Fork -> fork(sessionId)
-        SessionRowAction.StopTurn -> stopTurn(sessionId)
         SessionRowAction.CopyId -> closeOverlay()
     }
 }
@@ -540,8 +539,6 @@ fun ChatViewModel.applyTopBarAction(action: TopBarAction) {
             openOverlay(Overlay.Rename(it, session(it)?.title.orEmpty()))
         }
         TopBarAction.Fork -> sessionId?.let { fork(it) }
-        TopBarAction.StopTurn -> stopTurn(sessionId)
-        TopBarAction.ClearTranscript -> sessionId?.let { clearTranscript(it) }
         TopBarAction.Settings -> openOverlay(Overlay.Settings)
     }
 }

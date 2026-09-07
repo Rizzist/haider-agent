@@ -33,7 +33,6 @@ object ForgeSize {
     val iconMd = 20.dp
     val iconSm = 18.dp
     val avatar = 22.dp
-    val markLg = 34.dp
 
     /** Session-row state rail. */
     val rail = 3.dp
@@ -47,8 +46,8 @@ object ForgeSize {
     val contextRow = 32.dp
     val stateDot = 6.dp
     val badgeDot = 9.dp
-    val chip = 32.dp
-    val filterChip = 30.dp
+    /** Chip visual height. 36 dp inside a 48 dp target (addition F, S5). */
+    val chip = 36.dp
     val segmented = 36.dp
     val bannerAction = 34.dp
     val footerRow = 52.dp

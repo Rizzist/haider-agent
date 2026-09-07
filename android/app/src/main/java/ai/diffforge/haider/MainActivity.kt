@@ -13,18 +13,24 @@ import ai.diffforge.haider.ui.scaffold.HaiderApp
 import ai.diffforge.haider.ui.scaffold.SharedPreferencesBannerDismissals
 import ai.diffforge.haider.ui.scaffold.SystemAction
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.service.HaiderAccessibilityService
+import ai.diffforge.haider.ui.state.PermissionSnapshot
+import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.state.PermissionClassifier
 import ai.diffforge.haider.ui.theme.ThemeMode
 import ai.diffforge.haider.ui.theme.ThemePreferences
 import ai.diffforge.haider.update.ApkUpdateCoordinator
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -112,7 +118,56 @@ class MainActivity : ComponentActivity() {
 
     private val smsPermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) { /* reflected when the transport reports capabilities.changed */ }
+    ) {
+        // Settings used to print "Not granted" for SMS no matter what the
+        // dialog returned, because nothing read the answer back (verify-6 O3).
+        publishPermissions()
+    }
+
+    /**
+     * What Android currently says, read fresh.
+     *
+     * Accessibility comes from the secure setting the system Settings app
+     * writes, so the row agrees with the switch the user just saw. Screen
+     * capture is genuinely per-session: MediaProjection keeps no durable grant
+     * to read, so "ask each time" is the fact, not a placeholder.
+     */
+    private fun observePermissions(): PermissionSnapshot = PermissionSnapshot(
+        accessibility = if (accessibilityServiceEnabled()) {
+            PermissionStanding.Granted
+        } else {
+            PermissionStanding.NotGranted
+        },
+        screenCapture = PermissionStanding.AskEachTime,
+        sms = if (
+            ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_SMS) ==
+            PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECEIVE_SMS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            PermissionStanding.Granted
+        } else {
+            PermissionStanding.NotGranted
+        },
+    )
+
+    private fun publishPermissions() {
+        viewModel?.onPermissionsObserved(observePermissions())
+    }
+
+    private fun accessibilityServiceEnabled(): Boolean {
+        val enabled = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+        ).orEmpty()
+        val component = ComponentName(this, HaiderAccessibilityService::class.java)
+        return enabled.split(':').any {
+            it.equals(component.flattenToString(), ignoreCase = true) ||
+                it.equals(component.flattenToShortString(), ignoreCase = true)
+        }
+    }
+
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -224,6 +279,9 @@ class MainActivity : ComponentActivity() {
         if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityResumed(this)
         // The user may have granted it in system settings while we were away.
         syncNotificationPermission()
+        // Same for accessibility and SMS: returning from system Settings is
+        // the usual way either of those changes (verify-6 O3).
+        publishPermissions()
     }
 
     private fun syncNotificationPermission() {

@@ -170,8 +170,9 @@ class SessionRowTest {
         val actions = customActions()
         assertTrue(actions.contains("Rename"))
         assertTrue(actions.contains("Fork session"))
-        // Stop turn only when the snapshot carries a run_id.
-        assertTrue(actions.contains("Stop turn"))
+        // No Stop, even with a live run_id: the composer owns the only turn
+        // Stop, and TalkBack must not be offered a second one (verify-6 O2).
+        assertFalse(actions.contains("Stop turn"))
         // There is no session.delete RPC, so there is no Delete action.
         assertFalse(actions.contains("Delete"))
     }

@@ -59,8 +59,10 @@ object SendButtonMatrix {
         daemon is DaemonStatus.Starting ||
             daemon is DaemonStatus.Restarting ||
             daemon is DaemonStatus.Stopping -> ComposerState(
+            // No helper line. G5 leaves the composer with the allowed
+            // error/disconnected sentence only, and the banner above already
+            // says "Starting Haider…" with a progress line (verify-6 O7).
             button = SendButtonState.Starting,
-            helperRes = R.string.composer_helper_starting,
             inputEnabled = false,
         )
         daemon is DaemonStatus.Running && inputRequired -> ComposerState(

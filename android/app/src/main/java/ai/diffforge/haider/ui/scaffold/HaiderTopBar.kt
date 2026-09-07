@@ -51,8 +51,6 @@ enum class TopBarAction {
     SessionDetails,
     Rename,
     Fork,
-    StopTurn,
-    ClearTranscript,
     Settings,
 }
 
@@ -189,15 +187,12 @@ fun HaiderTopBar(
                         menuOpen = false
                         onAction(TopBarAction.Fork)
                     }
-                    // Enabled only when the snapshot carries a run_id.
-                    OverflowItem(R.string.action_stop_turn, session?.runId != null) {
-                        menuOpen = false
-                        onAction(TopBarAction.StopTurn)
-                    }
-                    OverflowItem(R.string.action_clear_transcript, session != null) {
-                        menuOpen = false
-                        onAction(TopBarAction.ClearTranscript)
-                    }
+                    // No Stop here. E2 puts the one turn Stop on the composer,
+                    // and an overflow entry alongside it was two Stops on one
+                    // screen (verify-6 O2). No Clear either: there is no
+                    // session.clear RPC, so it could only ever have emptied the
+                    // local view while the daemon kept every message —
+                    // contracts-v1 forbids exactly that (verify-6 O1).
                     OverflowItem(R.string.action_settings, true) {
                         menuOpen = false
                         onAction(TopBarAction.Settings)
@@ -238,7 +233,9 @@ private data class Subtitle(val text: String, val dot: androidx.compose.ui.graph
 private fun title(state: AppUiState, session: SessionRow?): String = when {
     session == null -> stringResource(R.string.header_fallback_title)
     !session.title.isNullOrBlank() -> session.title
-    else -> stringResource(R.string.header_session_fallback, session.id.take(6))
+    // A blank title is a new session, not a raw id: "Session s-new-" was the
+    // id leaking into the face S7 says it must never reach (verify-6 O6).
+    else -> stringResource(R.string.header_new_session)
 }
 
 @Composable

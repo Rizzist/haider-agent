@@ -1,5 +1,6 @@
 package ai.diffforge.haider.ui.chat
 
+import ai.diffforge.haider.ui.state.RelativeTime
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.components.ForgeButton
@@ -206,7 +207,7 @@ private fun ThinkingFold(message: Message) {
                 tint = colors.ember,
                 modifier = Modifier.size(ForgeSize.iconMd),
             )
-            Text("Thinking", style = type.toolRow, color = colors.textMuted)
+            Text("Thinking", style = type.sessionMeta, color = colors.textMuted)
         }
         if (expanded) {
             Text(
@@ -258,7 +259,7 @@ private fun ToolCluster(messageId: Long, tools: List<ToolCall>, streaming: Boole
                 Spacer(Modifier.width(ForgeSpace.xs))
                 Text(
                     "${tools.size} tool calls",
-                    style = type.toolRow,
+                    style = type.sessionMeta,
                     color = colors.textSoft,
                 )
             }
@@ -307,6 +308,17 @@ private fun ToolRow(tool: ToolCall) {
                 )
             } else {
                 Spacer(Modifier.weight(1f))
+            }
+            // A finished call says how long it took, in the row itself, and
+            // only when the daemon supplied the number (S3, verify-6 O8).
+            tool.durationMs?.takeIf { tool.status != ToolStatus.Running }?.let {
+                Spacer(Modifier.width(ForgeSpace.md))
+                Text(
+                    RelativeTime.elapsed(it),
+                    style = type.sessionMeta,
+                    color = colors.textMuted,
+                    maxLines = 1,
+                )
             }
             Spacer(Modifier.width(ForgeSpace.md))
             // A dot and a lowercase word, not a bordered pill (addition F, G3).

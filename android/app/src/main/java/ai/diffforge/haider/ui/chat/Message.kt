@@ -7,7 +7,6 @@ data class Message(
     val text: String,
     val thinking: String = "",
     val streaming: Boolean = false,
-    val status: String? = null,
     val tools: List<ToolCall> = emptyList(),
     val error: String? = null,
     /** `ChatReply.Error.retryable`; the 970 parser read it and threw it away. */
@@ -23,6 +22,15 @@ data class ToolCall(
     val summary: String,
     val status: ToolStatus,
     val result: String?,
+    /**
+     * How long the call took, when the daemon actually said so.
+     *
+     * S3 moved the duration off the trailing "— 41s" line and into the row;
+     * round 6 deleted the line and never carried the number, so a finished call
+     * showed no time at all (verify-6 O8). Null means the projection had no
+     * duration — it is never computed from a clock the UI happens to own.
+     */
+    val durationMs: Long? = null,
 )
 
 enum class ToolStatus {

@@ -78,7 +78,7 @@ fun ModelPicker(
                     Text("Model & provider", style = type.h4, color = colors.text)
                     Text(
                         config?.let { "${it.current.provider} / ${it.current.model}" } ?: "Loading daemon catalog…",
-                        style = type.toolRow,
+                        style = type.sessionMeta,
                         color = colors.textMuted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -225,7 +225,7 @@ private fun CatalogList(
                 if (selectedModel?.supportedEfforts.isNullOrEmpty()) {
                     Text(
                         "This model does not advertise an effort ladder.",
-                        style = type.toolRow,
+                        style = type.sessionMeta,
                         color = colors.textMuted,
                         modifier = Modifier.padding(horizontal = ForgeSpace.md, vertical = ForgeSpace.xs),
                     )

@@ -9,6 +9,7 @@ import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.PermissionSnapshot
 import ai.diffforge.haider.ui.state.SessionFilter
 import ai.diffforge.haider.ui.state.SessionListState
 import ai.diffforge.haider.ui.state.SetupPlan
@@ -158,10 +159,11 @@ class ChatViewModel(
         closeOverlay()
     }
 
-    fun clearTranscript(sessionId: String) {
-        transcripts[sessionId] = emptyList()
-        if (_state.value.activeSessionId == sessionId) update { it.copy(messages = emptyList()) }
-    }
+    // There is deliberately no clearTranscript. The daemon has no session.clear
+    // RPC, so the only thing this could do was empty the local list while every
+    // message stayed on disk — the transcript came straight back on the next
+    // attach. contracts-v1 forbids an action that implies durable deletion it
+    // cannot perform (verify-6 O1).
 
     // ---------- the turn ----------
 
@@ -341,6 +343,14 @@ class ChatViewModel(
         viewModelScope.launch {
             service.reportNotificationPermission(granted, permanentlyDenied)
         }
+
+    /**
+     * The Activity is the only thing that can see Android's own answer, so it
+     * pushes what it observed. Called on resume and after a permission result
+     * (verify-6 O3).
+     */
+    fun onPermissionsObserved(snapshot: PermissionSnapshot) =
+        update { it.copy(permissions = snapshot) }
 
     fun skipBatteryStep() {
         batterySkipped = true

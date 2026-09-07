@@ -405,44 +405,6 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
 }
 
 @Composable
-private fun FilterRow(
-    filter: SessionFilter,
-    counts: ai.diffforge.haider.ui.state.SessionListCounts,
-    onFilter: (SessionFilter) -> Unit,
-) {
-    val colors = Forge.colors
-    val type = Forge.type
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = ForgeSize.touch),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
-    ) {
-        listOf(
-            Triple(SessionFilter.All, R.string.drawer_filter_all, counts.all),
-            Triple(SessionFilter.Running, R.string.drawer_filter_running, counts.running),
-            Triple(SessionFilter.NeedsInput, R.string.drawer_filter_needs_input, counts.needsInput),
-        ).forEach { (value, labelRes, count) ->
-            val label = stringResource(labelRes, count)
-            ForgeChip(
-                onClick = { onFilter(value) },
-                height = ForgeSize.filterChip,
-                selected = filter == value,
-                contentDescription = label,
-            ) {
-                Text(
-                    label,
-                    style = type.sessionMeta,
-                    color = if (filter == value) colors.accent else colors.textMuted,
-                    maxLines = 1,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun DrawerFooter(
     state: AppUiState,
     themeMode: ThemeMode,

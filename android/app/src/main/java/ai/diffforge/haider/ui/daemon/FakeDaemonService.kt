@@ -373,7 +373,7 @@ class FakeDaemonService(
         }
         transcripts[sessionId]?.let { messages ->
             val index = messages.indexOfLast { it.streaming }
-            if (index >= 0) messages[index] = messages[index].copy(streaming = false, status = null)
+            if (index >= 0) messages[index] = messages[index].copy(streaming = false)
         }
     }
 
@@ -472,7 +472,6 @@ class FakeDaemonService(
             role = Role.Agent,
             text = "",
             streaming = true,
-            status = "queued…",
             provider = _models.value?.current?.provider,
         )
         _sessions.value = _sessions.value.map {
@@ -766,7 +765,6 @@ class FakeDaemonService(
             text = "Reproduced it. The nav controller pops past the start destination.",
             thinking = "Checking the back stack invariants first.",
             streaming = true,
-            status = "shell · gradlew test — 41s",
             provider = "anthropic",
             tools = listOf(
                 ToolCall("call-1", "shell", "gradlew :app:test", ToolStatus.Running, null),
@@ -781,6 +779,11 @@ class FakeDaemonService(
             role = Role.Agent,
             text = "Drafted the reply. It needs your approval before it goes out.",
             provider = "anthropic",
+            // A finished call, with the duration the daemon reported: the row
+            // is where that number belongs now (S3, verify-6 O8).
+            tools = listOf(
+                ToolCall("call-sms", "sms", "read inbox", ToolStatus.Completed, null, durationMs = 41_000L),
+            ),
         ),
     )
 

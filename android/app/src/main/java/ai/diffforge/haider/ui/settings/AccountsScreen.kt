@@ -230,6 +230,12 @@ fun AccountsScreen(
                 )
             }
 
+            // Independent of the add form, and of whether this screen was
+            // recreated while the browser had the foreground (verify-6 O4).
+            attempt?.let { live ->
+                Card { LiveOAuthPanel(live = live, onOpenUrl = onOpenUrl, onCancel = { oauth.cancel() }) }
+            }
+
             when (mode) {
                 AddMode.None -> Unit
 
@@ -367,9 +373,11 @@ fun AccountsScreen(
                     }
                 }
 
-                AddMode.OAuth -> Card {
-                    val live = attempt
-                    if (live == null) {
+                // The live attempt is rendered above, outside this form: it
+                // belongs to a process-scoped controller and outlives the
+                // composition, so a browser return that resets `mode` must not
+                // make a running sign-in disappear (verify-6 O4).
+                AddMode.OAuth -> if (attempt == null) Card {
                         ProviderPicker(
                             providers = providers.filter { it.supportsOAuth },
                             selected = provider,
@@ -399,58 +407,6 @@ fun AccountsScreen(
                             },
                             enabled = provider != null && !busy,
                         )
-                    } else {
-                        Column(
-                            verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
-                            modifier = Modifier.testTag(ACCOUNTS_OAUTH_WAITING_TAG),
-                        ) {
-                            Text(
-                                when (live.phase) {
-                                    OAuthAttemptController.Phase.Waiting ->
-                                        if (live.flow.style == OAuthStyle.Device) {
-                                            stringResource(R.string.accounts_oauth_device)
-                                        } else {
-                                            stringResource(R.string.accounts_oauth_waiting)
-                                        }
-                                    OAuthAttemptController.Phase.Exchanging ->
-                                        stringResource(R.string.accounts_oauth_exchanging)
-                                    OAuthAttemptController.Phase.Claiming ->
-                                        stringResource(R.string.accounts_oauth_claiming)
-                                    OAuthAttemptController.Phase.Failed,
-                                    OAuthAttemptController.Phase.Committed,
-                                    -> stringResource(R.string.accounts_oauth_waiting)
-                                },
-                                style = type.chatBody,
-                                color = colors.text,
-                            )
-                            live.flow.userCode?.let {
-                                Text(
-                                    stringResource(R.string.accounts_oauth_code, it),
-                                    style = type.numeric,
-                                    color = colors.accent,
-                                )
-                            }
-                            Text(
-                                stringResource(R.string.accounts_oauth_return_hint),
-                                style = type.sessionMeta,
-                                color = colors.textMuted,
-                            )
-                            Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-                                live.flow.authorizationUrl?.let { url ->
-                                    ForgeButton(
-                                        text = stringResource(R.string.accounts_oauth_open_again),
-                                        onClick = { onOpenUrl(url) },
-                                        kind = ForgeButtonKind.Ghost,
-                                    )
-                                }
-                                ForgeButton(
-                                    text = stringResource(R.string.action_cancel),
-                                    onClick = { oauth.cancel() },
-                                    kind = ForgeButtonKind.Ghost,
-                                )
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -468,15 +424,27 @@ fun AccountsScreen(
             AccountDetailSheet(
                 account = account,
                 onDismiss = { openAccount = null },
+                // Both of these return a result, and round 6 threw both away:
+                // a refused revision, a lost connection or a confirmation
+                // requirement announced "Account removed." anyway (lane 971-3
+                // handoff). Announce only what actually happened.
                 onSetActive = {
                     openAccount = null
-                    scope.launch { repository.setActive(account.alias); repository.refresh() }
+                    scope.launch {
+                        when (val result = repository.setActive(account.alias)) {
+                            AccountResult.Ok -> localNotice = null
+                            is AccountResult.Failed -> localNotice = result.publicCode
+                        }
+                        repository.refresh()
+                    }
                 },
                 onRemove = {
                     openAccount = null
                     scope.launch {
-                        repository.remove(account.alias)
-                        localNotice = "Account removed."
+                        when (val result = repository.remove(account.alias)) {
+                            AccountResult.Ok -> localNotice = "Account removed."
+                            is AccountResult.Failed -> localNotice = result.publicCode
+                        }
                         repository.refresh()
                     }
                 },
@@ -743,6 +711,73 @@ private fun LabelledField(
             trailing?.let {
                 Box(Modifier.padding(end = ForgeSpace.xs)) { it() }
             }
+        }
+    }
+}
+
+/**
+ * A sign-in that is already running.
+ *
+ * It is drawn from the process-scoped controller alone, so leaving for the
+ * browser and coming back — which recreates this screen with a fresh, empty
+ * add-form mode — still shows the waiting panel and its Cancel (verify-6 O4).
+ */
+@Composable
+private fun LiveOAuthPanel(
+    live: OAuthAttemptController.Attempt,
+    onOpenUrl: (String) -> Unit,
+    onCancel: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    Column(
+        verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+        modifier = Modifier.testTag(ACCOUNTS_OAUTH_WAITING_TAG),
+    ) {
+        Text(
+            when (live.phase) {
+                OAuthAttemptController.Phase.Waiting ->
+                    if (live.flow.style == OAuthStyle.Device) {
+                        stringResource(R.string.accounts_oauth_device)
+                    } else {
+                        stringResource(R.string.accounts_oauth_waiting)
+                    }
+                OAuthAttemptController.Phase.Exchanging ->
+                    stringResource(R.string.accounts_oauth_exchanging)
+                OAuthAttemptController.Phase.Claiming ->
+                    stringResource(R.string.accounts_oauth_claiming)
+                OAuthAttemptController.Phase.Failed,
+                OAuthAttemptController.Phase.Committed,
+                -> stringResource(R.string.accounts_oauth_waiting)
+            },
+            style = type.chatBody,
+            color = colors.text,
+        )
+        live.flow.userCode?.let {
+            Text(
+                stringResource(R.string.accounts_oauth_code, it),
+                style = type.numeric,
+                color = colors.accent,
+            )
+        }
+        Text(
+            stringResource(R.string.accounts_oauth_return_hint),
+            style = type.sessionMeta,
+            color = colors.textMuted,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+            live.flow.authorizationUrl?.let { url ->
+                ForgeButton(
+                    text = stringResource(R.string.accounts_oauth_open_again),
+                    onClick = { onOpenUrl(url) },
+                    kind = ForgeButtonKind.Ghost,
+                )
+            }
+            ForgeButton(
+                text = stringResource(R.string.action_cancel),
+                onClick = onCancel,
+                kind = ForgeButtonKind.Ghost,
+            )
         }
     }
 }

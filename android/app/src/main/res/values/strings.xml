@@ -10,7 +10,6 @@
     <string name="app_subtitle_setup">Setting up · step %1$d of %2$d</string>
     <string name="header_new_session">New session</string>
     <string name="header_fallback_title">Haider</string>
-    <string name="header_session_fallback">Session %1$s</string>
 
     <!-- Start surface -->
     <string name="start_title">Haider runs on this phone</string>
@@ -136,10 +135,6 @@
     <string name="chip_model_no_daemon">Start Haider first</string>
     <string name="chip_model_changing">changing…</string>
     <string name="composer_placeholder">Message Haider…</string>
-    <string name="composer_helper_running">Haider is working — tap the stop button to end this turn.</string>
-    <string name="composer_helper_paused">The turn is paused.</string>
-    <string name="composer_helper_setup">Finish setup to send.</string>
-    <string name="composer_helper_starting">Starting Haider…</string>
     <string name="composer_placeholder_paused">Answer above to continue…</string>
     <string name="composer_context_estimated">~%1$s ctx</string>
     <string name="composer_context_exact">%1$s ctx</string>
@@ -163,7 +158,6 @@
     <string name="action_rename">Rename</string>
     <string name="action_fork">Fork session</string>
     <string name="action_stop_turn">Stop turn</string>
-    <string name="action_clear_transcript">Clear transcript</string>
     <string name="action_settings">Settings</string>
     <string name="action_copy_session_id">Copy session id</string>
     <string name="action_delete">Delete</string>
@@ -184,6 +178,10 @@
     <string name="permission_granted">Granted</string>
     <string name="permission_not_granted">Not granted</string>
     <string name="permission_ask_each_time">Ask each time</string>
+    <string name="permission_unknown">Not checked yet</string>
+    <string name="setup_status_done">Done</string>
+    <string name="setup_status_now">Now</string>
+    <string name="setup_status_pending">Not yet</string>
     <string name="accounts_status_line">%1$d account · %2$s</string>
     <string name="accounts_status_empty">No accounts</string>
     <string name="accounts_add">Add account</string>
