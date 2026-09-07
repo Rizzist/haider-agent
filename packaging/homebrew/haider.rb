@@ -2,25 +2,25 @@ class Haider < Formula
   desc "Provider-agnostic coding-agent TUI and runtime"
   homepage "https://github.com/Rizzist/haider-agent"
   license "LicenseRef-KOA-P-1.0"
-  version "0.0.969"
+  version "0.0.970"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.969/haider-v0.0.969-aarch64-apple-darwin.tar.xz"
-      sha256 "cd3da7c826669bae30bac48aed9b5d1ff7c8c5b18b788fdb126472557f25bfbe"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin-split.tar.xz"
+      sha256 "af491b0ff35a3308cef7740e964bc5477dbe302ad1b9fe777d81180e8c0ba1b4"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.969/haider-v0.0.969-x86_64-apple-darwin.tar.xz"
-      sha256 "fbba256f1790dd618825856afe88d59d4b3944a2bb34483a6a0af9cb837b3c1e"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-x86_64-apple-darwin-split.tar.xz"
+      sha256 "054e21356fadff577a2e2d99622dd41ea3ca62ee3ff8ede23151ea3d7f28a5ba"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.969/haider-v0.0.969-aarch64-unknown-linux-gnu.tar.xz"
-      sha256 "0f805d26de131f78f2dad4f809a284f77c0722baa6de5d54bc10f98db1db85a9"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-unknown-linux-gnu-split.tar.xz"
+      sha256 "cc32f8d1dbe9be0ee13b765187b90db1c6cc81f65620b8a6c5e95992b8e703fc"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.969/haider-v0.0.969-x86_64-unknown-linux-gnu.tar.xz"
-      sha256 "cc26d496c588e75663665981e0cd94504d900cc9d370595eb99fdc0f59848937"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-x86_64-unknown-linux-gnu-split.tar.xz"
+      sha256 "c2130890836f85a09266579521be8339e673ce47eb7678c78033df751e3bce44"
     end
   end
 
