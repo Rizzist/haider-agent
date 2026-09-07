@@ -1,0 +1,50 @@
+[
+  {
+    "type": "user_message",
+    "text": "Find the old conversation",
+    "attachments": [],
+    "mode": "queue"
+  },
+  {
+    "type": "item",
+    "event": "started",
+    "item_id": "answer-1",
+    "item": {
+      "item": "agent_message",
+      "text": ""
+    }
+  },
+  {
+    "type": "item",
+    "event": "delta",
+    "item_id": "answer-1",
+    "delta": {
+      "delta": "text",
+      "text": "Found "
+    }
+  },
+  {
+    "type": "item",
+    "event": "completed",
+    "item_id": "answer-1",
+    "item": {
+      "item": "agent_message",
+      "text": "Found your conversation"
+    }
+  },
+  {
+    "type": "item",
+    "event": "completed",
+    "item_id": "plan-1",
+    "item": {
+      "item": "plan",
+      "items": [
+        {
+          "id": 1,
+          "text": "Visible plan must not vanish from coverage",
+          "state": "listed"
+        }
+      ]
+    }
+  }
+]

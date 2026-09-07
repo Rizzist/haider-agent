@@ -3,6 +3,10 @@ name: android-apk
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths: ['android/**', 'crates/**', 'scripts/android/**', 'Cargo.*', '.cargo/config.toml', '.github/workflows/android-apk.yml']
+  schedule:
+    - cron: '21 2 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -14,7 +18,11 @@ permissions:
 
 jobs:
   build-apk:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      RUST_MIN_STACK: '8388608'
     steps:
       - uses: actions/checkout@v4
       - name: unsafe-count gate
@@ -28,9 +36,22 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: install SDK packages
-        run: |
-          yes | sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" >/dev/null || true
+      - name: install pinned SDK and NDK
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;28.2.13676358"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: install pinned cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: host embedding, policy, vault, RPC and lifecycle tests
+        run: cargo test --locked -p haider-android -p haider-rpc -p haider-accounts -p haider-daemon -p haider-platform
+
+      - name: native verification script tests
+        run: python3 -m unittest discover -s scripts/android -p 'test_*.py'
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -63,15 +84,26 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: build and verify both native libraries from this checkout
+        working-directory: android
+        run: gradle :app:buildHaiderNative --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2
+
+      - name: archive unstripped native symbols by ELF build ID
+        uses: actions/upload-artifact@v4
+        with:
+          name: haider-android-native-symbols
+          path: android/app/build/generated/haiderNative/symbols/**
+          if-no-files-found: error
+
       - name: test and assemble release APK
         id: assemble
         working-directory: android
         shell: bash
         env:
-          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_B64: ${{ github.event_name != 'pull_request' && github.event_name != 'schedule' && secrets.ANDROID_KEYSTORE_B64 || '' }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && github.event_name != 'schedule' && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+          ANDROID_KEY_ALIAS: ${{ github.event_name != 'pull_request' && github.event_name != 'schedule' && secrets.ANDROID_KEY_ALIAS || '' }}
+          ANDROID_KEY_PASSWORD: ${{ github.event_name != 'pull_request' && github.event_name != 'schedule' && secrets.ANDROID_KEY_PASSWORD || '' }}
         run: |
           set -euo pipefail
           KEYSTORE="$RUNNER_TEMP/haider-release.jks"
@@ -92,13 +124,13 @@ jobs:
           unset ANDROID_KEYSTORE_B64
 
           export ANDROID_KEYSTORE_PATH="$KEYSTORE"
-          gradle -p buildSrc test --no-daemon --stacktrace
-          gradle :app:testReleaseUnitTest :app:assembleRelease \
+          gradle -p buildSrc test --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 --stacktrace
+          gradle :app:testPhoneReleaseUnitTest :app:testEmulatorDebugUnitTest :app:assemblePhoneRelease :app:assembleEmulatorDebug :app:assembleEmulatorDebugAndroidTest \
             -PhaiderVersion="${{ steps.version.outputs.version }}" \
-            --no-daemon --stacktrace
+            --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 --stacktrace
 
           if [ "$SIGNING_READY" = true ]; then
-            mapfile -t APKS < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
+            mapfile -t APKS < <(find app/build/outputs/apk/phone/release -maxdepth 1 -type f -name '*.apk' -print)
             test "${#APKS[@]}" -eq 1
             APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
             test -x "$APKSIGNER" || {
@@ -118,6 +150,31 @@ jobs:
             echo "::notice::unsigned release build completed; APK artifact upload skipped"
           fi
 
+      - name: verify APK version, native ABI contents and 16 KiB ZIP alignment
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          LLVM="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          for entry in 'phone/release arm64-v8a' 'emulator/debug x86_64'; do
+            read -r variant abi <<< "$entry"
+            mapfile -t APKS < <(find "android/app/build/outputs/apk/$variant" -maxdepth 1 -name '*.apk')
+            test "${#APKS[@]}" -eq 1
+            python3 scripts/android/verify-native.py --apk "${APKS[0]}" --abi "$abi" --version "$VERSION" \
+              --readelf "$LLVM/llvm-readelf" --zipalign "$BT/zipalign" --aapt2 "$BT/aapt2"
+          done
+
+      - name: archive emulator APK and instrumentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: haider-android-emulator-tests
+          path: |
+            android/app/build/outputs/apk/emulator/debug/*.apk
+            android/app/build/outputs/apk/androidTest/emulator/debug/*.apk
+          if-no-files-found: error
+
       - name: stage APK and checksum
         if: steps.assemble.outputs.signed == 'true'
         shell: bash
@@ -125,7 +182,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          mapfile -t APKS < <(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
+          mapfile -t APKS < <(find android/app/build/outputs/apk/phone/release -maxdepth 1 -type f -name '*.apk' -print)
           test "${#APKS[@]}" -eq 1 || {
             echo "expected exactly one release APK, found ${#APKS[@]}" >&2
             exit 1
@@ -141,4 +198,79 @@ jobs:
         with:
           name: haider-android-release
           path: dist-android/*
+          if-no-files-found: error
+
+  emulator-pr:
+    # Registry #80: advisory until the first recorded green GitHub runner execution.
+    continue-on-error: true
+    needs: build-apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: haider-android-emulator-tests
+          path: emulator-apks
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          cores: 2
+          ram-size: 2048M
+          disable-animations: true
+          script: python3 scripts/android/emulator-gate.py --serial emulator-5554 --owned-emulator --apks emulator-apks --tier pr --evidence emulator-evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-emulator-pr-evidence
+          path: emulator-evidence/**
+          if-no-files-found: error
+
+  emulator-nightly:
+    # Advisory stubs exercise actual reboot/Doze and a real 16 KiB image. Never fake protected broadcasts.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    needs: build-apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tier: nightly
+            target: google_apis
+          - tier: 16k
+            target: google_apis_ps16k
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: haider-android-emulator-tests
+          path: emulator-apks
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: ${{ matrix.target }}
+          cores: 2
+          ram-size: 2048M
+          disable-animations: true
+          script: python3 scripts/android/emulator-gate.py --serial emulator-5554 --owned-emulator --apks emulator-apks --tier ${{ matrix.tier }} --evidence emulator-evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-emulator-${{ matrix.tier }}-evidence
+          path: emulator-evidence/**
           if-no-files-found: error

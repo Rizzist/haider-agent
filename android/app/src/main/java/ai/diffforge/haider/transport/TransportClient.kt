@@ -1,5 +1,7 @@
 package ai.diffforge.haider.transport
 
+import ai.diffforge.haider.BuildConfig
+
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -103,6 +105,7 @@ class TransportClient(
     }
 
     fun start() {
+        check(BuildConfig.LEGACY_TERMUX_TRANSPORT) { "Legacy Termux transport is disabled" }
         synchronized(lifecycleMutex) {
             if (stopping || runner?.isActive == true) return
             runner = scope.launch {
