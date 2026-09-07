@@ -60,6 +60,13 @@ data class BannerInputs(
     val batteryRestricted: Boolean = false,
     val network: NetworkState = NetworkState.Available,
     val update: UpdateUiState = UpdateUiState.Hidden,
+    /**
+     * During first-run setup the checklist *is* the message (UI-SPEC 3.8): the
+     * daemon, notification and battery banners all repeat a step the user is
+     * already looking at, so ranks 1, 2, 4 and 5 stay quiet. Ranks 3, 6 and 7
+     * still speak, because none of them is on the checklist.
+     */
+    val firstRun: Boolean = false,
 )
 
 data class BannerResolution(
@@ -100,8 +107,8 @@ object BannerResolver {
     fun candidates(inputs: BannerInputs): List<BannerModel> {
         val out = mutableListOf<BannerModel>()
 
-        when (val daemon = inputs.daemon) {
-            is DaemonStatus.Failed -> out += BannerModel(
+        when (val daemon = if (inputs.firstRun) DaemonStatus.Stopped else inputs.daemon) {
+            is DaemonStatus.Failed -> if (!inputs.firstRun) out += BannerModel(
                 rank = 1,
                 severity = BannerSeverity.Error,
                 title = BannerText.of(R.string.banner_stopped_title),
@@ -112,7 +119,7 @@ object BannerResolver {
                 secondaryLabel = BannerText.of(R.string.banner_daemon_details_action),
                 secondaryAction = BannerAction.OpenDaemonDetails,
             )
-            DaemonStatus.Stopped -> out += BannerModel(
+            DaemonStatus.Stopped -> if (!inputs.firstRun) out += BannerModel(
                 rank = 1,
                 severity = BannerSeverity.Error,
                 title = BannerText.of(R.string.banner_stopped_title),
@@ -121,7 +128,8 @@ object BannerResolver {
                 action = BannerAction.StartDaemon,
                 filledAction = true,
             )
-            DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping -> out += BannerModel(
+            DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping ->
+                if (!inputs.firstRun) out += BannerModel(
                 rank = 2,
                 severity = BannerSeverity.Warning,
                 title = BannerText.of(R.string.banner_starting_title),
@@ -143,7 +151,9 @@ object BannerResolver {
             )
         }
 
-        if (inputs.notificationsSupported && !inputs.notificationsGranted) {
+        // Ranks 4 and 5 are setup steps 2 and 3: during first run the checklist
+        // already asks for them, and a banner repeating it is noise.
+        if (inputs.notificationsSupported && !inputs.notificationsGranted && !inputs.firstRun) {
             out += BannerModel(
                 rank = 4,
                 severity = BannerSeverity.Warning,
@@ -155,7 +165,7 @@ object BannerResolver {
             )
         }
 
-        if (inputs.batteryRestricted) {
+        if (inputs.batteryRestricted && !inputs.firstRun) {
             out += BannerModel(
                 rank = 5,
                 severity = BannerSeverity.Warning,

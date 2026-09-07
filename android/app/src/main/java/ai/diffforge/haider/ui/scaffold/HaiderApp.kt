@@ -122,6 +122,7 @@ fun HaiderApp(
                 batteryRestricted = state.environment.batteryRestricted,
                 network = state.environment.network,
                 update = updateState,
+                firstRun = !state.setup.complete && state.sessions.isEmpty(),
             ),
             dismissals = dismissals.snapshot(),
             nowMs = nowMs,
@@ -302,7 +303,9 @@ fun HaiderApp(
                                     onRetry = { viewModel.send() },
                                     modifier = Modifier.fillMaxSize(),
                                 )
-                                if (state.turnRunning) {
+                                // Nothing is streaming while the turn is parked
+                                // on a question: the answer is the affordance.
+                                if (state.turnRunning && !state.needsInputHere) {
                                     StickyStopChip(
                                         onStop = { viewModel.stopTurn() },
                                         modifier = Modifier

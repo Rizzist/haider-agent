@@ -152,7 +152,10 @@ fun Composer(
                 modifier = Modifier
                     .weight(1f)
                     .onFocusChanged { focused = it.isFocused }
-                    .padding(vertical = ForgeSpace.md),
+                    .padding(vertical = ForgeSpace.md)
+                    // The field is a target in its own right, not just the row
+                    // around it, so the minimum goes inside the padding.
+                    .heightIn(min = ForgeSize.touch),
                 decorationBox = { inner ->
                     Box {
                         if (text.isEmpty()) {

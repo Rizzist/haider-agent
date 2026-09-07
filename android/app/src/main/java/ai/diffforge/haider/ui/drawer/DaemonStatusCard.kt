@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
@@ -127,8 +128,12 @@ private fun phrase(status: DaemonStatus): String = when (status) {
 fun resourceLine(running: DaemonStatus.Running?, activeTurns: Int, nowMs: Long): String {
     val info = running?.info ?: return ""
     val segments = buildList {
-        info.sessionCount?.let { add(stringResource(R.string.daemon_sessions_segment, it.toInt())) }
-        if (activeTurns > 0) add(stringResource(R.string.daemon_turns_segment, activeTurns))
+        info.sessionCount?.let {
+            add(pluralStringResource(R.plurals.daemon_sessions_segment, it.toInt(), it.toInt()))
+        }
+        if (activeTurns > 0) {
+            add(pluralStringResource(R.plurals.daemon_turns_segment, activeTurns, activeTurns))
+        }
         info.pssBytes?.let { add(stringResource(R.string.daemon_memory_segment, (it / (1024 * 1024)).toString())) }
         RelativeTime.duration(info.startedAtElapsedRealtimeMs, nowMs)
             .takeIf { it.isNotEmpty() }

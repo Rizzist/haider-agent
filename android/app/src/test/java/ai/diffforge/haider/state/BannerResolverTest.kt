@@ -70,7 +70,7 @@ class BannerResolverTest {
             BannerResolver.resolve(
                 BannerInputs(
                     daemon = running,
-                    update = UpdateUiState.Available(AvailableUpdate("v0.0.972", "url", "sha", 1L)),
+                    update = UpdateUiState.Available(AvailableUpdate("v0.0.972", "0.0.972", "apk", "sha")),
                 ),
             ).model!!.rank,
         )
@@ -140,6 +140,39 @@ class BannerResolverTest {
         ).model!!
         assertEquals(ai.diffforge.haider.ui.state.BannerSeverity.Info, model.severity)
         assertNull(model.action)
+    }
+
+    @Test
+    fun `first run shows no daemon banner - the checklist is the message`() {
+        val inputs = BannerInputs(daemon = DaemonStatus.Stopped, firstRun = true)
+        assertNull(BannerResolver.resolve(inputs).model)
+        assertNull(
+            BannerResolver.resolve(
+                BannerInputs(daemon = DaemonStatus.Starting, firstRun = true),
+            ).model,
+        )
+        // The notification and battery banners are checklist steps too.
+        assertNull(
+            BannerResolver.resolve(
+                BannerInputs(
+                    daemon = DaemonStatus.Stopped,
+                    notificationsGranted = false,
+                    batteryRestricted = true,
+                    firstRun = true,
+                ),
+            ).model,
+        )
+        // What is not on the checklist still speaks.
+        assertEquals(
+            6,
+            BannerResolver.resolve(
+                BannerInputs(
+                    daemon = DaemonStatus.Stopped,
+                    network = NetworkState.Unavailable,
+                    firstRun = true,
+                ),
+            ).model!!.rank,
+        )
     }
 
     @Test

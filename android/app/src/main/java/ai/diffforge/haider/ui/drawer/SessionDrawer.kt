@@ -14,7 +14,9 @@ import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
 import ai.diffforge.haider.ui.theme.ThemeMode
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -54,6 +56,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -286,10 +292,18 @@ private fun IdentityBlock(appVersion: String, onClose: () -> Unit) {
     }
 }
 
+/**
+ * One full-width target. "New session with…" is the long press, as the spec
+ * intends: the same choices (model, effort) are a tap away in the footer's
+ * Model row, so the gesture is never the only path.
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun NewSessionRow(onClick: () -> Unit, onLongClick: () -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
+    val label = stringResource(R.string.drawer_new_session)
+    val withLabel = stringResource(R.string.drawer_new_session_with)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -297,7 +311,11 @@ private fun NewSessionRow(onClick: () -> Unit, onLongClick: () -> Unit) {
             .clip(ForgeShapes.pill)
             .background(colors.accentWash)
             .border(ForgeSize.hairline, colors.accent, ForgeShapes.pill)
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .semantics {
+                contentDescription = label
+                customActions = listOf(CustomAccessibilityAction(withLabel) { onLongClick(); true })
+            }
             .padding(horizontal = ForgeSpace.xl),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
@@ -308,18 +326,7 @@ private fun NewSessionRow(onClick: () -> Unit, onLongClick: () -> Unit) {
             tint = colors.accent,
             modifier = Modifier.size(ForgeSize.iconSm),
         )
-        Text(stringResource(R.string.drawer_new_session), style = type.button, color = colors.accent)
-        Box(Modifier.weight(1f))
-        Text(
-            stringResource(R.string.drawer_new_session_with),
-            style = type.sessionMeta,
-            color = colors.accent.copy(alpha = 0.75f),
-            maxLines = 1,
-            modifier = Modifier
-                .clip(ForgeShapes.pill)
-                .clickable(onClick = onLongClick)
-                .padding(horizontal = ForgeSpace.sm, vertical = ForgeSpace.xs),
-        )
+        Text(label, style = type.button, color = colors.accent)
     }
 }
 

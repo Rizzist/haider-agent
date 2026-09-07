@@ -50,8 +50,12 @@ object AppContainer {
     var daemonFactory: (Context) -> DaemonService = { FakeDaemonService(FakeScenario.FirstRun) }
     var accountsFactory: (Context) -> AccountsRepository = { FakeAccountsRepository() }
 
-    /** Robolectric hosts the composables in this Activity; it must not boot WorkManager. */
-    var bootstrapEnabled: Boolean = true
+    /**
+     * False in the Robolectric Compose tests: the test rule owns this
+     * Activity's content, and the update coordinator's WorkManager bootstrap
+     * has no place in a JVM test. Nothing else reads it.
+     */
+    var activityBootstrap: Boolean = true
 
     private var daemon: DaemonService? = null
     private var accounts: AccountsRepository? = null
@@ -82,7 +86,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        if (AppContainer.bootstrapEnabled) {
+        if (AppContainer.activityBootstrap) {
             ApkUpdateCoordinator.start(applicationContext)
         }
         val service = AppContainer.daemon(this)
@@ -99,6 +103,8 @@ class MainActivity : ComponentActivity() {
         val bannerPreferences = getSharedPreferences(BANNER_PREFERENCES, Context.MODE_PRIVATE)
 
         handleDeepLink(intent, viewModel)
+
+        if (!AppContainer.activityBootstrap) return
 
         setContent {
             var themeMode by rememberSaveable { mutableStateOf(ThemePreferences.load(themeStore)) }
@@ -181,11 +187,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (AppContainer.bootstrapEnabled) ApkUpdateCoordinator.onActivityResumed(this)
+        if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityResumed(this)
     }
 
     override fun onPause() {
-        if (AppContainer.bootstrapEnabled) ApkUpdateCoordinator.onActivityPaused(this)
+        if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityPaused(this)
         super.onPause()
     }
 

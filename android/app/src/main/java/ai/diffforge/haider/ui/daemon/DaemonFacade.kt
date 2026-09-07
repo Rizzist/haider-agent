@@ -78,6 +78,10 @@ data class NeedsInput(
     /** The daemon's own title, falling back to the first safe-body line. */
     val displayTitle: String
         get() = title.ifBlank { safeBody.firstOrNull().orEmpty() }
+
+    /** The quote block, minus any line already promoted to the title. */
+    val bodyLines: List<String>
+        get() = if (title.isBlank()) safeBody.drop(1) else safeBody
 }
 
 data class SessionRow(

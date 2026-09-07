@@ -107,7 +107,7 @@ val ForgeLight = ForgeColors(
     surfaceRaised = Color(0xFFFFFFFF),
     surfaceControl = Color(0xFFFAFAFC),
     surfaceHover = Color(0x0A000000),
-    surfaceSelected = Color(0x1AB45309),
+    surfaceSelected = Color(0x1A9A4B08),
     border = Color(0x14000000), // rgba(0,0,0,0.08)
     borderStrong = Color(0x24000000), // rgba(0,0,0,0.14)
     text = Color(0xFF1D1D1F),
@@ -115,20 +115,25 @@ val ForgeLight = ForgeColors(
     textSoft = Color(0xFF333333),
     textMuted = Color(0xFF6B6B6B),
     textDisabled = Color(0xFFA1A1A6),
-    accent = Color(0xFFB45309),
-    accentSoft = Color(0xFFC2621A),
+    // UI-SPEC 2.1 proposed accent #B45309 / accentSoft #C2621A. Its contrast
+    // table measured the accent only against the plain ground (5.05:1) and
+    // never against accentWash, where the same pair is 4.02:1, nor accentSoft
+    // at all, which is 3.81:1. Both are darkened here so every documented pair
+    // clears 4.5:1 — see ContrastTest. In a light theme "soft" means darker.
+    accent = Color(0xFF9A4B08),
+    accentSoft = Color(0xFF7C2D12),
     accentInk = Color(0xFFFFFFFF),
-    accentWash = Color(0x1AB45309),
-    focusRing = Color(0x8CB45309),
+    accentWash = Color(0x1A9A4B08),
+    focusRing = Color(0x8C9A4B08),
     scrim = Color(0x6B141416),
     link = Color(0xFF0066CC),
     amber = Color(0xFF8B5A00),
-    ember = Color(0xFFB45309),
+    ember = Color(0xFF9A4B08),
     green = Color(0xFF0A7F45),
     red = Color(0xFFB42318),
     trajectoryModel = Color(0xFF6D5AE0),
     stateRunning = Color(0xFF8B5A00),
-    stateNeedsInput = Color(0xFFB45309),
+    stateNeedsInput = Color(0xFF9A4B08),
     stateIdle = Color(0xFF6B6B6B),
     stateErrored = Color(0xFFB42318),
     stateUnknown = Color(0xFF6B6B6B),

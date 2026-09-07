@@ -40,7 +40,7 @@ fun ForgeButton(
     modifier: Modifier = Modifier,
     kind: ForgeButtonKind = ForgeButtonKind.Filled,
     enabled: Boolean = true,
-    minHeight: Dp = ForgeSize.actionButton,
+    minHeight: Dp = ForgeSize.touch,
     contentDescription: String? = null,
     leading: (@Composable () -> Unit)? = null,
 ) {

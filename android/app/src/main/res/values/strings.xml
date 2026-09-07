@@ -76,10 +76,16 @@
     <string name="daemon_action_start">Start</string>
     <string name="daemon_action_stop">Stop</string>
     <string name="daemon_action_restart">Restart</string>
-    <string name="daemon_sessions_segment">%1$d sessions</string>
-    <string name="daemon_turns_segment">%1$d turn active</string>
-    <string name="daemon_memory_segment">%1$s MB</string>
     <string name="daemon_uptime_segment">up %1$s</string>
+    <string name="daemon_memory_segment">%1$s MB</string>
+    <plurals name="daemon_sessions_segment">
+        <item quantity="one">%1$d session</item>
+        <item quantity="other">%1$d sessions</item>
+    </plurals>
+    <plurals name="daemon_turns_segment">
+        <item quantity="one">%1$d active</item>
+        <item quantity="other">%1$d active</item>
+    </plurals>
     <string name="daemon_details_title">Daemon details</string>
     <string name="daemon_copy_diagnostics">Copy diagnostics</string>
 

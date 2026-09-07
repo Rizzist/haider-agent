@@ -73,8 +73,9 @@ fun InputRequiredCard(
         Text(stringResource(R.string.ask_eyebrow), style = type.drawerSection, color = colors.accent)
         Text(needsInput.displayTitle, style = type.h4, color = colors.text)
 
-        // safe_body is rendered verbatim, never rewritten into prose.
-        if (needsInput.safeBody.isNotEmpty()) {
+        // safe_body is rendered verbatim, never rewritten into prose — and a
+        // line already promoted to the title is not said twice.
+        if (needsInput.bodyLines.isNotEmpty()) {
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -84,7 +85,7 @@ fun InputRequiredCard(
                     .padding(ForgeSpace.lg),
                 verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
             ) {
-                needsInput.safeBody.forEach { line ->
+                needsInput.bodyLines.forEach { line ->
                     Text(line, style = type.toolRow, color = colors.chatText)
                 }
             }
