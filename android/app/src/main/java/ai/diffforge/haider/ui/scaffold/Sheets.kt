@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui.scaffold
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.theme.Forge

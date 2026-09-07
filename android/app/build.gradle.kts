@@ -74,6 +74,32 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // Compose UI tests run on the JVM under Robolectric, not on an emulator:
+    // the release job runs :app:testReleaseUnitTest on a runner with no AVD
+    // (.github/workflows/android-apk.yml), and a connectedAndroidTest would need
+    // a new emulator job that the release would then be gated on (UI-SPEC 6.4).
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            all {
+                it.systemProperty("robolectric.graphicsMode", "NATIVE")
+                it.systemProperty(
+                    "roborazzi.test.record",
+                    (project.findProperty("roborazzi.test.record") ?: "false").toString(),
+                )
+                it.systemProperty(
+                    "roborazzi.test.verify",
+                    (project.findProperty("roborazzi.test.verify") ?: "false").toString(),
+                )
+                it.systemProperty(
+                    "roborazzi.test.compare",
+                    (project.findProperty("roborazzi.test.compare") ?: "false").toString(),
+                )
+                it.maxHeapSize = "2g"
+            }
+        }
+    }
 }
 
 dependencies {
@@ -98,4 +124,12 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test.ext:junit:1.2.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    testImplementation(composeBom)
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi:1.32.2")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:1.32.2")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

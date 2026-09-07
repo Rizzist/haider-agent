@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui.settings
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
@@ -113,6 +113,7 @@ fun SettingsScreen(
                         is DaemonStatus.Running -> stringResource(R.string.daemon_running)
                         DaemonStatus.Starting -> stringResource(R.string.daemon_starting)
                         DaemonStatus.Restarting -> stringResource(R.string.daemon_restarting)
+                        DaemonStatus.Stopping -> stringResource(R.string.daemon_stopping)
                         DaemonStatus.Stopped -> stringResource(R.string.daemon_stopped)
                         is DaemonStatus.Failed -> stringResource(R.string.daemon_failed, daemon.reason)
                     },

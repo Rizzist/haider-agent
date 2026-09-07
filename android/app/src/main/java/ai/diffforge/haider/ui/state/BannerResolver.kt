@@ -1,8 +1,8 @@
 package ai.diffforge.haider.ui.state
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.DaemonStatus
-import ai.diffforge.haider.daemon.NetworkState
+import ai.diffforge.haider.ui.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.NetworkState
 import ai.diffforge.haider.ui.chat.UpdateBannerModel
 import ai.diffforge.haider.update.UpdateUiState
 
@@ -121,7 +121,7 @@ object BannerResolver {
                 action = BannerAction.StartDaemon,
                 filledAction = true,
             )
-            DaemonStatus.Starting, DaemonStatus.Restarting -> out += BannerModel(
+            DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping -> out += BannerModel(
                 rank = 2,
                 severity = BannerSeverity.Warning,
                 title = BannerText.of(R.string.banner_starting_title),

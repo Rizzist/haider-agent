@@ -1,6 +1,6 @@
 package ai.diffforge.haider.ui.scaffold
 
-import ai.diffforge.haider.accounts.AccountsRepository
+import ai.diffforge.haider.ui.accounts.AccountsRepository
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.InputRequiredCard
@@ -44,6 +44,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -284,6 +285,17 @@ fun HaiderApp(
                                     ),
                                 )
                             }
+                            state.transcriptNotice?.let { notice ->
+                                Text(
+                                    notice,
+                                    style = Forge.type.sessionMeta,
+                                    color = colors.amber,
+                                    modifier = Modifier.padding(
+                                        horizontal = ForgeSpace.xl,
+                                        vertical = ForgeSpace.md,
+                                    ),
+                                )
+                            }
                             Box(Modifier.fillMaxSize()) {
                                 Transcript(
                                     messages = state.messages,
@@ -418,7 +430,6 @@ fun ChatViewModel.applyRowAction(sessionId: String, action: SessionRowAction) {
         SessionRowAction.Fork -> fork(sessionId)
         SessionRowAction.StopTurn -> stopTurn(sessionId)
         SessionRowAction.CopyId -> closeOverlay()
-        SessionRowAction.Delete -> delete(sessionId)
     }
 }
 

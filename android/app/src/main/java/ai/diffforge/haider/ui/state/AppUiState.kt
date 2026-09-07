@@ -1,10 +1,11 @@
 package ai.diffforge.haider.ui.state
 
-import ai.diffforge.haider.daemon.DaemonEnvironment
-import ai.diffforge.haider.daemon.DaemonStatus
-import ai.diffforge.haider.daemon.RosterPaging
-import ai.diffforge.haider.daemon.SessionRow
-import ai.diffforge.haider.daemon.SessionVisualState
+import ai.diffforge.haider.ui.daemon.DaemonEnvironment
+import ai.diffforge.haider.ui.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.RosterPaging
+import ai.diffforge.haider.ui.daemon.SearchIndexState
+import ai.diffforge.haider.ui.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.chat.Message
 
@@ -89,6 +90,9 @@ data class AppUiState(
     val query: String = "",
     val setup: SetupState = SetupPlan.build(false, false, true, false, false, false),
     val transcriptLoading: Boolean = false,
+    /** Set when a replay came back partial or unavailable; never hidden. */
+    val transcriptNotice: String? = null,
+    val searchIndex: SearchIndexState = SearchIndexState(),
     val answeredElsewhere: Set<String> = emptySet(),
 ) {
     val activeSession: SessionRow?

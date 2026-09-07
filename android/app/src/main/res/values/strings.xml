@@ -51,6 +51,7 @@
     <string name="drawer_filter_empty">Nothing is running right now.</string>
     <string name="drawer_search_empty">No session matches “%1$s”.</string>
     <string name="drawer_search_hint">Search sessions</string>
+    <string name="drawer_search_partial">Searching %1$d of %2$d sessions — still indexing history.</string>
     <string name="drawer_filter_all">All %1$d</string>
     <string name="drawer_filter_running">Running %1$d</string>
     <string name="drawer_filter_needs_input">Needs input %1$d</string>
@@ -184,6 +185,9 @@
     <string name="accounts_oauth_start">Start sign-in</string>
     <string name="accounts_oauth_opening">Opening your browser…</string>
     <string name="accounts_oauth_waiting">Finish the sign-in in your browser, then come back.</string>
+    <string name="accounts_oauth_device">Enter the code on the sign-in page, then come back.</string>
+    <string name="accounts_oauth_exchanging">Finishing the sign-in…</string>
+    <string name="accounts_oauth_return_hint">The return link only brings you back here. It carries no code and no token.</string>
     <string name="accounts_oauth_code">Code: %1$s</string>
     <string name="accounts_oauth_open_again">Open the sign-in page</string>
     <string name="accounts_oauth_claiming">Linking the account…</string>

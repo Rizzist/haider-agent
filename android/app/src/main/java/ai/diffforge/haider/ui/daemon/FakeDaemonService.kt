@@ -1,4 +1,4 @@
-package ai.diffforge.haider.daemon
+package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.transport.SessionModel
@@ -52,6 +52,7 @@ class FakeDaemonService(
     private val _models = MutableStateFlow<SessionConfig?>(null)
     private val _catalogError = MutableStateFlow<String?>(null)
     private val _catalogRequestedAtMs = MutableStateFlow<Long?>(null)
+    private val _searchIndex = MutableStateFlow(SearchIndexState())
 
     override val status: StateFlow<DaemonStatus> = _status.asStateFlow()
     override val environment: StateFlow<DaemonEnvironment> = _environment.asStateFlow()
@@ -61,6 +62,7 @@ class FakeDaemonService(
     override val models: StateFlow<SessionConfig?> = _models.asStateFlow()
     override val catalogError: StateFlow<String?> = _catalogError.asStateFlow()
     override val catalogRequestedAtMs: StateFlow<Long?> = _catalogRequestedAtMs.asStateFlow()
+    override val searchIndex: StateFlow<SearchIndexState> = _searchIndex.asStateFlow()
 
     private val transcripts = mutableMapOf<String, MutableList<Message>>()
     private var hiddenPages: List<List<SessionRow>> = emptyList()
@@ -165,7 +167,20 @@ class FakeDaemonService(
 
     fun setSessions(rows: List<SessionRow>) {
         _sessions.value = rows
+        _searchIndex.value = SearchIndexState(
+            indexedSessions = rows.size,
+            totalSessions = rows.size,
+            complete = true,
+        )
     }
+
+    /** Drives the honest "still indexing" path the drawer has to render. */
+    fun setSearchIndex(state: SearchIndexState) {
+        _searchIndex.value = state
+    }
+
+    /** Makes the next replay report partial or unavailable history. */
+    var transcriptOverride: ((String) -> TranscriptLoad?)? = null
 
     fun setStatus(status: DaemonStatus) {
         _status.value = status
@@ -278,12 +293,6 @@ class FakeDaemonService(
         return id
     }
 
-    override suspend fun delete(sessionId: String) {
-        calls += "delete:$sessionId"
-        _sessions.value = _sessions.value.filterNot { it.id == sessionId }
-        if (_activeSessionId.value == sessionId) _activeSessionId.value = _sessions.value.firstOrNull()?.id
-    }
-
     override suspend fun stopTurn(sessionId: String) {
         val row = _sessions.value.firstOrNull { it.id == sessionId }
         val coordinates = TurnCancel.coordinates(row) ?: throw MissingRunCoordinates(sessionId)
@@ -358,9 +367,26 @@ class FakeDaemonService(
         }
     }
 
-    override suspend fun transcript(sessionId: String): List<Message> {
+    override suspend fun transcript(sessionId: String): TranscriptLoad {
         calls += "session.attach:$sessionId"
-        return transcripts.getOrPut(sessionId) { defaultTranscript(sessionId) }.toList()
+        transcriptOverride?.invoke(sessionId)?.let { return it }
+        val messages = transcripts.getOrPut(sessionId) { defaultTranscript(sessionId) }.toList()
+        return TranscriptLoad.Complete(messages)
+    }
+
+    override suspend fun search(query: String): SearchOutcome {
+        calls += "session.read:search"
+        val index = _searchIndex.value
+        val needle = query.trim().lowercase()
+        val hits = if (needle.isEmpty()) {
+            emptyList()
+        } else {
+            _sessions.value.filter { row ->
+                listOfNotNull(row.title, row.model, row.provider, row.id)
+                    .any { it.lowercase().contains(needle) }
+            }.map { SearchHit(it.id, it.title, it.headSeq) }
+        }
+        return SearchOutcome(hits = hits, index = index, complete = index.complete)
     }
 
     // ---------- fixtures ----------
@@ -376,8 +402,8 @@ class FakeDaemonService(
             waitingForRouteCount = 0,
             profilePath = "/data/user/0/ai.diffforge.haider/files/haider/profiles/default",
             runtimeDir = "/data/user/0/ai.diffforge.haider/files/haider/runtime/android-default",
-            startedAtMs = nowMs - 4 * 60 * 60 * 1000L - 12 * 60 * 1000L,
-            rssBytes = 58L * 1024 * 1024,
+            startedAtElapsedRealtimeMs = nowMs - 4 * 60 * 60 * 1000L - 12 * 60 * 1000L,
+            pssBytes = 58L * 1024 * 1024,
         ),
     )
 

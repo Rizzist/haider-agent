@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui.drawer
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.StateDot
@@ -70,7 +70,7 @@ fun DaemonStatusCard(
             StateDot(
                 when (status) {
                     is DaemonStatus.Running -> colors.green
-                    DaemonStatus.Starting, DaemonStatus.Restarting -> colors.amber
+                    DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping -> colors.amber
                     DaemonStatus.Stopped -> colors.textMuted
                     is DaemonStatus.Failed -> colors.red
                 },
@@ -98,7 +98,8 @@ fun DaemonStatusCard(
                     kind = ForgeButtonKind.Filled,
                     minHeight = ForgeSize.bannerAction,
                 )
-                DaemonStatus.Starting, DaemonStatus.Restarting -> CircularProgressIndicator(
+                DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping ->
+                    CircularProgressIndicator(
                     modifier = Modifier.size(ForgeSize.iconSm),
                     color = colors.amber,
                 )
@@ -116,6 +117,7 @@ private fun phrase(status: DaemonStatus): String = when (status) {
     is DaemonStatus.Running -> stringResource(R.string.daemon_running)
     DaemonStatus.Starting -> stringResource(R.string.daemon_starting)
     DaemonStatus.Restarting -> stringResource(R.string.daemon_restarting)
+    DaemonStatus.Stopping -> stringResource(R.string.daemon_stopping)
     DaemonStatus.Stopped -> stringResource(R.string.daemon_stopped)
     is DaemonStatus.Failed -> stringResource(R.string.daemon_failed, status.reason)
 }
@@ -127,8 +129,8 @@ fun resourceLine(running: DaemonStatus.Running?, activeTurns: Int, nowMs: Long):
     val segments = buildList {
         info.sessionCount?.let { add(stringResource(R.string.daemon_sessions_segment, it.toInt())) }
         if (activeTurns > 0) add(stringResource(R.string.daemon_turns_segment, activeTurns))
-        info.rssBytes?.let { add(stringResource(R.string.daemon_memory_segment, (it / (1024 * 1024)).toString())) }
-        RelativeTime.duration(info.startedAtMs, nowMs)
+        info.pssBytes?.let { add(stringResource(R.string.daemon_memory_segment, (it / (1024 * 1024)).toString())) }
+        RelativeTime.duration(info.startedAtElapsedRealtimeMs, nowMs)
             .takeIf { it.isNotEmpty() }
             ?.let { add(stringResource(R.string.daemon_uptime_segment, it)) }
     }

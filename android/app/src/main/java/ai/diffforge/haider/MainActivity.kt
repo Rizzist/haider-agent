@@ -1,15 +1,17 @@
 package ai.diffforge.haider
 
-import ai.diffforge.haider.accounts.AccountsRepository
-import ai.diffforge.haider.accounts.FakeAccountsRepository
-import ai.diffforge.haider.daemon.DaemonService
-import ai.diffforge.haider.daemon.FakeDaemonService
-import ai.diffforge.haider.daemon.FakeScenario
+import ai.diffforge.haider.ui.accounts.AccountsRepository
+import ai.diffforge.haider.ui.accounts.FakeAccountsRepository
+import ai.diffforge.haider.ui.daemon.DaemonIntents
+import ai.diffforge.haider.ui.daemon.DaemonService
+import ai.diffforge.haider.ui.daemon.FakeDaemonService
+import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.scaffold.BANNER_PREFERENCES
 import ai.diffforge.haider.ui.scaffold.HaiderApp
 import ai.diffforge.haider.ui.scaffold.SharedPreferencesBannerDismissals
 import ai.diffforge.haider.ui.scaffold.SystemAction
+import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.theme.ThemeMode
 import ai.diffforge.haider.ui.theme.ThemePreferences
 import ai.diffforge.haider.update.ApkUpdateCoordinator
@@ -96,6 +98,8 @@ class MainActivity : ComponentActivity() {
         val themeStore = ThemePreferences.store(this)
         val bannerPreferences = getSharedPreferences(BANNER_PREFERENCES, Context.MODE_PRIVATE)
 
+        handleDeepLink(intent, viewModel)
+
         setContent {
             var themeMode by rememberSaveable { mutableStateOf(ThemePreferences.load(themeStore)) }
             val updateState by ApkUpdateCoordinator.state.collectAsState()
@@ -130,6 +134,48 @@ class MainActivity : ComponentActivity() {
                 onSystemAction = ::handleSystemAction,
                 dismissals = dismissals,
             )
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val service = AppContainer.daemon(this)
+        handleDeepLink(
+            intent,
+            ViewModelProvider(this, ChatViewModel.factory(service))[ChatViewModel::class.java],
+        )
+    }
+
+    /**
+     * Two navigation paths, neither of which is authority for anything.
+     *
+     * `haider://oauth/return` is the callback landing page's return link. It
+     * carries no code, state, token, flow id or ready reference, and another app
+     * can claim the scheme, so all it does is open Settings. It never starts a
+     * disabled daemon, creates a flow or commits an account; the sign-in result
+     * is read from `account.oauth_status` on the original RPC connection.
+     *
+     * `OPEN_SESSION` / `OPEN_INPUT` are explicit package-scoped notification
+     * intents. Their coordinates are hints: the UI re-reads the current snapshot
+     * before rendering or answering.
+     */
+    private fun handleDeepLink(intent: Intent?, viewModel: ChatViewModel) {
+        if (intent == null) return
+        val data = intent.data
+        if (data != null &&
+            data.scheme == DaemonIntents.DEEP_LINK_SCHEME &&
+            data.host == DaemonIntents.OAUTH_RETURN_HOST
+        ) {
+            viewModel.openOverlay(Overlay.Settings)
+            return
+        }
+        when (intent.action) {
+            DaemonIntents.OPEN_SESSION, DaemonIntents.OPEN_INPUT -> {
+                val sessionId = intent.getStringExtra(DaemonIntents.EXTRA_SESSION_ID)
+                if (!sessionId.isNullOrBlank()) viewModel.activate(sessionId)
+            }
+            DaemonIntents.OPEN_DAEMON_STATUS -> viewModel.openOverlay(Overlay.DaemonDetails)
         }
     }
 

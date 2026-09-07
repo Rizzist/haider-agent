@@ -1,13 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Network to reach the loopback daemon transport (APK-7). -->
+    <!-- Model calls and, until the embedded daemon lands, the loopback transport. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- The embedded daemon's sticky service (contracts C2). Its declaration and
+         Kotlin source belong to lane 971-2; this lane only claims the permission
+         the UI's Start/Stop affordances will drive. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
@@ -32,6 +36,24 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- The one browsable deep link in 971: the OAuth callback landing
+                 page offers haider://oauth/return, which carries no query,
+                 fragment, code, state, token, flow id or ready reference. A
+                 custom scheme can be claimed by another app, so this is a
+                 navigation hint only: it brings the user back to Settings and
+                 does nothing else — it never starts a disabled daemon, creates
+                 a flow, or commits an account. Notification navigation
+                 (OPEN_SESSION / OPEN_INPUT) uses explicit package-scoped
+                 intents and needs no filter. -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="haider"
+                    android:host="oauth"
+                    android:path="/return" />
             </intent-filter>
         </activity>
 

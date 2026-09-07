@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui.drawer
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.theme.Forge
@@ -80,7 +80,6 @@ fun SessionActionsSheet(
                 ActionRow(R.string.action_stop_turn) { onAction(SessionRowAction.StopTurn) }
             }
             ActionRow(R.string.action_copy_session_id) { onAction(SessionRowAction.CopyId) }
-            ActionRow(R.string.action_delete, destructive = true) { onAction(SessionRowAction.Delete) }
         }
     }
 }

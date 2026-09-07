@@ -153,6 +153,24 @@ fun SessionDrawer(
 
         if (state.sessions.size > SEARCH_THRESHOLD) {
             SearchField(query = state.query, onQuery = onQuery)
+            // Completeness is known only after coverage through each recorded
+            // head, so say how far the index has got instead of implying it is
+            // finished (contracts-v1, history and search).
+            if (state.query.isNotBlank() && !state.searchIndex.complete) {
+                Text(
+                    stringResource(
+                        R.string.drawer_search_partial,
+                        state.searchIndex.indexedSessions,
+                        state.searchIndex.totalSessions,
+                    ),
+                    style = type.sessionMeta,
+                    color = colors.amber,
+                    modifier = Modifier.padding(
+                        start = ForgeSpace.xl,
+                        top = ForgeSpace.xs,
+                    ),
+                )
+            }
         }
         if (state.sessions.size > FILTER_THRESHOLD) {
             FilterRow(filter = state.filter, counts = counts, onFilter = onFilter)

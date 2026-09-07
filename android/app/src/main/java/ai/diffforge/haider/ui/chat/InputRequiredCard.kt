@@ -1,8 +1,8 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.MenuOption
-import ai.diffforge.haider.daemon.NeedsInput
+import ai.diffforge.haider.ui.daemon.MenuOption
+import ai.diffforge.haider.ui.daemon.NeedsInput
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.StateDot

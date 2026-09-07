@@ -1,9 +1,10 @@
 package ai.diffforge.haider.ui.chat
 
-import ai.diffforge.haider.daemon.DaemonService
-import ai.diffforge.haider.daemon.DaemonStatus
-import ai.diffforge.haider.daemon.MissingRunCoordinates
-import ai.diffforge.haider.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.DaemonService
+import ai.diffforge.haider.ui.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.MissingRunCoordinates
+import ai.diffforge.haider.ui.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.state.SessionFilter
@@ -64,6 +65,9 @@ class ChatViewModel(
         viewModelScope.launch {
             service.catalogRequestedAtMs.collect { at -> update { it.copy(catalogRequestedAtMs = at) } }
         }
+        viewModelScope.launch {
+            service.searchIndex.collect { index -> update { it.copy(searchIndex = index) } }
+        }
     }
 
     // ---------- daemon lifecycle ----------
@@ -99,13 +103,6 @@ class ChatViewModel(
     fun fork(sessionId: String) = viewModelScope.launch {
         val id = service.fork(sessionId)
         service.activate(id)
-        closeOverlay()
-    }
-
-    fun delete(sessionId: String) = viewModelScope.launch {
-        service.delete(sessionId)
-        transcripts.remove(sessionId)
-        drafts.remove(sessionId)
         closeOverlay()
     }
 
@@ -190,14 +187,29 @@ class ChatViewModel(
 
     fun session(id: String?): SessionRow? = _state.value.sessions.firstOrNull { it.id == id }
 
+    /**
+     * A replay can be genuinely partial: `session.read` ranges are capped at
+     * 1,024 envelopes and an oversized envelope has to take an unavailable path.
+     * The notice is surfaced, never swallowed.
+     */
     private fun loadTranscript(sessionId: String) {
         viewModelScope.launch {
             update { it.copy(transcriptLoading = true) }
-            val messages = service.transcript(sessionId)
-            transcripts[sessionId] = messages
+            val load = service.transcript(sessionId)
+            transcripts[sessionId] = load.messages
+            val notice = when (load) {
+                is TranscriptLoad.Complete -> null
+                is TranscriptLoad.Partial ->
+                    "History up to ${load.loadedThroughSeq} of ${load.headSeq} — ${load.reason}"
+                is TranscriptLoad.Unavailable -> load.reason
+            }
             update {
                 if (it.activeSessionId == sessionId) {
-                    it.copy(messages = messages, transcriptLoading = false)
+                    it.copy(
+                        messages = load.messages,
+                        transcriptLoading = false,
+                        transcriptNotice = notice,
+                    )
                 } else {
                     it.copy(transcriptLoading = false)
                 }

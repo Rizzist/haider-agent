@@ -1,4 +1,4 @@
-package ai.diffforge.haider.daemon
+package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.chat.Message
@@ -17,6 +17,12 @@ import kotlinx.coroutines.flow.StateFlow
 sealed interface DaemonStatus {
     data object Stopped : DaemonStatus
     data object Starting : DaemonStatus
+
+    /**
+     * The service is draining. contracts-v1 C2 requires this to read as a local
+     * transition that does not accept new turns, rather than as Stopped.
+     */
+    data object Stopping : DaemonStatus
     data object Restarting : DaemonStatus
     data class Failed(val reason: String, val code: String?) : DaemonStatus
     data class Running(val info: DaemonInfo) : DaemonStatus
@@ -33,11 +39,12 @@ data class DaemonInfo(
     val waitingForRouteCount: Long? = null,
     val profilePath: String? = null,
     val runtimeDir: String? = null,
-    // ANDROID-OWNED — the daemon has no uptime or memory field. Verified absent
-    // from status.snapshot / StatusDocument / haider-client. Do NOT wait for
-    // them on the wire (UI-SPEC 5.3 non-negotiable 6, trap 6.6.7).
-    val startedAtMs: Long? = null,
-    val rssBytes: Long? = null,
+    // SERVICE-OWNED — the wire status carries no uptime and no memory number.
+    // contracts-v1 C2 appends both to the snapshot as service-owned metrics:
+    // a monotonic start time and a PSS sample, deliberately *not* labelled RSS.
+    // Unknown metrics stay null.
+    val startedAtElapsedRealtimeMs: Long? = null,
+    val pssBytes: Long? = null,
 )
 
 // ---------- session roster ----------
@@ -193,7 +200,6 @@ interface DaemonService {
     suspend fun markSeen(sessionId: String)
     suspend fun rename(sessionId: String, title: String)
     suspend fun fork(sessionId: String): String
-    suspend fun delete(sessionId: String)
 
     /** Refuses unless [TurnCancel.coordinates] resolves from the current snapshot. */
     suspend fun stopTurn(sessionId: String)
@@ -209,9 +215,96 @@ interface DaemonService {
     suspend fun refreshModels()
     suspend fun send(sessionId: String, text: String)
 
-    /** `session.attach`: the replayed transcript of a past session. */
-    suspend fun transcript(sessionId: String): List<Message>
+    /**
+     * `session.attach{after_seq:0, mode:"view"}` replay, paged through
+     * `session.read` (contracts-v1, full RPC/history).
+     *
+     * Returns a [TranscriptLoad] rather than a bare list because history can be
+     * genuinely partial: a range is capped at [SESSION_READ_MAX_ENVELOPES], and
+     * an envelope over the negotiated mobile limit has to take a truthful
+     * unavailable path instead of silent truncation presented as complete.
+     */
+    suspend fun transcript(sessionId: String): TranscriptLoad
+
+    /** Progress of the local transcript index that drawer search reads. */
+    val searchIndex: StateFlow<SearchIndexState>
+
+    /** Title/metadata plus indexed transcript content, honest about coverage. */
+    suspend fun search(query: String): SearchOutcome
 }
+
+// ---------- history ----------
+
+/** `session.read` ranges start at 1 and carry at most this many envelopes. */
+const val SESSION_READ_MAX_ENVELOPES: Long = 1_024
+
+/**
+ * The read pager. Ranges are inclusive, start at sequence 1 and never exceed
+ * [SESSION_READ_MAX_ENVELOPES]; the caller shrinks [pageSize] further when the
+ * negotiated byte cap demands it.
+ */
+object TranscriptPager {
+    data class Range(val startSeq: Long, val endSeq: Long)
+
+    fun ranges(
+        headSeq: Long,
+        pageSize: Long = SESSION_READ_MAX_ENVELOPES,
+        fromSeq: Long = 1,
+    ): List<Range> {
+        require(pageSize >= 1) { "page size must be positive" }
+        val capped = minOf(pageSize, SESSION_READ_MAX_ENVELOPES)
+        val start = maxOf(1L, fromSeq)
+        if (headSeq < start) return emptyList()
+        val out = mutableListOf<Range>()
+        var cursor = start
+        while (cursor <= headSeq) {
+            val end = minOf(headSeq, cursor + capped - 1)
+            out += Range(cursor, end)
+            cursor = end + 1
+        }
+        return out
+    }
+}
+
+/** What a replay actually returned. Partial history says so out loud. */
+sealed interface TranscriptLoad {
+    val messages: List<Message>
+
+    data class Complete(override val messages: List<Message>) : TranscriptLoad
+
+    /** Some envelopes are still being read, or one exceeded the mobile limit. */
+    data class Partial(
+        override val messages: List<Message>,
+        val reason: String,
+        val loadedThroughSeq: Long,
+        val headSeq: Long,
+    ) : TranscriptLoad
+
+    data class Unavailable(val reason: String) : TranscriptLoad {
+        override val messages: List<Message> get() = emptyList()
+    }
+}
+
+/**
+ * Search completeness is known only after coverage through each recorded head,
+ * so the UI shows how far the index has got rather than implying totality.
+ */
+data class SearchIndexState(
+    val indexedSessions: Int = 0,
+    val totalSessions: Int = 0,
+    val complete: Boolean = false,
+) {
+    val inProgress: Boolean get() = !complete && totalSessions > 0
+}
+
+data class SearchHit(val sessionId: String, val snippet: String?, val seq: Long?)
+
+data class SearchOutcome(
+    val hits: List<SearchHit>,
+    val index: SearchIndexState,
+    /** False while the index is still catching up: results may be incomplete. */
+    val complete: Boolean,
+)
 
 /** Raised when a cancel was asked for without live coordinates. */
 class MissingRunCoordinates(sessionId: String) :

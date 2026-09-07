@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui.state
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.DaemonStatus
 
 /** What the composer's trailing control is, right now (UI-SPEC 3.6). */
 enum class SendButtonState {
@@ -45,7 +45,11 @@ object SendButtonMatrix {
         hasText: Boolean,
         setupComplete: Boolean = true,
     ): ComposerState = when {
-        daemon is DaemonStatus.Starting || daemon is DaemonStatus.Restarting -> ComposerState(
+        // STOPPING reads as a transition that does not accept new turns
+        // (contracts-v1 C2), not as a stopped daemon you can queue against.
+        daemon is DaemonStatus.Starting ||
+            daemon is DaemonStatus.Restarting ||
+            daemon is DaemonStatus.Stopping -> ComposerState(
             button = SendButtonState.Starting,
             helperRes = R.string.composer_helper_starting,
             inputEnabled = false,

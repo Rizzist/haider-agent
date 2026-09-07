@@ -1,23 +1,27 @@
-package ai.diffforge.haider.accounts
+package ai.diffforge.haider.ui.accounts
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * In-memory accounts, so Settings -> Accounts is fully operable before the
- * daemon lanes land. It mirrors the daemon's behaviour where it matters:
+ * In-memory accounts, so Settings -> Accounts is fully operable before lane
+ * 971-3 lands the RPC client. It models exactly the frozen doors, including the
+ * parts that are easy to wish away:
  *
- *  - a key is validated before it is accepted, and a key that fails validation
- *    is not stored;
- *  - the raw key is never kept — only the fact that a key exists, plus the last
- *    four characters, which is what the daemon's own descriptors expose;
- *  - an OAuth flow polls before it can be claimed, so the UI must render the
- *    waiting state rather than assume instant success.
+ *  - an API key is staged before it is committed, and a key that fails
+ *    validation leaves no account behind;
+ *  - the raw key is never kept — only the daemon-style masked hint;
+ *  - an OAuth flow goes Waiting -> Exchanging -> Ready, because the provider's
+ *    success page is sent before the token exchange finishes, so the UI has to
+ *    render the in-between rather than assume instant success;
+ *  - a flow can be Lost, because flow ownership is bound to the daemon
+ *    instance, connection and attempt, and cannot move to a new connection.
  */
 class FakeAccountsRepository(
     seed: List<Account> = defaultAccounts,
-    private val oauthPollsBeforeReady: Int = 2,
+    private val waitingPolls: Int = 1,
+    private val exchangingPolls: Int = 1,
 ) : AccountsRepository {
 
     private val _providers = MutableStateFlow(defaultProviders)
@@ -32,10 +36,13 @@ class FakeAccountsRepository(
     val calls = mutableListOf<String>()
 
     private var polls = 0
-    private var cancelled = false
+    private var terminal: OAuthStatus? = null
 
     /** Set to a public code to make the next mutation fail. */
     var nextFailure: String? = null
+
+    /** Set to simulate the connection or UI process dying mid-flow. */
+    var flowLost: Boolean = false
 
     override suspend fun refresh() {
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_LIST
@@ -45,15 +52,20 @@ class FakeAccountsRepository(
         provider: String,
         alias: String?,
         apiKey: CharArray,
+        replaceExisting: Boolean,
     ): AccountResult {
-        calls += AccountsRpcAdapter.METHOD_ACCOUNT_ADD_API_KEY
-        nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
+        calls += AccountsRpcAdapter.METHOD_VAULT_STAGE
         when (val validated = validateApiKey(provider, apiKey)) {
             is AccountResult.Failed -> return validated
             AccountResult.Ok -> Unit
         }
+        calls += AccountsRpcAdapter.METHOD_ACCOUNT_LOGIN_API
+        nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
         val resolvedAlias = alias?.takeIf { it.isNotBlank() } ?: provider
         val current = _snapshot.value
+        if (!replaceExisting && current.accounts.any { it.alias == resolvedAlias }) {
+            return AccountResult.Failed("account_exists")
+        }
         _snapshot.value = AccountsSnapshot(
             revision = current.revision + 1,
             accounts = current.accounts.filterNot { it.alias == resolvedAlias } + Account(
@@ -70,14 +82,8 @@ class FakeAccountsRepository(
         return AccountResult.Ok
     }
 
-    override suspend fun validateApiKey(provider: String, apiKey: CharArray): AccountResult {
-        calls += AccountsRpcAdapter.METHOD_ACCOUNT_VALIDATE
-        return if (apiKey.size < MIN_KEY_LENGTH) {
-            AccountResult.Failed("invalid_api_key")
-        } else {
-            AccountResult.Ok
-        }
-    }
+    override suspend fun validateApiKey(provider: String, apiKey: CharArray): AccountResult =
+        if (apiKey.size < MIN_KEY_LENGTH) AccountResult.Failed("invalid_api_key") else AccountResult.Ok
 
     override suspend fun remove(alias: String): AccountResult {
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_REMOVE
@@ -103,29 +109,35 @@ class FakeAccountsRepository(
     override suspend fun startOAuth(provider: String, desiredAlias: String?): OAuthFlow {
         calls += AccountsRpcAdapter.METHOD_OAUTH_START
         polls = 0
-        cancelled = false
+        terminal = null
+        flowLost = false
         val descriptor = _providers.value.firstOrNull { it.id == provider }
-        if (descriptor?.supportsOAuth != true) {
+        if (descriptor?.supportsOAuth != true || !descriptor.available) {
             return OAuthFlow.Unavailable(provider, descriptor?.unavailableReason ?: "not supported")
         }
+        val device = descriptor.oauthStyle == OAuthStyle.Device
         return OAuthFlow.Started(
             provider = provider,
             alias = desiredAlias?.takeIf { it.isNotBlank() } ?: provider,
             flowId = "flow-$provider",
             attemptId = "attempt-1",
-            authorizationUrl = "https://example.invalid/oauth/$provider",
-            userCode = "HAID-971",
+            style = descriptor.oauthStyle,
+            // The daemon supplies the URL; the UI never composes a redirect.
+            authorizationUrl = "http://127.0.0.1:41287/callback-$provider",
+            userCode = if (device) "HAID-971" else null,
+            expiresAtMs = null,
         )
     }
 
     override suspend fun pollOAuth(flow: OAuthFlow.Started): OAuthStatus {
         calls += AccountsRpcAdapter.METHOD_OAUTH_STATUS
-        if (cancelled) return OAuthStatus.Failed(null, "cancelled")
+        if (flowLost) return OAuthStatus.Lost
+        terminal?.let { return it }
         polls += 1
-        return if (polls > oauthPollsBeforeReady) {
-            OAuthStatus.Ready("ref-${flow.flowId}", "you@${flow.provider}")
-        } else {
-            OAuthStatus.Waiting
+        return when {
+            polls <= waitingPolls -> OAuthStatus.Waiting
+            polls <= waitingPolls + exchangingPolls -> OAuthStatus.Exchanging
+            else -> OAuthStatus.Ready("ref-${flow.flowId}", "you@${flow.provider}")
         }
     }
 
@@ -133,7 +145,7 @@ class FakeAccountsRepository(
         flow: OAuthFlow.Started,
         oauthReference: String,
     ): AccountResult {
-        calls += AccountsRpcAdapter.METHOD_OAUTH_ADD
+        calls += AccountsRpcAdapter.METHOD_ACCOUNT_ADD
         nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
         val current = _snapshot.value
         _snapshot.value = AccountsSnapshot(
@@ -153,8 +165,11 @@ class FakeAccountsRepository(
 
     override suspend fun cancelOAuth(flow: OAuthFlow.Started) {
         calls += AccountsRpcAdapter.METHOD_OAUTH_CANCEL
-        cancelled = true
+        terminal = OAuthStatus.Failed(null, "cancelled")
     }
+
+    override suspend fun accountExists(provider: String, alias: String): Boolean =
+        _snapshot.value.accounts.any { it.provider == provider && it.alias == alias }
 
     companion object {
         const val MIN_KEY_LENGTH = 12
@@ -162,6 +177,13 @@ class FakeAccountsRepository(
         val defaultProviders = listOf(
             ProviderDescriptor("anthropic", "Anthropic", supportsApiKey = true, supportsOAuth = true),
             ProviderDescriptor("openai", "OpenAI", supportsApiKey = true, supportsOAuth = true),
+            ProviderDescriptor(
+                "kimi",
+                "Kimi",
+                supportsApiKey = true,
+                supportsOAuth = true,
+                oauthStyle = OAuthStyle.Device,
+            ),
             ProviderDescriptor("google", "Google", supportsApiKey = true, supportsOAuth = false),
             ProviderDescriptor(
                 "deepseek",

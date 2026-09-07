@@ -1,13 +1,14 @@
 package ai.diffforge.haider.ui.settings
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.accounts.Account
-import ai.diffforge.haider.accounts.AccountResult
-import ai.diffforge.haider.accounts.AccountsRepository
-import ai.diffforge.haider.accounts.AuthKind
-import ai.diffforge.haider.accounts.OAuthFlow
-import ai.diffforge.haider.accounts.OAuthStatus
-import ai.diffforge.haider.accounts.ProviderDescriptor
+import ai.diffforge.haider.ui.accounts.Account
+import ai.diffforge.haider.ui.accounts.AccountResult
+import ai.diffforge.haider.ui.accounts.AccountsRepository
+import ai.diffforge.haider.ui.accounts.AuthKind
+import ai.diffforge.haider.ui.accounts.OAuthFlow
+import ai.diffforge.haider.ui.accounts.OAuthStatus
+import ai.diffforge.haider.ui.accounts.OAuthStyle
+import ai.diffforge.haider.ui.accounts.ProviderDescriptor
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
@@ -95,17 +96,23 @@ fun AccountsScreen(
     var notice by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var flow by remember { mutableStateOf<OAuthFlow.Started?>(null) }
+    var phase by remember { mutableStateOf(OAuthPhase.Waiting) }
 
     LaunchedEffect(Unit) { repository.refresh() }
 
-    // Poll a live flow until it is claimable, exactly as the desktop does.
+    // Poll `account.oauth_status` on the same connection the flow was started
+    // on. Exchanging is a real state: the provider's success page is sent before
+    // the token exchange finishes, so the UI must render the in-between rather
+    // than assume the browser returning means done.
     LaunchedEffect(flow?.flowId) {
         val live = flow ?: return@LaunchedEffect
         while (true) {
             delay(OAUTH_POLL_MS)
             when (val status = repository.pollOAuth(live)) {
-                OAuthStatus.Waiting -> Unit
+                OAuthStatus.Waiting -> phase = OAuthPhase.Waiting
+                OAuthStatus.Exchanging -> phase = OAuthPhase.Exchanging
                 is OAuthStatus.Ready -> {
+                    phase = OAuthPhase.Claiming
                     val result = repository.completeOAuth(live, status.oauthReference)
                     notice = when (result) {
                         AccountResult.Ok -> "Signed in: ${status.identity ?: live.alias}"
@@ -119,6 +126,20 @@ fun AccountsScreen(
                 is OAuthStatus.Failed -> {
                     notice = status.publicCode ?: status.terminalKind
                     flow = null
+                    return@LaunchedEffect
+                }
+                // Flow ownership is bound to the daemon instance, connection and
+                // attempt: a lost flow cannot be resumed, only restarted — after
+                // checking whether the commit already landed.
+                OAuthStatus.Lost -> {
+                    val committed = repository.accountExists(live.provider, live.alias)
+                    notice = if (committed) {
+                        "Signed in: ${live.alias}"
+                    } else {
+                        "The sign-in was lost — start it again."
+                    }
+                    flow = null
+                    repository.refresh()
                     return@LaunchedEffect
                 }
             }
@@ -323,7 +344,11 @@ fun AccountsScreen(
                                     when (val started = repository.startOAuth(chosen, alias.takeIf { it.isNotBlank() })) {
                                         is OAuthFlow.Started -> {
                                             flow = started
+                                            phase = OAuthPhase.Waiting
                                             notice = null
+                                            // The daemon composed this URL and owns
+                                            // the loopback listener; the UI never
+                                            // invents a redirect.
                                             started.authorizationUrl?.let(onOpenUrl)
                                         }
                                         is OAuthFlow.Unavailable -> notice = started.reason
@@ -340,7 +365,17 @@ fun AccountsScreen(
                             modifier = Modifier.testTag(ACCOUNTS_OAUTH_WAITING_TAG),
                         ) {
                             Text(
-                                stringResource(R.string.accounts_oauth_waiting),
+                                when (phase) {
+                                    OAuthPhase.Waiting -> if (live.style == OAuthStyle.Device) {
+                                        stringResource(R.string.accounts_oauth_device)
+                                    } else {
+                                        stringResource(R.string.accounts_oauth_waiting)
+                                    }
+                                    OAuthPhase.Exchanging ->
+                                        stringResource(R.string.accounts_oauth_exchanging)
+                                    OAuthPhase.Claiming ->
+                                        stringResource(R.string.accounts_oauth_claiming)
+                                },
                                 style = type.chatBody,
                                 color = colors.text,
                             )
@@ -351,6 +386,11 @@ fun AccountsScreen(
                                     color = colors.accent,
                                 )
                             }
+                            Text(
+                                stringResource(R.string.accounts_oauth_return_hint),
+                                style = type.sessionMeta,
+                                color = colors.textMuted,
+                            )
                             Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
                                 live.authorizationUrl?.let { url ->
                                     ForgeButton(
@@ -378,6 +418,8 @@ fun AccountsScreen(
 }
 
 private enum class AddMode { None, ApiKey, OAuth }
+
+private enum class OAuthPhase { Waiting, Exchanging, Claiming }
 
 @Composable
 private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () -> Unit) {

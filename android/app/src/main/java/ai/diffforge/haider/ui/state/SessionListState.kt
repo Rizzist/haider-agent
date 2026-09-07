@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui.state
 
-import ai.diffforge.haider.daemon.SessionRow
-import ai.diffforge.haider.daemon.SessionVisualState
+import ai.diffforge.haider.ui.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.SessionVisualState
 
 /** The drawer's filter chips. */
 enum class SessionFilter { All, Running, NeedsInput }

@@ -1,9 +1,9 @@
 package ai.diffforge.haider.ui.scaffold
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.DaemonStatus
-import ai.diffforge.haider.daemon.SessionRow
-import ai.diffforge.haider.daemon.SessionVisualState
+import ai.diffforge.haider.ui.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.components.AttentionBadge
 import ai.diffforge.haider.ui.components.ForgeIconButton
 import ai.diffforge.haider.ui.components.StateDot
@@ -234,6 +234,7 @@ private fun subtitle(state: AppUiState, session: SessionRow?): Subtitle? {
     }
     val daemonWord = when (state.daemon) {
         DaemonStatus.Starting, DaemonStatus.Restarting -> stringResource(R.string.daemon_starting)
+        DaemonStatus.Stopping -> stringResource(R.string.daemon_stopping)
         DaemonStatus.Stopped -> stringResource(R.string.daemon_stopped)
         is DaemonStatus.Failed -> stringResource(R.string.daemon_stopped)
         is DaemonStatus.Running -> null

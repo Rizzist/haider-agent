@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui.start
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.drawer.SessionRowAction
 import ai.diffforge.haider.ui.drawer.SessionRowItem
 import ai.diffforge.haider.ui.state.AppUiState
@@ -229,8 +229,8 @@ private fun doneDetail(
     SetupStepId.RunService -> running?.info?.let { info ->
         stringResource(
             R.string.step_service_done,
-            info.rssBytes?.let { "${it / (1024 * 1024)} MB" } ?: "",
-            RelativeTime.clock(info.startedAtMs),
+            info.pssBytes?.let { "${it / (1024 * 1024)} MB" } ?: "",
+            RelativeTime.clock(info.startedAtElapsedRealtimeMs),
         )
     }
     SetupStepId.Notifications -> stringResource(R.string.step_notify_done)

@@ -1,9 +1,9 @@
 package ai.diffforge.haider.ui.drawer
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.daemon.SessionRow
-import ai.diffforge.haider.daemon.SessionVisualState
-import ai.diffforge.haider.daemon.SessionVisualStateFold
+import ai.diffforge.haider.ui.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.SessionVisualState
+import ai.diffforge.haider.ui.daemon.SessionVisualStateFold
 import ai.diffforge.haider.ui.components.ForkedPill
 import ai.diffforge.haider.ui.components.RunningDots
 import ai.diffforge.haider.ui.components.StateDot
@@ -42,7 +42,11 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 
-enum class SessionRowAction { Rename, Fork, StopTurn, CopyId, Delete }
+/**
+ * There is no `session.delete` RPC in contracts-v1, so the UI does not offer
+ * delete: an affordance whose door does not exist is a lie.
+ */
+enum class SessionRowAction { Rename, Fork, StopTurn, CopyId }
 
 /**
  * The drawer's centrepiece: a three-part row (mark · title · meta), as the
@@ -97,8 +101,8 @@ fun SessionRowItem(
                 onAction(SessionRowAction.StopTurn); true
             })
         }
-        add(CustomAccessibilityAction(stringResource(R.string.action_delete)) {
-            onAction(SessionRowAction.Delete); true
+        add(CustomAccessibilityAction(stringResource(R.string.action_copy_session_id)) {
+            onAction(SessionRowAction.CopyId); true
         })
     }
 
