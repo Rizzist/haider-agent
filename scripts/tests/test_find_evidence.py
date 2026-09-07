@@ -23,15 +23,19 @@ class EvidenceTests(unittest.TestCase):
     def lookup(self, pages, *args, api_exit=0):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            stub = root / "gh"
-            stub.write_text(
-                f'#!{sys.executable}\nimport json, os, sys\n'
-                'from pathlib import Path\n'
-                'Path(os.environ["CALLS"]).write_text(json.dumps(sys.argv[1:]))\n'
-                'print(os.environ["RESPONSE"])\n'
-                'sys.exit(int(os.environ["API_EXIT"]))\n', encoding="utf-8")
-            stub.chmod(0o755)
-            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+            # Inject only the gh transport; the actual CLI process and its
+            # output/error behavior run identically on POSIX and Windows.
+            (root / "sitecustomize.py").write_text(
+                'import json, os, subprocess\nfrom pathlib import Path\n'
+                'original = subprocess.run\n'
+                'def run(command, **kwargs):\n'
+                '    if command[0] != "gh": return original(command, **kwargs)\n'
+                '    Path(os.environ["CALLS"]).write_text(json.dumps(command[1:]))\n'
+                '    code = int(os.environ["API_EXIT"])\n'
+                '    if code: raise subprocess.CalledProcessError(code, command)\n'
+                '    return subprocess.CompletedProcess(command, code, os.environ["RESPONSE"], "")\n'
+                'subprocess.run = run\n', encoding="utf-8")
+            env = dict(os.environ, PYTHONPATH=str(root),
                        GITHUB_REPOSITORY="owner/repo", GITHUB_RUN_ID="99",
                        GITHUB_OUTPUT=str(root / "output"), CALLS=str(root / "calls"),
                        RESPONSE=json.dumps(pages), API_EXIT=str(api_exit))
@@ -79,10 +83,6 @@ class EvidenceTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(output, "")
 
-
-if __name__ == "__main__":
-    unittest.main()
-
 # API contract tests for reusable-call artifacts: an artifact proves bytes,
 # never a completed ship-gate verdict.
 import importlib.util
@@ -113,3 +113,7 @@ class ArtifactLookupTests(unittest.TestCase):
         with patch.object(MODULE, 'api', side_effect=subprocess.CalledProcessError(1, 'gh')):
             with self.assertRaises(subprocess.CalledProcessError):
                 MODULE.artifact_exists('owner/repo', '123', 'build', SHA)
+
+
+if __name__ == "__main__":
+    unittest.main()

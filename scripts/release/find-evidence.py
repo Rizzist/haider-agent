@@ -71,7 +71,7 @@ def artifact_exists(repo, run_id, name, sha):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("workflow", choices=("ci.yml", "xplat.yml", "ship-gate.yml"))
+    parser.add_argument("workflow", choices=("ci.yml", "xplat.yml", "ship-gate.yml", "release.yml"))
     parser.add_argument("sha")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--exclude-run-id", default=os.environ.get("GITHUB_RUN_ID", ""))

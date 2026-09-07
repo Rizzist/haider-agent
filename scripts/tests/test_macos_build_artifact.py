@@ -30,12 +30,26 @@ class ArtifactTests(unittest.TestCase):
         self.restored = self.root / 'restored'
         (self.root / 'Cargo.toml').write_text('[profile.release]\nlto="fat"\ncodegen-units=1\n')
         (self.root / 'Cargo.lock').write_text('version = 4\n')
-        stubdir = self.root / 'bin'
-        stubdir.mkdir()
-        stub = stubdir / 'rustc'
-        stub.write_text(f'#!{sys.executable}\nimport os\nprint(os.environ["RUSTC_FIXTURE"])\n')
-        stub.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(stubdir) + os.pathsep + os.environ['PATH'],
+        (self.root / 'sitecustomize.py').write_text(
+            'import os, subprocess\n'
+            'original = subprocess.check_output\n'
+            'def check_output(command, **kwargs):\n'
+            '    if command[0] != "rustc": return original(command, **kwargs)\n'
+            '    return os.environ["RUSTC_FIXTURE"]\n'
+            'subprocess.check_output = check_output\n'
+            # Like posix_mode_fixture.py: Windows cannot set POSIX execute bits.
+            # Only these generated macOS fixture paths receive synthetic modes.
+            'if os.name == "nt":\n'
+            '    from pathlib import Path\n'
+            '    native_stat = Path.stat\n'
+            '    def fixture_stat(path, *args, **kwargs):\n'
+            '        result = native_stat(path, *args, **kwargs)\n'
+            f'        if path.parent.name == "release" and path.name in {MODULE.BINARIES!r}:\n'
+            '            values = list(result); values[0] |= 0o111\n'
+            '            return os.stat_result(values)\n'
+            '        return result\n'
+            '    Path.stat = fixture_stat\n')
+        self.env = dict(os.environ, PYTHONPATH=str(self.root),
                         CARGO_INCREMENTAL='0', RUSTC_FIXTURE=RUSTC)
         for binary in MODULE.BINARIES:
             path = self.release / binary
@@ -108,10 +122,13 @@ class ArtifactTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertFalse(self.restored.exists())
 
-    def test_missing_symbols_and_nonexecutable_payload_rejected(self):
+    def test_missing_symbols_rejected(self):
         (self.release / 'haiderd.dSYM/Contents/Info.plist').unlink()
         self.assertNotEqual(self.cli('pack').returncode, 0)
         (self.release / 'haiderd.dSYM/Contents/Info.plist').write_text('restored')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX executable permission bit')
+    def test_nonexecutable_payload_rejected(self):
         (self.release / 'haider').chmod(0o644)
         self.assertNotEqual(self.cli('pack').returncode, 0)
 
