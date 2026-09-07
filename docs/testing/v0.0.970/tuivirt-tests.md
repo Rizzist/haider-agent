@@ -104,7 +104,17 @@ the full-size warm-up and medians reduce residual allocator/page/scheduler noise
 Each timed first frame still starts with a fresh model and terminal. Cached probes
 use the last construction, with the original 60 samples per position. No samples
 from a failed attempt are mixed into its retry. All timing ceilings stay active
-on both attempts. Debug builds retain behavioral checks and explicitly skip timing.
+on both attempts. Debug builds print the unoptimized-build timing SKIP before
+replay, then retain behavioral checks with exactly one construction per size.
+A counter at the real construction seam fails before a second replay at any size
+(including an accidental warm-up or retry), and the test pins all three counts
+to one. Median sampling and the measured retry path compile only in release.
+Completed-only replay scans earlier entries for an open item on each append,
+so even one debug construction was too slow. The debug fixture instead reduces
+each completed row in isolation and hydrates all of those display entries into
+one model, keeping setup linear without changing the three transcript sizes.
+The arithmetic pin also compares its entries, rendered text/styles, and scroll
+range with normal replay at 0 / 1 / 64 rows. Release retains normal replay.
 
 The old row-17 cold-fill law is gone. Its legacy test now checks the same
 33 ms first-frame frame budget at 10k; the workflow ledger invokes the
