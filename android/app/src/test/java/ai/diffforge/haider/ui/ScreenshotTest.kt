@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.theme.ThemeMode
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -17,8 +18,10 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
 /**
- * Eight goldens at 412x915, fontScale 1.0: main / drawer / first-run /
- * input-required, in both themes.
+ * Sixteen goldens at 412x915, fontScale 1.0, in both themes: main, drawer,
+ * first run, input required, settings, accounts, daemon stopped and the
+ * permanently denied notification permission — which is a distinct state from a
+ * first refusal, because Android will not ask again.
  *
  * Record with `-Proborazzi.test.record=true`. Verification in CI is a follow-up,
  * not a 971 gate: renderer drift between a laptop and a CI runner would fail the
@@ -36,13 +39,23 @@ class ScreenshotTest {
     @get:Rule
     val rule = createAndroidComposeRule<MainActivity>()
 
-    private fun capture(name: String, scenario: FakeScenario, dark: Boolean, openDrawer: Boolean = false) {
+    private fun capture(
+        name: String,
+        scenario: FakeScenario,
+        dark: Boolean,
+        openDrawer: Boolean = false,
+        overlay: Overlay? = null,
+    ) {
         val service = ComposeHost.install(scenario)
-        rule.setHaiderApp(
+        val viewModel = rule.setHaiderApp(
             service = service,
             dark = dark,
             themeMode = if (dark) ThemeMode.Dark else ThemeMode.Light,
         )
+        if (overlay != null) {
+            viewModel.openOverlay(overlay)
+            rule.waitForIdle()
+        }
         if (openDrawer) {
             rule.onAllNodes(hasContentDescription("Open sessions", substring = true))
                 .onFirst()
@@ -79,4 +92,40 @@ class ScreenshotTest {
     @Test
     fun `input required light`() =
         capture("input-required-light", FakeScenario.InputRequiredHere, dark = false)
+
+    @Test
+    fun `settings dark`() =
+        capture("settings-dark", FakeScenario.Populated, dark = true, overlay = Overlay.Settings)
+
+    @Test
+    fun `settings light`() =
+        capture("settings-light", FakeScenario.Populated, dark = false, overlay = Overlay.Settings)
+
+    @Test
+    fun `accounts dark`() =
+        capture("accounts-dark", FakeScenario.Populated, dark = true, overlay = Overlay.Accounts)
+
+    @Test
+    fun `accounts light`() =
+        capture("accounts-light", FakeScenario.Populated, dark = false, overlay = Overlay.Accounts)
+
+    @Test
+    fun `daemon stopped dark`() = capture("daemon-stopped-dark", FakeScenario.DaemonStopped, dark = true)
+
+    @Test
+    fun `daemon stopped light`() = capture("daemon-stopped-light", FakeScenario.DaemonStopped, dark = false)
+
+    @Test
+    fun `permission blocked dark`() = capture(
+        "permission-blocked-dark",
+        FakeScenario.NotificationsPermanentlyDenied,
+        dark = true,
+    )
+
+    @Test
+    fun `permission blocked light`() = capture(
+        "permission-blocked-light",
+        FakeScenario.NotificationsPermanentlyDenied,
+        dark = false,
+    )
 }

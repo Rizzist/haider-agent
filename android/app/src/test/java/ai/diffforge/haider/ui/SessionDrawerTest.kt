@@ -70,7 +70,9 @@ class SessionDrawerTest {
 
     @Test
     fun `an empty roster hides the groups and says what to do`() {
-        openDrawer(FakeScenario.EmptyRosterReady)
+        // With the daemon running the app opens into a session, so the empty
+        // roster is only reachable while it is stopped (addition D).
+        openDrawer(FakeScenario.EmptyRosterStopped)
         assertEquals(0, rule.onAllNodesWithTextSafe("NEEDS YOU"))
         assertEquals(0, rule.onAllNodesWithTextSafe("ACTIVE"))
         rule.onNodeWithText("No sessions yet. Tap New session to start one.").assertIsDisplayed()

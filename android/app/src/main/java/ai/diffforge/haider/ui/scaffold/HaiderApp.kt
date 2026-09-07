@@ -1,6 +1,10 @@
 package ai.diffforge.haider.ui.scaffold
 
 import ai.diffforge.haider.ui.accounts.AccountsRepository
+import ai.diffforge.haider.ui.accounts.OAuthAttemptController
+import ai.diffforge.haider.ui.chat.PickerKind
+import ai.diffforge.haider.ui.chat.SessionPickerSheet
+import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.InputRequiredCard
@@ -73,6 +77,7 @@ import kotlinx.coroutines.launch
 fun HaiderApp(
     viewModel: ChatViewModel,
     accounts: AccountsRepository,
+    oauth: OAuthAttemptController,
     appVersion: String,
     themeMode: ThemeMode,
     onThemeMode: (ThemeMode) -> Unit,
@@ -82,6 +87,7 @@ fun HaiderApp(
     onSystemAction: (SystemAction) -> Unit = {},
     dismissals: ai.diffforge.haider.ui.state.BannerDismissals = InMemoryBannerDismissals(),
     nowMsProvider: () -> Long = System::currentTimeMillis,
+    elapsedRealtimeProvider: () -> Long = android.os.SystemClock::elapsedRealtime,
     darkOverride: Boolean? = null,
 ) {
     val state by viewModel.state.collectAsState()
@@ -119,6 +125,7 @@ fun HaiderApp(
                     )
                 },
                 notificationsGranted = state.environment.notificationsGranted,
+                notificationsPermanentlyDenied = state.environment.notificationsPermanentlyDenied,
                 batteryRestricted = state.environment.batteryRestricted,
                 network = state.environment.network,
                 update = updateState,
@@ -129,6 +136,13 @@ fun HaiderApp(
         )
         LaunchedEffect(resolution.staleDismissals) {
             dismissals.clear(resolution.staleDismissals)
+        }
+
+        // `session_roster_delta` never reports removals, so the authoritative
+        // list is re-read on every open, and the rendered order is captured in
+        // the same breath and frozen until the drawer closes.
+        LaunchedEffect(drawerState.isOpen) {
+            if (drawerState.isOpen) viewModel.onDrawerOpened() else viewModel.onDrawerClosed()
         }
 
         // Back closes the drawer first, then any overlay (UI-SPEC 3.0).
@@ -145,7 +159,7 @@ fun HaiderApp(
                     state = state,
                     themeMode = themeMode,
                     appVersion = appVersion,
-                    nowMs = nowMs,
+                    elapsedRealtimeMs = elapsedRealtimeProvider(),
                     onBack = viewModel::closeOverlay,
                     onThemeMode = onThemeMode,
                     onOpenAccounts = { viewModel.openOverlay(Overlay.Accounts) },
@@ -162,6 +176,7 @@ fun HaiderApp(
             Overlay.Accounts -> {
                 AccountsScreen(
                     repository = accounts,
+                    oauth = oauth,
                     onBack = { viewModel.openOverlay(Overlay.Settings) },
                     onOpenUrl = onOpenUrl,
                 )
@@ -199,11 +214,15 @@ fun HaiderApp(
                         onStartDaemon = { viewModel.startDaemon() },
                         onStopDaemon = { viewModel.stopDaemon() },
                         onOpenDaemonDetails = { viewModel.openOverlay(Overlay.DaemonDetails) },
-                        onOpenModel = { viewModel.openOverlay(Overlay.ModelPicker) },
+                        // The footer's full-size row and the composer's 32 dp
+                        // chip open the same sheet — that is what makes the
+                        // chip a sanctioned shortcut rather than a lone path.
+                        onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
                         onOpenSettings = { viewModel.openOverlay(Overlay.Settings) },
                         onThemeMode = onThemeMode,
                         onLoadMore = { viewModel.loadMoreSessions() },
                         nowMsProvider = nowMsProvider,
+                        elapsedRealtimeProvider = elapsedRealtimeProvider,
                         modifier = Modifier.windowInsetsPadding(WindowInsets.safeDrawing),
                     )
                 }
@@ -217,9 +236,10 @@ fun HaiderApp(
             ) {
                 HaiderTopBar(
                     state = state,
+                    dark = dark,
                     onOpenDrawer = { scope.launch { drawerState.open() } },
-                    onOpenSessionSheet = {
-                        state.activeSessionId?.let { viewModel.openOverlay(Overlay.SessionActions(it)) }
+                    onToggleTheme = {
+                        onThemeMode(if (dark) ThemeMode.Light else ThemeMode.Dark)
                     },
                     onAction = { action -> viewModel.applyTopBarAction(action) },
                 )
@@ -231,6 +251,8 @@ fun HaiderApp(
                             BannerAction.OpenNeedsInput -> elsewhere?.let { viewModel.activate(it.id) }
                             BannerAction.RequestNotifications ->
                                 onSystemAction(SystemAction.RequestNotifications)
+                            BannerAction.OpenAppSettings ->
+                                onSystemAction(SystemAction.OpenAppSettings)
                             BannerAction.OpenBatterySettings -> onSystemAction(SystemAction.OpenBattery)
                             BannerAction.OpenDaemonDetails -> viewModel.openOverlay(Overlay.DaemonDetails)
                             BannerAction.ContinueUpdate -> onUpdateAction()
@@ -246,6 +268,7 @@ fun HaiderApp(
                             state = state,
                             appVersion = appVersion,
                             nowMs = nowMs,
+                            elapsedRealtimeMs = elapsedRealtimeProvider(),
                             onStepAction = { step ->
                                 when (step) {
                                     SetupStepId.RunService -> viewModel.startDaemon()
@@ -267,18 +290,24 @@ fun HaiderApp(
                                     needsInput = needsInput,
                                     nowMs = nowMs,
                                     answeredElsewhere = needsInput.menuId in state.answeredElsewhere,
+                                    // No coordinates, no answer affordance: a
+                                    // compare-and-set needs all of them.
+                                    answerable = MenuCoordinates.of(
+                                        sessionId = state.activeSessionId.orEmpty(),
+                                        needsInput = needsInput,
+                                        commandId = "render",
+                                    ) != null,
                                     onAnswer = { key, index, text ->
                                         val session = state.activeSessionId ?: return@InputRequiredCard
-                                        viewModel.answer(
-                                            session,
-                                            needsInput.menuId.orEmpty(),
-                                            key,
-                                            index,
-                                            text,
-                                        )
+                                        viewModel.answer(session, key, index, text)
                                     },
-                                    onOpenSecretVault = {
-                                        viewModel.openOverlay(Overlay.DaemonDetails)
+                                    onAnswerSecret = { key, index, secret ->
+                                        val session = state.activeSessionId
+                                        if (session == null) {
+                                            secret.fill(' ')
+                                        } else {
+                                            viewModel.answerSecret(session, key, index, secret)
+                                        }
                                     },
                                     modifier = Modifier.padding(
                                         horizontal = ForgeSpace.xl,
@@ -341,10 +370,14 @@ fun HaiderApp(
                         chip = chip,
                         contextTokens = state.activeSession?.footprintTokens,
                         contextExact = state.activeSession?.footprintExact,
+                        provider = state.models?.current?.provider,
+                        effort = state.models?.current?.effort,
                         onSend = { viewModel.send() },
                         onStop = { viewModel.stopTurn() },
                         onStartDaemon = { viewModel.startDaemon() },
-                        onOpenModel = { viewModel.openOverlay(Overlay.ModelPicker) },
+                        onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
+                        onOpenProvider = { viewModel.openOverlay(Overlay.Picker(PickerKind.Provider)) },
+                        onOpenEffort = { viewModel.openOverlay(Overlay.Picker(PickerKind.Effort)) },
                         onRetryModels = { viewModel.refreshModels() },
                         onAttach = { viewModel.openOverlay(Overlay.Attach) },
                         modifier = Modifier.widthIn(max = ForgeSize.readableMax),
@@ -368,6 +401,17 @@ private fun Overlays(
     onSystemAction: (SystemAction) -> Unit,
 ) {
     when (val overlay = state.overlay) {
+        is Overlay.Picker -> SessionPickerSheet(
+            kind = overlay.kind,
+            inventory = state.providers,
+            currentProvider = state.models?.current?.provider,
+            currentModel = state.models?.current?.model,
+            currentEffort = state.models?.current?.effort,
+            onDismiss = viewModel::closeOverlay,
+            onSelectProvider = viewModel::selectProvider,
+            onSelectModel = viewModel::selectModel,
+            onSelectEffort = viewModel::selectEffort,
+        )
         Overlay.ModelPicker, Overlay.NewSessionWith -> ModelPicker(
             config = state.models,
             error = state.catalogError,
@@ -416,6 +460,9 @@ private fun Overlays(
 /** Everything the UI needs from the platform, kept out of the composables. */
 sealed interface SystemAction {
     data object RequestNotifications : SystemAction
+
+    /** For a permanently denied permission: the dialog will not come back. */
+    data object OpenAppSettings : SystemAction
     data object OpenBattery : SystemAction
     data object OpenAccessibility : SystemAction
     data object GrantSms : SystemAction

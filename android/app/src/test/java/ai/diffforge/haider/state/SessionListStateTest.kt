@@ -146,6 +146,86 @@ class SessionListStateTest {
     }
 
     @Test
+    fun `grouping presents the attention order instead of overriding it`() {
+        // Round 1 emitted groups in enum order, so an ACTIVE row could be
+        // drawn above a more recent RECENT row: the grouping silently re-sorted
+        // what `order` had already decided.
+        val unseen = row("unseen", lastActivityMs = 100, seenAtMs = 0)
+        val active = row("active", lastActivityMs = 50, seenAtMs = 50, runId = "r")
+        val rows = listOf(unseen, active)
+        assertEquals(
+            SessionListState.order(rows, null).map { it.id },
+            SessionListState.groups(rows, null).flatMap { it.rows }.map { it.id },
+        )
+    }
+
+    @Test
+    fun `flattening the groups always reproduces the canonical order`() {
+        val rows = listOf(
+            row("a", state = SessionVisualState.NeedsInput, needsInput = asking, lastActivityMs = now - 9_000),
+            row("b", state = SessionVisualState.Running, runId = "r", lastActivityMs = now),
+            row("c", lastActivityMs = now - 1_000),
+            row("d", lastActivityMs = null, seenAtMs = null),
+        )
+        assertEquals(
+            SessionListState.order(rows, null).map { it.id },
+            SessionListState.groups(rows, null).flatMap { it.rows }.map { it.id },
+        )
+    }
+
+    @Test
+    fun `a frozen row does not move when its group changes underneath it`() {
+        val before = listOf(
+            row("a", lastActivityMs = 20, seenAtMs = 20),
+            row("b", lastActivityMs = 10, seenAtMs = 10),
+        )
+        val snapshot = SessionListState.OrderSnapshot.capture(before, null)
+        // `b` starts asking for a human, which would promote it to NEEDS YOU.
+        val after = before.map { if (it.id == "b") it.copy(needsInput = asking) else it }
+        assertEquals(
+            listOf("a", "b"),
+            SessionListState.groups(after, null, snapshot = snapshot).flatMap { it.rows }.map { it.id },
+        )
+        // And it keeps the group header it was rendered under, so the row does
+        // not jump out from beneath the user's thumb.
+        assertEquals(
+            listOf(SessionGroupKind.Recent),
+            SessionListState.groups(after, null, snapshot = snapshot).map { it.kind },
+        )
+    }
+
+    @Test
+    fun `the freeze lifts when a new snapshot is captured`() {
+        val before = listOf(
+            row("a", lastActivityMs = 20, seenAtMs = 20),
+            row("b", lastActivityMs = 10, seenAtMs = 10),
+        )
+        val after = before.map { if (it.id == "b") it.copy(needsInput = asking) else it }
+        val reopened = SessionListState.OrderSnapshot.capture(after, null)
+        assertEquals(
+            listOf("b", "a"),
+            SessionListState.groups(after, null, snapshot = reopened).flatMap { it.rows }.map { it.id },
+        )
+    }
+
+    @Test
+    fun `transcript hits survive the metadata filter`() {
+        val rows = listOf(
+            row("s-1", title = "Nothing matching"),
+            row("s-2", title = "Also nothing"),
+        )
+        // The query matches no metadata, but the repository found it in a
+        // transcript, so the row must still be listed.
+        val listed = SessionListState.groups(
+            rows = rows,
+            activeId = null,
+            query = "back stack invariants",
+            extraIds = setOf("s-2"),
+        ).flatMap { it.rows }.map { it.id }
+        assertEquals(listOf("s-2"), listed)
+    }
+
+    @Test
     fun `hundreds of sessions stay ordered without collapsing groups`() {
         val rows = (0 until 300).map { index ->
             row(

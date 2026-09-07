@@ -132,6 +132,12 @@ object DaemonIntents {
 data class DaemonEnvironment(
     val network: NetworkState = NetworkState.Available,
     val notificationsGranted: Boolean = true,
+    /**
+     * A second refusal is not a first one: Android will not show the dialog
+     * again, so the banner's action has to open app settings instead of asking
+     * for something the user can no longer be asked for (UI-SPEC 3.8).
+     */
+    val notificationsPermanentlyDenied: Boolean = false,
     val batteryRestricted: Boolean = false,
 )
 

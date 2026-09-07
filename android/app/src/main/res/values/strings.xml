@@ -20,7 +20,7 @@
     <string name="step_service_title">Run Haider in the background</string>
     <string name="step_service_body">A sticky foreground service hosts the agent. No runtime permission is needed.</string>
     <string name="step_service_action">Start Haider</string>
-    <string name="step_service_done">Running · %1$s · started %2$s</string>
+    <string name="step_service_done">Running · %1$s · up %2$s</string>
     <string name="step_notify_title">Let Haider notify you</string>
     <string name="step_notify_body">Without notifications you will not be told when a turn finishes or the agent needs an answer.</string>
     <string name="step_notify_action">Allow notifications</string>
@@ -52,6 +52,8 @@
     <string name="drawer_search_empty">No session matches “%1$s”.</string>
     <string name="drawer_search_hint">Search sessions</string>
     <string name="drawer_search_partial">Searching %1$d of %2$d sessions — still indexing history.</string>
+    <string name="drawer_search_running">Searching transcripts…</string>
+    <string name="state_unknown">Unknown</string>
     <string name="drawer_filter_all">All %1$d</string>
     <string name="drawer_filter_running">Running %1$d</string>
     <string name="drawer_filter_needs_input">Needs input %1$d</string>
@@ -101,6 +103,8 @@
     <string name="banner_notify_title">Notifications are off</string>
     <string name="banner_notify_body">You won\'t hear when a turn ends or Haider asks.</string>
     <string name="banner_notify_action">Allow</string>
+    <string name="banner_notify_body_blocked">Android will not ask again. Turn them on in app settings.</string>
+    <string name="banner_notify_action_settings">Settings</string>
     <string name="banner_battery_title">Android may stop Haider</string>
     <string name="banner_battery_body">Mark it unrestricted so long turns survive.</string>
     <string name="banner_battery_action">Fix</string>
@@ -111,6 +115,17 @@
 
     <!-- Composer -->
     <string name="chip_model_label">MODEL</string>
+    <string name="chip_provider_label">PROVIDER</string>
+    <string name="chip_effort_label">EFFORT</string>
+    <string name="picker_provider_title">Provider</string>
+    <string name="picker_model_title">Model</string>
+    <string name="picker_effort_title">Effort</string>
+    <string name="picker_unavailable">%1$s — %2$s</string>
+    <string name="picker_empty">Nothing to choose yet. The daemon has not published an inventory.</string>
+    <string name="cd_change_provider">Change provider</string>
+    <string name="cd_change_effort">Change effort</string>
+    <string name="cd_use_light_theme">Use the light theme</string>
+    <string name="cd_use_dark_theme">Use the dark theme</string>
     <string name="chip_model_loading_cd">Loading models</string>
     <string name="chip_model_error">Models unavailable · Retry</string>
     <string name="chip_model_no_daemon">Start Haider first</string>
@@ -132,6 +147,9 @@
     <string name="ask_waiting">Waiting %1$s · notification sent</string>
     <string name="ask_answered_elsewhere">Answered elsewhere.</string>
     <string name="ask_secret_elsewhere">Answer this on your computer — secrets cannot be typed here.</string>
+    <string name="ask_secret_masked">Typed here, stored in the on-device vault. Only a reference is sent — never the secret itself.</string>
+    <string name="ask_secret_hint">Enter it securely</string>
+    <string name="ask_coordinates_missing">This prompt is missing its answer coordinates. Reopen the session to answer it.</string>
     <string name="ask_allow_always_note">Won\'t ask again this session</string>
     <string name="ask_send">Send</string>
     <string name="ask_free_text_hint">Type your answer</string>

@@ -11,7 +11,6 @@ import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.AttentionBadgeKind
 import ai.diffforge.haider.ui.state.ModelNames
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,6 +21,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material3.DropdownMenu
@@ -57,8 +58,9 @@ enum class TopBarAction {
 }
 
 /**
- * 56 dp, one hairline, and **exactly two** interactive controls, both the same
- * shape (UI-SPEC 3.1).
+ * 56 dp, one hairline, and interactive controls that are all the same shape
+ * (UI-SPEC 3.1): the drawer button, the appearance toggle and the overflow.
+ * The title is not one of them — it is data.
  *
  * 970 crammed a bordered pill next to two bordered circles in 48 dp boxes, each
  * with different padding (D1), and printed `model ?: "Diff Forge AI"` on the
@@ -69,8 +71,9 @@ enum class TopBarAction {
 @Composable
 fun HaiderTopBar(
     state: AppUiState,
+    dark: Boolean,
     onOpenDrawer: () -> Unit,
-    onOpenSessionSheet: () -> Unit,
+    onToggleTheme: () -> Unit,
     onAction: (TopBarAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -111,11 +114,13 @@ fun HaiderTopBar(
                 }
             }
 
+            // The title is data, not a control. Making it clickable made the
+            // header a three-target bar, which is exactly what 6.3.1 forbids;
+            // "Session details" lives in the overflow instead.
             Column(
                 modifier = Modifier
                     .weight(1f)
                     .heightIn(min = ForgeSize.touch)
-                    .clickable(onClick = onOpenSessionSheet)
                     .padding(horizontal = ForgeSpace.md),
                 verticalArrangement = Arrangement.Center,
             ) {
@@ -143,6 +148,21 @@ fun HaiderTopBar(
                         )
                     }
                 }
+            }
+
+            // Addition D: light/dark stays on the bar, beside the overflow.
+            ForgeIconButton(
+                onClick = onToggleTheme,
+                contentDescription = stringResource(
+                    if (dark) R.string.cd_use_light_theme else R.string.cd_use_dark_theme,
+                ),
+            ) {
+                Icon(
+                    if (dark) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
+                    contentDescription = null,
+                    tint = colors.textSoft,
+                    modifier = Modifier.size(ForgeSize.icon),
+                )
             }
 
             Box {

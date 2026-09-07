@@ -55,14 +55,14 @@ class AccountsFlowTest {
         assertFalse(request.toString().contains("sk-live"))
         assertTrue(request.toString().contains("REDACTED"))
         // The payload still carries it, because that is what the vault needs.
-        assertTrue(request.body().getString("value").startsWith("sk-live"))
-        assertEquals(AccountsRpcAdapter.VAULT_PURPOSE_API_KEY, request.body().getString("purpose"))
+        assertTrue(request.body().getString("secret").startsWith("sk-live"))
+        assertEquals(AccountsRpcAdapter.PURPOSE_API_KEY, request.body().getString("purpose"))
     }
 
     @Test
     fun `the oauth flow walks waiting then exchanging then ready`() = runTest {
         val repository = FakeAccountsRepository()
-        val flow = repository.startOAuth("anthropic", "personal") as OAuthFlow.Started
+        val flow = repository.startOAuth("anthropic", "personal", "attempt-1") as OAuthFlow.Started
         assertEquals(OAuthStatus.Waiting, repository.pollOAuth(flow))
         // The provider's success page arrives before the exchange finishes.
         assertEquals(OAuthStatus.Exchanging, repository.pollOAuth(flow))
@@ -84,7 +84,7 @@ class AccountsFlowTest {
     @Test
     fun `a device flow carries a user code instead of capturing a redirect`() = runTest {
         val repository = FakeAccountsRepository()
-        val flow = repository.startOAuth("kimi", null) as OAuthFlow.Started
+        val flow = repository.startOAuth("kimi", null, "attempt-1") as OAuthFlow.Started
         assertEquals(OAuthStyle.Device, flow.style)
         assertEquals("HAID-971", flow.userCode)
     }
@@ -92,7 +92,7 @@ class AccountsFlowTest {
     @Test
     fun `a lost flow is not resumable, only re-checked`() = runTest {
         val repository = FakeAccountsRepository()
-        val flow = repository.startOAuth("anthropic", "personal") as OAuthFlow.Started
+        val flow = repository.startOAuth("anthropic", "personal", "attempt-1") as OAuthFlow.Started
         repository.flowLost = true
         assertEquals(OAuthStatus.Lost, repository.pollOAuth(flow))
         // The honest question is whether the commit already landed.
@@ -102,14 +102,14 @@ class AccountsFlowTest {
     @Test
     fun `a provider without sign-in says so instead of offering it`() = runTest {
         val repository = FakeAccountsRepository()
-        val unavailable = repository.startOAuth("google", null)
+        val unavailable = repository.startOAuth("google", null, "attempt-1")
         assertTrue(unavailable is OAuthFlow.Unavailable)
     }
 
     @Test
     fun `cancelling makes the next poll terminal`() = runTest {
         val repository = FakeAccountsRepository()
-        val flow = repository.startOAuth("anthropic", null) as OAuthFlow.Started
+        val flow = repository.startOAuth("anthropic", null, "attempt-1") as OAuthFlow.Started
         repository.cancelOAuth(flow)
         val status = repository.pollOAuth(flow) as OAuthStatus.Failed
         assertEquals("cancelled", status.terminalKind)

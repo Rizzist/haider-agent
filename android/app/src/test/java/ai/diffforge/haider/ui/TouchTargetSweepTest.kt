@@ -38,26 +38,52 @@ class TouchTargetSweepTest {
     @get:Rule
     val rule = createAndroidComposeRule<MainActivity>()
 
-    /** The sanctioned sub-48 dp shortcuts, matched by their spoken label. */
-    private val shortcuts = listOf(
+    /**
+     * The sub-48 dp shortcuts, named exactly, each with the full-size
+     * equivalent that makes it permissible (UI-SPEC 4.3). Nothing is matched by
+     * a loose prefix: "Start" would have exempted every Start button in the
+     * app, which is how the round-1 list grew past the three sanctioned kinds.
+     *
+     * | shortcut | full-size equivalent |
+     * |---|---|
+     * | composer model/provider/effort chips | the picker sheets, and the drawer footer's Model row |
+     * | banner action buttons (34 dp) | the same action in Settings |
+     * | drawer filter chips (30 dp) | scrolling the grouped list |
+     * | appearance segmented chips (30 dp) | Settings -> Appearance |
+     */
+    private val exactShortcuts = setOf(
+        // Composer context row (32 dp visual).
         "Change model",
-        "Models unavailable",
+        "Models unavailable · Retry",
         "Start Haider first",
         "Loading models",
-        "All ",
-        "Running ",
-        "Needs input ",
-        "Sys",
-        "Light",
-        "Dark",
+        // Banner actions (34 dp), each duplicated in Settings.
         "Start",
-        "Stop",
-        "Restart",
         "Allow",
         "Fix",
         "Open",
         "Dismiss",
+        // Daemon card actions (34 dp), duplicated in Settings -> Daemon.
+        "Stop",
+        "Restart",
+        // Appearance segmented control (30 dp), duplicated in Settings.
+        "Sys",
+        "Light",
+        "Dark",
     )
+
+    /** Filter chips carry live counts, so they are matched on their stem. */
+    private val countedShortcuts = setOf("All", "Running", "Needs input")
+
+    private fun exempt(label: String): Boolean {
+        if (label in exactShortcuts) return true
+        // "Change provider, anthropic" / "Change effort, high": the chip's own
+        // label plus its current value.
+        if (label.startsWith("Change provider") || label.startsWith("Change effort")) return true
+        if (label.startsWith("Change model")) return true
+        val stem = label.substringBeforeLast(' ')
+        return stem in countedShortcuts
+    }
 
     private fun sweep(label: String) {
         val minPx = with(rule.density) { 48.dp.toPx() }
@@ -65,7 +91,7 @@ class TouchTargetSweepTest {
             .fetchSemanticsNodes()
             .filter { node ->
                 val description = node.spokenLabel()
-                shortcuts.none { description.startsWith(it) } &&
+                !exempt(description) &&
                     (node.size.width < minPx || node.size.height < minPx)
             }
             .map { "${it.spokenLabel()} = ${it.size.width}x${it.size.height}px" }
@@ -107,6 +133,24 @@ class TouchTargetSweepTest {
         val service = ComposeHost.install(FakeScenario.InputRequiredHere)
         rule.setHaiderApp(service)
         sweep("input required")
+    }
+
+    @Test
+    fun `the settings screen has no undersized targets`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.openOverlay(ai.diffforge.haider.ui.state.Overlay.Settings)
+        rule.waitForIdle()
+        sweep("settings")
+    }
+
+    @Test
+    fun `the accounts screen has no undersized targets`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.openOverlay(ai.diffforge.haider.ui.state.Overlay.Accounts)
+        rule.waitForIdle()
+        sweep("accounts")
     }
 
     @Test

@@ -2,10 +2,13 @@ package ai.diffforge.haider.ui.state
 
 import ai.diffforge.haider.ui.daemon.DaemonEnvironment
 import ai.diffforge.haider.ui.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.ProviderInventory
 import ai.diffforge.haider.ui.daemon.RosterPaging
 import ai.diffforge.haider.ui.daemon.SearchIndexState
 import ai.diffforge.haider.ui.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.SearchOutcome
 import ai.diffforge.haider.ui.daemon.SessionVisualState
+import ai.diffforge.haider.ui.daemon.TurnCancel
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.chat.Message
 
@@ -20,6 +23,9 @@ sealed interface Overlay {
     data object Attach : Overlay
     data object DaemonDetails : Overlay
     data object NewSessionWith : Overlay
+
+    /** Provider / model / effort pickers for the composer bar. */
+    data class Picker(val kind: ai.diffforge.haider.ui.chat.PickerKind) : Overlay
     data object Settings : Overlay
     data object Accounts : Overlay
     data class SessionActions(val sessionId: String) : Overlay
@@ -93,13 +99,29 @@ data class AppUiState(
     /** Set when a replay came back partial or unavailable; never hidden. */
     val transcriptNotice: String? = null,
     val searchIndex: SearchIndexState = SearchIndexState(),
+    /** The repository's full-roster search result for [query], when it has one. */
+    val searchOutcome: SearchOutcome? = null,
+    val searching: Boolean = false,
+    val providers: ProviderInventory = ProviderInventory(),
+    /** Non-null exactly while the drawer is open, freezing the rendered order. */
+    val orderSnapshot: SessionListState.OrderSnapshot? = null,
     val answeredElsewhere: Set<String> = emptySet(),
 ) {
     val activeSession: SessionRow?
         get() = sessions.firstOrNull { it.id == activeSessionId }
 
+    /**
+     * A Stop affordance exists only when the *current snapshot* carries run
+     * coordinates. A streaming message left over from a connection drop is not
+     * a live run, and offering Stop for it would cancel nothing — or worse,
+     * cancel a run that already ended (frame.rs:1716-1730).
+     */
     val turnRunning: Boolean
-        get() = activeSession?.runId != null || messages.any { it.streaming }
+        get() = TurnCancel.coordinates(activeSession) != null
+
+    /** A message still marked streaming while the roster reports no run. */
+    val staleStream: Boolean
+        get() = !turnRunning && messages.any { it.streaming }
 
     val needsInputHere: Boolean
         get() = activeSession?.needsInput != null

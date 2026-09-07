@@ -47,15 +47,15 @@ object ModelChipStateMachine {
                 effort = config.current.effort,
             )
         }
-        if (selectionBusy) return ModelChipState.Changing
         if (catalogError != null) return ModelChipState.Error(catalogError)
         if (daemon !is DaemonStatus.Running) return ModelChipState.DaemonDown
-        if (requestedAtMs == null) return ModelChipState.Loading
-        return if (nowMs - requestedAtMs >= DEADLINE_MS) {
-            ModelChipState.Error(null)
-        } else {
-            ModelChipState.Loading
-        }
+        // Nothing resolved and nothing in flight is not "loading" — there is no
+        // request to wait for, so the chip offers a retry immediately.
+        if (requestedAtMs == null) return ModelChipState.Error(null)
+        // The deadline bounds BOTH unresolved states. A selection that never
+        // comes back is exactly as stuck as a catalog that never arrives.
+        if (nowMs - requestedAtMs >= DEADLINE_MS) return ModelChipState.Error(null)
+        return if (selectionBusy) ModelChipState.Changing else ModelChipState.Loading
     }
 }
 

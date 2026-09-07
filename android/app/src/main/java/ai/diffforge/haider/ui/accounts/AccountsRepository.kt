@@ -32,6 +32,10 @@ data class ProviderDescriptor(
     val oauthStyle: OAuthStyle = OAuthStyle.AuthorizationCode,
     val available: Boolean = true,
     val unavailableReason: String? = null,
+    /** `ProviderSummaryWire.models`; the composer's model picker reads these. */
+    val models: List<String> = emptyList(),
+    val defaultModel: String? = null,
+    val apiFamily: String? = null,
 )
 
 data class Account(
@@ -109,12 +113,19 @@ interface AccountsRepository {
     /** Stages and validates without committing, for the field's inline check. */
     suspend fun validateApiKey(provider: String, apiKey: CharArray): AccountResult
 
+    /** `provider.list`, the inventory both the pickers and this screen read. */
+    suspend fun refreshProviders()
+
     /** `account.remove` with the revision it was read at. */
     suspend fun remove(alias: String): AccountResult
     suspend fun setActive(alias: String): AccountResult
 
-    /** `account.oauth_start{provider,desired_alias,attempt_id}`. */
-    suspend fun startOAuth(provider: String, desiredAlias: String?): OAuthFlow
+    /**
+     * `account.oauth_start{provider,desired_alias,attempt_id}`. The attempt id
+     * is the *client's*: the response does not carry one back, and it is the
+     * coordinate every later `oauth_status` call is bound to.
+     */
+    suspend fun startOAuth(provider: String, desiredAlias: String?, attemptId: String): OAuthFlow
 
     /** `account.oauth_status{flow_id,attempt_id}` on the original connection. */
     suspend fun pollOAuth(flow: OAuthFlow.Started): OAuthStatus

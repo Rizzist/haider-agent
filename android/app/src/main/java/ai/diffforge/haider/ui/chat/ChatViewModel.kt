@@ -3,11 +3,14 @@ package ai.diffforge.haider.ui.chat
 import ai.diffforge.haider.ui.daemon.DaemonService
 import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.daemon.MissingRunCoordinates
+import ai.diffforge.haider.ui.daemon.MenuAnswerInput
+import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.state.SessionFilter
+import ai.diffforge.haider.ui.state.SessionListState
 import ai.diffforge.haider.ui.state.SetupPlan
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -15,6 +18,8 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -28,6 +33,8 @@ class ChatViewModel(
     private val service: DaemonService,
     private val clock: () -> Long = System::currentTimeMillis,
     private val notificationsSupported: Boolean = true,
+    /** Typing settles before the roster is searched; zero in tests. */
+    private val searchDebounceMs: Long = SEARCH_DEBOUNCE_MS,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(AppUiState())
@@ -36,10 +43,19 @@ class ChatViewModel(
     private val transcripts = mutableMapOf<String, List<Message>>()
     private val drafts = mutableMapOf<String, String>()
     private var batterySkipped = false
+    private var searchJob: Job? = null
+    private var commandSeq = 0L
 
     init {
         viewModelScope.launch {
-            service.status.collect { status -> update { it.copy(daemon = status) }; recomputeSetup() }
+            service.status.collect { status ->
+                update { it.copy(daemon = status) }
+                recomputeSetup()
+                // Addition D: with the daemon enabled the app opens straight
+                // into a session. There is no setup screen to walk past once
+                // there is nothing left to set up.
+                if (status is DaemonStatus.Running) ensureActiveSession()
+            }
         }
         viewModelScope.launch {
             service.environment.collect { env -> update { it.copy(environment = env) }; recomputeSetup() }
@@ -68,6 +84,9 @@ class ChatViewModel(
         viewModelScope.launch {
             service.searchIndex.collect { index -> update { it.copy(searchIndex = index) } }
         }
+        viewModelScope.launch {
+            service.providers.collect { inventory -> update { it.copy(providers = inventory) } }
+        }
     }
 
     // ---------- daemon lifecycle ----------
@@ -81,6 +100,20 @@ class ChatViewModel(
     // ---------- roster ----------
 
     fun refreshRoster() = viewModelScope.launch { service.refreshRoster() }
+
+    /**
+     * Called when the drawer opens. `session_roster_delta` never reports
+     * removals, so the authoritative list has to be re-read on open (C5), and
+     * the rendered order is captured in the same breath so it can be frozen
+     * until the drawer closes.
+     */
+    fun onDrawerOpened() {
+        update { it.copy(orderSnapshot = SessionListState.OrderSnapshot.capture(it.sessions, it.activeSessionId)) }
+        viewModelScope.launch { service.refreshRoster() }
+    }
+
+    /** The freeze lifts when the drawer closes, so the next open re-sorts. */
+    fun onDrawerClosed() = update { it.copy(orderSnapshot = null) }
 
     fun loadMoreSessions() = viewModelScope.launch { service.loadMoreSessions() }
 
@@ -143,32 +176,89 @@ class ChatViewModel(
         loadTranscript(id)
     }
 
-    fun answer(sessionId: String, menuId: String, optionKey: String, optionIndex: Int, text: String? = null) =
-        viewModelScope.launch {
-            runCatching { service.answer(sessionId, menuId, optionKey, optionIndex, text) }
-                .onFailure { error ->
-                    if (error.message?.contains(ALREADY_RESOLVED) == true) {
-                        update { it.copy(answeredElsewhere = it.answeredElsewhere + menuId) }
-                    }
-                }
-            loadTranscript(sessionId)
+    /**
+     * Answers with coordinates read from the snapshot that rendered the card.
+     * If any coordinate is missing there is nothing to compare and set, so no
+     * answer is sent.
+     */
+    fun answer(
+        sessionId: String,
+        optionKey: String,
+        optionIndex: Int,
+        text: String? = null,
+    ) = viewModelScope.launch {
+        val coordinates = coordinatesFor(sessionId) ?: return@launch
+        submitAnswer(coordinates, optionKey, optionIndex, text?.let(MenuAnswerInput::Text))
+    }
+
+    /**
+     * The masked path: the plaintext goes to `vault.stage` with purpose
+     * `menu_secret`, the answer carries only the returned reference, and the
+     * caller's buffer is wiped whatever happens.
+     */
+    fun answerSecret(
+        sessionId: String,
+        optionKey: String,
+        optionIndex: Int,
+        secret: CharArray,
+    ) = viewModelScope.launch {
+        val coordinates = coordinatesFor(sessionId)
+        try {
+            if (coordinates == null) return@launch
+            val reference = runCatching { service.stageMenuSecret(secret) }.getOrNull()
+                ?: return@launch
+            submitAnswer(coordinates, optionKey, optionIndex, MenuAnswerInput.Secret(reference))
+        } finally {
+            secret.fill(' ')
         }
+    }
+
+    private fun coordinatesFor(sessionId: String): MenuCoordinates? = MenuCoordinates.of(
+        sessionId = sessionId,
+        needsInput = session(sessionId)?.needsInput,
+        commandId = "menu-answer-${++commandSeq}",
+    )
+
+    private suspend fun submitAnswer(
+        coordinates: MenuCoordinates,
+        optionKey: String,
+        optionIndex: Int,
+        input: MenuAnswerInput?,
+    ) {
+        runCatching { service.answer(coordinates, optionKey, optionIndex, input) }
+            .onFailure { error ->
+                if (error.message?.contains(ALREADY_RESOLVED) == true) {
+                    update { it.copy(answeredElsewhere = it.answeredElsewhere + coordinates.menuId) }
+                }
+            }
+        loadTranscript(coordinates.sessionId)
+    }
 
     // ---------- model catalog ----------
 
     fun selectModel(provider: String, model: String) = viewModelScope.launch {
-        update { it.copy(selectionBusy = true) }
+        // The chip's deadline anchors on whatever is in flight, so a selection
+        // that never returns expires exactly like a catalog that never arrives.
+        update { it.copy(selectionBusy = true, catalogRequestedAtMs = clock()) }
         runCatching { service.selectModel(provider, model) }
         update { it.copy(selectionBusy = false) }
     }
 
     fun selectEffort(effort: String?) = viewModelScope.launch {
-        update { it.copy(selectionBusy = true) }
+        update { it.copy(selectionBusy = true, catalogRequestedAtMs = clock()) }
         runCatching { service.selectEffort(effort) }
         update { it.copy(selectionBusy = false) }
     }
 
     fun refreshModels() = viewModelScope.launch { service.refreshModels() }
+
+    fun refreshProviders() = viewModelScope.launch { service.refreshProviders() }
+
+    fun selectProvider(provider: String) = viewModelScope.launch {
+        update { it.copy(selectionBusy = true, catalogRequestedAtMs = clock()) }
+        runCatching { service.selectProvider(provider) }
+        update { it.copy(selectionBusy = false) }
+    }
 
     // ---------- surfaces ----------
 
@@ -178,7 +268,30 @@ class ChatViewModel(
 
     fun setFilter(filter: SessionFilter) = update { it.copy(filter = filter) }
 
-    fun setQuery(query: String) = update { it.copy(query = query) }
+    /**
+     * Metadata filtering is immediate; the full-roster transcript search runs
+     * through the repository's paged read cache and its completeness is
+     * surfaced rather than assumed.
+     */
+    fun setQuery(query: String) {
+        update { it.copy(query = query, searching = query.isNotBlank()) }
+        searchJob?.cancel()
+        if (query.isBlank()) {
+            update { it.copy(searchOutcome = null, searching = false) }
+            return
+        }
+        searchJob = viewModelScope.launch {
+            if (searchDebounceMs > 0) delay(searchDebounceMs)
+            val outcome = runCatching { service.search(query) }.getOrNull()
+            update {
+                if (it.query == query) {
+                    it.copy(searchOutcome = outcome, searching = false)
+                } else {
+                    it
+                }
+            }
+        }
+    }
 
     fun skipBatteryStep() {
         batterySkipped = true
@@ -186,6 +299,26 @@ class ChatViewModel(
     }
 
     fun session(id: String?): SessionRow? = _state.value.sessions.firstOrNull { it.id == id }
+
+    /**
+     * Opens the session the user would expect to be looking at: the one already
+     * active, else the most recent by the canonical order, else a fresh one.
+     * Lanes 1/2/3 only have to make the facade truthful; this path is wired.
+     */
+    fun ensureActiveSession() = viewModelScope.launch {
+        // The service's own value, not the mirrored state: the status flow can
+        // arrive before the active-session flow has hydrated, and reading the
+        // half-built copy would replace the session the daemon already has.
+        if (service.activeSessionId.value != null) return@launch
+        val current = _state.value
+        if (current.activeSessionId != null) return@launch
+        if (current.daemon !is DaemonStatus.Running) return@launch
+        val candidate = SessionListState.order(service.sessions.value, null).firstOrNull()
+        val id = candidate?.id ?: service.createSession()
+        service.activate(id)
+        service.markSeen(id)
+        loadTranscript(id)
+    }
 
     /**
      * A replay can be genuinely partial: `session.read` ranges are capped at
@@ -235,6 +368,7 @@ class ChatViewModel(
     }
 
     companion object {
+        const val SEARCH_DEBOUNCE_MS = 150L
         const val ALREADY_RESOLVED = "ERROR_CODE_ALREADY_RESOLVED"
 
         fun factory(

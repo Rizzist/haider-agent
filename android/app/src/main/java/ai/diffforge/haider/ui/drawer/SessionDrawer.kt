@@ -94,34 +94,45 @@ fun SessionDrawer(
     onThemeMode: (ThemeMode) -> Unit,
     onLoadMore: () -> Unit,
     nowMsProvider: () -> Long = System::currentTimeMillis,
+    elapsedRealtimeProvider: () -> Long = android.os.SystemClock::elapsedRealtime,
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
     val type = Forge.type
     var nowMs by remember { mutableLongStateOf(nowMsProvider()) }
+    var elapsedMs by remember { mutableLongStateOf(elapsedRealtimeProvider()) }
     LaunchedEffect(Unit) {
-        // Recompute relative time on a 30 s ticker while the drawer is open,
-        // and the resource line every 5 s. Never while it is closed.
+        // Relative times are wall-clock; uptime is monotonic. They are two
+        // different clocks and mixing them is a fifty-seven-year uptime.
         while (true) {
             delay(ForgeMotion.RESOURCE_TICK_MS)
             nowMs = nowMsProvider()
+            elapsedMs = elapsedRealtimeProvider()
         }
     }
 
     val counts = remember(state.sessions) { SessionListState.counts(state.sessions) }
-    // Captured on open and whenever the user changes what they are looking at.
-    val snapshot = remember(state.filter, state.query, state.sessions.size == 0) {
-        SessionListState.OrderSnapshot.of(
-            SessionListState.order(state.sessions, state.activeSessionId),
-        )
-    }
-    val groups = remember(state.sessions, state.filter, state.query, state.activeSessionId, snapshot) {
+    // The snapshot is owned by the view model and captured on drawer open, so
+    // the frozen order survives recomposition and a filter change re-captures
+    // deliberately rather than by accident of a `remember` key.
+    val snapshot = state.orderSnapshot
+    val searchIds = state.searchOutcome?.hits?.map { it.sessionId }?.toSet().orEmpty()
+    val groups = remember(
+        state.sessions,
+        state.filter,
+        state.query,
+        state.activeSessionId,
+        snapshot,
+        searchIds,
+    ) {
         SessionListState.groups(
             rows = state.sessions,
             activeId = state.activeSessionId,
             filter = state.filter,
             query = state.query,
             snapshot = snapshot,
+            // Transcript-content hits the metadata filter would not find.
+            extraIds = searchIds,
         )
     }
 
@@ -152,7 +163,7 @@ fun SessionDrawer(
         DaemonStatusCard(
             status = state.daemon,
             activeTurns = state.sessions.count { it.runId != null },
-            nowMs = nowMs,
+            elapsedRealtimeMs = elapsedMs,
             onStart = onStartDaemon,
             onStop = onStopDaemon,
             onOpenDetails = onOpenDaemonDetails,
@@ -166,12 +177,22 @@ fun SessionDrawer(
             // Completeness is known only after coverage through each recorded
             // head, so say how far the index has got instead of implying it is
             // finished (contracts-v1, history and search).
-            if (state.query.isNotBlank() && !state.searchIndex.complete) {
+            if (state.query.isNotBlank() && state.searching) {
+                Text(
+                    stringResource(R.string.drawer_search_running),
+                    style = type.sessionMeta,
+                    color = colors.textMuted,
+                    modifier = Modifier.padding(start = ForgeSpace.xl, top = ForgeSpace.xs),
+                )
+            }
+            if (state.query.isNotBlank() && !state.searching &&
+                state.searchOutcome?.complete == false
+            ) {
                 Text(
                     stringResource(
                         R.string.drawer_search_partial,
-                        state.searchIndex.indexedSessions,
-                        state.searchIndex.totalSessions,
+                        state.searchOutcome?.index?.indexedSessions ?: 0,
+                        state.searchOutcome?.index?.totalSessions ?: state.sessions.size,
                     ),
                     style = type.sessionMeta,
                     color = colors.amber,

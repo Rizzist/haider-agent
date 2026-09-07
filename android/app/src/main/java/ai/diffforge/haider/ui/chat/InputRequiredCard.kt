@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.daemon.MenuOption
+import ai.diffforge.haider.ui.accounts.SecretBuffer
 import ai.diffforge.haider.ui.daemon.NeedsInput
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
@@ -21,8 +22,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -31,10 +34,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+
+const val ASK_SECRET_FIELD_TAG = "ask_secret_field"
 
 /**
  * A transcript card, never a dialog (UI-SPEC 3.7).
@@ -52,13 +60,18 @@ fun InputRequiredCard(
     needsInput: NeedsInput,
     nowMs: Long,
     answeredElsewhere: Boolean,
+    /** Null when the rendered prompt is missing a compare-and-set coordinate. */
+    answerable: Boolean,
     onAnswer: (optionKey: String, optionIndex: Int, text: String?) -> Unit,
-    onOpenSecretVault: () -> Unit,
+    onAnswerSecret: (optionKey: String, optionIndex: Int, secret: CharArray) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
     val type = Forge.type
     var freeText by remember { mutableStateOf("") }
+    var secretText by remember { mutableStateOf("") }
+    val secret = remember { SecretBuffer() }
+    DisposableEffect(Unit) { onDispose { secret.wipe() } }
 
     Column(
         modifier = modifier
@@ -98,23 +111,84 @@ fun InputRequiredCard(
                 color = colors.textMuted,
             )
 
-            // A secret must never travel as MenuInput::text.
+            // A secret never travels as MenuInput::text. It is staged through
+            // `vault.stage` with purpose `menu_secret` and the answer carries
+            // only the opaque reference (frame.rs:1552, frame.rs:5814).
             needsInput.secretAnswer -> Column(
                 verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
             ) {
                 Text(
-                    stringResource(R.string.ask_secret_elsewhere),
+                    stringResource(R.string.ask_secret_masked),
                     style = type.sessionMeta,
                     color = colors.textMuted,
                 )
-                ForgeButton(
-                    text = stringResource(R.string.action_session_details),
-                    onClick = onOpenSecretVault,
-                    kind = ForgeButtonKind.Ghost,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+                ) {
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .heightIn(min = ForgeSize.touch)
+                            .clip(ForgeShapes.cardTight)
+                            .background(colors.surfaceControl)
+                            .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight)
+                            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
+                    ) {
+                        BasicTextField(
+                            value = secretText,
+                            onValueChange = {
+                                secretText = it
+                                secret.set(it)
+                            },
+                            singleLine = true,
+                            enabled = answerable,
+                            textStyle = type.chatBody.copy(color = colors.text),
+                            cursorBrush = SolidColor(colors.accent),
+                            // Masked: the value is never rendered back.
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = ForgeSize.touch)
+                                .testTag(ASK_SECRET_FIELD_TAG),
+                            decorationBox = { inner ->
+                                Box {
+                                    if (secretText.isEmpty()) {
+                                        Text(
+                                            stringResource(R.string.ask_secret_hint),
+                                            style = type.chatBody,
+                                            color = colors.textMuted,
+                                        )
+                                    }
+                                    inner()
+                                }
+                            },
+                        )
+                    }
+                    val option = needsInput.options.firstOrNull()
+                    ForgeButton(
+                        text = stringResource(R.string.ask_send),
+                        onClick = {
+                            // The buffer hands over a copy and wipes it; the
+                            // field is cleared in the same breath.
+                            onAnswerSecret(option?.key.orEmpty(), 0, secret.copy())
+                            secret.wipe()
+                            secretText = ""
+                        },
+                        enabled = answerable && secretText.isNotBlank(),
+                    )
+                }
+                if (!answerable) {
+                    Text(
+                        stringResource(R.string.ask_coordinates_missing),
+                        style = type.sessionMeta,
+                        color = colors.amber,
+                    )
+                }
             }
 
-            needsInput.options.isNotEmpty() -> OptionButtons(needsInput.options, onAnswer)
+            needsInput.options.isNotEmpty() -> OptionButtons(needsInput.options, answerable, onAnswer)
 
             else -> Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -153,7 +227,7 @@ fun InputRequiredCard(
                 ForgeButton(
                     text = stringResource(R.string.ask_send),
                     onClick = { onAnswer("", 0, freeText) },
-                    enabled = freeText.isNotBlank(),
+                    enabled = answerable && freeText.isNotBlank(),
                 )
             }
         }
@@ -175,6 +249,7 @@ fun InputRequiredCard(
 @Composable
 private fun OptionButtons(
     options: List<MenuOption>,
+    answerable: Boolean,
     onAnswer: (String, Int, String?) -> Unit,
 ) {
     val colors = Forge.colors
@@ -186,6 +261,7 @@ private fun OptionButtons(
                     text = option.label,
                     onClick = { onAnswer(option.key, index, null) },
                     kind = option.kind(),
+                    enabled = answerable,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -197,6 +273,7 @@ private fun OptionButtons(
                     text = option.label,
                     onClick = { onAnswer(option.key, index, null) },
                     kind = option.kind(),
+                    enabled = answerable,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }

@@ -30,11 +30,28 @@ object SessionListState {
      * one of these on open / filter change / pull-to-refresh and reuses it
      * while it stays open.
      */
-    data class OrderSnapshot(val ids: List<String>) {
+    data class OrderSnapshot(
+        val ids: List<String>,
+        /**
+         * The group each row was rendered under. Freezing only the flat order
+         * is not enough: a row that acquires `needs_input` while the drawer is
+         * open would jump into NEEDS YOU and drag the tap target with it.
+         */
+        val groups: Map<String, SessionGroupKind> = emptyMap(),
+    ) {
         private val index: Map<String, Int> = ids.withIndex().associate { (i, id) -> id to i }
         fun rank(id: String): Int? = index[id]
+        fun group(id: String): SessionGroupKind? = groups[id]
+
         companion object {
-            fun of(rows: List<SessionRow>): OrderSnapshot = OrderSnapshot(rows.map { it.id })
+            /** Captures the canonical order and the group each row sat in. */
+            fun of(rows: List<SessionRow>): OrderSnapshot = OrderSnapshot(
+                ids = rows.map { it.id },
+                groups = rows.associate { it.id to groupKind(it) },
+            )
+
+            fun capture(rows: List<SessionRow>, activeId: String?): OrderSnapshot =
+                of(order(rows, activeId))
         }
     }
 
@@ -86,14 +103,28 @@ object SessionListState {
      * captured position and rows it has never seen are appended in canonical
      * order, so a roster delta never re-sorts under the user's thumb.
      */
+    /**
+     * The drawer's list.
+     *
+     * Group headers appear in the order their first member appears in the
+     * canonical order, so grouping *presents* the attention order instead of
+     * overriding it: flattening the returned groups reproduces [order] exactly.
+     *
+     * While [snapshot] is present, a row it knows keeps both its position and
+     * the group it was rendered under, and rows it has never seen are appended
+     * in canonical order — so nothing moves under the user's thumb.
+     */
     fun groups(
         rows: List<SessionRow>,
         activeId: String?,
         filter: SessionFilter = SessionFilter.All,
         query: String = "",
         snapshot: OrderSnapshot? = null,
+        extraIds: Set<String> = emptySet(),
     ): List<SessionGroup> {
-        val visible = rows.filter { matches(it, filter) && matches(it, query) }
+        val visible = rows.filter {
+            matches(it, filter) && (matches(it, query) || it.id in extraIds)
+        }
         val ordered = if (snapshot == null) {
             order(visible, activeId)
         } else {
@@ -102,10 +133,18 @@ object SessionListState {
             val fresh = order(visible.filter { snapshot.rank(it.id) == null }, activeId)
             known + fresh
         }
-        return SessionGroupKind.entries.mapNotNull { kind ->
-            val group = ordered.filter { groupKind(it) == kind }
-            if (group.isEmpty()) null else SessionGroup(kind, group)
+        val kindOf: (SessionRow) -> SessionGroupKind = { row ->
+            snapshot?.group(row.id) ?: groupKind(row)
         }
+        val out = mutableListOf<SessionGroup>()
+        val placed = mutableSetOf<SessionGroupKind>()
+        ordered.forEach { row ->
+            val kind = kindOf(row)
+            if (placed.add(kind)) {
+                out += SessionGroup(kind, ordered.filter { kindOf(it) == kind })
+            }
+        }
+        return out
     }
 
     /** The flat ordered list, for the start surface's "recent sessions" block. */

@@ -46,7 +46,12 @@ import androidx.compose.ui.text.style.TextOverflow
 fun DaemonStatusCard(
     status: DaemonStatus,
     activeTurns: Int,
-    nowMs: Long,
+    /**
+     * `SystemClock.elapsedRealtime()`, **not** wall-clock time: the service's
+     * `startedAtElapsedRealtimeMs` is monotonic, and subtracting it from a Unix
+     * timestamp produces an uptime of about fifty-seven years.
+     */
+    elapsedRealtimeMs: Long,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onOpenDetails: () -> Unit,
@@ -106,7 +111,7 @@ fun DaemonStatusCard(
                 )
             }
         }
-        val line = resourceLine(running, activeTurns, nowMs)
+        val line = resourceLine(running, activeTurns, elapsedRealtimeMs)
         if (line.isNotEmpty()) {
             Text(line, style = type.numeric, color = colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
@@ -125,7 +130,11 @@ private fun phrase(status: DaemonStatus): String = when (status) {
 
 /** Each segment appears only when its source is known. */
 @Composable
-fun resourceLine(running: DaemonStatus.Running?, activeTurns: Int, nowMs: Long): String {
+fun resourceLine(
+    running: DaemonStatus.Running?,
+    activeTurns: Int,
+    elapsedRealtimeMs: Long,
+): String {
     val info = running?.info ?: return ""
     val segments = buildList {
         info.sessionCount?.let {
@@ -135,7 +144,7 @@ fun resourceLine(running: DaemonStatus.Running?, activeTurns: Int, nowMs: Long):
             add(pluralStringResource(R.plurals.daemon_turns_segment, activeTurns, activeTurns))
         }
         info.pssBytes?.let { add(stringResource(R.string.daemon_memory_segment, (it / (1024 * 1024)).toString())) }
-        RelativeTime.duration(info.startedAtElapsedRealtimeMs, nowMs)
+        RelativeTime.duration(info.startedAtElapsedRealtimeMs, elapsedRealtimeMs)
             .takeIf { it.isNotEmpty() }
             ?.let { add(stringResource(R.string.daemon_uptime_segment, it)) }
     }

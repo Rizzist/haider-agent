@@ -35,7 +35,7 @@ class HaiderTopBarTest {
     val rule = createAndroidComposeRule<MainActivity>()
 
     @Test
-    fun `the header carries exactly two button controls, both 48 dp`() {
+    fun `the header carries three same-shaped 48 dp controls and nothing else`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         rule.setHaiderApp(service)
 
@@ -45,15 +45,17 @@ class HaiderTopBarTest {
         val bar = rule.onNodeWithTag(HAIDER_TOP_BAR_TAG).fetchSemanticsNode()
         val buttons = buttonsUnder(bar)
 
-        // One drawer button, one overflow. The title block is a target too, but
-        // it is not a Button — it opens the session sheet.
-        assertEquals(
-            buttons.map { it.config.getOrNull(SemanticsProperties.ContentDescription)?.first() }
-                .toString(),
-            2,
-            buttons.size,
-        )
+        // Drawer, appearance, overflow. UI-SPEC 6.3.1 said two; the owner's
+        // addition D put light/dark back on the bar, and that is the amendment.
+        // What 6.3.1 protects still holds: one shape, one size, and no fourth
+        // affordance smuggled in as a clickable label.
+        val labels = buttons.map {
+            it.config.getOrNull(SemanticsProperties.ContentDescription)?.first()
+        }
+        assertEquals(labels.toString(), 3, buttons.size)
         assertTrue(buttons.all { it.size.width >= minPx && it.size.height >= minPx })
+        // The title is data, not a control: nothing else in the bar is tappable.
+        assertEquals(labels.toString(), 3, clickableUnder(bar).size)
         // The 970 status pill is gone from the bar entirely.
         assertEquals(0, rule.onAllNodesWithTextSafe("connected"))
     }
@@ -94,6 +96,13 @@ class HaiderTopBarTest {
     }
 
     @Test
+    fun `the appearance toggle is on the bar`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        rule.setHaiderApp(service)
+        rule.onNodeWithContentDescription("Use the light theme").assertIsDisplayed()
+    }
+
+    @Test
     fun `the drawer button opens the drawer`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         rule.setHaiderApp(service)
@@ -102,6 +111,14 @@ class HaiderTopBarTest {
         rule.onNodeWithContentDescription("Close sessions").assertIsDisplayed()
         assertTrue(true)
     }
+}
+
+/** Every clickable node in one subtree, whatever its role. */
+internal fun clickableUnder(
+    node: androidx.compose.ui.semantics.SemanticsNode,
+): List<androidx.compose.ui.semantics.SemanticsNode> = buildList {
+    if (node.config.contains(androidx.compose.ui.semantics.SemanticsActions.OnClick)) add(node)
+    node.children.forEach { addAll(clickableUnder(it)) }
 }
 
 /** Every Button-role node in one subtree. */

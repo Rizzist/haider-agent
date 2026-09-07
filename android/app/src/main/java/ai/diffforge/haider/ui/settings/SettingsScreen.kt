@@ -55,7 +55,7 @@ fun SettingsScreen(
     state: AppUiState,
     themeMode: ThemeMode,
     appVersion: String,
-    nowMs: Long,
+    elapsedRealtimeMs: Long,
     onBack: () -> Unit,
     onThemeMode: (ThemeMode) -> Unit,
     onOpenAccounts: () -> Unit,
@@ -123,7 +123,7 @@ fun SettingsScreen(
                 val line = resourceLine(
                     state.daemon as? DaemonStatus.Running,
                     state.sessions.count { it.runId != null },
-                    nowMs,
+                    elapsedRealtimeMs,
                 )
                 if (line.isNotEmpty()) {
                     Text(line, style = type.numeric, color = colors.textMuted)

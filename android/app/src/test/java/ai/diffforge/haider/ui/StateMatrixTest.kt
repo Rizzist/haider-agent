@@ -72,6 +72,19 @@ class StateMatrixTest {
     }
 
     @Test
+    fun `notifications permanently denied - the action goes to settings`() {
+        rule.setHaiderApp(ComposeHost.install(FakeScenario.NotificationsPermanentlyDenied))
+        assertTrue(rule.onAllNodesWithTextSafe("Notifications are off") > 0)
+        // Android will not show the dialog again; asking for it would be a lie.
+        assertTrue(
+            rule.onAllNodesWithTextSafe(
+                "Android will not ask again. Turn them on in app settings.",
+            ) > 0,
+        )
+        assertEquals(0, rule.onAllNodesWithTextSafe("Allow"))
+    }
+
+    @Test
     fun `no network - informational, and send stays available`() {
         val service = ComposeHost.install(FakeScenario.NoNetwork)
         val viewModel = rule.setHaiderApp(service)

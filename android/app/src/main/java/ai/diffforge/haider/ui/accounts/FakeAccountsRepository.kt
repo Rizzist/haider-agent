@@ -106,7 +106,15 @@ class FakeAccountsRepository(
         return AccountResult.Ok
     }
 
-    override suspend fun startOAuth(provider: String, desiredAlias: String?): OAuthFlow {
+    override suspend fun refreshProviders() {
+        calls += AccountsRpcAdapter.METHOD_PROVIDER_LIST
+    }
+
+    override suspend fun startOAuth(
+        provider: String,
+        desiredAlias: String?,
+        attemptId: String,
+    ): OAuthFlow {
         calls += AccountsRpcAdapter.METHOD_OAUTH_START
         polls = 0
         terminal = null
@@ -120,7 +128,7 @@ class FakeAccountsRepository(
             provider = provider,
             alias = desiredAlias?.takeIf { it.isNotBlank() } ?: provider,
             flowId = "flow-$provider",
-            attemptId = "attempt-1",
+            attemptId = attemptId,
             style = descriptor.oauthStyle,
             // The daemon supplies the URL; the UI never composes a redirect.
             authorizationUrl = "http://127.0.0.1:41287/callback-$provider",

@@ -161,12 +161,19 @@ fun SessionRowItem(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
             ) {
-                if (stateWord != null && rail != null) {
-                    StatePill(stateWord.uppercase(), rail)
+                if (rail != null && SessionVisualStateFold.rendersRail(row.state)) {
+                    StatePill(stateWord.orEmpty().uppercase(), rail)
                 } else {
-                    StateDot(colors.stateIdle)
+                    // No rail, no pill — a muted dot and the state's own word.
+                    StateDot(
+                        if (row.state == SessionVisualState.Unknown) {
+                            colors.stateUnknown
+                        } else {
+                            colors.stateIdle
+                        },
+                    )
                     Text(
-                        stringResource(R.string.state_idle),
+                        stateWord.orEmpty(),
                         style = type.sessionMeta,
                         color = colors.textMuted,
                     )
@@ -224,7 +231,11 @@ private fun stateWord(state: SessionVisualState): String? = when (state) {
     SessionVisualState.NeedsInput -> stringResource(R.string.state_needs_input)
     SessionVisualState.Errored -> stringResource(R.string.state_errored)
     SessionVisualState.WaitingForNetwork -> stringResource(R.string.state_waiting_network)
-    SessionVisualState.Idle, SessionVisualState.Unknown -> null
+    // Neutral states still say what they are. "Unknown" is not "Idle": the
+    // daemon could not vouch for this session, and the row must not imply it
+    // is fine (sessionActivity.js:91-94).
+    SessionVisualState.Idle -> stringResource(R.string.state_idle)
+    SessionVisualState.Unknown -> stringResource(R.string.state_unknown)
 }
 
 @Composable

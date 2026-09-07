@@ -24,7 +24,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import ai.diffforge.haider.ui.components.ForgeChip
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.CircularProgressIndicator
@@ -70,10 +74,14 @@ fun Composer(
     chip: ModelChipState,
     contextTokens: Long?,
     contextExact: Boolean?,
+    provider: String?,
+    effort: String?,
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStartDaemon: () -> Unit,
     onOpenModel: () -> Unit,
+    onOpenProvider: () -> Unit,
+    onOpenEffort: () -> Unit,
     onRetryModels: () -> Unit,
     onAttach: () -> Unit,
     modifier: Modifier = Modifier,
@@ -88,19 +96,39 @@ fun Composer(
             .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.md),
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
     ) {
+        // Provider / model / effort, like the desktop composer's chips row
+        // (SessionComposer.jsx). Each opens a sheet; each is a shortcut with a
+        // full-size equivalent in the drawer footer and the model sheet.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = ForgeSize.contextRow),
+                .heightIn(min = ForgeSize.contextRow)
+                .horizontalScroll(rememberScrollState()),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
         ) {
+            if (provider != null) {
+                ValueChip(
+                    labelRes = R.string.chip_provider_label,
+                    value = provider,
+                    contentDescription = stringResource(R.string.cd_change_provider),
+                    onClick = onOpenProvider,
+                )
+            }
             ModelChip(
                 state = chip,
                 onOpenModel = onOpenModel,
                 onRetry = onRetryModels,
                 onStartDaemon = onStartDaemon,
             )
-            Box(Modifier.weight(1f))
+            if (effort != null) {
+                ValueChip(
+                    labelRes = R.string.chip_effort_label,
+                    value = effort,
+                    contentDescription = stringResource(R.string.cd_change_effort),
+                    onClick = onOpenEffort,
+                )
+            }
             // Absent means unknown: no segment rather than a printed zero.
             ModelNames.tokens(contextTokens)?.let { tokens ->
                 Text(
@@ -191,6 +219,34 @@ fun Composer(
     }
 }
 
+/** One labelled value chip: PROVIDER anthropic, EFFORT high. */
+@Composable
+private fun ValueChip(
+    labelRes: Int,
+    value: String,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    ForgeChip(onClick = onClick, contentDescription = "$contentDescription, $value") {
+        Text(stringResource(labelRes), style = type.label, color = colors.textMuted)
+        Text(
+            value,
+            style = type.chip,
+            color = colors.textSoft,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Icon(
+            Icons.Rounded.ExpandMore,
+            contentDescription = null,
+            tint = colors.textMuted,
+            modifier = Modifier.size(ForgeSize.iconSm),
+        )
+    }
+}
+
 @Composable
 private fun SendControl(
     composer: ComposerState,
@@ -234,30 +290,43 @@ private fun SendControl(
     }
 }
 
-/** The sticky stop chip that floats above the composer while a turn streams. */
+/**
+ * The sticky stop chip that floats above the composer while a turn streams.
+ *
+ * The chip is 28 dp, as UI-SPEC 3.5 draws it, but the *target* is a full 48 dp
+ * box around it. It is not one of the three sanctioned sub-48 shortcuts, so it
+ * does not get to be one: the pixels stay small and the touch area does not.
+ */
 @Composable
 fun StickyStopChip(onStop: () -> Unit, modifier: Modifier = Modifier) {
     val colors = Forge.colors
     val type = Forge.type
     val stopLabel = stringResource(R.string.cd_stop_turn)
-    Row(
+    Box(
         modifier = modifier
-            .height(ForgeSize.stopChip)
+            .heightIn(min = ForgeSize.touch)
             .clip(ForgeShapes.pill)
-            .background(colors.red.copy(alpha = 0.16f))
-            .border(ForgeSize.hairline, colors.red.copy(alpha = 0.5f), ForgeShapes.pill)
             .clickable(onClick = onStop)
-            .semantics { contentDescription = stopLabel; role = Role.Button }
-            .padding(horizontal = ForgeSpace.lg),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
+            .semantics { contentDescription = stopLabel; role = Role.Button },
+        contentAlignment = Alignment.Center,
     ) {
-        Icon(
-            Icons.Rounded.Stop,
-            contentDescription = null,
-            tint = colors.red,
-            modifier = Modifier.size(ForgeSize.iconSm),
-        )
-        Text(stringResource(R.string.action_stop_turn), style = type.chip, color = colors.red)
+        Row(
+            modifier = Modifier
+                .height(ForgeSize.stopChip)
+                .clip(ForgeShapes.pill)
+                .background(colors.red.copy(alpha = 0.16f))
+                .border(ForgeSize.hairline, colors.red.copy(alpha = 0.5f), ForgeShapes.pill)
+                .padding(horizontal = ForgeSpace.lg),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
+        ) {
+            Icon(
+                Icons.Rounded.Stop,
+                contentDescription = null,
+                tint = colors.red,
+                modifier = Modifier.size(ForgeSize.iconSm),
+            )
+            Text(stringResource(R.string.action_stop_turn), style = type.chip, color = colors.red)
+        }
     }
 }

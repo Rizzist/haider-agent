@@ -6,17 +6,31 @@ import org.json.JSONObject
 /**
  * The one file that knows the account/provider wire shapes.
  *
- * Method names are the frozen ones from `docs/android/contracts-v1.md`: there
- * is no `oauth.*` namespace, `account.oauth_import*` is daemon-local CLI import
- * and not a browser callback API, and no new RequestBody method is introduced —
- * the 136-method pin is unchanged.
+ * Every builder and parser below is derived from the frozen Rust declarations
+ * and checked against the canonical transcript
+ * (`crates/haider-rpc/tests/fixtures/wire_transcript.json`), not from the
+ * desktop client's Tauri command names:
  *
- * Lane 971-3 points a real full-RPC client at these builders and parsers;
- * nothing else in the UI moves.
+ * | door | Rust | canonical shape |
+ * |---|---|---|
+ * | `vault.stage` | `RequestBody::VaultStage` (frame.rs:3951) | `{stage_id, purpose, secret}` — the field is **secret**, and `stage_id` is a required client nonce for same-connection retry dedupe |
+ * | `account.login_api` | `RequestBody::AccountLoginApi` (frame.rs:3968) | `{command_id, provider, alias?, vault_reference, validation_model?, replace_existing?}`; the optionals are `skip_serializing_if`, so they are omitted, not sent as null |
+ * | `account.oauth_start` | frame.rs:3984 / resp frame.rs:5120 | request `{provider, desired_alias, attempt_id}`; response `{availability, flow_id, authorization_url, provider_origin?, loopback_port?, expires_at_ms?}` — **no `attempt_id` comes back**; the client keeps its own |
+ * | `account.oauth_status` | frame.rs:3992 / resp frame.rs:5131 | `{flow_id, attempt_id}` → `{flow_id, status: OAuthFlowStatusWire}` |
+ * | `account.add` | frame.rs:4044 | `{command_id, provider, alias, auth_method, flow_id, attempt_id, oauth_reference}` |
+ * | `account.remove` | frame.rs:4067 | `{command_id, alias, expected_revision?}` |
+ * | `account.set_active` | frame.rs:4060 | `{command_id, alias, confirm_new_epoch?}` — **no** `expected_revision` |
+ * | `account.list` | resp frame.rs:5216 | `{descriptors: CredentialDescriptor[], revision?}` — the key is **descriptors** |
+ * | `provider.list` | resp frame.rs:5237 | `{providers: ProviderSummaryWire[], revision}`, each row keyed `provider` / `auth_methods` / `availability` |
  *
- * Secrets: [stageApiKeyRequest] is the only place a key is ever written into a
- * payload, and the request type it returns is deliberately not a `data class`,
- * so a generated `toString()` can never print one.
+ * `CredentialDescriptor` (haider-protocol `credential.rs:60`) is
+ * `{alias, provider, auth_method, identity, status: {status}, active, label?}`;
+ * `AuthMethod` renames OAuth to `oauth` explicitly so the acronym is not
+ * mangled.
+ *
+ * Secrets: [stageApiKeyRequest] and [stageMenuSecretRequest] are the only
+ * places a secret is written into a payload, and the type they return is
+ * deliberately not a `data class`, so a generated `toString()` cannot print one.
  */
 object AccountsRpcAdapter {
     const val METHOD_PROVIDER_LIST = "provider.list"
@@ -34,10 +48,15 @@ object AccountsRpcAdapter {
     const val METHOD_OAUTH_STATUS = "account.oauth_status"
     const val METHOD_OAUTH_CANCEL = "account.oauth_cancel"
 
-    const val VAULT_PURPOSE_API_KEY = "api_key"
-    const val AUTH_METHOD_OAUTH = "oauth"
+    /** `StagePurpose` (frame.rs:1549). */
+    const val PURPOSE_API_KEY = "api_key"
+    const val PURPOSE_MENU_SECRET = "menu_secret"
 
-    /** Never a `data class`: a generated `toString()` would print the key. */
+    /** `AccountAddMethod` (frame.rs:1535). */
+    const val AUTH_METHOD_OAUTH = "oauth"
+    const val AUTH_METHOD_API_KEY = "api_key"
+
+    /** Never a `data class`: a generated `toString()` would print the secret. */
     class SecretRequest(
         val method: String,
         private val payload: JSONObject,
@@ -46,24 +65,50 @@ object AccountsRpcAdapter {
         override fun toString(): String = "$method(secret=REDACTED)"
     }
 
-    fun providerListRequest(): JSONObject = JSONObject().put("method", METHOD_PROVIDER_LIST)
+    // ---------- reads ----------
+
+    fun providerListRequest(provider: String? = null): JSONObject = JSONObject()
+        .put("method", METHOD_PROVIDER_LIST)
+        .putIfPresent("provider", provider)
 
     fun accountListRequest(provider: String? = null): JSONObject = JSONObject()
         .put("method", METHOD_ACCOUNT_LIST)
-        .put("provider", provider ?: JSONObject.NULL)
+        .putIfPresent("provider", provider)
 
     fun accountListWatchRequest(): JSONObject = JSONObject().put("method", METHOD_ACCOUNT_LIST_WATCH)
 
-    /** Step one of an API-key add: the key goes into the vault, not into a log. */
-    fun stageApiKeyRequest(apiKey: CharArray): SecretRequest = SecretRequest(
+    // ---------- secrets ----------
+
+    /**
+     * Step one of an API-key add. `stage_id` is an ephemeral client nonce: the
+     * same id with the same bytes returns the same reference, the same id with
+     * different bytes is invalid, so it must be fresh per attempt.
+     */
+    fun stageApiKeyRequest(apiKey: CharArray, stageId: String = "stage-api-key"): SecretRequest =
+        SecretRequest(
+            METHOD_VAULT_STAGE,
+            JSONObject()
+                .put("method", METHOD_VAULT_STAGE)
+                .put("stage_id", stageId)
+                .put("purpose", PURPOSE_API_KEY)
+                .put("secret", String(apiKey)),
+        )
+
+    /** The same door with the menu purpose, for `MenuInput::SecretVaultReference`. */
+    fun stageMenuSecretRequest(secret: CharArray, stageId: String): SecretRequest = SecretRequest(
         METHOD_VAULT_STAGE,
         JSONObject()
             .put("method", METHOD_VAULT_STAGE)
-            .put("purpose", VAULT_PURPOSE_API_KEY)
-            .put("value", String(apiKey)),
+            .put("stage_id", stageId)
+            .put("purpose", PURPOSE_MENU_SECRET)
+            .put("secret", String(secret)),
     )
 
-    /** Step two: commit the staged reference on the SAME connection. */
+    fun parseVaultStage(body: JSONObject): String = body.getString("vault_reference")
+
+    // ---------- writes ----------
+
+    /** Step two: claim the staged reference on the SAME connection. */
     fun loginApiRequest(
         commandId: String,
         provider: String,
@@ -75,26 +120,53 @@ object AccountsRpcAdapter {
         .put("method", METHOD_ACCOUNT_LOGIN_API)
         .put("command_id", commandId)
         .put("provider", provider)
-        .put("alias", alias ?: JSONObject.NULL)
+        .putIfPresent("alias", alias)
         .put("vault_reference", vaultReference)
-        .put("validation_model", validationModel ?: JSONObject.NULL)
-        .put("replace_existing", replaceExisting)
+        .putIfPresent("validation_model", validationModel)
+        .apply { if (replaceExisting) put("replace_existing", true) }
 
-    fun removeRequest(alias: String, expectedRevision: Long?): JSONObject = JSONObject()
+    fun removeRequest(
+        commandId: String,
+        alias: String,
+        expectedRevision: Long? = null,
+    ): JSONObject = JSONObject()
         .put("method", METHOD_ACCOUNT_REMOVE)
+        .put("command_id", commandId)
         .put("alias", alias)
-        .put("expected_revision", expectedRevision ?: JSONObject.NULL)
+        .apply { if (expectedRevision != null) put("expected_revision", expectedRevision) }
 
-    fun setActiveRequest(alias: String, expectedRevision: Long?): JSONObject = JSONObject()
+    /**
+     * The provider is intentionally absent: the daemon derives it from
+     * descriptor truth. There is no `expected_revision` on this door —
+     * `confirm_new_epoch` is the explicit confirmation coordinate.
+     */
+    fun setActiveRequest(
+        commandId: String,
+        alias: String,
+        confirmNewEpoch: Boolean = false,
+    ): JSONObject = JSONObject()
         .put("method", METHOD_ACCOUNT_SET_ACTIVE)
+        .put("command_id", commandId)
         .put("alias", alias)
-        .put("expected_revision", expectedRevision ?: JSONObject.NULL)
+        .apply { if (confirmNewEpoch) put("confirm_new_epoch", true) }
 
-    fun oauthStartRequest(provider: String, desiredAlias: String?, attemptId: String): JSONObject =
+    fun setDefaultModelRequest(
+        commandId: String,
+        provider: String,
+        model: String,
+        expectedRevision: Long,
+    ): JSONObject = JSONObject()
+        .put("method", METHOD_ACCOUNT_SET_DEFAULT_MODEL)
+        .put("command_id", commandId)
+        .put("provider", provider)
+        .put("model", model)
+        .put("expected_revision", expectedRevision)
+
+    fun oauthStartRequest(provider: String, desiredAlias: String, attemptId: String): JSONObject =
         JSONObject()
             .put("method", METHOD_OAUTH_START)
             .put("provider", provider)
-            .put("desired_alias", desiredAlias ?: provider)
+            .put("desired_alias", desiredAlias)
             .put("attempt_id", attemptId)
 
     fun oauthStatusRequest(flowId: String, attemptId: String): JSONObject = JSONObject()
@@ -102,7 +174,12 @@ object AccountsRpcAdapter {
         .put("flow_id", flowId)
         .put("attempt_id", attemptId)
 
-    /** Commit, after Ready. The opaque reference goes straight back; no token. */
+    fun oauthCancelRequest(flowId: String, attemptId: String): JSONObject = JSONObject()
+        .put("method", METHOD_OAUTH_CANCEL)
+        .put("flow_id", flowId)
+        .put("attempt_id", attemptId)
+
+    /** Commit after Ready. The opaque reference goes straight back; no token. */
     fun accountAddRequest(
         commandId: String,
         provider: String,
@@ -110,20 +187,16 @@ object AccountsRpcAdapter {
         flowId: String,
         attemptId: String,
         oauthReference: String,
+        authMethod: String = AUTH_METHOD_OAUTH,
     ): JSONObject = JSONObject()
         .put("method", METHOD_ACCOUNT_ADD)
         .put("command_id", commandId)
         .put("provider", provider)
         .put("alias", alias)
-        .put("auth_method", AUTH_METHOD_OAUTH)
+        .put("auth_method", authMethod)
         .put("flow_id", flowId)
         .put("attempt_id", attemptId)
         .put("oauth_reference", oauthReference)
-
-    fun oauthCancelRequest(flowId: String, attemptId: String): JSONObject = JSONObject()
-        .put("method", METHOD_OAUTH_CANCEL)
-        .put("flow_id", flowId)
-        .put("attempt_id", attemptId)
 
     // ---------- parsers ----------
 
@@ -131,26 +204,33 @@ object AccountsRpcAdapter {
         val array = body.optJSONArray("providers") ?: JSONArray()
         return (0 until array.length()).map { index ->
             val item = array.getJSONObject(index)
-            val auth = item.optJSONArray("auth_kinds")
-            val kinds = (0 until (auth?.length() ?: 0)).map { auth!!.getString(it) }
+            val id = item.getString("provider")
+            val methods = item.stringList("auth_methods")
+            val availability = item.optString("availability", "available")
             ProviderDescriptor(
-                id = item.getString("id"),
-                label = item.optString("label", item.getString("id")),
-                supportsApiKey = kinds.isEmpty() || kinds.contains("api_key"),
-                supportsOAuth = kinds.contains(AUTH_METHOD_OAUTH),
+                id = id,
+                label = item.optStringOrNull("label") ?: id,
+                supportsApiKey = methods.isEmpty() || methods.contains(AUTH_METHOD_API_KEY),
+                supportsOAuth = methods.contains(AUTH_METHOD_OAUTH),
                 oauthStyle = if (item.optString("oauth_style") == "device") {
                     OAuthStyle.Device
                 } else {
                     OAuthStyle.AuthorizationCode
                 },
-                available = item.optBoolean("available", true),
-                unavailableReason = item.optStringOrNull("reason"),
+                available = availability == "available" && item.optBoolean("enabled", true),
+                unavailableReason = item.optStringOrNull("availability_reason"),
+                models = item.stringList("models"),
+                defaultModel = item.optStringOrNull("default_model"),
+                apiFamily = item.optStringOrNull("api_family"),
             )
         }
     }
 
+    fun parseProviderRevision(body: JSONObject): Long = body.optLong("revision", 0L)
+
     fun parseAccounts(body: JSONObject): AccountsSnapshot {
-        val array = body.optJSONArray("accounts") ?: JSONArray()
+        // The response key is `descriptors`; `accounts` is not a wire name.
+        val array = body.optJSONArray("descriptors") ?: JSONArray()
         val accounts = (0 until array.length()).map { index ->
             val item = array.getJSONObject(index)
             Account(
@@ -164,17 +244,35 @@ object AccountsRpcAdapter {
                 },
                 active = item.optBoolean("active", false),
                 identity = item.optStringOrNull("identity"),
-                status = item.optString("status", "ok"),
+                // CredentialStatus is internally tagged on `status`.
+                status = item.optJSONObject("status")?.optString("status") ?: "ok",
             )
         }
-        return AccountsSnapshot(revision = body.optLong("revision", 0L), accounts = accounts)
+        return AccountsSnapshot(
+            // Older daemons omit the revision; absent is 0, never a lie.
+            revision = if (body.isNull("revision")) 0L else body.optLong("revision", 0L),
+            accounts = accounts,
+        )
     }
 
+    /** One descriptor, as returned by login_api / add / set_active. */
+    fun parseDescriptor(body: JSONObject): Account? {
+        val item = body.optJSONObject("descriptor") ?: return null
+        return parseAccounts(
+            JSONObject().put("descriptors", JSONArray().put(item)),
+        ).accounts.firstOrNull()
+    }
+
+    /**
+     * The response carries no `attempt_id` — the client already has it, and
+     * requiring one back is how a real flow gets rejected as malformed.
+     */
     fun parseOAuthStart(
         provider: String,
         alias: String,
         style: OAuthStyle,
         body: JSONObject,
+        attemptId: String = "",
     ): OAuthFlow {
         val availability = body.optJSONObject("availability")
         if (availability != null && !availability.optBoolean("available", true)) {
@@ -184,7 +282,7 @@ object AccountsRpcAdapter {
             provider = provider,
             alias = alias,
             flowId = body.getString("flow_id"),
-            attemptId = body.getString("attempt_id"),
+            attemptId = attemptId,
             style = style,
             authorizationUrl = body.optStringOrNull("authorization_url")
                 ?: body.optStringOrNull("verification_url"),
@@ -193,6 +291,7 @@ object AccountsRpcAdapter {
         )
     }
 
+    /** `OAuthFlowStatusWire` (frame.rs:1513), internally tagged on `status`. */
     fun parseOAuthStatus(body: JSONObject): OAuthStatus {
         val status = body.optJSONObject("status") ?: body
         return when (val kind = status.optString("status", "unknown")) {
@@ -201,10 +300,8 @@ object AccountsRpcAdapter {
                 identity = status.optStringOrNull("identity"),
             )
             "exchanging" -> OAuthStatus.Exchanging
-            "failed", "expired", "cancelled" -> OAuthStatus.Failed(
-                publicCode = status.optStringOrNull("public_code"),
-                terminalKind = kind,
-            )
+            "failed" -> OAuthStatus.Failed(status.optStringOrNull("public_code"), kind)
+            "expired", "cancelled" -> OAuthStatus.Failed(null, kind)
             // waiting_browser / waiting_device / unknown: keep polling.
             else -> OAuthStatus.Waiting
         }
@@ -212,4 +309,19 @@ object AccountsRpcAdapter {
 
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (isNull(key)) null else optString(key).ifBlank { null }
+
+    private fun JSONObject.stringList(key: String): List<String> {
+        val array = optJSONArray(key) ?: return emptyList()
+        return (0 until array.length()).mapNotNull { index ->
+            when (val value = array.opt(index)) {
+                is String -> value
+                is JSONObject -> value.optString("name").ifBlank { null }
+                else -> null
+            }
+        }
+    }
+
+    /** Optional wire fields are omitted, never sent as an explicit null. */
+    private fun JSONObject.putIfPresent(key: String, value: String?): JSONObject =
+        if (value.isNullOrBlank()) this else put(key, value)
 }

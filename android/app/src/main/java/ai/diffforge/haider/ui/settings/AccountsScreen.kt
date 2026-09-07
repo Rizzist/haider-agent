@@ -5,10 +5,10 @@ import ai.diffforge.haider.ui.accounts.Account
 import ai.diffforge.haider.ui.accounts.AccountResult
 import ai.diffforge.haider.ui.accounts.AccountsRepository
 import ai.diffforge.haider.ui.accounts.AuthKind
-import ai.diffforge.haider.ui.accounts.OAuthFlow
-import ai.diffforge.haider.ui.accounts.OAuthStatus
+import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.accounts.OAuthStyle
 import ai.diffforge.haider.ui.accounts.ProviderDescriptor
+import ai.diffforge.haider.ui.accounts.SecretBuffer
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
@@ -43,6 +43,7 @@ import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -60,24 +61,30 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 const val ACCOUNTS_KEY_FIELD_TAG = "accounts_key_field"
 const val ACCOUNTS_OAUTH_WAITING_TAG = "accounts_oauth_waiting"
 
 /**
- * Settings -> Accounts on the phone: add an API key (provider pick, masked entry,
- * validate, save, remove) or sign in through a provider's OAuth flow.
+ * Settings -> Accounts: add an API key (provider pick, masked entry, validate,
+ * save, remove) or sign in through a provider's OAuth flow.
  *
- * The key lives in a local `CharArray`, is passed straight to the repository and
- * is wiped and cleared the moment the call returns. It is never stored on an
- * [Account], never rendered back, and never written into a log line — the
- * account list shows the daemon's masked hint instead.
+ * Two things here are deliberate and load-bearing:
+ *
+ *  - the key lives in a [SecretBuffer], and every read of it runs inside
+ *    `use { }`, so the bytes are wiped on success, on failure and on
+ *    cancellation. The buffer is also wiped when the form is cancelled, when
+ *    the mode changes, and in `onDispose`;
+ *  - the OAuth attempt lives in [OAuthAttemptController], **outside** this
+ *    composition, because returning through `haider://oauth/return` navigates
+ *    to Settings and disposes this screen. A `remember`ed flow id would be gone
+ *    exactly when the status poll needs it.
  */
 @Composable
 fun AccountsScreen(
     repository: AccountsRepository,
+    oauth: OAuthAttemptController,
     onBack: () -> Unit,
     onOpenUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -87,63 +94,40 @@ fun AccountsScreen(
     val scope = rememberCoroutineScope()
     val providers by repository.providers.collectAsState()
     val snapshot by repository.snapshot.collectAsState()
+    val attempt by oauth.attempt.collectAsState()
+    val controllerNotice by oauth.notice.collectAsState()
 
     var mode by remember { mutableStateOf(AddMode.None) }
     var provider by remember { mutableStateOf<String?>(null) }
     var alias by remember { mutableStateOf("") }
-    var key by remember { mutableStateOf("") }
+    var keyText by remember { mutableStateOf("") }
     var revealKey by remember { mutableStateOf(false) }
-    var notice by remember { mutableStateOf<String?>(null) }
+    var localNotice by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    var flow by remember { mutableStateOf<OAuthFlow.Started?>(null) }
-    var phase by remember { mutableStateOf(OAuthPhase.Waiting) }
+    val secret = remember { SecretBuffer() }
+    val notice = localNotice ?: controllerNotice
 
-    LaunchedEffect(Unit) { repository.refresh() }
-
-    // Poll `account.oauth_status` on the same connection the flow was started
-    // on. Exchanging is a real state: the provider's success page is sent before
-    // the token exchange finishes, so the UI must render the in-between rather
-    // than assume the browser returning means done.
-    LaunchedEffect(flow?.flowId) {
-        val live = flow ?: return@LaunchedEffect
-        while (true) {
-            delay(OAUTH_POLL_MS)
-            when (val status = repository.pollOAuth(live)) {
-                OAuthStatus.Waiting -> phase = OAuthPhase.Waiting
-                OAuthStatus.Exchanging -> phase = OAuthPhase.Exchanging
-                is OAuthStatus.Ready -> {
-                    phase = OAuthPhase.Claiming
-                    val result = repository.completeOAuth(live, status.oauthReference)
-                    notice = when (result) {
-                        AccountResult.Ok -> "Signed in: ${status.identity ?: live.alias}"
-                        is AccountResult.Failed -> result.publicCode
-                    }
-                    flow = null
-                    mode = AddMode.None
-                    repository.refresh()
-                    return@LaunchedEffect
-                }
-                is OAuthStatus.Failed -> {
-                    notice = status.publicCode ?: status.terminalKind
-                    flow = null
-                    return@LaunchedEffect
-                }
-                // Flow ownership is bound to the daemon instance, connection and
-                // attempt: a lost flow cannot be resumed, only restarted — after
-                // checking whether the commit already landed.
-                OAuthStatus.Lost -> {
-                    val committed = repository.accountExists(live.provider, live.alias)
-                    notice = if (committed) {
-                        "Signed in: ${live.alias}"
-                    } else {
-                        "The sign-in was lost — start it again."
-                    }
-                    flow = null
-                    repository.refresh()
-                    return@LaunchedEffect
-                }
-            }
+    // The buffer never outlives the screen, however the screen ends.
+    DisposableEffect(Unit) {
+        onDispose { secret.wipe() }
+    }
+    // Leaving the API-key form for any reason clears the key with it.
+    LaunchedEffect(mode) {
+        if (mode != AddMode.ApiKey) {
+            secret.wipe()
+            keyText = ""
+            revealKey = false
         }
+    }
+    LaunchedEffect(Unit) {
+        repository.refresh()
+        repository.refreshProviders()
+    }
+
+    fun clearSecret() {
+        secret.wipe()
+        keyText = ""
+        revealKey = false
     }
 
     Column(
@@ -159,7 +143,10 @@ fun AccountsScreen(
                 .padding(horizontal = ForgeSpace.xs),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            ForgeIconButton(onClick = onBack, contentDescription = stringResource(R.string.action_back)) {
+            ForgeIconButton(
+                onClick = { clearSecret(); onBack() },
+                contentDescription = stringResource(R.string.action_back),
+            ) {
                 Icon(
                     Icons.Rounded.ArrowBack,
                     contentDescription = null,
@@ -182,9 +169,7 @@ fun AccountsScreen(
                 .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.lg),
             verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
         ) {
-            notice?.let {
-                Text(it, style = type.sessionMeta, color = colors.accent)
-            }
+            notice?.let { Text(it, style = type.sessionMeta, color = colors.accent) }
 
             if (snapshot.accounts.isEmpty()) {
                 Text(
@@ -202,7 +187,7 @@ fun AccountsScreen(
                         onRemove = {
                             scope.launch {
                                 repository.remove(account.alias)
-                                notice = "Account removed."
+                                localNotice = "Account removed."
                                 repository.refresh()
                             }
                         },
@@ -215,7 +200,8 @@ fun AccountsScreen(
                     text = stringResource(R.string.accounts_add_api_key),
                     onClick = {
                         mode = if (mode == AddMode.ApiKey) AddMode.None else AddMode.ApiKey
-                        notice = null
+                        localNotice = null
+                        oauth.clearNotice()
                     },
                     kind = if (mode == AddMode.ApiKey) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
                 )
@@ -223,7 +209,8 @@ fun AccountsScreen(
                     text = stringResource(R.string.accounts_sign_in),
                     onClick = {
                         mode = if (mode == AddMode.OAuth) AddMode.None else AddMode.OAuth
-                        notice = null
+                        localNotice = null
+                        oauth.clearNotice()
                     },
                     kind = if (mode == AddMode.OAuth) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
                 )
@@ -231,6 +218,7 @@ fun AccountsScreen(
 
             when (mode) {
                 AddMode.None -> Unit
+
                 AddMode.ApiKey -> Card {
                     ProviderPicker(
                         providers = providers.filter { it.supportsApiKey },
@@ -244,8 +232,11 @@ fun AccountsScreen(
                     )
                     LabelledField(
                         label = stringResource(R.string.accounts_api_key),
-                        value = key,
-                        onValueChange = { key = it },
+                        value = keyText,
+                        onValueChange = {
+                            keyText = it
+                            secret.set(it)
+                        },
                         masked = !revealKey,
                         tag = ACCOUNTS_KEY_FIELD_TAG,
                         trailing = {
@@ -276,18 +267,21 @@ fun AccountsScreen(
                                 val chosen = provider ?: return@ForgeButton
                                 busy = true
                                 scope.launch {
-                                    val secret = key.toCharArray()
-                                    val result = repository.validateApiKey(chosen, secret)
-                                    secret.fill(' ')
-                                    notice = when (result) {
-                                        AccountResult.Ok -> "Key validated."
-                                        is AccountResult.Failed -> result.publicCode
+                                    try {
+                                        // Validation reads the buffer and hands
+                                        // back nothing: no copy escapes `use`.
+                                        val result = secret.use { repository.validateApiKey(chosen, it) }
+                                        localNotice = when (result) {
+                                            AccountResult.Ok -> "Key validated."
+                                            is AccountResult.Failed -> result.publicCode
+                                        }
+                                    } finally {
+                                        busy = false
                                     }
-                                    busy = false
                                 }
                             },
                             kind = ForgeButtonKind.Ghost,
-                            enabled = provider != null && key.isNotBlank() && !busy,
+                            enabled = provider != null && keyText.isNotBlank() && !busy,
                         )
                         ForgeButton(
                             text = stringResource(R.string.action_save),
@@ -295,35 +289,45 @@ fun AccountsScreen(
                                 val chosen = provider ?: return@ForgeButton
                                 busy = true
                                 scope.launch {
-                                    val secret = key.toCharArray()
-                                    val result = repository.addApiKey(
-                                        chosen,
-                                        alias.takeIf { it.isNotBlank() },
-                                        secret,
-                                    )
-                                    // Wipe the copy, then clear the field: the
-                                    // secret never outlives the call.
-                                    secret.fill(' ')
-                                    key = ""
-                                    busy = false
+                                    var result: AccountResult? = null
+                                    try {
+                                        result = secret.use {
+                                            repository.addApiKey(chosen, alias.takeIf(String::isNotBlank), it)
+                                        }
+                                    } finally {
+                                        // Whatever happened — success, refusal,
+                                        // cancellation — the key is gone.
+                                        clearSecret()
+                                        busy = false
+                                    }
                                     when (result) {
                                         AccountResult.Ok -> {
-                                            notice = "API key added and validated."
+                                            localNotice = "API key added and validated."
                                             mode = AddMode.None
                                             alias = ""
                                             repository.refresh()
                                         }
-                                        is AccountResult.Failed -> notice = result.publicCode
+                                        is AccountResult.Failed -> localNotice = result.publicCode
+                                        null -> Unit
                                     }
                                 }
                             },
-                            enabled = provider != null && key.isNotBlank() && !busy,
+                            enabled = provider != null && keyText.isNotBlank() && !busy,
+                        )
+                        ForgeButton(
+                            text = stringResource(R.string.action_cancel),
+                            onClick = {
+                                clearSecret()
+                                mode = AddMode.None
+                            },
+                            kind = ForgeButtonKind.Ghost,
+                            enabled = !busy,
                         )
                     }
                 }
 
                 AddMode.OAuth -> Card {
-                    val live = flow
+                    val live = attempt
                     if (live == null) {
                         ProviderPicker(
                             providers = providers.filter { it.supportsOAuth },
@@ -341,20 +345,15 @@ fun AccountsScreen(
                                 val chosen = provider ?: return@ForgeButton
                                 busy = true
                                 scope.launch {
-                                    when (val started = repository.startOAuth(chosen, alias.takeIf { it.isNotBlank() })) {
-                                        is OAuthFlow.Started -> {
-                                            flow = started
-                                            phase = OAuthPhase.Waiting
-                                            notice = null
-                                            // The daemon composed this URL and owns
-                                            // the loopback listener; the UI never
-                                            // invents a redirect.
-                                            started.authorizationUrl?.let(onOpenUrl)
-                                        }
-                                        is OAuthFlow.Unavailable -> notice = started.reason
-                                            ?: "Sign-in is unavailable for $chosen."
+                                    try {
+                                        // The daemon composed the URL and owns
+                                        // the loopback listener; the UI never
+                                        // invents a redirect.
+                                        oauth.start(chosen, alias.takeIf(String::isNotBlank))
+                                            ?.let(onOpenUrl)
+                                    } finally {
+                                        busy = false
                                     }
-                                    busy = false
                                 }
                             },
                             enabled = provider != null && !busy,
@@ -365,21 +364,25 @@ fun AccountsScreen(
                             modifier = Modifier.testTag(ACCOUNTS_OAUTH_WAITING_TAG),
                         ) {
                             Text(
-                                when (phase) {
-                                    OAuthPhase.Waiting -> if (live.style == OAuthStyle.Device) {
-                                        stringResource(R.string.accounts_oauth_device)
-                                    } else {
-                                        stringResource(R.string.accounts_oauth_waiting)
-                                    }
-                                    OAuthPhase.Exchanging ->
+                                when (live.phase) {
+                                    OAuthAttemptController.Phase.Waiting ->
+                                        if (live.flow.style == OAuthStyle.Device) {
+                                            stringResource(R.string.accounts_oauth_device)
+                                        } else {
+                                            stringResource(R.string.accounts_oauth_waiting)
+                                        }
+                                    OAuthAttemptController.Phase.Exchanging ->
                                         stringResource(R.string.accounts_oauth_exchanging)
-                                    OAuthPhase.Claiming ->
+                                    OAuthAttemptController.Phase.Claiming ->
                                         stringResource(R.string.accounts_oauth_claiming)
+                                    OAuthAttemptController.Phase.Failed,
+                                    OAuthAttemptController.Phase.Committed,
+                                    -> stringResource(R.string.accounts_oauth_waiting)
                                 },
                                 style = type.chatBody,
                                 color = colors.text,
                             )
-                            live.userCode?.let {
+                            live.flow.userCode?.let {
                                 Text(
                                     stringResource(R.string.accounts_oauth_code, it),
                                     style = type.numeric,
@@ -392,7 +395,7 @@ fun AccountsScreen(
                                 color = colors.textMuted,
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-                                live.authorizationUrl?.let { url ->
+                                live.flow.authorizationUrl?.let { url ->
                                     ForgeButton(
                                         text = stringResource(R.string.accounts_oauth_open_again),
                                         onClick = { onOpenUrl(url) },
@@ -401,11 +404,7 @@ fun AccountsScreen(
                                 }
                                 ForgeButton(
                                     text = stringResource(R.string.action_cancel),
-                                    onClick = {
-                                        val cancelling = live
-                                        flow = null
-                                        scope.launch { repository.cancelOAuth(cancelling) }
-                                    },
+                                    onClick = { oauth.cancel() },
                                     kind = ForgeButtonKind.Ghost,
                                 )
                             }
@@ -419,8 +418,6 @@ fun AccountsScreen(
 
 private enum class AddMode { None, ApiKey, OAuth }
 
-private enum class OAuthPhase { Waiting, Exchanging, Claiming }
-
 @Composable
 private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () -> Unit) {
     val colors = Forge.colors
@@ -429,7 +426,7 @@ private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    account.label ?: account.alias,
+                    account.label ?: account.identity ?: account.alias,
                     style = type.sessionTitle,
                     color = colors.text,
                     maxLines = 1,
@@ -540,6 +537,8 @@ private fun LabelledField(
                 ),
                 modifier = Modifier
                     .weight(1f)
+                    .padding(vertical = ForgeSpace.md)
+                    .heightIn(min = ForgeSize.touch)
                     .let { if (tag != null) it.testTag(tag) else it },
             )
             trailing?.let {
@@ -548,5 +547,3 @@ private fun LabelledField(
         }
     }
 }
-
-private const val OAUTH_POLL_MS = 1_500L

@@ -1,6 +1,7 @@
 package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.accounts.AccountsRpcAdapter
 import ai.diffforge.haider.transport.SessionModel
 import ai.diffforge.haider.transport.SessionProvider
 import ai.diffforge.haider.transport.SessionSelection
@@ -29,12 +30,14 @@ enum class FakeScenario {
     DaemonStopped,
     DaemonFailed,
     NotificationsDenied,
+    NotificationsPermanentlyDenied,
     NoNetwork,
     TurnRunning,
     InputRequiredHere,
     InputRequiredElsewhere,
     ErroredTurn,
     EmptyRosterReady,
+    EmptyRosterStopped,
     Populated,
     LargeRoster,
 }
@@ -53,6 +56,7 @@ class FakeDaemonService(
     private val _catalogError = MutableStateFlow<String?>(null)
     private val _catalogRequestedAtMs = MutableStateFlow<Long?>(null)
     private val _searchIndex = MutableStateFlow(SearchIndexState())
+    private val _providers = MutableStateFlow(ProviderInventory())
 
     override val status: StateFlow<DaemonStatus> = _status.asStateFlow()
     override val environment: StateFlow<DaemonEnvironment> = _environment.asStateFlow()
@@ -63,9 +67,11 @@ class FakeDaemonService(
     override val catalogError: StateFlow<String?> = _catalogError.asStateFlow()
     override val catalogRequestedAtMs: StateFlow<Long?> = _catalogRequestedAtMs.asStateFlow()
     override val searchIndex: StateFlow<SearchIndexState> = _searchIndex.asStateFlow()
+    override val providers: StateFlow<ProviderInventory> = _providers.asStateFlow()
 
     private val transcripts = mutableMapOf<String, MutableList<Message>>()
     private var hiddenPages: List<List<SessionRow>> = emptyList()
+    private val readCache = mutableMapOf<String, TranscriptLoad>()
     private var nextMessageId = 1L
 
     /** Recorded calls, so a test can assert what the UI asked the daemon for. */
@@ -79,8 +85,10 @@ class FakeDaemonService(
         _catalogError.value = null
         _catalogRequestedAtMs.value = nowMs
         _models.value = catalog()
+        _providers.value = inventory()
         _environment.value = DaemonEnvironment()
         hiddenPages = emptyList()
+        readCache.clear()
         _paging.value = RosterPaging()
         when (scenario) {
             FakeScenario.FirstRun -> {
@@ -111,6 +119,17 @@ class FakeDaemonService(
             FakeScenario.NotificationsDenied -> {
                 _status.value = running()
                 _environment.value = DaemonEnvironment(notificationsGranted = false)
+                setSessions(populatedRoster().filter { it.needsInput == null })
+                _activeSessionId.value = "s-nav"
+            }
+            // Distinct from a first refusal: the system dialog will not appear
+            // again, so the action has to deep-link into app settings.
+            FakeScenario.NotificationsPermanentlyDenied -> {
+                _status.value = running()
+                _environment.value = DaemonEnvironment(
+                    notificationsGranted = false,
+                    notificationsPermanentlyDenied = true,
+                )
                 setSessions(populatedRoster().filter { it.needsInput == null })
                 _activeSessionId.value = "s-nav"
             }
@@ -149,6 +168,13 @@ class FakeDaemonService(
                 setSessions(populatedRoster())
                 _activeSessionId.value = "s-broken"
                 transcripts["s-broken"] = erroredTranscript()
+            }
+            // Nothing to open into, because the daemon is not running: the
+            // drawer's empty state still has to be reachable.
+            FakeScenario.EmptyRosterStopped -> {
+                _status.value = DaemonStatus.Stopped
+                setSessions(emptyList())
+                _activeSessionId.value = null
             }
             FakeScenario.EmptyRosterReady -> {
                 _status.value = running()
@@ -209,6 +235,10 @@ class FakeDaemonService(
         _catalogRequestedAtMs.value = atMs
     }
 
+    fun setProviders(inventory: ProviderInventory) {
+        _providers.value = inventory
+    }
+
     override suspend fun start() {
         calls += "start"
         _status.value = DaemonStatus.Starting
@@ -260,6 +290,9 @@ class FakeDaemonService(
             createdAtMs = nowMs,
         )
         _sessions.value = listOf(row) + _sessions.value
+        // A new session has no history: it must not inherit a default fixture,
+        // or "open and chat" lands on somebody else's transcript.
+        transcripts[id] = mutableListOf()
         _activeSessionId.value = id
         return id
     }
@@ -318,15 +351,24 @@ class FakeDaemonService(
     }
 
     override suspend fun answer(
-        sessionId: String,
-        menuId: String,
+        coordinates: MenuCoordinates,
         optionKey: String,
         optionIndex: Int,
-        text: String?,
+        input: MenuAnswerInput?,
     ) {
-        calls += "menu.answer:$sessionId:$menuId:$optionKey:$optionIndex"
+        // The whole compare-and-set identity is recorded, so a test can prove
+        // the coordinates came from the snapshot that rendered the card. A
+        // secret is recorded as its reference; the plaintext is never here.
+        val inputTag = when (input) {
+            null -> "none"
+            is MenuAnswerInput.Text -> "text"
+            is MenuAnswerInput.Secret -> "secret:${input.vaultReference}"
+        }
+        calls += "menu.answer:${coordinates.sessionId}:${coordinates.menuId}:" +
+            "${coordinates.requestSeq}:${coordinates.workerGeneration}:" +
+            "$optionKey:$optionIndex:$inputTag"
         _sessions.value = _sessions.value.map {
-            if (it.id == sessionId) {
+            if (it.id == coordinates.sessionId) {
                 it.copy(needsInput = null, state = SessionVisualState.Running, runState = "running")
             } else {
                 it
@@ -351,6 +393,24 @@ class FakeDaemonService(
         _catalogError.value = null
         _catalogRequestedAtMs.value = nowMs
         _models.value = catalog()
+    }
+
+    override suspend fun refreshProviders() {
+        calls += AccountsRpcAdapter.METHOD_PROVIDER_LIST
+        _providers.value = inventory()
+    }
+
+    override suspend fun selectProvider(provider: String) {
+        calls += "selectProvider:$provider"
+        val option = _providers.value.providers.firstOrNull { it.id == provider } ?: return
+        val model = option.defaultModel ?: option.models.firstOrNull() ?: return
+        selectModel(provider, model)
+    }
+
+    override suspend fun stageMenuSecret(secret: CharArray): String {
+        // Method name only: an argument here could be the secret itself.
+        calls += AccountsRpcAdapter.METHOD_VAULT_STAGE
+        return "vaultref-menu-${secret.size}"
     }
 
     override suspend fun send(sessionId: String, text: String) {
@@ -381,19 +441,51 @@ class FakeDaemonService(
         return TranscriptLoad.Complete(messages)
     }
 
+    /**
+     * Searches titles, metadata **and indexed transcript content**, reading
+     * each session through [TranscriptPager] ranges so the 1,024-envelope cap
+     * is respected. Coverage is reported honestly: a session whose replay came
+     * back Partial or Unavailable is counted as not indexed, and the outcome
+     * is then incomplete.
+     */
     override suspend fun search(query: String): SearchOutcome {
-        calls += "session.read:search"
-        val index = _searchIndex.value
         val needle = query.trim().lowercase()
-        val hits = if (needle.isEmpty()) {
-            emptyList()
-        } else {
-            _sessions.value.filter { row ->
-                listOfNotNull(row.title, row.model, row.provider, row.id)
-                    .any { it.lowercase().contains(needle) }
-            }.map { SearchHit(it.id, it.title, it.headSeq) }
+        if (needle.isEmpty()) {
+            return SearchOutcome(emptyList(), _searchIndex.value, complete = _searchIndex.value.complete)
         }
+        val rows = _sessions.value
+        val hits = mutableListOf<SearchHit>()
+        var indexed = 0
+        rows.forEach { row ->
+            val metadataHit = listOfNotNull(row.title, row.model, row.provider, row.agentType, row.id)
+                .any { it.lowercase().contains(needle) }
+            val load = readThroughCache(row)
+            if (load is TranscriptLoad.Complete) indexed += 1
+            val bodyHit = load.messages.firstOrNull { message ->
+                message.text.lowercase().contains(needle)
+            }
+            when {
+                bodyHit != null -> hits += SearchHit(row.id, bodyHit.text.take(120), row.headSeq)
+                metadataHit -> hits += SearchHit(row.id, row.title, row.headSeq)
+            }
+        }
+        val index = SearchIndexState(
+            indexedSessions = indexed,
+            totalSessions = rows.size,
+            complete = indexed == rows.size && !_paging.value.hasMore,
+        )
+        _searchIndex.value = index
         return SearchOutcome(hits = hits, index = index, complete = index.complete)
+    }
+
+    /** The paged read cache: one `session.read` call per bounded range. */
+    private suspend fun readThroughCache(row: SessionRow): TranscriptLoad {
+        readCache[row.id]?.let { return it }
+        val ranges = TranscriptPager.ranges(row.headSeq.coerceAtLeast(1))
+        ranges.forEach { range -> calls += "session.read:${row.id}:${range.startSeq}-${range.endSeq}" }
+        val load = transcript(row.id)
+        readCache[row.id] = load
+        return load
     }
 
     // ---------- fixtures ----------
@@ -409,8 +501,32 @@ class FakeDaemonService(
             waitingForRouteCount = 0,
             profilePath = "/data/user/0/ai.diffforge.haider/files/haider/profiles/default",
             runtimeDir = "/data/user/0/ai.diffforge.haider/files/haider/runtime/android-default",
-            startedAtElapsedRealtimeMs = nowMs - 4 * 60 * 60 * 1000L - 12 * 60 * 1000L,
+            startedAtElapsedRealtimeMs = FIXED_UPTIME - 4 * 60 * 60 * 1000L - 12 * 60 * 1000L,
             pssBytes = 58L * 1024 * 1024,
+        ),
+    )
+
+    private fun inventory(): ProviderInventory = ProviderInventory(
+        revision = 7,
+        providers = listOf(
+            ProviderOption(
+                id = "anthropic",
+                label = "Anthropic",
+                models = listOf("claude-sonnet-4-5", "claude-opus-4-1"),
+                defaultModel = "claude-sonnet-4-5",
+                available = true,
+                unavailableReason = null,
+                efforts = listOf("low", "medium", "high"),
+            ),
+            ProviderOption(
+                id = "openai",
+                label = "OpenAI",
+                models = listOf("gpt-5"),
+                defaultModel = "gpt-5",
+                available = false,
+                unavailableReason = "No account configured",
+                efforts = listOf("medium", "high"),
+            ),
         ),
     )
 
@@ -621,7 +737,10 @@ class FakeDaemonService(
     )
 
     companion object {
-        /** A fixed clock so screenshots are byte-stable. */
+        /** A fixed wall clock so screenshots are byte-stable. */
         const val FIXED_NOW: Long = 1_772_000_000_000L
+
+        /** A fixed *monotonic* clock; uptime is measured against this one. */
+        const val FIXED_UPTIME: Long = 40_000_000L
     }
 }

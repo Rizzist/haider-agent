@@ -4,12 +4,16 @@ import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.daemon.FakeDaemonService
 import ai.diffforge.haider.ui.daemon.MenuOption
 import ai.diffforge.haider.ui.daemon.NeedsInput
+import ai.diffforge.haider.ui.chat.ASK_SECRET_FIELD_TAG
 import ai.diffforge.haider.ui.chat.InputRequiredCard
 import ai.diffforge.haider.ui.theme.ForgeTheme
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
@@ -32,15 +36,25 @@ class InputRequiredCardTest {
 
     private val answers = mutableListOf<Triple<String, Int, String?>>()
 
-    private fun render(needsInput: NeedsInput, answeredElsewhere: Boolean = false) {
+    private val secrets = mutableListOf<Triple<String, Int, String>>()
+
+    private fun render(
+        needsInput: NeedsInput,
+        answeredElsewhere: Boolean = false,
+        answerable: Boolean = true,
+    ) {
         rule.setContent {
             ForgeTheme(dark = true) {
                 InputRequiredCard(
                     needsInput = needsInput,
                     nowMs = FakeDaemonService.FIXED_NOW,
                     answeredElsewhere = answeredElsewhere,
+                    answerable = answerable,
                     onAnswer = { key, index, text -> answers += Triple(key, index, text) },
-                    onOpenSecretVault = {},
+                    onAnswerSecret = { key, index, secret ->
+                        secrets += Triple(key, index, String(secret))
+                        secret.fill(' ')
+                    },
                 )
             }
         }
@@ -96,20 +110,39 @@ class InputRequiredCardTest {
     }
 
     @Test
-    fun `a secret prompt never gets a text field`() {
+    fun `a secret prompt gets a masked field, never a plain one`() {
         render(
             NeedsInput(
                 kind = "secret",
                 title = "Passphrase for the signing key?",
+                menuId = "menu-1",
+                requestSeq = 3,
+                workerGeneration = 1,
                 secretAnswer = true,
             ),
         )
-        rule.onNodeWithText("Answer this on your computer — secrets cannot be typed here.")
-            .assertIsDisplayed()
-        assertEquals(
-            0,
-            rule.onAllNodes(hasSetTextAction()).fetchSemanticsNodes().size,
+        rule.onNodeWithTag(ASK_SECRET_FIELD_TAG).performTextInput("hunter2-hunter2")
+        rule.waitForIdle()
+        // Masked: the typed value is not rendered back anywhere.
+        assertEquals(0, rule.onAllNodesWithTextSafe("hunter2-hunter2"))
+        rule.onNodeWithText("Send").performClick()
+        rule.waitForIdle()
+        // It leaves through the secret path, not the text path.
+        assertEquals("hunter2-hunter2", secrets.single().third)
+        assertTrue(answers.isEmpty())
+    }
+
+    @Test
+    fun `a prompt missing its coordinates offers no answer at all`() {
+        render(
+            NeedsInput(
+                kind = "approval",
+                title = "Send it?",
+                options = listOf(MenuOption("send", "Send it", decision = "allow_once")),
+            ),
+            answerable = false,
         )
+        rule.onNodeWithText("Send it").assertIsNotEnabled()
     }
 
     @Test

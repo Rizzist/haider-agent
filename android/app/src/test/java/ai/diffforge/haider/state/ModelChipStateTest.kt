@@ -92,8 +92,27 @@ class ModelChipStateTest {
     }
 
     @Test
-    fun `with no request in flight it never claims a deadline`() {
-        assertEquals(ModelChipState.Loading, resolve(requestedAtMs = null, nowMs = Long.MAX_VALUE / 2))
+    fun `with nothing in flight the chip offers a retry, not an endless wait`() {
+        // There is no request to wait for, so "loading" would be a lie that
+        // never resolves. This is the first of the two escapes the verifier
+        // found.
+        assertTrue(
+            resolve(requestedAtMs = null, nowMs = Long.MAX_VALUE / 2) is ModelChipState.Error,
+        )
+        assertTrue(resolve(requestedAtMs = null, nowMs = requestedAt) is ModelChipState.Error)
+    }
+
+    @Test
+    fun `a selection that never returns expires like a catalog that never arrives`() {
+        // The second escape: selectionBusy used to short-circuit the deadline.
+        assertEquals(
+            ModelChipState.Changing,
+            resolve(busy = true, nowMs = requestedAt + ModelChipStateMachine.DEADLINE_MS - 1),
+        )
+        assertTrue(
+            resolve(busy = true, nowMs = requestedAt + ModelChipStateMachine.DEADLINE_MS)
+                is ModelChipState.Error,
+        )
     }
 }
 

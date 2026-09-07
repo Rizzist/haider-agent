@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.accounts.FakeAccountsRepository
+import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.settings.ACCOUNTS_KEY_FIELD_TAG
 import ai.diffforge.haider.ui.settings.AccountsScreen
 import ai.diffforge.haider.ui.theme.ForgeTheme
@@ -40,6 +41,7 @@ class AccountsScreenTest {
     val rule = createAndroidComposeRule<MainActivity>()
 
     private val repository = FakeAccountsRepository()
+    private val controller = OAuthAttemptController(repository, kotlinx.coroutines.MainScope())
     private val opened = mutableListOf<String>()
 
     private fun render() {
@@ -47,6 +49,7 @@ class AccountsScreenTest {
             ForgeTheme(dark = true) {
                 AccountsScreen(
                     repository = repository,
+                    oauth = controller,
                     onBack = {},
                     onOpenUrl = { opened += it },
                 )

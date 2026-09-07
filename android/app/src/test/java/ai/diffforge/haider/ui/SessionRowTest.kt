@@ -103,6 +103,31 @@ class SessionRowTest {
     }
 
     @Test
+    fun `an idle row says idle rather than saying nothing`() {
+        val spoken = render(
+            SessionRow(id = "s", title = "Quiet", state = SessionVisualState.Idle),
+        ).joinToString(" ")
+        assertTrue("a neutral state still has a word", spoken.contains("Idle"))
+    }
+
+    @Test
+    fun `an unknown row says unknown, not idle`() {
+        // The daemon could not vouch for this session. Rendering it as "Idle"
+        // claims it is fine, which is the one thing Unknown must never do
+        // (sessionActivity.js:91-94).
+        val spoken = render(
+            SessionRow(
+                id = "s",
+                title = "Sweep",
+                state = SessionVisualState.Unknown,
+                runState = "effect_unknown",
+            ),
+        ).joinToString(" ")
+        assertTrue(spoken.contains("Unknown"))
+        assertFalse(spoken.contains("Idle"))
+    }
+
+    @Test
     fun `an unknown row claims nothing`() {
         val spoken = render(
             SessionRow(

@@ -4,6 +4,7 @@ import ai.diffforge.haider.AppContainer
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.accounts.AccountsRepository
 import ai.diffforge.haider.ui.accounts.FakeAccountsRepository
+import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.daemon.FakeDaemonService
 import ai.diffforge.haider.ui.daemon.FakeScenario
@@ -30,23 +31,27 @@ object ComposeHost {
         return service
     }
 
-    fun viewModel(service: FakeDaemonService): ChatViewModel = ChatViewModel(service)
+    fun viewModel(service: FakeDaemonService): ChatViewModel =
+        ChatViewModel(service, searchDebounceMs = 0)
 }
 
 /** Renders the whole app against a fake daemon, in a fixed theme. */
 fun ComposeContentTestRule.setHaiderApp(
     service: FakeDaemonService,
     accounts: AccountsRepository = FakeAccountsRepository(),
+    oauth: OAuthAttemptController? = null,
     dark: Boolean = true,
     themeMode: ThemeMode = ThemeMode.Dark,
     onSystemAction: (SystemAction) -> Unit = {},
     onOpenUrl: (String) -> Unit = {},
 ): ChatViewModel {
-    val viewModel = ChatViewModel(service)
+    val viewModel = ChatViewModel(service, searchDebounceMs = 0)
+    val controller = oauth ?: OAuthAttemptController(accounts, kotlinx.coroutines.MainScope())
     setContent {
         HaiderApp(
             viewModel = viewModel,
             accounts = accounts,
+            oauth = controller,
             appVersion = "0.0.971",
             themeMode = themeMode,
             onThemeMode = {},
@@ -54,6 +59,7 @@ fun ComposeContentTestRule.setHaiderApp(
             onOpenUrl = onOpenUrl,
             dismissals = InMemoryBannerDismissals(),
             nowMsProvider = { FakeDaemonService.FIXED_NOW },
+            elapsedRealtimeProvider = { FakeDaemonService.FIXED_UPTIME },
             darkOverride = dark,
         )
     }

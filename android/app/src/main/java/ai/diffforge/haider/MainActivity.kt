@@ -2,6 +2,7 @@ package ai.diffforge.haider
 
 import ai.diffforge.haider.ui.accounts.AccountsRepository
 import ai.diffforge.haider.ui.accounts.FakeAccountsRepository
+import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.daemon.DaemonIntents
 import ai.diffforge.haider.ui.daemon.DaemonService
 import ai.diffforge.haider.ui.daemon.FakeDaemonService
@@ -37,6 +38,9 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.runtime.SideEffect
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.ViewModelProvider
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 /**
  * Process-wide wiring.
@@ -59,6 +63,13 @@ object AppContainer {
 
     private var daemon: DaemonService? = null
     private var accounts: AccountsRepository? = null
+    private var oauth: OAuthAttemptController? = null
+
+    /**
+     * Process-scoped on purpose: a live OAuth attempt must survive the Accounts
+     * screen being disposed by the `haider://oauth/return` navigation.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     fun daemon(context: Context): DaemonService =
         daemon ?: daemonFactory(context.applicationContext).also { daemon = it }
@@ -66,10 +77,14 @@ object AppContainer {
     fun accounts(context: Context): AccountsRepository =
         accounts ?: accountsFactory(context.applicationContext).also { accounts = it }
 
+    fun oauth(context: Context): OAuthAttemptController =
+        oauth ?: OAuthAttemptController(accounts(context), scope).also { oauth = it }
+
     /** Tests reset the container between cases. */
     fun reset() {
         daemon = null
         accounts = null
+        oauth = null
     }
 }
 
@@ -91,6 +106,7 @@ class MainActivity : ComponentActivity() {
         }
         val service = AppContainer.daemon(this)
         val accounts = AppContainer.accounts(this)
+        val oauth = AppContainer.oauth(this)
         val viewModel = ViewModelProvider(
             this,
             ChatViewModel.factory(
@@ -128,6 +144,7 @@ class MainActivity : ComponentActivity() {
             HaiderApp(
                 viewModel = viewModel,
                 accounts = accounts,
+                oauth = oauth,
                 appVersion = BuildConfigVersion.name(this),
                 themeMode = themeMode,
                 onThemeMode = { mode ->
@@ -201,7 +218,8 @@ class MainActivity : ComponentActivity() {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
                 }
-            SystemAction.OpenBattery -> startSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, true)
+            SystemAction.OpenAppSettings, SystemAction.OpenBattery ->
+                startSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, true)
             SystemAction.OpenAccessibility -> startSettings(Settings.ACTION_ACCESSIBILITY_SETTINGS, false)
             SystemAction.GrantSms -> smsPermissions.launch(
                 arrayOf(

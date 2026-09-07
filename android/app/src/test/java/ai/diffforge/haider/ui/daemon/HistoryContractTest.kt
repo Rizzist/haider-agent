@@ -84,11 +84,33 @@ class HistoryContractTest {
     @Test
     fun `search says how much of the roster it has covered`() = runTest {
         val service = FakeDaemonService(FakeScenario.LargeRoster)
-        service.setSearchIndex(SearchIndexState(indexedSessions = 40, totalSessions = 240, complete = false))
         val outcome = service.search("Session task 3")
-        assertTrue(!outcome.complete)
+        // 60 rows are loaded and indexed; the roster has more pages, so the
+        // result cannot claim to be complete.
+        assertEquals(60, outcome.index.indexedSessions)
+        assertTrue("unread pages cannot be searched yet", !outcome.complete)
         assertTrue(outcome.index.inProgress)
-        assertEquals(40, outcome.index.indexedSessions)
+        assertTrue(outcome.hits.isNotEmpty())
+    }
+
+    @Test
+    fun `search reads transcripts through the bounded read cache`() = runTest {
+        val service = FakeDaemonService(FakeScenario.Populated)
+        // A phrase that appears only inside a transcript, never in metadata.
+        val outcome = service.search("nav controller pops past")
+        assertEquals(listOf("s-nav"), outcome.hits.map { it.sessionId })
+        // Each covered session was read through `session.read` ranges.
+        assertTrue(service.calls.any { it.startsWith("session.read:s-nav:1-") })
+        assertTrue(service.calls.any { it.startsWith("session.attach:") })
+    }
+
+    @Test
+    fun `an unreadable transcript keeps the outcome honest`() = runTest {
+        val service = FakeDaemonService(FakeScenario.Populated)
+        service.transcriptOverride = { TranscriptLoad.Unavailable("history could not be read") }
+        val outcome = service.search("anything")
+        assertEquals(0, outcome.index.indexedSessions)
+        assertTrue(!outcome.complete)
     }
 
     @Test

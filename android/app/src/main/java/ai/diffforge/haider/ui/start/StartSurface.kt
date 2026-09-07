@@ -56,6 +56,7 @@ fun StartSurface(
     state: AppUiState,
     appVersion: String,
     nowMs: Long,
+    elapsedRealtimeMs: Long,
     onStepAction: (SetupStepId) -> Unit,
     onSuggestion: (String) -> Unit,
     onSelectSession: (String) -> Unit,
@@ -147,14 +148,17 @@ fun StartSurface(
                     SetupStepRow(
                         step = step,
                         index = index,
-                        doneDetail = doneDetail(step.id, state, running, nowMs),
+                        doneDetail = doneDetail(step.id, state, running, elapsedRealtimeMs),
                         onAction = { onStepAction(step.id) },
                     )
                 }
             }
         }
 
-        if (state.sessions.isEmpty()) {
+        // One brand-new session is not a "recent sessions" list; it is the
+        // session the user is looking at. Suggestions are more use than a
+        // one-row roster of itself.
+        if (state.sessions.size <= 1) {
             SuggestionList(onSuggestion = onSuggestion)
         } else {
             RecentSessions(
@@ -224,13 +228,15 @@ private fun doneDetail(
     id: SetupStepId,
     state: AppUiState,
     running: DaemonStatus.Running?,
-    nowMs: Long,
+    elapsedRealtimeMs: Long,
 ): String? = when (id) {
     SetupStepId.RunService -> running?.info?.let { info ->
         stringResource(
             R.string.step_service_done,
             info.pssBytes?.let { "${it / (1024 * 1024)} MB" } ?: "",
-            RelativeTime.clock(info.startedAtElapsedRealtimeMs),
+            // Uptime is monotonic, so a wall-clock "started at" cannot be
+            // derived from it: say how long it has been running instead.
+            RelativeTime.duration(info.startedAtElapsedRealtimeMs, elapsedRealtimeMs),
         )
     }
     SetupStepId.Notifications -> stringResource(R.string.step_notify_done)

@@ -24,6 +24,7 @@ enum class BannerAction {
     StartDaemon,
     OpenNeedsInput,
     RequestNotifications,
+    OpenAppSettings,
     OpenBatterySettings,
     OpenDaemonDetails,
     ContinueUpdate,
@@ -57,6 +58,7 @@ data class BannerInputs(
     val needsInputElsewhere: NeedsInputElsewhere? = null,
     val notificationsGranted: Boolean = true,
     val notificationsSupported: Boolean = true,
+    val notificationsPermanentlyDenied: Boolean = false,
     val batteryRestricted: Boolean = false,
     val network: NetworkState = NetworkState.Available,
     val update: UpdateUiState = UpdateUiState.Hidden,
@@ -158,9 +160,23 @@ object BannerResolver {
                 rank = 4,
                 severity = BannerSeverity.Warning,
                 title = BannerText.of(R.string.banner_notify_title),
-                detail = BannerText.of(R.string.banner_notify_body),
-                actionLabel = BannerText.of(R.string.banner_notify_action),
-                action = BannerAction.RequestNotifications,
+                detail = if (inputs.notificationsPermanentlyDenied) {
+                    BannerText.of(R.string.banner_notify_body_blocked)
+                } else {
+                    BannerText.of(R.string.banner_notify_body)
+                },
+                actionLabel = BannerText.of(
+                    if (inputs.notificationsPermanentlyDenied) {
+                        R.string.banner_notify_action_settings
+                    } else {
+                        R.string.banner_notify_action
+                    },
+                ),
+                action = if (inputs.notificationsPermanentlyDenied) {
+                    BannerAction.OpenAppSettings
+                } else {
+                    BannerAction.RequestNotifications
+                },
                 dismissible = true,
             )
         }

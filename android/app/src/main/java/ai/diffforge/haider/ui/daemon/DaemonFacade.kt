@@ -117,6 +117,30 @@ data class SessionRow(
         get() = lastActivityMs != null && seenAtMs != null && lastActivityMs > seenAtMs
 }
 
+/** One provider row from `provider.list`, as the pickers need it. */
+data class ProviderOption(
+    val id: String,
+    val label: String,
+    val models: List<String>,
+    val defaultModel: String?,
+    val available: Boolean,
+    val unavailableReason: String?,
+    val efforts: List<String> = emptyList(),
+)
+
+/** The `provider.list` snapshot plus its revision. */
+data class ProviderInventory(
+    val providers: List<ProviderOption> = emptyList(),
+    val revision: Long = 0,
+    val error: String? = null,
+) {
+    fun modelsFor(provider: String?): List<String> =
+        providers.firstOrNull { it.id == provider }?.models.orEmpty()
+
+    fun effortsFor(provider: String?): List<String> =
+        providers.firstOrNull { it.id == provider }?.efforts.orEmpty()
+}
+
 /** Roster page state, so the drawer can scroll hundreds of sessions honestly. */
 data class RosterPaging(
     val loading: Boolean = false,
@@ -164,6 +188,39 @@ data class CancelCoordinates(
     val workerGeneration: Long,
 )
 
+/**
+ * The compare-and-set identity `WireFrame::MenuAnswer` requires
+ * (frame.rs:5926). Every field must come from the *same* snapshot that
+ * rendered the card: `menu_id` from one poll paired with a `request_seq` from
+ * another answers a question that no longer exists.
+ */
+data class MenuCoordinates(
+    val sessionId: String,
+    val menuId: String,
+    val requestSeq: Long,
+    val workerGeneration: Long,
+    val commandId: String,
+) {
+    companion object {
+        /**
+         * Null whenever the rendered prompt is missing any coordinate — the UI
+         * then shows no answer affordance rather than guessing one.
+         */
+        fun of(sessionId: String, needsInput: NeedsInput?, commandId: String): MenuCoordinates? {
+            val menuId = needsInput?.menuId ?: return null
+            val requestSeq = needsInput.requestSeq ?: return null
+            val workerGeneration = needsInput.workerGeneration ?: return null
+            return MenuCoordinates(sessionId, menuId, requestSeq, workerGeneration, commandId)
+        }
+    }
+}
+
+/** `MenuInput` (frame.rs:5805). A secret only ever travels as a reference. */
+sealed interface MenuAnswerInput {
+    data class Text(val text: String) : MenuAnswerInput
+    data class Secret(val vaultReference: String) : MenuAnswerInput
+}
+
 object TurnCancel {
     /**
      * `run_id` and `worker_generation` must come from the same message as
@@ -187,6 +244,9 @@ interface DaemonService {
     val paging: StateFlow<RosterPaging>
     val activeSessionId: StateFlow<String?>
     val models: StateFlow<SessionConfig?>
+
+    /** `provider.list` inventory, for the composer's provider/model pickers. */
+    val providers: StateFlow<ProviderInventory>
     val catalogError: StateFlow<String?>
 
     /** When the catalog request went out; drives the model chip's 6 s deadline. */
@@ -207,16 +267,30 @@ interface DaemonService {
 
     /** Refuses unless [TurnCancel.coordinates] resolves from the current snapshot. */
     suspend fun stopTurn(sessionId: String)
+    /**
+     * Answers with the full frozen coordinate set. There is no overload that
+     * takes a bare `menuId`: an answer without `request_seq` and
+     * `worker_generation` cannot be a compare-and-set.
+     */
     suspend fun answer(
-        sessionId: String,
-        menuId: String,
+        coordinates: MenuCoordinates,
         optionKey: String,
         optionIndex: Int,
-        text: String? = null,
+        input: MenuAnswerInput? = null,
     )
+
+    /**
+     * `vault.stage` with purpose `menu_secret`, returning the opaque reference
+     * an answer may carry. The plaintext never leaves this call.
+     */
+    suspend fun stageMenuSecret(secret: CharArray): String
     suspend fun selectModel(provider: String, model: String)
     suspend fun selectEffort(effort: String?)
     suspend fun refreshModels()
+
+    /** `provider.list`; also the door the provider picker refreshes through. */
+    suspend fun refreshProviders()
+    suspend fun selectProvider(provider: String)
     suspend fun send(sessionId: String, text: String)
 
     /**
