@@ -10,6 +10,8 @@ data class Message(
     val status: String? = null,
     val tools: List<ToolCall> = emptyList(),
     val error: String? = null,
+    /** `ChatReply.Error.retryable`; the 970 parser read it and threw it away. */
+    val errorRetryable: Boolean = false,
     val provider: String? = null,
 )
 
@@ -49,11 +51,4 @@ enum class ToolStatus {
             else -> Unknown
         }
     }
-}
-
-enum class ConnectionState(val label: String) {
-    Idle("idle"),
-    Connecting("connecting"),
-    Connected("connected"),
-    Error("error"),
 }

@@ -30,6 +30,7 @@ object ForgeSize {
     /** Visible circle of an icon button inside a [touch] box. */
     val control = 44.dp
     val icon = 22.dp
+    val iconMd = 20.dp
     val iconSm = 18.dp
     val avatar = 22.dp
     val markLg = 34.dp
@@ -56,6 +57,7 @@ object ForgeSize {
 
     /** Tablet affordance retained from the existing transcript. */
     val readableMax = 776.dp
+    val sheetMax = 640.dp
     val proseMax = 600.dp
     val startFirstChildInset = 22.dp
     val toolResultMax = 220.dp

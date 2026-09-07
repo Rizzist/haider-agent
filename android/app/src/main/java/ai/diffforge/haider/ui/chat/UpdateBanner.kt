@@ -1,98 +1,75 @@
 package ai.diffforge.haider.ui.chat
 
-import ai.diffforge.haider.ui.theme.Forge
-import ai.diffforge.haider.ui.theme.ForgeShapes
+import ai.diffforge.haider.ui.state.BannerAction
+import ai.diffforge.haider.ui.state.BannerModel
+import ai.diffforge.haider.ui.state.BannerSeverity
+import ai.diffforge.haider.ui.state.BannerText
 import ai.diffforge.haider.update.UpdateUiState
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ArrowForward
-import androidx.compose.material.icons.rounded.SystemUpdate
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.unit.dp
 
-@Composable
-fun UpdateBanner(
-    state: UpdateUiState,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val content = when (state) {
-        UpdateUiState.Hidden -> return
-        is UpdateUiState.Available -> BannerContent(
-            title = "Update available → ${state.release.tag}",
-            detail = "Download, verify SHA-256, then open Android's installer",
-            clickable = true,
-        )
-        is UpdateUiState.Downloading -> BannerContent(
-            title = "Downloading ${state.release.tag}…",
-            detail = "The APK will be verified before installation",
-            clickable = false,
-        )
-        is UpdateUiState.PermissionRequired -> BannerContent(
-            title = "Allow installs to continue → Settings",
-            detail = "Enable “Allow from this source”, then return to Haider",
-            clickable = true,
-        )
-        is UpdateUiState.AwaitingConfirmation -> BannerContent(
-            title = if (state.confirmationReady) {
-                "Open Android's installer → ${state.tag}"
-            } else {
-                "Confirm ${state.tag} in Android's installer"
-            },
-            detail = "Installation never proceeds silently",
-            clickable = state.confirmationReady,
-        )
-        is UpdateUiState.Error -> BannerContent(
-            title = "Update refused",
-            detail = state.message,
-            clickable = state.release != null,
+/**
+ * The update surface no longer draws its own row: it emits a [BannerModel] at
+ * rank 7 and the one [ai.diffforge.haider.ui.scaffold.StatusBanner] renders it,
+ * so update messaging inherits the app's single banner style.
+ *
+ * The `UpdateUiState` copy below is the 970 mapping preserved verbatim
+ * (the old `UpdateBanner.kt:32-63`).
+ */
+object UpdateBannerModel {
+    const val RANK = 7
+
+    fun from(state: UpdateUiState): BannerModel? {
+        val copy = when (state) {
+            UpdateUiState.Hidden -> return null
+            is UpdateUiState.Available -> Copy(
+                "Update available → ${state.release.tag}",
+                "Download, verify SHA-256, then open Android's installer",
+                clickable = true,
+                error = false,
+            )
+            is UpdateUiState.Downloading -> Copy(
+                "Downloading ${state.release.tag}…",
+                "The APK will be verified before installation",
+                clickable = false,
+                error = false,
+            )
+            is UpdateUiState.PermissionRequired -> Copy(
+                "Allow installs to continue → Settings",
+                "Enable “Allow from this source”, then return to Haider",
+                clickable = true,
+                error = false,
+            )
+            is UpdateUiState.AwaitingConfirmation -> Copy(
+                if (state.confirmationReady) {
+                    "Open Android's installer → ${state.tag}"
+                } else {
+                    "Confirm ${state.tag} in Android's installer"
+                },
+                "Installation never proceeds silently",
+                clickable = state.confirmationReady,
+                error = false,
+            )
+            is UpdateUiState.Error -> Copy(
+                "Update refused",
+                state.message,
+                clickable = state.release != null,
+                error = true,
+            )
+        }
+        return BannerModel(
+            rank = RANK,
+            severity = if (copy.error) BannerSeverity.Error else BannerSeverity.Info,
+            title = BannerText.literal(copy.title),
+            detail = BannerText.literal(copy.detail),
+            actionLabel = if (copy.clickable) BannerText.literal("Continue") else null,
+            action = if (copy.clickable) BannerAction.ContinueUpdate else null,
+            dismissible = true,
         )
     }
-    val colors = Forge.colors
-    val type = Forge.type
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 7.dp)
-            .clip(ForgeShapes.cardTight)
-            .background(colors.surfaceRaised)
-            .border(1.dp, if (state is UpdateUiState.Error) colors.red else colors.accentSoft, ForgeShapes.cardTight)
-            .clickable(enabled = content.clickable, onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            Icons.Rounded.SystemUpdate,
-            contentDescription = null,
-            tint = if (state is UpdateUiState.Error) colors.red else colors.accentSoft,
-        )
-        Spacer(Modifier.width(10.dp))
-        Column(Modifier.weight(1f)) {
-            Text(content.title, style = type.toolStrong, color = colors.text)
-            Text(content.detail, style = type.toolRow, color = colors.textMuted)
-        }
-        if (content.clickable) {
-            Spacer(Modifier.width(8.dp))
-            Icon(Icons.Rounded.ArrowForward, contentDescription = "Continue update", tint = colors.accentSoft)
-        }
-    }
+
+    private data class Copy(
+        val title: String,
+        val detail: String,
+        val clickable: Boolean,
+        val error: Boolean,
+    )
 }
-
-private data class BannerContent(
-    val title: String,
-    val detail: String,
-    val clickable: Boolean,
-)

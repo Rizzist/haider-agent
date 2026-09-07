@@ -1,234 +1,238 @@
 package ai.diffforge.haider.ui.chat
 
-import ai.diffforge.haider.transport.ChatReply
-import ai.diffforge.haider.transport.ChatSegment
-import ai.diffforge.haider.transport.DaemonConnection
-import ai.diffforge.haider.transport.SessionConfig
-import ai.diffforge.haider.transport.TransportState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
+import ai.diffforge.haider.daemon.DaemonService
+import ai.diffforge.haider.daemon.DaemonStatus
+import ai.diffforge.haider.daemon.MissingRunCoordinates
+import ai.diffforge.haider.daemon.SessionRow
+import ai.diffforge.haider.ui.state.AppUiState
+import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.SessionFilter
+import ai.diffforge.haider.ui.state.SetupPlan
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-/** Transcript projection and the APK's correlation boundary for daemon chat streams. */
-class ChatViewModel : ViewModel() {
-    private val _messages = mutableStateListOf<Message>()
-    val messages: List<Message> get() = _messages
+/**
+ * The app's single state owner.
+ *
+ * 970 held nine independent `mutableStateOf` fields and one implicit
+ * conversation. 971 is multi-session: transcripts and drafts are keyed by
+ * session id, and everything the tree reads is one immutable [AppUiState].
+ */
+class ChatViewModel(
+    private val service: DaemonService,
+    private val clock: () -> Long = System::currentTimeMillis,
+    private val notificationsSupported: Boolean = true,
+) : ViewModel() {
 
-    var connection by mutableStateOf(ConnectionState.Idle)
-        private set
-    var sessionConfig by mutableStateOf<SessionConfig?>(null)
-        private set
-    var settingsError by mutableStateOf<String?>(null)
-        private set
-    var selectionBusy by mutableStateOf(false)
-        private set
+    private val _state = MutableStateFlow(AppUiState())
+    val state: StateFlow<AppUiState> = _state.asStateFlow()
 
-    val isBusy: Boolean get() = _messages.any { it.role == Role.Agent && it.streaming }
-
-    private var nextId = 1L
-    private val turnAgents = mutableMapOf<Long, Long>()
+    private val transcripts = mutableMapOf<String, List<Message>>()
+    private val drafts = mutableMapOf<String, String>()
+    private var batterySkipped = false
 
     init {
         viewModelScope.launch {
-            DaemonConnection.state.collect { state ->
-                val previous = connection
-                connection = when (state) {
-                    TransportState.Disconnected -> ConnectionState.Idle
-                    TransportState.Connecting -> ConnectionState.Connecting
-                    TransportState.Authenticated -> ConnectionState.Connected
-                    is TransportState.Error -> ConnectionState.Error
-                }
-                if (previous == ConnectionState.Connected && connection != ConnectionState.Connected) {
-                    selectionBusy = false
-                    sealInterruptedTurns()
-                }
+            service.status.collect { status -> update { it.copy(daemon = status) }; recomputeSetup() }
+        }
+        viewModelScope.launch {
+            service.environment.collect { env -> update { it.copy(environment = env) }; recomputeSetup() }
+        }
+        viewModelScope.launch {
+            service.sessions.collect { rows -> update { it.copy(sessions = rows) } }
+        }
+        viewModelScope.launch {
+            service.paging.collect { paging -> update { it.copy(paging = paging) } }
+        }
+        viewModelScope.launch {
+            service.activeSessionId.collect { id ->
+                update { it.copy(activeSessionId = id, draft = drafts[id].orEmpty()) }
+                if (id != null) loadTranscript(id)
             }
         }
         viewModelScope.launch {
-            DaemonConnection.sessionConfig.collect { config ->
-                sessionConfig = config
-                if (config != null) {
-                    selectionBusy = false
-                    settingsError = null
-                }
-            }
+            service.models.collect { config -> update { it.copy(models = config) }; recomputeSetup() }
         }
         viewModelScope.launch {
-            DaemonConnection.sessionErrors.collect { message ->
-                selectionBusy = false
-                settingsError = message
-            }
+            service.catalogError.collect { error -> update { it.copy(catalogError = error) } }
         }
         viewModelScope.launch {
-            DaemonConnection.chatReplies.collect(::applyReply)
+            service.catalogRequestedAtMs.collect { at -> update { it.copy(catalogRequestedAtMs = at) } }
         }
     }
 
-    fun send(raw: String) {
-        val text = raw.trim()
-        if (text.isEmpty()) return
-        _messages.add(Message(nextId++, Role.User, text))
-        if (connection != ConnectionState.Connected) {
-            _messages.add(
-                Message(
-                    id = nextId++,
-                    role = Role.Agent,
-                    text = "The daemon isn't connected. Open setup and check its host, port, and token.",
-                    error = "Message not sent",
-                ),
-            )
-            return
-        }
+    // ---------- daemon lifecycle ----------
 
-        val agentId = nextId++
-        _messages.add(
-            Message(
-                id = agentId,
-                role = Role.Agent,
-                text = "",
-                streaming = true,
-                status = "queued…",
-                provider = sessionConfig?.current?.provider,
-            ),
-        )
-        viewModelScope.launch {
-            var reservedId: Long? = null
-            try {
-                DaemonConnection.sendChat(text) { turnId ->
-                    reservedId = turnId
-                    turnAgents[turnId] = agentId
-                }
-            } catch (error: Exception) {
-                reservedId?.let(turnAgents::remove)
-                mutateAgent(agentId) {
-                    it.copy(
-                        streaming = false,
-                        status = null,
-                        error = error.message ?: "Couldn't reach the daemon",
-                    )
-                }
-            }
-        }
+    fun startDaemon() = viewModelScope.launch { service.start() }
+
+    fun stopDaemon() = viewModelScope.launch { service.stop() }
+
+    fun restartDaemon() = viewModelScope.launch { service.restart() }
+
+    // ---------- roster ----------
+
+    fun refreshRoster() = viewModelScope.launch { service.refreshRoster() }
+
+    fun loadMoreSessions() = viewModelScope.launch { service.loadMoreSessions() }
+
+    fun newSession(model: String? = null, effort: String? = null) = viewModelScope.launch {
+        val id = service.createSession(model, effort)
+        loadTranscript(id)
     }
 
-    fun selectModel(provider: String, model: String) {
-        if (connection != ConnectionState.Connected || selectionBusy) return
-        selectionBusy = true
-        settingsError = null
-        viewModelScope.launch {
-            try {
-                DaemonConnection.selectModel(provider, model)
-            } catch (error: Exception) {
-                selectionBusy = false
-                settingsError = error.message ?: "Couldn't change the model"
-            }
-        }
+    fun activate(sessionId: String) = viewModelScope.launch {
+        service.activate(sessionId)
+        service.markSeen(sessionId)
+        loadTranscript(sessionId)
     }
 
-    fun selectEffort(effort: String?) {
-        if (connection != ConnectionState.Connected || selectionBusy) return
-        selectionBusy = true
-        settingsError = null
-        viewModelScope.launch {
-            try {
-                DaemonConnection.selectEffort(effort)
-            } catch (error: Exception) {
-                selectionBusy = false
-                settingsError = error.message ?: "Couldn't change effort"
-            }
-        }
+    fun rename(sessionId: String, title: String) = viewModelScope.launch {
+        service.rename(sessionId, title)
+        closeOverlay()
     }
 
-    fun refreshSessionConfig() {
-        if (connection != ConnectionState.Connected) return
-        settingsError = null
-        viewModelScope.launch {
-            try {
-                DaemonConnection.requestSessionConfig()
-            } catch (error: Exception) {
-                settingsError = error.message ?: "Couldn't refresh models"
-            }
-        }
+    fun fork(sessionId: String) = viewModelScope.launch {
+        val id = service.fork(sessionId)
+        service.activate(id)
+        closeOverlay()
     }
 
-    private fun applyReply(reply: ChatReply) {
-        val agentId = turnAgents[reply.id] ?: beginUnsolicitedStream(reply) ?: return
-        when (reply) {
-            is ChatReply.Delta -> mutateAgent(agentId) { message ->
-                when (reply.segment) {
-                    ChatSegment.Answer -> message.copy(text = message.text + reply.text)
-                    ChatSegment.Thinking -> message.copy(thinking = message.thinking + reply.text)
-                }
-            }
-            is ChatReply.Tool -> mutateAgent(agentId) { message ->
-                val tool = ToolCall(
-                    callId = reply.callId,
-                    name = reply.name,
-                    summary = reply.summary,
-                    status = ToolStatus.fromWire(reply.status),
-                    result = reply.result,
-                )
-                val existing = message.tools.indexOfFirst { it.callId == tool.callId }
-                val tools = message.tools.toMutableList()
-                if (existing >= 0) tools[existing] = tool else tools.add(tool)
-                message.copy(tools = tools)
-            }
-            is ChatReply.Status -> mutateAgent(agentId) { it.copy(status = reply.text) }
-            is ChatReply.Done -> {
-                turnAgents.remove(reply.id)
-                mutateAgent(agentId) { it.copy(streaming = false, status = null) }
-            }
-            is ChatReply.Error -> {
-                turnAgents.remove(reply.id)
-                mutateAgent(agentId) {
-                    it.copy(streaming = false, status = null, error = reply.message)
-                }
-            }
-        }
+    fun delete(sessionId: String) = viewModelScope.launch {
+        service.delete(sessionId)
+        transcripts.remove(sessionId)
+        drafts.remove(sessionId)
+        closeOverlay()
+    }
+
+    fun clearTranscript(sessionId: String) {
+        transcripts[sessionId] = emptyList()
+        if (_state.value.activeSessionId == sessionId) update { it.copy(messages = emptyList()) }
+    }
+
+    // ---------- the turn ----------
+
+    fun setDraft(text: String) {
+        val id = _state.value.activeSessionId
+        if (id != null) drafts[id] = text
+        update { it.copy(draft = text) }
+    }
+
+    fun send() = viewModelScope.launch {
+        val current = _state.value
+        val text = current.draft.trim()
+        if (text.isEmpty()) return@launch
+        if (current.daemon !is DaemonStatus.Running) service.start()
+        val id = current.activeSessionId ?: service.createSession()
+        service.send(id, text)
+        drafts[id] = ""
+        update { it.copy(draft = "") }
+        loadTranscript(id)
     }
 
     /**
-     * Daemon-owned negative IDs carry authenticated background chat streams,
-     * including monitor reports. Positive IDs remain strictly correlated to
-     * requests reserved by [send].
+     * Refuses without live coordinates: `run_id == null` means no active run, so
+     * the button is not rendered and the call is not made
+     * (UI-SPEC 5.3 non-negotiable 1).
      */
-    private fun beginUnsolicitedStream(reply: ChatReply): Long? {
-        if (reply.id >= 0L || reply is ChatReply.Done || reply is ChatReply.Error) return null
-        val agentId = nextId++
-        _messages.add(
-            Message(
-                id = agentId,
-                role = Role.Agent,
-                text = "",
-                streaming = true,
-                status = "monitor update…",
-                provider = sessionConfig?.current?.provider,
+    fun stopTurn(sessionId: String? = _state.value.activeSessionId) = viewModelScope.launch {
+        val id = sessionId ?: return@launch
+        runCatching { service.stopTurn(id) }
+            .onFailure { if (it !is MissingRunCoordinates) throw it }
+        loadTranscript(id)
+    }
+
+    fun answer(sessionId: String, menuId: String, optionKey: String, optionIndex: Int, text: String? = null) =
+        viewModelScope.launch {
+            runCatching { service.answer(sessionId, menuId, optionKey, optionIndex, text) }
+                .onFailure { error ->
+                    if (error.message?.contains(ALREADY_RESOLVED) == true) {
+                        update { it.copy(answeredElsewhere = it.answeredElsewhere + menuId) }
+                    }
+                }
+            loadTranscript(sessionId)
+        }
+
+    // ---------- model catalog ----------
+
+    fun selectModel(provider: String, model: String) = viewModelScope.launch {
+        update { it.copy(selectionBusy = true) }
+        runCatching { service.selectModel(provider, model) }
+        update { it.copy(selectionBusy = false) }
+    }
+
+    fun selectEffort(effort: String?) = viewModelScope.launch {
+        update { it.copy(selectionBusy = true) }
+        runCatching { service.selectEffort(effort) }
+        update { it.copy(selectionBusy = false) }
+    }
+
+    fun refreshModels() = viewModelScope.launch { service.refreshModels() }
+
+    // ---------- surfaces ----------
+
+    fun openOverlay(overlay: Overlay) = update { it.copy(overlay = overlay) }
+
+    fun closeOverlay() = update { it.copy(overlay = Overlay.None) }
+
+    fun setFilter(filter: SessionFilter) = update { it.copy(filter = filter) }
+
+    fun setQuery(query: String) = update { it.copy(query = query) }
+
+    fun skipBatteryStep() {
+        batterySkipped = true
+        recomputeSetup()
+    }
+
+    fun session(id: String?): SessionRow? = _state.value.sessions.firstOrNull { it.id == id }
+
+    private fun loadTranscript(sessionId: String) {
+        viewModelScope.launch {
+            update { it.copy(transcriptLoading = true) }
+            val messages = service.transcript(sessionId)
+            transcripts[sessionId] = messages
+            update {
+                if (it.activeSessionId == sessionId) {
+                    it.copy(messages = messages, transcriptLoading = false)
+                } else {
+                    it.copy(transcriptLoading = false)
+                }
+            }
+        }
+    }
+
+    private fun recomputeSetup() = update { current ->
+        current.copy(
+            setup = SetupPlan.build(
+                daemonRunning = current.daemon is DaemonStatus.Running,
+                notificationsGranted = current.environment.notificationsGranted,
+                notificationsSupported = notificationsSupported,
+                batteryRestricted = current.environment.batteryRestricted,
+                batterySkipped = batterySkipped,
+                modelResolved = current.models != null,
             ),
         )
-        turnAgents[reply.id] = agentId
-        return agentId
     }
 
-    private fun mutateAgent(id: Long, transform: (Message) -> Message) {
-        val index = _messages.indexOfLast { it.id == id }
-        if (index >= 0) _messages[index] = transform(_messages[index])
+    private inline fun update(transform: (AppUiState) -> AppUiState) {
+        _state.value = transform(_state.value)
     }
 
-    private fun sealInterruptedTurns() {
-        val ids = turnAgents.values.toSet()
-        turnAgents.clear()
-        ids.forEach { id ->
-            mutateAgent(id) {
-                it.copy(
-                    streaming = false,
-                    status = null,
-                    error = "Connection lost before this reply completed",
-                )
-            }
+    companion object {
+        const val ALREADY_RESOLVED = "ERROR_CODE_ALREADY_RESOLVED"
+
+        fun factory(
+            service: DaemonService,
+            clock: () -> Long = System::currentTimeMillis,
+            notificationsSupported: Boolean = true,
+        ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                ChatViewModel(service, clock, notificationsSupported) as T
         }
     }
 }

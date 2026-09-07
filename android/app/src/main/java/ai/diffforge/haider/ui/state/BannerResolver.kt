@@ -3,6 +3,7 @@ package ai.diffforge.haider.ui.state
 import ai.diffforge.haider.R
 import ai.diffforge.haider.daemon.DaemonStatus
 import ai.diffforge.haider.daemon.NetworkState
+import ai.diffforge.haider.ui.chat.UpdateBannerModel
 import ai.diffforge.haider.update.UpdateUiState
 
 /** A string the banner will render: a resource plus args, or a literal. */
@@ -178,71 +179,11 @@ object BannerResolver {
             )
         }
 
-        updateBanner(inputs.update)?.let(out::add)
+        UpdateBannerModel.from(inputs.update)?.let(out::add)
 
         return out.sortedBy { it.rank }
     }
 
-    /**
-     * The 970 `UpdateUiState` mapping, preserved verbatim
-     * (`UpdateBanner.kt:32-63`) so update messaging inherits the one banner
-     * style instead of drawing its own row.
-     */
-    fun updateBanner(state: UpdateUiState): BannerModel? {
-        val (title, detail, clickable, error) = when (state) {
-            UpdateUiState.Hidden -> return null
-            is UpdateUiState.Available -> UpdateCopy(
-                "Update available → ${state.release.tag}",
-                "Download, verify SHA-256, then open Android's installer",
-                true,
-                false,
-            )
-            is UpdateUiState.Downloading -> UpdateCopy(
-                "Downloading ${state.release.tag}…",
-                "The APK will be verified before installation",
-                false,
-                false,
-            )
-            is UpdateUiState.PermissionRequired -> UpdateCopy(
-                "Allow installs to continue → Settings",
-                "Enable “Allow from this source”, then return to Haider",
-                true,
-                false,
-            )
-            is UpdateUiState.AwaitingConfirmation -> UpdateCopy(
-                if (state.confirmationReady) {
-                    "Open Android's installer → ${state.tag}"
-                } else {
-                    "Confirm ${state.tag} in Android's installer"
-                },
-                "Installation never proceeds silently",
-                state.confirmationReady,
-                false,
-            )
-            is UpdateUiState.Error -> UpdateCopy(
-                "Update refused",
-                state.message,
-                state.release != null,
-                true,
-            )
-        }
-        return BannerModel(
-            rank = 7,
-            severity = if (error) BannerSeverity.Error else BannerSeverity.Info,
-            title = BannerText.literal(title),
-            detail = BannerText.literal(detail),
-            actionLabel = if (clickable) BannerText.literal("Continue") else null,
-            action = if (clickable) BannerAction.ContinueUpdate else null,
-            dismissible = true,
-        )
-    }
-
-    private data class UpdateCopy(
-        val title: String,
-        val detail: String,
-        val clickable: Boolean,
-        val error: Boolean,
-    )
 }
 
 /** Persistence seam for banner dismissals, so the resolver stays pure. */
