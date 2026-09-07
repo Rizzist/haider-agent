@@ -18,8 +18,16 @@ internal class TestHaiderDaemonService : HaiderDaemonService() {
     val fake = FakeNativeDaemonHost()
     val state = FakeLifecycleStore()
     var promotedBeforeVersion = false
-    override fun createPaths() = DaemonPaths("{}", "/private/runtime/h.sock", File("/unused-vault"))
-    override fun createLifecycleStore(): DaemonLifecycleStore = state
+    var beforePaths: () -> Unit = {}
+    var beforeSave: () -> Unit = {}
+    override fun createPaths(): DaemonPaths {
+        beforePaths()
+        return DaemonPaths("{}", "/private/runtime/h.sock", File("/unused-vault"))
+    }
+    override fun createLifecycleStore(): DaemonLifecycleStore = object : DaemonLifecycleStore {
+        override fun load() = state.load()
+        override fun save(next: PersistedLifecycle) { beforeSave(); state.save(next) }
+    }
     override fun createVault(paths: DaemonPaths) = VaultDekProvider { use ->
         val dek = ByteArray(32) { 7 }
         try { use(dek) } finally { dek.fill(0) }
@@ -36,6 +44,41 @@ internal class TestHaiderDaemonService : HaiderDaemonService() {
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class HaiderDaemonServiceTest {
+    @Test fun coldStartCannotBeStoppedByInitializationWhileItsOwnerActionIsPending() {
+        val controller = Robolectric.buildService(TestHaiderDaemonService::class.java)
+        val service = controller.get()
+        val initialize = CountDownLatch(1)
+        val savingStart = CountDownLatch(1)
+        val completeStart = CountDownLatch(1)
+        service.beforePaths = { check(initialize.await(5, TimeUnit.SECONDS)) }
+        service.beforeSave = {
+            savingStart.countDown()
+            check(completeStart.await(5, TimeUnit.SECONDS))
+        }
+        controller.create()
+        try {
+            service.onStartCommand(HaiderDaemonService.userStartIntent(service), 0, 1)
+            initialize.countDown()
+            assertTrue(savingStart.await(5, TimeUnit.SECONDS))
+            // Restore has published DISABLED and posted teardown; STARTING cannot publish yet.
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse("Initialization stopped a pending cold start", shadowOf(service).isStoppedBySelf)
+            completeStart.countDown()
+            await { service.fake.passedDek != null }
+            service.fake.ready()
+            val binder = IHaiderDaemonService.Stub.asInterface(service.onBind(Intent()))
+            await { binder.snapshot.phase == "READY" }
+            assertTrue(service.promotedBeforeVersion)
+            assertNotNull(binder.rpcEndpoint)
+            assertFalse(shadowOf(service).isStoppedBySelf)
+            service.onStartCommand(Intent().setAction(DaemonIntents.STOP_DAEMON), 0, 2)
+            await { shadowOf(service).isStoppedBySelf }
+            assertEquals("DISABLED", binder.snapshot.phase)
+        } finally {
+            initialize.countDown(); completeStart.countDown()
+            controller.destroy()
+        }
+    }
     @Test fun foregroundBeforeNativeReadyBindingSurvivesUnbindAndStopDisables() {
         val controller = Robolectric.buildService(TestHaiderDaemonService::class.java).create()
         val service = controller.get()

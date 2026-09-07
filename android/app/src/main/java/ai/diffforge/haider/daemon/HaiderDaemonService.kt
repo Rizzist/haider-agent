@@ -24,6 +24,8 @@ import android.os.RemoteException
 import android.os.SystemClock
 import ai.diffforge.haider.R
 import org.json.JSONObject
+import java.io.FileDescriptor
+import java.io.PrintWriter
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -44,6 +46,8 @@ open class HaiderDaemonService : Service() {
     private var rosterEpoch = 0L
     private var lastMetricsElapsedMs = -10_000L
     private var ownerFailed = false
+    // Main-thread confined. Snapshots can still describe initialization or an older action.
+    private var pendingStartActions = 0
     @Volatile private var started = false
     @Volatile private var destroyed = false
     @Volatile private var latest = DaemonServiceSnapshot()
@@ -111,30 +115,46 @@ open class HaiderDaemonService : Service() {
             stopSelf(startId)
             return START_STICKY
         }
+        pendingStartActions++
         started = true
         val action = intent?.action
         owner.execute {
-            if (ownerFailed) {
-                if (!latest.enabled) finishStoppedStart()
-                return@execute
-            }
-            ownerWork {
-                when (action) {
-                    ACTION_USER_START -> engine.startUserInitiated()
-                    DaemonIntents.STOP_DAEMON -> engine.stopAndDisable()
-                    DaemonIntents.RESTART_DAEMON -> engine.restart()
-                    ACTION_PREPARE_UPDATE -> engine.prepareForUpdate()
-                    ACTION_PACKAGE_REPLACED -> engine.resumeEnabled(afterReplacement = true)
-                    null, ACTION_RESUME_ENABLED -> engine.resumeEnabled()
+            try {
+                ownerWork {
+                    when (action) {
+                        ACTION_USER_START -> engine.startUserInitiated()
+                        DaemonIntents.STOP_DAEMON -> engine.stopAndDisable()
+                        DaemonIntents.RESTART_DAEMON -> engine.restart()
+                        ACTION_PREPARE_UPDATE -> engine.prepareForUpdate()
+                        ACTION_PACKAGE_REPLACED -> engine.resumeEnabled(afterReplacement = true)
+                        null, ACTION_RESUME_ENABLED -> engine.resumeEnabled()
+                    }
                 }
-                // A disabled sticky restart must not leave an inert foreground service behind.
-                if (!engine.snapshot.enabled && engine.snapshot.phase in setOf("DISABLED", "ERROR")) finishStoppedStart()
+            } finally {
+                main.post {
+                    pendingStartActions--
+                    // Reconsider teardown only after every accepted action has completed.
+                    finishStoppedStart()
+                }
             }
         }
         return START_STICKY
     }
     override fun onBind(intent: Intent?): IBinder = binder
     override fun onUnbind(intent: Intent?): Boolean = false
+    /** Read-only shell diagnostics for recovery probes; never binds, starts, or instruments the app. */
+    override fun dump(fd: FileDescriptor?, writer: PrintWriter, args: Array<out String>?) {
+        val snapshot = latest
+        writer.println("HAIDER_DAEMON_STATE " + JSONObject()
+            .put("enabled", snapshot.enabled).put("phase", snapshot.phase)
+            .put("generation", snapshot.daemonGeneration).put("snapshotSeq", snapshot.snapshotSeq)
+            .put("errorCode", snapshot.errorCode ?: JSONObject.NULL)
+            .put("errorRetryable", snapshot.errorRetryable)
+            .put("restartAttempt", snapshot.restartAttempt)
+            .put("nextRetryUnixMs", snapshot.nextRetryUnixMs ?: JSONObject.NULL)
+            .put("hasEndpoint", snapshot.rpcEndpoint != null)
+            .put("started", started).put("destroyed", destroyed))
+    }
     // No onTaskRemoved stop: swiping/killing the UI does not revoke user-enabled service lifetime.
 
     override fun onDestroy() {
@@ -225,8 +245,8 @@ open class HaiderDaemonService : Service() {
     }
     private fun finishStoppedStart() {
         main.post {
-            // A later queued explicit start supersedes an earlier stop callback.
-            if (!latest.enabled && latest.phase in setOf("DISABLED", "ERROR") && !destroyed) {
+            // A disabled restore/older Stop cannot revoke a start still queued on the owner.
+            if (pendingStartActions == 0 && !latest.enabled && latest.phase in setOf("DISABLED", "ERROR") && !destroyed) {
                 started = false
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()

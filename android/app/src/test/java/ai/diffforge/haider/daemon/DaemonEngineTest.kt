@@ -64,10 +64,19 @@ class DaemonEngineTest {
         engine = engine()
         assertEquals("ERROR", engine.snapshot.phase)
         assertEquals("CRASH_LOOP", engine.snapshot.errorCode)
+        assertTrue(engine.snapshot.errorRetryable)
+        assertNull(engine.snapshot.nextRetryUnixMs)
+        engine = engine() // Restore an already-latched state, rather than recording another crash.
+        assertEquals("ERROR", engine.snapshot.phase)
+        assertEquals("CRASH_LOOP", engine.snapshot.errorCode)
+        assertTrue(engine.snapshot.errorRetryable)
+        assertNull(engine.snapshot.nextRetryUnixMs)
         clock.advance(1_000_000); engine.tick(); engine.resumeEnabled()
         assertEquals(3, host.calls.count { it == "start" })
         engine.restart()
         assertEquals("STARTING", engine.snapshot.phase)
+        assertFalse(engine.snapshot.errorRetryable)
+        assertNull(engine.snapshot.errorCode)
         assertTrue(store.state.crashes.isEmpty())
     }
     @Test fun oldCrashesExpireButBackwardWallClockDoesNotClearLatch() {

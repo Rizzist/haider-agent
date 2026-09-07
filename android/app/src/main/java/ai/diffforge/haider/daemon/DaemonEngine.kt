@@ -58,7 +58,8 @@ internal class DaemonEngine(
         } else {
             emit(snapshot.copy(enabled = persisted.enabled,
                 phase = if (persisted.latchedError != null) "ERROR" else if (persisted.enabled) "RESTARTING" else "DISABLED",
-                errorCode = persisted.latchedError, restartAttempt = persisted.crashes.size,
+                errorCode = persisted.latchedError, errorRetryable = persisted.latchedError == "CRASH_LOOP",
+                restartAttempt = persisted.crashes.size,
                 nextRetryUnixMs = persisted.retryAtUnixMs))
             persisted.retryAtUnixMs?.let {
                 retryElapsedMs = clock.elapsedMs() + (it - clock.unixMs()).coerceIn(0, MAX_BACKOFF_MS)
@@ -281,7 +282,8 @@ internal class DaemonEngine(
         retryElapsedMs = null
         emit(snapshot.copy(enabled = persisted.enabled, phase = "ERROR", rpcEndpoint = null,
             restartAttempt = persisted.crashes.size, nextRetryUnixMs = null,
-            errorCode = code, errorRetryable = false, startedAtElapsedRealtimeMs = null))
+            // Retryable means explicit user restart; the latch still prohibits automatic retry.
+            errorCode = code, errorRetryable = code == "CRASH_LOOP", startedAtElapsedRealtimeMs = null))
     }
 
     private fun save(next: PersistedLifecycle) {
