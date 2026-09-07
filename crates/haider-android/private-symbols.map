@@ -1,0 +1,3 @@
+{
+  local: blake3_compress_in_place_portable;
+};

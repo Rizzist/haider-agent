@@ -1730,6 +1730,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "haider-android"
+version = "0.0.970"
+dependencies = [
+ "haider-daemon",
+ "haider-platform",
+ "haider-rpc",
+ "jni 0.21.1",
+ "ndk-context",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "haider-cli"
 version = "0.0.970"
 dependencies = [

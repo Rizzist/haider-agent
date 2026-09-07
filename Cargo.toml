@@ -6,6 +6,7 @@ members = [
     "crates/haider-store",
     "crates/haider-core",
     "crates/haider-daemon",
+    "crates/haider-android",
     "crates/haider-daemond",
     "crates/haider-provider",
     "crates/haider-tools",

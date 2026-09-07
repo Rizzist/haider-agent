@@ -1,6 +1,6 @@
 //! Single-opener guard for a profile root. Owns the lock semantics:
 //!
-//! - Exclusivity comes from an advisory OS lock (`File::try_lock`) on
+//! - Exclusivity comes from an advisory OS lock on
 //!   `<root>/lock`, held for as long as the returned [`ProfileLock`] lives.
 //!   Dropping it — including by process death or kill — releases the lock;
 //!   there is no stale-lock state to clean up.
@@ -43,7 +43,7 @@ impl Drop for ProfileLock {
         // Make the release boundary synchronous and explicit. Relying only
         // on handle close can leave a just-closed profile briefly contended
         // on macOS and Windows, where recovery immediately reopens it.
-        let _ = self.file.unlock();
+        let _ = haider_platform::unlock_file(&self.file);
     }
 }
 
@@ -67,7 +67,7 @@ impl ProfileLock {
                     false,
                 )
             })?;
-        match file.try_lock() {
+        match haider_platform::try_lock_file_exclusive(&file) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 return Err(store_error(
