@@ -98,6 +98,10 @@ jobs:
           }
       - uses: Swatinem/rust-cache@v2
         if: matrix.target == 'aarch64-apple-darwin'
+        # Match the producer/render cache environment before key selection.
+        env:
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_DEV_DEBUG: 0
         with:
           shared-key: macos-release-aarch64
       - name: locate shared macOS release artifact
@@ -495,6 +499,8 @@ jobs:
   installers:
     name: Additional installers (${{ matrix.target }})
     needs: build
+    # Reused gates leave a skipped ancestor; check the direct result explicitly.
+    if: always() && !cancelled() && needs.build.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -598,7 +604,7 @@ jobs:
 
   publish:
     needs: [build, installers]
-    if: github.event_name == 'push'   # only tag pushes cut a release
+    if: always() && !cancelled() && needs.build.result == 'success' && needs.installers.result == 'success' && github.event_name == 'push'   # only tag pushes cut a release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -696,7 +702,7 @@ jobs:
   npm:
     name: Publish npm
     needs: publish
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: always() && !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -748,7 +754,7 @@ jobs:
   repin-packages:
     name: Re-pin Homebrew and Scoop manifests
     needs: publish
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: always() && !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     continue-on-error: true
     concurrency:
@@ -850,7 +856,7 @@ jobs:
   chocolatey:
     name: Publish Chocolatey
     needs: publish
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: always() && !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     continue-on-error: true
     steps:

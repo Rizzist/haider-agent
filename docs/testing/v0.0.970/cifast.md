@@ -45,7 +45,10 @@ and full SHA, any ref/event, only `status=completed` plus `conclusion=success`.
 It excludes the current run (including reruns of that run). Wrong SHAs, queued,
 failed, cancelled, skipped and neutral runs cannot satisfy it. A valid miss
 outputs `satisfied=false`; malformed responses/API errors fail the job. No
-successful lookup plus no successful fallback means no build. A successful
+successful lookup plus no successful fallback means no build. Installers,
+publish and package follow-up explicitly require their direct dependencies to
+succeed and reject cancellation, so the intentionally skipped reusable gate
+cannot silently skip the rest of a successful release. A successful
 older attempt/run remains usable, matching the existing require-evidence rule.
 
 Ship-gate concurrency is keyed by **SHA**, with cancellation disabled. A main
@@ -96,7 +99,8 @@ Client and daemon measurements use these exact unsigned bytes. Only the small
 `memdaemon_workload` debug driver is built by the daemon measurement job. The
 render benchmark keeps its own release test binary and an explicit arm64 target;
 it shares `macos-release-aarch64` with the producer (and release's dependency
-cache). Concurrent jobs cannot consume a cache that has not been saved yet, and
+cache). Release's cache step explicitly matches the producer's CARGO env before
+key selection. Concurrent jobs cannot consume a cache that has not been saved yet, and
 GitHub cache ref scope still applies; an artifact, not a cache hit, proves byte
 identity. No test or timing measurement is satisfied by a cache.
 
@@ -147,8 +151,11 @@ same shard. Failure artifact names include the shard number.
 ## Registry #80 and proof before acceptance
 
 No new performance threshold is introduced. Existing required daemon/render/
-probe gates remain required, and the existing client-footprint advisory policy
-is preserved (its comment requires three green main runs before promotion).
+probe gates remain required. The client budget measurement remains advisory
+(its comment requires three green main measurements before promotion), while
+client setup, download, manifest validation and evidence upload are required.
+The actual measurement outcome is recorded in the job summary. A job-wide
+waiver must not mask artifact integrity or setup failures.
 The shared producer, integrity checks and verdict are necessary build/evidence
 plumbing; a broken build or corrupt artifact is never waived as advisory.
 The new standalone Windows rehearsal is **advisory to release until its first

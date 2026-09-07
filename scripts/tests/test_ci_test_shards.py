@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'scripts/ci-test.sh'
@@ -55,10 +56,10 @@ if [[ "$*" == *"--no-fail-fast -p $FAIL_CRATE "* && -n "$FAIL_CRATE" ]]; then
   echo 'test simulated_failure ... FAILED'
   exit 1
 fi
-''')
+''', newline='\n')
             cargo.chmod(0o755)
             timeout = bin_dir / 'timeout'
-            timeout.write_text('#!/usr/bin/env bash\nshift\nexec "$@"\n')
+            timeout.write_text('#!/usr/bin/env bash\nshift\nexec "$@"\n', newline='\n')
             timeout.chmod(0o755)
             kwargs = dict(PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
                           CARGO_CALLS=(root / 'calls').as_posix(), FAIL_CRATE=fail_crate,
@@ -88,6 +89,18 @@ fi
                     executions.append(call.split()[3])
         self.assertEqual(streamed, 1)
         self.assertEqual(sorted(executions), sorted(EXPECTED))
+
+    def test_recording_helpers_survive_windows_default_newlines(self):
+        original = Path.write_text
+
+        def windows_text(path, data, *args, **kwargs):
+            kwargs.setdefault('newline', '\r\n')
+            return original(path, data, *args, **kwargs)
+
+        with patch.object(Path, 'write_text', windows_text):
+            result, calls, _ = self.driver(1)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(calls[-1].startswith('test --no-fail-fast -p xtask'))
 
     def test_unsharded_keeps_workspace_compile_and_failures_collect(self):
         result, calls, summary = self.driver(fail_crate='haider-core')
