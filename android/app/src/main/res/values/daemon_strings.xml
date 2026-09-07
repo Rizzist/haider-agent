@@ -1,0 +1,24 @@
+<resources>
+    <string name="daemon_default_model" translatable="false">claude-opus-5</string>
+    <string name="daemon_channel_status">Haider running status</string>
+    <string name="daemon_channel_attention">Haider needs input</string>
+    <string name="daemon_channel_completion">Haider turn results</string>
+    <string name="daemon_notification_title">Haider</string>
+    <string name="daemon_status_ready">Ready on this device</string>
+    <string name="daemon_status_offline">Ready · Network unavailable</string>
+    <string name="daemon_status_starting">Starting on this device</string>
+    <string name="daemon_status_recovering">Recovering sessions</string>
+    <string name="daemon_status_restarting">Waiting to restart</string>
+    <string name="daemon_status_stopping">Stopping safely</string>
+    <string name="daemon_status_disabled">Stopped</string>
+    <string name="daemon_status_error">Needs attention · Open daemon status</string>
+    <string name="daemon_action_open">Open</string>
+    <string name="daemon_action_restart">Restart</string>
+    <string name="daemon_action_stop">Stop</string>
+    <string name="daemon_attention_title">Haider needs your input</string>
+    <string name="daemon_attention_body">Open the session to review the current request.</string>
+    <string name="daemon_completion_title">Haider session update</string>
+    <string name="daemon_completion_done">A turn finished. Open the session to review it.</string>
+    <string name="daemon_completion_failed">A turn failed. Open the session to review it.</string>
+    <string name="daemon_completion_cancelled">A turn was cancelled.</string>
+</resources>

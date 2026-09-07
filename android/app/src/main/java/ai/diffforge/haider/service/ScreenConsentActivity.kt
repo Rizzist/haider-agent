@@ -4,7 +4,6 @@ import android.app.Activity
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
-import ai.diffforge.haider.transport.CapabilityBus
 
 class ScreenConsentActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -23,7 +22,8 @@ class ScreenConsentActivity : Activity() {
                 ScreenCaptureService.projectionIntent(this, resultCode, data),
             )
         } else if (requestCode == REQUEST_CAPTURE) {
-            CapabilityBus.set("screenCapture", false)
+            // Consent Activity is in the UI process; release state in the capability process.
+            stopService(Intent(this, ScreenCaptureService::class.java))
         }
         finish()
     }
