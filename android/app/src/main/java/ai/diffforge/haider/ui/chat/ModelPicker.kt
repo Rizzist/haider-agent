@@ -3,6 +3,8 @@ package ai.diffforge.haider.ui.chat
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
+import ai.diffforge.haider.ui.theme.ForgeSize
+import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,6 +27,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material3.Icon
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -59,16 +62,16 @@ fun ModelPicker(
     ) {
         Column(
             modifier = Modifier
-                .padding(horizontal = 16.dp)
-                .widthIn(max = 640.dp)
+                .padding(horizontal = ForgeSpace.xl)
+                .widthIn(max = ForgeSize.sheetMax)
                 .fillMaxWidth()
                 .fillMaxHeight(0.86f)
                 .clip(ForgeShapes.card)
                 .background(colors.surfaceRaised)
-                .border(1.dp, colors.borderStrong, ForgeShapes.card),
+                .border(ForgeSize.hairline, colors.borderStrong, ForgeShapes.card),
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 10.dp, top = 12.dp, bottom = 10.dp),
+                modifier = Modifier.fillMaxWidth().padding(start = ForgeSpace.xl, end = ForgeSpace.md, top = ForgeSpace.lg, bottom = ForgeSpace.md),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
@@ -82,13 +85,13 @@ fun ModelPicker(
                     )
                 }
                 Box(
-                    modifier = Modifier.size(48.dp).clip(CircleShape).clickable(onClick = onDismiss),
+                    modifier = Modifier.size(ForgeSize.touch).clip(CircleShape).clickable(onClick = onDismiss),
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(Icons.Rounded.Close, contentDescription = "Close", tint = colors.textSoft)
                 }
             }
-            Box(Modifier.fillMaxWidth().background(colors.border).size(width = 1.dp, height = 1.dp))
+            Box(Modifier.fillMaxWidth().background(colors.border).size(width = ForgeSize.hairline, height = ForgeSize.hairline))
 
             val pendingSelection = pending
             when {
@@ -138,11 +141,11 @@ private fun CacheChangeConfirmation(
         is PendingSelection.Model -> "${selection.provider} / ${selection.model}"
         is PendingSelection.Effort -> selection.effort ?: "provider-default effort"
     }
-    Column(modifier = Modifier.fillMaxWidth().padding(22.dp)) {
+    Column(modifier = Modifier.fillMaxWidth().padding(ForgeSpace.xxl)) {
         Text("CONFIRM CACHE EPOCH", style = type.label, color = colors.amber)
-        Spacer(Modifier.size(8.dp))
+        Spacer(Modifier.size(ForgeSpace.md))
         Text("Switch to $target?", style = type.h4, color = colors.text)
-        Spacer(Modifier.size(7.dp))
+        Spacer(Modifier.size(ForgeSize.stateDot))
         Text(
             "This can invalidate stable prompt tokens and start a new context-cache epoch. " +
                 "The daemon will apply the change to the next turn.",
@@ -150,11 +153,11 @@ private fun CacheChangeConfirmation(
             color = colors.textMuted,
         )
         Row(
-            modifier = Modifier.fillMaxWidth().padding(top = 18.dp),
+            modifier = Modifier.fillMaxWidth().padding(top = ForgeSpace.xl),
             horizontalArrangement = Arrangement.End,
         ) {
             PickerAction("Cancel", colors.textSoft, onCancel)
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(ForgeSpace.md))
             PickerAction("Confirm change", colors.amber, onConfirm)
         }
     }
@@ -168,10 +171,10 @@ private fun PickerAction(label: String, color: Color, onClick: () -> Unit) {
         color = color,
         modifier = Modifier
             .clip(ForgeShapes.pill)
-            .border(1.dp, color.copy(alpha = 0.45f), ForgeShapes.pill)
+            .border(ForgeSize.hairline, color.copy(alpha = 0.45f), ForgeShapes.pill)
             .clickable(onClick = onClick)
-            .heightIn(min = 48.dp)
-            .padding(horizontal = 13.dp, vertical = 8.dp),
+            .minimumInteractiveComponentSize()
+            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
     )
 }
 
@@ -191,18 +194,18 @@ private fun CatalogList(
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 18.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = ForgeSpace.xl),
     ) {
         item {
             Text(
                 "EFFORT",
                 style = type.label,
                 color = colors.textMuted,
-                modifier = Modifier.padding(start = 18.dp, end = 18.dp, top = 15.dp, bottom = 7.dp),
+                modifier = Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, top = ForgeSpace.xl, bottom = ForgeSpace.sm),
             )
         }
         item {
-            Column(modifier = Modifier.padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Column(modifier = Modifier.padding(horizontal = ForgeSpace.lg), verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs)) {
                 SelectionRow(
                     title = "Provider default",
                     detail = selectedModel?.defaultEffort?.let { "Default: $it" },
@@ -224,7 +227,7 @@ private fun CatalogList(
                         "This model does not advertise an effort ladder.",
                         style = type.toolRow,
                         color = colors.textMuted,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        modifier = Modifier.padding(horizontal = ForgeSpace.md, vertical = ForgeSpace.xs),
                     )
                 }
             }
@@ -233,19 +236,19 @@ private fun CatalogList(
             item(key = "provider-${provider.id}") {
                 val available = provider.enabled && provider.availability == "available"
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 19.dp, bottom = 7.dp),
+                    modifier = Modifier.fillMaxWidth().padding(start = ForgeSpace.xl, end = ForgeSpace.xl, top = ForgeSpace.xl, bottom = ForgeSpace.sm),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     BrandMark(provider.id)
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(ForgeSpace.md))
                     Text(provider.id.uppercase(), style = type.label, color = colors.textSoft)
                     Spacer(Modifier.weight(1f))
                     Box(
-                        Modifier.size(6.dp).clip(CircleShape).background(
+                        Modifier.size(ForgeSize.stateDot).clip(CircleShape).background(
                             if (available) colors.green else colors.textMuted,
                         ),
                     )
-                    Spacer(Modifier.width(5.dp))
+                    Spacer(Modifier.width(ForgeSpace.xs))
                     Text(
                         if (available) "AVAILABLE" else provider.availability.uppercase(),
                         style = type.label,
@@ -257,7 +260,7 @@ private fun CatalogList(
                         reason,
                         style = type.toolRow,
                         color = colors.textMuted,
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp),
+                        modifier = Modifier.padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.xxs),
                     )
                 }
             }
@@ -271,7 +274,7 @@ private fun CatalogList(
                     enabled = available && !busy &&
                         !(config.current.provider == provider.id && config.current.model == model.id),
                     onClick = { onSelectModel(provider.id, model.id) },
-                    modifier = Modifier.padding(horizontal = 12.dp),
+                    modifier = Modifier.padding(horizontal = ForgeSpace.lg),
                 )
             }
         }
@@ -281,7 +284,7 @@ private fun CatalogList(
                     "Changing model or effort may start a new context-cache epoch.",
                 style = type.toolRow,
                 color = colors.textMuted,
-                modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp),
+                modifier = Modifier.padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.xl),
             )
         }
     }
@@ -304,8 +307,8 @@ private fun SelectionRow(
             .clip(ForgeShapes.cardTight)
             .background(if (selected) colors.surfaceSelected else Color.Transparent)
             .clickable(enabled = enabled, onClick = onClick)
-            .heightIn(min = 48.dp)
-            .padding(horizontal = 10.dp, vertical = 10.dp),
+            .minimumInteractiveComponentSize()
+            .padding(horizontal = ForgeSpace.md, vertical = ForgeSpace.md),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f)) {
@@ -317,7 +320,7 @@ private fun SelectionRow(
             detail?.let { Text(it, style = type.toolRow, color = colors.textMuted) }
         }
         if (selected) {
-            Icon(Icons.Rounded.Check, contentDescription = "Selected", tint = colors.accentSoft, modifier = Modifier.size(18.dp))
+            Icon(Icons.Rounded.Check, contentDescription = "Selected", tint = colors.accentSoft, modifier = Modifier.size(ForgeSize.iconSm))
         }
     }
 }
@@ -327,7 +330,7 @@ private fun CatalogNotice(message: String, action: String?, onAction: () -> Unit
     val colors = Forge.colors
     val type = Forge.type
     Column(
-        modifier = Modifier.fillMaxWidth().padding(24.dp),
+        modifier = Modifier.fillMaxWidth().padding(ForgeSpace.xxxl),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(message, style = type.chatBody, color = colors.textMuted)
@@ -337,12 +340,12 @@ private fun CatalogNotice(message: String, action: String?, onAction: () -> Unit
                 style = type.chip,
                 color = colors.accentSoft,
                 modifier = Modifier
-                    .padding(top = 14.dp)
+                    .padding(top = ForgeSpace.lg)
                     .clip(ForgeShapes.pill)
-                    .border(1.dp, colors.accentSoft.copy(alpha = 0.4f), ForgeShapes.pill)
+                    .border(ForgeSize.hairline, colors.accentSoft.copy(alpha = 0.4f), ForgeShapes.pill)
                     .clickable(onClick = onAction)
-                    .heightIn(min = 48.dp)
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                    .minimumInteractiveComponentSize()
+                    .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
             )
         }
     }

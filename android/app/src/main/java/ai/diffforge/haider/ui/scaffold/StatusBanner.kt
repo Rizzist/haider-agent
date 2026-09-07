@@ -1,0 +1,211 @@
+package ai.diffforge.haider.ui.scaffold
+
+import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.ForgeButton
+import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.state.BannerAction
+import ai.diffforge.haider.ui.state.BannerModel
+import ai.diffforge.haider.ui.state.BannerSeverity
+import ai.diffforge.haider.ui.state.BannerText
+import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeShapes
+import ai.diffforge.haider.ui.theme.ForgeSize
+import ai.diffforge.haider.ui.theme.ForgeSpace
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.NotificationsOff
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.QuestionAnswer
+import androidx.compose.material.icons.rounded.SystemUpdate
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.traversalIndex
+import ai.diffforge.haider.ui.components.ForgeIconButton
+
+/**
+ * One banner under the header, at most one instance visible, chosen by the
+ * severity ladder in [ai.diffforge.haider.ui.state.BannerResolver].
+ *
+ * Update messaging comes through here too: `UpdateBanner` now emits a
+ * [BannerModel] instead of drawing its own row, so there is one banner style in
+ * the app rather than two.
+ */
+@Composable
+fun StatusBanner(
+    model: BannerModel?,
+    onAction: (BannerAction) -> Unit,
+    onDismiss: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (model == null) return
+    val colors = Forge.colors
+    val type = Forge.type
+    val tint = when (model.severity) {
+        BannerSeverity.Error -> colors.red
+        BannerSeverity.Warning -> colors.amber
+        BannerSeverity.Accent -> colors.accent
+        BannerSeverity.Info -> colors.textMuted
+    }
+    Column(
+        modifier
+            .fillMaxWidth()
+            .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.md)
+            // Announced before the transcript when it appears (UI-SPEC 4.2).
+            .semantics {
+                liveRegion = LiveRegionMode.Polite
+                traversalIndex = -1f
+            },
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(ForgeShapes.card)
+                .background(colors.surfaceRaised)
+                .border(ForgeSize.hairline, tint.copy(alpha = 0.55f), ForgeShapes.card)
+                .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.lg),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
+        ) {
+            Icon(
+                icon(model),
+                contentDescription = null,
+                tint = tint,
+                modifier = Modifier.size(ForgeSize.icon),
+            )
+            Column(Modifier.weight(1f)) {
+                Text(resolve(model.title), style = type.banner, color = colors.text)
+                model.detail?.let {
+                    Text(resolve(it), style = type.toolRow, color = colors.textMuted)
+                }
+                if (model.secondaryAction != null && model.secondaryLabel != null) {
+                    Text(
+                        resolve(model.secondaryLabel),
+                        style = type.toolRow,
+                        color = colors.accent,
+                        modifier = Modifier
+                            .padding(top = ForgeSpace.xs)
+                            .clip(ForgeShapes.pill),
+                    )
+                }
+            }
+            if (model.action != null && model.actionLabel != null) {
+                ForgeButton(
+                    text = resolve(model.actionLabel),
+                    onClick = { onAction(model.action) },
+                    kind = if (model.filledAction) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
+                    // The one sanctioned sub-48 dp control height; every banner
+                    // action has a full-size equivalent in Settings (UI-SPEC 4.3).
+                    minHeight = ForgeSize.bannerAction,
+                )
+            }
+            if (model.dismissible) {
+                ForgeIconButton(
+                    onClick = { onDismiss(model.rank) },
+                    contentDescription = stringResource(R.string.cd_dismiss_banner),
+                ) {
+                    Icon(
+                        Icons.Rounded.Close,
+                        contentDescription = null,
+                        tint = colors.textMuted,
+                        modifier = Modifier.size(ForgeSize.iconSm),
+                    )
+                }
+            }
+        }
+        if (model.progress) {
+            LinearProgressIndicator(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(ForgeSize.progressLine),
+                color = tint,
+                trackColor = Color.Transparent,
+            )
+        }
+    }
+}
+
+@Composable
+private fun resolve(text: BannerText): String = when {
+    text.literal != null -> text.literal
+    text.resId != null && text.args.isEmpty() -> stringResource(text.resId)
+    text.resId != null -> stringResource(text.resId, *text.args.toTypedArray())
+    else -> ""
+}
+
+private fun icon(model: BannerModel) = when (model.rank) {
+    1 -> Icons.Rounded.PlayArrow
+    2 -> Icons.Rounded.PlayArrow
+    3 -> Icons.Rounded.QuestionAnswer
+    4 -> Icons.Rounded.NotificationsOff
+    5 -> Icons.Rounded.Bolt
+    6 -> Icons.Rounded.CloudOff
+    7 -> Icons.Rounded.SystemUpdate
+    else -> Icons.Rounded.ErrorOutline
+}
+
+/** The dismissal store: seven days, keyed by rank, reset by a state change. */
+class SharedPreferencesBannerDismissals(
+    private val preferences: android.content.SharedPreferences,
+) : ai.diffforge.haider.ui.state.BannerDismissals {
+    override fun snapshot(): Map<Int, Long> = preferences.all
+        .mapNotNull { (key, value) ->
+            val rank = key.removePrefix(PREFIX).toIntOrNull() ?: return@mapNotNull null
+            val at = value as? Long ?: return@mapNotNull null
+            rank to at
+        }
+        .toMap()
+
+    override fun dismiss(rank: Int, atMs: Long) {
+        preferences.edit().putLong("$PREFIX$rank", atMs).apply()
+    }
+
+    override fun clear(ranks: Set<Int>) {
+        if (ranks.isEmpty()) return
+        val editor = preferences.edit()
+        ranks.forEach { editor.remove("$PREFIX$it") }
+        editor.apply()
+    }
+
+    private companion object {
+        const val PREFIX = "banner_dismissed_"
+    }
+}
+
+/** In-memory dismissals, for previews and tests. */
+class InMemoryBannerDismissals : ai.diffforge.haider.ui.state.BannerDismissals {
+    private val entries = mutableMapOf<Int, Long>()
+    override fun snapshot(): Map<Int, Long> = entries.toMap()
+    override fun dismiss(rank: Int, atMs: Long) {
+        entries[rank] = atMs
+    }
+
+    override fun clear(ranks: Set<Int>) {
+        ranks.forEach(entries::remove)
+    }
+}
+
+/** Preferences file for banner dismissals. */
+const val BANNER_PREFERENCES = "haider_banners"

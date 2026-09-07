@@ -1,0 +1,249 @@
+package ai.diffforge.haider.ui.chat
+
+import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.ForgeButton
+import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.components.Skeleton
+import ai.diffforge.haider.ui.daemon.ProviderInventory
+import ai.diffforge.haider.ui.state.ModelNames
+import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeShapes
+import ai.diffforge.haider.ui.theme.ForgeSize
+import ai.diffforge.haider.ui.theme.ForgeSpace
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
+
+/** Which composer chip a picker sheet belongs to. */
+enum class PickerKind { Provider, Model, Effort }
+
+/**
+ * Provider / model / effort pickers for the composer bar, matching the desktop
+ * client's chips row (`SessionComposer.jsx` model + effort chips) but sized for
+ * a phone: each chip opens a sheet rather than an inline dropdown.
+ *
+ * Everything here reads `provider.list` through
+ * [ai.diffforge.haider.ui.daemon.ProviderInventory] and writes through the
+ * canonical session-selection calls on the facade. A provider whose
+ * availability is not `available` is shown with its reason and cannot be
+ * chosen — the inventory's own truth, not a guess.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SessionPickerSheet(
+    kind: PickerKind,
+    inventory: ProviderInventory,
+    currentProvider: String?,
+    currentModel: String?,
+    currentEffort: String?,
+    /**
+     * True only while a catalog request is still inside the 6 s deadline. Once
+     * it expires — or if nothing was ever requested — the sheet says so and
+     * offers Retry rather than spinning. First-run "Pick a model" sat on
+     * "Asking the daemon for its model catalog…" indefinitely.
+     */
+    pending: Boolean,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit,
+    onSelectProvider: (String) -> Unit,
+    onSelectModel: (provider: String, model: String) -> Unit,
+    onSelectEffort: (String?) -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+        containerColor = colors.surfaceRaised,
+        shape = ForgeShapes.sheet,
+    ) {
+        Column(
+            Modifier
+                .padding(start = ForgeSpace.xl, end = ForgeSpace.xl, bottom = ForgeSpace.xxxl)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+        ) {
+            Text(
+                stringResource(
+                    when (kind) {
+                        PickerKind.Provider -> R.string.picker_provider_title
+                        PickerKind.Model -> R.string.picker_model_title
+                        PickerKind.Effort -> R.string.picker_effort_title
+                    },
+                ),
+                style = type.h4,
+                color = colors.text,
+            )
+
+            when (kind) {
+                PickerKind.Provider -> {
+                    if (inventory.providers.isEmpty()) EmptyInventory(pending, onRetry)
+                    inventory.providers.forEach { option ->
+                        PickerRow(
+                            label = option.label,
+                            secondary = if (option.available) {
+                                option.defaultModel?.let { ModelNames.short(it) }
+                            } else {
+                                stringResource(
+                                    R.string.picker_unavailable,
+                                    option.label,
+                                    option.unavailableReason.orEmpty(),
+                                )
+                            },
+                            selected = option.id == currentProvider,
+                            enabled = option.available,
+                            onClick = { onSelectProvider(option.id); onDismiss() },
+                        )
+                    }
+                }
+
+                PickerKind.Model -> {
+                    if (inventory.providers.none { it.models.isNotEmpty() }) {
+                        EmptyInventory(pending, onRetry)
+                    }
+                    // Grouped by provider, as the desktop chip is.
+                    inventory.providers.forEach { option ->
+                        if (option.models.isEmpty()) return@forEach
+                        Text(
+                            option.label.uppercase(),
+                            style = type.drawerSection,
+                            color = colors.textMuted,
+                            modifier = Modifier.padding(top = ForgeSpace.md),
+                        )
+                        option.models.forEach { model ->
+                            PickerRow(
+                                label = ModelNames.short(model.id),
+                                secondary = model.id,
+                                selected = model.id == currentModel && option.id == currentProvider,
+                                enabled = option.available,
+                                onClick = { onSelectModel(option.id, model.id); onDismiss() },
+                            )
+                        }
+                    }
+                }
+
+                PickerKind.Effort -> {
+                    // Per *model*, not per provider: Opus allows medium and
+                    // high where Sonnet also allows low, and offering `low` for
+                    // Opus is offering something the catalog rejects.
+                    val efforts = inventory.effortsFor(currentProvider, currentModel)
+                    if (efforts.isEmpty()) EmptyInventory(pending, onRetry)
+                    efforts.forEach { effort ->
+                        PickerRow(
+                            label = effort,
+                            secondary = null,
+                            selected = effort == currentEffort,
+                            enabled = true,
+                            onClick = { onSelectEffort(effort); onDismiss() },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyInventory(pending: Boolean, onRetry: () -> Unit) {
+    val colors = Forge.colors
+    val type = Forge.type
+    if (pending) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+        ) {
+            Skeleton(width = ForgeSpace.huge * 3)
+            Text(
+                stringResource(R.string.picker_loading),
+                style = type.sessionMeta,
+                color = colors.textMuted,
+            )
+        }
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+        Text(stringResource(R.string.picker_empty), style = type.sessionMeta, color = colors.textMuted)
+        ForgeButton(
+            text = stringResource(R.string.action_retry),
+            onClick = onRetry,
+            kind = ForgeButtonKind.Ghost,
+        )
+    }
+}
+
+@Composable
+private fun PickerRow(
+    label: String,
+    secondary: String?,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = ForgeSize.touch)
+            .clip(ForgeShapes.row)
+            .clickable(enabled = enabled, onClick = onClick)
+            .alpha(if (enabled) 1f else 0.55f)
+            .padding(horizontal = ForgeSpace.lg)
+            .semantics {
+                contentDescription = label
+                role = Role.Button
+                this.selected = selected
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(label, style = type.button, color = if (selected) colors.accent else colors.text)
+            secondary?.let {
+                Text(
+                    it,
+                    style = type.numeric,
+                    color = colors.textMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        if (selected) {
+            Icon(
+                Icons.Rounded.Check,
+                contentDescription = null,
+                tint = colors.accent,
+                modifier = Modifier.size(ForgeSize.iconSm),
+            )
+        } else {
+            Box(Modifier.size(ForgeSize.iconSm))
+        }
+    }
+}

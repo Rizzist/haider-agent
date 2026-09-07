@@ -1,6 +1,8 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeSize
+import ai.diffforge.haider.ui.theme.ForgeSpace
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -42,7 +44,7 @@ internal fun MarkdownText(
     val type = Forge.type
     val blocks = remember(text) { parseMarkdownBlocks(text) }
     val rendered = if (blocks.isEmpty()) listOf(MarkdownBlock.Paragraph("")) else blocks
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
         rendered.forEachIndexed { index, block ->
             val last = index == rendered.lastIndex
             when (block) {
@@ -58,10 +60,10 @@ internal fun MarkdownText(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
-                        .clip(RoundedCornerShape(7.dp))
+                        .clip(ForgeShapes.quote)
                         .background(colors.bgDeep)
-                        .border(1.dp, colors.border, RoundedCornerShape(7.dp))
-                        .padding(10.dp),
+                        .border(ForgeSize.hairline, colors.border, ForgeShapes.quote)
+                        .padding(ForgeSpace.md),
                 )
                 is MarkdownBlock.Quote -> InlineMarkdownLine(
                     text = block.text,
@@ -72,7 +74,7 @@ internal fun MarkdownText(
                     modifier = Modifier
                         .fillMaxWidth()
                         .drawBehind {
-                            val stroke = 2.dp.toPx()
+                            val stroke = ForgeSpace.xxs.toPx()
                             drawLine(
                                 color = colors.ember.copy(alpha = 0.45f),
                                 start = Offset(stroke / 2f, 0f),
@@ -80,7 +82,7 @@ internal fun MarkdownText(
                                 strokeWidth = stroke,
                             )
                         }
-                        .padding(start = 12.dp, top = 3.dp, bottom = 3.dp),
+                        .padding(start = ForgeSpace.lg, top = ForgeSpace.xxs, bottom = ForgeSpace.xxs),
                 )
                 is MarkdownBlock.Heading -> InlineMarkdownLine(
                     text = block.text,
@@ -95,7 +97,7 @@ internal fun MarkdownText(
                     color = colors.chatText,
                     showCaret = showCaret && last,
                     caretAlpha = caretAlpha,
-                    modifier = Modifier.padding(start = 8.dp),
+                    modifier = Modifier.padding(start = ForgeSpace.md),
                 )
                 is MarkdownBlock.Table -> Text(
                     text = inlineMarkdown(
@@ -113,8 +115,8 @@ internal fun MarkdownText(
                         .horizontalScroll(rememberScrollState())
                         .clip(ForgeShapes.cardTight)
                         .background(colors.surface)
-                        .border(1.dp, colors.border, ForgeShapes.cardTight)
-                        .padding(9.dp),
+                        .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight)
+                        .padding(ForgeSpace.md),
                 )
                 is MarkdownBlock.Paragraph -> InlineMarkdownLine(
                     text = block.text,

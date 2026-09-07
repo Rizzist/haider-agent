@@ -1,16 +1,13 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.ForgeButton
+import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.components.motionEnabled
 import ai.diffforge.haider.ui.theme.ForgeShapes
-import android.os.PowerManager
-import android.os.Handler
-import android.os.Looper
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.database.ContentObserver
-import android.provider.Settings
+import ai.diffforge.haider.ui.theme.ForgeSize
+import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -45,9 +42,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.KeyboardArrowRight
 import androidx.compose.material3.Icon
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -62,19 +59,22 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.distinctUntilChanged
 import org.json.JSONArray
 import org.json.JSONObject
 
 @Composable
-fun Transcript(messages: List<Message>, modifier: Modifier = Modifier) {
+fun Transcript(
+    messages: List<Message>,
+    onRetry: () -> Unit = {},
+    modifier: Modifier = Modifier,
+) {
     val listState = rememberLazyListState()
     var stickToBottom by remember { mutableStateOf(true) }
-    val nearBottomPx = with(LocalDensity.current) { 60.dp.roundToPx() }
+    val nearBottomPx = with(LocalDensity.current) { (ForgeSpace.huge + ForgeSpace.huge).roundToPx() }
 
     LaunchedEffect(listState, nearBottomPx) {
         snapshotFlow {
@@ -102,15 +102,20 @@ fun Transcript(messages: List<Message>, modifier: Modifier = Modifier) {
     LazyColumn(
         state = listState,
         modifier = modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        contentPadding = PaddingValues(
+            start = ForgeSpace.xl,
+            end = ForgeSpace.xl,
+            top = ForgeSpace.xl,
+            bottom = ForgeSpace.xl,
+        ),
+        verticalArrangement = Arrangement.spacedBy(ForgeSpace.xl),
     ) {
         items(messages, key = { it.id }) { message ->
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                Box(modifier = Modifier.widthIn(max = 776.dp).fillMaxWidth()) {
+                Box(modifier = Modifier.widthIn(max = ForgeSize.readableMax).fillMaxWidth()) {
                     when (message.role) {
                         Role.User -> UserBubble(message)
-                        Role.Agent -> AgentTurn(message)
+                        Role.Agent -> AgentTurn(message, onRetry)
                     }
                 }
             }
@@ -128,10 +133,14 @@ private fun UserBubble(message: Message) {
             Box(
                 modifier = Modifier
                     .widthIn(max = maxBubbleWidth)
-                    .clip(USER_SHAPE)
-                    .background(colors.accent.copy(alpha = 0.12f))
-                    .border(1.dp, colors.accentSoft.copy(alpha = 0.28f), USER_SHAPE)
-                    .padding(horizontal = 13.dp, vertical = 9.dp),
+                    .clip(ForgeShapes.userBubble)
+                    .background(colors.accentWash)
+                    .border(
+                        ForgeSize.hairline,
+                        colors.accent.copy(alpha = 0.30f),
+                        ForgeShapes.userBubble,
+                    )
+                    .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
             ) {
                 Text(message.text, style = type.userBody, color = colors.chatText)
             }
@@ -140,17 +149,20 @@ private fun UserBubble(message: Message) {
 }
 
 @Composable
-private fun AgentTurn(message: Message) {
+private fun AgentTurn(message: Message, onRetry: () -> Unit) {
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-        BrandMark(message.provider, modifier = Modifier.padding(top = 2.dp))
-        Spacer(Modifier.width(10.dp))
+        BrandMark(message.provider, modifier = Modifier.padding(top = ForgeSpace.xxs))
+        Spacer(Modifier.width(ForgeSpace.md))
         Box(modifier = Modifier.weight(1f)) {
-            Column(modifier = Modifier.widthIn(max = 600.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Column(
+                modifier = Modifier.widthIn(max = ForgeSize.proseMax),
+                verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+            ) {
                 if (message.thinking.isNotEmpty()) ThinkingFold(message)
                 if (message.tools.isNotEmpty()) ToolCluster(message.id, message.tools, message.streaming)
                 if (message.text.isNotEmpty() || message.streaming) AssistantProse(message)
                 if (message.streaming && !message.status.isNullOrBlank()) LiveStatus(message.status)
-                message.error?.let { ErrorCard(it) }
+                message.error?.let { ErrorCard(it, message.errorRetryable, onRetry) }
             }
         }
     }
@@ -185,15 +197,15 @@ private fun ThinkingFold(message: Message) {
             modifier = Modifier
                 .clip(ForgeShapes.cardTight)
                 .clickable { expanded = !expanded }
-                .heightIn(min = 48.dp)
-                .padding(end = 8.dp),
+                .minimumInteractiveComponentSize()
+                .padding(end = ForgeSpace.md),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
                 if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.KeyboardArrowRight,
                 contentDescription = if (expanded) "Collapse thinking" else "Expand thinking",
                 tint = colors.ember,
-                modifier = Modifier.size(20.dp),
+                modifier = Modifier.size(ForgeSize.iconMd),
             )
             Text("Thinking", style = type.toolRow, color = colors.textMuted)
         }
@@ -203,9 +215,9 @@ private fun ThinkingFold(message: Message) {
                 style = type.thinking,
                 color = colors.textMuted,
                 modifier = Modifier
-                    .padding(start = 9.dp, top = 5.dp)
+                    .padding(start = ForgeSpace.md, top = ForgeSpace.xs)
                     .drawBehind {
-                        val stroke = 2.dp.toPx()
+                        val stroke = ForgeSpace.xxs.toPx()
                         drawLine(
                             color = colors.ember.copy(alpha = 0.45f),
                             start = Offset(stroke / 2f, 0f),
@@ -213,7 +225,7 @@ private fun ThinkingFold(message: Message) {
                             strokeWidth = stroke,
                         )
                     }
-                    .padding(start = 12.dp),
+                    .padding(start = ForgeSpace.lg),
             )
         }
     }
@@ -233,23 +245,23 @@ private fun ToolCluster(messageId: Long, tools: List<ToolCall>, streaming: Boole
             .fillMaxWidth()
             .clip(ForgeShapes.cardTight)
             .background(colors.surface)
-            .border(1.dp, colors.border, ForgeShapes.cardTight),
+            .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable { expanded = !expanded }
-                .heightIn(min = 48.dp)
-                .padding(horizontal = 10.dp, vertical = 9.dp),
+                .minimumInteractiveComponentSize()
+                .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
                 if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.KeyboardArrowRight,
                 contentDescription = if (expanded) "Collapse tool calls" else "Expand tool calls",
                 tint = colors.textMuted,
-                modifier = Modifier.size(18.dp),
+                modifier = Modifier.size(ForgeSize.iconSm),
             )
-            Spacer(Modifier.width(4.dp))
+            Spacer(Modifier.width(ForgeSpace.xs))
             Text(
                 if (tools.size == 1) "1 tool call" else "${tools.size} tool calls",
                 style = type.toolRow,
@@ -260,7 +272,7 @@ private fun ToolCluster(messageId: Long, tools: List<ToolCall>, streaming: Boole
         }
         if (expanded) {
             tools.forEachIndexed { index, tool ->
-                if (index > 0) Box(Modifier.fillMaxWidth().background(colors.border).size(width = 1.dp, height = 1.dp))
+                if (index > 0) Box(Modifier.fillMaxWidth().background(colors.border).size(width = ForgeSize.hairline, height = ForgeSize.hairline))
                 ToolRow(tool)
             }
         }
@@ -276,15 +288,15 @@ private fun ToolRow(tool: ToolCall) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(enabled = !tool.result.isNullOrBlank()) { detailOpen = !detailOpen }
-            .heightIn(min = 48.dp)
-            .padding(horizontal = 11.dp, vertical = 9.dp),
+            .minimumInteractiveComponentSize()
+            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(toolGlyph(tool.name), style = type.toolRow, color = colors.textMuted)
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(ForgeSpace.md))
             Text(tool.name, style = type.toolStrong, color = colors.textSoft, maxLines = 1)
             if (tool.summary.isNotBlank()) {
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(ForgeSpace.md))
                 Text(
                     tool.summary,
                     style = type.toolRow,
@@ -296,9 +308,9 @@ private fun ToolRow(tool: ToolCall) {
             } else {
                 Spacer(Modifier.weight(1f))
             }
-            Spacer(Modifier.width(8.dp))
-            Box(Modifier.size(6.dp).clip(CircleShape).background(toolStatusColor(tool.status)))
-            Spacer(Modifier.width(5.dp))
+            Spacer(Modifier.width(ForgeSpace.md))
+            Box(Modifier.size(ForgeSize.stateDot).clip(CircleShape).background(toolStatusColor(tool.status)))
+            Spacer(Modifier.width(ForgeSpace.xs))
             Text(tool.status.label.uppercase(), style = type.label, color = toolStatusColor(tool.status))
         }
         if (detailOpen && !tool.result.isNullOrBlank()) {
@@ -309,13 +321,13 @@ private fun ToolRow(tool: ToolCall) {
                 color = colors.chatText,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 220.dp)
+                    .heightIn(max = ForgeSize.toolResultMax)
                     .verticalScroll(rememberScrollState())
-                    .padding(top = 8.dp)
-                    .clip(RoundedCornerShape(6.dp))
+                    .padding(top = ForgeSpace.md)
+                    .clip(ForgeShapes.quote)
                     .background(colors.bgDeep)
-                    .border(1.dp, colors.border, RoundedCornerShape(6.dp))
-                    .padding(9.dp),
+                    .border(ForgeSize.hairline, colors.border, ForgeShapes.quote)
+                    .padding(ForgeSpace.md),
             )
         }
     }
@@ -327,8 +339,8 @@ private fun LiveStatus(status: String) {
     val type = Forge.type
     val alpha = if (motionEnabled()) pulsingStatusAlpha() else 1f
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(7.dp).clip(CircleShape).background(colors.amber.copy(alpha = alpha)))
-        Spacer(Modifier.width(8.dp))
+        Box(Modifier.size(ForgeSize.stateDot).clip(CircleShape).background(colors.amber.copy(alpha = alpha)))
+        Spacer(Modifier.width(ForgeSpace.md))
         Text(status, style = type.toolRow, color = colors.textMuted)
     }
 }
@@ -345,50 +357,7 @@ private fun pulsingStatusAlpha(): Float {
 }
 
 @Composable
-private fun motionEnabled(): Boolean {
-    val context = LocalContext.current
-    var enabled by remember(context) { mutableStateOf(readMotionEnabled(context)) }
-    DisposableEffect(context) {
-        val refresh = { enabled = readMotionEnabled(context) }
-        val powerReceiver = object : BroadcastReceiver() {
-            override fun onReceive(receiverContext: Context?, intent: Intent?) = refresh()
-        }
-        val animatorObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
-            override fun onChange(selfChange: Boolean) = refresh()
-        }
-        ContextCompat.registerReceiver(
-            context,
-            powerReceiver,
-            IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED),
-            ContextCompat.RECEIVER_NOT_EXPORTED,
-        )
-        context.contentResolver.registerContentObserver(
-            Settings.Global.getUriFor(Settings.Global.ANIMATOR_DURATION_SCALE),
-            false,
-            animatorObserver,
-        )
-        onDispose {
-            context.unregisterReceiver(powerReceiver)
-            context.contentResolver.unregisterContentObserver(animatorObserver)
-        }
-    }
-    return enabled
-}
-
-private fun readMotionEnabled(context: Context): Boolean {
-    val animatorScale = runCatching {
-        Settings.Global.getFloat(
-            context.contentResolver,
-            Settings.Global.ANIMATOR_DURATION_SCALE,
-            1f,
-        )
-    }.getOrDefault(1f)
-    val powerSaver = context.getSystemService(PowerManager::class.java)?.isPowerSaveMode == true
-    return animatorScale > 0f && !powerSaver
-}
-
-@Composable
-private fun ErrorCard(message: String) {
+private fun ErrorCard(message: String, retryable: Boolean, onRetry: () -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
     Column(
@@ -396,9 +365,9 @@ private fun ErrorCard(message: String) {
             .fillMaxWidth()
             .clip(ForgeShapes.cardTight)
             .background(colors.red.copy(alpha = 0.07f))
-            .border(1.dp, colors.red.copy(alpha = 0.4f), ForgeShapes.cardTight)
+            .border(ForgeSize.hairline, colors.red.copy(alpha = 0.4f), ForgeShapes.cardTight)
             .drawBehind {
-                val stroke = 3.dp.toPx()
+                val stroke = ForgeSize.rail.toPx()
                 drawLine(
                     color = colors.red,
                     start = Offset(stroke / 2f, 0f),
@@ -406,11 +375,20 @@ private fun ErrorCard(message: String) {
                     strokeWidth = stroke,
                 )
             }
-            .padding(start = 12.dp, end = 11.dp, top = 9.dp, bottom = 10.dp),
+            .padding(start = ForgeSpace.lg, end = ForgeSpace.lg, top = ForgeSpace.md, bottom = ForgeSpace.md),
     ) {
         Text("RUN FAILED", style = type.label, color = colors.red)
-        Spacer(Modifier.size(3.dp))
+        Spacer(Modifier.size(ForgeSpace.xxs))
         Text(message, style = type.userBody, color = colors.chatText)
+        // ChatReply.Error.retryable was parsed and thrown away in 970.
+        if (retryable) {
+            Spacer(Modifier.size(ForgeSpace.md))
+            ForgeButton(
+                text = stringResource(R.string.action_retry),
+                onClick = onRetry,
+                kind = ForgeButtonKind.Ghost,
+            )
+        }
     }
 }
 
@@ -432,10 +410,10 @@ fun BrandMark(provider: String?, modifier: Modifier = Modifier) {
     }
     Box(
         modifier = modifier
-            .size(22.dp)
+            .size(ForgeSize.avatar)
             .clip(CircleShape)
             .background(color.copy(alpha = 0.12f))
-            .border(1.dp, color.copy(alpha = 0.45f), CircleShape),
+            .border(ForgeSize.hairline, color.copy(alpha = 0.45f), CircleShape),
         contentAlignment = Alignment.Center,
     ) {
         Text(mark, style = Forge.type.label, color = color)
@@ -470,7 +448,7 @@ private fun ToolSummaryTags(tools: List<ToolCall>) {
         Triple(tools.count { it.status == ToolStatus.Cancelled }, "CANCELLED", colors.textMuted),
         Triple(tools.count { it.status == ToolStatus.Unknown }, "UNKNOWN", colors.textMuted),
     ).filter { it.first > 0 }
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm)) {
         tags.forEach { (count, label, color) ->
             Text("$count $label", style = type.label, color = color, maxLines = 1)
         }
@@ -499,9 +477,3 @@ private fun toolGlyph(name: String): String {
     }
 }
 
-private val USER_SHAPE = RoundedCornerShape(
-    topStart = 14.dp,
-    topEnd = 14.dp,
-    bottomStart = 14.dp,
-    bottomEnd = 5.dp,
-)

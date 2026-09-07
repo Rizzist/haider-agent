@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- Framework NoActionBar theme so the ComponentActivity hosts Compose with
-         no app bar. Colors mirror the Session Deck dark ground (#07090d) so the
-         splash-to-Compose handoff has no light flash. -->
-    <style name="Theme.Haider" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#07090d</item>
-        <item name="android:statusBarColor">#07090d</item>
-        <item name="android:navigationBarColor">#07090d</item>
-        <item name="android:windowLightStatusBar">false</item>
+         no app bar. The day variant paints the Session Deck light ground
+         (#f5f5f7); values-night paints the dark ground (#07090d). Before 971
+         this file hardcoded #07090d for both, so every light-theme cold start
+         flashed black (UI-SPEC trap 6.6.8). -->
+    <style name="Theme.Haider" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/forge_bg</item>
+        <item name="android:statusBarColor">@color/forge_bg</item>
+        <item name="android:navigationBarColor">@color/forge_bg</item>
+        <item name="android:windowLightStatusBar">true</item>
     </style>
 </resources>
