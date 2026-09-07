@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Network to reach the loopback daemon transport (APK-7). -->
+    <!-- Provider/web networking; daemon RPC itself uses app-private Unix sockets. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
@@ -49,6 +51,7 @@
 
         <service
             android:name=".service.HaiderAccessibilityService"
+            android:process=":daemon"
             android:exported="true"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
@@ -61,11 +64,13 @@
 
         <service
             android:name=".service.ScreenCaptureService"
+            android:process=":daemon"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
         <receiver
             android:name=".service.SmsReceiver"
+            android:process=":daemon"
             android:exported="true"
             android:permission="android.permission.BROADCAST_SMS">
             <intent-filter>
@@ -76,6 +81,48 @@
         <receiver
             android:name=".update.UpdateInstallReceiver"
             android:exported="false" />
+
+        <service
+            android:name=".daemon.HaiderDaemonService"
+            android:process=":daemon"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled on-device AI daemon that maintains local sessions, responds to user automation events, and notifies the user when a running session requires attention." />
+        </service>
+
+        <receiver
+            android:name=".daemon.DaemonRestartReceiver"
+            android:process=":daemon"
+            android:exported="false"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".service.CapabilityControlReceiver"
+            android:process=":daemon"
+            android:exported="false" />
+
+        <!-- Navigation hint only. Browser authorization results never enter this process. -->
+        <activity
+            android:name=".daemon.OAuthReturnActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="haider" android:host="oauth" android:path="/return" />
+            </intent-filter>
+        </activity>
 
     </application>
 </manifest>
