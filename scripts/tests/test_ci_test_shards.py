@@ -15,6 +15,10 @@ EXPECTED = {'haider-platform', 'haider-protocol', 'haider-accounts', 'haider-cor
             'haider-store', 'haider-tools', 'haider-client', 'haider-verify', 'haider-stt', 'xtask'}
 
 
+@unittest.skipUnless(
+    os.name == 'posix',
+    'POSIX Bash driver and executable shims; covered by xplat-check Linux check '
+    "leg's pipeline regression tests (Windows Python may resolve bash to WSL)")
 class ShardTests(unittest.TestCase):
     def command(self, *args, **overrides):
         env = dict(os.environ)
@@ -68,6 +72,7 @@ fi
             if index is not None:
                 kwargs.update(HAIDER_CI_SHARD_INDEX=str(index), HAIDER_CI_SHARD_TOTAL='3')
             result = self.command(**kwargs)
+            self.assertTrue((root / 'calls').exists(), result.stdout + result.stderr)
             calls = (root / 'calls').read_text().splitlines()
             summary = (root / 'logs/failure-summary.md').read_text()
             return result, calls, summary
@@ -90,7 +95,7 @@ fi
         self.assertEqual(streamed, 1)
         self.assertEqual(sorted(executions), sorted(EXPECTED))
 
-    def test_recording_helpers_survive_windows_default_newlines(self):
+    def test_recording_helpers_force_lf_newlines(self):
         original = Path.write_text
 
         def windows_text(path, data, *args, **kwargs):

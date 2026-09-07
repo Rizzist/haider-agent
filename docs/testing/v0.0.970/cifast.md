@@ -78,7 +78,11 @@ Artifact **`release-build-aarch64-apple-darwin-<full-sha>`**, retained 14 days,
 contains `release-build.tar.gz` and `manifest.json`. The archive includes `haider`,
 `haider-tui`, `haiderd`, their packed `.dSYM` companions, and
 `haider-symbol-archive` (needed by the unchanged native-ID symbol archive step),
-plus its `.dSYM` if emitted. A tar preserves executable modes inside Actions'
+plus its `.dSYM` if emitted. Cargo copies each bundle out of `deps/` but keeps
+the hashed DWARF basename inside it, for example
+`haider-tui.dSYM/Contents/Resources/DWARF/haider_tui-<hash>`. Preserve the entire
+bundle, including relocation files; do not rename its internal members or run
+`dsymutil` again on an already stripped executable. A tar preserves executable modes inside Actions'
 artifact ZIP. Manifest entries record SHA-256, byte size and normalized mode for
 every file. Identity includes the full candidate SHA, target, verbose rustc
 version and a profile fingerprint over the release profile, release override
@@ -86,6 +90,11 @@ env/Rust flags, Cargo.lock and repository Cargo config.
 
 Consumers validate identity, complete inventory, file sizes, modes and checksums
 in private staging before copying to `target/aarch64-apple-darwin/release`.
+Pack and restore also compare `xcrun dwarfdump --uuid` sets for each runtime
+executable and its whole dSYM bundle, matching the mechanism in
+`haider-symbol-archive`. Each runtime bundle requires `Info.plist` and a direct
+DWARF file, without assuming the file's basename. Restore checks UUIDs in staging
+before touching the destination.
 Traversal, links, duplicate archive entries and missing symbols are rejected.
 An existing but invalid artifact fails closed; it never silently falls back.
 The release evidence job resolves an unexpired artifact's run ID from a successful
@@ -147,6 +156,73 @@ Windows clipboard gate, native bundle tests and thin executable boundary checks
 run only in shard 1. The current deterministic partition also places haider-tui
 in shard 1, so its ordinary clipboard test and the explicit gate remain on that
 same shard. Failure artifact names include the shard number.
+
+The five `test_ci_test_shards.ShardTests` cases are POSIX-only: they execute the
+real Bash driver with executable shell shims and POSIX paths. Windows Python's
+bare `bash` lookup selected the WSL launcher in the first installer rehearsal,
+which has no installed distribution, so it never reached the driver or shim.
+The class-level `skipUnless(os.name == 'posix')` reason names the covering
+`xplat-check` Linux **check** leg's `pipeline regression tests (POSIX Bash driver)`
+step; macOS `ci` also runs these cases. This skips only the Python shell-driver
+harness on Windows; all three native Windows Rust test shards still execute
+`ci-test.sh` through Actions' configured Bash shell.
+
+The artifact test rejecting an unset POSIX execute bit is also POSIX-only,
+because Windows cannot write that bit. Its reason names the same Linux check
+leg. All other artifact tests and every evidence resolver test remain enabled
+on Windows Python 3.12: they invoke `sys.executable` and replace only external
+`rustc`/`xcrun`/`gh` transports inside the child process. The artifact fixture
+supplies execute bits only for its generated macOS payload on Windows; it does
+not alter production permission checks. The LF-newline driver case simulates
+CRLF defaults on POSIX and does not claim Windows runtime coverage.
+
+## First-execution repairs (970-cifast-fix)
+
+Base: `cec5a62d86423f671d1031f0701f6a4265bd417e`. Ship-gate run **34127778785**
+finished its thin-LTO build in 24m42s, then rejected the three hashed DWARF
+members because the packer demanded un-hashed names. The bundles and plist
+members were present. Windows installer rehearsal **34127927580** failed only
+the five shard harness cases (two assertions and three missing-call-file errors);
+the log's UTF-16 WSL error identifies the wrong Bash launcher. Neither failure
+is evidence of a Rust source defect.
+
+Local evidence is under
+`/Users/rizzist/Developer/haiderharness/state/evidence/970-cifast-fix/1-impl/`:
+
+- `cargo-symbol-layout.log` and `cargo-symbol-fixture/`: a zero-dependency Cargo
+  fixture with the repository release profile and an unchanged copy of the
+  actual symbol archiver, built with Rust 1.95.0, `--release --offline --target
+  aarch64-apple-darwin`, `CARGO_BUILD_JOBS=2`, and thin/16 plus fat/1 overrides.
+  Both produced hashed DWARF files and matching executable/bundle UUIDs. This
+  tiny fixture observes the real compiler layout; it is not a Haider runtime build.
+- `pre-fix-pack-python312.log`: the base packer rejects that actual thin build
+  with exactly the CI missing-member list. The first attempt, retained in
+  `pre-fix-pack.log`, instead failed because `env.sh` selected Python without
+  `tomllib`; all subsequent gates put the supplied Python 3.12 venv first.
+- `real-artifact-roundtrip.log`: fixed pack/restore passes for both actual
+  profiles, all restored bytes match, the three fixture executables run, line
+  tables remain present, and the restored original symbol archiver accepts all
+  three runtime bundles using the release workflow's invocation pattern.
+- `python-discovery.log`: Python **3.12.14**, full discovery with the supplied
+  `970-winiss/1-impl/native-payload`, **72 tests, zero skips, PASS** on macOS.
+  The tiny Python artifact fixture pins hashed names, hyphen-to-underscore
+  conversion, relocation preservation, missing DWARF rejection, UUID mismatch,
+  absent UUIDs and tool failures without compiling Rust.
+- `local-gates.json`, `yaml-parse.log`: `actionlint -shellcheck=`, changed workflow
+  YAML parsing, unsafe counts (**production=189, test=21**), release-evidence
+  regressions and whitespace validation passed. Candidate identity and the
+  separate Astra verdict are recorded alongside the lane evidence.
+
+Required CI confirmation remains with the release owner after local gates and
+integration: **`ship-gate` → `shared macOS release build (aarch64)`** on the next
+wave head must pack/upload successfully, and its client/daemon footprint jobs
+must restore that artifact. **`windows-installer-check` → `Additional installers
+(x86_64-pc-windows-msvc)` → `Packaging regression tests`** on `ci-winonly-*` must
+pass under native Windows Python 3.12, followed by the installer lifecycle steps.
+The new POSIX harness coverage runs in **`xplat-check` → Linux check → `pipeline
+regression tests (POSIX Bash driver)`**. macOS execution and source review do not
+claim these new native CI results, signing/notarization, or thin-LTO performance
+acceptance. This repair commits only on `lane-970-cifast-fix` and does not push.
 
 ## Registry #80 and proof before acceptance
 

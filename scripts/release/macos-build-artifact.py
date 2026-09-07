@@ -51,12 +51,36 @@ def identity(repo, sha):
 
 
 def required_members(names):
+    names = set(names)
     required = set(BINARIES)
     for binary in RUNTIME:
-        required.update((f"{binary}.dSYM/Contents/Info.plist",
-                         f"{binary}.dSYM/Contents/Resources/DWARF/{binary}"))
-    if not required <= set(names):
-        raise ValueError(f"missing release members: {sorted(required - set(names))}")
+        required.add(f"{binary}.dSYM/Contents/Info.plist")
+    if not required <= names:
+        raise ValueError(f"missing release members: {sorted(required - names)}")
+    for binary in RUNTIME:
+        # Cargo copies the bundle out of deps/ but retains rustc's hashed
+        # DWARF basename (e.g. haider_tui-<hash>), under both thin and fat LTO.
+        dwarf = PurePosixPath(f"{binary}.dSYM/Contents/Resources/DWARF")
+        if not any(PurePosixPath(name).parent == dwarf for name in names):
+            raise ValueError(f"missing DWARF member: {binary}.dSYM")
+
+
+def macho_uuids(path):
+    output = subprocess.check_output(["xcrun", "dwarfdump", "--uuid", str(path)], text=True)
+    identities = set(re.findall(
+        r"^UUID: ([0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}) ",
+        output, re.MULTILINE))
+    if not identities:
+        raise ValueError(f"dwarfdump did not report a Mach-O UUID: {path}")
+    return {identity.upper() for identity in identities}
+
+
+def verify_symbols(release_dir):
+    # Same mechanism as release.yml's haider-symbol-archive: compare the
+    # executable and whole bundle UUID sets, without guessing DWARF filenames.
+    for binary in RUNTIME:
+        if macho_uuids(release_dir / binary) != macho_uuids(release_dir / f"{binary}.dSYM"):
+            raise ValueError(f"Mach-O UUID mismatch: {binary}")
 
 
 def allowed_member(name):
@@ -82,6 +106,7 @@ def pack(release_dir, bundle, expected):
         if name in BINARIES and not path.stat().st_mode & 0o111:
             raise ValueError(f"non-executable release binary: {name}")
         manifest["files"][name] = {"sha256": digest(path), "size": path.stat().st_size, "mode": mode}
+    verify_symbols(release_dir)
     bundle.mkdir(parents=True, exist_ok=True)
     with tarfile.open(bundle / "release-build.tar.gz", "w:gz") as archive:
         for path, name in zip(files, names):
@@ -121,6 +146,7 @@ def restore(bundle, release_dir, expected):
                 if digest(destination) != record.get("sha256"):
                     raise ValueError(f"checksum mismatch: {name}")
                 destination.chmod(mode)
+        verify_symbols(stage)
         release_dir.mkdir(parents=True, exist_ok=True)
         for name in (*BINARIES, *(f"{binary}.dSYM" for binary in BINARIES)):
             source = stage / name
