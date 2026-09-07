@@ -82,3 +82,34 @@ class EvidenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# API contract tests for reusable-call artifacts: an artifact proves bytes,
+# never a completed ship-gate verdict.
+import importlib.util
+from unittest.mock import patch
+
+SPEC = importlib.util.spec_from_file_location('find_evidence', SCRIPT)
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+class ArtifactLookupTests(unittest.TestCase):
+    def test_present_missing_expired_and_wrong_name(self):
+        for artifact, expected in [({'name': 'build', 'expired': False}, True),
+                                   ({'name': 'build', 'expired': True}, False),
+                                   ({'name': 'other', 'expired': False}, False),
+                                   ({'name': 'build'}, False)]:
+            with patch.object(MODULE, 'api', side_effect=[
+                [{'id': 123, 'head_sha': SHA, 'status': 'in_progress'}],
+                [{'artifacts': []}, {'artifacts': [artifact]}],
+            ]):
+                self.assertEqual(MODULE.artifact_exists('owner/repo', '123', 'build', SHA), expected)
+
+    def test_wrong_sha_or_run_and_api_failure_rejected(self):
+        for response in [[{'id': 123, 'head_sha': 'f' * 40}], [{'id': 456, 'head_sha': SHA}], [{}]]:
+            with patch.object(MODULE, 'api', return_value=response):
+                with self.assertRaises(ValueError):
+                    MODULE.artifact_exists('owner/repo', '123', 'build', SHA)
+        with patch.object(MODULE, 'api', side_effect=subprocess.CalledProcessError(1, 'gh')):
+            with self.assertRaises(subprocess.CalledProcessError):
+                MODULE.artifact_exists('owner/repo', '123', 'build', SHA)

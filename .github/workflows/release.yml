@@ -21,13 +21,16 @@ jobs:
     outputs:
       satisfied: ${{ steps.lookup.outputs.satisfied }}
       run_id: ${{ steps.lookup.outputs.run_id }}
+      artifact_run_id: ${{ steps.lookup.outputs.artifact_run_id }}
     steps:
       - uses: actions/checkout@v4
       - name: find successful ship-gate on the exact candidate SHA (any ref)
         id: lookup
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA"
+        run: >-
+          python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA"
+          --artifact "release-build-aarch64-apple-darwin-$GITHUB_SHA"
 
   ship-gate-run:
     needs: ship-gate-evidence
@@ -93,8 +96,45 @@ jobs:
           } catch {
             Write-Warning "Could not apply Defender exclusions: $_. Build continues, just slower."
           }
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.target == 'aarch64-apple-darwin'
+        with:
+          shared-key: macos-release-aarch64
+      - name: locate shared macOS release artifact
+        if: matrix.target == 'aarch64-apple-darwin'
+        id: shared
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_RUN_ID: ${{ needs.ship-gate-evidence.outputs.artifact_run_id }}
+          GATE_REUSED: ${{ needs.ship-gate-evidence.outputs.satisfied }}
+        run: |
+          # A reusable workflow uploads into this caller's run. A reused verdict
+          # may outlive its artifact; only that absence permits local compilation.
+          if [ "$GATE_REUSED" != true ]; then ARTIFACT_RUN_ID="$GITHUB_RUN_ID"; fi
+          if [ -n "$ARTIFACT_RUN_ID" ]; then
+            python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA" \
+              --artifact "release-build-aarch64-apple-darwin-$GITHUB_SHA" \
+              --artifact-run-id "$ARTIFACT_RUN_ID"
+          fi
+      - uses: actions/download-artifact@v4
+        if: matrix.target == 'aarch64-apple-darwin' && steps.shared.outputs.artifact_run_id != ''
+        with:
+          name: release-build-aarch64-apple-darwin-${{ github.sha }}
+          path: release-build
+          run-id: ${{ steps.shared.outputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+      - name: verify and restore shared macOS release artifact
+        if: matrix.target == 'aarch64-apple-darwin' && steps.shared.outputs.artifact_run_id != ''
+        run: |
+          source scripts/release/macos-release-env.sh
+          python3 scripts/release/macos-build-artifact.py restore --sha "$GITHUB_SHA" --bundle release-build
+      - name: build (macOS, unless shared artifact is available)
+        if: runner.os == 'macOS' && steps.shared.outputs.artifact_run_id == ''
+        run: |
+          source scripts/release/macos-release-env.sh
+          cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target ${{ matrix.target }}
       - name: build
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         run: cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target ${{ matrix.target }}
       # WINDOWS ONLY: thin LTO across 16 codegen units instead of fat LTO in one.
       #

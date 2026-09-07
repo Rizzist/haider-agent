@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   # Static workflow name avoids sharing the caller's group when release.yml
@@ -35,6 +36,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVIDENCE_SHA: ${{ github.sha }}
         run: bash scripts/release/require-evidence.sh "$EVIDENCE_SHA"
+
+  build-macos-release:
+    needs: evidence
+    name: shared macOS release build (aarch64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        run: bash scripts/check-unsafe-counts.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-release-aarch64
+      - name: build unsigned release payload
+        run: |
+          source scripts/release/macos-release-env.sh
+          cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target aarch64-apple-darwin
+          python3 scripts/release/macos-build-artifact.py pack --sha "$GITHUB_SHA" --bundle release-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-build-aarch64-apple-darwin-${{ github.sha }}
+          path: release-build/
+          if-no-files-found: error
+          retention-days: 14
 
   behaviour:
     needs: evidence
@@ -76,15 +104,15 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-ship-render-release-profile
+          shared-key: macos-release-aarch64
       # Ledger row 17 is a shape gate: first and cached frames fit 33 ms at
       # 10k/50k/200k, with the curve flat in N. This job deliberately stays
       # --release; debug builds announce a timing SKIP.
       - name: virtual transcript shape (release — ledger row 17)
-        run: cargo test --release -p haider-tui --test tuivirt_shape_bench_tests --locked -- --nocapture
+        run: cargo test --release --target aarch64-apple-darwin -p haider-tui --test tuivirt_shape_bench_tests --locked -- --nocapture
 
   daemon-footprint:
-    needs: evidence
+    needs: build-macos-release
     name: daemon footprint budget (release profile)
     runs-on: macos-15
     steps:
@@ -98,18 +126,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-ship-daemon-footprint-release-profile
-      - name: build daemon and deterministic footprint driver
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-aarch64-apple-darwin-${{ github.sha }}
+          path: release-build
+      - name: verify and restore unsigned release payload
+        run: |
+          source scripts/release/macos-release-env.sh
+          python3 scripts/release/macos-build-artifact.py restore --sha "$GITHUB_SHA" --bundle release-build
+      - name: build deterministic footprint driver
         env:
           RUST_MIN_STACK: 8388608
           HAIDER_DISCOVERY_DISABLED: 1
           HAIDER_TEST_DEVICE_NAME: test-mac
         run: |
-          cargo build --release --locked -p haider-daemond
           cargo build --locked -p haider-client --example memdaemon_workload
       - name: enforce settled daemon footprint budgets
         run: >-
           python3 scripts/perf/daemon-footprint-budget.py
-          --daemon "$GITHUB_WORKSPACE/target/release/haiderd"
+          --daemon "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/haiderd"
           --driver "$GITHUB_WORKSPACE/target/debug/examples/memdaemon_workload"
           --output "$GITHUB_WORKSPACE/target/daemon-footprint/measurement.json"
           --artifacts-dir "$GITHUB_WORKSPACE/target/daemon-footprint/process-reports"
@@ -123,7 +158,7 @@ jobs:
           retention-days: 14
 
   client-footprint:
-    needs: evidence
+    needs: build-macos-release
     name: client footprint (settled macOS release)
     # Registry #80: typed run terminality is distinct from aggregate session
     # settlement. TODO(2026-09-02): after three consecutive green runs of this
@@ -145,14 +180,16 @@ jobs:
           shared-key: macos-ship-client-footprint-release-profile
       - name: footprint harness self-test
         run: python3 scripts/perf/client-footprint-budget.py --self-test
-      - name: build release client and daemon
-        env:
-          RUST_MIN_STACK: 8388608
-          HAIDER_DISCOVERY_DISABLED: 1
-          HAIDER_TEST_DEVICE_NAME: test-mac
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-aarch64-apple-darwin-${{ github.sha }}
+          path: release-build
+      - name: verify and restore unsigned release payload
         run: |
-          cargo build --release -p haider-cli -p haider-daemond -p haider-tui-exe --locked
-          test "$(stat -f %z target/release/haiderd)" -gt 10485760
+          source scripts/release/macos-release-env.sh
+          python3 scripts/release/macos-build-artifact.py restore --sha "$GITHUB_SHA" --bundle release-build
+      - name: require a full release daemon
+        run: test "$(stat -f %z target/aarch64-apple-darwin/release/haiderd)" -gt 10485760
       - name: calibrate and enforce settled client footprint budgets (N=5)
         run: |
           mkdir -p "$RUNNER_TEMP/client-footprint"
@@ -162,7 +199,7 @@ jobs:
             local output="$2"
             local budget="$3"
             if ! python3 scripts/perf/client-footprint-budget.py \
-              --haider target/release/haider \
+              --haider target/aarch64-apple-darwin/release/haider \
               --surface "$surface" \
               --output "$RUNNER_TEMP/client-footprint/$output" \
               --calibrate \
