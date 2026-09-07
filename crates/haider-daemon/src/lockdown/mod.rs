@@ -660,12 +660,11 @@ impl LockdownManager {
     ) -> Result<T, LockdownError> {
         let lock_path = self.root.join(QUOTA_LOCK_FILE);
         let lock = private_open(&lock_path, true)?;
-        lock.lock()
+        haider_platform::lock_file_exclusive(&lock)
             .map_err(|source| io_error("lock", &lock_path, source))?;
         cleanup_stale_temporaries(&self.root)?;
         let result = operation();
-        let unlocked = lock
-            .unlock()
+        let unlocked = haider_platform::unlock_file(&lock)
             .map_err(|source| io_error("unlock", &lock_path, source));
         match result {
             Err(error) => Err(error),

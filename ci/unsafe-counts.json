@@ -5,6 +5,10 @@
       "production": 0,
       "test": 0
     },
+    "haider-android": {
+      "production": 2,
+      "test": 0
+    },
     "haider-cli": {
       "production": 0,
       "test": 0

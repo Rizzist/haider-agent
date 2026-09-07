@@ -9,6 +9,7 @@ mod bounded_wait;
 #[cfg(windows)]
 mod console;
 mod directory;
+mod file_lock;
 pub mod fs;
 mod ipc;
 mod process;
@@ -30,6 +31,7 @@ pub use directory::{
     WorkspaceDirectory, WorkspaceDirectoryError, duplicate_workspace_directory,
     open_workspace_directory, open_workspace_file,
 };
+pub use file_lock::{lock_file_exclusive, try_lock_file_exclusive, unlock_file};
 #[cfg(windows)]
 pub use fs::replace_file_with_backup;
 pub use fs::{
