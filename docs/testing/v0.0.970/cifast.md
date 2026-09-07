@@ -200,3 +200,33 @@ both wall time and total usage. Do not advertise a measured speedup until CI.
 
 The macOS thin-LTO experiment's expected deltas and revert rule are recorded in
 the final commit below; it must remain independently revertible.
+
+### Final experiment: macOS thin LTO / 16 codegen units
+
+The final commit exports `CARGO_PROFILE_RELEASE_LTO=thin` and
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` in `macos-release-env.sh`. This affects
+only the shared arm64 macOS producer and the macOS release compile steps
+(arm64 fallback and Intel); manifest verification sources it to enforce identical
+settings. Windows keeps its existing overrides. Linux, Android, Cargo.toml,
+probe ladder and the render benchmark's release profile are unchanged. The
+render benchmark must still pass independently; it remains a fat-LTO control,
+not a measurement of the thin-LTO runtime binary. The footprint jobs measure the
+actual thin-LTO payload. Codesign/notarization/compat/package steps are unchanged.
+
+**Hypothesis, not a result:** thin LTO and 16 codegen units may reduce the supplied
+61–66 minute arm64 and ~70 minute Intel compilation times by **30–60%**, with a
+small binary-size increase. Plan for roughly **45–65 minutes** of pre-tag
+ship-gate work and **45–70 minutes** from tag to publish if those compile savings
+materialize. Render dependency reuse may be partial because its profile differs.
+Runner queues, cold caches, sibling builds and ci/xplat can dominate these ranges.
+Record the actual compile, measurement, signing and publish durations separately.
+
+Keep this commit only after both footprint gates (including advisory client
+samples) and render pass on CI, and **each** unsigned `haider`, `haider-tui` and
+`haiderd` size is strictly less than 1.10 times its corresponding fat-LTO size.
+Compare manifests from the fat parent and thin candidate with an identical
+`crates/` tree and Rust version; compare raw unsigned binaries, not compressed
+archives or signed files. Missing/failed measurements or growth at/above 10%
+means revert **this single final commit**, then revalidate the resulting exact
+candidate SHA. The optimization is an experiment awaiting that evidence, not an
+advisory waiver for a failed existing budget.
