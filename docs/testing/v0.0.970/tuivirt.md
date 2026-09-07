@@ -44,10 +44,9 @@ model construction is outside every timed interval and there are no sleeps.
 
 The worst observed frame is 0.257 ms, 99.2% below the 33 ms budget (99.2%
 headroom, above registry #79's 25% requirement). Every cached p95 is below
-0.15 ms and every first frame is below 0.26 ms. At this original measurement,
-the gate used a 20% ratio plus 1 ms for timer noise. The later `renderflake`
-repair uses cold-frame medians and a mechanism-derived first-frame ratio;
-see the current rule in [tuivirt-tests.md](tuivirt-tests.md#shape-gate--ledger-row-17-replacement-tuivirt_shape_bench_testsrs).
+0.15 ms and every first frame is below 0.26 ms. The gate's checked 20% rule
+includes its pre-existing 1 ms absolute allowance for sub-millisecond timer
+noise.
 
 The same test asserts that the first frame contains the actual final row and
 that setting the 64-bit scroll offset to its ceiling reaches `row 0` at every

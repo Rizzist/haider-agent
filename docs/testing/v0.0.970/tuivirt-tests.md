@@ -92,19 +92,8 @@ geometry`; they are not duplicated here.
 
 | behaviour | test | status |
 | --- | --- | --- |
-| First-frame median of five independent cold constructions after one discarded warm-up per size ≤ 33 ms; cached p95 (following AND mid-scroll) ≤ 33 ms at 10k / 50k / 200k rows. First medians use 1.65× + 1 ms flatness, cached p95 retains 1.20× + 1 ms, from 10k to 200k, `--release` only. One logged failure retries the whole comparison once; the same test proves the real tail opens first and row 0 remains reachable beyond 65,535 rows | `first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows` | always on; run `cargo test --release -p haider-tui --test tuivirt_shape_bench_tests --locked -- --nocapture` |
-| The gate's own arithmetic (both flatness ceilings, first boundary + 1 ns rejection, median and p95 picks) | `shape_gate_arithmetic_is_pinned` | always on |
-| Retry at most once, require one complete passing comparison, preserve all absolute and cached ceilings | `retry_requires_one_complete_passing_comparison` | always on; synthetic values are labeled separately in output |
-
-The first-frame ratio accounts for the actual all-agent fixture: fixed viewport
-formatting and a bounded cache are O(1) in transcript length, while the row lookup
-uses at most 14 versus 18 binary-search steps. `1.65 / (18/14) - 1 = 28.3%`
-headroom exceeds 25%. Replay and its O(N) allocator growth stay outside the timer;
-the full-size warm-up and medians reduce residual allocator/page/scheduler noise.
-Each timed first frame still starts with a fresh model and terminal. Cached probes
-use the last construction, with the original 60 samples per position. No samples
-from a failed attempt are mixed into its retry. All timing ceilings stay active
-on both attempts. Debug builds retain behavioral checks and explicitly skip timing.
+| First frame ≤ 33 ms and cached p95 (following AND mid-scroll) ≤ 33 ms at 10k / 50k / 200k rows, both flat within 20 % (+1 ms sub-millisecond jitter allowance) from 10k to 200k, `--release` only; the same test proves the real tail opens first and row 0 remains reachable beyond 65,535 rows | `first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows` | always on; run `cargo test --release -p haider-tui --test tuivirt_shape_bench_tests -- --nocapture` |
+| The gate's own arithmetic (1.2× + 1 ms flatness ceiling, percentile pick) | `shape_gate_arithmetic_is_pinned` | always on, green |
 
 The old row-17 cold-fill law is gone. Its legacy test now checks the same
 33 ms first-frame frame budget at 10k; the workflow ledger invokes the
