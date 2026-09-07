@@ -29,6 +29,28 @@ crates="haider-platform haider-protocol haider-accounts haider-core haider-pdf \
 haider-provider haider-daemon haider-daemond haider-rpc haider-tui haider-tui-exe haider-cli haider-compat \
 haider-store haider-tools haider-client haider-verify haider-stt xtask"
 
+# One-based shards partition the same explicit crate set by sorted name. Keep
+# the historical execution order and workspace compile on unsharded platforms.
+shard_index="${HAIDER_CI_SHARD_INDEX:-1}"
+shard_total="${HAIDER_CI_SHARD_TOTAL:-1}"
+if [[ ! "$shard_index" =~ ^[1-9][0-9]?$ || ! "$shard_total" =~ ^[1-9][0-9]?$ ]] ||
+   (( shard_index > shard_total )); then
+  echo "invalid HAIDER_CI_SHARD_INDEX/HAIDER_CI_SHARD_TOTAL" >&2
+  exit 2
+fi
+if (( shard_total > 1 )); then
+  crates=$(printf '%s\n' $crates | LC_ALL=C sort | awk -v shard="$shard_index" -v total="$shard_total" '(NR - 1) % total == shard - 1')
+  if [ -z "$crates" ]; then
+    echo "empty CI test shard" >&2
+    exit 2
+  fi
+fi
+case "${1:-}" in
+  --list-crates) printf '%s\n' $crates; exit 0 ;;
+  '') ;;
+  *) echo "usage: ci-test.sh [--list-crates]" >&2; exit 2 ;;
+esac
+
 log_dir="${HAIDER_CI_TEST_LOG_DIR:-target/ci-test-logs}"
 mkdir -p "$log_dir"
 : > "$log_dir/failure-summary.md"
@@ -145,9 +167,14 @@ echo "::endgroup::"
 # fails its crate in minutes with the crate named, instead of burning the
 # 6-hour job timeout with no attribution (the first Windows test run hung
 # for hours exactly this way).
-echo "::group::compile all test binaries"
+echo "::group::compile test binaries (shard $shard_index/$shard_total)"
 compile_log="$log_dir/compile.log"
-cargo test --workspace --no-run --locked 2>&1 | tee "$compile_log"
+compile_args=(--workspace)
+if (( shard_total > 1 )); then
+  compile_args=()
+  for crate in $crates; do compile_args+=(-p "$crate"); done
+fi
+cargo test "${compile_args[@]}" --no-run --locked 2>&1 | tee "$compile_log"
 compile_status=${PIPESTATUS[0]}
 if [ "$compile_status" -ne 0 ]; then
   echo "FAIL: compile all test binaries"
