@@ -105,16 +105,23 @@ class FakeDaemonService(
                 setSessions(populatedRoster())
                 _activeSessionId.value = "s-nav"
             }
+            // These two isolate their banner rank: a session asking for a human
+            // is rank 3 and would outrank them, which is correct behaviour but
+            // makes the scenario useless for exercising rank 4 or 6.
             FakeScenario.NotificationsDenied -> {
                 _status.value = running()
                 _environment.value = DaemonEnvironment(notificationsGranted = false)
-                setSessions(populatedRoster())
+                setSessions(populatedRoster().filter { it.needsInput == null })
                 _activeSessionId.value = "s-nav"
             }
             FakeScenario.NoNetwork -> {
                 _status.value = running()
                 _environment.value = DaemonEnvironment(network = NetworkState.Unavailable)
-                setSessions(populatedRoster())
+                setSessions(
+                    populatedRoster()
+                        .filter { it.needsInput == null }
+                        .map { it.copy(runId = null, state = SessionVisualState.Idle, runState = "idle") },
+                )
                 _activeSessionId.value = "s-nav"
             }
             FakeScenario.TurnRunning -> {

@@ -35,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -42,6 +43,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
+
+const val HAIDER_TOP_BAR_TAG = "haider_top_bar"
 
 /** What the header overflow can do. */
 enum class TopBarAction {
@@ -77,7 +80,7 @@ fun HaiderTopBar(
     val session = state.activeSession
     val subtitle = subtitle(state, session)
 
-    Column(modifier) {
+    Column(modifier.testTag(HAIDER_TOP_BAR_TAG)) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()

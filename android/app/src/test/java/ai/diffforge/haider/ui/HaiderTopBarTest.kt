@@ -2,10 +2,17 @@ package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.scaffold.HAIDER_TOP_BAR_TAG
+import ai.diffforge.haider.ui.theme.ForgeSize
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -28,17 +35,27 @@ class HaiderTopBarTest {
     val rule = createAndroidComposeRule<MainActivity>()
 
     @Test
-    fun `the header carries exactly two controls`() {
+    fun `the header carries exactly two button controls, both 48 dp`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         rule.setHaiderApp(service)
 
-        // Everything clickable above the banner: the drawer button and the
-        // overflow. The title block is a target too, but it is not a Button
-        // role — it opens the session sheet.
-        rule.onNodeWithContentDescription("Open sessions, 1 session needs input").assertIsDisplayed()
-        rule.onNodeWithContentDescription("More options").assertIsDisplayed()
+        val minPx = with(rule.density) { ForgeSize.touch.toPx() }
+        // Counted inside the bar itself: the closed drawer is composed at the
+        // same coordinates and its collapse button is not on the header.
+        val bar = rule.onNodeWithTag(HAIDER_TOP_BAR_TAG).fetchSemanticsNode()
+        val buttons = buttonsUnder(bar)
+
+        // One drawer button, one overflow. The title block is a target too, but
+        // it is not a Button — it opens the session sheet.
+        assertEquals(
+            buttons.map { it.config.getOrNull(SemanticsProperties.ContentDescription)?.first() }
+                .toString(),
+            2,
+            buttons.size,
+        )
+        assertTrue(buttons.all { it.size.width >= minPx && it.size.height >= minPx })
         // The 970 status pill is gone from the bar entirely.
-        rule.onAllNodesWithTextSafe("connected").let { assertEquals(0, it) }
+        assertEquals(0, rule.onAllNodesWithTextSafe("connected"))
     }
 
     @Test
@@ -85,6 +102,14 @@ class HaiderTopBarTest {
         rule.onNodeWithContentDescription("Close sessions").assertIsDisplayed()
         assertTrue(true)
     }
+}
+
+/** Every Button-role node in one subtree. */
+internal fun buttonsUnder(
+    node: androidx.compose.ui.semantics.SemanticsNode,
+): List<androidx.compose.ui.semantics.SemanticsNode> = buildList {
+    if (node.config.getOrNull(SemanticsProperties.Role) == Role.Button) add(node)
+    node.children.forEach { addAll(buttonsUnder(it)) }
 }
 
 /** Counts matching text nodes without failing when there are none. */

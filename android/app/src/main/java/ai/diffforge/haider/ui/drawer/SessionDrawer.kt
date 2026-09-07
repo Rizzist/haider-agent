@@ -130,7 +130,11 @@ fun SessionDrawer(
         snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }
             .distinctUntilChanged()
             .collect { lastVisible ->
-                val total = listState.layoutInfo.totalItemsCount
+                val layout = listState.layoutInfo
+                val total = layout.totalItemsCount
+                // A closed drawer has no visible items, and "0 >= 0 - 8" would
+                // otherwise page the whole roster in while nobody is looking.
+                if (layout.visibleItemsInfo.isEmpty() || total == 0) return@collect
                 if (state.paging.hasMore && !state.paging.loading && lastVisible >= total - PAGE_TRIGGER) {
                     onLoadMore()
                 }
