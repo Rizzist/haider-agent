@@ -2,6 +2,7 @@
 //! Android consumes these Rust-produced presentation payloads directly as test resources.
 //! Regenerate with UPDATE_ANDROID_GOLDEN=1 cargo test -p haider-rpc --test android_projection_golden_tests.
 
+use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::{DeliveryMode, EventPayload};
 
@@ -27,6 +28,17 @@ fn android_display_payloads_match_rust_serialization() {
             item_id: haider_protocol::ids::ItemId::new("answer-1"),
             item: TurnItem::AgentMessage {
                 text: "Found your conversation".into(),
+            },
+        }),
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("plan-1"),
+            item: TurnItem::Plan {
+                items: vec![TodoItem {
+                    id: 1,
+                    text: "Visible plan must not vanish from coverage".into(),
+                    state: TodoState::Listed,
+                    dep: None,
+                }],
             },
         }),
     ];

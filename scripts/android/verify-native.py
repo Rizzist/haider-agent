@@ -14,6 +14,8 @@ MACHINES = {'arm64-v8a': 183, 'x86_64': 62}
 JNI = {'Java_ai_diffforge_haider_daemon_NativeDaemon_' + name for name in
        ('nativeVersion', 'nativeInit', 'nativeStart', 'nativeObserve', 'nativeShutdown', 'nativeRelease')}
 NEEDED = {'libc.so', 'libm.so', 'libdl.so', 'liblog.so', 'libandroid.so'}
+# Compose's graphics-path dependency ships this library for each filtered ABI.
+PACKAGED_LIBRARIES = {'libhaider.so', 'libandroidx.graphics.path.so'}
 
 
 class InvalidNative(ValueError):
@@ -31,7 +33,7 @@ def cstring(data, offset):
     return data[offset:end].decode('utf-8')
 
 
-def inspect_elf(data, abi, version):
+def inspect_elf(data, abi, version=None):
     require(len(data) >= 64 and data[:7] == b'\x7fELF\x02\x01\x01', 'expected ELF64 little endian')
     kind, machine = struct.unpack_from('<HH', data, 16)
     require(kind == 3, 'expected ET_DYN')
@@ -63,6 +65,8 @@ def inspect_elf(data, abi, version):
             require(header[4] + header[5] <= len(data), 'truncated ELF section')
             sections[name] = data[header[4]:header[4] + header[5]]
     require('.debug_info' not in sections, 'unstripped debug data in APK library')
+    if version is None:
+        return {}
     require('.haider.build' in sections, 'missing same-build provenance section')
     metadata = json.loads(sections['.haider.build'])
     require(metadata.get('format') == 1 and metadata.get('daemon_version') == version, 'embedded version mismatch')
@@ -78,6 +82,8 @@ def verify_so(path, abi, version, readelf):
         return subprocess.check_output([readelf, *args, str(path)], text=True)
     needed = set(re.findall(r'\(NEEDED\).*?\[([^]]+)\]', read('-dW')))
     require('libc.so' in needed and needed <= NEEDED, f'unexpected DT_NEEDED: {sorted(needed - NEEDED)}')
+    if version is None:
+        return dict(abi=abi, needed=sorted(needed))
     exported = set()
     for line in read('--dyn-syms', '--wide').splitlines():
         fields = line.split()
@@ -92,23 +98,27 @@ def verify_so(path, abi, version, readelf):
 
 def verify_apk(path, abi, version, readelf, zipalign, aapt2):
     badging = subprocess.check_output([aapt2, 'dump', 'badging', str(path)], text=True)
-    require(re.search(r"versionName='([^']+)'", badging).group(1) == version, 'APK version mismatch')
+    apk_version = re.search(r"versionName='([^']+)'", badging)
+    require(apk_version is not None and apk_version[1] == version, 'APK version mismatch')
     with zipfile.ZipFile(path) as archive:
         names = [info.filename for info in archive.infolist() if info.filename.startswith('lib/') and not info.is_dir()]
-        require(names == [f'lib/{abi}/libhaider.so'], f'wrong APK native contents: {names}')
-        info = archive.getinfo(names[0])
-        require(info.compress_type == zipfile.ZIP_STORED, 'native library is compressed')
-        with path.open('rb') as raw:
-            raw.seek(info.header_offset)
-            header = raw.read(30)
-            name_length, extra_length = struct.unpack_from('<HH', header, 26)
-            require((info.header_offset + 30 + name_length + extra_length) % 16384 == 0, 'APK native entry not 16 KiB aligned')
+        expected = {f'lib/{abi}/{name}' for name in PACKAGED_LIBRARIES}
+        require(len(names) == len(expected) and set(names) == expected, f'wrong APK native contents: {names}')
+        libraries = {}
         with tempfile.TemporaryDirectory() as temp:
-            so = Path(temp) / 'libhaider.so'
-            so.write_bytes(archive.read(info))
-            result = verify_so(so, abi, version, readelf)
+            for name in names:
+                info = archive.getinfo(name)
+                require(info.compress_type == zipfile.ZIP_STORED, f'native library is compressed: {name}')
+                with path.open('rb') as raw:
+                    raw.seek(info.header_offset)
+                    header = raw.read(30)
+                    name_length, extra_length = struct.unpack_from('<HH', header, 26)
+                    require((info.header_offset + 30 + name_length + extra_length) % 16384 == 0, f'APK native entry not 16 KiB aligned: {name}')
+                so = Path(temp) / Path(name).name
+                so.write_bytes(archive.read(info))
+                libraries[so.name] = verify_so(so, abi, version if so.name == 'libhaider.so' else None, readelf)
     subprocess.run([zipalign, '-c', '-P', '16', '-v', '4', str(path)], check=True, stdout=subprocess.DEVNULL)
-    return result
+    return dict(abi=abi, version=version, libraries=libraries)
 
 
 def main():

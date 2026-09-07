@@ -28,6 +28,7 @@ class OAuthStatus internal constructor(val status: String, val oauthReference: S
 /** Same client as the session UI: account/OAuth operations consume no additional socket. */
 class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) : AccountsDataSource, Closeable {
     private val refreshMutex = Mutex()
+    private var watchedEpoch: Long? = null
     private val _providers = MutableStateFlow<List<ProviderDescriptor>>(emptyList())
     private val _snapshot = MutableStateFlow(AccountsSnapshot(null, emptyList()))
     private val _error = MutableStateFlow<String?>(null)
@@ -42,8 +43,11 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
     override suspend fun refresh() = refreshMutex.withLock {
         try {
             val epoch = client.connectionEpoch
-            val watch = client.request(RpcMethods.watchAccounts(), epoch)
-            if (watch["accepted"] != JsonPrimitive(true)) throw RpcProtocolException("watch_rejected")
+            if (watchedEpoch != epoch) {
+                val watch = client.request(RpcMethods.watchAccounts(), epoch)
+                if (watch["accepted"] != JsonPrimitive(true)) throw RpcProtocolException("watch_rejected")
+                watchedEpoch = epoch
+            }
             val providers = client.request(RpcMethods.providers(), epoch)
             val accounts = client.request(RpcMethods.accounts(), epoch)
             checkAvailability(providers)

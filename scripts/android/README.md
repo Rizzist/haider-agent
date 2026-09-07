@@ -33,7 +33,9 @@ JNI test compares the actual native version with the APK version.
 `verify-native.py --so ... --abi arm64-v8a --version ... --readelf ...` checks ELF type,
 machine, LOAD alignment, RELRO, dependencies, JNI exports, build ID and provenance. Its
 `--apk` form also needs `--aapt2`/`--zipalign`, and verifies the APK version, exact single-ABI
-contents, uncompressed native entry and 16 KiB ZIP alignment. Release signing names and
+contents (`libhaider.so` and Compose’s `libandroidx.graphics.path.so`), uncompressed native
+entries and 16 KiB ZIP alignment. Both libraries undergo ELF/DT_NEEDED checks; Haider alone
+requires the embedded provenance and six JNI exports. Release signing names and
 v2/v3 verification remain in `android-apk.yml`; native symbols are a separate artifact.
 
 ## RPC integration boundaries
@@ -44,11 +46,15 @@ v2/v3 verification remain in `android-apk.yml`; native symbols are a separate ar
 - `SessionRosterRepository : SessionRoster` eagerly follows all pages, buffers the initial watch,
   applies complete SessionSummary replacements, and retains a read-only offline roster.
   The UI's lazy `loadMoreSessions` fake should adapt to the already fetched roster.
+  Account and roster watches register once per connection epoch; later refreshes reuse them.
+  An RPC deadline closes that connection and surfaces an IO failure, preserving background recovery.
 - `TranscriptRepository` attaches from the persisted applied cursor and reattaches gaps/lagged
   streams. `indexAll` covers all roster heads with single-envelope `session.read` ranges because
   wire v1 does not expose a typed oversized-page retry response. Unsupported visible payloads
   and oversized envelopes retain an explicit partial result. The display cache keeps allowed
   presentation fields; credentials, menu secret answers and account responses are never stored.
+  Projection v2 rebuilds old cursors that may have discarded unknown item variants. Stale
+  attachment IDs are ignored and a roster head rollback resets the affected replay cache.
 - UI `DaemonService` lifecycle/status remains lane 2's Binder facade; this package does not
   introduce another incompatible `DaemonService`. Bind session actions through `RpcMethods`,
   keeping worker/run/menu coordinates from one snapshot and command IDs across response-loss retries.
@@ -72,8 +78,10 @@ UPDATE_ANDROID_GOLDEN=1 cargo test -p haider-rpc --test android_projection_golde
 
 ## Advisory device tiers
 
-`emulator-gate.py --apks DIR --tier pr|nightly|16k --evidence DIR [--serial DEVICE]` installs
-exactly one debug app and its instrumentation APK, exercises real filesystem LocalSocket/JNI,
+`emulator-gate.py --apks DIR --tier pr|nightly|16k --evidence DIR --serial emulator-N --owned-emulator` installs
+exactly one debug app and its instrumentation APK. The caller must own that disposable emulator.
+Local APK package validation precedes every ADB call. Cleanup only stops an app installed by
+this invocation and restores Doze only when this invocation forced it. The tier exercises real filesystem LocalSocket/JNI,
 and requires the integrated deterministic fake-provider/Binder test. Missing service or fake
 provider is a failure. The nightly tier actually reboots and enters Doze; the 16k tier requires
 `getconf PAGE_SIZE == 16384`. Screenshot/layout evidence must then be visually inspected by Astra.

@@ -26,8 +26,8 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
         when (frame.string("kind")) {
             "event" -> {
                 val session = frame.string("session_id")
-                // Events can arrive immediately after the attach response, before the awaiting caller resumes.
-                if (synchronized(lock) { wanted.containsKey(session) }) {
+                // Registration runs on the reader before any following push is delivered.
+                if (synchronized(lock) { attachments[frame.string("attachment_id")]?.session == session && wanted.containsKey(session) }) {
                     try { if (cache.apply(session, frame.objectAt("envelope"))) _revision.value++ }
                     catch (_: ReplayGap) { recover(session) }
                 }
@@ -89,6 +89,7 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
         try {
             val epoch = client.connectionEpoch
             for (row in rows) {
+                if (cache.lastApplied(row.sessionId) > row.headSeq) cache.reset(row.sessionId)
                 val pageSize = 1L
                 while (cache.lastApplied(row.sessionId) < row.headSeq) {
                     val start = cache.lastApplied(row.sessionId) + 1

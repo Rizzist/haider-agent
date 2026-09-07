@@ -225,7 +225,7 @@ jobs:
           cores: 2
           ram-size: 2048M
           disable-animations: true
-          script: python3 scripts/android/emulator-gate.py --apks emulator-apks --tier pr --evidence emulator-evidence
+          script: python3 scripts/android/emulator-gate.py --serial emulator-5554 --owned-emulator --apks emulator-apks --tier pr --evidence emulator-evidence
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -267,7 +267,7 @@ jobs:
           cores: 2
           ram-size: 2048M
           disable-animations: true
-          script: python3 scripts/android/emulator-gate.py --apks emulator-apks --tier ${{ matrix.tier }} --evidence emulator-evidence
+          script: python3 scripts/android/emulator-gate.py --serial emulator-5554 --owned-emulator --apks emulator-apks --tier ${{ matrix.tier }} --evidence emulator-evidence
       - uses: actions/upload-artifact@v4
         if: always()
         with:

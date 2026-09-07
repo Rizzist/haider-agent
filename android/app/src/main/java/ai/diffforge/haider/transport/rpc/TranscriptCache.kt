@@ -70,7 +70,9 @@ class TranscriptCache(private val directory: File) {
     }
     private fun file(session: String): File {
         val hash = MessageDigest.getInstance("SHA-256").digest(session.toByteArray()).joinToString("") { "%02x".format(it) }
-        return File(directory, "$hash.replay-v1.jsonl")
+        // v1 discarded unknown item variants without recording incomplete coverage. A new
+        // projection must replay from zero instead of trusting those persisted cursors.
+        return File(directory, "$hash.replay-v2.jsonl")
     }
     private fun atomic(file: File, contents: String) {
         val temp = File.createTempFile("cache-", ".tmp", directory)
@@ -95,12 +97,15 @@ class TranscriptCache(private val directory: File) {
                         "agent_message", "incomplete_agent_message" -> obj("item" to kind, "text" to item.optionalString("text"))
                         "reasoning" -> obj("item" to kind, "summary" to item.optionalString("summary"))
                         "refusal" -> obj("item" to kind, "reason" to item.optionalString("reason"))
-                        "tool_call" -> obj("item" to kind, "name" to item.optionalString("name"), "status" to item.optionalString("status"))
+                        // Tool arguments and other structured items need a separately reviewed
+                        // display projection. Dropping their content must keep coverage partial.
                         else -> null
                     }
                     val safeDelta = delta?.takeIf { it.optionalString("delta") in setOf("text", "reasoning") }
                         ?.let { obj("delta" to it.string("delta"), "text" to it.optionalString("text")) }
-                    obj("type" to "item", "event" to payload.optionalString("event"), "item_id" to payload.optionalString("item_id"),
+                    if ((item != null && value == null) || (delta != null && safeDelta == null) || (value == null && safeDelta == null))
+                        obj("type" to "unrendered")
+                    else obj("type" to "item", "event" to payload.optionalString("event"), "item_id" to payload.optionalString("item_id"),
                         "item" to value, "delta" to safeDelta)
                 }
                 else -> obj("type" to "unrendered")

@@ -61,7 +61,7 @@ class RpcClientTest {
             assertEquals("accounts_changed", withTimeout(1000) { push.await() }.string("kind"))
             try { client.menuAnswer(RpcMethods.menu("command", MenuCoordinate(SessionCoordinate("s", 1), "m", 1, "ok", 0))); fail() }
             catch (error: RpcRemoteException) { assertEquals("already_resolved", error.code); assertFalse(error.toString().contains("sensitive")) }
-            try { client.request(RpcMethods.accounts()); fail() } catch (_: TimeoutCancellationException) { } catch (_: IOException) { }
+            try { client.request(RpcMethods.accounts()); fail() } catch (_: IOException) { }
             server.join()
         } finally { subscription.close(); client.close(); scope.cancel() }
     }
@@ -77,10 +77,50 @@ class RpcClientTest {
             try {
                 client.request(obj("method" to "session.rename", "title" to "x".repeat(500_000)))
                 fail("unread pipe must block until closed")
-            } catch (_: TimeoutCancellationException) { } catch (_: IOException) { }
+            } catch (_: IOException) { }
             assertTrue("blocking stream deadline must close the socket", (System.nanoTime() - start) / 1_000_000 < 2500)
             assertEquals(RpcConnectionState.DISCONNECTED, client.state.value)
         } finally { client.close(); server.cancel(); scope.cancel() }
+    }
+
+    @Test fun callerDeadlineRemainsCancellation() = runBlocking<Unit> {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val peer = Peer()
+        val client = RpcClient(scope, { peer }, 5000)
+        val server = scope.launch { peer.handshake(); delay(10_000) }
+        try {
+            client.connect(target)
+            try { withTimeout(100) { client.request(RpcMethods.accounts()) }; fail() }
+            catch (_: TimeoutCancellationException) { }
+            assertEquals(RpcConnectionState.DISCONNECTED, client.state.value)
+        } finally { client.close(); server.cancel(); scope.cancel() }
+    }
+
+    @Test fun transcriptIgnoresStaleAttachmentBeforeImmediateCurrentEvent() = runBlocking<Unit> {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val peer = Peer()
+        val client = RpcClient(scope, { peer })
+        val dir = Files.createTempDirectory("attachment-correlation").toFile()
+        val repository = TranscriptRepository(client, scope, TranscriptCache(dir))
+        val frames = javaClass.classLoader!!.getResourceAsStream("wire_transcript.json")!!.bufferedReader().use {
+            wireJson.parseToJsonElement(it.readText()).jsonArray.map { row -> RpcWire.parse(row.jsonObject.string("ws_body")) }
+        }
+        val event = frames.first { it.string("kind") == "event" }
+        val server = scope.launch(Dispatchers.IO) {
+            peer.handshake()
+            val attach = peer.receive()
+            peer.reply(attach, obj("method" to "session.attach", "attachment_id" to "current", "attach_state" to obj("session_id" to "session-1")))
+            for (id in listOf("stale", "current")) RpcWire.write(peer.send, JsonObject(event + mapOf(
+                "attachment_id" to JsonPrimitive(id), "envelope" to JsonObject(event.objectAt("envelope") + mapOf(
+                    "seq" to JsonPrimitive(1), "payload" to obj("type" to "user_message", "text" to id))))))
+            delay(10_000)
+        }
+        try {
+            client.connect(target)
+            repository.attach("session-1")
+            withTimeout(3000) { while (repository.transcript("session-1").isEmpty()) delay(10) }
+            assertEquals("current", repository.transcript("session-1").single().display.string("text"))
+        } finally { repository.close(); client.close(); server.cancel(); scope.cancel(); dir.deleteRecursively() }
     }
 
     @Test fun responseHookRegistersAttachmentBeforeImmediatePush() = runBlocking<Unit> {

@@ -108,6 +108,10 @@ class RpcClient(
             }
         } catch (error: Exception) {
             fail(next, error is RpcProtocolException)
+            if (error is TimeoutCancellationException) {
+                currentCoroutineContext().ensureActive()
+                throw IOException("handshake_timeout", error)
+            }
             throw error
         }
     }
@@ -140,6 +144,12 @@ class RpcClient(
                 }
                 wait.await()
             }
+        } catch (timeout: TimeoutCancellationException) {
+            fail(active, false)
+            // A per-request deadline is a recoverable transport failure. Owner cancellation
+            // still propagates, including a deadline imposed by the caller's own scope.
+            currentCoroutineContext().ensureActive()
+            throw IOException("request_timeout", timeout)
         } catch (cancelled: CancellationException) {
             fail(active, false)
             throw cancelled

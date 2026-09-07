@@ -2,7 +2,10 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import tempfile
 import unittest
+from unittest.mock import patch
+import zipfile
 
 spec = importlib.util.spec_from_file_location('verify_native', Path(__file__).with_name('verify-native.py'))
 verify = importlib.util.module_from_spec(spec)
@@ -42,6 +45,47 @@ class NativeGateTest(unittest.TestCase):
         struct.pack_into('<H', data, 16, 2)
         with self.assertRaisesRegex(verify.InvalidNative, 'ET_DYN'):
             verify.inspect_elf(data, 'arm64-v8a', '0.0.971')
+
+
+class ApkGateTest(unittest.TestCase):
+    def verify_archive(self, changes=None):
+        changes = changes or {}
+        with tempfile.TemporaryDirectory() as directory:
+            apk = Path(directory) / 'app.apk'
+            names = changes.get('names', ['lib/arm64-v8a/' + name for name in sorted(verify.PACKAGED_LIBRARIES)])
+            with zipfile.ZipFile(apk, 'w') as archive:
+                for name in names:
+                    info = zipfile.ZipInfo(name)
+                    info.compress_type = changes.get('compression', zipfile.ZIP_STORED)
+                    # A real local ZIP header, with valid custom padding extra field.
+                    padding = (-(archive.fp.tell() + 30 + len(name) + 4)) % 16384
+                    info.extra = struct.pack('<HH', 0xcafe, padding) + bytes(padding)
+                    if changes.get('unaligned'):
+                        info.extra = b''
+                    archive.writestr(info, fixture(alignment=4096 if changes.get('bad_dependency') and 'graphics' in name else 16384))
+            checked = []
+            def so(path, abi, version, readelf):
+                checked.append((path.name, version))
+                return verify.inspect_elf(path.read_bytes(), abi, version)
+            with patch.object(verify.subprocess, 'check_output', return_value="package: versionName='0.0.971'"), \
+                    patch.object(verify.subprocess, 'run') as align, patch.object(verify, 'verify_so', side_effect=so):
+                result = verify.verify_apk(apk, 'arm64-v8a', '0.0.971', 'readelf', 'zipalign', 'aapt2')
+                align.assert_called_once()
+            return result, checked
+
+    def test_checks_compose_and_haider_libraries(self):
+        result, checked = self.verify_archive()
+        self.assertEqual(set(result['libraries']), verify.PACKAGED_LIBRARIES)
+        self.assertEqual(set(checked), {('libhaider.so', '0.0.971'), ('libandroidx.graphics.path.so', None)})
+
+    def test_rejects_missing_extra_wrong_abi_duplicate_and_bad_alignment(self):
+        correct = ['lib/arm64-v8a/' + name for name in sorted(verify.PACKAGED_LIBRARIES)]
+        for change in ({'names': correct[:1]}, {'names': correct + ['lib/arm64-v8a/libunexpected.so']},
+                       {'names': [name.replace('arm64-v8a', 'x86_64') for name in correct]},
+                       {'names': [correct[0], correct[0]]}, {'compression': zipfile.ZIP_DEFLATED},
+                       {'unaligned': True}, {'bad_dependency': True}):
+            with self.subTest(change=change), self.assertRaises(verify.InvalidNative):
+                self.verify_archive(change)
 
     def test_writable_executable_rejected(self):
         data = bytearray(fixture())

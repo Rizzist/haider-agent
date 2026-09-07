@@ -26,6 +26,7 @@ class SessionRosterRepository(private val client: RpcClient, private val scope: 
     private val cache: TranscriptCache) : SessionRoster, Closeable {
     private val lock = Any()
     private val refreshMutex = Mutex()
+    private var watchedEpoch: Long? = null
     private val _sessions = MutableStateFlow(cache.loadRoster().map(SessionSummary::parse))
     private val _loading = MutableStateFlow(false)
     private val _error = MutableStateFlow<String?>(null)
@@ -56,8 +57,11 @@ class SessionRosterRepository(private val client: RpcClient, private val scope: 
         _error.value = null
         synchronized(lock) { baseline = mutableMapOf(); buffered.clear() }
         try {
-            val accepted = client.request(RpcMethods.watchSessions(), epoch)
-            if (accepted["accepted"] != JsonPrimitive(true)) throw RpcProtocolException("watch_rejected")
+            if (watchedEpoch != epoch) {
+                val accepted = client.request(RpcMethods.watchSessions(), epoch)
+                if (accepted["accepted"] != JsonPrimitive(true)) throw RpcProtocolException("watch_rejected")
+                watchedEpoch = epoch
+            }
             val cursors = mutableSetOf<String>()
             var cursor: String? = null
             do {

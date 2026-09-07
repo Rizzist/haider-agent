@@ -104,7 +104,7 @@ class RpcGoldenTest {
         try {
             val cache = TranscriptCache(dir)
             val envelope = frames().first { it.string("kind") == "event" }.objectAt("envelope")
-            json("android_display_payloads_v1.json").jsonArray.forEachIndexed { index, payload ->
+            json("android_display_payloads_v1.json").jsonArray.take(4).forEachIndexed { index, payload ->
                 val next = JsonObject(envelope + mapOf("seq" to JsonPrimitive(index + 1), "payload" to payload))
                 assertTrue(cache.apply("session-1", next))
                 assertFalse(cache.apply("session-1", next))
@@ -120,5 +120,30 @@ class RpcGoldenTest {
             assertEquals(5L, TranscriptCache(dir).lastApplied("session-1"))
             assertTrue(file.readText().endsWith("\n"))
         } finally { dir.deleteRecursively() }
+    }
+
+    @Test fun unsupportedRustItemsStayPartialAndOldProjectionCursorsAreRebuilt() = kotlinx.coroutines.runBlocking<Unit> {
+        val dir = Files.createTempDirectory("haider-partial-test").toFile()
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())
+        val client = RpcClient(scope)
+        val cache = TranscriptCache(dir)
+        val repository = TranscriptRepository(client, scope, cache)
+        try {
+            val template = frames().first { it.string("kind") == "event" }.objectAt("envelope")
+            val plan = json("android_display_payloads_v1.json").jsonArray.last()
+            assertEquals("plan", plan.jsonObject.objectAt("item").string("item"))
+            cache.apply("session-1", JsonObject(template + mapOf("seq" to JsonPrimitive(1), "payload" to plan)))
+            val row = SessionSummary.parse(obj("session_id" to "session-1", "head_seq" to 1, "worker_generation" to 1))
+            repository.indexAll(listOf(row))
+            assertFalse(repository.coverage.value.complete)
+            assertEquals("unsupported_display_events", repository.coverage.value.error)
+            val file = dir.listFiles()!!.single()
+            assertTrue(file.renameTo(File(dir, file.name.replace("replay-v2", "replay-v1"))))
+            assertEquals(0L, TranscriptCache(dir).lastApplied("session-1"))
+            // A roster head rollback must not preserve/search a cursor from a lost future.
+            repository.indexAll(listOf(row.copy(headSeq = 0)))
+            assertEquals(0L, cache.lastApplied("session-1"))
+            assertTrue(repository.transcript("session-1").isEmpty())
+        } finally { repository.close(); client.close(); scope.coroutineContext[kotlinx.coroutines.Job]?.cancel(); dir.deleteRecursively() }
     }
 }
