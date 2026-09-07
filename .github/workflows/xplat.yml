@@ -1,7 +1,9 @@
 name: xplat-check
 on:
   push:
-    branches: ["**"]
+    # main is fast-forwarded to the tested wave SHA. Missing exact-SHA
+    # evidence is dispatched by require-evidence.sh, including direct main work.
+    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
 
@@ -16,7 +18,7 @@ env:
 
 jobs:
   rust:
-    name: ${{ matrix.phase }} (${{ matrix.target }})
+    name: ${{ matrix.phase }} (${{ matrix.target }}, shard ${{ matrix.shard || 1 }}/${{ matrix.shards || 1 }})
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +32,18 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             phase: test
+            shard: 1
+            shards: 3
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            phase: test
+            shard: 2
+            shards: 3
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            phase: test
+            shard: 3
+            shards: 3
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             phase: check
@@ -85,9 +99,12 @@ jobs:
         shell: bash
         # ci-test.sh preserves the 8 MiB stack, hermetic discovery/device env,
         # sibling-binary compile phase, and the Windows-only streamed test.
+        env:
+          HAIDER_CI_SHARD_INDEX: ${{ matrix.shard || 1 }}
+          HAIDER_CI_SHARD_TOTAL: ${{ matrix.shards || 1 }}
         run: bash scripts/ci-test.sh
       - name: native durable bundle installation and version checks
-        if: matrix.phase == 'test'
+        if: matrix.phase == 'test' && (runner.os != 'Windows' || matrix.shard == 1)
         env:
           HAIDER_INSTALL_TEST_BIN_DIR: target/debug
           RUST_MIN_STACK: 8388608
@@ -95,10 +112,10 @@ jobs:
           HAIDER_TEST_DEVICE_NAME: test-mac
         run: python -m unittest scripts/tests/test_install_bundle_native.py
       - name: thin executable dependency and binary boundary
-        if: matrix.phase == 'test'
+        if: matrix.phase == 'test' && (runner.os != 'Windows' || matrix.shard == 1)
         run: python scripts/qa-gate/thinexe_abba.py boundary --candidate target/debug --target ${{ matrix.target }} --output target/ci-test-logs/thinexe-boundary.json
       - name: native Windows clipboard write and paste gate (no terminal)
-        if: matrix.phase == 'test' && runner.os == 'Windows'
+        if: matrix.phase == 'test' && runner.os == 'Windows' && matrix.shard == 1
         env:
           RUST_MIN_STACK: 8388608
           HAIDER_DISCOVERY_DISABLED: 1
@@ -112,7 +129,7 @@ jobs:
         if: failure() && matrix.phase == 'test'
         uses: actions/upload-artifact@v4
         with:
-          name: ci-test-failures-${{ matrix.target }}
+          name: ci-test-failures-${{ matrix.target }}-${{ matrix.shard || 1 }}
           path: target/ci-test-logs/**
           if-no-files-found: error
           retention-days: 14
