@@ -13,6 +13,7 @@ import ai.diffforge.haider.ui.scaffold.HaiderApp
 import ai.diffforge.haider.ui.scaffold.SharedPreferencesBannerDismissals
 import ai.diffforge.haider.ui.scaffold.SystemAction
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.PermissionClassifier
 import ai.diffforge.haider.ui.theme.ThemeMode
 import ai.diffforge.haider.ui.theme.ThemePreferences
 import ai.diffforge.haider.update.ApkUpdateCoordinator
@@ -103,8 +104,10 @@ class MainActivity : ComponentActivity() {
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        val permanentlyDenied = !granted && !shouldShowNotificationRationale()
-        viewModel?.onNotificationPermissionResult(granted, permanentlyDenied)
+        // A request has now definitely happened, so a false rationale result
+        // from here really does mean "will not ask again".
+        markNotificationRequested()
+        viewModel?.onNotificationPermissionResult(granted, !granted && !shouldShowNotificationRationale())
     }
 
     private val smsPermissions = registerForActivityResult(
@@ -229,13 +232,27 @@ class MainActivity : ComponentActivity() {
             android.content.pm.PackageManager.PERMISSION_GRANTED
         viewModel?.onNotificationPermissionResult(
             granted,
-            !granted && !shouldShowNotificationRationale(),
+            PermissionClassifier.permanentlyDenied(
+                granted = granted,
+                everRequested = hasRequestedNotifications(),
+                shouldShowRationale = shouldShowNotificationRationale(),
+            ),
         )
     }
 
     private fun shouldShowNotificationRationale(): Boolean =
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             shouldShowRequestPermissionRationale(android.Manifest.permission.POST_NOTIFICATIONS)
+
+    private fun permissionPreferences() =
+        getSharedPreferences(PERMISSION_PREFERENCES, Context.MODE_PRIVATE)
+
+    private fun hasRequestedNotifications(): Boolean =
+        permissionPreferences().getBoolean(KEY_NOTIFICATIONS_REQUESTED, false)
+
+    private fun markNotificationRequested() {
+        permissionPreferences().edit().putBoolean(KEY_NOTIFICATIONS_REQUESTED, true).apply()
+    }
 
     override fun onPause() {
         if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityPaused(this)
@@ -279,6 +296,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+private const val PERMISSION_PREFERENCES = "haider_permissions"
+private const val KEY_NOTIFICATIONS_REQUESTED = "notifications_requested"
 
 /** The version string shown in the header, drawer and start surface. */
 object BuildConfigVersion {

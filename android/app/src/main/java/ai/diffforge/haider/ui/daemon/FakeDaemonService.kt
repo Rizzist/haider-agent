@@ -215,6 +215,13 @@ class FakeDaemonService(
     /** Makes the next replay report partial or unavailable history. */
     var transcriptOverride: ((String) -> TranscriptLoad?)? = null
 
+    /**
+     * The daemon has no catalog to give. A refresh then resolves to an error
+     * rather than leaving the request in flight forever, which is what the
+     * first-run picker has to render as a retry.
+     */
+    var catalogUnavailable: Boolean = false
+
     fun setStatus(status: DaemonStatus) {
         _status.value = status
     }
@@ -419,14 +426,19 @@ class FakeDaemonService(
 
     override suspend fun refreshModels() {
         calls += "refreshModels"
-        _catalogError.value = null
         _catalogRequestedAtMs.value = nowMs
+        if (catalogUnavailable) {
+            _models.value = null
+            _catalogError.value = "catalog_unavailable"
+            return
+        }
+        _catalogError.value = null
         _models.value = catalog()
     }
 
     override suspend fun refreshProviders() {
         calls += AccountsRpcAdapter.METHOD_PROVIDER_LIST
-        _providers.value = inventory()
+        _providers.value = if (catalogUnavailable) ProviderInventory() else inventory()
     }
 
     override suspend fun selectProvider(provider: String) {

@@ -122,6 +122,7 @@
     <string name="picker_effort_title">Effort</string>
     <string name="picker_unavailable">%1$s — %2$s</string>
     <string name="picker_empty">Nothing to choose yet. The daemon has not published an inventory.</string>
+    <string name="picker_loading">Asking the daemon for its catalog…</string>
     <string name="cd_change_provider">Change provider</string>
     <string name="cd_change_effort">Change effort</string>
     <string name="cd_use_light_theme">Use the light theme</string>

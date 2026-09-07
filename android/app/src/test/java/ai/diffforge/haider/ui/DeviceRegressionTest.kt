@@ -6,6 +6,7 @@ import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.settings.ACCOUNTS_KEY_FIELD_TAG
 import ai.diffforge.haider.ui.settings.AccountsScreen
+import ai.diffforge.haider.ui.state.PermissionClassifier
 import ai.diffforge.haider.ui.theme.ForgeTheme
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertTextEquals
@@ -160,5 +161,52 @@ class DeviceRegressionTest {
         viewModel.onNotificationPermissionResult(granted = false, permanentlyDenied = true)
         rule.waitForIdle()
         assertTrue(viewModel.state.value.environment.notificationsPermanentlyDenied)
+    }
+
+    @Test
+    fun `a fresh install is never-asked, not permanently denied`() {
+        // `shouldShowRequestPermissionRationale` is false before the first
+        // request and after the last refusal. Reading it alone made a fresh
+        // install claim "Android will not ask again" — while the next tap still
+        // opened the dialog.
+        val service = ComposeHost.install(FakeScenario.FirstRun)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.onNotificationPermissionResult(
+            granted = false,
+            permanentlyDenied = PermissionClassifier.permanentlyDenied(
+                granted = false,
+                everRequested = false,
+                shouldShowRationale = false,
+            ),
+        )
+        rule.waitForIdle()
+        assertFalse(viewModel.state.value.environment.notificationsPermanentlyDenied)
+        assertEquals(
+            0,
+            rule.onAllNodesWithTextSafe("Android will not ask again. Turn them on in app settings."),
+        )
+        // The step is still the ordinary ask, not a trip to app settings.
+        assertTrue(rule.onAllNodesWithTextSafe("Let Haider notify you") > 0)
+    }
+
+    @Test
+    fun `a second refusal, after a real request, does read as permanent`() {
+        val service = ComposeHost.install(FakeScenario.NotificationsDenied)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.onNotificationPermissionResult(
+            granted = false,
+            permanentlyDenied = PermissionClassifier.permanentlyDenied(
+                granted = false,
+                everRequested = true,
+                shouldShowRationale = false,
+            ),
+        )
+        rule.waitForIdle()
+        assertTrue(viewModel.state.value.environment.notificationsPermanentlyDenied)
+        assertTrue(
+            rule.onAllNodesWithTextSafe(
+                "Android will not ask again. Turn them on in app settings.",
+            ) > 0,
+        )
     }
 }

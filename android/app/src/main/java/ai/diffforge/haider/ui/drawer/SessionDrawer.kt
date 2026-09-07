@@ -221,8 +221,13 @@ fun SessionDrawer(
                 )
             } else {
                 LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                    // Sections are contiguous runs, so a kind can legitimately
+                    // appear more than once — an appended Active row behind a
+                    // frozen Recent one does exactly that. The header key has
+                    // to be unique per *section*, not per kind, or LazyColumn
+                    // throws on the duplicate.
                     groups.forEach { group ->
-                        item(key = "group-${group.kind}") {
+                        item(key = "section-${group.kind}-${group.rows.first().id}") {
                             Text(
                                 stringResource(groupLabel(group.kind)),
                                 style = type.drawerSection,

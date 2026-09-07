@@ -21,6 +21,7 @@ import ai.diffforge.haider.ui.start.StartSurface
 import ai.diffforge.haider.ui.state.BannerAction
 import ai.diffforge.haider.ui.state.BannerInputs
 import ai.diffforge.haider.ui.state.BannerResolver
+import ai.diffforge.haider.ui.state.ModelChipState
 import ai.diffforge.haider.ui.state.ModelChipStateMachine
 import ai.diffforge.haider.ui.state.NeedsInputElsewhere
 import ai.diffforge.haider.ui.state.Overlay
@@ -276,7 +277,8 @@ fun HaiderApp(
                                     SetupStepId.Notifications ->
                                         onSystemAction(SystemAction.RequestNotifications)
                                     SetupStepId.Battery -> onSystemAction(SystemAction.OpenBattery)
-                                    SetupStepId.Model -> viewModel.openOverlay(Overlay.ModelPicker)
+                                    SetupStepId.Model ->
+                                        viewModel.openOverlay(Overlay.Picker(PickerKind.Model))
                                 }
                             },
                             // Fills the composer; the user stays the author.
@@ -394,6 +396,7 @@ fun HaiderApp(
         Overlays(
             viewModel = viewModel,
             state = state,
+            nowMs = nowMs,
             onSystemAction = onSystemAction,
         )
     }
@@ -403,8 +406,17 @@ fun HaiderApp(
 private fun Overlays(
     viewModel: ChatViewModel,
     state: ai.diffforge.haider.ui.state.AppUiState,
+    nowMs: Long,
     onSystemAction: (SystemAction) -> Unit,
 ) {
+    // Opening any picker asks for what it needs; the legacy sheet never did,
+    // which is how first run could sit on an empty catalog forever.
+    LaunchedEffect(state.overlay) {
+        if (state.overlay is Overlay.Picker && state.models == null) {
+            viewModel.refreshProviders()
+            viewModel.refreshModels()
+        }
+    }
     when (val overlay = state.overlay) {
         is Overlay.Picker -> SessionPickerSheet(
             kind = overlay.kind,
@@ -412,6 +424,20 @@ private fun Overlays(
             currentProvider = state.models?.current?.provider,
             currentModel = state.models?.current?.model,
             currentEffort = state.models?.current?.effort,
+            // The same 6 s rule the composer chip obeys: a sheet is not allowed
+            // to sit on "asking…" either.
+            pending = ModelChipStateMachine.resolve(
+                daemon = state.daemon,
+                config = state.models,
+                catalogError = state.catalogError,
+                selectionBusy = state.selectionBusy,
+                requestedAtMs = state.catalogRequestedAtMs,
+                nowMs = nowMs,
+            ) == ModelChipState.Loading,
+            onRetry = {
+                viewModel.refreshProviders()
+                viewModel.refreshModels()
+            },
             onDismiss = viewModel::closeOverlay,
             onSelectProvider = viewModel::selectProvider,
             onSelectModel = viewModel::selectModel,

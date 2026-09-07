@@ -1,6 +1,9 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.ForgeButton
+import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.components.Skeleton
 import ai.diffforge.haider.ui.daemon.ProviderInventory
 import ai.diffforge.haider.ui.state.ModelNames
 import ai.diffforge.haider.ui.theme.Forge
@@ -60,6 +63,14 @@ fun SessionPickerSheet(
     currentProvider: String?,
     currentModel: String?,
     currentEffort: String?,
+    /**
+     * True only while a catalog request is still inside the 6 s deadline. Once
+     * it expires — or if nothing was ever requested — the sheet says so and
+     * offers Retry rather than spinning. First-run "Pick a model" sat on
+     * "Asking the daemon for its model catalog…" indefinitely.
+     */
+    pending: Boolean,
+    onRetry: () -> Unit,
     onDismiss: () -> Unit,
     onSelectProvider: (String) -> Unit,
     onSelectModel: (provider: String, model: String) -> Unit,
@@ -93,7 +104,7 @@ fun SessionPickerSheet(
 
             when (kind) {
                 PickerKind.Provider -> {
-                    if (inventory.providers.isEmpty()) EmptyInventory()
+                    if (inventory.providers.isEmpty()) EmptyInventory(pending, onRetry)
                     inventory.providers.forEach { option ->
                         PickerRow(
                             label = option.label,
@@ -114,7 +125,9 @@ fun SessionPickerSheet(
                 }
 
                 PickerKind.Model -> {
-                    if (inventory.providers.none { it.models.isNotEmpty() }) EmptyInventory()
+                    if (inventory.providers.none { it.models.isNotEmpty() }) {
+                        EmptyInventory(pending, onRetry)
+                    }
                     // Grouped by provider, as the desktop chip is.
                     inventory.providers.forEach { option ->
                         if (option.models.isEmpty()) return@forEach
@@ -141,7 +154,7 @@ fun SessionPickerSheet(
                     // high where Sonnet also allows low, and offering `low` for
                     // Opus is offering something the catalog rejects.
                     val efforts = inventory.effortsFor(currentProvider, currentModel)
-                    if (efforts.isEmpty()) EmptyInventory()
+                    if (efforts.isEmpty()) EmptyInventory(pending, onRetry)
                     efforts.forEach { effort ->
                         PickerRow(
                             label = effort,
@@ -158,12 +171,31 @@ fun SessionPickerSheet(
 }
 
 @Composable
-private fun EmptyInventory() {
-    Text(
-        stringResource(R.string.picker_empty),
-        style = Forge.type.sessionMeta,
-        color = Forge.colors.textMuted,
-    )
+private fun EmptyInventory(pending: Boolean, onRetry: () -> Unit) {
+    val colors = Forge.colors
+    val type = Forge.type
+    if (pending) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+        ) {
+            Skeleton(width = ForgeSpace.huge * 3)
+            Text(
+                stringResource(R.string.picker_loading),
+                style = type.sessionMeta,
+                color = colors.textMuted,
+            )
+        }
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+        Text(stringResource(R.string.picker_empty), style = type.sessionMeta, color = colors.textMuted)
+        ForgeButton(
+            text = stringResource(R.string.action_retry),
+            onClick = onRetry,
+            kind = ForgeButtonKind.Ghost,
+        )
+    }
 }
 
 @Composable
