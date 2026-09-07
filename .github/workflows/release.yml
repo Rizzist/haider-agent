@@ -16,14 +16,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ship-gate:
+  ship-gate-evidence:
+    runs-on: ubuntu-latest
+    outputs:
+      satisfied: ${{ steps.lookup.outputs.satisfied }}
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: find successful ship-gate on the exact candidate SHA (any ref)
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA"
+
+  ship-gate-run:
+    needs: ship-gate-evidence
+    if: needs.ship-gate-evidence.outputs.satisfied != 'true'
     permissions:
       actions: write
       contents: read
     uses: ./.github/workflows/ship-gate.yml
 
   build:
-    needs: ship-gate
+    needs: [ship-gate-evidence, ship-gate-run]
+    if: always() && needs.ship-gate-evidence.result == 'success' && (needs.ship-gate-run.result == 'success' || needs.ship-gate-run.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
