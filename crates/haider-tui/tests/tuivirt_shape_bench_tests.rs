@@ -45,6 +45,15 @@ const FLAT_SLACK: Duration = Duration::from_millis(1);
 const FIRST_SAMPLES: usize = 5;
 const SIZES: [usize; 3] = [10_000, 50_000, 200_000];
 
+#[cfg(debug_assertions)]
+thread_local! {
+    // Count the real constructions across the entire behavioral test, so an
+    // accidental warm-up or retry fails BEFORE repeating expensive replay.
+    static COLD_CONSTRUCTIONS: std::cell::Cell<[usize; 3]> = const {
+        std::cell::Cell::new([0; 3])
+    };
+}
+
 fn samples() -> usize {
     if cfg!(debug_assertions) { 5 } else { 60 }
 }
@@ -83,9 +92,78 @@ struct Shape {
     p95_middle: Duration,
 }
 
+#[cfg(debug_assertions)]
+fn debug_replayed(rows: usize) -> AppModel {
+    // Completed-only replay scans the whole prior transcript for an open
+    // item at each append. Keep debug fixture setup linear: reduce each row
+    // in isolation, then hydrate the same display entries into ONE model.
+    // Release still exercises the original replay, outside its frame timers.
+    let mut model = tuivirt_common::session_model();
+    let entries = (0..rows)
+        .map(|n| {
+            tuivirt_common::push_agent(
+                &mut model,
+                &format!("bench-{n}"),
+                &tuivirt_common::agent_row(n),
+            );
+            let row = std::mem::take(&mut model.projection);
+            let [entry] = row.entries() else {
+                panic!("one completed agent event must produce exactly one display entry");
+            };
+            entry.clone()
+        })
+        .collect();
+    model.projection =
+        haider_tui::projection::SessionProjection::hydrate(entries, None, None, None, false);
+    model
+}
+
+#[cfg(debug_assertions)]
+fn assert_debug_fixture_matches_replay() {
+    use tuivirt_common::{assert_same_frame, draw};
+
+    for rows in [0, 1, 64] {
+        let expected = replayed(rows);
+        let actual = debug_replayed(rows);
+        assert_eq!(actual.projection.entries(), expected.projection.entries());
+        assert_same_frame(
+            "fixture tail",
+            &draw(&actual, 118, 36),
+            &draw(&expected, 118, 36),
+        );
+        assert_eq!(actual.scroll_max.get(), expected.scroll_max.get());
+        for back in [expected.scroll_max.get() / 2, expected.scroll_max.get()] {
+            actual.scroll_back.set(back);
+            expected.scroll_back.set(back);
+            assert_same_frame(
+                "fixture scroll",
+                &draw(&actual, 118, 36),
+                &draw(&expected, 118, 36),
+            );
+        }
+    }
+}
+
 fn cold_frame(rows: usize) -> (AppModel, Terminal<TestBackend>, Duration) {
+    #[cfg(debug_assertions)]
+    COLD_CONSTRUCTIONS.with(|counts| {
+        let mut actual = counts.get();
+        let index = SIZES
+            .iter()
+            .position(|&size| size == rows)
+            .expect("bench size");
+        assert_eq!(
+            actual[index], 0,
+            "debug shape probe must construct at most once per size ({rows} rows)"
+        );
+        actual[index] += 1;
+        counts.set(actual);
+    });
     // Fresh construction, never a cloned or previously rendered model.
     // Replay and terminal construction stay outside every interval.
+    #[cfg(debug_assertions)]
+    let model = debug_replayed(rows);
+    #[cfg(not(debug_assertions))]
     let model = replayed(rows);
     let mut terminal = Terminal::new(TestBackend::new(118, 36)).expect("test terminal");
     let first = one_frame(&model, &mut terminal);
@@ -97,21 +175,24 @@ fn cold_frame(rows: usize) -> (AppModel, Terminal<TestBackend>, Duration) {
     (model, terminal, first)
 }
 
+#[cfg(not(debug_assertions))]
 fn measure(rows: usize) -> Shape {
     // Discard one warm-up AT THIS SIZE, then measure five independent cold
     // render caches in this process. Drop each before constructing the next;
     // retain only the last model/terminal for the unchanged cached p95 probes.
-    let count = if cfg!(debug_assertions) {
-        // Timing is skipped in debug; preserve its single cold behavioral
-        // probe without multiplying the expensive replay construction work.
-        1
-    } else {
-        drop(cold_frame(rows));
-        FIRST_SAMPLES
-    };
-    let mut first_samples: Vec<Duration> = (1..count).map(|_| cold_frame(rows).2).collect();
-    let (model, mut terminal, first) = cold_frame(rows);
+    drop(cold_frame(rows));
+    let mut first_samples: Vec<Duration> = (1..FIRST_SAMPLES).map(|_| cold_frame(rows).2).collect();
+    let (model, terminal, first) = cold_frame(rows);
     first_samples.push(first);
+    probe_cached(rows, model, terminal, percentile(first_samples, 50))
+}
+
+fn probe_cached(
+    rows: usize,
+    model: AppModel,
+    mut terminal: Terminal<TestBackend>,
+    first: Duration,
+) -> Shape {
     let follow: Vec<Duration> = (0..samples())
         .map(|_| one_frame(&model, &mut terminal))
         .collect();
@@ -127,7 +208,7 @@ fn measure(rows: usize) -> Shape {
     );
     Shape {
         rows,
-        first: percentile(first_samples, 50),
+        first,
         p95_follow: percentile(follow, 95),
         p95_middle: percentile(middle, 95),
     }
@@ -215,12 +296,23 @@ fn compare_with_retry(
 
 #[test]
 fn first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows() {
-    if cfg!(debug_assertions) {
-        // Keep the visible-tail and full-scroll behavioral assertions active.
-        let _ = SIZES.map(measure);
+    #[cfg(debug_assertions)]
+    {
         println!("tuivirt shape gate = SKIP (unoptimized build). Run with --release to enforce.");
-        return;
+        // Keep the visible-tail and full-scroll behavioral assertions active.
+        for rows in SIZES {
+            let (model, terminal, first) = cold_frame(rows);
+            let _ = probe_cached(rows, model, terminal, first);
+        }
+        COLD_CONSTRUCTIONS.with(|counts| {
+            assert_eq!(counts.get(), [1; 3], "one debug construction at every size");
+            println!(
+                "tuivirt debug constructions @ {SIZES:?} rows: {:?}",
+                counts.get()
+            );
+        });
     }
+    #[cfg(not(debug_assertions))]
     compare_with_retry("measured", || SIZES.map(measure))
         .unwrap_or_else(|reason| panic!("{reason}"));
 }
@@ -229,6 +321,8 @@ fn first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows() {
 /// ceilings are pinned independently, and the percentile picks the right sample.
 #[test]
 fn shape_gate_arithmetic_is_pinned() {
+    #[cfg(debug_assertions)]
+    assert_debug_fixture_matches_replay();
     flat(
         "exactly flat",
         Duration::from_millis(10),
