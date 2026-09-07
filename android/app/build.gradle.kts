@@ -1,4 +1,6 @@
 import ai.diffforge.haider.build.HaiderVersion
+import ai.diffforge.haider.build.HaiderNative
+import ai.diffforge.haider.build.HaiderJniLibs
 
 plugins {
     id("com.android.application")
@@ -28,6 +30,7 @@ if (!releaseSigningAvailable) {
 android {
     namespace = "ai.diffforge.haider"
     compileSdk = 35
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "ai.diffforge.haider"
@@ -35,7 +38,26 @@ android {
         targetSdk = 35
         versionCode = workspaceVersion.code
         versionName = workspaceVersion.name
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("boolean", "LEGACY_TERMUX_TRANSPORT", "false")
     }
+
+    flavorDimensions += "device"
+    productFlavors {
+        create("phone") {
+            dimension = "device"
+            ndk { abiFilters += "arm64-v8a" }
+        }
+        create("emulator") {
+            dimension = "device"
+            ndk { abiFilters += "x86_64" }
+        }
+    }
+
+    // AGP 8.7.3 defaults to uncompressed, directly mapped JNI libraries for minSdk 26.
+    // Keep native packaging defaults; no extraction workaround.
+    sourceSets.getByName("test").resources.srcDir("../../crates/haider-rpc/tests/fixtures")
+    sourceSets.getByName("androidTest").assets.srcDir("../../crates/haider-rpc/tests/fixtures")
 
     signingConfigs {
         if (releaseSigningAvailable) {
@@ -73,8 +95,37 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
+
+val nativeBuild = tasks.register<HaiderNative>("buildHaiderNative") {
+    repository.set(rootProject.layout.projectDirectory.dir(".."))
+    version.set(workspaceVersion.name)
+    sources.from(fileTree(rootProject.projectDir.parentFile) {
+        include("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "crates/**", "scripts/android/**")
+        exclude("**/target/**", "**/__pycache__/**")
+    })
+    outputDirectory.set(layout.buildDirectory.dir("generated/haiderNative"))
+}
+androidComponents {
+    beforeVariants(selector().withBuildType("release")) { variant ->
+        if (variant.productFlavors.any { it.second == "emulator" }) variant.enable = false
+    }
+    onVariants { variant ->
+        val jni = tasks.register<HaiderJniLibs>("prepare${variant.name.replaceFirstChar { it.uppercaseChar() }}HaiderJniLibs") {
+            nativeDirectory.set(nativeBuild.flatMap { it.outputDirectory })
+            abi.set(if (variant.productFlavors.any { it.second == "emulator" }) "x86_64" else "arm64-v8a")
+            outputDirectory.set(layout.buildDirectory.dir("generated/haiderJniLibs/${variant.name}"))
+        }
+        variant.sources.jniLibs?.addGeneratedSourceDirectory(jni, HaiderJniLibs::outputDirectory)
+    }
+}
+
+// Keep the separately owned xplat compile entrypoint working after introducing ABI flavors.
+tasks.register("compileReleaseKotlin") { dependsOn("compilePhoneReleaseKotlin") }
+tasks.register("testDebugUnitTest") { dependsOn("testPhoneDebugUnitTest", "testEmulatorDebugUnitTest") }
+tasks.register("testReleaseUnitTest") { dependsOn("testPhoneReleaseUnitTest") }
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
@@ -96,6 +147,10 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }

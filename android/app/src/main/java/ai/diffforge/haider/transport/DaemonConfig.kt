@@ -1,8 +1,9 @@
 package ai.diffforge.haider.transport
 
 import android.content.Context
+import ai.diffforge.haider.BuildConfig
 
-/** Persisted endpoint and bearer token for the phone's Haider daemon. */
+/** Legacy Termux configuration. Standalone never reads or writes endpoint/token preferences. */
 data class DaemonConfig(
     val host: String = DEFAULT_HOST,
     val port: Int,
@@ -18,6 +19,7 @@ data class DaemonConfig(
 
         /** Returns null until a valid port and non-empty token have been saved. */
         fun load(context: Context): DaemonConfig? {
+            if (!BuildConfig.LEGACY_TERMUX_TRANSPORT) return null
             val preferences = context.getSharedPreferences(
                 PREFERENCES_NAME,
                 Context.MODE_PRIVATE,
@@ -47,6 +49,7 @@ data class DaemonConfig(
             port: Int,
             token: String,
         ) {
+            check(BuildConfig.LEGACY_TERMUX_TRANSPORT) { "Legacy Termux transport is disabled" }
             require(port in 1..65535) { "Daemon port is outside the valid range" }
             require(token.isNotEmpty()) { "Daemon token must not be empty" }
             val normalizedHost = host.trim().ifEmpty { DEFAULT_HOST }

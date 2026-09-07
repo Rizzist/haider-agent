@@ -1,6 +1,7 @@
 package ai.diffforge.haider.transport
 
 import android.content.Context
+import ai.diffforge.haider.BuildConfig
 import ai.diffforge.haider.service.AndroidCapabilityHandler
 import ai.diffforge.haider.service.SmsPermissionMonitor
 import kotlinx.coroutines.CoroutineScope
@@ -43,6 +44,7 @@ object DaemonConnection {
 
     /** Loads the saved endpoint and starts one client. Calls while a client is active are no-ops. */
     fun start(context: Context) {
+        if (!BuildConfig.LEGACY_TERMUX_TRANSPORT) return
         val appContext = context.applicationContext
         SmsPermissionMonitor.start(appContext)
         val config = DaemonConfig.load(appContext) ?: return
@@ -56,6 +58,7 @@ object DaemonConnection {
 
     /** Stops the current client, reloads configuration, and starts a replacement asynchronously. */
     fun restart(context: Context) {
+        if (!BuildConfig.LEGACY_TERMUX_TRANSPORT) return
         val appContext = context.applicationContext
         SmsPermissionMonitor.start(appContext)
         val config = DaemonConfig.load(appContext)
