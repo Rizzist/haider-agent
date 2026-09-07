@@ -102,11 +102,11 @@ const {download} = require(process.argv[1]);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const start = performance.now();
-    await assert.rejects(download(`http://127.0.0.1:${server.address().port}/redirect`, {get: http.get, attemptMs: 80}), /timed out/);
+    await assert.rejects(download(`http://127.0.0.1:${server.address().port}/redirect`, {get: http.get, attemptMs: 400}), /timed out/);
     const elapsed = performance.now() - start;
     assert.equal(requests, 4, 'exactly two attempts, each following one redirect');
-    assert(elapsed < 600, `attempts exceeded their shared deadline: ${elapsed}`);
-    assert(elapsed >= 140, `unexpected early timeout: ${elapsed}`);
+    assert(elapsed < 2400, `attempts exceeded their shared deadline: ${elapsed}`);  // 6x one attempt: two attempts plus setup slack
+    assert(elapsed >= 700, `unexpected early timeout: ${elapsed}`);  // two 400 ms attempts minus scheduler slack
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(sockets.size, 0, 'all redirect and terminal sockets must close before return');
   } finally {for (const socket of sockets) socket.destroy(); server.close();}

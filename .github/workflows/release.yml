@@ -474,6 +474,10 @@ jobs:
           test "$(payload/haider$EXE --version)" = "haider $VERSION"
       - name: Packaging regression tests
         shell: bash
+        env:
+          # test_install_bundle_native needs the native release siblings; `payload` holds the
+          # frozen archive members for this runner's own target (xplat uses target/debug).
+          HAIDER_INSTALL_TEST_BIN_DIR: payload
         run: python -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Install native Linux package tools
         if: runner.os == 'Linux'
