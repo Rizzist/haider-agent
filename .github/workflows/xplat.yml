@@ -1,7 +1,9 @@
 name: xplat-check
 on:
   push:
-    branches: ["**"]
+    # main is fast-forwarded to the tested wave SHA. Missing exact-SHA
+    # evidence is dispatched by require-evidence.sh, including direct main work.
+    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
 

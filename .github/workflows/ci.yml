@@ -1,24 +1,23 @@
 name: ci
 on:
   push:
-    branches: ["**"]
+    # main is fast-forwarded to the tested wave SHA. Missing exact-SHA
+    # evidence is dispatched by require-evidence.sh, including direct main work.
+    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
 
 # PIPELINE CONTRACT — capability may move, but it may not disappear.
-# FAST PATH (every branch push, every PR, and dispatch): this workflow runs
-# macOS fmt/clippy/repo guards/self-test, the full per-crate macOS tests, and
-# the Linux X11 computer-use E2E. xplat.yml concurrently runs check, clippy,
-# and the same full tests on Linux + Windows, plus the Android native/Kotlin
-# build. SHIP GATE: ship-gate.yml runs the complete demo+live PTY probe ladder
-# with profile.ci and the upper-bound render benchmark with the true release
-# profile. It runs automatically on main, is a required `needs` dependency of
-# release.yml for every v* tag/manual release build, and can be invoked before
-# tagging with `gh workflow run ship-gate.yml --ref <candidate-ref>`; the
-# ship gate first requires successful ci.yml and xplat.yml runs on the exact
-# caller SHA, dispatching missing evidence. The local scripts/ship-970.sh
-# pregate uses the same resolver before tagging. release.yml and the Android
-# release workflows continue to build actual artifacts with release settings.
+# FAST PATH (branch pushes except main, PRs, and dispatch): macOS lint/tests
+# and Linux X11 E2E here; Linux/Windows check/clippy/tests and Android in xplat.
+# main is the exact tested wave head, so its duplicate push runs are omitted.
+# SHIP GATE: wave-* and main start the demo+live probes, render benchmark and
+# footprint measurements concurrently with exact-SHA ci/xplat evidence waits.
+# The terminal verdict is required before tagging. Missing ci/xplat runs can
+# still be dispatched on main by require-evidence.sh after resolving its SHA.
+# release.yml reuses completed-success ship-gate evidence on the exact tag SHA
+# from any ref, or calls the gate when missing. Never dispatch release manually.
+# See docs/testing/v0.0.970/cifast.md for the pipeline and proof contract.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
