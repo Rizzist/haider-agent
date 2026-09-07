@@ -146,6 +146,60 @@ class SessionListStateTest {
     }
 
     @Test
+    fun `interleaved unseen and running rows keep the canonical order`() {
+        // The device pass found canonical [a,b,c] rendering as [a,c,b] when an
+        // unseen row sat between two running ones: the group was derived from
+        // run_id rather than from the attention tier, so grouping re-sorted.
+        val rows = listOf(
+            row("a", title = "A", runId = "run-a", lastActivityMs = 300, seenAtMs = null),
+            row("b", title = "B", lastActivityMs = 200, seenAtMs = 0),
+            row("c", title = "C", runId = "run-c", lastActivityMs = 100, seenAtMs = null),
+        )
+        assertEquals(listOf("a", "b", "c"), SessionListState.order(rows, null).map { it.id })
+        assertEquals(
+            listOf("a", "b", "c"),
+            SessionListState.flatten(SessionListState.groups(rows, null)),
+        )
+    }
+
+    @Test
+    fun `a new row is appended, never inserted above a frozen one`() {
+        val rows = listOf(
+            row("a", runId = "r", lastActivityMs = 300, seenAtMs = null),
+            row("b", lastActivityMs = 200, seenAtMs = 200),
+        )
+        val snapshot = SessionListState.OrderSnapshot.capture(rows, null)
+        // A brand-new Active row would sort first by activity; while the drawer
+        // is open it goes to the end instead.
+        val fresh = row("c", runId = "r2", lastActivityMs = 400, seenAtMs = null)
+        assertEquals(
+            listOf("a", "b", "c"),
+            SessionListState.flatten(
+                SessionListState.groups(rows + fresh, null, snapshot = snapshot),
+            ),
+        )
+    }
+
+    @Test
+    fun `flattening the sections always reproduces the order, whatever the mix`() {
+        // The invariant, stated once: sections are contiguous runs of the flat
+        // order, so a header may repeat but a row never moves.
+        val rows = (0 until 24).map { index ->
+            row(
+                id = "s-%02d".format(index),
+                lastActivityMs = now - index * 1_000L,
+                seenAtMs = if (index % 3 == 0) 0L else now,
+                runId = if (index % 2 == 0) "run-$index" else null,
+                needsInput = if (index % 7 == 0) asking else null,
+            )
+        }
+        assertEquals(
+            SessionListState.order(rows, null).map { it.id },
+            SessionListState.flatten(SessionListState.groups(rows, null)),
+        )
+    }
+
+    @Test
     fun `grouping presents the attention order instead of overriding it`() {
         // Round 1 emitted groups in enum order, so an ACTIVE row could be
         // drawn above a more recent RECENT row: the grouping silently re-sorted

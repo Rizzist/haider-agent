@@ -8,6 +8,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.heightIn
@@ -40,6 +41,11 @@ fun ForgeButton(
     modifier: Modifier = Modifier,
     kind: ForgeButtonKind = ForgeButtonKind.Filled,
     enabled: Boolean = true,
+    /**
+     * The *visual* height. The target is always at least [ForgeSize.touch]:
+     * a banner's 34 dp button keeps its 34 dp look inside a 48 dp target,
+     * rather than being an exception to the rule.
+     */
     minHeight: Dp = ForgeSize.touch,
     contentDescription: String? = null,
     leading: (@Composable () -> Unit)? = null,
@@ -61,26 +67,33 @@ fun ForgeButton(
         ForgeButtonKind.Ghost -> colors.borderStrong
         ForgeButtonKind.Destructive -> colors.red.copy(alpha = 0.55f)
     }
-    Row(
+    Box(
         modifier = modifier
-            .heightIn(min = minHeight)
-            .defaultMinSize(minWidth = ForgeSize.rowMin)
+            .defaultMinSize(minWidth = ForgeSize.touch, minHeight = ForgeSize.touch)
             .clip(ForgeShapes.pill)
-            .background(fill)
-            .border(ForgeSize.hairline, outline, ForgeShapes.pill)
             .clickable(enabled = enabled, onClick = onClick)
-            .alpha(if (enabled) 1f else DISABLED_ALPHA)
-            .padding(horizontal = ForgeSpace.xl)
             .semantics {
                 this.role = Role.Button
                 if (contentDescription != null) {
                     this.contentDescription = contentDescription
                 }
             },
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm, Alignment.CenterHorizontally),
+        contentAlignment = Alignment.Center,
     ) {
-        leading?.invoke()
-        Text(text, style = type.button, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Row(
+            modifier = Modifier
+                .heightIn(min = minHeight)
+                .defaultMinSize(minWidth = ForgeSize.rowMin)
+                .clip(ForgeShapes.pill)
+                .background(fill)
+                .border(ForgeSize.hairline, outline, ForgeShapes.pill)
+                .alpha(if (enabled) 1f else DISABLED_ALPHA)
+                .padding(horizontal = ForgeSpace.xl),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm, Alignment.CenterHorizontally),
+        ) {
+            leading?.invoke()
+            Text(text, style = type.button, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
     }
 }

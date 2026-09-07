@@ -45,13 +45,13 @@ object SessionListState {
 
         companion object {
             /** Captures the canonical order and the group each row sat in. */
-            fun of(rows: List<SessionRow>): OrderSnapshot = OrderSnapshot(
+            fun of(rows: List<SessionRow>, activeId: String? = null): OrderSnapshot = OrderSnapshot(
                 ids = rows.map { it.id },
-                groups = rows.associate { it.id to groupKind(it) },
+                groups = rows.associate { it.id to groupKind(it, activeId) },
             )
 
             fun capture(rows: List<SessionRow>, activeId: String?): OrderSnapshot =
-                of(order(rows, activeId))
+                of(order(rows, activeId), activeId)
         }
     }
 
@@ -83,11 +83,18 @@ object SessionListState {
         else -> 2
     }
 
-    fun groupKind(row: SessionRow): SessionGroupKind = when {
-        row.needsInput != null || row.state == SessionVisualState.NeedsInput -> SessionGroupKind.NeedsYou
-        row.runId != null -> SessionGroupKind.Active
-        else -> SessionGroupKind.Recent
-    }
+    /**
+     * The group **is** the attention tier. Deriving it from `run_id` instead
+     * put an unseen row (tier 1) in RECENT while a running row (also tier 1)
+     * went to ACTIVE, so grouping re-sorted what [order] had already decided:
+     * canonical `[a, b, c]` rendered as `[a, c, b]`.
+     */
+    fun groupKind(row: SessionRow, activeId: String? = null): SessionGroupKind =
+        when (tier(row, activeId)) {
+            0 -> SessionGroupKind.NeedsYou
+            1 -> SessionGroupKind.Active
+            else -> SessionGroupKind.Recent
+        }
 
     /** The canonical comparator: tier, then activity desc, then title asc. */
     fun order(rows: List<SessionRow>, activeId: String?): List<SessionRow> =
@@ -134,18 +141,32 @@ object SessionListState {
             known + fresh
         }
         val kindOf: (SessionRow) -> SessionGroupKind = { row ->
-            snapshot?.group(row.id) ?: groupKind(row)
+            snapshot?.group(row.id) ?: groupKind(row, activeId)
         }
+        // Sections are contiguous runs of the flat order, never buckets that
+        // pull rows out of it. Flattening the result always reproduces
+        // `ordered` exactly — asserted in SessionListStateTest — so a header
+        // can appear twice rather than a row moving, which is the trade the
+        // ordering law (rule 6) demands.
         val out = mutableListOf<SessionGroup>()
-        val placed = mutableSetOf<SessionGroupKind>()
+        var current = mutableListOf<SessionRow>()
+        var currentKind: SessionGroupKind? = null
         ordered.forEach { row ->
             val kind = kindOf(row)
-            if (placed.add(kind)) {
-                out += SessionGroup(kind, ordered.filter { kindOf(it) == kind })
+            if (kind != currentKind) {
+                if (current.isNotEmpty()) out += SessionGroup(currentKind!!, current)
+                current = mutableListOf()
+                currentKind = kind
             }
+            current += row
         }
+        if (current.isNotEmpty() && currentKind != null) out += SessionGroup(currentKind!!, current)
         return out
     }
+
+    /** The invariant the drawer depends on, exposed so tests can state it. */
+    fun flatten(groups: List<SessionGroup>): List<String> =
+        groups.flatMap { group -> group.rows.map { it.id } }
 
     /** The flat ordered list, for the start surface's "recent sessions" block. */
     fun recent(rows: List<SessionRow>, activeId: String?, limit: Int): List<SessionRow> =

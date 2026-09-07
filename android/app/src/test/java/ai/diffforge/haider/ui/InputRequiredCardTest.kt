@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.daemon.FakeDaemonService
+import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.daemon.MenuOption
 import ai.diffforge.haider.ui.daemon.NeedsInput
 import ai.diffforge.haider.ui.chat.ASK_SECRET_FIELD_TAG
@@ -43,15 +44,21 @@ class InputRequiredCardTest {
         answeredElsewhere: Boolean = false,
         answerable: Boolean = true,
     ) {
+        val coordinates = if (answerable) {
+            MenuCoordinates.of("s", needsInput, "c")
+                ?: MenuCoordinates("s", "menu-fixture", 1, 1, "c")
+        } else {
+            null
+        }
         rule.setContent {
             ForgeTheme(dark = true) {
                 InputRequiredCard(
                     needsInput = needsInput,
                     nowMs = FakeDaemonService.FIXED_NOW,
                     answeredElsewhere = answeredElsewhere,
-                    answerable = answerable,
-                    onAnswer = { key, index, text -> answers += Triple(key, index, text) },
-                    onAnswerSecret = { key, index, secret ->
+                    coordinates = coordinates,
+                    onAnswer = { _, key, index, text -> answers += Triple(key, index, text) },
+                    onAnswerSecret = { _, key, index, secret ->
                         secrets += Triple(key, index, String(secret))
                         secret.fill(' ')
                     },

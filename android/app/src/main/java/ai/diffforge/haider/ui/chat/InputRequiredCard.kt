@@ -3,6 +3,7 @@ package ai.diffforge.haider.ui.chat
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.daemon.MenuOption
 import ai.diffforge.haider.ui.accounts.SecretBuffer
+import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.daemon.NeedsInput
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
@@ -60,10 +61,15 @@ fun InputRequiredCard(
     needsInput: NeedsInput,
     nowMs: Long,
     answeredElsewhere: Boolean,
-    /** Null when the rendered prompt is missing a compare-and-set coordinate. */
-    answerable: Boolean,
-    onAnswer: (optionKey: String, optionIndex: Int, text: String?) -> Unit,
-    onAnswerSecret: (optionKey: String, optionIndex: Int, secret: CharArray) -> Unit,
+    /**
+     * The coordinates that were rendered. Null means the prompt is missing one,
+     * and no answer affordance is offered at all. They travel *with* the
+     * callback so a stale click cannot answer a replacement prompt: a captured
+     * lambda carries the menu it was drawn for, not whatever arrived since.
+     */
+    coordinates: MenuCoordinates?,
+    onAnswer: (MenuCoordinates, optionKey: String, optionIndex: Int, text: String?) -> Unit,
+    onAnswerSecret: (MenuCoordinates, optionKey: String, optionIndex: Int, secret: CharArray) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
@@ -72,6 +78,16 @@ fun InputRequiredCard(
     var secretText by remember { mutableStateOf("") }
     val secret = remember { SecretBuffer() }
     DisposableEffect(Unit) { onDispose { secret.wipe() } }
+    /**
+     * The coordinates this card instance was drawn with, captured once and
+     * never updated. The caller keys the card on the prompt, so a replacement
+     * destroys this instance and builds a new one with fresh coordinates —
+     * while a callback captured from the old instance keeps carrying the old
+     * ones, and the view model refuses them. Without this, a stale click
+     * silently answered whatever prompt had arrived in the meantime.
+     */
+    val rendered = remember { coordinates }
+    val answerable = rendered != null
 
     Column(
         modifier = modifier
@@ -170,9 +186,10 @@ fun InputRequiredCard(
                     ForgeButton(
                         text = stringResource(R.string.ask_send),
                         onClick = {
+                            val drawn = rendered ?: return@ForgeButton
                             // The buffer hands over a copy and wipes it; the
                             // field is cleared in the same breath.
-                            onAnswerSecret(option?.key.orEmpty(), 0, secret.copy())
+                            onAnswerSecret(drawn, option?.key.orEmpty(), 0, secret.copy())
                             secret.wipe()
                             secretText = ""
                         },
@@ -188,7 +205,8 @@ fun InputRequiredCard(
                 }
             }
 
-            needsInput.options.isNotEmpty() -> OptionButtons(needsInput.options, answerable, onAnswer)
+            needsInput.options.isNotEmpty() ->
+                OptionButtons(needsInput.options, rendered, onAnswer)
 
             else -> Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -226,7 +244,10 @@ fun InputRequiredCard(
                 }
                 ForgeButton(
                     text = stringResource(R.string.ask_send),
-                    onClick = { onAnswer("", 0, freeText) },
+                    onClick = {
+                        val drawn = rendered ?: return@ForgeButton
+                        onAnswer(drawn, "", 0, freeText)
+                    },
                     enabled = answerable && freeText.isNotBlank(),
                 )
             }
@@ -249,9 +270,10 @@ fun InputRequiredCard(
 @Composable
 private fun OptionButtons(
     options: List<MenuOption>,
-    answerable: Boolean,
-    onAnswer: (String, Int, String?) -> Unit,
+    coordinates: MenuCoordinates?,
+    onAnswer: (MenuCoordinates, String, Int, String?) -> Unit,
 ) {
+    val answerable = coordinates != null
     val colors = Forge.colors
     val type = Forge.type
     if (options.size <= 2) {
@@ -259,7 +281,10 @@ private fun OptionButtons(
             options.forEachIndexed { index, option ->
                 ForgeButton(
                     text = option.label,
-                    onClick = { onAnswer(option.key, index, null) },
+                    onClick = {
+                        val rendered = coordinates ?: return@ForgeButton
+                        onAnswer(rendered, option.key, index, null)
+                    },
                     kind = option.kind(),
                     enabled = answerable,
                     modifier = Modifier.weight(1f),
@@ -271,7 +296,10 @@ private fun OptionButtons(
             options.forEachIndexed { index, option ->
                 ForgeButton(
                     text = option.label,
-                    onClick = { onAnswer(option.key, index, null) },
+                    onClick = {
+                        val rendered = coordinates ?: return@ForgeButton
+                        onAnswer(rendered, option.key, index, null)
+                    },
                     kind = option.kind(),
                     enabled = answerable,
                     modifier = Modifier.fillMaxWidth(),

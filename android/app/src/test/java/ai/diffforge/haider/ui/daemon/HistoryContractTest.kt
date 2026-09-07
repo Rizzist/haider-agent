@@ -82,15 +82,15 @@ class HistoryContractTest {
     }
 
     @Test
-    fun `search says how much of the roster it has covered`() = runTest {
+    fun `search follows the cursor through every roster page`() = runTest {
         val service = FakeDaemonService(FakeScenario.LargeRoster)
-        val outcome = service.search("Session task 3")
-        // 60 rows are loaded and indexed; the roster has more pages, so the
-        // result cannot claim to be complete.
-        assertEquals(60, outcome.index.indexedSessions)
-        assertTrue("unread pages cannot be searched yet", !outcome.complete)
-        assertTrue(outcome.index.inProgress)
-        assertTrue(outcome.hits.isNotEmpty())
+        // "Session task 240" is the last row of the last page: round 2 reported
+        // "60 of 60 ... still indexing" and found nothing, with 180 unread.
+        val outcome = service.search("Session task 240")
+        assertEquals(240, outcome.index.totalSessions)
+        assertEquals(240, outcome.index.indexedSessions)
+        assertTrue("the last page must be searchable", outcome.hits.any { it.sessionId == "s-0239" })
+        assertTrue("a fully paged roster is complete coverage", outcome.complete)
     }
 
     @Test

@@ -34,8 +34,17 @@ data class ProviderDescriptor(
     val unavailableReason: String? = null,
     /** `ProviderSummaryWire.models`; the composer's model picker reads these. */
     val models: List<String> = emptyList(),
+    /** `model_details`, keyed by model id: where supported efforts live. */
+    val modelDetails: Map<String, ModelDetail> = emptyMap(),
     val defaultModel: String? = null,
     val apiFamily: String? = null,
+)
+
+/** One row of `ProviderSummaryWire.model_details`. */
+data class ModelDetail(
+    val supportedEfforts: List<String> = emptyList(),
+    val defaultEffort: String? = null,
+    val contextWindow: Long? = null,
 )
 
 data class Account(
@@ -107,6 +116,21 @@ interface AccountsRepository {
         provider: String,
         alias: String?,
         apiKey: CharArray,
+        replaceExisting: Boolean = false,
+    ): AccountResult
+
+    /**
+     * `vault.stage` alone. Returns the opaque reference, so the UI can consume
+     * and wipe the plaintext immediately and carry only the reference forward
+     * — the key is not needed again.
+     */
+    suspend fun stageApiKey(apiKey: CharArray): String?
+
+    /** `account.login_api` with an already-staged reference. */
+    suspend fun commitStagedApiKey(
+        provider: String,
+        alias: String?,
+        vaultReference: String,
         replaceExisting: Boolean = false,
     ): AccountResult
 

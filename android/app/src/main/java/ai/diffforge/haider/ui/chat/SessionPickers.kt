@@ -126,18 +126,21 @@ fun SessionPickerSheet(
                         )
                         option.models.forEach { model ->
                             PickerRow(
-                                label = ModelNames.short(model),
-                                secondary = model,
-                                selected = model == currentModel && option.id == currentProvider,
+                                label = ModelNames.short(model.id),
+                                secondary = model.id,
+                                selected = model.id == currentModel && option.id == currentProvider,
                                 enabled = option.available,
-                                onClick = { onSelectModel(option.id, model); onDismiss() },
+                                onClick = { onSelectModel(option.id, model.id); onDismiss() },
                             )
                         }
                     }
                 }
 
                 PickerKind.Effort -> {
-                    val efforts = inventory.effortsFor(currentProvider)
+                    // Per *model*, not per provider: Opus allows medium and
+                    // high where Sonnet also allows low, and offering `low` for
+                    // Opus is offering something the catalog rejects.
+                    val efforts = inventory.effortsFor(currentProvider, currentModel)
                     if (efforts.isEmpty()) EmptyInventory()
                     efforts.forEach { effort ->
                         PickerRow(

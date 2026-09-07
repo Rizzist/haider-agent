@@ -65,17 +65,41 @@ class DrawerSearchTest {
     }
 
     @Test
-    fun `incomplete coverage is stated, not implied`() {
+    fun `a fully paged roster reports complete coverage`() {
         val service = ComposeHost.install(FakeScenario.LargeRoster)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.setQuery("Session task 240")
+        rule.waitForIdle()
+        val outcome = viewModel.state.value.searchOutcome!!
+        // The last page is reachable now, and the coverage line says so by
+        // disappearing rather than by claiming a smaller roster.
+        assertTrue(outcome.complete)
+        assertEquals(240, outcome.index.totalSessions)
+        assertTrue(outcome.hits.any { it.sessionId == "s-0239" })
+    }
+
+    @Test
+    fun `history it could not read is stated, not implied`() {
+        // The drawer's search field appears above 20 sessions, so the coverage
+        // line lives with the large roster. One unreadable transcript is real
+        // partial coverage: fully paged, not fully indexed.
+        val service = ComposeHost.install(FakeScenario.LargeRoster)
+        service.transcriptOverride = { sessionId ->
+            if (sessionId == "s-0007") {
+                ai.diffforge.haider.ui.daemon.TranscriptLoad.Unavailable("history could not be read")
+            } else {
+                null
+            }
+        }
         val viewModel = rule.setHaiderApp(service)
         rule.onAllNodes(hasContentDescription("Open sessions", substring = true))
             .onFirst()
             .performClick()
         rule.waitForIdle()
-        viewModel.setQuery("Session task 3")
+        viewModel.setQuery("Session task")
         rule.waitForIdle()
         val outcome = viewModel.state.value.searchOutcome!!
-        assertTrue("unread pages cannot be searched yet", !outcome.complete)
+        assertTrue("an unreadable transcript is not coverage", !outcome.complete)
         assertTrue(
             rule.onAllNodesWithTextSafe(
                 "Searching ${outcome.index.indexedSessions} of " +

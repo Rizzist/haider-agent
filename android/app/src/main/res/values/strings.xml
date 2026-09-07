@@ -221,6 +221,7 @@
     <string name="accounts_set_active">Use this account</string>
     <string name="accounts_unavailable">%1$s is unavailable — %2$s</string>
     <string name="accounts_key_never_leaves">The key is stored in the on-device vault. It is never written to a log or a transcript.</string>
+    <string name="accounts_key_staged">Validated and held in the vault. Save to finish, or Cancel to discard it.</string>
 
     <!-- Content descriptions -->
     <string name="cd_open_sessions">Open sessions</string>

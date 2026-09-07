@@ -90,9 +90,22 @@ object AppContainer {
 
 class MainActivity : ComponentActivity() {
 
+    private var viewModel: ChatViewModel? = null
+
+    /**
+     * The result has to be propagated, not dropped. An empty callback left
+     * first-run stuck on step 2 with "Notifications are off" *after* the user
+     * had granted the permission, because nothing observable ever changed.
+     *
+     * A refusal with no rationale to show is a permanent denial: Android will
+     * not present the dialog again, so the banner switches to app settings.
+     */
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { /* reflected through the daemon snapshot */ }
+    ) { granted ->
+        val permanentlyDenied = !granted && !shouldShowNotificationRationale()
+        viewModel?.onNotificationPermissionResult(granted, permanentlyDenied)
+    }
 
     private val smsPermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -114,6 +127,7 @@ class MainActivity : ComponentActivity() {
                 notificationsSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
             ),
         )[ChatViewModel::class.java]
+        this.viewModel = viewModel
 
         val themeStore = ThemePreferences.store(this)
         val bannerPreferences = getSharedPreferences(BANNER_PREFERENCES, Context.MODE_PRIVATE)
@@ -205,7 +219,23 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityResumed(this)
+        // The user may have granted it in system settings while we were away.
+        syncNotificationPermission()
     }
+
+    private fun syncNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        viewModel?.onNotificationPermissionResult(
+            granted,
+            !granted && !shouldShowNotificationRationale(),
+        )
+    }
+
+    private fun shouldShowNotificationRationale(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            shouldShowRequestPermissionRationale(android.Manifest.permission.POST_NOTIFICATIONS)
 
     override fun onPause() {
         if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityPaused(this)

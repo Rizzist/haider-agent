@@ -117,16 +117,30 @@ data class SessionRow(
         get() = lastActivityMs != null && seenAtMs != null && lastActivityMs > seenAtMs
 }
 
+/**
+ * One model from `ProviderSummaryWire.model_details`. Efforts belong to the
+ * *model*, not the provider: Opus allows medium and high where Sonnet also
+ * allows low, and flattening them by provider offered a setting the catalog
+ * rejects.
+ */
+data class ModelOption(
+    val id: String,
+    val supportedEfforts: List<String> = emptyList(),
+    val defaultEffort: String? = null,
+    val contextWindow: Long? = null,
+)
+
 /** One provider row from `provider.list`, as the pickers need it. */
 data class ProviderOption(
     val id: String,
     val label: String,
-    val models: List<String>,
+    val models: List<ModelOption>,
     val defaultModel: String?,
     val available: Boolean,
     val unavailableReason: String?,
-    val efforts: List<String> = emptyList(),
-)
+) {
+    val modelIds: List<String> get() = models.map { it.id }
+}
 
 /** The `provider.list` snapshot plus its revision. */
 data class ProviderInventory(
@@ -134,11 +148,27 @@ data class ProviderInventory(
     val revision: Long = 0,
     val error: String? = null,
 ) {
-    fun modelsFor(provider: String?): List<String> =
-        providers.firstOrNull { it.id == provider }?.models.orEmpty()
+    fun provider(id: String?): ProviderOption? = providers.firstOrNull { it.id == id }
 
-    fun effortsFor(provider: String?): List<String> =
-        providers.firstOrNull { it.id == provider }?.efforts.orEmpty()
+    fun modelsFor(provider: String?): List<ModelOption> = provider(provider)?.models.orEmpty()
+
+    fun model(provider: String?, model: String?): ModelOption? =
+        provider(provider)?.models?.firstOrNull { it.id == model }
+
+    /**
+     * The efforts the *selected model* actually supports. An unknown pair
+     * offers nothing rather than a plausible-looking default: the picker would
+     * rather be empty than wrong.
+     */
+    fun effortsFor(provider: String?, model: String?): List<String> =
+        model(provider, model)?.supportedEfforts.orEmpty()
+
+    /** True when the catalog does not list this effort for this model. */
+    fun rejectsEffort(provider: String?, model: String?, effort: String?): Boolean {
+        if (effort == null) return false
+        val supported = effortsFor(provider, model)
+        return supported.isNotEmpty() && effort !in supported
+    }
 }
 
 /** Roster page state, so the drawer can scroll hundreds of sessions honestly. */
@@ -240,6 +270,16 @@ interface DaemonService {
 
     /** Network / notification / battery signals, from the C2 snapshot. */
     val environment: StateFlow<DaemonEnvironment>
+
+    /**
+     * Android-side permission results.
+     *
+     * In production these arrive through the C2 snapshot, but the snapshot is
+     * published by a service in another process: the Activity that receives the
+     * grant has to say so, or first-run sits on step 2 forever with the
+     * permission already granted. This is the door it says it through.
+     */
+    suspend fun reportNotificationPermission(granted: Boolean, permanentlyDenied: Boolean)
     val sessions: StateFlow<List<SessionRow>>
     val paging: StateFlow<RosterPaging>
     val activeSessionId: StateFlow<String?>

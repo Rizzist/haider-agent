@@ -61,7 +61,14 @@ class ChatViewModel(
             service.environment.collect { env -> update { it.copy(environment = env) }; recomputeSetup() }
         }
         viewModelScope.launch {
-            service.sessions.collect { rows -> update { it.copy(sessions = rows) } }
+            service.sessions.collect { rows ->
+                update { it.copy(sessions = rows) }
+                // Pages that arrive after a query was typed have to join it,
+                // or the result silently describes a smaller roster than the
+                // one the user is looking at.
+                val query = _state.value.query
+                if (query.isNotBlank()) rerunSearch(query)
+            }
         }
         viewModelScope.launch {
             service.paging.collect { paging -> update { it.copy(paging = paging) } }
@@ -182,13 +189,13 @@ class ChatViewModel(
      * answer is sent.
      */
     fun answer(
-        sessionId: String,
+        rendered: MenuCoordinates,
         optionKey: String,
         optionIndex: Int,
         text: String? = null,
     ) = viewModelScope.launch {
-        val coordinates = coordinatesFor(sessionId) ?: return@launch
-        submitAnswer(coordinates, optionKey, optionIndex, text?.let(MenuAnswerInput::Text))
+        val live = liveCoordinates(rendered) ?: return@launch
+        submitAnswer(live, optionKey, optionIndex, text?.let(MenuAnswerInput::Text))
     }
 
     /**
@@ -197,27 +204,43 @@ class ChatViewModel(
      * caller's buffer is wiped whatever happens.
      */
     fun answerSecret(
-        sessionId: String,
+        rendered: MenuCoordinates,
         optionKey: String,
         optionIndex: Int,
         secret: CharArray,
     ) = viewModelScope.launch {
-        val coordinates = coordinatesFor(sessionId)
         try {
-            if (coordinates == null) return@launch
+            val live = liveCoordinates(rendered) ?: return@launch
             val reference = runCatching { service.stageMenuSecret(secret) }.getOrNull()
                 ?: return@launch
-            submitAnswer(coordinates, optionKey, optionIndex, MenuAnswerInput.Secret(reference))
+            submitAnswer(live, optionKey, optionIndex, MenuAnswerInput.Secret(reference))
         } finally {
             secret.fill(' ')
         }
     }
 
-    private fun coordinatesFor(sessionId: String): MenuCoordinates? = MenuCoordinates.of(
-        sessionId = sessionId,
-        needsInput = session(sessionId)?.needsInput,
-        commandId = "menu-answer-${++commandSeq}",
-    )
+    /**
+     * Compare-and-set means comparing. The card hands back the coordinates it
+     * was *drawn* with; if the live snapshot now carries a different menu,
+     * request sequence or worker generation, the prompt on screen is not the
+     * prompt the daemon is waiting on, and the answer is dropped rather than
+     * applied to whatever replaced it.
+     */
+    private fun liveCoordinates(rendered: MenuCoordinates): MenuCoordinates? {
+        val current = MenuCoordinates.of(
+            sessionId = rendered.sessionId,
+            needsInput = session(rendered.sessionId)?.needsInput,
+            commandId = "menu-answer-${++commandSeq}",
+        ) ?: return null
+        val matches = current.menuId == rendered.menuId &&
+            current.requestSeq == rendered.requestSeq &&
+            current.workerGeneration == rendered.workerGeneration
+        if (!matches) {
+            update { it.copy(answeredElsewhere = it.answeredElsewhere + rendered.menuId) }
+            return null
+        }
+        return current
+    }
 
     private suspend fun submitAnswer(
         coordinates: MenuCoordinates,
@@ -282,16 +305,27 @@ class ChatViewModel(
         }
         searchJob = viewModelScope.launch {
             if (searchDebounceMs > 0) delay(searchDebounceMs)
-            val outcome = runCatching { service.search(query) }.getOrNull()
-            update {
-                if (it.query == query) {
-                    it.copy(searchOutcome = outcome, searching = false)
-                } else {
-                    it
-                }
-            }
+            runSearch(query)
         }
     }
+
+    private fun rerunSearch(query: String) {
+        if (searchJob?.isActive == true) return
+        searchJob = viewModelScope.launch { runSearch(query) }
+    }
+
+    private suspend fun runSearch(query: String) {
+        val outcome = runCatching { service.search(query) }.getOrNull()
+        update {
+            if (it.query == query) it.copy(searchOutcome = outcome, searching = false) else it
+        }
+    }
+
+    /** Called from the Activity's permission callback, granted or not. */
+    fun onNotificationPermissionResult(granted: Boolean, permanentlyDenied: Boolean) =
+        viewModelScope.launch {
+            service.reportNotificationPermission(granted, permanentlyDenied)
+        }
 
     fun skipBatteryStep() {
         batterySkipped = true

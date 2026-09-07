@@ -92,19 +92,57 @@ class ComposerPickersTest {
     }
 
     @Test
-    fun `the effort picker offers what the provider actually supports`() {
+    fun `the effort picker offers what the selected model supports`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         rule.setHaiderApp(service)
         rule.onAllNodes(hasContentDescription("Change effort", substring = true))
             .onFirst()
             .performClick()
         rule.waitForIdle()
+        // Sonnet is selected and does allow low.
         listOf("low", "medium", "high").forEach {
             rule.onNodeWithContentDescription(it).assertIsDisplayed()
         }
         rule.onNodeWithContentDescription("low").performClick()
         rule.waitForIdle()
         assertTrue(service.calls.contains("selectEffort:low"))
+    }
+
+    @Test
+    fun `the effort picker follows the model, not the provider`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        // Opus allows medium and high only; the picker must not offer low.
+        viewModel.selectModel("anthropic", "claude-opus-4-1")
+        rule.waitForIdle()
+        viewModel.openOverlay(
+            ai.diffforge.haider.ui.state.Overlay.Picker(ai.diffforge.haider.ui.chat.PickerKind.Effort),
+        )
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("medium").assertIsDisplayed()
+        rule.onNodeWithContentDescription("high").assertIsDisplayed()
+        rule.onNodeWithContentDescription("low").assertDoesNotExist()
+    }
+
+    @Test
+    fun `switching to a stricter model re-derives an unsupported effort`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.selectEffort("low")
+        rule.waitForIdle()
+        viewModel.selectModel("anthropic", "claude-opus-4-1")
+        rule.waitForIdle()
+        // `low` cannot survive the switch: Opus does not accept it.
+        assertEquals("high", service.models.value!!.current.effort)
+    }
+
+    @Test
+    fun `an unsupported effort is refused rather than sent`() = kotlinx.coroutines.test.runTest {
+        val service = ai.diffforge.haider.ui.daemon.FakeDaemonService(FakeScenario.Populated)
+        service.selectModel("anthropic", "claude-opus-4-1")
+        service.selectEffort("low")
+        assertTrue(service.calls.contains("selectEffort:rejected:low"))
+        assertTrue(service.calls.none { it == "selectEffort:low" })
     }
 
     @Test

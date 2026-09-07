@@ -54,6 +54,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -286,34 +287,38 @@ fun HaiderApp(
                     } else {
                         Column(Modifier.fillMaxSize()) {
                             if (needsInput != null) {
+                                // Keyed on the prompt: a replacement is a new
+                                // card, not a mutated one, so a callback held
+                                // from the old card keeps the old coordinates
+                                // and is refused rather than misapplied.
+                                key(
+                                    needsInput.menuId,
+                                    needsInput.requestSeq,
+                                    needsInput.workerGeneration,
+                                ) {
                                 InputRequiredCard(
                                     needsInput = needsInput,
                                     nowMs = nowMs,
                                     answeredElsewhere = needsInput.menuId in state.answeredElsewhere,
                                     // No coordinates, no answer affordance: a
                                     // compare-and-set needs all of them.
-                                    answerable = MenuCoordinates.of(
+                                    coordinates = MenuCoordinates.of(
                                         sessionId = state.activeSessionId.orEmpty(),
                                         needsInput = needsInput,
-                                        commandId = "render",
-                                    ) != null,
-                                    onAnswer = { key, index, text ->
-                                        val session = state.activeSessionId ?: return@InputRequiredCard
-                                        viewModel.answer(session, key, index, text)
+                                        commandId = "rendered",
+                                    ),
+                                    onAnswer = { rendered, key, index, text ->
+                                        viewModel.answer(rendered, key, index, text)
                                     },
-                                    onAnswerSecret = { key, index, secret ->
-                                        val session = state.activeSessionId
-                                        if (session == null) {
-                                            secret.fill(' ')
-                                        } else {
-                                            viewModel.answerSecret(session, key, index, secret)
-                                        }
+                                    onAnswerSecret = { rendered, key, index, secret ->
+                                        viewModel.answerSecret(rendered, key, index, secret)
                                     },
                                     modifier = Modifier.padding(
                                         horizontal = ForgeSpace.xl,
                                         vertical = ForgeSpace.lg,
                                     ),
                                 )
+                                }
                             }
                             state.transcriptNotice?.let { notice ->
                                 Text(

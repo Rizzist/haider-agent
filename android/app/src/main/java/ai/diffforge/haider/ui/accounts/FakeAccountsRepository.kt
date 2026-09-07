@@ -35,6 +35,7 @@ class FakeAccountsRepository(
     /** Method names only — never arguments; an argument here could be a key. */
     val calls = mutableListOf<String>()
 
+    private val staged = mutableMapOf<String, String>()
     private var polls = 0
     private var terminal: OAuthStatus? = null
 
@@ -76,6 +77,43 @@ class FakeAccountsRepository(
                 active = current.accounts.none { it.active },
                 // The daemon exposes a masked hint, never the key.
                 identity = "••••" + String(apiKey).takeLast(4),
+                status = "ok",
+            ),
+        )
+        return AccountResult.Ok
+    }
+
+    override suspend fun stageApiKey(apiKey: CharArray): String? {
+        calls += AccountsRpcAdapter.METHOD_VAULT_STAGE
+        if (apiKey.size < MIN_KEY_LENGTH) return null
+        // The daemon returns an opaque handle; the bytes stay behind.
+        staged["vaultref-${apiKey.size}"] = "••••" + String(apiKey).takeLast(4)
+        return "vaultref-${apiKey.size}"
+    }
+
+    override suspend fun commitStagedApiKey(
+        provider: String,
+        alias: String?,
+        vaultReference: String,
+        replaceExisting: Boolean,
+    ): AccountResult {
+        calls += AccountsRpcAdapter.METHOD_ACCOUNT_LOGIN_API
+        nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
+        val hint = staged[vaultReference] ?: return AccountResult.Failed("unknown_vault_reference")
+        val resolvedAlias = alias?.takeIf { it.isNotBlank() } ?: provider
+        val current = _snapshot.value
+        if (!replaceExisting && current.accounts.any { it.alias == resolvedAlias }) {
+            return AccountResult.Failed("account_exists")
+        }
+        _snapshot.value = AccountsSnapshot(
+            revision = current.revision + 1,
+            accounts = current.accounts.filterNot { it.alias == resolvedAlias } + Account(
+                alias = resolvedAlias,
+                provider = provider,
+                label = null,
+                authKind = AuthKind.ApiKey,
+                active = current.accounts.none { it.active },
+                identity = hint,
                 status = "ok",
             ),
         )

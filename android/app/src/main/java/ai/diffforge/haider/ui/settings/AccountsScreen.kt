@@ -21,6 +21,8 @@ import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -105,18 +107,26 @@ fun AccountsScreen(
     var localNotice by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     val secret = remember { SecretBuffer() }
+    // Once staged, the plaintext is not needed again: the reference is what
+    // `account.login_api` claims. Holding the key past staging is the whole
+    // finding — "Key validated" left the masked field populated.
+    var stagedReference by remember { mutableStateOf<String?>(null) }
     val notice = localNotice ?: controllerNotice
 
     // The buffer never outlives the screen, however the screen ends.
     DisposableEffect(Unit) {
         onDispose { secret.wipe() }
     }
+    // A staged key that is validated but never saved says so, so the empty
+    // field does not read as "nothing happened".
+    val stagedHint = stagedReference != null && keyText.isBlank()
     // Leaving the API-key form for any reason clears the key with it.
     LaunchedEffect(mode) {
         if (mode != AddMode.ApiKey) {
             secret.wipe()
             keyText = ""
             revealKey = false
+            stagedReference = null
         }
     }
     LaunchedEffect(Unit) {
@@ -128,6 +138,11 @@ fun AccountsScreen(
         secret.wipe()
         keyText = ""
         revealKey = false
+    }
+
+    fun forgetStaging() {
+        clearSecret()
+        stagedReference = null
     }
 
     Column(
@@ -144,7 +159,7 @@ fun AccountsScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ForgeIconButton(
-                onClick = { clearSecret(); onBack() },
+                onClick = { forgetStaging(); onBack() },
                 contentDescription = stringResource(R.string.action_back),
             ) {
                 Icon(
@@ -236,6 +251,8 @@ fun AccountsScreen(
                         onValueChange = {
                             keyText = it
                             secret.set(it)
+                            // Editing invalidates a previous staging.
+                            stagedReference = null
                         },
                         masked = !revealKey,
                         tag = ACCOUNTS_KEY_FIELD_TAG,
@@ -256,9 +273,15 @@ fun AccountsScreen(
                         },
                     )
                     Text(
-                        stringResource(R.string.accounts_key_never_leaves),
+                        stringResource(
+                            if (stagedHint) {
+                                R.string.accounts_key_staged
+                            } else {
+                                R.string.accounts_key_never_leaves
+                            },
+                        ),
                         style = type.sessionMeta,
-                        color = colors.textMuted,
+                        color = if (stagedHint) colors.accent else colors.textMuted,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
                         ForgeButton(
@@ -268,14 +291,24 @@ fun AccountsScreen(
                                 busy = true
                                 scope.launch {
                                     try {
-                                        // Validation reads the buffer and hands
-                                        // back nothing: no copy escapes `use`.
                                         val result = secret.use { repository.validateApiKey(chosen, it) }
+                                        if (result is AccountResult.Ok) {
+                                            // Stage it, keep only the handle,
+                                            // and drop the key on the spot.
+                                            stagedReference = secret.use { repository.stageApiKey(it) }
+                                        }
                                         localNotice = when (result) {
-                                            AccountResult.Ok -> "Key validated."
+                                            AccountResult.Ok -> if (stagedReference != null) {
+                                                "Key validated."
+                                            } else {
+                                                "invalid_api_key"
+                                            }
                                             is AccountResult.Failed -> result.publicCode
                                         }
                                     } finally {
+                                        // Validated or refused, the plaintext
+                                        // does not outlive this handler.
+                                        clearSecret()
                                         busy = false
                                     }
                                 }
@@ -291,13 +324,21 @@ fun AccountsScreen(
                                 scope.launch {
                                     var result: AccountResult? = null
                                     try {
-                                        result = secret.use {
-                                            repository.addApiKey(chosen, alias.takeIf(String::isNotBlank), it)
+                                        val reference = stagedReference
+                                            ?: secret.use { repository.stageApiKey(it) }
+                                        result = if (reference == null) {
+                                            AccountResult.Failed("invalid_api_key")
+                                        } else {
+                                            repository.commitStagedApiKey(
+                                                chosen,
+                                                alias.takeIf(String::isNotBlank),
+                                                reference,
+                                            )
                                         }
                                     } finally {
                                         // Whatever happened — success, refusal,
                                         // cancellation — the key is gone.
-                                        clearSecret()
+                                        forgetStaging()
                                         busy = false
                                     }
                                     when (result) {
@@ -312,12 +353,13 @@ fun AccountsScreen(
                                     }
                                 }
                             },
-                            enabled = provider != null && keyText.isNotBlank() && !busy,
+                            enabled = provider != null &&
+                                (keyText.isNotBlank() || stagedReference != null) && !busy,
                         )
                         ForgeButton(
                             text = stringResource(R.string.action_cancel),
                             onClick = {
-                                clearSecret()
+                                forgetStaging()
                                 mode = AddMode.None
                             },
                             kind = ForgeButtonKind.Ghost,
@@ -465,6 +507,7 @@ private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () 
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ProviderPicker(
     providers: List<ProviderDescriptor>,
@@ -475,7 +518,12 @@ private fun ProviderPicker(
     val type = Forge.type
     Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
         Text(stringResource(R.string.accounts_provider), style = type.label, color = colors.textMuted)
-        Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+        // A fixed Row squeezed the fifth provider to a four-pixel sliver on a
+        // 360 dp phone. Wrapping keeps every label its own full width.
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+            verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
+        ) {
             providers.forEach { descriptor ->
                 ForgeChip(
                     onClick = { onSelect(descriptor.id) },

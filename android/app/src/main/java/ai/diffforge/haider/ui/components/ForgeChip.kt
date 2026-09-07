@@ -8,10 +8,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,21 +47,32 @@ fun ForgeChip(
     val colors = Forge.colors
     val fill = backgroundColor ?: if (selected) colors.accentWash else colors.surfaceControl
     val outline = borderColor ?: if (selected) colors.accent else colors.border
-    Row(
+    // The clickable parent IS the target: 48 x 48 minimum, with the small
+    // visual chip centred inside it. `minimumInteractiveComponentSize` grows
+    // only the platform's touch delegate, so the node a sweep (or a screen
+    // reader) measures stayed 32 dp — which is why chips needed an exemption
+    // list at all. They do not need one now.
+    Box(
         modifier = modifier
-            .minimumInteractiveComponentSize()
-            .height(height)
+            .defaultMinSize(minWidth = ForgeSize.touch, minHeight = ForgeSize.touch)
             .clip(ForgeShapes.pill)
-            .background(fill)
-            .border(ForgeSize.hairline, outline, ForgeShapes.pill)
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = ForgeSpace.lg)
             .semantics {
                 this.role = Role.Button
                 if (contentDescription != null) this.contentDescription = contentDescription
             },
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
-        content = { content() },
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            modifier = Modifier
+                .height(height)
+                .clip(ForgeShapes.pill)
+                .background(fill)
+                .border(ForgeSize.hairline, outline, ForgeShapes.pill)
+                .padding(horizontal = ForgeSpace.lg),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
+            content = { content() },
+        )
+    }
 }

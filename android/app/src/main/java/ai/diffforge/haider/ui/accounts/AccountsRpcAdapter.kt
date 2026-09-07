@@ -220,6 +220,7 @@ object AccountsRpcAdapter {
                 available = availability == "available" && item.optBoolean("enabled", true),
                 unavailableReason = item.optStringOrNull("availability_reason"),
                 models = item.stringList("models"),
+                modelDetails = item.modelDetails(),
                 defaultModel = item.optStringOrNull("default_model"),
                 apiFamily = item.optStringOrNull("api_family"),
             )
@@ -309,6 +310,28 @@ object AccountsRpcAdapter {
 
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (isNull(key)) null else optString(key).ifBlank { null }
+
+    /**
+     * `ProviderSummaryWire.model_details` (frame.rs:1383). `models` is the flat
+     * id list; the per-model detail is where supported efforts live, and the
+     * effort picker reads it rather than a provider-wide guess.
+     */
+    private fun JSONObject.modelDetails(): Map<String, ModelDetail> {
+        val array = optJSONArray("model_details") ?: return emptyMap()
+        return (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val name = item.optString("name").ifBlank { null } ?: return@mapNotNull null
+            name to ModelDetail(
+                supportedEfforts = item.stringList("supported_efforts"),
+                defaultEffort = item.optStringOrNull("default_effort"),
+                contextWindow = if (item.isNull("context_window")) {
+                    null
+                } else {
+                    item.optLong("context_window")
+                },
+            )
+        }.toMap()
+    }
 
     private fun JSONObject.stringList(key: String): List<String> {
         val array = optJSONArray(key) ?: return emptyList()

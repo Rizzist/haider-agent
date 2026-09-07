@@ -256,6 +256,17 @@ class FakeDaemonService(
         _status.value = running()
     }
 
+    override suspend fun reportNotificationPermission(
+        granted: Boolean,
+        permanentlyDenied: Boolean,
+    ) {
+        calls += "permissions.notifications:$granted"
+        _environment.value = _environment.value.copy(
+            notificationsGranted = granted,
+            notificationsPermanentlyDenied = !granted && permanentlyDenied,
+        )
+    }
+
     override suspend fun refreshRoster() {
         calls += "refreshRoster"
     }
@@ -379,12 +390,30 @@ class FakeDaemonService(
     override suspend fun selectModel(provider: String, model: String) {
         calls += "selectModel:$provider/$model"
         val current = _models.value ?: return
-        _models.value = current.copy(current = current.current.copy(provider = provider, model = model))
+        // The daemon re-derives effort when the model changes: an effort the
+        // new model does not support cannot survive the switch.
+        val inventory = _providers.value
+        val effort = current.current.effort
+        val resolved = if (inventory.rejectsEffort(provider, model, effort)) {
+            inventory.model(provider, model)?.defaultEffort
+        } else {
+            effort
+        }
+        _models.value = current.copy(
+            current = current.current.copy(provider = provider, model = model, effort = resolved),
+        )
     }
 
     override suspend fun selectEffort(effort: String?) {
-        calls += "selectEffort:$effort"
         val current = _models.value ?: return
+        // The daemon refuses an unsupported effort; so does the fake, or the
+        // UI would look correct against a catalog that would reject it.
+        if (_providers.value.rejectsEffort(current.current.provider, current.current.model, effort)) {
+            calls += "selectEffort:rejected:$effort"
+            _catalogError.value = "unsupported_effort"
+            return
+        }
+        calls += "selectEffort:$effort"
         _models.value = current.copy(current = current.current.copy(effort = effort))
     }
 
@@ -402,8 +431,8 @@ class FakeDaemonService(
 
     override suspend fun selectProvider(provider: String) {
         calls += "selectProvider:$provider"
-        val option = _providers.value.providers.firstOrNull { it.id == provider } ?: return
-        val model = option.defaultModel ?: option.models.firstOrNull() ?: return
+        val option = _providers.value.provider(provider) ?: return
+        val model = option.defaultModel ?: option.modelIds.firstOrNull() ?: return
         selectModel(provider, model)
     }
 
@@ -452,6 +481,13 @@ class FakeDaemonService(
         val needle = query.trim().lowercase()
         if (needle.isEmpty()) {
             return SearchOutcome(emptyList(), _searchIndex.value, complete = _searchIndex.value.complete)
+        }
+        // Follow `next_cursor` through *all* pages before answering. Searching
+        // only what happens to be loaded reported "60 of 60 … still indexing"
+        // while 180 rows sat unread, and found nothing on the last page.
+        var guard = 0
+        while (_paging.value.hasMore && guard++ < MAX_SEARCH_PAGES) {
+            loadMoreSessions()
         }
         val rows = _sessions.value
         val hits = mutableListOf<SearchHit>()
@@ -512,20 +548,22 @@ class FakeDaemonService(
             ProviderOption(
                 id = "anthropic",
                 label = "Anthropic",
-                models = listOf("claude-sonnet-4-5", "claude-opus-4-1"),
+                models = listOf(
+                    ModelOption("claude-sonnet-4-5", listOf("low", "medium", "high"), "high", 200_000),
+                    // Opus does not offer `low`; the picker must not either.
+                    ModelOption("claude-opus-4-1", listOf("medium", "high"), "high", 200_000),
+                ),
                 defaultModel = "claude-sonnet-4-5",
                 available = true,
                 unavailableReason = null,
-                efforts = listOf("low", "medium", "high"),
             ),
             ProviderOption(
                 id = "openai",
                 label = "OpenAI",
-                models = listOf("gpt-5"),
+                models = listOf(ModelOption("gpt-5", listOf("medium", "high"), "medium", 400_000)),
                 defaultModel = "gpt-5",
                 available = false,
                 unavailableReason = "No account configured",
-                efforts = listOf("medium", "high"),
             ),
         ),
     )
@@ -737,6 +775,9 @@ class FakeDaemonService(
     )
 
     companion object {
+        /** Bounds a runaway cursor rather than paging forever. */
+        const val MAX_SEARCH_PAGES = 64
+
         /** A fixed wall clock so screenshots are byte-stable. */
         const val FIXED_NOW: Long = 1_772_000_000_000L
 
