@@ -5,4 +5,218 @@
     <string name="screen_capture_channel_description">Shows when Haider has active screen-capture consent.</string>
     <string name="screen_capture_notification_title">Haider screen capture</string>
     <string name="screen_capture_notification_text">Screen capture is ready for one frame.</string>
+
+    <!-- Header -->
+    <string name="app_subtitle_setup">Setting up · step %1$d of %2$d</string>
+    <string name="header_new_session">New session</string>
+    <string name="header_fallback_title">Haider</string>
+    <string name="header_session_fallback">Session %1$s</string>
+
+    <!-- Start surface -->
+    <string name="start_title">Haider runs on this phone</string>
+    <string name="start_subtitle">v%1$s · no server, no Termux</string>
+    <string name="start_lede">The agent, its sessions and its transcripts live in this app. Four steps and it is yours.</string>
+    <string name="start_lede_three">The agent, its sessions and its transcripts live in this app. Three steps and it is yours.</string>
+    <string name="step_service_title">Run Haider in the background</string>
+    <string name="step_service_body">A sticky foreground service hosts the agent. No runtime permission is needed.</string>
+    <string name="step_service_action">Start Haider</string>
+    <string name="step_service_done">Running · %1$s · started %2$s</string>
+    <string name="step_notify_title">Let Haider notify you</string>
+    <string name="step_notify_body">Without notifications you will not be told when a turn finishes or the agent needs an answer.</string>
+    <string name="step_notify_action">Allow notifications</string>
+    <string name="step_notify_done">Notifications allowed</string>
+    <string name="step_battery_title">Keep it alive on One UI</string>
+    <string name="step_battery_body">Samsung puts sleeping apps to death. Mark Haider as unrestricted so long turns survive the screen going off.</string>
+    <string name="step_battery_action">Open battery settings</string>
+    <string name="step_battery_done">Battery restrictions cleared</string>
+    <string name="step_model_title">Pick a model</string>
+    <string name="step_model_body">Sign in to a provider or paste a key. You can change it per session later.</string>
+    <string name="step_model_action">Choose a model</string>
+    <string name="step_model_done">%1$s · %2$s</string>
+    <string name="suggestions_header">WHEN YOU ARE READY</string>
+    <string name="suggestion_sms">Summarise the texts I missed today</string>
+    <string name="suggestion_screen">What is on my screen right now?</string>
+    <string name="suggestion_settings">Open Settings and turn on Wi-Fi calling</string>
+    <string name="ready_line">Ready. Ask for anything on this phone.</string>
+    <string name="recent_sessions_header">RECENT SESSIONS</string>
+    <string name="see_all_sessions">See all %1$d sessions</string>
+
+    <!-- Drawer -->
+    <string name="drawer_new_session">New session</string>
+    <string name="drawer_new_session_with">New session with…</string>
+    <string name="drawer_group_needs_you">NEEDS YOU</string>
+    <string name="drawer_group_active">ACTIVE</string>
+    <string name="drawer_group_recent">RECENT</string>
+    <string name="drawer_empty">No sessions yet. Tap New session to start one.</string>
+    <string name="drawer_filter_empty">Nothing is running right now.</string>
+    <string name="drawer_search_empty">No session matches “%1$s”.</string>
+    <string name="drawer_search_hint">Search sessions</string>
+    <string name="drawer_filter_all">All %1$d</string>
+    <string name="drawer_filter_running">Running %1$d</string>
+    <string name="drawer_filter_needs_input">Needs input %1$d</string>
+    <string name="drawer_identity_line">v%1$s · on this device</string>
+    <string name="drawer_loading_more">Loading more sessions…</string>
+    <string name="drawer_footer_model">Model</string>
+    <string name="drawer_footer_settings">Settings</string>
+    <string name="drawer_footer_settings_secondary">Permissions, daemon, accounts, updates</string>
+    <string name="drawer_footer_appearance">Appearance</string>
+    <string name="appearance_system">Sys</string>
+    <string name="appearance_light">Light</string>
+    <string name="appearance_dark">Dark</string>
+
+    <!-- Daemon -->
+    <string name="daemon_running">Running in background</string>
+    <string name="daemon_starting">Starting…</string>
+    <string name="daemon_recovering">Recovering…</string>
+    <string name="daemon_restarting">Restarting…</string>
+    <string name="daemon_stopping">Stopping…</string>
+    <string name="daemon_stopped">Stopped</string>
+    <string name="daemon_failed">Stopped — %1$s</string>
+    <string name="daemon_action_start">Start</string>
+    <string name="daemon_action_stop">Stop</string>
+    <string name="daemon_action_restart">Restart</string>
+    <string name="daemon_sessions_segment">%1$d sessions</string>
+    <string name="daemon_turns_segment">%1$d turn active</string>
+    <string name="daemon_memory_segment">%1$s MB</string>
+    <string name="daemon_uptime_segment">up %1$s</string>
+    <string name="daemon_details_title">Daemon details</string>
+    <string name="daemon_copy_diagnostics">Copy diagnostics</string>
+
+    <!-- Banner -->
+    <string name="banner_stopped_title">Haider isn\'t running</string>
+    <string name="banner_stopped_body">Sessions are frozen until it starts.</string>
+    <string name="banner_stopped_action">Start</string>
+    <string name="banner_starting_title">Starting Haider…</string>
+    <string name="banner_starting_body">First start takes a few seconds.</string>
+    <string name="banner_needs_you_title">“%1$s” needs you</string>
+    <string name="banner_needs_you_body">Waiting %1$s — %2$s</string>
+    <string name="banner_needs_you_action">Open</string>
+    <string name="banner_notify_title">Notifications are off</string>
+    <string name="banner_notify_body">You won\'t hear when a turn ends or Haider asks.</string>
+    <string name="banner_notify_action">Allow</string>
+    <string name="banner_battery_title">Android may stop Haider</string>
+    <string name="banner_battery_body">Mark it unrestricted so long turns survive.</string>
+    <string name="banner_battery_action">Fix</string>
+    <string name="banner_offline_title">No network</string>
+    <string name="banner_offline_body">The agent runs locally, but model calls will fail.</string>
+    <string name="banner_daemon_details_action">Daemon details</string>
+    <string name="cd_dismiss_banner">Dismiss</string>
+
+    <!-- Composer -->
+    <string name="chip_model_label">MODEL</string>
+    <string name="chip_model_loading_cd">Loading models</string>
+    <string name="chip_model_error">Models unavailable · Retry</string>
+    <string name="chip_model_no_daemon">Start Haider first</string>
+    <string name="chip_model_changing">changing…</string>
+    <string name="composer_placeholder">Message Haider…</string>
+    <string name="composer_helper_running">Haider is working — tap the stop button to end this turn.</string>
+    <string name="composer_helper_paused">The turn is paused.</string>
+    <string name="composer_helper_setup">Finish setup to send.</string>
+    <string name="composer_helper_starting">Starting Haider…</string>
+    <string name="composer_placeholder_paused">Answer above to continue…</string>
+    <string name="composer_context_estimated">~%1$s ctx</string>
+    <string name="composer_context_exact">%1$s ctx</string>
+    <string name="attach_screenshot">Screenshot of my screen</string>
+    <string name="attach_file">Photo or file</string>
+    <string name="attach_title">Attach</string>
+
+    <!-- Input required -->
+    <string name="ask_eyebrow">HAIDER NEEDS YOU</string>
+    <string name="ask_waiting">Waiting %1$s · notification sent</string>
+    <string name="ask_answered_elsewhere">Answered elsewhere.</string>
+    <string name="ask_secret_elsewhere">Answer this on your computer — secrets cannot be typed here.</string>
+    <string name="ask_allow_always_note">Won\'t ask again this session</string>
+    <string name="ask_send">Send</string>
+    <string name="ask_free_text_hint">Type your answer</string>
+
+    <!-- Session actions -->
+    <string name="action_session_details">Session details</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_fork">Fork session</string>
+    <string name="action_stop_turn">Stop turn</string>
+    <string name="action_clear_transcript">Clear transcript</string>
+    <string name="action_settings">Settings</string>
+    <string name="action_copy_session_id">Copy session id</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_save">Save</string>
+    <string name="action_done">Done</string>
+    <string name="action_back">Back</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_section_daemon">DAEMON</string>
+    <string name="settings_section_accounts">ACCOUNTS</string>
+    <string name="settings_section_permissions">PERMISSIONS</string>
+    <string name="settings_section_appearance">APPEARANCE</string>
+    <string name="settings_section_updates">UPDATES</string>
+    <string name="settings_section_about">ABOUT</string>
+    <string name="settings_permission_accessibility">Accessibility</string>
+    <string name="settings_permission_accessibility_body">Read the on-screen UI tree and inject taps and swipes that you authorise.</string>
+    <string name="settings_permission_accessibility_action">Open Accessibility settings</string>
+    <string name="settings_permission_screen">Screen capture</string>
+    <string name="settings_permission_screen_body">Android asks for consent each session, the first time the agent needs a frame.</string>
+    <string name="settings_permission_sms">SMS</string>
+    <string name="settings_permission_sms_body">Read your inbox and receive incoming messages as they arrive.</string>
+    <string name="settings_permission_sms_action">Grant SMS access</string>
+    <string name="settings_permission_notifications">Notifications</string>
+    <string name="settings_permission_notifications_body">Turn ends and questions arrive as notifications.</string>
+    <string name="settings_permission_battery">Battery</string>
+    <string name="settings_permission_battery_body">An unrestricted app keeps running while the screen is off.</string>
+    <string name="settings_about_version">Haider %1$s</string>
+    <string name="settings_about_body">The agent, its sessions and its transcripts live on this device.</string>
+
+    <!-- Accounts -->
+    <string name="accounts_title">Accounts</string>
+    <string name="accounts_empty">No accounts yet. Add an API key or sign in to a provider.</string>
+    <string name="accounts_add_api_key">Add API key</string>
+    <string name="accounts_sign_in">Sign in with a provider</string>
+    <string name="accounts_provider">Provider</string>
+    <string name="accounts_alias">Name (optional)</string>
+    <string name="accounts_api_key">API key</string>
+    <string name="accounts_api_key_hint">Paste the key</string>
+    <string name="accounts_validate">Validate</string>
+    <string name="accounts_validated">Key validated.</string>
+    <string name="accounts_saved">API key added and validated.</string>
+    <string name="accounts_removed">Account removed.</string>
+    <string name="accounts_remove_confirm">Remove %1$s?</string>
+    <string name="accounts_oauth_start">Start sign-in</string>
+    <string name="accounts_oauth_opening">Opening your browser…</string>
+    <string name="accounts_oauth_waiting">Finish the sign-in in your browser, then come back.</string>
+    <string name="accounts_oauth_code">Code: %1$s</string>
+    <string name="accounts_oauth_open_again">Open the sign-in page</string>
+    <string name="accounts_oauth_claiming">Linking the account…</string>
+    <string name="accounts_oauth_failed">Sign-in failed — %1$s</string>
+    <string name="accounts_signed_in">Signed in: %1$s</string>
+    <string name="accounts_active">ACTIVE</string>
+    <string name="accounts_set_active">Use this account</string>
+    <string name="accounts_unavailable">%1$s is unavailable — %2$s</string>
+    <string name="accounts_key_never_leaves">The key is stored in the on-device vault. It is never written to a log or a transcript.</string>
+
+    <!-- Content descriptions -->
+    <string name="cd_open_sessions">Open sessions</string>
+    <string name="cd_open_sessions_needs">Open sessions, %1$d session needs input</string>
+    <string name="cd_open_sessions_running">Open sessions, %1$d running</string>
+    <string name="cd_open_sessions_errored">Open sessions, %1$d errored</string>
+    <string name="cd_close_sessions">Close sessions</string>
+    <string name="cd_more_options">More options</string>
+    <string name="cd_attach">Attach</string>
+    <string name="cd_send">Send message</string>
+    <string name="cd_start_and_send">Start Haider and send</string>
+    <string name="cd_stop_turn">Stop this turn</string>
+    <string name="cd_change_model">Change model</string>
+    <string name="cd_new_activity">new activity</string>
+    <string name="cd_start_haider">Start Haider</string>
+    <string name="cd_new_session">New session</string>
+    <string name="cd_show_key">Show the key</string>
+    <string name="cd_hide_key">Hide the key</string>
+    <string name="cd_clear_search">Clear the search</string>
+
+    <!-- Spoken state words -->
+    <string name="state_running">Running</string>
+    <string name="state_needs_input">Needs input</string>
+    <string name="state_errored">Errored</string>
+    <string name="state_waiting_network">Waiting for network</string>
+    <string name="state_idle">Idle</string>
 </resources>
