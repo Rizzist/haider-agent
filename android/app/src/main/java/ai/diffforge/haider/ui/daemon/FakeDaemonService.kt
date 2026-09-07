@@ -12,6 +12,7 @@ import ai.diffforge.haider.ui.chat.ToolStatus
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -318,6 +319,10 @@ class FakeDaemonService(
             seenAtMs = nowMs,
             createdAtMs = nowMs,
         )
+        // A real create is a round trip: the id is not visible until it comes
+        // back. Publishing it synchronously hid the window in which a second
+        // caller sees no active session and creates another one.
+        yield()
         _sessions.value = listOf(row) + _sessions.value
         // A new session has no history: it must not inherit a default fixture,
         // or "open and chat" lands on somebody else's transcript.
