@@ -42,6 +42,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Windows installer compile check (advisory)
+        if: runner.os == 'Windows' && matrix.phase == 'check'
+        # Registry #80: advisory until its first green CI run, then make required.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (!(Test-Path "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+          ./packaging/installers/windows-compile-check.ps1
       - name: unsafe-count gate
         shell: bash
         run: bash scripts/check-unsafe-counts.sh
