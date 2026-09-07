@@ -26,6 +26,7 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+haider-tools = { path = "../haider-tools" }
 haider-store = { path = "../haider-store" }
 haider-provider = { path = "../haider-provider" }
 async-trait.workspace = true
