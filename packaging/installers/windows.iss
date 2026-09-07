@@ -4,6 +4,12 @@
 AppId=HaiderHarness
 AppName=Haider
 AppVersion={#ReleaseVersion}
+; Inno 6 version-resource contracts: https://jrsoftware.org/ishelp/topic_setup_versioninfoversion.htm
+; https://jrsoftware.org/ishelp/topic_setup_versioninfoproducttextversion.htm
+; https://jrsoftware.org/ishelp/topic_setup_versioninfotextversion.htm
+VersionInfoVersion={#ReleaseVersion}.0
+VersionInfoProductTextVersion={#ReleaseVersion}
+VersionInfoTextVersion={#ReleaseVersion}
 AppPublisher=Haider
 DefaultDirName={localappdata}\Programs\Haider
 DisableProgramGroupPage=yes

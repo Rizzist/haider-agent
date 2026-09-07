@@ -1,5 +1,100 @@
 # v0.0.970 installer lane
 
+## Round 2 — first native Windows post-compile execution
+
+This section supersedes the Windows tool-availability and execution status in
+the historical sections below. Packaging source is based on `98e219c7`.
+[Windows-only run 34115729654](https://github.com/Rizzist/haider-agent/actions/runs/34115729654)
+ran on side branch `ci-winonly-98e219c7`, workflow head
+`524c0f299281ada5285d7b9bb65d58493d881845`. Its Windows release build succeeded;
+the additional-installers job compiled the release installer, then failed at
+the old `windows-build.ps1:45` with `Installer version mismatch: 0.0.970`.
+The log has literal spaces after the version inside PowerShell's formatted
+exception. The fixture compile, lifecycle gate, signature check and sidecar
+write were not reached. The earlier xplat advisory ISCC compile on `98e219c7`
+had already passed; compiler success alone did not exercise this wrapper.
+
+The root-cause hypothesis is padded Inno text resources compared without
+normalization. There is now direct local artifact evidence: the newly compiled
+PE contains `ProductVersion = "0.0.970"` followed by **43 U+0020 spaces**, and
+`FileVersion` followed by 13 spaces, even with explicit text directives.
+Both fixed numeric versions are `0.0.970.0`. This establishes real resource
+padding in the local Inno build; the failed Windows artifact's resource has
+not been independently read, so its exact raw value remains a CI check.
+
+Changes and audited contracts:
+
+- `windows.iss` sets `VersionInfoVersion={#ReleaseVersion}.0`,
+  `VersionInfoProductTextVersion={#ReleaseVersion}`, and
+  `VersionInfoTextVersion={#ReleaseVersion}`. The Inno 6.7.3 docs define the
+  [numeric file version](https://github.com/jrsoftware/issrc/blob/is-6_7_3/ISHelp/isetup.xml#L6258),
+  [textual product version](https://github.com/jrsoftware/issrc/blob/is-6_7_3/ISHelp/isetup.xml#L6232),
+  and [textual file version](https://github.com/jrsoftware/issrc/blob/is-6_7_3/ISHelp/isetup.xml#L6249)
+  separately; the numeric product version defaults to the numeric file version.
+  Inno accepts fewer than four numeric components, but the template explicitly
+  supplies all four. These directives do not remove Inno's text padding.
+- `windows-build.ps1` trims only boundary whitespace/NULs, then uses ordinal
+  equality against `V` and `V.0`. PowerShell's culture-aware equality can ignore
+  an embedded NUL; the local negative probe caught that and the ordinal fix
+  rejects it. Both release and older fixture resources are checked. Diagnostics
+  include raw text, length, every character code, normalized text, and
+  `FileVersion`, `ProductVersion`, `FileVersionRaw`, `ProductVersionRaw`, written
+  directly to the log as well as included in any mismatch exception.
+- The fixture retains the hash-verified current payload and manifest while
+  changing only installer metadata to `0.0.969`. It stays unsigned in the
+  temporary work directory. Progress messages identify release compile,
+  fixture compile, install, upgrade, verification, uninstall, removal,
+  signature verification and final checksum output. Every direct native call
+  (`python`, both ISCC calls, installed `haider --version`) checks its exit code.
+  The invoked PowerShell lifecycle script propagates terminating errors;
+  its success is not inferred from a stale `$LASTEXITCODE`.
+- `Run-Setup` uses a single explicitly quoted argument string, separate
+  executable path, `-Wait -PassThru`, and rejects every nonzero exit.
+  [Start-Process](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/start-process?view=powershell-7.5)
+  joins argument arrays and waits for descendants on Windows. Each phase has
+  its own `/LOG="path"` outside the builder's deleted work directory; native
+  failures print the log tail. Both setup and uninstall retain
+  `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, as documented for
+  [setup](https://jrsoftware.org/ishelp/topic_setupcmdline.htm) and
+  [uninstall](https://jrsoftware.org/ishelp/topic_uninstcmdline.htm).
+- The unchanged `AppId=HaiderHarness` implies ARP key `HaiderHarness_is1`
+  ([Inno AppId rule](https://jrsoftware.org/ishelp/topic_setup_appid.htm)).
+  A refused-existing-install preflight and stable AppId preserve the clean
+  `unins000.exe`/`.dat` upgrade contract; a missing uninstaller fails explicitly.
+  Signed uninstallers must validate and retain the `.msg` file assertion;
+  a valid signed upgrade must install a valid signed uninstaller.
+- The CI guard retains `CI=true` and `RUNNER_OS=Windows` and also checks
+  PowerShell's actual `$IsWindows`. Registry snapshots tolerate a missing
+  `Environment` key, distinguish absent and empty PATH values, dispose handles,
+  and use `DoNotExpandEnvironmentNames` for raw restoration checks. The installed
+  PATH token check still uses expanded user PATH so expandable duplicates fail.
+  Removal still requires exact raw PATH text (now ordinal) and kind,
+  absent install directory/owner/ARP keys, and an unchanged state sentinel.
+- File-set count checks handle empty results before `Compare-Object`; failures
+  print expected/actual members. File operations use `-LiteralPath` for paths
+  with spaces or wildcard characters. All payload/manifest hashes and complete
+  file-set checks remain required. Cleanup attempts all owned removals and
+  reports errors without hiding the original failure; cleanup-only errors fail.
+
+Local round-2 validation (external evidence: `state/evidence/970-winiss/3-impl2`):
+
+| Gate | Result |
+| --- | --- |
+| `~/.local/bin/pwsh -NoProfile -File .../checks/parse-scripts.ps1` (`Parser.ParseFile` with collected errors, both scripts) | Exit 0; PowerShell 7.6.5; zero parse errors |
+| `HAIDER_INSTALL_TEST_BIN_DIR=/Users/rizzist/Developer/haiderharness/state/evidence/970-winiss/1-impl/native-payload /tmp/haider-winiss-970-venv/bin/python3 -m unittest discover -s scripts/tests -p 'test_*.py'` | Exit 0; 53 tests, no skips |
+| `zsh /Users/rizzist/Developer/haiderharness/runtime/inno-compile-local.sh /Users/rizzist/Developer/haiderharness/worktrees/970-winiss` | Exit 0; `LOCAL-INNO-COMPILE-OK`; real Inno compiler under Wine/Colima |
+| `pwsh -NoProfile -File .../checks/powershell-behavior.ps1` | Exit 0 after ordinal repair; actual candidate version helper with a mocked resource provider; real harmless macOS child process checks slash arguments, spaced paths, and exit 23 rejection |
+| PE resource inspection with `pefile` | Exit 0; actual compiled fixture has correct numeric/text versions and the padding described above |
+| `git diff --check` | Exit 0 |
+
+These are local compiler, packaging and helper checks, not native Windows
+lifecycle execution. Only a fresh Windows CI run can prove the exact release
+resource through Windows `VersionInfo`, older fixture compile with release
+bytes, native install/upgrade/CLI/uninstall, registry and PATH restoration,
+Authenticode with configured signing, and final sidecar ordering. No actual
+credential/signing material was read or used. No commit or push is authorized
+for this round. **Native Windows verification remains pending; not SHIP.**
+
 ## Release run 4 repair — lane 970-winiss
 
 This update supersedes the historical Windows inspection-only verdict below.
