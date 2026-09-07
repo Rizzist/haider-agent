@@ -3,6 +3,8 @@
 # Generated 2026-09-07 from release.yml at 98e219c7; build/installer steps are verbatim.
 name: windows-installer-check
 'on':
+  push:
+    branches: ['ci-winonly-*']
   workflow_dispatch: {}
 concurrency:
   group: windows-installer-check-${{ github.ref }}
