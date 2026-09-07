@@ -109,7 +109,7 @@ class RpcClientTest {
         val server = scope.launch(Dispatchers.IO) {
             peer.handshake()
             val attach = peer.receive()
-            peer.reply(attach, obj("method" to "session.attach", "attachment_id" to "current", "attach_state" to obj("session_id" to "session-1")))
+            peer.reply(attach, obj("method" to "session.attach", "attachment_id" to "current", "attach_state" to obj("session_id" to "session-1", "replay_through_seq" to 1, "worker_generation" to 1)))
             for (id in listOf("stale", "current")) RpcWire.write(peer.send, JsonObject(event + mapOf(
                 "attachment_id" to JsonPrimitive(id), "envelope" to JsonObject(event.objectAt("envelope") + mapOf(
                     "seq" to JsonPrimitive(1), "payload" to obj("type" to "user_message", "text" to id))))))

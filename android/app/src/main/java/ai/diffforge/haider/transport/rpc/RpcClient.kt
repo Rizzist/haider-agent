@@ -54,8 +54,12 @@ class RpcClient(
     private val scope: CoroutineScope,
     private val socketFactory: () -> RpcSocket = ::AndroidRpcSocket,
     private val requestTimeoutMs: Long = 30_000,
+    private val heartbeatIntervalMs: Long = 15_000,
+    private val heartbeatTimeoutMs: Long = 15_000,
 ) : Closeable {
     private val lock = Any()
+    // Serialize epoch retirement with ordered callbacks without holding the pending-map lock.
+    private val delivery = Any()
     private val lifecycle = Mutex()
     private val writes = Mutex()
     private val listeners = CopyOnWriteArrayList<(JsonObject) -> Unit>()
@@ -66,7 +70,11 @@ class RpcClient(
     val welcome: StateFlow<RpcWelcome?> = _welcome.asStateFlow()
     private var socket: RpcSocket? = null
     private var reader: Job? = null
+    private var heartbeat: Job? = null
+    private var probe: Pair<JsonPrimitive, CompletableDeferred<Unit>>? = null
     private var epoch = 0L
+    private val _epochs = MutableStateFlow(0L)
+    val connectionEpochs: StateFlow<Long> = _epochs.asStateFlow()
     val connectionEpoch: Long get() = synchronized(lock) { epoch }
 
     /** Callbacks run in read order on IO. They must not block awaiting an RPC response. */
@@ -95,17 +103,39 @@ class RpcClient(
                 if (socket !== next) throw IOException("connection_replaced")
                 _welcome.value = granted
                 _state.value = RpcConnectionState.CONNECTED
-            }
-            reader = scope.launch(Dispatchers.IO) {
-                try {
-                    while (isActive) {
-                        val frame = RpcWire.read(next.input, granted.frameLimit) ?: throw IOException("connection_eof")
-                        if (synchronized(lock) { socket === next }) receive(frame)
-                    }
-                } catch (error: Exception) {
-                    fail(next, error is RpcProtocolException)
+                reader = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                    try {
+                        while (isActive) {
+                            val frame = RpcWire.read(next.input, granted.frameLimit) ?: throw IOException("connection_eof")
+                            receive(next, frame)
+                        }
+                    } catch (error: Exception) { fail(next, error is RpcProtocolException) }
+                    finally { fail(next, false) }
+                }
+                heartbeat = scope.launch(start = CoroutineStart.LAZY) {
+                    try {
+                        var nonce = 0L
+                        while (isActive) {
+                            delay(heartbeatIntervalMs)
+                            val token = JsonPrimitive(++nonce)
+                            val pong = CompletableDeferred<Unit>()
+                            synchronized(lock) {
+                                if (socket !== next) throw IOException("connection_lost")
+                                probe = token to pong
+                            }
+                            // One budget includes queueing, write progress and the matching Pong.
+                            // This never restarts a pending request's independent deadline.
+                            withTimeout(heartbeatTimeoutMs) {
+                                writeFrame(next, RpcWire.ping(token))
+                                pong.await()
+                            }
+                        }
+                    } catch (error: Exception) { fail(next, error is RpcProtocolException) }
+                    finally { fail(next, false) }
                 }
             }
+            val jobs = synchronized(lock) { if (socket === next) listOfNotNull(reader, heartbeat) else emptyList() }
+            jobs.forEach { job -> job.invokeOnCompletion { fail(next, false) }; job.start() }
         } catch (error: Exception) {
             fail(next, error is RpcProtocolException)
             if (error is TimeoutCancellationException) {
@@ -135,13 +165,7 @@ class RpcClient(
         }
         try {
             return withTimeout(requestTimeoutMs) {
-                writes.withLock {
-                        val limit = synchronized(lock) {
-                            if (socket !== active) throw IOException("connection_lost")
-                            _welcome.value?.frameLimit ?: throw IOException("connection_lost")
-                        }
-                        socketIo(active) { RpcWire.write(active.output, frame(id), limit) }
-                }
+                writeFrame(active, frame(id))
                 wait.await()
             }
         } catch (timeout: TimeoutCancellationException) {
@@ -159,6 +183,14 @@ class RpcClient(
         } finally { synchronized(lock) { pending.remove(id) } }
     }
 
+    private suspend fun writeFrame(active: RpcSocket, frame: JsonObject) = writes.withLock {
+        val limit = synchronized(lock) {
+            if (socket !== active) throw IOException("connection_lost")
+            _welcome.value?.frameLimit ?: throw IOException("connection_lost")
+        }
+        socketIo(active) { RpcWire.write(active.output, frame, limit) }
+    }
+
     /** Cancellation must close a LocalSocket; coroutine cancellation alone cannot interrupt its streams. */
     private suspend fun <T> socketIo(active: RpcSocket, operation: () -> T): T = suspendCancellableCoroutine { continuation ->
         val work = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
@@ -170,30 +202,46 @@ class RpcClient(
         work.start()
     }
 
-    private fun receive(frame: JsonObject) {
-        when (frame.string("kind")) {
-            "response" -> {
-                val item = synchronized(lock) { pending.remove(frame.string("request_id")) } ?: return // Late timed-out response.
-                try {
-                    val body = frame.objectAt("body")
-                    when (body.string("method")) {
-                        "error" -> item.reply.completeExceptionally(RpcRemoteException(body.string("code")))
-                        item.method -> { item.onResponse(body); item.reply.complete(body) }
-                        else -> throw RpcProtocolException("response_method_mismatch")
-                    }
-                } catch (error: Exception) { item.reply.completeExceptionally(error); throw error }
+    private suspend fun receive(active: RpcSocket, frame: JsonObject) {
+        if (frame.string("kind") == "ping") {
+            val nonce = RpcWire.nonce(frame)
+            withTimeout(heartbeatTimeoutMs) { writeFrame(active, RpcWire.pong(nonce)) }
+            return
+        }
+        synchronized(delivery) {
+            if (synchronized(lock) { socket !== active }) return
+            when (frame.string("kind")) {
+                "response" -> {
+                    val item = synchronized(lock) { pending.remove(frame.string("request_id")) } ?: return // Late timed-out response.
+                    try {
+                        val body = frame.objectAt("body")
+                        when (body.string("method")) {
+                            "error" -> item.reply.completeExceptionally(RpcRemoteException(body.string("code"), body.optionalBoolean("retryable") ?: false))
+                            item.method -> { item.onResponse(body); item.reply.complete(body) }
+                            else -> throw RpcProtocolException("response_method_mismatch")
+                        }
+                    } catch (error: Exception) { item.reply.completeExceptionally(error); throw error }
+                }
+                "pong" -> {
+                    val nonce = RpcWire.nonce(frame)
+                    synchronized(lock) { probe?.takeIf { it.first == nonce }?.let { it.second.complete(Unit); probe = null } }
+                }
+                "protocol_error" -> throw RpcProtocolException("server_protocol_error")
+                "hello", "welcome", "request" -> throw RpcProtocolException("unexpected_frame")
+                else -> listeners.forEach { it(frame) }
             }
-            "protocol_error" -> throw RpcProtocolException("server_protocol_error")
-            "hello", "welcome", "request" -> throw RpcProtocolException("unexpected_frame")
-            else -> listeners.forEach { it(frame) }
         }
     }
 
-    private fun fail(active: RpcSocket, protocol: Boolean) {
+    private fun fail(active: RpcSocket, protocol: Boolean): Unit = synchronized(delivery) {
         synchronized(lock) {
             if (socket !== active) return
             socket = null
+            reader?.cancel(); reader = null
+            heartbeat?.cancel(); heartbeat = null
+            probe?.second?.cancel(); probe = null
             epoch++
+            _epochs.value = epoch
             _welcome.value = null
             _state.value = if (protocol) RpcConnectionState.PROTOCOL_ERROR else RpcConnectionState.DISCONNECTED
             pending.values.forEach { it.reply.completeExceptionally(IOException("connection_lost")) }
@@ -204,8 +252,6 @@ class RpcClient(
 
     override fun close() {
         synchronized(lock) { socket }?.let { fail(it, false) }
-        reader?.cancel()
-        reader = null
     }
 
     private fun RpcSocket.closeQuietly() { try { close() } catch (_: IOException) { } }
@@ -218,11 +264,11 @@ class RpcClient(
             val limit = frame.number("frame_limit")
             val caps = frame.strings("capabilities_granted")
             val requested = if (control) setOf("view", "control") else setOf("view")
-            if (limit !in 1..RpcWire.MAX_BODY.toLong() || caps != requested) throw RpcProtocolException("invalid_grant")
+            if (limit !in 1..0xffff_ffffL || caps != requested) throw RpcProtocolException("invalid_grant")
             if (frame.string("daemon_version") != target.appVersion || frame.number("daemon_generation") != target.daemonGeneration)
                 throw RpcProtocolException("native_version_or_generation_mismatch")
             if (frame.string("profile_id") != "android-default") throw RpcProtocolException("profile_mismatch")
-            return RpcWelcome(frame.string("instance_id"), target.daemonGeneration, limit.toInt(), target.appVersion, caps, frame.strings("features"))
+            return RpcWelcome(frame.string("instance_id"), target.daemonGeneration, minOf(limit, RpcWire.MAX_BODY.toLong()).toInt(), target.appVersion, caps, frame.strings("features"))
         }
     }
 }

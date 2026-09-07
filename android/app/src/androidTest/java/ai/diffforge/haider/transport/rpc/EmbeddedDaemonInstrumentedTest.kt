@@ -65,7 +65,7 @@ class EmbeddedDaemonInstrumentedTest {
             val cache = TranscriptCache(File(context.cacheDir, "integration-rpc-cache"))
             val replay = TranscriptRepository(client, scope, cache)
             try {
-                replay.attach(session)
+                replay.attach(session, control = true)
                 val accepted = client.request(RpcMethods.submit(UUID.randomUUID().toString(),
                     SessionCoordinate(session, digest.number("worker_generation")), "Reply with the deterministic test completion."))
                 assertEquals(session, accepted.string("session_id"))

@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import shutil
 from pathlib import Path
 import struct
 import tempfile
@@ -30,9 +32,64 @@ def fixture(machine=183, alignment=16384, relro=True, version='0.0.971'):
     return bytes(data)
 
 
+def dynamic_fixture(needed):
+    """ELF64 with real DT_NEEDED entries, decoded by the actual NDK readelf."""
+    names = b'\0.shstrtab\0.dynstr\0.dynamic\0'
+    strings = b'\0' + b''.join(name.encode() + b'\0' for name in needed)
+    data = bytearray(1536)
+    data[:7] = b'\x7fELF\x02\x01\x01'
+    struct.pack_into('<HHIQQQIHHHHHH', data, 16, 3, 183, 1, 0, 64, 256, 0, 64, 56, 3, 64, 4, 1)
+    struct.pack_into('<IIQQQQQQ', data, 64, 1, 4, 0, 0, 0, len(data), len(data), 16384)
+    struct.pack_into('<IIQQQQQQ', data, 120, 0x6474e552, 4, 1024, 1024, 0, 16, 16, 1)
+    size = (len(needed) + 3) * 16
+    struct.pack_into('<IIQQQQQQ', data, 176, 2, 4, 1024, 1024, 0, size, size, 8)
+    struct.pack_into('<IIQQQQIIQQ', data, 320, 1, 3, 0, 0, 512, len(names), 0, 0, 1, 0)
+    struct.pack_into('<IIQQQQIIQQ', data, 384, 11, 3, 2, 768, 768, len(strings), 0, 0, 1, 0)
+    struct.pack_into('<IIQQQQIIQQ', data, 448, 19, 6, 2, 1024, 1024, size, 2, 0, 8, 16)
+    data[512:512 + len(names)] = names
+    data[768:768 + len(strings)] = strings
+    entries = [(5, 768), (10, len(strings))]
+    offset = 1
+    for name in needed:
+        entries.append((1, offset))
+        offset += len(name) + 1
+    entries.append((0, 0))
+    for index, entry in enumerate(entries):
+        struct.pack_into('<QQ', data, 1024 + index * 16, *entry)
+    return bytes(data)
+
+
+def readelf_tool():
+    installed = shutil.which('llvm-readelf')
+    if installed:
+        return installed
+    ndk_paths = [Path(value) for name in ('ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT')
+                 if (value := os.environ.get(name))]
+    # setup-android exposes the SDK; sdkmanager's pinned NDK install need not export NDK_HOME.
+    ndk_paths += [Path(value) / 'ndk' / '28.2.13676358'
+                  for name in ('ANDROID_HOME', 'ANDROID_SDK_ROOT') if (value := os.environ.get(name))]
+    for ndk in ndk_paths:
+        candidates = list(ndk.glob('toolchains/llvm/prebuilt/*/bin/llvm-readelf'))
+        if candidates:
+            return str(candidates[0])
+    raise RuntimeError('NDK llvm-readelf required for real DT_NEEDED tests; source env.sh')
+
+
 class NativeGateTest(unittest.TestCase):
     def test_valid_static_elf(self):
         self.assertEqual(verify.inspect_elf(fixture(), 'arm64-v8a', '0.0.971')['api'], 26)
+
+    def test_verify_so_rejects_real_dt_needed_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture.so'
+            path.write_bytes(dynamic_fixture(['libc.so', 'libm.so']))
+            self.assertEqual(verify.verify_so(path, 'arm64-v8a', None, readelf_tool())['needed'],
+                             ['libc.so', 'libm.so'])
+            # Policy-independent pin: widening NEEDED to allow libssl must fail this test.
+            for library in ('libssl.so', 'libcrypto.so', 'libc++_shared.so'):
+                path.write_bytes(dynamic_fixture(['libc.so', library]))
+                with self.subTest(library=library), self.assertRaisesRegex(verify.InvalidNative, 'DT_NEEDED'):
+                    verify.verify_so(path, 'arm64-v8a', None, readelf_tool())
 
     def test_mutations_fail_closed(self):
         for data in (fixture(machine=62), fixture(alignment=4096), fixture(relro=False),

@@ -6,7 +6,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 
 class RpcProtocolException(val code: String) : IOException(code)
-class RpcRemoteException(val code: String) : IOException(code)
+class RpcRemoteException(val code: String, val retryable: Boolean = false) : IOException(code)
 
 internal val wireJson = Json { isLenient = false; ignoreUnknownKeys = true }
 internal fun obj(vararg fields: Pair<String, Any?>): JsonObject = buildJsonObject {
@@ -78,6 +78,12 @@ object RpcWire {
         if (bytes.size !in 1..limit) throw RpcProtocolException("frame_limit")
         DataOutputStream(output).apply { writeInt(bytes.size); write(bytes); flush() }
     }
+
+    fun nonce(frame: JsonObject): JsonPrimitive = (frame["nonce"] as? JsonPrimitive)
+        ?.takeIf { !it.isString && it.content.toULongOrNull() != null }
+        ?: throw RpcProtocolException("invalid_nonce")
+    fun ping(nonce: JsonPrimitive) = obj("v" to 1, "kind" to "ping", "nonce" to nonce)
+    fun pong(nonce: JsonPrimitive) = obj("v" to 1, "kind" to "pong", "nonce" to nonce)
 
     fun request(id: String, body: JsonObject) = obj("v" to 1, "kind" to "request", "request_id" to id, "body" to body)
     fun hello(version: String, instance: String, control: Boolean) = obj(

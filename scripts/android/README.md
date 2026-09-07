@@ -55,13 +55,20 @@ v2/v3 verification remain in `android-apk.yml`; native symbols are a separate ar
   presentation fields; credentials, menu secret answers and account responses are never stored.
   Projection v2 rebuilds old cursors that may have discarded unknown item variants. Stale
   attachment IDs are ignored and a roster head rollback resets the affected replay cache.
-- UI `DaemonService` lifecycle/status remains lane 2's Binder facade; this package does not
-  introduce another incompatible `DaemonService`. Bind session actions through `RpcMethods`,
-  keeping worker/run/menu coordinates from one snapshot and command IDs across response-loss retries.
-- `AccountsRepository : AccountsDataSource` matches the Settings operation names, with explicit
-  semantic command IDs and a required OAuth desired alias. Adapt these in the UI facade.
-  `validateApiKey` returns `validate_only_unavailable`: the frozen protocol only validates as
-  part of `account.login_api`, which commits. A fake validate-only success is not a real wire door.
+- `RpcDaemonService : ui.daemon.DaemonService` composes the Binder `RpcControlPlane`
+  port with the session, history and account repositories. `RpcAccountsRepository` supplies
+  the UI's account interface on the same socket. See `docs/android/rpc-ui-integration.md`
+  for constructor inputs, shared interface corrections and the remaining UI consumer work.
+  `rosterReady` distinguishes initial hydration from an empty cache; `transcriptUpdates`
+  folds pushed display events without reattaching per delta. Session operations acquire
+  target Control authority and retain semantic IDs/original coordinates on retryable errors.
+- `RpcClient` owns a 15-second Ping cadence and a 15-second write/Pong budget per epoch,
+  below the daemon's 45-second read-idle limit. It echoes all valid u64 Ping nonces and
+  requires a matching Pong. Heartbeats never restart a business-request deadline.
+  Welcome frame ceilings are validated as positive u32 and clamped to the mobile limit.
+- `validateApiKey` returns `validate_only_unavailable`: the frozen protocol only validates
+  as part of `account.login_api`, which commits. OAuth keeps the caller's attempt ID and
+  fences all transient references by the original connection epoch.
 - The notifier uses its own View-only `RpcClient` plus the roster repository. Lane 2's
   `SessionRosterSource` adapter must map a freshly reconciled roster to `Baseline`, live summaries
   to `Changes`, and connection loss to `Reset`, projecting only its safe `NotificationSession`

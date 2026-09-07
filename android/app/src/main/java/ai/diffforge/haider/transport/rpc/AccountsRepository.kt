@@ -12,7 +12,9 @@ import java.util.UUID
 data class Account(val alias: String, val provider: String, val label: String?, val authKind: String,
     val active: Boolean, val identity: String?, val status: String)
 data class ProviderDescriptor(val id: String, val supportsApiKey: Boolean, val supportsOAuth: Boolean,
-    val available: Boolean, val models: List<String>, val defaultModel: String?)
+    val available: Boolean, val models: List<String>, val defaultModel: String?,
+    val unavailableReason: String? = null, val apiFamily: String? = null,
+    val modelDetails: List<ai.diffforge.haider.transport.SessionModel> = emptyList())
 data class AccountsSnapshot(val revision: Long?, val accounts: List<Account>)
 
 /** Transient connection-owned capability; never use in saved-state, logs, Binder or notifications. */
@@ -21,7 +23,7 @@ class OAuthFlow internal constructor(val provider: String, val alias: String, va
     internal val epoch: Long) {
     override fun toString() = "OAuthFlow(redacted)"
 }
-class OAuthStatus internal constructor(val status: String, val oauthReference: String?, val identity: String?) {
+class OAuthStatus internal constructor(val status: String, val oauthReference: String?, val identity: String?, val publicCode: String? = null) {
     override fun toString() = "OAuthStatus(redacted)"
 }
 
@@ -30,6 +32,8 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
     private val refreshMutex = Mutex()
     private var watchedEpoch: Long? = null
     private val _providers = MutableStateFlow<List<ProviderDescriptor>>(emptyList())
+    private val _providerRevision = MutableStateFlow<Long?>(null)
+    val providerRevision: StateFlow<Long?> = _providerRevision.asStateFlow()
     private val _snapshot = MutableStateFlow(AccountsSnapshot(null, emptyList()))
     private val _error = MutableStateFlow<String?>(null)
     override val providers: StateFlow<List<ProviderDescriptor>> = _providers.asStateFlow()
@@ -45,17 +49,19 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
             val epoch = client.connectionEpoch
             if (watchedEpoch != epoch) {
                 val watch = client.request(RpcMethods.watchAccounts(), epoch)
-                if (watch["accepted"] != JsonPrimitive(true)) throw RpcProtocolException("watch_rejected")
+                RpcResponses.watch(watch)
                 watchedEpoch = epoch
             }
             val providers = client.request(RpcMethods.providers(), epoch)
             val accounts = client.request(RpcMethods.accounts(), epoch)
             checkAvailability(providers)
             checkAvailability(accounts)
-            val nextProviders = providers.objects("providers").map(::parseProvider)
-            val nextAccounts = AccountsSnapshot(accounts.optionalNumber("revision"), accounts.objects("descriptors").map(::parseAccount))
+            val inventory = RpcResponses.providers(providers)
+            val nextProviders = inventory.providers
+            val nextAccounts = RpcResponses.accounts(accounts)
             if (client.connectionEpoch != epoch) throw java.io.IOException("connection_lost")
             _providers.value = nextProviders
+            _providerRevision.value = inventory.revision
             _snapshot.value = nextAccounts
             _error.value = null
         } catch (cancelled: CancellationException) { throw cancelled }
@@ -67,13 +73,19 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
         validationModel: String?, replaceExisting: Boolean): Account {
         val epoch = client.connectionEpoch
         try {
-            val stage = client.request(RpcMethods.stage(UUID.randomUUID().toString(), "api_key", String(apiKey)), epoch)
-            apiKey.fill('\u0000')
-            val result = client.request(RpcMethods.loginApi(commandId, provider, alias, stage.string("vault_reference"), validationModel, replaceExisting), epoch)
-            val descriptor = parseAccount(result.objectAt("descriptor"))
-            refreshes.trySend(Unit)
-            return descriptor
+            val stage = stageApiKey(apiKey, epoch)
+            return commitStagedApiKey(provider, alias, stage.reference, commandId, epoch, validationModel, replaceExisting)
         } finally { apiKey.fill('\u0000') }
+    }
+
+    internal suspend fun stageApiKey(apiKey: CharArray, epoch: Long): RpcResponses.Stage = try {
+        RpcResponses.stage(client.request(RpcMethods.stage(UUID.randomUUID().toString(), "api_key", String(apiKey)), epoch))
+    } finally { apiKey.fill('\u0000') }
+
+    internal suspend fun commitStagedApiKey(provider: String, alias: String?, reference: String, commandId: String,
+        epoch: Long, validationModel: String? = null, replaceExisting: Boolean = false): Account {
+        val result = client.request(RpcMethods.loginApi(commandId, provider, alias, reference, validationModel, replaceExisting), epoch)
+        return RpcResponses.descriptor(result).also { refreshes.trySend(Unit) }
     }
 
     /** The frozen 136-method protocol has no validate-only door. Never silently add an account here. */
@@ -83,34 +95,40 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
     }
 
     override suspend fun remove(alias: String, commandId: String, expectedRevision: Long?) {
-        client.request(RpcMethods.remove(commandId, alias, expectedRevision)); refreshes.trySend(Unit)
+        RpcResponses.removed(client.request(RpcMethods.remove(commandId, alias, expectedRevision))); refreshes.trySend(Unit)
     }
     override suspend fun setActive(alias: String, commandId: String, confirmNewEpoch: Boolean) {
-        client.request(RpcMethods.setActive(commandId, alias, confirmNewEpoch)); refreshes.trySend(Unit)
+        RpcResponses.descriptor(client.request(RpcMethods.setActive(commandId, alias, confirmNewEpoch))); refreshes.trySend(Unit)
     }
     override suspend fun refreshAccount(alias: String) {
-        client.request(RpcMethods.refreshAccount(alias)); refreshes.trySend(Unit)
+        RpcResponses.descriptor(client.request(RpcMethods.refreshAccount(alias))); refreshes.trySend(Unit)
     }
-    override suspend fun startOAuth(provider: String, desiredAlias: String): OAuthFlow {
-        val attempt = UUID.randomUUID().toString()
+    override suspend fun startOAuth(provider: String, desiredAlias: String, attempt: String): OAuthFlow {
         val epoch = client.connectionEpoch
         val result = client.request(RpcMethods.oauthStart(provider, desiredAlias, attempt), epoch)
-        if (result.objectAt("availability")["available"] != JsonPrimitive(true)) throw RpcRemoteException("oauth_unavailable")
-        return OAuthFlow(provider, desiredAlias, result.string("flow_id"), attempt,
-            result.optionalString("authorization_url"), result.optionalString("user_code"), result.optionalNumber("expires_at_ms"), epoch)
+        return RpcResponses.oauthStart(result, provider, desiredAlias, attempt, epoch)
     }
     override suspend fun pollOAuth(flow: OAuthFlow): OAuthStatus {
         val result = client.request(RpcMethods.oauthStatus(flow.flowId, flow.attemptId), flow.epoch).objectAt("status")
-        val status = result.string("status")
-        return OAuthStatus(status, if (status == "ready") result.string("oauth_reference") else null, result.optionalString("identity"))
+        return RpcResponses.oauthStatus(result)
     }
     override suspend fun completeOAuth(flow: OAuthFlow, oauthReference: String, commandId: String): Account {
         val result = client.request(RpcMethods.addOAuth(commandId, flow.provider, flow.alias, flow.flowId, flow.attemptId, oauthReference), flow.epoch)
-        val account = parseAccount(result.objectAt("descriptor"))
+        val account = RpcResponses.descriptor(result)
         refreshes.trySend(Unit)
         return account
     }
-    override suspend fun cancelOAuth(flow: OAuthFlow) { client.request(RpcMethods.oauthCancel(flow.flowId, flow.attemptId), flow.epoch) }
+    override suspend fun cancelOAuth(flow: OAuthFlow) {
+        RpcResponses.oauthStatus(client.request(RpcMethods.oauthCancel(flow.flowId, flow.attemptId), flow.epoch).objectAt("status"))
+    }
+    suspend fun refreshProviders() {
+        val epoch = client.connectionEpoch
+        val body = client.request(RpcMethods.providers(), epoch)
+        val inventory = RpcResponses.providers(body)
+        if (epoch != client.connectionEpoch) throw java.io.IOException("connection_lost")
+        _providers.value = inventory.providers
+        _providerRevision.value = inventory.revision
+    }
     override fun close() { listener.close(); reconnect.cancel(); worker.cancel(); refreshes.close() }
 
     companion object {
@@ -121,9 +139,15 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
             val methods = value.strings("auth_methods")
             return ProviderDescriptor(value.string("provider"), "api_key" in methods, "oauth" in methods,
                 value["enabled"] == JsonPrimitive(true) && value.optionalString("availability") == "available",
-                value.strings("models").toList(), value.optionalString("default_model"))
+                value.strings("models").toList(), value.optionalString("default_model"),
+                value.optionalString("availability_reason"), value.optionalString("api_family"),
+                (value["model_details"] as? JsonArray).orEmpty().map {
+                    val model = it.jsonObject
+                    ai.diffforge.haider.transport.SessionModel(model.string("name"), model.optionalNumber("context_window"),
+                        model.strings("supported_efforts").toList(), model.optionalString("default_effort"))
+                })
         }
-        private fun checkAvailability(value: JsonObject) {
+        internal fun checkAvailability(value: JsonObject) {
             if ((value["availability"] as? JsonObject)?.optionalString("state") == "unavailable") throw RpcRemoteException("snapshot_unavailable")
         }
     }

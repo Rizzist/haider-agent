@@ -54,3 +54,28 @@ fn android_display_payloads_match_rust_serialization() {
         value
     );
 }
+
+#[test]
+fn android_liveness_matches_rust_wire_and_uds_bytes() {
+    let frames = [
+        haider_rpc::WireFrame::Ping { nonce: 17 },
+        haider_rpc::WireFrame::Pong { nonce: 17 },
+        haider_rpc::WireFrame::Ping { nonce: u64::MAX },
+        haider_rpc::WireFrame::Pong { nonce: u64::MAX },
+    ];
+    let rows: Vec<_> = frames.iter().map(|frame| {
+        let body = serde_json::to_string(frame).expect("serialize liveness");
+        let bytes = haider_rpc::uds_codec::encode(frame, 1024).expect("encode liveness");
+        serde_json::json!({"ws_body": body, "uds_stream_hex": bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()})
+    }).collect();
+    let actual = serde_json::to_string_pretty(&rows).expect("serialize fixture") + "\n";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/android_liveness_wire_v1.json");
+    if std::env::var_os("UPDATE_ANDROID_GOLDEN").is_some() {
+        std::fs::write(&path, &actual).expect("write liveness fixture");
+    }
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read liveness fixture"),
+        actual
+    );
+}

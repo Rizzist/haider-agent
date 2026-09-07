@@ -48,7 +48,7 @@ interface AccountsDataSource {
     suspend fun remove(alias: String, commandId: String, expectedRevision: Long? = snapshot.value.revision)
     suspend fun setActive(alias: String, commandId: String, confirmNewEpoch: Boolean = false)
     suspend fun refreshAccount(alias: String)
-    suspend fun startOAuth(provider: String, desiredAlias: String): OAuthFlow
+    suspend fun startOAuth(provider: String, desiredAlias: String, attempt: String = java.util.UUID.randomUUID().toString()): OAuthFlow
     suspend fun pollOAuth(flow: OAuthFlow): OAuthStatus
     suspend fun completeOAuth(flow: OAuthFlow, oauthReference: String, commandId: String): Account
     suspend fun cancelOAuth(flow: OAuthFlow)

@@ -38,15 +38,15 @@ object RpcMethods {
         command("session.select_model", command, at, "provider" to provider, "model" to model, "confirm_new_epoch" to if (confirmNewEpoch) true else null)
     fun selectEffort(command: String, at: SessionCoordinate, effort: String?, confirmNewEpoch: Boolean = false) =
         command("session.select_effort", command, at, "effort" to effort, "confirm_new_epoch" to if (confirmNewEpoch) true else null)
-    fun fork(command: String, at: SessionCoordinate, node: String, seq: Long, name: String? = null) =
-        command("session.fork", command, at, "fork_node_id" to node, "fork_seq" to seq, "name" to name)
+    fun fork(command: String, at: SessionCoordinate, node: String, seq: Long, name: String? = null, sourceBranch: String? = null) =
+        command("session.fork", command, at, "fork_node_id" to node, "fork_seq" to seq, "name" to name, "source_branch_id" to sourceBranch)
     fun menu(command: String, at: MenuCoordinate, input: JsonObject? = null) = obj(
         "command_id" to command, "session_id" to at.session.sessionId, "worker_generation" to at.session.workerGeneration,
         "menu_id" to at.menuId, "request_seq" to at.requestSeq, "option_key" to at.optionKey,
         "option_index" to at.optionIndex, "input" to input)
     fun textInput(text: String) = obj("kind" to "text", "text" to text)
     fun secretInput(reference: String) = obj("kind" to "secret_vault_reference", "vault_reference" to reference)
-    fun providers() = obj("method" to "provider.list")
+    fun providers(provider: String? = null) = obj("method" to "provider.list", "provider" to provider)
     fun accounts() = obj("method" to "account.list")
     fun watchAccounts() = obj("method" to "account.list_watch")
     fun refreshAccount(alias: String) = obj("method" to "account.refresh", "alias" to alias)

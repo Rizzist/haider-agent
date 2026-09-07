@@ -49,13 +49,22 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
 
     fun transcript(session: String): List<TranscriptCache.Entry> = cache.entries(session)
 
-    suspend fun attach(session: String, control: Boolean = false) = attaching.withLock {
+    suspend fun attach(session: String, control: Boolean = false) = attaching.withLock { attachLocked(session, control) }
+
+    /** Hold the attachment lease through the protected request, including concurrent selection/replay changes. */
+    suspend fun <T> withControlAttachment(session: String, operation: suspend (Long) -> T): T = attaching.withLock {
+        val epoch = attachLocked(session, control = true)
+        operation(epoch)
+    }
+
+    private suspend fun attachLocked(session: String, control: Boolean): Long {
         synchronized(lock) { wanted[session] = control }
         detachCurrent(session)
         val epoch = client.connectionEpoch
         val register: (JsonObject) -> Unit = { body ->
-            if (body.objectAt("attach_state").string("session_id") != session) throw RpcProtocolException("attachment_session_mismatch")
-            synchronized(lock) { attachments[body.string("attachment_id")] = Attachment(session, control) }
+            val receipt = RpcResponses.attachment(body)
+            if (receipt.sessionId != session) throw RpcProtocolException("attachment_session_mismatch")
+            synchronized(lock) { attachments[receipt.id] = Attachment(session, control) }
         }
         try { client.request(RpcMethods.attach(session, cache.lastApplied(session), control), epoch, register) }
         catch (error: RpcRemoteException) {
@@ -63,6 +72,7 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
             cache.reset(session)
             client.request(RpcMethods.attach(session, 0, control), epoch, register)
         }
+        return epoch
     }
 
     suspend fun detach(session: String) = attaching.withLock {
@@ -71,7 +81,7 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
     }
     private suspend fun detachCurrent(session: String) {
         val ids = synchronized(lock) { attachments.filterValues { it.session == session }.keys.toList().also { ids -> ids.forEach(attachments::remove) } }
-        ids.forEach { client.request(RpcMethods.detach(it)) }
+        ids.forEach { RpcResponses.detached(client.request(RpcMethods.detach(it))) }
     }
     private fun recover(session: String) {
         if (!synchronized(lock) { recovering.add(session) }) return
@@ -96,9 +106,9 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
                     val end = minOf(row.headSeq, start + pageSize - 1)
                     // v1 has no typed oversized-page response. A single envelope is the minimum
                     // safe range; if even that exceeds the negotiated cap, expose partial history.
-                    val result = client.request(RpcMethods.read(row.sessionId, start, end), epoch).objectAt("result")
-                    if (result.string("session_id") != row.sessionId) throw RpcProtocolException("read_session_mismatch")
-                    val events = result.objects("envelopes")
+                    val result = RpcResponses.read(client.request(RpcMethods.read(row.sessionId, start, end), epoch))
+                    if (result.sessionId != row.sessionId) throw RpcProtocolException("read_session_mismatch")
+                    val events = result.envelopes
                     if (events.isEmpty()) throw RpcProtocolException("incomplete_history")
                     events.forEach { cache.apply(row.sessionId, it) }
                     _revision.value++
