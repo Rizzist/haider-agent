@@ -35,7 +35,7 @@ jobs:
       if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y libasound2-dev libglib2.0-dev pkg-config
     - name: tag matches workspace version (tag builds only)
-      if: github.event_name == 'push'
+      if: startsWith(github.ref, 'refs/tags/')
       shell: bash
       run: 'TAG="${GITHUB_REF_NAME#v}"
 
