@@ -249,6 +249,48 @@ class SessionListStateTest {
     }
 
     @Test
+    fun `the snapshot absorbs rows that appear after it was captured`() {
+        val before = listOf(row("a", lastActivityMs = 10, seenAtMs = 10))
+        val snapshot = SessionListState.OrderSnapshot.capture(before, null)
+        val c = row("c", lastActivityMs = 2, seenAtMs = 2)
+        val d = row("d", lastActivityMs = 1, seenAtMs = 1)
+        val extended = snapshot.extend(listOf(c, d), null)
+        assertEquals(listOf("a", "c", "d"), extended.ids)
+        // Ranked once: a later delta cannot re-rank them.
+        val again = extended.extend(listOf(c.copy(lastActivityMs = 900), d), null)
+        assertEquals(listOf("a", "c", "d"), again.ids)
+    }
+
+    @Test
+    fun `extending records the group each new row was first shown under`() {
+        val snapshot = SessionListState.OrderSnapshot.capture(
+            listOf(row("a", lastActivityMs = 10, seenAtMs = 10)),
+            null,
+        )
+        val extended = snapshot.extend(
+            listOf(row("b", lastActivityMs = 5, seenAtMs = 5, runId = "r")),
+            null,
+        )
+        assertEquals(SessionGroupKind.Active, extended.group("b"))
+        // And the row keeps that section even once it stops running.
+        val rows = listOf(
+            row("a", lastActivityMs = 10, seenAtMs = 10),
+            row("b", lastActivityMs = 5, seenAtMs = 5),
+        )
+        assertEquals(
+            listOf("a", "b"),
+            SessionListState.flatten(SessionListState.groups(rows, null, snapshot = extended)),
+        )
+    }
+
+    @Test
+    fun `extending with nothing new returns the same snapshot`() {
+        val rows = listOf(row("a", lastActivityMs = 10, seenAtMs = 10))
+        val snapshot = SessionListState.OrderSnapshot.capture(rows, null)
+        assertEquals(snapshot, snapshot.extend(rows, null))
+    }
+
+    @Test
     fun `the freeze lifts when a new snapshot is captured`() {
         val before = listOf(
             row("a", lastActivityMs = 20, seenAtMs = 20),

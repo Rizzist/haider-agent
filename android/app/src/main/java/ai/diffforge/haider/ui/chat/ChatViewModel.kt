@@ -62,7 +62,16 @@ class ChatViewModel(
         }
         viewModelScope.launch {
             service.sessions.collect { rows ->
-                update { it.copy(sessions = rows) }
+                update { current ->
+                    current.copy(
+                        sessions = rows,
+                        // While the drawer is open the freeze absorbs new rows
+                        // rather than leaving them outside it: they are ranked
+                        // once, on arrival, and do not move again until it
+                        // closes.
+                        orderSnapshot = current.orderSnapshot?.extend(rows, current.activeSessionId),
+                    )
+                }
                 // Pages that arrive after a query was typed have to join it,
                 // or the result silently describes a smaller roster than the
                 // one the user is looking at.

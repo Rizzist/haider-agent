@@ -43,6 +43,26 @@ object SessionListState {
         fun rank(id: String): Int? = index[id]
         fun group(id: String): SessionGroupKind? = groups[id]
 
+        /**
+         * Takes in rows that appeared after the freeze began.
+         *
+         * A row is ranked once, at the moment it is first displayed, and keeps
+         * that rank until the drawer closes. Without this, an appended row was
+         * never in the snapshot at all, so every later delta re-sorted the
+         * appended set among itself — two rows added a second apart would swap
+         * as soon as one of them saw activity, which is precisely the tap-theft
+         * the freeze exists to prevent.
+         */
+        fun extend(rows: List<SessionRow>, activeId: String?): OrderSnapshot {
+            val unseen = rows.filterNot { index.containsKey(it.id) }
+            if (unseen.isEmpty()) return this
+            val appended = order(unseen, activeId)
+            return OrderSnapshot(
+                ids = ids + appended.map { it.id },
+                groups = groups + appended.associate { it.id to groupKind(it, activeId) },
+            )
+        }
+
         companion object {
             /** Captures the canonical order and the group each row sat in. */
             fun of(rows: List<SessionRow>, activeId: String? = null): OrderSnapshot = OrderSnapshot(
