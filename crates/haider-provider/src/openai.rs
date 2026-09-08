@@ -3967,7 +3967,7 @@ pub fn replay_openai_http_error(
     body: &[u8],
 ) -> ProviderError {
     let parsed = serde_json::from_slice::<OpenAiErrorEnvelope>(body).ok();
-    let provider_detail = openai_http_error_detail(body);
+    let provider_detail = crate::error_detail::http_error_detail(body);
     let error_type = parsed
         .as_ref()
         .and_then(|envelope| envelope.error.kind.as_deref());
@@ -4067,87 +4067,6 @@ struct OpenAiApiError {
     code: Option<String>,
 }
 
-fn openai_http_error_detail(body: &[u8]) -> Option<String> {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(value) => openai_error_message(&value).and_then(sanitize_openai_error_detail),
-        Err(_) => std::str::from_utf8(body)
-            .ok()
-            .and_then(sanitize_openai_error_detail),
-    }
-}
-
-fn openai_error_message(value: &serde_json::Value) -> Option<&str> {
-    value
-        .pointer("/error/message")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            value
-                .pointer("/response/error/message")
-                .and_then(serde_json::Value::as_str)
-        })
-        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("detail").and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
-        .or_else(|| {
-            value
-                .pointer("/response/error")
-                .and_then(serde_json::Value::as_str)
-        })
-        .or_else(|| value.as_str())
-}
-
-fn sanitize_openai_error_detail(detail: &str) -> Option<String> {
-    let mut words = Vec::new();
-    let mut redact_next = false;
-    for word in detail.split_whitespace() {
-        let normalized = word
-            .trim_matches(|character: char| {
-                !character.is_ascii_alphanumeric() && character != '_' && character != '-'
-            })
-            .to_ascii_lowercase();
-        if redact_next {
-            words.push("[REDACTED]".to_owned());
-            // `Authorization: Bearer <opaque>` is a common three-token
-            // spelling. Consuming `Bearer` must not expose the token after it.
-            redact_next = normalized == "bearer";
-            continue;
-        }
-        if looks_like_provider_secret(&normalized) || has_inline_provider_secret(word) {
-            words.push("[REDACTED]".to_owned());
-            continue;
-        }
-        words.push(word.to_owned());
-        redact_next = matches!(
-            normalized.as_str(),
-            "bearer" | "authorization" | "api_key" | "access_token" | "refresh_token"
-        );
-    }
-    let detail = words.join(" ");
-    (!detail.is_empty()).then_some(detail)
-}
-
-fn has_inline_provider_secret(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    ["authorization", "api_key", "access_token", "refresh_token"]
-        .iter()
-        .any(|label| {
-            value.strip_prefix(label).is_some_and(|suffix| {
-                suffix
-                    .strip_prefix('=')
-                    .or_else(|| suffix.strip_prefix(':'))
-                    .is_some_and(|secret| !secret.is_empty())
-            })
-        })
-}
-
-fn looks_like_provider_secret(value: &str) -> bool {
-    (value.starts_with("sk-") && value.len() >= 12)
-        || (value.starts_with("sess-") && value.len() >= 16)
-        || (value.starts_with("eyj")
-            && value.len() >= 24
-            && value.bytes().filter(|byte| *byte == b'.').count() >= 2)
-}
-
 fn openai_error_message_is_overload(message: &str) -> bool {
     message.to_ascii_lowercase().contains("overloaded")
 }
@@ -4174,7 +4093,8 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
         .get("code")
         .and_then(serde_json::Value::as_str)
         .or_else(|| error.get("type").and_then(serde_json::Value::as_str));
-    let provider_detail = openai_error_message(error).and_then(sanitize_openai_error_detail);
+    let provider_detail = crate::error_detail::provider_error_message(error)
+        .and_then(crate::error_detail::sanitize_provider_error_detail);
     let provider_kind = match kind {
         Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
         Some("permission_denied") => ProviderErrorKind::PermissionDenied,
@@ -4223,7 +4143,7 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
 }
 
 fn openai_stream_error_prose(detail: &str) -> ProviderError {
-    let provider_detail = sanitize_openai_error_detail(detail);
+    let provider_detail = crate::error_detail::sanitize_provider_error_detail(detail);
     let provider_kind = if provider_detail
         .as_deref()
         .is_some_and(openai_error_message_is_authentication)

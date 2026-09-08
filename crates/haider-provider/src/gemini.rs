@@ -2640,7 +2640,13 @@ pub fn replay_gemini_http_error(
     } else {
         format!("Gemini HTTP {status} returned {}", provider_kind_name(kind))
     };
-    ProviderError::new(kind, message)
+    let mut error = ProviderError::new(kind, message);
+    if kind == ProviderErrorKind::InvalidRequest
+        && let Some(detail) = crate::error_detail::http_error_detail(body)
+    {
+        error = error.with_provider_detail(&detail);
+    }
+    error
         .with_retry_after_ms(retry_after_ms)
         .with_http_metadata(status, None)
 }

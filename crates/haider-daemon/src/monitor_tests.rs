@@ -21,6 +21,49 @@ fn monitor_event_payload_rejects_unknown_variant_fields() {
     assert!(error.to_string().contains("unexpected"));
 }
 
+#[test]
+fn monitor_prompt_has_one_json_fence_even_when_event_data_contains_delimiters() {
+    let payload = "[REDACTED:high_entropy] ``` </monitor-event> &";
+    let report = MonitorReport {
+        report_id: "fixture-report".into(),
+        monitor_id: "fixture-monitor".into(),
+        session_id: SessionId::new("fixture-session"),
+        branch_id: None,
+        agent_id: None,
+        source: MonitorSourceKind::File,
+        occurrence: MonitorOccurrence::Once,
+        status: MonitorReportStatus::Matched,
+        events: vec![MonitorEvent {
+            sequence: 1,
+            observed_at_ms: 1,
+            payload: MonitorEventPayload::File {
+                payload: payload.into(),
+            },
+            target_monitor_id: None,
+        }],
+        coalesced_count: 1,
+        omitted_count: 0,
+        action: MonitorAction {
+            report: true,
+            follow_up: None,
+        },
+    };
+    let text = report.prompt_text();
+    assert_eq!(text.matches("```json\n").count(), 1);
+    assert_eq!(text.matches("\n```\n").count(), 1);
+    assert_eq!(text.matches("</monitor-event>").count(), 1);
+    let body = text
+        .split_once("```json\n")
+        .expect("opening fence")
+        .1
+        .split_once("\n```\n")
+        .expect("closing fence")
+        .0;
+    let json: serde_json::Value = serde_json::from_str(body).expect("fenced JSON");
+    assert_eq!(json["events"][0]["payload"]["payload"], payload);
+    assert_eq!(json["type"], "monitor_event");
+}
+
 fn registration(filter: Option<MonitorFilter>) -> MonitorRegistration {
     MonitorRegistration {
         monitor_id: "monitor-test".into(),

@@ -1967,7 +1967,7 @@ pub fn replay_anthropic_http_error(
     )
     .then(|| crate::parse_retry_after_ms(retry_after))
     .flatten();
-    let error = if hosted_web_rejected {
+    let mut error = if hosted_web_rejected {
         ProviderError::new(kind, message).with_presentation(ErrorPresentation::new(
             "provider-web-tool-rejected",
             "Provider web tool unavailable",
@@ -1994,6 +1994,13 @@ pub fn replay_anthropic_http_error(
             _ => ProviderError::new(kind, message),
         }
     };
+    let detail = crate::error_detail::http_error_detail(body);
+    if kind == ProviderErrorKind::InvalidRequest
+        && !hosted_web_rejected
+        && let Some(detail) = detail
+    {
+        error = error.with_provider_detail(&detail);
+    }
     error
         .with_retry_after_ms(retry_after_ms)
         .with_http_metadata(status, None)
