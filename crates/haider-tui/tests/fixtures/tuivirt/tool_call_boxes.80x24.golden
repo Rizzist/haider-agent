@@ -5,38 +5,38 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
 02|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
-03|    output line 0243 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-04|    output line 0244 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-05|    output line 0245 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-06|    output line 0246 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-07|    output line 0247 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-08|    output line 0248 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-09|    output line 0249 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-10|    output line 0250 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-11|    output line 0251 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-12|    output line 0252 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-13|    output line 0253 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-14|    output line 0254 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-15|    output line 0255 — bounded tail probe                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-16|    ⋯ output above is a bounded tail — earlier output truncated                 |
-   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×63; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×17
-17|  $ git status --short ✓ · exit 0                                               |
-   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×18; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×47
-18|  ✓ fs_edit crates/haider-store/src/event_store.rs +4 −1                        |
+03|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+04| ❯ read the store and run the tests                                             |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×32; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×45
+05|  ✓ fs_read(crates/haider-store/src/event_store.rs)                             |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×29
+06|  ◐ web_fetch · running…                                                        |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×9; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×56
+07|  ✗ fs_edit(src/lib.rs) · failed                                                |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×48
+08|  Ran 2 shell commands · bounded tails                                          |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×31; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×42
+09|    └ output line 0052 — bounded tail probe                                     |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×37; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×37
+10|  $ git status --short · exit 0                                                 |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×18; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×49
+11|  ✓ fs_edit crates/haider-store/src/event_store.rs +4 −1                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×45; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×24
+12|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+13|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+14|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+15|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+16|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+17|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+18|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 19|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 20|───────────────────────────────────────────────────────────────────── fable-5 ──|

@@ -440,6 +440,23 @@ pub fn sync_model_persistence(
     }
 }
 
+/// 971-tui-collapse: persist a tool-output VERBOSITY commit (mirrors the
+/// theme/notification syncs, keyed on the model's commit counter so a
+/// commit re-affirming the boot default still writes the file).
+pub fn sync_verbosity_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.verbosity_commits == *seen_commits {
+        return;
+    }
+    *seen_commits = model.verbosity_commits;
+    if let Some(store) = settings.as_mut() {
+        store.save_verbosity_if_changed(model.theme_choice, model.toolfold.verbosity());
+    }
+}
+
 /// 970 — persist a terms ACKNOWLEDGEMENT (mirrors the theme/notification
 /// syncs, keyed on the model's commit counter so a re-affirmation is never
 /// silently dropped). The journal itself is idempotent per subject, so a user
@@ -632,6 +649,19 @@ pub async fn run_demo(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 971-tui-collapse: seed the tool-output verbosity from the persisted
+    // setting (default `normal`) so a prior ⌥V survives a restart, and
+    // mirror it into the store so a later theme save never drops it. The
+    // SEED is not a commit — nothing is written until the reader cycles.
+    let verbosity = settings
+        .as_ref()
+        .map_or_else(crate::toolfold::Verbosity::default, |store| {
+            store.load_verbosity()
+        });
+    model.toolfold.seed_verbosity(verbosity);
+    if let Some(store) = settings.as_mut() {
+        store.set_verbosity(verbosity);
+    }
     // 970: the terms acknowledgements this profile already carries — read
     // ONCE at boot so the first-login disclosure never reappears for a user
     // who has already answered it.
@@ -642,6 +672,7 @@ pub async fn run_demo(
         .unwrap_or_default();
     let mut seen_terms_commits = model.terms_ack_commits;
     let mut seen_theme_commits = model.theme_commits;
+    let mut seen_verbosity_commits = model.verbosity_commits;
     let mut active_title = model.window_title();
 
     // Query the terminal for a graphics protocol and build the wordmark image
@@ -817,6 +848,11 @@ pub async fn run_demo(
         // Theme cycled: re-sync the emulator background.
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
         sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
+        sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        // 971-tui-collapse: observe tool start/finish against the shared
+        // clock, so a collapsed row can carry an honest duration (the
+        // protocol carries none).
+        model.note_tool_timings();
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
@@ -3702,6 +3738,19 @@ pub async fn run_live(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 971-tui-collapse: seed the tool-output verbosity from the persisted
+    // setting (default `normal`) so a prior ⌥V survives a restart, and
+    // mirror it into the store so a later theme save never drops it. The
+    // SEED is not a commit — nothing is written until the reader cycles.
+    let verbosity = settings
+        .as_ref()
+        .map_or_else(crate::toolfold::Verbosity::default, |store| {
+            store.load_verbosity()
+        });
+    model.toolfold.seed_verbosity(verbosity);
+    if let Some(store) = settings.as_mut() {
+        store.set_verbosity(verbosity);
+    }
     // W-C M2: seed the desktop-notification toggle from the persisted setting
     // (default on) so a prior `/notifications off` survives a restart, and
     // mirror it into the store so a later theme save never drops it.
@@ -3738,6 +3787,7 @@ pub async fn run_live(
     let mut seen_theme_commits = model.theme_commits;
     let mut seen_notification_commits = model.notification_commits;
     let mut seen_model_commits = model.model_commits;
+    let mut seen_verbosity_commits = model.verbosity_commits;
     let mut active_title = model.window_title();
 
     // Graphics wordmark query — after raw mode, before the input pump (see the
@@ -4031,6 +4081,9 @@ pub async fn run_live(
         // notifications as OSC 9 to the terminal (tty-gated inside).
         sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
+        sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        // 971-tui-collapse: see the demo loop.
+        model.note_tool_timings();
         emit_notifications(&mut model);
         if model.theme != active_theme {
             active_theme = model.theme;

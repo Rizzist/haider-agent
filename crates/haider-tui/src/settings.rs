@@ -2,11 +2,19 @@
 //! profile dir. This is DISPLAY preference, never daemon truth: nothing
 //! here rides the wire, and a missing/corrupt file simply means defaults.
 //!
-//! One setting today: the theme CHOICE (`system` or a fixed key). The
+//! Settings today: the theme CHOICE (`system` or a fixed key), the
+//! desktop-notification toggle, the last committed model pick, and the
+//! tool-output VERBOSITY (971-tui-collapse: quiet · normal · verbose, so an
+//! orchestration run opens quiet and a debugging run opens verbose). The
 //! resolved theme is NOT persisted — `system` re-evaluates the terminal's
 //! appearance on every boot, which is the whole point of the choice layer.
+//!
+//! Note what verbosity is and is not: a PROFILE preference, so it survives
+//! a session switch and a restart. WHICH ROWS a reader opened is transcript
+//! state and lives in the session slot (`session::SessionState::tool_rows`).
 
 use crate::theme::ThemeChoice;
+use crate::toolfold::Verbosity;
 use std::path::{Path, PathBuf};
 
 /// The settings file's name, beside the demo state in the profile dir.
@@ -33,6 +41,11 @@ struct SettingsDto {
     last_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_model: Option<String>,
+    /// 971-tui-collapse: the tool-output verbosity mode. Additive — files
+    /// written before this wave omit it and load as `normal` (the default),
+    /// so old settings stay valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_verbosity: Option<String>,
 }
 
 fn default_notifications() -> bool {
@@ -52,6 +65,10 @@ pub struct SettingsStore {
     /// Model retention: the `(provider, model)` pair mirrored into every
     /// write so a theme/notification save never drops it. Seeded at boot.
     last_model: Option<(String, String)>,
+    /// The tool-output verbosity mirrored into every write, so a theme or
+    /// model save never drops it. Seeded from the file at boot.
+    verbosity: Verbosity,
+    last_saved_verbosity: Option<Verbosity>,
 }
 
 impl SettingsStore {
@@ -64,6 +81,8 @@ impl SettingsStore {
             notifications: true,
             last_saved_notifications: None,
             last_model: None,
+            verbosity: Verbosity::default(),
+            last_saved_verbosity: None,
         }
     }
 
@@ -108,6 +127,41 @@ impl SettingsStore {
         self.load_dto().is_none_or(|dto| dto.notifications)
     }
 
+    /// 971-tui-collapse: the persisted tool-output verbosity. A missing,
+    /// corrupt, foreign-version or pre-wave file means `normal` — the
+    /// owner's default, never a half-applied mode.
+    #[must_use]
+    pub fn load_verbosity(&self) -> Verbosity {
+        self.load_dto()
+            .and_then(|dto| dto.tool_verbosity)
+            .and_then(|name| Verbosity::parse(&name))
+            .unwrap_or_default()
+    }
+
+    /// Seed the tracked verbosity (from a boot-time load) so a later theme,
+    /// notification or model save preserves it.
+    pub fn set_verbosity(&mut self, verbosity: Verbosity) {
+        self.verbosity = verbosity;
+        self.last_saved_verbosity = Some(verbosity);
+    }
+
+    /// Persist a verbosity commit, carrying the current theme and toggle. A
+    /// no-op only when this store already WROTE that value: the caller's
+    /// trigger is a commit counter, so a commit re-affirming the current
+    /// mode on a profile whose file does not exist yet still reaches disk.
+    pub fn save_verbosity_if_changed(&mut self, theme: ThemeChoice, verbosity: Verbosity) {
+        if self.last_saved_verbosity == Some(verbosity) {
+            self.verbosity = verbosity;
+            return;
+        }
+        self.verbosity = verbosity;
+        if self.write_dto(theme, self.notifications) {
+            self.last_saved = Some(theme);
+            self.last_saved_notifications = Some(self.notifications);
+            self.last_saved_verbosity = Some(verbosity);
+        }
+    }
+
     fn load_dto(&self) -> Option<SettingsDto> {
         let raw = std::fs::read_to_string(&self.path).ok()?;
         let dto: SettingsDto = serde_json::from_str(&raw).ok()?;
@@ -147,6 +201,7 @@ impl SettingsStore {
         if self.write_dto(theme, self.notifications) {
             self.last_saved = Some(theme);
             self.last_saved_notifications = Some(self.notifications);
+            self.last_saved_verbosity = Some(self.verbosity);
         }
     }
 
@@ -161,6 +216,7 @@ impl SettingsStore {
         if self.write_dto(choice, self.notifications) {
             self.last_saved = Some(choice);
             self.last_saved_notifications = Some(self.notifications);
+            self.last_saved_verbosity = Some(self.verbosity);
         }
     }
 
@@ -175,6 +231,7 @@ impl SettingsStore {
         if self.write_dto(theme, enabled) {
             self.last_saved = Some(theme);
             self.last_saved_notifications = Some(enabled);
+            self.last_saved_verbosity = Some(self.verbosity);
         }
     }
 
@@ -188,6 +245,7 @@ impl SettingsStore {
                 .as_ref()
                 .map(|(provider, _)| provider.clone()),
             last_model: self.last_model.as_ref().map(|(_, model)| model.clone()),
+            tool_verbosity: Some(self.verbosity.name().to_owned()),
         };
         let Ok(json) = serde_json::to_string(&dto) else {
             return false;

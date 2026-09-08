@@ -1,0 +1,49 @@
+# tuivirt golden · collapse_tools_desert · 80x24
+00|[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v<VERSION> · ~/dev/enterprise-suite  |
+   ~ Rgb(207, 175, 165)/Rgb(240, 228, 204)/NONE×2; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×6; Rgb(207, 175, 165)/Rgb(240, 228, 204)/NONE×2; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×5; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×2; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×2; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×2; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×3; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×2; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×2; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×8; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×2; Rgb(156, 98, 2)/Rgb(240, 228, 204)/BOLD×6; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×9; Rgb(46, 33, 16)/Rgb(240, 228, 204)/NONE×25; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×2
+01|            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · test-lion-box |
+   ~ Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×12; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×4; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×2; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×4; Rgb(123, 39, 64)/Rgb(156, 98, 2)/BOLD×2; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×2; Rgb(123, 39, 64)/Rgb(156, 98, 2)/BOLD×2; Rgb(123, 39, 64)/Rgb(240, 228, 204)/BOLD×8; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×2; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×7; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×4; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×30; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×1
+02|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(207, 175, 165)/Rgb(240, 228, 204)/NONE×80
+03|    └ SHIP — wave-971 candidate clears every gate                               |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×6; Rgb(85, 112, 46)/Rgb(240, 228, 204)/NONE×4; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×39; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×31
+04|  Ran 3 shell commands                                                          |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×2; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×4; Rgb(46, 33, 16)/Rgb(240, 228, 204)/BOLD×1; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×15; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×58
+05|    └ Resuming agent a830387                                                    |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×6; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×15; Rgb(123, 39, 64)/Rgb(240, 228, 204)/NONE×7; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×52
+06|  ✓ grep("todos_collapsed" *.rs) · 12 lines · 400ms                             |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×2; Rgb(85, 112, 46)/Rgb(240, 228, 204)/NONE×2; Rgb(123, 39, 64)/Rgb(240, 228, 204)/NONE×4; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×43; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×29
+07|    src/render.rs:5740:            if model.todos_collapsed {                   |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×19; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×38; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×19
+08|    src/render.rs:6336: let arrow = …                                           |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×19; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×14; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×43
+09|    src/app.rs:5254:    pub todos_collapsed: bool,                              |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×16; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×30; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×30
+10|    ERROR one match could not be read                                           |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(179, 35, 28)/Rgb(240, 228, 204)/NONE×5; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×28; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×43
+11|    warning: 2 files skipped                                                    |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(163, 78, 8)/Rgb(240, 228, 204)/NONE×8; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×16; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×52
+12|    src/app.rs:5709: todos_collapsed: false,                                    |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×16; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×24; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×36
+13|    src/app.rs:16876: self.todos_collapsed = false;                             |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×17; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×30; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×29
+14|    src/session.rs:127: pub todos_collapsed: bool,                              |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×19; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×27; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×30
+15|    src/render.rs:6368: if !model.todos_collapsed {                             |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×19; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×28; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×29
+16|    src/render.rs:6389: if !model.todos_collapsed {                             |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×4; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×19; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×28; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×29
+17|    └ ⋯ 2 more lines · ⏎ show all                                               |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×6; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×14; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×13; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×47
+18|  ◐ Monitor(Astra 971-tui-collapse verification (re-armed)) · running… 3s       |
+   ~ Rgb(210, 191, 155)/Rgb(240, 228, 204)/NONE×2; Rgb(163, 78, 8)/Rgb(240, 228, 204)/NONE×2; Rgb(123, 39, 64)/Rgb(240, 228, 204)/NONE×7; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×62; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×7
+19|                                                                                |
+   ~ Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×80
+20|───────────────────────────────────────────────────────────────────── fable-5 ──|
+   ~ Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×69; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×9; Rgb(156, 98, 2)/Rgb(240, 228, 204)/NONE×2
+21|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text     |
+   ~ Rgb(46, 33, 16)/Rgb(244, 236, 218)/NONE×2; Rgb(156, 98, 2)/Rgb(244, 236, 218)/BOLD×2; Rgb(240, 228, 204)/Rgb(156, 98, 2)/NONE×1; Rgb(112, 93, 65)/Rgb(244, 236, 218)/NONE×70; Rgb(46, 33, 16)/Rgb(244, 236, 218)/NONE×5
+22|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(207, 175, 165)/Rgb(240, 228, 204)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                |
+   ~ Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×1; Rgb(207, 175, 165)/Rgb(240, 228, 204)/NONE×2; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×4; Rgb(207, 175, 165)/Rgb(240, 228, 204)/NONE×2; Rgb(112, 93, 65)/Rgb(240, 228, 204)/NONE×33; Rgb(77, 58, 32)/Rgb(240, 228, 204)/NONE×38

@@ -125,6 +125,16 @@ pub struct SessionState {
     pub auto_resuming: bool,
     pub subtree_collapsed: bool,
     pub todos_collapsed: bool,
+    /// 971-tui-collapse: this session's ⌥T blanket override and its
+    /// per-row disclosure states. The verbosity MODE is deliberately not
+    /// here — it is a profile preference (`tui-settings.json`), so it
+    /// survives a session switch and a restart alike, while WHICH ROWS a
+    /// reader opened belongs to the transcript they opened them in.
+    pub tools_all_expanded: bool,
+    /// The background-task line under the composer is expanded into its
+    /// per-task list. Collapsed by default (owner 2026-09-08).
+    pub tasks_line_expanded: bool,
+    pub tool_rows: std::collections::BTreeMap<String, crate::toolfold::RowState>,
     // ---- Launcher-row statics (sim session fields the demo never edits).
     pub model_short: String,
     pub device: String,
@@ -209,6 +219,9 @@ impl SessionState {
             auto_resuming: false,
             subtree_collapsed: false,
             todos_collapsed: false,
+            tools_all_expanded: false,
+            tasks_line_expanded: false,
+            tool_rows: std::collections::BTreeMap::new(),
             model_short: String::new(),
             device: String::new(),
             ago: String::new(),
