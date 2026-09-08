@@ -3,6 +3,7 @@ package ai.diffforge.haider.ui.chat
 import ai.diffforge.haider.ui.state.RelativeTime
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.rememberBlink
 import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
@@ -10,11 +11,6 @@ import ai.diffforge.haider.ui.components.motionEnabled
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -61,6 +57,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -175,18 +172,11 @@ private fun AgentTurn(message: Message, onRetry: () -> Unit) {
 
 @Composable
 private fun AssistantProse(message: Message) {
-    if (message.streaming && motionEnabled()) {
-        val transition = rememberInfiniteTransition(label = "stream-caret")
-        val caretAlpha by transition.animateFloat(
-            initialValue = 1f,
-            targetValue = 0.15f,
-            animationSpec = infiniteRepeatable(tween(500), RepeatMode.Reverse),
-            label = "caret-alpha",
-        )
-        MarkdownText(message.text, showCaret = true, caretAlpha = caretAlpha)
-    } else {
-        MarkdownText(message.text, showCaret = message.streaming)
-    }
+    // The caret is a boolean now, not an animated alpha threaded through the
+    // markdown builder: it toggles at the shared ticker's rate, so the text is
+    // laid out ~3 times a second instead of 60 (verify-10 O5).
+    val caretVisible = rememberBlink(active = message.streaming)
+    MarkdownText(message.text, showCaret = message.streaming && caretVisible)
 }
 
 @Composable
@@ -285,21 +275,32 @@ private fun ToolCluster(messageId: Long, tools: List<ToolCall>, streaming: Boole
     }
 }
 
+/** The 36 dp painted body inside a tool row's 48 dp target. */
+const val TOOL_ROW_INK_TAG = "tool_row_ink"
+
 @Composable
 private fun ToolRow(tool: ToolCall) {
     val colors = Forge.colors
     val type = Forge.type
     var detailOpen by rememberSaveable(tool.callId) { mutableStateOf(tool.status.needsAttention) }
+    // Two nodes, like the drawer row: the wrapper takes the 48 dp target and
+    // the body paints 36. A `heightIn` minimum inside one node cannot shrink
+    // the node it is inside (verify-10 O4).
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = ForgeSize.touch)
-            .clickable(enabled = !tool.result.isNullOrBlank()) { detailOpen = !detailOpen }
-            .padding(vertical = ForgeSpace.xs)
-            .heightIn(min = ForgeSize.toolRowHeight)
-            .padding(horizontal = ForgeSpace.lg),
+            .clickable(enabled = !tool.result.isNullOrBlank()) { detailOpen = !detailOpen },
         verticalArrangement = Arrangement.Center,
     ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = ForgeSize.toolRowHeight)
+                .testTag(TOOL_ROW_INK_TAG)
+                .padding(horizontal = ForgeSpace.lg),
+            verticalArrangement = Arrangement.Center,
+        ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             // mono: tool output, from the glyph to the result.
             Text(toolGlyph(tool.name), style = type.toolRow, color = colors.textMuted)
@@ -341,6 +342,7 @@ private fun ToolRow(tool: ToolCall) {
                 color = toolStatusColor(tool.status),
             )
         }
+        }
         if (detailOpen && !tool.result.isNullOrBlank()) {
             val result = remember(tool.result) { prettyToolResult(tool.result) }
             Text(
@@ -362,16 +364,6 @@ private fun ToolRow(tool: ToolCall) {
     }
 }
 
-@Composable
-private fun pulsingStatusAlpha(): Float {
-    val transition = rememberInfiniteTransition(label = "tool-shimmer")
-    return transition.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
-        label = "tool-shimmer-alpha",
-    ).value
-}
 
 @Composable
 private fun ErrorCard(message: String, retryable: Boolean, onRetry: () -> Unit) {

@@ -60,4 +60,22 @@ class NarrowHeaderTest {
             rule.onAllNodes(hasContentDescription("Needs you")).fetchSemanticsNodes().isNotEmpty(),
         )
     }
+
+    @Test
+    fun `the three selects share one row at 360 dp`() {
+        rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
+        rule.waitForIdle()
+        // Literal coordinates, as the finding asked: all three centres on the
+        // same y. Round 11 put Permissions 52 dp lower (verify-10 O3).
+        val ys = listOf(
+            "Change model, Sonnet 4.5",
+            "Change effort, high",
+            "Change what Haider may do on its own, Auto",
+        ).map { description ->
+            rule.onNode(hasContentDescription(description)).fetchSemanticsNode()
+                .positionInRoot.y
+        }
+        assertEquals("select centres: $ys", ys[0], ys[1], 1f)
+        assertEquals("select centres: $ys", ys[0], ys[2], 1f)
+    }
 }

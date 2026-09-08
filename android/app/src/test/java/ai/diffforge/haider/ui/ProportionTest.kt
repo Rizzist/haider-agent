@@ -5,6 +5,8 @@ import ai.diffforge.haider.ui.chat.COMPOSER_TEXT_TAG
 import ai.diffforge.haider.ui.chat.SELECT_INK_TAG
 import ai.diffforge.haider.ui.drawer.SESSION_ROW_INK_TAG
 import androidx.compose.ui.test.onAllNodesWithTag
+import ai.diffforge.haider.ui.chat.TOOL_ROW_INK_TAG
+import ai.diffforge.haider.ui.drawer.DRAWER_HEAD_TAG
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.scaffold.HAIDER_TOP_BAR_TAG
@@ -62,6 +64,7 @@ class ProportionTest {
         const val TARGET = 48f
         const val SELECT_INK = 30f
         const val ROW_INK = 40f
+        const val TOOL_INK = 36f
     }
 
     // ---------- R1: the header is 48 dp with 32 dp visuals ----------
@@ -369,6 +372,87 @@ class ProportionTest {
             "the text ends at $textRight and the mic starts at ${mic.positionInRoot.x}",
             textRight <= mic.positionInRoot.x + 1f,
         )
+    }
+
+    // ---------- verify-10 O1: every rendered field, whole identifiers ----------
+
+    @Test
+    fun `an option label is part of the card`() {
+        // Native Auto consumed a card titled "Allow sms.list?" whose button
+        // said "Allow sms.send" (verify-10 O1).
+        val card = ai.diffforge.haider.ui.daemon.NeedsInput(
+            kind = "permission",
+            title = "Allow sms.list?",
+            options = listOf(
+                ai.diffforge.haider.ui.daemon.MenuOption(key = "allow", label = "Allow sms.send"),
+                ai.diffforge.haider.ui.daemon.MenuOption(key = "deny", label = "Don't"),
+            ),
+        )
+        assertTrue(CapabilityApproval.requestedCapabilities(card).contains("sms.send"))
+        assertFalse(CapabilityApproval.suppresses(PermissionMode.Auto, card))
+    }
+
+    @Test
+    fun `a longer identifier is not its covered prefix`() {
+        val card = needsInputOf("permission", "Allow sms.list.delete for old threads?")
+        // Round 11 took two segments and matched the prefix (verify-10 O1).
+        assertEquals(setOf("sms.list.delete"), CapabilityApproval.requestedCapabilities(card))
+        assertFalse(CapabilityApproval.suppresses(PermissionMode.Auto, card))
+    }
+
+    // ---------- verify-10 O2: the visible transcript is the canonical one ----------
+
+    @Test
+    fun `after Auto the transcript shows the completed call, not the old prose`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        service.setPermissionModeForTest(PermissionMode.Ask)
+        val viewModel = rule.setHaiderApp(service)
+        service.raiseDeviceApproval("s-nav")
+        rule.waitForIdle()
+        viewModel.selectPermissionMode(PermissionMode.Auto)
+        rule.waitForIdle()
+
+        // Visible == canonical: the row is terminal *and* the screen says so.
+        assertTrue(
+            "the completion never reached the screen",
+            rule.onAllNodesWithTextSafe(
+                ai.diffforge.haider.ui.daemon.FakeDaemonService.AUTO_SMS_TEXT,
+            ) > 0,
+        )
+        val completed = viewModel.state.value.messages.last().tools.last()
+        assertEquals(
+            ai.diffforge.haider.ui.daemon.FakeDaemonService.AUTO_SMS_RESULT,
+            completed.result,
+        )
+        assertEquals(1_200L, completed.durationMs)
+        assertFalse(viewModel.state.value.messages.last().streaming)
+    }
+
+    // ---------- verify-10 O4 / O7: paint versus target, again ----------
+
+    @Test
+    fun `a tool row paints 36 dp inside its 48 dp target`() {
+        rule.setHaiderApp(ComposeHost.install(FakeScenario.TurnRunning))
+        rule.waitForIdle()
+        val ink = rule.onAllNodesWithTag(TOOL_ROW_INK_TAG, useUnmergedTree = true)
+            .fetchSemanticsNodes()
+            .first()
+        assertEquals(
+            "the tool body paints ${dp(ink.size.height.toFloat())}",
+            Spec.TOOL_INK,
+            dp(ink.size.height.toFloat()).value,
+            1.5f,
+        )
+    }
+
+    @Test
+    fun `the drawer head is one 48 dp row`() {
+        rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
+        rule.onNodeWithContentDescription("Open sessions, 1 session needs input").performClick()
+        rule.waitForIdle()
+        val head = rule.onNodeWithTag(DRAWER_HEAD_TAG, useUnmergedTree = true)
+            .fetchSemanticsNode()
+        assertEquals(Spec.TARGET, dp(head.size.height.toFloat()).value, 0.5f)
     }
 
     private fun needsInputOf(kind: String, title: String) =

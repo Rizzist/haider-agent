@@ -115,24 +115,34 @@ fun Composer(
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
     ) {
         if (showPickers) {
-            // FlowRow, not a scrolling row: below 360 dp the third select wraps
-            // to a second line rather than hiding off the right edge.
-            FlowRow(
+            // One row at 360 dp. Round 10 used a FlowRow and the third select
+            // wrapped at exactly 360, a 52 dp displacement (verify-10 O3), so
+            // the three share the width instead: each takes a third and its
+            // value ellipsises rather than pushing the next one down. It still
+            // wraps below 360, where a third of the width cannot hold a label
+            // and a value.
+            // A Row, not a FlowRow. `weight` inside a FlowRow is applied after
+            // it has already decided to wrap, so the third select still moved
+            // to a second line at exactly 360 dp (verify-10 O3). Three equal
+            // thirds always share one row and ellipsise their value instead.
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
-                verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
+                horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 ModelSelect(
                     state = chip,
                     onOpenModel = onOpenModel,
                     onRetry = onRetryModels,
                     onStartDaemon = onStartDaemon,
+                    modifier = Modifier.weight(1f),
                 )
                 LabelledSelect(
                     label = stringResource(R.string.select_label_effort),
                     value = effort ?: stringResource(R.string.select_value_default),
                     contentDescription = stringResource(R.string.cd_change_effort),
                     onClick = onOpenEffort,
+                    modifier = Modifier.weight(1f),
                 )
                 LabelledSelect(
                     label = stringResource(R.string.select_label_permissions),
@@ -144,6 +154,7 @@ fun Composer(
                     ),
                     contentDescription = stringResource(R.string.cd_change_permissions),
                     onClick = onOpenPermissions,
+                    modifier = Modifier.weight(1f),
                 )
             }
         }
@@ -278,13 +289,14 @@ private fun LabelledSelect(
     value: String,
     contentDescription: String,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
     enabled: Boolean = true,
     leading: (@Composable () -> Unit)? = null,
 ) {
     val colors = Forge.colors
     val type = Forge.type
     Box(
-        modifier = Modifier
+        modifier = modifier
             .heightIn(min = ForgeSize.touch)
             .clickable(enabled = enabled, onClick = onClick)
             .semantics {
@@ -312,6 +324,7 @@ private fun LabelledSelect(
                 color = colors.text,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
             )
             Icon(
                 Icons.Rounded.ExpandMore,
@@ -330,11 +343,13 @@ private fun ModelSelect(
     onOpenModel: () -> Unit,
     onRetry: () -> Unit,
     onStartDaemon: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val label = stringResource(R.string.select_label_model)
     when (state) {
         is ModelChipState.Resolved -> LabelledSelect(
             label = label,
+            modifier = modifier,
             value = state.shortModel,
             contentDescription = stringResource(R.string.cd_change_model),
             onClick = onOpenModel,
@@ -344,6 +359,7 @@ private fun ModelSelect(
         )
         ModelChipState.Loading -> LabelledSelect(
             label = label,
+            modifier = modifier,
             value = stringResource(R.string.select_value_default),
             contentDescription = stringResource(R.string.chip_model_loading_cd),
             onClick = onOpenModel,
@@ -351,18 +367,21 @@ private fun ModelSelect(
         )
         is ModelChipState.Error -> LabelledSelect(
             label = label,
+            modifier = modifier,
             value = stringResource(R.string.chip_model_error),
             contentDescription = stringResource(R.string.chip_model_error),
             onClick = onRetry,
         )
         ModelChipState.DaemonDown -> LabelledSelect(
             label = label,
+            modifier = modifier,
             value = stringResource(R.string.chip_model_no_daemon),
             contentDescription = stringResource(R.string.chip_model_no_daemon),
             onClick = onStartDaemon,
         )
         ModelChipState.Changing -> LabelledSelect(
             label = label,
+            modifier = modifier,
             value = stringResource(R.string.chip_model_changing),
             contentDescription = stringResource(R.string.cd_change_model),
             onClick = onOpenModel,

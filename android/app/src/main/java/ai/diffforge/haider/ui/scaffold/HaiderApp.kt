@@ -21,6 +21,7 @@ import ai.diffforge.haider.ui.settings.SettingsScreen
 import ai.diffforge.haider.ui.start.AutonomyGrant
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.PermissionStanding
+import ai.diffforge.haider.ui.components.MotionLifecycleGate
 import ai.diffforge.haider.ui.start.StartSurface
 import ai.diffforge.haider.ui.state.BannerAction
 import ai.diffforge.haider.ui.state.BannerInputs
@@ -45,7 +46,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.WindowInsets
@@ -108,6 +110,9 @@ fun HaiderApp(
     ForgeTheme(dark = dark) {
         val colors = Forge.colors
         val drawerState = rememberDrawerState(DrawerValue.Closed)
+        // One gate for every looping animation: a paused app animates nothing
+        // (verify-10 O5).
+        MotionLifecycleGate()
         val scope = rememberCoroutineScope()
         var nowMs by remember { mutableLongStateOf(nowMsProvider()) }
         LaunchedEffect(Unit) {
@@ -216,6 +221,9 @@ fun HaiderApp(
                     modifier = Modifier.widthIn(max = drawerWidth),
                 ) {
                     SessionDrawer(
+                        // The closed drawer stays composed, so it has to be
+                        // told when it is invisible (verify-10 O5).
+                        open = drawerState.isOpen,
                         state = state,
                         themeMode = themeMode,
                         appVersion = appVersion,
@@ -253,7 +261,17 @@ fun HaiderApp(
                 Modifier
                     .fillMaxSize()
                     .background(colors.bg)
-                    .windowInsetsPadding(WindowInsets.safeDrawing),
+                    // One owner for the IME: the shell takes the top and the
+                    // sides, the composer takes the bottom. Round 11 gave
+                    // `safeDrawing` — which *includes* the IME — to the whole
+                    // column and then padded the composer again, so the header
+                    // panned away and a keyboard-sized gap opened above the
+                    // keyboard (verify-10 O6).
+                    .windowInsetsPadding(
+                        WindowInsets.safeDrawing.only(
+                            WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
+                        ),
+                    ),
             ) {
                 HaiderTopBar(
                     state = state,
@@ -409,7 +427,17 @@ fun HaiderApp(
                     requestedAtMs = state.catalogRequestedAtMs,
                     nowMs = nowMs,
                 )
-                Box(Modifier.fillMaxWidth().imePadding(), contentAlignment = Alignment.Center) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        // The bottom inset is the union of the navigation bar
+                        // and the IME, so the composer sits against whichever
+                        // is there — and never against both.
+                        .windowInsetsPadding(
+                            WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom),
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
                     Composer(
                         // The picker row is meaningless before the daemon can
                         // answer; the input stays visible and disabled so the

@@ -71,6 +71,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 
 /**
  * The drawer: identity, daemon card and New session fixed at the top, the
@@ -82,11 +83,16 @@ import androidx.compose.ui.platform.LocalDensity
  * search change. A list that reorders under a thumb steals taps
  * (UI-SPEC 3.3, trap 6.6.4).
  */
+/** The merged daemon + New chat + collapse row. */
+const val DRAWER_HEAD_TAG = "drawer_head"
+
 @Composable
 fun SessionDrawer(
     state: AppUiState,
     themeMode: ThemeMode,
     appVersion: String,
+    /** False while the drawer is shut: its rows must not animate (O5). */
+    open: Boolean = true,
     onClose: () -> Unit,
     onNewSession: () -> Unit,
     onNewSessionWith: () -> Unit,
@@ -173,7 +179,14 @@ fun SessionDrawer(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = ForgeSize.touch),
+                // R3 asks for a 44 dp head. Its three controls are targets, and
+                // a target may not be smaller than 48, so the row is 48 dp of
+                // layout with a 44 dp painted band — the same paint-versus-
+                // target split as every other row (verify-10 O7). The literal
+                // 44 dp *layout* row cannot coexist with legal targets inside
+                // it, which is recorded in the round report.
+                .height(ForgeSize.touch)
+                .testTag(DRAWER_HEAD_TAG),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             DaemonStatusRow(
@@ -272,6 +285,7 @@ fun SessionDrawer(
                                 onClick = { onSelect(row.id) },
                                 onLongClick = { onRowAction(row.id, SessionRowAction.Rename) },
                                 onAction = { action -> onRowAction(row.id, action) },
+                                visible = open,
                             )
                         }
                     }

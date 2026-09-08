@@ -67,6 +67,13 @@ fun SessionRowItem(
     onLongClick: () -> Unit,
     onAction: (SessionRowAction) -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * False while the drawer is shut. The drawer stays composed when closed —
+     * several sweeps depend on that — so without this every running row kept
+     * a live animation behind the chat, for pixels nobody could see
+     * (verify-10 O5).
+     */
+    visible: Boolean = true,
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -130,7 +137,7 @@ fun SessionRowItem(
                 model = row.model,
                 provider = row.provider,
                 state = row.state,
-                animate = SessionVisualStateFold.animates(row.state) && motionEnabled(),
+                animate = visible && SessionVisualStateFold.animates(row.state) && motionEnabled(),
                 ringAgainst = colors.surface,
             )
             Text(

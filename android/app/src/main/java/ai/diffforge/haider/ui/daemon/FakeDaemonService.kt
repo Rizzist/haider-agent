@@ -144,38 +144,37 @@ class FakeDaemonService(
      * with no run id.
      */
     private fun completeAutoTurn(sessionId: String) {
-        transcripts.getOrPut(sessionId) { mutableListOf() }.let { messages ->
-            val index = messages.indexOfLast { it.streaming }
-            if (index >= 0) {
-                messages[index] = messages[index].copy(
-                    streaming = false,
-                    tools = messages[index].tools.map { tool ->
-                        if (tool.status == ToolStatus.Running) {
-                            tool.copy(status = ToolStatus.Completed, durationMs = 1_200L)
-                        } else {
-                            tool
-                        }
-                    },
-                )
-            } else {
-                messages += Message(
-                    id = nextMessageId++,
-                    role = Role.Agent,
-                    text = "Read your recent texts.",
-                    provider = "anthropic",
-                    tools = listOf(
-                        ToolCall(
-                            callId = "call-auto-$sessionId",
-                            name = "sms",
-                            summary = "sms.list",
-                            status = ToolStatus.Completed,
-                            result = null,
-                            durationMs = 1_200L,
-                        ),
-                    ),
-                )
-            }
+        // The transcript is what a person looks at. Round 11 flipped the row to
+        // Idle and left the approval prose on screen with a null result, so the
+        // visible transcript and the canonical one disagreed (verify-10 O2).
+        val completed = ToolCall(
+            callId = "call-auto-$sessionId",
+            name = "sms",
+            summary = "sms.list --limit 20",
+            status = ToolStatus.Completed,
+            result = AUTO_SMS_RESULT,
+            durationMs = 1_200L,
+        )
+        val messages = transcripts.getOrPut(sessionId) { mutableListOf() }
+        val index = messages.indexOfLast { it.streaming }
+        if (index >= 0) {
+            messages[index] = messages[index].copy(
+                streaming = false,
+                text = AUTO_SMS_TEXT,
+                tools = messages[index].tools.filterNot { it.name == "sms" } + completed,
+            )
+        } else {
+            messages += Message(
+                id = nextMessageId++,
+                role = Role.Agent,
+                text = AUTO_SMS_TEXT,
+                provider = "anthropic",
+                tools = listOf(completed),
+            )
         }
+        // The stream the UI actually collects has to carry it, or the screen
+        // keeps whatever it loaded first.
+        publishTranscript(sessionId)
         _sessions.value = _sessions.value.map { row ->
             if (row.id == sessionId) {
                 calls += "tool.policy.auto_completed:$sessionId"
@@ -656,14 +655,36 @@ class FakeDaemonService(
     /** Overridable so a live scenario can push folded updates into a test. */
     var transcriptStream: ((String) -> Flow<TranscriptLoad>)? = null
 
+    /**
+     * A live stream per session, not a one-shot.
+     *
+     * The one-shot default meant a mid-turn change — the Auto completion, for
+     * one — never reached the screen, because nothing emitted again after the
+     * initial load (verify-10 O2).
+     */
+    private val transcriptFlows = mutableMapOf<String, MutableStateFlow<TranscriptLoad>>()
+
     override fun transcriptUpdates(sessionId: String): Flow<TranscriptLoad> =
-        transcriptStream?.invoke(sessionId) ?: flow { emit(transcript(sessionId)) }
+        transcriptStream?.invoke(sessionId) ?: transcriptFlow(sessionId).asStateFlow()
+
+    private fun transcriptFlow(sessionId: String): MutableStateFlow<TranscriptLoad> =
+        transcriptFlows.getOrPut(sessionId) { MutableStateFlow(snapshotTranscript(sessionId)) }
+
+    /** The same value [transcript] returns, without the suspend or the call log. */
+    private fun snapshotTranscript(sessionId: String): TranscriptLoad =
+        transcriptOverride?.invoke(sessionId)
+            ?: TranscriptLoad.Complete(
+                transcripts.getOrPut(sessionId) { defaultTranscript(sessionId) }.toList(),
+            )
+
+    /** Pushes the current transcript to whoever is collecting this session. */
+    private fun publishTranscript(sessionId: String) {
+        transcriptFlow(sessionId).value = snapshotTranscript(sessionId)
+    }
 
     override suspend fun transcript(sessionId: String): TranscriptLoad {
         calls += "session.attach:$sessionId"
-        transcriptOverride?.invoke(sessionId)?.let { return it }
-        val messages = transcripts.getOrPut(sessionId) { defaultTranscript(sessionId) }.toList()
-        return TranscriptLoad.Complete(messages)
+        return snapshotTranscript(sessionId)
     }
 
     /**
@@ -975,6 +996,13 @@ class FakeDaemonService(
     )
 
     companion object {
+        /** What the allowed call returned, rendered verbatim in the tool row. */
+        const val AUTO_SMS_RESULT =
+            "2 messages\n  Amir  \"4 pm still works\"\n  Bank  \"Payment received\""
+
+        /** The assistant's line once the allowed call came back. */
+        const val AUTO_SMS_TEXT = "Read your recent texts: 2 new, nothing urgent."
+
         /** Bounds a runaway cursor rather than paging forever. */
         const val MAX_SEARCH_PAGES = 64
 

@@ -50,8 +50,12 @@ object CapabilityApproval {
      * Anything that looks like one and is not in [COVERED] — `sms.send`, a
      * name from a newer daemon, even a version string — leaves the card up.
      * The failure direction is "ask", every time.
+     *
+     * The pattern takes **every** dotted segment, so `sms.list.delete` is one
+     * token and not the covered prefix `sms.list`. Round 11 stopped at two
+     * segments and accepted the truncation (verify-10 O1).
      */
-    private val TOOL_TOKEN = Regex("""\b[a-z0-9_]+\.[a-z0-9_]+\b""")
+    private val TOOL_TOKEN = Regex("""[a-z0-9_]+(?:\.[a-z0-9_]+)+""")
 
     private val NEVER_SUPPRESSED_KINDS = setOf(
         "question",
@@ -65,11 +69,28 @@ object CapabilityApproval {
         "file",
     )
 
-    /** Every capability the card actually names. */
-    fun requestedCapabilities(needsInput: NeedsInput): Set<String> =
-        TOOL_TOKEN.findAll(
-            (listOf(needsInput.title) + needsInput.safeBody).joinToString(" ").lowercase(),
-        ).map { it.value }.toSet()
+    /**
+     * Every capability the card names, from **every** surface it renders.
+     *
+     * The option labels are part of the card: a card titled "Allow sms.list?"
+     * whose button says "Allow sms.send" was consumed by Auto because only the
+     * title and body were read (verify-10 O1). Whatever a person could see and
+     * press is scanned.
+     */
+    fun requestedCapabilities(needsInput: NeedsInput): Set<String> {
+        val surfaces = buildList {
+            add(needsInput.title)
+            addAll(needsInput.safeBody)
+            needsInput.options.forEach { option ->
+                add(option.label)
+                add(option.key)
+                option.detail?.let(::add)
+            }
+        }
+        return TOOL_TOKEN.findAll(surfaces.joinToString(" ").lowercase())
+            .map { it.value }
+            .toSet()
+    }
 
     /**
      * True only when the card names at least one capability and **every** one
