@@ -206,6 +206,22 @@ class ParityTest {
     }
 
     @Test
+    fun `the composer's model sheet offers a custom id only where it is advisory`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.openOverlay(Overlay.Picker(ai.diffforge.haider.ui.chat.PickerKind.Model))
+        rule.waitForIdle()
+        // `local-lab` published an advisory list; Anthropic did not. One entry,
+        // not one per provider (lane 971-UI-extras follow-up).
+        assertEquals(
+            1,
+            rule.onAllNodes(
+                androidx.compose.ui.test.hasText("Custom model…", substring = true),
+            ).fetchSemanticsNodes().size,
+        )
+    }
+
+    @Test
     fun `a daemon with no usage report says so`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         service.setUsage(UsageSnapshot(supported = false))
