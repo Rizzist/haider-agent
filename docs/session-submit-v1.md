@@ -47,6 +47,14 @@ budget continuation; `haider resume <session_id> --json` remains the recovery
 barrier and accepts no prompt. A currently active session uses the existing
 `DeliveryMode::Queue` admission semantics.
 
+If an ordinary turn reaches its request ceiling, the CLI exits 78 with
+`request_budget_exceeded`. Its failure summary and stderr provide
+`haider session submit <session_id> -`; supply the next prompt on stdin.
+This starts a fresh ordinary turn and preserves the session's history.
+The raw journal records in JSON and JSONL retain the daemon's original
+error evidence. Use the CLI failure summary/stderr for command guidance;
+`--resume` remains the separate door for pinned budget continuations.
+
 Before acceptance, machine output includes an error object and null run/turn
 IDs. Unknown native sessions return `error.code = "session_not_found"`;
 sessions fenced by the daemon's close/delete lifecycle return `"session_closed"`.

@@ -4949,3 +4949,151 @@ fn ordinary_session_submission_is_separate_from_budget_resume() {
         );
     }
 }
+
+#[test]
+fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
+    let limit = haider_protocol::request_budget::RequestBudgetV1::default().hard_cap;
+    let mut script = Vec::new();
+    for ordinal in 1..=limit {
+        if ordinal > 1 {
+            script.push(serde_json::json!({
+                "step": "expect_tool_result", "call_id": format!("ceiling-{}", ordinal - 1)
+            }));
+        }
+        script.push(serde_json::json!({
+            "step": "emit_tool_call", "call_id": format!("ceiling-{ordinal}"),
+            "name": "fs_read", "args": {"path": "continuity.txt"}
+        }));
+        script.push(serde_json::json!({"step": "finish", "reason": "tool_use"}));
+    }
+    script.push(serde_json::json!({"step": "emit_text", "text": "UNREACHABLE_REQUEST"}));
+    script.push(serde_json::json!({"step": "finish", "reason": "end_turn"}));
+    let ceiling_script = serde_json::to_string(&script).expect("fake ceiling script");
+
+    for output_mode in ["json", "jsonl"] {
+        let fixture = haider();
+        let profile = fixture.profile.clone();
+        let workspace = profile.parent().expect("profile parent").join("workspace");
+        std::fs::write(workspace.join("continuity.txt"), "retained fixture history")
+            .expect("workspace input");
+        let invoke = |args: &[&str], script: &str, input: Option<&[u8]>, expected: i32| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+            configure_test_home(&mut command, &profile);
+            command
+                .current_dir(&workspace)
+                .env("HAIDER_PROFILE_DIR", &profile)
+                .env("HAIDER_DISCOVERY_DISABLED", "1")
+                // Restart each owned daemon so every phase has its own exact
+                // provider script and the advertised continuation is durable.
+                .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
+                .env("HAIDER_TEST_FAKE_PROVIDER", script)
+                .env_remove("HAIDER_MODEL")
+                .args(args);
+            let output = bounded_output(&mut command, input);
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let first = invoke(
+            &[
+                "run",
+                "--provider",
+                "fake",
+                "--read-only",
+                "--output",
+                "json",
+                "--timeout",
+                "30s",
+                "initial turn",
+            ],
+            DEFAULT_FAKE_SCRIPT,
+            None,
+            0,
+        );
+        let first: serde_json::Value = serde_json::from_slice(&first.stdout).expect("initial JSON");
+        let session_id = first["session_id"].as_str().expect("native session");
+        let capped = invoke(
+            &[
+                "run",
+                "--session",
+                session_id,
+                "--output",
+                output_mode,
+                "--timeout",
+                "30s",
+                "reach the ordinary ceiling",
+            ],
+            &ceiling_script,
+            None,
+            78,
+        );
+        let stderr = String::from_utf8(capped.stderr).expect("failure stderr");
+        let advertised = stderr
+            .split('`')
+            .find(|part| part.starts_with("haider session submit "))
+            .expect("ordinary failure advertises a session command");
+        assert!(!stderr.contains("--resume"), "{stderr}");
+        let records: Vec<serde_json::Value> = if output_mode == "json" {
+            let capped: serde_json::Value =
+                serde_json::from_slice(&capped.stdout).expect("ceiling JSON");
+            assert_eq!(capped["error"]["code"], "request_budget_exceeded");
+            for field in [
+                &capped["error"]["message"],
+                &capped["error"]["presentation"]["detail"],
+            ] {
+                let message = field.as_str().expect("failure guidance");
+                assert!(message.contains(advertised), "{message}");
+                assert!(!message.contains("--resume"), "{message}");
+            }
+            capped["events"].as_array().expect("journal").clone()
+        } else {
+            String::from_utf8(capped.stdout)
+                .expect("JSONL")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("JSONL record"))
+                .collect()
+        };
+        let hard_bound = records
+            .iter()
+            .find_map(|record| {
+                let payload = &record["payload"];
+                (payload["event"] == "completed"
+                    && payload["item"]["kind"] == "provider_request_budget_v1"
+                    && payload["item"]["data"]["phase"] == "hard_bound")
+                    .then_some(&payload["item"]["data"])
+            })
+            .expect("original durable ceiling evidence");
+        assert_eq!(hard_bound["used"], limit);
+        assert_eq!(hard_bound["budget"]["hard_cap"], limit);
+        assert!(
+            !serde_json::to_string(&records)
+                .expect("records")
+                .contains("UNREACHABLE_REQUEST")
+        );
+
+        // Execute the command extracted from the actual CLI error, including
+        // its stdin door, instead of merely comparing an expected hint string.
+        let mut args: Vec<_> = advertised.split_whitespace().skip(1).collect();
+        args.extend(["--output", "json", "--timeout", "30s"]);
+        let continued = invoke(
+            &args,
+            DEFAULT_FAKE_SCRIPT,
+            Some(b"continue with a fresh turn\n"),
+            0,
+        );
+        let continued: serde_json::Value =
+            serde_json::from_slice(&continued.stdout).expect("continued JSON");
+        assert_eq!(continued["session_id"], session_id);
+        assert_eq!(continued["outcome"], "done");
+        assert_eq!(continued["run_id"], continued["turn_id"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.get("run_id") != Some(&continued["run_id"]))
+        );
+    }
+}

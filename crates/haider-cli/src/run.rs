@@ -952,7 +952,10 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     }
 
     match result {
-        Ok(result) => {
+        Ok(mut result) => {
+            if options.session_id.is_some() {
+                present_session_submit_failure(&mut result);
+            }
             if options.output != RunOutput::Jsonl
                 && let Err(error) = write_final(io::stdout().lock(), options.output, &result)
             {
@@ -2016,6 +2019,26 @@ fn is_typed_terminal_run_state(envelope: &RawEnvelope) -> bool {
         }
     };
     state_matches && error_shape_matches
+}
+
+// The durable journal's generic budget hint also serves pinned runs. An
+// ordinary submission has no headless pin, so its CLI summary must offer its
+// own continuation door. Keep the raw JSON/JSONL journal evidence intact.
+fn present_session_submit_failure(result: &mut HeadlessRunResult) {
+    let Some(failure) = &mut result.failure else {
+        return;
+    };
+    if failure.code != HeadlessFailureCode::Run(ErrorCode::RequestBudgetExceeded) {
+        return;
+    }
+    let message = format!(
+        "The session request ceiling was reached. Continue with `haider session submit {} -` and provide the next prompt on stdin.",
+        result.session_id
+    );
+    failure.message.clone_from(&message);
+    if let Some(presentation) = &mut failure.presentation {
+        presentation.detail = message;
+    }
 }
 
 pub(crate) fn write_final(
