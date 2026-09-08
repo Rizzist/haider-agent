@@ -130,7 +130,7 @@ pub struct SessionState {
     /// here — it is a profile preference (`tui-settings.json`), so it
     /// survives a session switch and a restart alike, while WHICH ROWS a
     /// reader opened belongs to the transcript they opened them in.
-    pub tools_all_expanded: bool,
+    pub tools_blanket: crate::toolfold::Blanket,
     /// The background-task line under the composer is expanded into its
     /// per-task list. Collapsed by default (owner 2026-09-08).
     pub tasks_line_expanded: bool,
@@ -219,7 +219,7 @@ impl SessionState {
             auto_resuming: false,
             subtree_collapsed: false,
             todos_collapsed: false,
-            tools_all_expanded: false,
+            tools_blanket: crate::toolfold::Blanket::default(),
             tasks_line_expanded: false,
             tool_rows: std::collections::BTreeMap::new(),
             model_short: String::new(),

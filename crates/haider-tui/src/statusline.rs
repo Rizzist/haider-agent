@@ -36,7 +36,12 @@
 
 use crate::toolfold::{Segment, Tone, ellipsize};
 
-/// Task rows the expanded list shows before it yields to a `+K more` row.
+/// Task rows one PAGE of the expanded list shows before it yields to the
+/// `+K more` row.
+///
+/// Verify 1 (F7): that row used to be inert, so a session with fourteen
+/// monitors could not reveal them at all. It is an affordance now — click
+/// it, or `/tasks more`, to walk the pages.
 pub const MAX_ROWS: usize = 8;
 
 /// What a row in the expanded list IS. The kind is the row's "type" column —
@@ -200,6 +205,9 @@ pub struct StatusLine {
     pub counts: Counts,
     pub rows: Vec<Row>,
     pub expanded: bool,
+    /// Which page of the list is showing (F7). Clamped by [`Self::page`],
+    /// so a page that a finished task emptied falls back to the first.
+    pub page: usize,
 }
 
 impl StatusLine {
@@ -210,9 +218,22 @@ impl StatusLine {
         self.mode.is_some() || !self.counts.is_empty()
     }
 
+    /// Pages the list spans — at least one, so `page 1 of 1` is sayable.
+    #[must_use]
+    pub fn pages(&self) -> usize {
+        self.rows.len().div_ceil(MAX_ROWS).max(1)
+    }
+
+    /// The page actually showing, clamped into range: a page a finished
+    /// task emptied falls back to the first rather than rendering nothing.
+    #[must_use]
+    pub fn page(&self) -> usize {
+        self.page.min(self.pages() - 1)
+    }
+
     /// Rows this line occupies: one collapsed; expanded, the summary plus
-    /// `● main` plus the bounded task list plus a `+K more` row when the
-    /// list overflowed.
+    /// this page of the task list plus the `+K more` affordance when the
+    /// list spans more than one page.
     #[must_use]
     pub fn height(&self) -> u16 {
         if !self.shows() {
@@ -221,9 +242,9 @@ impl StatusLine {
         if !self.expanded {
             return 1;
         }
-        let listed = self.rows.len().min(MAX_ROWS);
-        let overflow = usize::from(self.rows.len() > listed);
-        u16::try_from(1 + listed + overflow).unwrap_or(u16::MAX)
+        let (listed, hidden) = self.listed();
+        let overflow = usize::from(hidden > 0);
+        u16::try_from(1 + listed.len() + overflow).unwrap_or(u16::MAX)
     }
 
     /// The collapsed summary: `▸▸ bypass permissions on · 6 shells, 14 monitors`.
@@ -306,20 +327,37 @@ impl StatusLine {
         head
     }
 
-    /// The `+K more` row closing an overflowing list.
+    /// The `+K more` row closing an overflowing list — an AFFORDANCE, not
+    /// a dead label (F7): it names the page it is on and the gesture that
+    /// walks to the next, and wraps back to the first at the end.
     #[must_use]
-    pub fn overflow_segments(hidden: usize) -> Vec<Segment> {
+    pub fn overflow_segments(&self, hidden: usize) -> Vec<Segment> {
+        let (page, pages) = (self.page(), self.pages());
+        let last = page + 1 == pages;
         vec![
             Segment::new("  ", Tone::Structure),
             Segment::new(format!("  +{hidden} more"), Tone::Meta),
+            Segment::new(format!(" · page {} of {pages}", page + 1), Tone::Meta),
+            Segment::new(
+                if last {
+                    " · ⏎ back to the first"
+                } else {
+                    " · ⏎ next page"
+                },
+                Tone::Accent,
+            ),
         ]
     }
 
-    /// The listed rows and the count the `+K more` row must report.
+    /// This page's rows, and how many the page is not showing.
     #[must_use]
     pub fn listed(&self) -> (&[Row], usize) {
-        let listed = self.rows.len().min(MAX_ROWS);
-        (&self.rows[..listed], self.rows.len() - listed)
+        if self.rows.is_empty() {
+            return (&self.rows, 0);
+        }
+        let start = self.page() * MAX_ROWS;
+        let end = start.saturating_add(MAX_ROWS).min(self.rows.len());
+        (&self.rows[start..end], self.rows.len() - (end - start))
     }
 }
 

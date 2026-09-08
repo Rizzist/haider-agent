@@ -62,6 +62,15 @@ impl<'a> LayoutCtx<'a> {
     }
 }
 
+/// Line indices an entry wants remembered, filled while it lays itself out.
+/// The cache turns them into WRAPPED-row offsets, which is the space the
+/// hit map lives in.
+#[derive(Debug, Default, Clone, Copy)]
+struct EntryMarks {
+    /// Index, in the produced `lines`, of the `⏎ show all` affordance.
+    show_all: Option<usize>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptLayoutCache {
     initialized: bool,
@@ -91,6 +100,14 @@ struct CachedTranscriptEntry {
     height: u64,
     dynamic: bool,
     windowed: bool,
+    /// Wrapped-row offset, from the entry's first row, of the `⏎ show all`
+    /// affordance — `None` when the entry drew none.
+    ///
+    /// MEASURED, not derived (verify 1, F6): a truncation or decode footer
+    /// follows the affordance, and either of them can WRAP, so counting
+    /// rows backwards from the entry's height put the mouse target a row
+    /// below the line the reader clicked.
+    show_all_row: Option<u64>,
 }
 
 impl TranscriptLayoutCache {
@@ -326,9 +343,16 @@ fn cache_transcript_entry_window(
         return cache_extreme_agent_entry(block, text, ctx, window);
     }
     let mut lines = Vec::new();
-    transcript_lines(&mut lines, entry, ctx, index);
+    let mut marks = EntryMarks::default();
+    transcript_lines(&mut lines, entry, ctx, index, &mut marks);
     let lines = lines.into_iter().map(owned_line).collect::<Vec<_>>();
     let height = wrapped_lines_height(&lines, ctx.width);
+    // The affordance's row is measured from the lines ABOVE it, so a
+    // wrapped summary row or a wrapped footer cannot move the hit (F6).
+    let show_all_row = marks
+        .show_all
+        .and_then(|index| lines.get(..index))
+        .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
     let dynamic = matches!(
         entry,
         TranscriptEntry::Item(ItemBlock {
@@ -347,6 +371,7 @@ fn cache_transcript_entry_window(
         height: u64::from(height),
         dynamic,
         windowed: false,
+        show_all_row,
     }
 }
 
@@ -462,6 +487,7 @@ fn cache_extreme_agent_entry(
             line_start: 2,
             height,
             dynamic: false,
+            show_all_row: None,
             windowed: true,
         };
     }
@@ -511,6 +537,7 @@ fn cache_extreme_agent_entry(
             retained_height: 0,
             height: estimated_height,
             dynamic: false,
+            show_all_row: None,
             windowed: true,
         };
     };
@@ -574,6 +601,7 @@ fn cache_extreme_agent_entry(
         retained_height,
         height: estimated_height.max(line_start.saturating_add(retained_height)),
         dynamic: false,
+        show_all_row: None,
         windowed: true,
     }
 }
@@ -710,6 +738,60 @@ pub fn foldable_runs(
         }
     }
     runs
+}
+
+/// Resolve a pending tool-row REVEAL against this frame's geometry (verify
+/// 1, F4: ⌥N/⌥P could move the focus to a row above the viewport and leave
+/// the reader looking at rows they had not asked about).
+///
+/// Same discipline as the tree jump directly below: node → display entry →
+/// wrapped row, every step through the renderer's own width-keyed cache,
+/// and the anchor clears only when it LANDS. A row already fully inside the
+/// viewport is left where it is — revealing it would scroll the transcript
+/// for no reason.
+fn resolve_tool_reveal(
+    model: &AppModel,
+    cache: &TranscriptLayoutCache,
+    projection: &SessionProjection,
+    prefix_rows: u64,
+    max_scroll_rows: u64,
+    viewport_height: u16,
+) {
+    let Some(item_id) = model.pending_tool_reveal.borrow().clone() else {
+        return;
+    };
+    let Some(index) = projection.entries().iter().position(
+        |entry| matches!(entry, TranscriptEntry::Item(block) if block.item_id.as_str() == item_id),
+    ) else {
+        // The row is not in THIS transcript (the chip view's, say) — the
+        // anchor stays armed for the frame that owns it.
+        return;
+    };
+    *model.pending_tool_reveal.borrow_mut() = None;
+    let start = prefix_rows.saturating_add(cache.row_start(projection, index));
+    let height = cache
+        .entries
+        .get(&index)
+        .map_or(1, |entry| entry.height.max(1));
+    let scroll = max_scroll_rows.saturating_sub(model.scroll_back.get().min(max_scroll_rows));
+    let viewport_end = scroll.saturating_add(u64::from(viewport_height));
+    if start >= scroll && start.saturating_add(height) <= viewport_end {
+        return;
+    }
+    // Above the viewport: put the row's first line at the top. Below it:
+    // bring its LAST line to the bottom, which is the smaller move.
+    let target_top = if start < scroll {
+        start
+    } else {
+        start
+            .saturating_add(height)
+            .saturating_sub(u64::from(viewport_height))
+    }
+    .min(max_scroll_rows);
+    model
+        .scroll_back
+        .set(max_scroll_rows.saturating_sub(target_top));
+    model.sticky_suppressed.set(true);
 }
 
 /// A tool call whose outcome is known. Only settled calls fold — a live row
@@ -6264,6 +6346,14 @@ fn render_session(
     // anchor clears only when it LANDS.
     // (A taken jump whose branch is no longer displayed stays dropped: it
     // is never resolved against another branch's rows.)
+    resolve_tool_reveal(
+        model,
+        &transcript_cache,
+        &model.projection,
+        0,
+        max_scroll_rows,
+        transcript_area.height,
+    );
     if let Some(jump) = model.pending_jump.take()
         && jump.branch.as_ref() == model.branch_state.active()
     {
@@ -10659,6 +10749,14 @@ fn render_subagent(
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
+    resolve_tool_reveal(
+        model,
+        &transcript_cache,
+        &chip.transcript,
+        u64::from(wrapped_lines_height(&prefix, transcript_area.width)),
+        max_scroll,
+        transcript_area.height,
+    );
     let (visible_lines, visible_base, visible_total, scroll) = virtualized_transcript_lines(
         &mut transcript_cache,
         &chip.transcript,
@@ -12183,11 +12281,11 @@ fn render_task_line(
                 row_hits.push((offset, door));
             }
         }
-        if hidden > 0 {
-            rows.push(toned_line(
-                &crate::statusline::StatusLine::overflow_segments(hidden),
-                theme,
-            ));
+        if hidden > 0
+            && let Ok(offset) = u16::try_from(rows.len())
+        {
+            rows.push(toned_line(&status.overflow_segments(hidden), theme));
+            row_hits.push((offset, Hit::TaskLineMore));
         }
     }
     rows.truncate(area.height as usize);
@@ -14283,6 +14381,7 @@ fn transcript_lines<'a>(
     entry: &'a TranscriptEntry,
     ctx: LayoutCtx<'_>,
     index: usize,
+    marks: &mut EntryMarks,
 ) {
     let (theme, width) = (ctx.theme, ctx.width);
     match entry {
@@ -14336,7 +14435,7 @@ fn transcript_lines<'a>(
                 lines.push(Line::from(spans));
             }
         }
-        TranscriptEntry::Item(block) => item_lines(lines, block, ctx, index),
+        TranscriptEntry::Item(block) => item_lines(lines, block, ctx, index, marks),
         TranscriptEntry::Peer {
             sender,
             sender_kind,
@@ -14715,14 +14814,17 @@ fn toned_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'sta
     )
 }
 
-/// One row of EXPANDED tool output: the 4-cell indent, then the line split
-/// into meaning-toned runs (owner item 3 — a non-zero exit code, a verdict,
-/// a `file:line`, a thread id each keep their own ink). The body ink is
-/// `dim`, not the old `faint`: this is text a reader reads.
-fn tool_output_line(text: &str, theme: &Theme, width: u16) -> Line<'static> {
-    let budget = (width as usize).saturating_sub(4);
+/// One DISPLAY row of expanded tool output: the 4-cell indent, then the row
+/// split into meaning-toned runs (owner item 3 — a non-zero exit code, a
+/// verdict, a `file:line`, a thread id each keep their own ink). The body
+/// ink is `dim`, not the old `faint`: this is text a reader reads.
+///
+/// The row arrives already wrapped to the content budget by
+/// `toolfold::output_rows`, so nothing is ellipsized away here — verify 1
+/// (F2) found `show all` silently dropping the suffix of every long line.
+fn tool_output_line(text: &str, theme: &Theme) -> Line<'static> {
     let mut spans = vec![Span::styled("    ", theme.faint_style())];
-    for segment in crate::toolfold::meaning_segments(&crate::toolfold::ellipsize(text, budget)) {
+    for segment in crate::toolfold::meaning_segments(text) {
         spans.push(Span::styled(segment.text, theme.tone_style(segment.tone)));
     }
     Line::from(spans)
@@ -14790,6 +14892,7 @@ fn tool_disclosure_lines<'a>(
     ctx: LayoutCtx<'_>,
     index: usize,
     facts: &crate::toolfold::RowFacts<'_>,
+    marks: &mut EntryMarks,
 ) {
     use crate::toolfold::{self as tf, FoldRole, RowState};
     let theme = ctx.theme;
@@ -14849,18 +14952,30 @@ fn tool_disclosure_lines<'a>(
         }
         return;
     }
-    let retained: Vec<&str> = output.lines().collect();
-    let shown = if matches!(state, RowState::ShowAll) {
-        retained.len()
+    // Every retained row, hard-wrapped to the content budget: `show all`
+    // now really does show all of it (F2).
+    let retained = tf::output_rows(
+        &output,
+        block.output_truncated,
+        cells.saturating_sub(OUTPUT_INDENT),
+    );
+    let (start, end, below) = if matches!(state, RowState::ShowAll) {
+        (0, retained.len(), 0)
     } else {
-        tf::EXPANDED_MAX_ROWS.min(retained.len())
+        tf::bounded_window(
+            retained.len(),
+            ctx.fold.scroll_of(item_id),
+            tf::EXPANDED_MAX_ROWS,
+        )
     };
-    for text in &retained[..shown] {
-        lines.push(tool_output_line(text, theme, ctx.width));
+    for text in &retained[start..end] {
+        lines.push(tool_output_line(text, theme));
     }
-    let hidden = retained.len().saturating_sub(shown);
-    if hidden > 0 {
-        lines.push(toned_line(&tf::show_all_segments(hidden), theme));
+    if start > 0 || below > 0 {
+        // Remembered by LINE index; the cache measures it into a wrapped
+        // row so the hit lands on the glyphs the reader sees (F6).
+        marks.show_all = Some(lines.len());
+        lines.push(toned_line(&tf::show_all_segments(start, below), theme));
     }
     // Honesty below the tail (r2: bottom-anchored viewport). Only where the
     // output was actually shown — a collapsed row has already returned.
@@ -14876,6 +14991,23 @@ fn tool_disclosure_lines<'a>(
             theme.warn_style(),
         ));
     }
+}
+
+/// Cells the output indent costs, so the wrap budget and the rendered row
+/// agree exactly.
+pub(crate) const OUTPUT_INDENT: usize = 4;
+
+/// How many DISPLAY rows one tool row's retained output wraps to at `width`
+/// — the clamp the scroll gestures need, taken from the same function that
+/// renders them so the two can never disagree.
+#[must_use]
+pub fn retained_output_rows(block: &ItemBlock, width: u16) -> usize {
+    crate::toolfold::output_rows(
+        &block.output_text(),
+        block.output_truncated,
+        (width as usize).saturating_sub(OUTPUT_INDENT),
+    )
+    .len()
 }
 
 /// Register the click targets for every visible tool row (971-tui-collapse).
@@ -14900,7 +15032,7 @@ fn tool_row_hits(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
-    use crate::toolfold::{FoldRole, RowState};
+    use crate::toolfold::FoldRole;
     let viewport_end = scroll.saturating_add(u64::from(area.height));
     let row_rect = |row: u64| -> Option<Rect> {
         if row < scroll || row >= viewport_end {
@@ -14930,14 +15062,11 @@ fn tool_row_hits(
         }
         let start = prefix_rows.saturating_add(cache.row_start(projection, index));
         let item_id = block.item_id.as_str().to_owned();
-        // The `show all` elbow is the LAST row of a bounded-expanded entry
-        // that hid something. `entry.height` is the measured truth, so this
-        // survives a summary row that wrapped.
-        if matches!(ctx.role(index), FoldRole::Alone)
-            && ctx.fold.state_of(&item_id) == RowState::Expanded
-            && block.output_text().lines().count() > crate::toolfold::EXPANDED_MAX_ROWS
-            && entry.height > 0
-            && let Some(rect) = row_rect(start.saturating_add(entry.height - 1))
+        // The `show all` elbow, at the row the layout MEASURED it onto —
+        // never counted backwards from the entry's height, which put the
+        // target under a wrapped honesty footer (verify 1, F6).
+        if let Some(offset) = entry.show_all_row
+            && let Some(rect) = row_rect(start.saturating_add(offset))
         {
             hits.push((rect, Hit::ToolShowAll(item_id.clone())));
         }
@@ -14959,6 +15088,7 @@ fn item_lines<'a>(
     block: &'a ItemBlock,
     ctx: LayoutCtx<'_>,
     index: usize,
+    marks: &mut EntryMarks,
 ) {
     let (theme, width) = (ctx.theme, ctx.width);
     match &block.item {
@@ -15126,7 +15256,7 @@ fn item_lines<'a>(
                 spinner: true,
                 reason: block.tool_reason.as_deref(),
             };
-            tool_disclosure_lines(lines, block, ctx, index, &facts);
+            tool_disclosure_lines(lines, block, ctx, index, &facts, marks);
         }
         TurnItem::CommandExecution {
             command,
@@ -15154,7 +15284,7 @@ fn item_lines<'a>(
                 spinner: false,
                 reason: None,
             };
-            tool_disclosure_lines(lines, block, ctx, index, &facts);
+            tool_disclosure_lines(lines, block, ctx, index, &facts, marks);
         }
         TurnItem::FileChange {
             path,

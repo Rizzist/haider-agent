@@ -4285,6 +4285,9 @@ pub enum Hit {
     /// The live background-task line under the composer — click expands it
     /// into the per-task list, and folds it again.
     TaskLineToggle,
+    /// The expanded list's `+K more` row — walks its pages (verify 1, F7:
+    /// this row used to be inert).
+    TaskLineMore,
     /// One pinned-todo row. Carries the todo's id so a stale rect can only
     /// ever light the row it was measured on. Clicking a row does nothing —
     /// the sim's rows are not buttons; the hit exists so the row can take
@@ -5335,6 +5338,17 @@ pub struct AppModel {
     /// per-task list (owner 2026-09-08). Collapsed by default; per-session
     /// (the slot), because it is a view of THAT session's background work.
     pub tasks_line_expanded: bool,
+    /// Which page of that list is showing (verify 1, F7).
+    pub tasks_line_page: usize,
+    /// A one-shot request to reveal one tool row in the transcript (verify
+    /// 1, F4). RENDER resolves it against its own width-keyed geometry —
+    /// the model cannot know which wrapped row an entry lands on — and
+    /// clears it only when it LANDS, exactly as `pending_jump` does.
+    pub pending_tool_reveal: std::cell::RefCell<Option<String>>,
+    /// Tool-row disclosure states read from the profile at boot, keyed by
+    /// session id (verify 1, F3). Consulted the FIRST time a session is
+    /// opened in this process; its own slot is authoritative afterwards.
+    pub persisted_tool_rows: std::collections::BTreeMap<String, crate::settings::ToolRowsRecord>,
     /// Durable last-model aliases retained outside checked-out rows so the
     /// all-sessions search can match the active session before/without a
     /// live model-selection repaint.
@@ -5813,6 +5827,9 @@ impl Default for AppModel {
             session_created_at_ms: std::collections::HashMap::new(),
             session_permissions: std::collections::HashMap::new(),
             tasks_line_expanded: false,
+            tasks_line_page: 0,
+            pending_tool_reveal: std::cell::RefCell::new(None),
+            persisted_tool_rows: std::collections::BTreeMap::new(),
             session_last_models: std::collections::HashMap::new(),
             session_kinds: std::collections::HashMap::new(),
             active_session: None,
@@ -6506,6 +6523,18 @@ impl AppModel {
         }
         // The ◉ talk chip's live hold (sim `.mic.live`, tui.js:5484-5489).
         if self.listening {
+            return true;
+        }
+        // Verify 1 (F5): the band's EXPANDED task list prints a live
+        // elapsed figure per row, and shells/monitors alone animate
+        // nothing else — so once startup settled the shared clock stopped
+        // and every label froze mid-count. An expanded list with anything
+        // running keeps the clock advancing on the SAME 600 ms beat every
+        // other animation rides (no new timer, the zero-idle-wakeup law is
+        // preserved because a COLLAPSED list still lets the TUI idle). The
+        // band is every view's, so this is checked before the per-screen
+        // match rather than inside it.
+        if self.tasks_line_expanded && self.background_work_running() {
             return true;
         }
         match self.screen {
@@ -8880,6 +8909,15 @@ impl AppModel {
                     self.dirty = true;
                 }
             }
+            // Verify 1 (F2): ⇟/⇞ page the FOCUSED row's bounded output
+            // window. Guarded on a focus the reader SET and on the row
+            // actually being bounded-expanded — the guard's call answers
+            // `false` otherwise, so the keys keep falling through to
+            // whatever owns them next on every other surface.
+            KeyCode::PageDown | KeyCode::PageUp
+                if matches!(self.screen, Screen::Session | Screen::Subagent)
+                    && self.toolfold.focus().is_some()
+                    && self.page_focused_tool_output(key.code == KeyCode::PageDown) => {}
             // 971-tui-collapse: with a tool row FOCUSED (⌥N/⌥P, or a
             // click) and NOTHING drafted, ⏎/Space cycle that row's
             // disclosure instead of submitting an empty turn. Both guards
@@ -15139,10 +15177,26 @@ impl AppModel {
                 Some("expand") | Some("expanded") => self.set_all_tool_rows(true),
                 Some("next") => self.move_tool_focus(true),
                 Some("prev") | Some("previous") => self.move_tool_focus(false),
+                // F2's Alt-free page keys: the focused row's bounded
+                // output window, without reaching for PgDn/PgUp.
+                Some("down") | Some("more") => {
+                    if !self.page_focused_tool_output(true) {
+                        self.flash =
+                            Some("· /collapse down — focus a bounded row first (⌥N)".to_owned());
+                        self.dirty = true;
+                    }
+                }
+                Some("up") | Some("back") => {
+                    if !self.page_focused_tool_output(false) {
+                        self.flash =
+                            Some("· /collapse up — focus a bounded row first (⌥N)".to_owned());
+                        self.dirty = true;
+                    }
+                }
                 Some("toggle") | None => self.toggle_all_tool_rows(),
                 Some(other) => {
                     self.flash = Some(format!(
-                        "· /collapse {other}? — all · expand · next · prev (bare toggles every tool row)"
+                        "· /collapse {other}? — all · expand · next · prev · down · up"
                     ));
                     self.dirty = true;
                 }
@@ -15159,7 +15213,14 @@ impl AppModel {
                     }
                 },
             },
-            "tasks" => self.toggle_tasks_line(),
+            "tasks" => match arg.as_deref() {
+                Some("more") | Some("next") | Some("page") => self.page_tasks_line(),
+                None | Some("toggle") => self.toggle_tasks_line(),
+                Some(other) => {
+                    self.flash = Some(format!("· /tasks {other}? — more (bare toggles the line)"));
+                    self.dirty = true;
+                }
+            },
             "" => {}
             other => {
                 // W-C M1: a user-loaded custom command merges OVER (never
@@ -15389,10 +15450,44 @@ impl AppModel {
 
     // ---- 971-tui-collapse: the band's background-task line ----
 
+    /// Anything running whose elapsed figure the expanded task list would
+    /// tick. Deliberately CHEAP — it runs on every animation beat, so it
+    /// counts rather than building the row list.
+    #[must_use]
+    pub fn background_work_running(&self) -> bool {
+        self.monitor_count > 0
+            || self.live_shell_count() > 0
+            || self.tasks.running_count() > 0
+            || tree_live_count(&self.chips) > 0
+    }
+
     /// ⌥S / a click on the line — expand it into the per-task list, or fold
     /// it back. Collapsed is the default and the resting state.
+    /// `+K more` / `/tasks more` — walk the expanded list's pages, wrapping
+    /// back to the first at the end (F7: the row used to be inert).
+    pub fn page_tasks_line(&mut self) {
+        let line = self.status_line();
+        if !self.tasks_line_expanded || line.pages() <= 1 {
+            self.tasks_line_expanded = true;
+            self.tasks_line_page = 0;
+            self.flash = Some("· background tasks — one page".to_owned());
+            self.dirty = true;
+            return;
+        }
+        self.tasks_line_page = (line.page() + 1) % line.pages();
+        self.flash = Some(format!(
+            "· background tasks — page {} of {}",
+            self.tasks_line_page + 1,
+            line.pages()
+        ));
+        self.dirty = true;
+    }
+
     pub fn toggle_tasks_line(&mut self) {
         self.tasks_line_expanded = !self.tasks_line_expanded;
+        // A fresh expansion opens on the first page; a stale one would hide
+        // the rows the reader just asked to see.
+        self.tasks_line_page = 0;
         self.flash = Some(if self.tasks_line_expanded {
             "· background tasks expanded — ⌥S · /tasks".to_owned()
         } else {
@@ -15534,6 +15629,7 @@ impl AppModel {
             counts,
             rows,
             expanded: self.tasks_line_expanded,
+            page: self.tasks_line_page,
         }
     }
 
@@ -15648,6 +15744,11 @@ impl AppModel {
             None => rows.len() - 1,
         };
         self.toolfold.set_focus(Some(&rows[next]));
+        // Verify 1 (F4): a focus the reader cannot SEE is not a focus. The
+        // frame resolves this anchor against its own width-keyed geometry
+        // after the layout reconciles, exactly as a tree jump does — the
+        // model cannot know the row a wrapped entry lands on.
+        *self.pending_tool_reveal.borrow_mut() = Some(rows[next].clone());
         self.dirty = true;
     }
 
@@ -15669,13 +15770,64 @@ impl AppModel {
         self.note_tool_rows_state();
     }
 
-    /// `/collapse all|expand` — the same law, stated absolutely rather
-    /// than as a flip, so a typed command is idempotent.
+    /// `/collapse all|expand` — the same law stated ABSOLUTELY, so a typed
+    /// command is idempotent.
+    ///
+    /// Verify 1 (F1): this used to no-op when the blanket already matched,
+    /// which left contrary per-row overrides open behind a "collapsed"
+    /// flash, and it could not beat the `verbose` default at all. It now
+    /// always commits an explicit blanket, which outranks the mode and
+    /// drops every override.
     pub fn set_all_tool_rows(&mut self, expanded: bool) {
-        if self.toolfold.all_expanded() != expanded {
-            self.toolfold.toggle_all();
-        }
+        self.toolfold.set_blanket(if expanded {
+            crate::toolfold::Blanket::Expanded
+        } else {
+            crate::toolfold::Blanket::Collapsed
+        });
         self.note_tool_rows_state();
+    }
+
+    /// PgDn/PgUp — page the FOCUSED row's bounded output window (F2).
+    /// Answers `false` when nothing is focused or the focused row is not
+    /// bounded-expanded, so the key falls through to whatever owns it next.
+    pub fn page_focused_tool_output(&mut self, forward: bool) -> bool {
+        let Some(item_id) = self.toolfold.focus().map(str::to_owned) else {
+            return false;
+        };
+        if self.toolfold.state_of(&item_id) != crate::toolfold::RowState::Expanded {
+            return false;
+        }
+        // The clamp comes from the same wrap the frame renders, at the
+        // width the frame last used, so the window can never scroll past
+        // what is actually there.
+        let width = self.transcript_view.get().width;
+        let Some(rows) = self
+            .projection
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                crate::projection::TranscriptEntry::Item(block)
+                    if block.item_id.as_str() == item_id =>
+                {
+                    Some(crate::render::retained_output_rows(block, width))
+                }
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let max = rows.saturating_sub(crate::toolfold::EXPANDED_MAX_ROWS);
+        if max == 0 {
+            return false;
+        }
+        // A page keeps one row of overlap, so the reader never loses their
+        // place across a jump.
+        let step = crate::toolfold::EXPANDED_MAX_ROWS.saturating_sub(1).max(1);
+        let delta = isize::try_from(step).unwrap_or(1);
+        self.toolfold
+            .scroll_row(&item_id, if forward { delta } else { -delta }, max);
+        self.dirty = true;
+        true
     }
 
     fn note_tool_rows_state(&mut self) {
@@ -17359,6 +17511,8 @@ impl AppModel {
         self.toolfold.clear_session();
         self.tool_timings.clear();
         self.tasks_line_expanded = false;
+        self.tasks_line_page = 0;
+        *self.pending_tool_reveal.borrow_mut() = None;
         self.auto_resuming = false;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
@@ -17521,9 +17675,20 @@ impl AppModel {
         // The transcript's disclosure state rides the same A→B→A checkout
         // law as the two older collapse flags: leaving a session keeps the
         // rows the reader opened IN ITS SLOT, re-entering restores exactly.
-        self.toolfold
-            .restore(slot.tools_all_expanded, std::mem::take(&mut slot.tool_rows));
+        // The slot is authoritative once this process has seen the
+        // session; the FIRST open after a restart falls back to the profile
+        // store (verify 1, F3).
+        let (blanket, rows) = if slot.tool_rows.is_empty()
+            && slot.tools_blanket == crate::toolfold::Blanket::Mode
+            && let Some(record) = self.persisted_tool_rows.get(id.as_str())
+        {
+            (record.blanket, record.rows())
+        } else {
+            (slot.tools_blanket, std::mem::take(&mut slot.tool_rows))
+        };
+        self.toolfold.restore(blanket, rows);
         self.tasks_line_expanded = slot.tasks_line_expanded;
+        self.tasks_line_page = 0;
         self.session_title = slot.title.take();
         self.session_name = slot.name.take();
         self.session_head = std::mem::take(&mut slot.head);
@@ -17646,7 +17811,7 @@ impl AppModel {
             slot.auto_resuming = std::mem::take(&mut self.auto_resuming);
             slot.subtree_collapsed = std::mem::take(&mut self.subtree_collapsed);
             slot.todos_collapsed = std::mem::take(&mut self.todos_collapsed);
-            slot.tools_all_expanded = self.toolfold.all_expanded();
+            slot.tools_blanket = self.toolfold.blanket();
             slot.tool_rows = self.toolfold.rows_snapshot();
             slot.tasks_line_expanded = std::mem::take(&mut self.tasks_line_expanded);
             slot.title = self.session_title.take();
@@ -18597,6 +18762,7 @@ impl AppModel {
             // The band's own line: it belongs to EVERY view (the F2 law), so
             // this hit is not screen-scoped.
             Hit::TaskLineToggle => self.toggle_tasks_line(),
+            Hit::TaskLineMore => self.page_tasks_line(),
             // Hover-only affordance (see the variant's doc comment).
             Hit::TodoRow(_) => {}
             // The collapsed subagents summary row — the fleet's clickable

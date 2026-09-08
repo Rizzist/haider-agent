@@ -686,17 +686,27 @@ fn an_expanded_row_is_bounded_and_offers_show_all() {
         !transcript_has(&model, &format!("hit number {}", tf::EXPANDED_MAX_ROWS)),
         "the expanded region stops at EXPANDED_MAX_ROWS"
     );
-    assert!(transcript_has(&model, &format!("⋯ {hidden} more lines")));
+    assert!(transcript_has(&model, &format!("⋯ {hidden} more rows")));
     model.handle_hit(Hit::ToolShowAll("t1".to_owned()));
     assert_eq!(model.toolfold.state_of("t1"), RowState::ShowAll);
     assert!(transcript_has(&model, "hit number 39"));
 }
 
 #[test]
-fn show_all_is_singular_for_one_hidden_line() {
+fn the_bounded_affordance_names_what_it_hides_and_how_to_walk_it() {
     assert_eq!(
-        tf::segments_text(&tf::show_all_segments(1)),
-        "    └ ⋯ 1 more line · ⏎ show all"
+        tf::segments_text(&tf::show_all_segments(0, 1)),
+        "    └ ⋯ 1 more row · ⇟/⇞ page · ⏎ show all"
+    );
+    assert_eq!(
+        tf::segments_text(&tf::show_all_segments(4, 6)),
+        "    └ ⋯ 10 more rows (4 above) · ⇟/⇞ page · ⏎ show all",
+        "a scrolled window says what it has already passed (verify 1, F2)"
+    );
+    assert_eq!(
+        tf::segments_text(&tf::show_all_segments(9, 0)),
+        "    └ ⋯ 9 more rows (9 above) · ⏎ show all",
+        "at the bottom there is nothing below to page to"
     );
 }
 
@@ -1518,4 +1528,464 @@ fn the_key_hints_name_both_paths() {
             );
         }
     }
+}
+
+// ---- 13. verify 1 round 3 — the seven OPEN findings -------------------
+
+/// F1. An ABSOLUTE blanket clears contrary per-row overrides, and beats the
+/// verbosity default. Round 2 no-opped when the boolean already matched
+/// (leaving a row open behind a "collapsed" flash) and could not touch
+/// `verbose` at all.
+#[test]
+fn an_absolute_blanket_clears_contrary_overrides_and_outranks_the_mode() {
+    let mut model = session_model();
+    tool(&mut model, "t1", "verify", ToolStatus::Completed, "one");
+    tool(&mut model, "t2", "grep", ToolStatus::Completed, "two");
+
+    // Open one row by hand, then collapse everything: the hand-opened row
+    // must close with the rest.
+    model.toolfold.cycle("t1");
+    assert_eq!(model.toolfold.state_of("t1"), RowState::Expanded);
+    model.set_all_tool_rows(false);
+    assert_eq!(
+        model.toolfold.state_of("t1"),
+        RowState::Collapsed,
+        "an absolute collapse is all-or-nothing even when the blanket already matched"
+    );
+
+    // The mirror: close one by hand, then expand everything.
+    model.set_all_tool_rows(true);
+    model.toolfold.set("t2", RowState::Collapsed);
+    model.set_all_tool_rows(true);
+    assert_eq!(
+        model.toolfold.state_of("t2"),
+        RowState::Expanded,
+        "…and so is an absolute expand"
+    );
+
+    // In verbose the mode opens rows by default; an explicit blanket
+    // collapse must still win.
+    model.set_tool_verbosity(Verbosity::Verbose);
+    assert_eq!(model.toolfold.state_of("t1"), RowState::Expanded);
+    model.set_all_tool_rows(false);
+    assert_eq!(
+        model.toolfold.blanket(),
+        tf::Blanket::Collapsed,
+        "the blanket is stated, not inferred"
+    );
+    assert_eq!(
+        model.toolfold.state_of("t1"),
+        RowState::Collapsed,
+        "an explicit blanket outranks the verbosity default (verify 1, F1)"
+    );
+    assert!(!model.toolfold.all_expanded());
+    // ⌃O/⌥T from there re-opens, still inside verbose.
+    model.toggle_all_tool_rows();
+    assert_eq!(model.toolfold.state_of("t1"), RowState::Expanded);
+
+    // Changing the mode returns the blanket to deferring to it.
+    model.set_tool_verbosity(Verbosity::Normal);
+    assert_eq!(model.toolfold.blanket(), tf::Blanket::Mode);
+    assert_eq!(model.toolfold.state_of("t1"), RowState::Collapsed);
+}
+
+/// F2a. Every retained row is reachable: nothing is ellipsized away, and
+/// long lines wrap instead of losing their suffix.
+#[test]
+fn a_long_output_line_wraps_rather_than_losing_its_suffix() {
+    let long = format!("{}END_SENTINEL", "x".repeat(300));
+    let rows = tf::output_rows(&long, false, 40);
+    assert_eq!(rows.len(), (300 + 13usize).div_ceil(40));
+    assert!(
+        rows.concat().ends_with("END_SENTINEL"),
+        "the suffix survives the wrap"
+    );
+    assert!(rows.iter().all(|row| row.chars().count() <= 40));
+    // A blank retained line is still a row — dropping it would reflow the
+    // output the tool actually produced.
+    assert_eq!(tf::output_rows("a\n\nb\n", false, 10).len(), 3);
+    // Width 0 degrades to the logical lines rather than looping forever.
+    assert_eq!(tf::output_rows("a\nb\n", false, 0).len(), 2);
+
+    let mut model = session_model();
+    tool_out(
+        &mut model,
+        "t1",
+        "grep",
+        ToolStatus::Completed,
+        "hits",
+        &format!("{long}\n"),
+    );
+    model.toolfold.set("t1", RowState::ShowAll);
+    assert!(
+        transcript_has(&model, "END_SENTINEL"),
+        "show all reaches the end of a long line (verify 1, F2)"
+    );
+}
+
+/// F2b. The bounded window SCROLLS: rows past the tenth are reachable
+/// without opening the whole tail.
+#[test]
+fn the_bounded_window_pages_through_every_retained_row() {
+    let mut model = session_model();
+    let body: String = (0..40).map(|n| format!("hit number {n:02}\n")).collect();
+    tool_out(
+        &mut model,
+        "t1",
+        "grep",
+        ToolStatus::Completed,
+        "many hits",
+        &body,
+    );
+    model.toolfold.set("t1", RowState::Expanded);
+    model.toolfold.set_focus(Some("t1"));
+    // The frame publishes the width the clamp uses.
+    let _ = rows(&model, 120, 40);
+    assert!(transcript_has(&model, "hit number 00"));
+    assert!(!transcript_has(&model, "hit number 10"));
+
+    assert!(
+        model.page_focused_tool_output(true),
+        "a bounded row with more rows below pages"
+    );
+    assert_eq!(model.toolfold.scroll_of("t1"), tf::EXPANDED_MAX_ROWS - 1);
+    assert!(transcript_has(&model, "hit number 10"));
+    assert!(transcript_has(&model, "(9 above)"));
+
+    // Paging to the end reaches the last retained row and clamps there.
+    for _ in 0..10 {
+        model.page_focused_tool_output(true);
+    }
+    let _ = rows(&model, 120, 40);
+    assert!(transcript_has(&model, "hit number 39"));
+    assert_eq!(
+        model.toolfold.scroll_of("t1"),
+        40 - tf::EXPANDED_MAX_ROWS,
+        "the window clamps at the end instead of scrolling past it"
+    );
+    // …and back to the top.
+    for _ in 0..10 {
+        model.page_focused_tool_output(false);
+    }
+    assert_eq!(model.toolfold.scroll_of("t1"), 0);
+    let _ = rows(&model, 120, 40);
+    assert!(transcript_has(&model, "hit number 00"));
+}
+
+#[test]
+fn paging_answers_false_for_a_row_that_is_not_bounded_expanded() {
+    let mut model = session_model();
+    tool_out(
+        &mut model,
+        "t1",
+        "grep",
+        ToolStatus::Completed,
+        "short",
+        "one\ntwo\n",
+    );
+    let _ = rows(&model, 120, 40);
+    assert!(
+        !model.page_focused_tool_output(true),
+        "with no focus the key falls through"
+    );
+    model.toolfold.set_focus(Some("t1"));
+    assert!(
+        !model.page_focused_tool_output(true),
+        "a COLLAPSED row has no window to page"
+    );
+    model.toolfold.set("t1", RowState::Expanded);
+    assert!(
+        !model.page_focused_tool_output(true),
+        "output that fits the bound has nowhere to page to"
+    );
+    // The Alt-free path says so rather than failing silently.
+    submit(&mut model, "/collapse down");
+    let flash = model.flash.clone().expect("a refusal explains itself");
+    assert!(flash.contains("focus a bounded row"), "{flash}");
+}
+
+/// F3. Disclosure survives a PROCESS restart, versioned and bounded.
+#[test]
+fn row_disclosure_survives_a_process_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("tui-settings.json");
+    let record = haider_tui::settings::ToolRowsRecord {
+        blanket: tf::Blanket::Collapsed,
+        rows: [("t1".to_owned(), RowState::ShowAll)].into_iter().collect(),
+    };
+    let mut store = haider_tui::settings::SettingsStore::at(path.clone());
+    store.save_tool_rows_if_changed(
+        haider_tui::theme::ThemeChoice::System,
+        session_id().as_str(),
+        &record,
+    );
+
+    // A fresh process reads it back and the first open of that session
+    // restores it.
+    let reopened = haider_tui::settings::SettingsStore::at(path.clone());
+    let loaded = reopened.load_tool_rows();
+    assert_eq!(loaded.get(session_id().as_str()), Some(&record));
+    assert_eq!(
+        reopened.load_verbosity(),
+        Verbosity::Normal,
+        "the disclosure write carries the rest of the file"
+    );
+
+    // The FIRST open of that session in a fresh process restores from the
+    // store; its slot is authoritative afterwards.
+    let mut model = session_model();
+    model.persisted_tool_rows = loaded;
+    let restarted = SessionId::new("collapse-restarted");
+    model
+        .persisted_tool_rows
+        .insert(restarted.as_str().to_owned(), record.clone());
+    model.upsert_live_session(&restarted);
+    model.open_session(&restarted);
+    assert_eq!(model.toolfold.blanket(), tf::Blanket::Collapsed);
+    assert_eq!(
+        model.toolfold.state_of("t1"),
+        RowState::ShowAll,
+        "the row the reader left open comes back open after a restart"
+    );
+    // A second visit takes the SLOT, not the store, so an in-process change
+    // is never overwritten by a stale record.
+    model.set_all_tool_rows(true);
+    model.open_session(&session_id());
+    model.open_session(&restarted);
+    assert_eq!(model.toolfold.blanket(), tf::Blanket::Expanded);
+
+    // An EMPTY record removes the entry rather than persisting nothing
+    // under a live key.
+    let mut store = haider_tui::settings::SettingsStore::at(path.clone());
+    store.set_tool_rows(reopened.load_tool_rows());
+    store.save_tool_rows_if_changed(
+        haider_tui::theme::ThemeChoice::System,
+        session_id().as_str(),
+        &haider_tui::settings::ToolRowsRecord::default(),
+    );
+    assert!(
+        haider_tui::settings::SettingsStore::at(path)
+            .load_tool_rows()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_disclosure_record_of_a_foreign_version_is_dropped_not_half_applied() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("tui-settings.json");
+    std::fs::write(
+        &path,
+        br#"{"version":1,"theme":"dark","notifications":true,"tool_rows":{
+             "s-old":{"version":99,"blanket":"expanded","rows":{"t1":"show_all"}},
+             "s-new":{"version":1,"blanket":"collapsed","rows":{"t1":"expanded","t2":"sideways"}}}}"#,
+    )
+    .expect("seed");
+    let loaded = haider_tui::settings::SettingsStore::at(path).load_tool_rows();
+    assert!(
+        !loaded.contains_key("s-old"),
+        "a future record shape is dropped whole"
+    );
+    let kept = loaded.get("s-new").expect("the known record loads");
+    assert_eq!(kept.blanket, tf::Blanket::Collapsed);
+    assert_eq!(kept.rows.get("t1"), Some(&RowState::Expanded));
+    assert!(
+        !kept.rows.contains_key("t2"),
+        "an unknown row state is dropped, never guessed"
+    );
+}
+
+/// F4. Moving the focus REVEALS the row — a focus the reader cannot see is
+/// not a focus.
+#[test]
+fn moving_the_focus_arms_a_reveal_and_scrolls_the_row_into_view() {
+    let mut model = session_model();
+    for index in 0..30 {
+        tool_out(
+            &mut model,
+            &format!("t{index:02}"),
+            "verify",
+            ToolStatus::Completed,
+            &format!("candidate {index}"),
+            &format!("line for {index}\n"),
+        );
+    }
+    // Follow-bottom: the oldest rows are far above the viewport.
+    let painted = rows(&model, 80, 24);
+    assert!(!painted.iter().any(|row| row.contains("candidate 0)")));
+
+    // Walk the focus back to the oldest row.
+    model.toolfold.set_focus(Some("t29"));
+    for _ in 0..29 {
+        model.move_tool_focus(false);
+    }
+    assert_eq!(model.toolfold.focus(), Some("t00"));
+    assert!(
+        model.pending_tool_reveal.borrow().is_some(),
+        "the reveal is armed for the frame that owns the geometry"
+    );
+    let painted = rows(&model, 80, 24);
+    assert!(
+        painted.iter().any(|row| row.contains("candidate 0")),
+        "the focused row is on screen (verify 1, F4): {painted:#?}"
+    );
+    assert!(
+        model.pending_tool_reveal.borrow().is_none(),
+        "the anchor clears only when it lands"
+    );
+}
+
+#[test]
+fn revealing_a_row_already_in_view_scrolls_nothing() {
+    let mut model = session_model();
+    tool(&mut model, "t1", "verify", ToolStatus::Completed, "one");
+    tool(&mut model, "t2", "grep", ToolStatus::Completed, "two");
+    let _ = rows(&model, 120, 40);
+    let before = model.scroll_back.get();
+    model.move_tool_focus(true);
+    let _ = rows(&model, 120, 40);
+    assert_eq!(
+        model.scroll_back.get(),
+        before,
+        "a row already fully visible is left where it is"
+    );
+}
+
+/// F5. The shared clock keeps advancing while the expanded task list needs
+/// a live elapsed figure — shells and monitors alone animate nothing else,
+/// so the labels used to freeze once startup settled.
+#[test]
+fn an_expanded_task_list_keeps_the_shared_clock_running() {
+    let mut model = tasks_model(1, 2);
+    model.chips = Vec::new();
+    assert!(
+        !model.animated(),
+        "a COLLAPSED list still lets the TUI idle — the zero-wakeup law"
+    );
+    model.toggle_tasks_line();
+    assert!(
+        model.animated(),
+        "an expanded list with work running ticks the clock (verify 1, F5)"
+    );
+    // And on every host screen, because the band is every view's.
+    for screen in [Screen::Launcher, Screen::Loom, Screen::Accounts] {
+        model.screen = screen;
+        assert!(model.animated(), "{screen:?} must tick too");
+    }
+    // Nothing running: nothing to tick, even expanded.
+    let mut quiet = session_model();
+    quiet.toggle_tasks_line();
+    assert!(!quiet.background_work_running());
+    assert!(!quiet.animated());
+}
+
+/// F6. The show-all mouse target is the row the layout MEASURED the
+/// affordance onto — a wrapped honesty footer used to move it one row down.
+#[test]
+fn the_show_all_hit_lands_on_the_affordance_under_a_truncation_footer() {
+    let mut model = session_model();
+    // Overflow the retained tail so the truncation footer renders BELOW the
+    // affordance, which is what displaced the hit.
+    let body: String = (0..900)
+        .map(|n| format!("output line {n:04} — bounded tail probe\n"))
+        .collect();
+    tool_out(
+        &mut model,
+        "t1",
+        "bash",
+        ToolStatus::Completed,
+        "yes",
+        &body,
+    );
+    model.toolfold.set("t1", RowState::Expanded);
+    let painted = rows(&model, 80, 24);
+    let (rect, _) = {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| hits = haider_tui::render::render(&model, frame))
+            .expect("draw");
+        hits.into_iter()
+            .find(|(_, hit)| matches!(hit, Hit::ToolShowAll(_)))
+            .expect("the affordance is clickable")
+    };
+    let affordance = painted
+        .iter()
+        .position(|row| row.contains("⏎ show all"))
+        .expect("the affordance is on screen");
+    assert_eq!(
+        usize::from(rect.y),
+        affordance,
+        "the hit is ON the visible affordance, not under the footer below it \
+         (verify 1, F6): {painted:#?}"
+    );
+    assert!(
+        painted
+            .iter()
+            .any(|row| row.contains("earlier output truncated")),
+        "the footer is still there — it is what displaced the hit"
+    );
+    model.handle_hit(Hit::ToolShowAll("t1".to_owned()));
+    assert_eq!(model.toolfold.state_of("t1"), RowState::ShowAll);
+}
+
+/// F7. The `+K more` row is an affordance: it walks the pages, and wraps.
+#[test]
+fn the_task_list_more_row_pages_the_list() {
+    let mut model = tasks_model(6, 14);
+    model.toggle_tasks_line();
+    let line = model.status_line();
+    let pages = line.pages();
+    assert!(pages > 1, "the fixture overflows one page");
+    assert!(transcript_has(&model, &format!("page 1 of {pages}")));
+    assert!(transcript_has(&model, "⏎ next page"));
+
+    model.handle_hit(Hit::TaskLineMore);
+    assert_eq!(model.tasks_line_page, 1);
+    let line = model.status_line();
+    assert!(!line.listed().0.is_empty(), "page 2 shows rows");
+    assert!(transcript_has(&model, &format!("page 2 of {pages}")));
+
+    // The last page offers the way back rather than a dead end.
+    for _ in 1..pages {
+        model.handle_hit(Hit::TaskLineMore);
+    }
+    assert_eq!(model.tasks_line_page, 0, "it wraps to the first page");
+
+    // The Alt-free twin.
+    submit(&mut model, "/tasks more");
+    assert_eq!(model.tasks_line_page, 1);
+    // Re-expanding always opens on the first page.
+    model.toggle_tasks_line();
+    model.toggle_tasks_line();
+    assert_eq!(model.tasks_line_page, 0);
+}
+
+#[test]
+fn a_single_page_list_says_so_rather_than_paging_nowhere() {
+    let mut model = tasks_model(1, 1);
+    model.toggle_tasks_line();
+    assert_eq!(model.status_line().pages(), 1);
+    assert!(!transcript_has(&model, "more"));
+    model.handle_hit(Hit::TaskLineMore);
+    assert_eq!(model.tasks_line_page, 0);
+    let flash = model.flash.clone().expect("it says why nothing moved");
+    assert!(flash.contains("one page"), "{flash}");
+}
+
+#[test]
+fn a_page_a_finished_task_emptied_falls_back_to_the_first() {
+    let mut model = tasks_model(6, 14);
+    model.toggle_tasks_line();
+    model.tasks_line_page = 2;
+    assert_eq!(model.status_line().page(), 2);
+    // Everything finishes: the stale page clamps instead of rendering an
+    // empty window.
+    model.shells.clear();
+    model.monitors.clear();
+    model.monitor_count = 0;
+    let line = model.status_line();
+    assert_eq!(line.page(), 0);
+    assert_eq!(line.pages(), 1);
+    assert!(line.listed().0.is_empty());
 }

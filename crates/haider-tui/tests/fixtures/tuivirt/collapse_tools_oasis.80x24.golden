@@ -33,8 +33,8 @@
    ~ Rgb(53, 71, 61)/Rgb(12, 20, 16)/NONE×4; Rgb(216, 176, 76)/Rgb(12, 20, 16)/NONE×19; Rgb(124, 148, 134)/Rgb(12, 20, 16)/NONE×28; Rgb(185, 207, 192)/Rgb(12, 20, 16)/NONE×29
 16|    src/render.rs:6389: if !model.todos_collapsed {                             |
    ~ Rgb(53, 71, 61)/Rgb(12, 20, 16)/NONE×4; Rgb(216, 176, 76)/Rgb(12, 20, 16)/NONE×19; Rgb(124, 148, 134)/Rgb(12, 20, 16)/NONE×28; Rgb(185, 207, 192)/Rgb(12, 20, 16)/NONE×29
-17|    └ ⋯ 2 more lines · ⏎ show all                                               |
-   ~ Rgb(53, 71, 61)/Rgb(12, 20, 16)/NONE×6; Rgb(124, 148, 134)/Rgb(12, 20, 16)/NONE×14; Rgb(216, 176, 76)/Rgb(12, 20, 16)/NONE×13; Rgb(185, 207, 192)/Rgb(12, 20, 16)/NONE×47
+17|    └ ⋯ 2 more rows · ⇟/⇞ page · ⏎ show all                                     |
+   ~ Rgb(53, 71, 61)/Rgb(12, 20, 16)/NONE×6; Rgb(124, 148, 134)/Rgb(12, 20, 16)/NONE×13; Rgb(216, 176, 76)/Rgb(12, 20, 16)/NONE×24; Rgb(185, 207, 192)/Rgb(12, 20, 16)/NONE×37
 18|  ◐ Monitor(Astra 971-tui-collapse verification (re-armed)) · running… 3s       |
    ~ Rgb(53, 71, 61)/Rgb(12, 20, 16)/NONE×2; Rgb(240, 180, 92)/Rgb(12, 20, 16)/NONE×2; Rgb(223, 138, 90)/Rgb(12, 20, 16)/NONE×7; Rgb(124, 148, 134)/Rgb(12, 20, 16)/NONE×62; Rgb(185, 207, 192)/Rgb(12, 20, 16)/NONE×7
 19|                                                                                |

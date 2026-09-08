@@ -133,24 +133,68 @@ impl RowState {
     }
 }
 
-/// Rows an [`RowState::Expanded`] tool row shows before it yields to the
-/// `show all` affordance. Bounded so one chatty tool can never take the
-/// viewport hostage (the spec's "expanded output scrolls inside its own
-/// bounded region").
+/// What the reader asked of EVERY tool row at once, which is a different
+/// question from what the verbosity mode defaults to (verify 1, F1).
+///
+/// The round-2 boolean could not express "collapse everything" while the
+/// mode was `verbose`: the mode's default won and the blanket lost, so
+/// ⌃O and `/collapse all` looked inert in verbose. A blanket the reader
+/// states EXPLICITLY now outranks the mode; `Mode` is the resting state
+/// that defers to it, and changing the mode returns to `Mode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Blanket {
+    /// No blanket asked for — the verbosity mode's default stands.
+    #[default]
+    Mode,
+    /// Every untouched row collapsed, whatever the mode says.
+    Collapsed,
+    /// Every untouched row expanded, whatever the mode says.
+    Expanded,
+}
+
+impl Blanket {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::Collapsed => "collapsed",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "mode" => Some(Self::Mode),
+            "collapsed" => Some(Self::Collapsed),
+            "expanded" => Some(Self::Expanded),
+            _ => None,
+        }
+    }
+}
+
+/// DISPLAY rows an [`RowState::Expanded`] tool row shows before it yields
+/// to the `show all` affordance. Bounded so one chatty tool can never take
+/// the viewport hostage — and scrollable WITHIN that bound (verify 1, F2),
+/// so every retained row is reachable without opening the whole tail.
 pub const EXPANDED_MAX_ROWS: usize = 10;
 
 /// A run must be at least this long to fold into `Ran N …`.
 pub const FOLD_MIN: usize = 2;
 
+/// Sessions the profile store keeps disclosure state for (verify 1, F3).
+/// Bounded so a long-lived profile can never grow `tui-settings.json`
+/// without limit; the oldest key yields when a ninth session commits.
+pub const MAX_PERSISTED_SESSIONS: usize = 8;
+
 /// Per-row disclosure states one session's slot retains.
 ///
 /// Scope, stated exactly: these live in `session::SessionState`, so they
 /// survive leaving a session and coming back to it within a run (the A→B→A
-/// checkout law). The VERBOSITY mode is what survives a process restart —
-/// it is a profile preference in `tui-settings.json`. Carrying every row's
-/// state across restarts too would need a new durable per-session store;
-/// the demo store's DTO law forbids widening it in place, so that is a
-/// separate lane, and this bound keeps the in-memory map finite meanwhile.
+/// checkout law), AND — since verify 1 (F3) — in `tui-settings.json` keyed
+/// by session id, so they survive a process restart. The slot stays
+/// authoritative once a session has been opened in this process; the store
+/// is what the first open after a restart falls back to.
 pub const MAX_PERSISTED_ROWS: usize = 128;
 
 /// The spinner a streaming row wears, driven by the SHARED animation clock
@@ -250,14 +294,18 @@ pub fn segments_text(segments: &[Segment]) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolFold {
     verbosity: Verbosity,
-    /// ⌥T's blanket override of the verbosity default for this transcript.
-    all_expanded: bool,
+    /// ⌥T / ⌃O / `/collapse`'s blanket, which OUTRANKS the verbosity
+    /// default when the reader stated one (verify 1, F1).
+    blanket: Blanket,
     /// Rows whose reader-set state overrides the default. Keyed by the item
     /// id STRING (`ItemId` is `Hash`, not `Ord`; a `BTreeMap` keeps the
     /// persisted file byte-stable).
     rows: BTreeMap<String, RowState>,
     /// Fold heads the reader opened — the run shows its member rows again.
     unfolded: BTreeSet<String>,
+    /// First DISPLAY row the bounded expanded window shows, per row — the
+    /// internal scroll verify 1 (F2) found missing. Absent means the top.
+    scroll: BTreeMap<String, usize>,
     /// The keyboard-focused tool row, if any. `None` is the resting state:
     /// the composer keeps ⏎/Space until the reader asks for a row with ⌥N/⌥P
     /// or points at one, so this can never steal a submit.
@@ -272,8 +320,19 @@ impl ToolFold {
     }
 
     #[must_use]
+    pub const fn blanket(&self) -> Blanket {
+        self.blanket
+    }
+
+    /// True when every untouched row is currently open — the blanket the
+    /// reader asked for, or the mode's default when they asked for none.
+    #[must_use]
     pub const fn all_expanded(&self) -> bool {
-        self.all_expanded
+        match self.blanket {
+            Blanket::Expanded => true,
+            Blanket::Collapsed => false,
+            Blanket::Mode => self.verbosity.opens_rows(),
+        }
     }
 
     #[must_use]
@@ -294,7 +353,7 @@ impl ToolFold {
         if let Some(state) = self.rows.get(item_id) {
             return *state;
         }
-        if self.all_expanded || self.verbosity.opens_rows() {
+        if self.all_expanded() {
             RowState::Expanded
         } else {
             RowState::Collapsed
@@ -317,6 +376,11 @@ impl ToolFold {
     /// Put one row in an exact state (the `show all` door, and restore).
     pub fn set(&mut self, item_id: &str, state: RowState) {
         self.rows.insert(item_id.to_owned(), state);
+        // A row that closed, or opened whole, starts its window at the top:
+        // a stale offset would open it part-way down for no reason.
+        if !matches!(state, RowState::Expanded) {
+            self.scroll.remove(item_id);
+        }
         self.prune_rows();
         self.bump();
     }
@@ -330,13 +394,30 @@ impl ToolFold {
         self.bump();
     }
 
-    /// ⌥T — every tool row in the transcript at once. The per-row overrides
-    /// are DROPPED so the gesture is genuinely all-or-nothing (a leftover
-    /// override would leave the reader pressing ⌥T at a row that refuses).
+    /// ⌥T / ⌃O — every tool row in the transcript at once, from whatever
+    /// they collectively show now.
     pub fn toggle_all(&mut self) {
-        self.all_expanded = !self.all_expanded;
+        self.set_blanket(if self.all_expanded() {
+            Blanket::Collapsed
+        } else {
+            Blanket::Expanded
+        });
+    }
+
+    /// `/collapse all|expand` — the blanket stated ABSOLUTELY, so a typed
+    /// command is idempotent.
+    ///
+    /// Verify 1 (F1) found two holes this closes: the round-2 version
+    /// no-opped when the boolean already matched, leaving contrary per-row
+    /// overrides open behind a "collapsed" flash; and it could not beat the
+    /// `verbose` default at all. The overrides are DROPPED unconditionally —
+    /// the gesture is genuinely all-or-nothing, or the reader is pressing it
+    /// at a row that refuses — and an explicit blanket outranks the mode.
+    pub fn set_blanket(&mut self, blanket: Blanket) {
+        self.blanket = blanket;
         self.rows.clear();
         self.unfolded.clear();
+        self.scroll.clear();
         self.bump();
     }
 
@@ -348,9 +429,12 @@ impl ToolFold {
             return;
         }
         self.verbosity = verbosity;
-        self.all_expanded = false;
+        // The MODE is the new default, so the blanket returns to deferring
+        // to it and stale overrides go with it.
+        self.blanket = Blanket::Mode;
         self.rows.clear();
         self.unfolded.clear();
+        self.scroll.clear();
         self.bump();
     }
 
@@ -371,12 +455,15 @@ impl ToolFold {
         }
     }
 
-    /// Restore a session slot's disclosure state (the A→B→A checkout law).
-    pub fn restore(&mut self, all_expanded: bool, rows: BTreeMap<String, RowState>) {
-        self.all_expanded = all_expanded;
+    /// Restore a session's disclosure state — from its in-process slot (the
+    /// A→B→A checkout law) or from the profile store after a restart
+    /// (verify 1, F3).
+    pub fn restore(&mut self, blanket: Blanket, rows: BTreeMap<String, RowState>) {
+        self.blanket = blanket;
         self.rows = rows;
         self.rows_truncate();
         self.unfolded.clear();
+        self.scroll.clear();
         self.focus = None;
         self.bump();
     }
@@ -387,12 +474,49 @@ impl ToolFold {
         self.rows.clone()
     }
 
+    /// True when this session has disclosure state worth persisting.
+    #[must_use]
+    pub fn has_session_state(&self) -> bool {
+        self.blanket != Blanket::Mode || !self.rows.is_empty()
+    }
+
+    // ---- F2: the bounded window's internal scroll ----
+
+    /// First DISPLAY row the bounded expanded window shows for this row.
+    #[must_use]
+    pub fn scroll_of(&self, item_id: &str) -> usize {
+        self.scroll.get(item_id).copied().unwrap_or(0)
+    }
+
+    /// Scroll one row's bounded window, clamped to `max` (the caller knows
+    /// how many display rows the retained output actually wraps to, so the
+    /// clamp cannot drift from what is on screen).
+    pub fn scroll_row(&mut self, item_id: &str, delta: isize, max: usize) {
+        let current = self.scroll_of(item_id);
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta.unsigned_abs())
+        }
+        .min(max);
+        if next == current {
+            return;
+        }
+        if next == 0 {
+            self.scroll.remove(item_id);
+        } else {
+            self.scroll.insert(item_id.to_owned(), next);
+        }
+        self.bump();
+    }
+
     /// Detaching clears the transcript-local disclosure state; the mode
     /// survives because it is a PROFILE preference, not a session's.
     pub fn clear_session(&mut self) {
-        self.all_expanded = false;
+        self.blanket = Blanket::Mode;
         self.rows.clear();
         self.unfolded.clear();
+        self.scroll.clear();
         self.focus = None;
         self.bump();
     }
@@ -673,17 +797,80 @@ pub fn fold_noun(name: &str, count: usize) -> String {
     }
 }
 
-/// The `show all` affordance closing a bounded expanded region.
+/// The affordance closing a bounded expanded region: what it is still
+/// hiding, how to walk it, and how to open the lot.
+///
+/// Verify 1 (F2): the bounded window had no way to reach rows 10+ short of
+/// opening everything, so the footer now names the page keys too. `above`
+/// is what the internal scroll has already passed.
 #[must_use]
-pub fn show_all_segments(hidden: usize) -> Vec<Segment> {
-    vec![
-        Segment::new("    └ ", Tone::Structure),
-        Segment::new(
-            format!("⋯ {hidden} more line{}", if hidden == 1 { "" } else { "s" }),
-            Tone::Meta,
-        ),
-        Segment::new(" · ⏎ show all", Tone::Accent),
-    ]
+pub fn show_all_segments(above: usize, below: usize) -> Vec<Segment> {
+    let mut segments = vec![Segment::new("    └ ", Tone::Structure)];
+    let hidden = above + below;
+    segments.push(Segment::new(
+        format!("⋯ {hidden} more row{}", if hidden == 1 { "" } else { "s" }),
+        Tone::Meta,
+    ));
+    if above > 0 {
+        segments.push(Segment::new(format!(" ({above} above)"), Tone::Meta));
+    }
+    if below > 0 {
+        segments.push(Segment::new(" · ⇟/⇞ page", Tone::Accent));
+    }
+    segments.push(Segment::new(" · ⏎ show all", Tone::Accent));
+    segments
+}
+
+/// Retained output as DISPLAY rows: every logical line hard-wrapped to
+/// `width` cells, so no suffix is unreachable (verify 1, F2 — `ellipsize`
+/// silently dropped the tail of every long line, `show all` included).
+///
+/// `tail_was_cut` drops the leading mid-line FRAGMENT the 8 KiB output cap
+/// leaves behind, for the same reason [`subline_segments_from`] does.
+/// Wrapping is by CHARACTER, not by word: tool output is paths, diffs and
+/// log lines, where a word break moves a column and a character break does
+/// not lose one.
+#[must_use]
+pub fn output_rows(output: &str, tail_was_cut: bool, width: usize) -> Vec<String> {
+    let body = if tail_was_cut {
+        output.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        output
+    };
+    let mut rows: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if width == 0 {
+            rows.push(line.to_owned());
+            continue;
+        }
+        let mut chars = line.chars().peekable();
+        let mut wrapped = false;
+        while chars.peek().is_some() {
+            let chunk: String = chars.by_ref().take(width).collect();
+            rows.push(chunk);
+            wrapped = true;
+        }
+        if !wrapped {
+            // A blank retained line is a row: dropping it would silently
+            // reflow the output the tool actually produced.
+            rows.push(String::new());
+        }
+    }
+    rows
+}
+
+/// The bounded window over `rows`, and what it leaves above and below.
+/// The offset is clamped here, so a stale scroll can never show an empty
+/// window.
+#[must_use]
+pub fn bounded_window(rows: usize, scroll: usize, budget: usize) -> (usize, usize, usize) {
+    if budget == 0 || rows == 0 {
+        return (0, 0, rows);
+    }
+    let max_scroll = rows.saturating_sub(budget);
+    let start = scroll.min(max_scroll);
+    let end = start.saturating_add(budget).min(rows);
+    (start, end, rows - end)
 }
 
 /// Char-truncate with a trailing ellipsis (the transcript's shared
