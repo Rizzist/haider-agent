@@ -54,6 +54,12 @@ const val CUSTOM_MODEL_FIELD_TAG = "custom_model_field"
  * daemon is the authority on whether the id exists, and its answer arrives
  * through `session.select_model`'s refusal path — the same panel a cache-epoch
  * refusal lands in, which now tells the two apart.
+ *
+ * SCOPE (lane 971-UI-extras, coordinator ruling): this is wired into
+ * [ai.diffforge.haider.ui.chat.ModelPicker] only. The composer's own model
+ * sheet lives in `SessionPickers.kt`, which this lane may not touch; the
+ * component is self-contained, so that wiring is one call and is done at merge
+ * time by the lane-971-ui agent.
  */
 @Composable
 fun CustomModelEntry(

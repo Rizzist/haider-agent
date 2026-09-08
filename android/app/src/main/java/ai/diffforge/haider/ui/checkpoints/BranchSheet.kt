@@ -66,6 +66,15 @@ const val BRANCHES_NAME_FIELD_TAG = "branches_name_field"
  * published fact. A checkpoint carries neither — it records a file mutation,
  * not a history node — so a branch forks at the session's own head, and the
  * sheet states that rather than offering a fork point it cannot address.
+ *
+ * SETTLED (lane 971-UI-extras, coordinator ruling). These three are decisions,
+ * not omissions, and are not to be re-opened without a wire change:
+ *
+ *  1. a branch forks at the session's PUBLISHED HEAD, because a checkpoint is
+ *     not addressable as a fork point on this wire;
+ *  2. choosing a branch threads into the NEXT `turn.submit` and moves nothing
+ *     already committed — there is no `branch.switch` to mean anything else;
+ *  3. main is the OMITTED `branch_id`, never a synthesised id.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
