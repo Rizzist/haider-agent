@@ -87,26 +87,28 @@ class StartSurfaceTest {
         rule.onNodeWithText("Start Haider").performClick()
         rule.waitForIdle()
         // Step 1 collapses to its done line, and the next step opens.
-        assertTrue(rule.onAllNodesWithTextSafe("Let Haider notify you") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Let Haider work on its own") > 0)
         assertTrue(service.calls.contains("start"))
     }
 
     @Test
-    fun `a suggestion fills the composer and does not send`() {
+    fun `the empty state is a tile and two lines, with no suggestions to tap`() {
         val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
-        val viewModel = rule.setHaiderApp(service)
-        rule.onNodeWithContentDescription("What is on my screen right now?").performClick()
+        rule.setHaiderApp(service)
         rule.waitForIdle()
-        assertEquals("What is on my screen right now?", viewModel.state.value.draft)
-        // The user stays the author: nothing was sent.
-        assertTrue(service.calls.none { it.startsWith("chat.send") })
+        // Addition H2 removes the suggestion list: the composer is the way in,
+        // and a menu of sentences to type was not helping anybody find it.
+        assertEquals(0, rule.onAllNodesWithTextSafe("What is on my screen right now?"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Try"))
+        rule.onNodeWithText("No session yet.").assertIsDisplayed()
+        rule.onNodeWithText("Send a message below to start.").assertIsDisplayed()
     }
 
     @Test
-    fun `a completed setup drops the checklist and the hero for the suggestions`() {
+    fun `a completed setup drops the checklist and the hero`() {
         val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
         rule.setHaiderApp(service)
-        rule.onNodeWithText("Try").assertIsDisplayed()
+        rule.onNodeWithText("No session yet.").assertIsDisplayed()
         assertEquals(0, rule.onAllNodesWithTextSafe("Keep it alive on One UI"))
         // Addition F, F1/S7: no logo, no version line, no "Ready." sentence.
         assertEquals(0, rule.onAllNodesWithTextSafe("Ready. Ask for anything on this phone."))
@@ -114,12 +116,11 @@ class StartSurfaceTest {
     }
 
     @Test
-    fun `suggestions are hidden until the daemon is ready`() {
-        // Before that they are a list of things the app cannot do (F, F2).
+    fun `the empty block is hidden until the daemon is ready`() {
+        // Before that the screen is the checklist (F, F2).
         val service = ComposeHost.install(FakeScenario.FirstRun)
         rule.setHaiderApp(service)
-        assertEquals(0, rule.onAllNodesWithTextSafe("Try"))
-        assertEquals(0, rule.onAllNodesWithTextSafe("Summarise the texts I missed today"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("No session yet."))
         // And the composer says what to do instead of a helper sentence.
         assertTrue(rule.onAllNodesWithTextSafe("Start Haider to begin") > 0)
     }

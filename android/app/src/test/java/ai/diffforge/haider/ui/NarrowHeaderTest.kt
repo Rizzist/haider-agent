@@ -1,0 +1,63 @@
+package ai.diffforge.haider.ui
+
+import ai.diffforge.haider.MainActivity
+import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.scaffold.HAIDER_TOP_BAR_TAG
+import ai.diffforge.haider.ui.theme.ForgeSize
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.annotation.Config
+
+/**
+ * The narrow header, which is where verify-8 O3 was found: at 360 dp the
+ * unconstrained state pill squeezed the theme circle to 28 dp.
+ */
+@RunWith(AndroidJUnit4::class)
+@Config(sdk = [34], qualifiers = "w360dp-h800dp-xhdpi")
+class NarrowHeaderTest {
+
+    init {
+        ComposeHost.install()
+    }
+
+    @get:Rule
+    val rule = createAndroidComposeRule<MainActivity>()
+
+    @Test
+    fun `all five controls keep 48 dp at 360 dp with a needs-input session`() {
+        rule.setHaiderApp(ComposeHost.install(FakeScenario.InputRequiredHere))
+        rule.waitForIdle()
+        val bar = rule.onNodeWithTag(HAIDER_TOP_BAR_TAG).fetchSemanticsNode()
+        val targets = clickableUnder(bar)
+        assertEquals(5, targets.size)
+        val minPx = with(rule.density) { ForgeSize.touch.toPx() }
+        targets.forEach {
+            val label = it.config.getOrNull(SemanticsProperties.ContentDescription)?.first()
+            assertTrue(
+                "$label is ${it.size.width}x${it.size.height}px at 360 dp",
+                it.size.width >= minPx && it.size.height >= minPx,
+            )
+        }
+    }
+
+    @Test
+    fun `the pill drops its word rather than ellipsising it, and still speaks`() {
+        rule.setHaiderApp(ComposeHost.install(FakeScenario.InputRequiredHere))
+        rule.waitForIdle()
+        // No "Needs…" or "Runn…" on the row.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Needs you"))
+        // The word is still there for a screen reader.
+        assertTrue(
+            rule.onAllNodes(hasContentDescription("Needs you")).fetchSemanticsNodes().isNotEmpty(),
+        )
+    }
+}

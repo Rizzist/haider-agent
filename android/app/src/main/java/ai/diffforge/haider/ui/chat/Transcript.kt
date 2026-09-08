@@ -3,6 +3,7 @@ package ai.diffforge.haider.ui.chat
 import ai.diffforge.haider.ui.state.RelativeTime
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.motionEnabled
@@ -152,7 +153,11 @@ private fun UserBubble(message: Message) {
 @Composable
 private fun AgentTurn(message: Message, onRetry: () -> Unit) {
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-        BrandMark(message.provider, modifier = Modifier.padding(top = ForgeSpace.xxs))
+        BrandMarkOnly(
+            model = null,
+            provider = message.provider,
+            modifier = Modifier.padding(top = ForgeSpace.xxs),
+        )
         Spacer(Modifier.width(ForgeSpace.md))
         Box(modifier = Modifier.weight(1f)) {
             Column(
@@ -204,7 +209,7 @@ private fun ThinkingFold(message: Message) {
             Icon(
                 if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.KeyboardArrowRight,
                 contentDescription = if (expanded) "Collapse thinking" else "Expand thinking",
-                tint = colors.ember,
+                tint = colors.accent,
                 modifier = Modifier.size(ForgeSize.iconMd),
             )
             Text("Thinking", style = type.sessionMeta, color = colors.textMuted)
@@ -293,13 +298,16 @@ private fun ToolRow(tool: ToolCall) {
             .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            // mono: tool output, from the glyph to the result.
             Text(toolGlyph(tool.name), style = type.toolRow, color = colors.textMuted)
             Spacer(Modifier.width(ForgeSpace.md))
+            // mono: the tool's own name.
             Text(tool.name, style = type.toolStrong, color = colors.textSoft, maxLines = 1)
             if (tool.summary.isNotBlank()) {
                 Spacer(Modifier.width(ForgeSpace.md))
                 Text(
                     tool.summary,
+                    // mono: the command that was run.
                     style = type.toolRow,
                     color = colors.textMuted,
                     maxLines = 1,
@@ -334,6 +342,7 @@ private fun ToolRow(tool: ToolCall) {
             val result = remember(tool.result) { prettyToolResult(tool.result) }
             Text(
                 result,
+                // mono: the tool's raw result.
                 style = type.toolRow,
                 color = colors.chatText,
                 modifier = Modifier
@@ -395,34 +404,6 @@ private fun ErrorCard(message: String, retryable: Boolean, onRetry: () -> Unit) 
                 kind = ForgeButtonKind.Ghost,
             )
         }
-    }
-}
-
-@Composable
-fun BrandMark(provider: String?, modifier: Modifier = Modifier) {
-    val colors = Forge.colors
-    val normalized = provider.orEmpty().lowercase()
-    val (mark, color) = when {
-        "anthropic" in normalized || "claude" in normalized -> "✳" to Color(0xFFD97757)
-        "gemini" in normalized || "google" in normalized -> "✦" to Color(0xFF4E86F5)
-        "deepseek" in normalized -> "D" to Color(0xFF4D6BFE)
-        "qwen" in normalized -> "Q" to Color(0xFF615CED)
-        "kimi" in normalized || "moonshot" in normalized -> "K" to Color(0xFF16A8F0)
-        "mistral" in normalized -> "M" to Color(0xFFFF7000)
-        "llama" in normalized || "meta" in normalized -> "L" to Color(0xFF0668E1)
-        "glm" in normalized -> "G" to Color(0xFF3859FF)
-        "openai" in normalized || "codex" in normalized -> "AI" to colors.text
-        else -> "H" to colors.ember
-    }
-    Box(
-        modifier = modifier
-            .size(ForgeSize.avatar)
-            .clip(CircleShape)
-            .background(color.copy(alpha = 0.12f))
-            .border(ForgeSize.hairline, color.copy(alpha = 0.45f), CircleShape),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(mark, style = Forge.type.label, color = color)
     }
 }
 

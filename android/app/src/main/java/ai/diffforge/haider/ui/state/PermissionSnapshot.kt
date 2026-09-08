@@ -20,6 +20,14 @@ enum class PermissionStanding { Granted, NotGranted, AskEachTime, Unknown }
  */
 data class PermissionSnapshot(
     val accessibility: PermissionStanding = PermissionStanding.Unknown,
+    /**
+     * Granted only while a projection is actually live.
+     *
+     * MediaProjection has no durable grant to read back, so this is the
+     * capture service's own state, not a constant: reporting AskEachTime while
+     * a projection was running made the row lie and re-open consent
+     * (verify-8 O2).
+     */
     val screenCapture: PermissionStanding = PermissionStanding.AskEachTime,
     val sms: PermissionStanding = PermissionStanding.Unknown,
 )

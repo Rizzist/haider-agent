@@ -69,6 +69,8 @@ fun SessionActionsSheet(
             )
             Text(
                 row.id,
+                // mono: a session id is a literal token, and the sheet's own
+                // Copy session id action exists because people paste it.
                 style = type.numeric,
                 color = colors.textMuted,
                 modifier = Modifier.padding(bottom = ForgeSpace.lg),

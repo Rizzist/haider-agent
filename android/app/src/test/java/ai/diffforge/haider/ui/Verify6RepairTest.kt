@@ -42,17 +42,15 @@ class Verify6RepairTest {
     @get:Rule
     val rule = createAndroidComposeRule<MainActivity>()
 
-    private fun openOverflow() {
-        rule.onAllNodes(hasContentDescription("More", substring = true)).onFirst().performClick()
-        rule.waitForIdle()
-    }
+    // There is no overflow any more (addition H1): the header is controls
+    // only. These pins assert the absence over the whole screen instead.
 
     // ---------- O1: no deceptive Clear ----------
 
     @Test
     fun `the overflow offers no Clear transcript, because nothing can clear it`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
-        openOverflow()
+        rule.waitForIdle()
         assertEquals(0, rule.onAllNodesWithTextSafe("Clear transcript"))
     }
 
@@ -62,8 +60,6 @@ class Verify6RepairTest {
     fun `no node outside the composer carries the stop-turn action`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.TurnRunning))
         rule.waitForIdle()
-        // Overflow open — this is the surface the round-6 pin never opened.
-        openOverflow()
         assertEquals(0, rule.onAllNodesWithTextSafe("Stop turn"))
         assertEquals(
             "the composer Stop must survive; anything else must not",
@@ -120,9 +116,9 @@ class Verify6RepairTest {
         rule.waitForIdle()
         assertTrue(rule.onAllNodesWithTextSafe("Not yet") > 0)
         // Tapping a pending step used to do nothing at all.
-        rule.onNodeWithText("Let Haider notify you").performClick()
+        rule.onNodeWithText("Let Haider work on its own").performClick()
         rule.waitForIdle()
-        rule.onNodeWithText("Allow notifications").assertIsDisplayed()
+        rule.onNodeWithText("Allow all four").assertIsDisplayed()
     }
 
     // ---------- O6: no raw id in the header ----------

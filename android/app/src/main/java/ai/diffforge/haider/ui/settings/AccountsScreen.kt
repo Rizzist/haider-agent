@@ -9,6 +9,7 @@ import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.accounts.OAuthStyle
 import ai.diffforge.haider.ui.accounts.ProviderDescriptor
 import ai.diffforge.haider.ui.accounts.SecretBuffer
+import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
@@ -282,10 +283,14 @@ fun AccountsScreen(
                     )
                     Text(
                         stringResource(
-                            if (stagedHint) {
-                                R.string.accounts_key_staged
-                            } else {
-                                R.string.accounts_key_never_leaves
+                            when {
+                                // Staging is not validation and the commit has
+                                // not returned: saying "validated" while both
+                                // buttons are disabled was a claim about a call
+                                // still in flight (verify-8 O7).
+                                busy -> R.string.accounts_key_signing_in
+                                stagedHint -> R.string.accounts_key_staged
+                                else -> R.string.accounts_key_never_leaves
                             },
                         ),
                         style = type.sessionMeta,
@@ -307,6 +312,15 @@ fun AccountsScreen(
                                     try {
                                         val reference = stagedReference
                                             ?: secret.use { repository.stageApiKey(it) }
+                                        // The moment the vault has it, this
+                                        // screen does not. Round 7 kept the
+                                        // plaintext in the field — revealable
+                                        // with the eye button — for the whole
+                                        // login round trip, which is exactly
+                                        // the window an over-the-shoulder
+                                        // reader needs (verify-7 P2).
+                                        clearSecret()
+                                        stagedReference = reference
                                         result = if (reference == null) {
                                             AccountResult.Failed(STAGING_UNAVAILABLE)
                                         } else {
@@ -492,11 +506,7 @@ private fun AccountRow(account: Account, onOpen: () -> Unit) {
             .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.sm),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SessionGlyph(
-            provider = account.provider,
-            state = SessionVisualState.Idle,
-            animate = false,
-        )
+        BrandMarkOnly(model = null, provider = account.provider)
         Column(
             Modifier
                 .weight(1f)
@@ -738,6 +748,8 @@ private fun LiveOAuthPanel(
         live.flow.userCode?.let {
             Text(
                 stringResource(R.string.accounts_oauth_code, it),
+                // mono: a device code the person reads out character by
+                // character; proportional digits invite a misread.
                 style = type.numeric,
                 color = colors.accent,
             )

@@ -116,7 +116,20 @@ fun InputRequiredCard(
                 verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
             ) {
                 needsInput.bodyLines.forEach { line ->
-                    Text(line, style = type.toolRow, color = colors.chatText)
+                    // S6's monospace exception is for a *literal proposal* —
+                    // a message body or a command quoted verbatim, which the
+                    // daemon marks by quoting it. A rationale line is prose
+                    // and reads on the ramp (verify-8 O5).
+                    Text(
+                        line,
+                        style = if (isQuotedProposal(line)) {
+                            // mono: the literal text being proposed.
+                            type.toolRow
+                        } else {
+                            type.chatBody
+                        },
+                        color = colors.chatText,
+                    )
                 }
             }
         }
@@ -320,4 +333,15 @@ fun MenuOption.kind(): ForgeButtonKind = when (decision) {
     "allow_once" -> ForgeButtonKind.Filled
     "reject_always" -> ForgeButtonKind.Destructive
     else -> ForgeButtonKind.Ghost
+}
+
+/**
+ * A proposal the daemon quoted, as opposed to a sentence explaining it.
+ *
+ * The daemon wraps the literal payload in typographic quotes; anything else in
+ * `safeBody` is rationale (contracts-v1, needs-input body).
+ */
+internal fun isQuotedProposal(line: String): Boolean {
+    val trimmed = line.trim()
+    return trimmed.startsWith("\u201c") || trimmed.startsWith("\"") || trimmed.startsWith("$")
 }

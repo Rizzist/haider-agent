@@ -203,7 +203,7 @@ class DeviceRegressionTest {
         val service = ComposeHost.install(FakeScenario.FirstRun)
         val viewModel = rule.setHaiderApp(service)
         rule.waitForIdle()
-        assertTrue(rule.onAllNodesWithTextSafe("Let Haider notify you") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Let Haider work on its own") > 0)
 
         // What the Activity's permission callback does. An empty callback left
         // first run stuck on step 2 with the permission already granted.
@@ -213,7 +213,7 @@ class DeviceRegressionTest {
         assertTrue(service.calls.contains("permissions.notifications:true"))
         assertTrue(viewModel.state.value.environment.notificationsGranted)
         assertEquals(0, rule.onAllNodesWithTextSafe("Notifications are off"))
-        assertTrue(rule.onAllNodesWithTextSafe("Notifications allowed") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Haider can work unattended") > 0)
     }
 
     @Test
@@ -253,7 +253,7 @@ class DeviceRegressionTest {
             ).fetchSemanticsNodes().size,
         )
         // The step is still the ordinary ask, not a trip to app settings.
-        assertTrue(rule.onAllNodesWithTextSafe("Let Haider notify you") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Let Haider work on its own") > 0)
     }
 
     @Test

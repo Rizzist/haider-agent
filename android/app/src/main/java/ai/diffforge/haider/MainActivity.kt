@@ -14,6 +14,8 @@ import ai.diffforge.haider.ui.scaffold.SharedPreferencesBannerDismissals
 import ai.diffforge.haider.ui.scaffold.SystemAction
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.service.HaiderAccessibilityService
+import ai.diffforge.haider.transport.CapabilityBus
+import ai.diffforge.haider.service.ScreenConsentActivity
 import ai.diffforge.haider.ui.state.PermissionSnapshot
 import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.state.PermissionClassifier
@@ -138,7 +140,14 @@ class MainActivity : ComponentActivity() {
         } else {
             PermissionStanding.NotGranted
         },
-        screenCapture = PermissionStanding.AskEachTime,
+        // The capture service publishes "screenCapture" on the bus while a
+        // projection is live. Reporting AskEachTime regardless made Settings
+        // claim consent was needed during an active projection (verify-8 O2).
+        screenCapture = if (CapabilityBus.granted.value.contains("screenCapture")) {
+            PermissionStanding.Granted
+        } else {
+            PermissionStanding.AskEachTime
+        },
         sms = if (
             ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_SMS) ==
             PackageManager.PERMISSION_GRANTED &&
@@ -332,6 +341,10 @@ class MainActivity : ComponentActivity() {
                     android.Manifest.permission.RECEIVE_SMS,
                 ),
             )
+            // MediaProjection consent: a transparent system activity issues
+            // it and starts the capture service on OK (addition H6).
+            SystemAction.RequestScreenCapture ->
+                startActivity(Intent(this, ScreenConsentActivity::class.java))
             SystemAction.Screenshot, SystemAction.PickFile -> Unit
             is SystemAction.CopyText -> {
                 val clipboard = getSystemService(ClipboardManager::class.java)

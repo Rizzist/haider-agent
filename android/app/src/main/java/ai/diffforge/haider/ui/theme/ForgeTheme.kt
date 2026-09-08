@@ -45,6 +45,8 @@ data class ForgeColors(
     val accentInk: Color,
     /** Tinted fills, chips, step markers. */
     val accentWash: Color,
+    /** Hairline on tinted accent surfaces (reference `accentLine`). */
+    val accentLine: Color,
     /** 2 dp outline on focus / keyboard navigation. */
     val focusRing: Color,
     /** Drawer scrim. */
@@ -52,7 +54,6 @@ data class ForgeColors(
     /** Markdown links only. */
     val link: Color,
     val amber: Color,
-    val ember: Color,
     val green: Color,
     val red: Color,
     val trajectoryModel: Color,
@@ -65,6 +66,14 @@ data class ForgeColors(
     val isDark: Boolean,
 )
 
+/**
+ * next-diffforge forge dark (owner addition H4).
+ *
+ * Surfaces and text tiers come from `LiveAppDemo.js:41-72`; the accent family
+ * is the dashboard's blue selection set (`selBg` / `selBorder` / `selRing`),
+ * replacing 971's ember. State tones follow `modelBrand.jsx`: green while a
+ * turn runs, amber while it waits for a human, red on error.
+ */
 val ForgeDark = ForgeColors(
     bg = Color(0xFF07090D),
     bgDeep = Color(0xFF020304),
@@ -72,71 +81,75 @@ val ForgeDark = ForgeColors(
     surfaceRaised = Color(0xFF11161D),
     surfaceControl = Color(0xFF151B23),
     surfaceHover = Color(0x0EE6ECF5), // rgba(230,236,245,0.055)
-    surfaceSelected = Color(0x1FE8873A), // rgba(232,135,58,0.12)
+    surfaceSelected = Color(0x143B82F6), // selBg rgba(59,130,246,0.08)
     border = Color(0x1AE6ECF5), // rgba(230,236,245,0.10)
     borderStrong = Color(0x29E6ECF5), // rgba(230,236,245,0.16)
     text = Color(0xFFF4F7FA),
-    chatText = Color(0xFFD6DEE8),
+    chatText = Color(0xFFE8EEF8),
     textSoft = Color(0xFFB6C0CC),
     textMuted = Color(0xFF7A8493),
     textDisabled = Color(0xFF505966),
-    accent = Color(0xFFE8873A),
-    accentSoft = Color(0xFFFFA55E),
-    accentInk = Color(0xFF0B0B0C),
-    accentWash = Color(0x24E8873A),
-    focusRing = Color(0x8CE8873A),
+    accent = Color(0xFF3B82F6),
+    accentSoft = Color(0xFF7DB0FF),
+    // Near-black on a solid #3B82F6 fill measures 4.9:1; white measures 3.7:1
+    // and would fail the same table that caught the ember pair in round 1.
+    accentInk = Color(0xFF060B12),
+    accentWash = Color(0x143B82F6), // selBg
+    accentLine = Color(0x807DB0FF), // selBorder rgba(125,176,255,0.5)
+    focusRing = Color(0x3D4FA3FF), // selRing rgba(79,163,255,0.24)
     scrim = Color(0xA8020304),
     link = Color(0xFF7DB0FF),
     amber = Color(0xFFDFA55A),
-    ember = Color(0xFFE8873A),
     green = Color(0xFF3CCB7F),
     red = Color(0xFFEF6B6B),
-    trajectoryModel = Color(0xFF8B7CF6),
-    stateRunning = Color(0xFFDFA55A),
-    stateNeedsInput = Color(0xFFE8873A),
+    trajectoryModel = Color(0xFFB795F6),
+    stateRunning = Color(0xFF3CCB7F),
+    stateNeedsInput = Color(0xFFDFA55A),
     stateIdle = Color(0xFF7A8493),
     stateErrored = Color(0xFFEF6B6B),
     stateUnknown = Color(0xFF7A8493),
     isDark = true,
 )
 
+/**
+ * next-diffforge forge light (`tokens.js` THEME_VARS.light).
+ *
+ * As in round 1, "soft" means *darker* in a light theme: the soft accent is
+ * the reference's `--df-accent-text`, so it clears 4.5:1 on the wash as well
+ * as on the ground.
+ */
 val ForgeLight = ForgeColors(
-    bg = Color(0xFFF5F5F7),
-    bgDeep = Color(0xFFECECEF),
+    bg = Color(0xFFF4F6FB),
+    bgDeep = Color(0xFFEEF1F7),
     surface = Color(0xFFFFFFFF),
     surfaceRaised = Color(0xFFFFFFFF),
-    surfaceControl = Color(0xFFFAFAFC),
-    surfaceHover = Color(0x0A000000),
-    surfaceSelected = Color(0x1A9A4B08),
-    border = Color(0x14000000), // rgba(0,0,0,0.08)
-    borderStrong = Color(0x24000000), // rgba(0,0,0,0.14)
-    text = Color(0xFF1D1D1F),
-    chatText = Color(0xFF2B2B2F),
-    textSoft = Color(0xFF333333),
-    textMuted = Color(0xFF6B6B6B),
-    textDisabled = Color(0xFFA1A1A6),
-    // UI-SPEC 2.1 proposed accent #B45309 / accentSoft #C2621A. Its contrast
-    // table measured the accent only against the plain ground (5.05:1) and
-    // never against accentWash, where the same pair is 4.02:1, nor accentSoft
-    // at all, which is 3.81:1. Both are darkened here so every documented pair
-    // clears 4.5:1 — see ContrastTest. In a light theme "soft" means darker.
-    accent = Color(0xFF9A4B08),
-    accentSoft = Color(0xFF7C2D12),
+    surfaceControl = Color(0xFFE9EDF5),
+    surfaceHover = Color(0x0A0F172A),
+    surfaceSelected = Color(0x1A1A56C4),
+    border = Color(0x1F0F172A), // rgba(15,23,42,0.12)
+    borderStrong = Color(0x380F172A), // rgba(15,23,42,0.22)
+    text = Color(0xFF0B1420),
+    chatText = Color(0xFF16202E),
+    textSoft = Color(0xFF46556B),
+    textMuted = Color(0xFF5F6B80),
+    textDisabled = Color(0xFF94A3B8),
+    accent = Color(0xFF1A56C4),
+    accentSoft = Color(0xFF123F92),
     accentInk = Color(0xFFFFFFFF),
-    accentWash = Color(0x1A9A4B08),
-    focusRing = Color(0x8C9A4B08),
-    scrim = Color(0x6B141416),
-    link = Color(0xFF0066CC),
-    amber = Color(0xFF8B5A00),
-    ember = Color(0xFF9A4B08),
-    green = Color(0xFF0A7F45),
-    red = Color(0xFFB42318),
+    accentWash = Color(0x1A1A56C4),
+    accentLine = Color(0x521A56C4),
+    focusRing = Color(0x731A56C4),
+    scrim = Color(0x6B0F172A),
+    link = Color(0xFF123F92),
+    amber = Color(0xFF9A5B00),
+    green = Color(0xFF15803D),
+    red = Color(0xFFC02626),
     trajectoryModel = Color(0xFF6D5AE0),
-    stateRunning = Color(0xFF8B5A00),
-    stateNeedsInput = Color(0xFF9A4B08),
-    stateIdle = Color(0xFF6B6B6B),
-    stateErrored = Color(0xFFB42318),
-    stateUnknown = Color(0xFF6B6B6B),
+    stateRunning = Color(0xFF15803D),
+    stateNeedsInput = Color(0xFF9A5B00),
+    stateIdle = Color(0xFF5F6B80),
+    stateErrored = Color(0xFFC02626),
+    stateUnknown = Color(0xFF5F6B80),
     isDark = false,
 )
 
@@ -160,6 +173,14 @@ data class ForgeType(
     val button: TextStyle,
     val banner: TextStyle,
     val numeric: TextStyle,
+    /** The letter inside a brand tile. */
+    /** The reference empty state's 16 sp / 860 line (dashboard.js:39178). */
+    val emptyTitle: TextStyle,
+    /** Its 13 sp muted sentence at line-height 1.6 (dashboard.js:39184). */
+    val emptyBody: TextStyle,
+    val brandLetter: TextStyle,
+    /** The tiny tracked label inside a composer select (dashboard.js:39694). */
+    val selectLabel: TextStyle,
 )
 
 val ForgeTypography = ForgeType(
@@ -168,7 +189,7 @@ val ForgeTypography = ForgeType(
     thinking = TextStyle(fontFamily = FontFamily.Default, fontSize = 14.sp, lineHeight = 22.sp, fontWeight = FontWeight.Normal),
     toolRow = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp),
     toolStrong = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp, fontWeight = FontWeight.SemiBold),
-    chip = TextStyle(fontFamily = FontFamily.Default, fontSize = 11.sp, lineHeight = 14.sp, fontWeight = FontWeight.Medium),
+    chip = TextStyle(fontFamily = FontFamily.Default, fontSize = 12.sp, lineHeight = 15.sp, fontWeight = FontWeight.Medium),
     label = TextStyle(fontFamily = FontFamily.Default, fontSize = 10.sp, lineHeight = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.6.sp),
     h1 = TextStyle(fontFamily = FontFamily.Default, fontSize = 19.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold),
     h4 = TextStyle(fontFamily = FontFamily.Default, fontSize = 16.sp, lineHeight = 21.sp, fontWeight = FontWeight.SemiBold),
@@ -176,7 +197,7 @@ val ForgeTypography = ForgeType(
     sessionMeta = TextStyle(fontFamily = FontFamily.Default, fontSize = 12.sp, lineHeight = 16.sp, fontWeight = FontWeight.Normal),
     drawerSection = TextStyle(
         fontFamily = FontFamily.Default,
-        fontSize = 10.5.sp,
+        fontSize = 10.sp,
         lineHeight = 14.sp,
         fontWeight = FontWeight.Bold,
         letterSpacing = 0.9.sp,
@@ -188,6 +209,31 @@ val ForgeTypography = ForgeType(
         fontSize = 12.sp,
         lineHeight = 16.sp,
         fontWeight = FontWeight.Medium,
+    ),
+    emptyTitle = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontSize = 16.sp,
+        lineHeight = 21.sp,
+        fontWeight = FontWeight.ExtraBold,
+    ),
+    emptyBody = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontSize = 13.sp,
+        lineHeight = 21.sp,
+        fontWeight = FontWeight.Normal,
+    ),
+    brandLetter = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontSize = 9.sp,
+        lineHeight = 10.sp,
+        fontWeight = FontWeight.Bold,
+    ),
+    selectLabel = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontSize = 10.sp,
+        lineHeight = 11.sp,
+        fontWeight = FontWeight.Black,
+        letterSpacing = 0.9.sp,
     ),
 )
 

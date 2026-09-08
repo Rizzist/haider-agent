@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.chat.Message
+import ai.diffforge.haider.ui.state.PermissionMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -299,6 +300,16 @@ interface DaemonService {
 
     /** `provider.list` inventory, for the composer's provider/model pickers. */
     val providers: StateFlow<ProviderInventory>
+
+    /**
+     * How much the daemon lets the model do without asking (addition H6).
+     *
+     * The policy lives in the daemon — android-standalone Auto mode is not
+     * something the UI can grant itself — so this is the door the UI reads and
+     * sets it through, not a local flag.
+     */
+    val permissionMode: StateFlow<PermissionMode>
+    suspend fun setPermissionMode(mode: PermissionMode)
 
     /** Derived from `tools.inventory`: can this device run a shell at all? */
     val shell: StateFlow<ShellAvailability>

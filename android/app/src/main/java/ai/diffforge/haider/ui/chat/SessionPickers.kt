@@ -6,6 +6,9 @@ import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.Skeleton
 import ai.diffforge.haider.ui.daemon.ProviderInventory
 import ai.diffforge.haider.ui.state.ModelNames
+import ai.diffforge.haider.ui.components.BrandMarkOnly
+import ai.diffforge.haider.ui.state.PermissionMode
+import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
@@ -17,6 +20,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -28,6 +33,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,7 +56,7 @@ import androidx.compose.ui.text.style.TextOverflow
  * Two pickers, not three: the model sheet is grouped by provider, so choosing
  * a model chooses its provider (addition F, S5).
  */
-enum class PickerKind { Model, Effort }
+enum class PickerKind { Model, Effort, Permissions }
 
 /**
  * Provider / model / effort pickers for the composer bar, matching the desktop
@@ -74,13 +84,28 @@ fun SessionPickerSheet(
      * "Asking the daemon for its model catalog…" indefinitely.
      */
     pending: Boolean,
+    /** True while a selection is in flight; the sheet waits for its answer. */
+    busy: Boolean,
+    /** What the daemon said, if it refused. Rendered here, never swallowed. */
+    refusal: SelectionRefusal?,
     onRetry: () -> Unit,
     onDismiss: () -> Unit,
     onSelectModel: (provider: String, model: String) -> Unit,
     onSelectEffort: (String?) -> Unit,
+    permissionMode: PermissionMode,
+    onSelectPermissionMode: (PermissionMode) -> Unit,
+    onConfirmRefused: () -> Unit,
+    onDismissRefusal: () -> Unit,
 ) {
     val colors = Forge.colors
     val type = Forge.type
+    // Tapping a row used to dismiss the sheet on the spot, so a refusal landed
+    // on a surface that had already closed (verify-7 P2). The sheet now stays
+    // until the selection actually lands, and closes itself when it does.
+    var submitted by remember { mutableStateOf(false) }
+    LaunchedEffect(submitted, busy, refusal) {
+        if (submitted && !busy && refusal == null) onDismiss()
+    }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(),
@@ -98,11 +123,21 @@ fun SessionPickerSheet(
                     when (kind) {
                         PickerKind.Model -> R.string.picker_model_title
                         PickerKind.Effort -> R.string.picker_effort_title
+                        PickerKind.Permissions -> R.string.picker_permissions_title
                     },
                 ),
                 style = type.h4,
                 color = colors.text,
             )
+
+            if (refusal != null) {
+                SelectionRefusalPanel(
+                    refusal = refusal,
+                    onConfirm = onConfirmRefused,
+                    onKeep = { submitted = false; onDismissRefusal() },
+                )
+                return@Column
+            }
 
             when (kind) {
                 PickerKind.Model -> {
@@ -134,9 +169,40 @@ fun SessionPickerSheet(
                                 secondary = model.id,
                                 selected = model.id == currentModel && option.id == currentProvider,
                                 enabled = option.available,
-                                onClick = { onSelectModel(option.id, model.id); onDismiss() },
+                                onClick = { submitted = true; onSelectModel(option.id, model.id) },
+                                // The mark belongs on the surface people
+                                // actually pick from (verify-8 O4).
+                                leading = {
+                                    BrandMarkOnly(model = model.id, provider = option.id)
+                                },
                             )
                         }
+                    }
+                }
+
+                // Auto is the owner's "model work should be automated": one
+                // standing consent, given once, instead of a card per SMS read
+                // (addition H6). Ask is the only other value — there is no
+                // per-tool matrix to get lost in.
+                PickerKind.Permissions -> {
+                    PermissionMode.entries.forEach { mode ->
+                        PickerRow(
+                            label = stringResource(
+                                when (mode) {
+                                    PermissionMode.Auto -> R.string.permission_mode_auto
+                                    PermissionMode.Ask -> R.string.permission_mode_ask
+                                },
+                            ),
+                            secondary = stringResource(
+                                when (mode) {
+                                    PermissionMode.Auto -> R.string.permission_mode_auto_detail
+                                    PermissionMode.Ask -> R.string.permission_mode_ask_detail
+                                },
+                            ),
+                            selected = mode == permissionMode,
+                            enabled = mode != permissionMode,
+                            onClick = { onSelectPermissionMode(mode); onDismiss() },
+                        )
                     }
                 }
 
@@ -152,7 +218,7 @@ fun SessionPickerSheet(
                             secondary = null,
                             selected = effort == currentEffort,
                             enabled = true,
-                            onClick = { onSelectEffort(effort); onDismiss() },
+                            onClick = { submitted = true; onSelectEffort(effort) },
                         )
                     }
                 }
@@ -196,6 +262,7 @@ private fun PickerRow(
     selected: Boolean,
     enabled: Boolean,
     onClick: () -> Unit,
+    leading: (@Composable () -> Unit)? = null,
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -214,6 +281,10 @@ private fun PickerRow(
             },
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        leading?.let {
+            it()
+            Spacer(Modifier.width(ForgeSpace.md))
+        }
         Column(Modifier.weight(1f)) {
             Text(label, style = type.button, color = if (selected) colors.accent else colors.text)
             secondary?.let {

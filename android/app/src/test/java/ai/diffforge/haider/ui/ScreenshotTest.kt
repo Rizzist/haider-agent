@@ -1,9 +1,23 @@
 package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
+import ai.diffforge.haider.ui.components.BrandMarkOnly
+import ai.diffforge.haider.ui.components.SessionGlyph
+import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeSpace
+import ai.diffforge.haider.ui.theme.ForgeTheme
 import ai.diffforge.haider.ui.theme.ThemeMode
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Text
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
@@ -186,4 +200,79 @@ class NarrowScreenshotTest {
 
     @Test fun `narrow api key form dark`() = captureForm("narrow-api-key-dark", dark = true)
     @Test fun `narrow api key form light`() = captureForm("narrow-api-key-light", dark = false)
+
+    /** H3: the three selects must fit 360 dp, wrapping rather than scrolling. */
+    private fun captureComposer(name: String, dark: Boolean) {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        rule.setHaiderApp(
+            service = service,
+            dark = dark,
+            themeMode = if (dark) ThemeMode.Dark else ThemeMode.Light,
+        )
+        rule.waitForIdle()
+        rule.onRoot().captureRoboImage("src/test/screenshots/$name.png")
+    }
+
+    @Test fun `narrow composer dark`() = captureComposer("narrow-composer-dark", dark = true)
+    @Test fun `narrow composer light`() = captureComposer("narrow-composer-light", dark = false)
+}
+
+/**
+ * One golden per provider family, both themes: the marks are ported vendor
+ * geometry and a regression in a path is invisible in any assertion (H5).
+ */
+@RunWith(AndroidJUnit4::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+@Config(sdk = [34], qualifiers = "w412dp-h915dp-xhdpi")
+class BrandMarkScreenshotTest {
+
+    init {
+        // Hosted in the app's own activity with its bootstrap disabled, so the
+        // shipped manifest needs no test-only entry.
+        ComposeHost.install()
+    }
+
+    @get:Rule
+    val rule = createAndroidComposeRule<MainActivity>()
+
+    private fun captureMarks(name: String, dark: Boolean) {
+        rule.setContent {
+            ForgeTheme(dark = dark) {
+                Column(
+                    Modifier
+                        .background(Forge.colors.bg)
+                        .padding(ForgeSpace.xl),
+                    verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+                ) {
+                    listOf(
+                        "gpt-5.7" to "openai",
+                        "claude-opus-4-5" to "anthropic",
+                        "gemini-3-pro" to "google",
+                        "deepseek-v3" to "deepseek",
+                        "grok-4" to "xai",
+                        "qwen3-max" to "alibaba",
+                    ).forEach { (model, provider) ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+                        ) {
+                            SessionGlyph(
+                                model = model,
+                                provider = provider,
+                                state = SessionVisualState.Running,
+                                animate = false,
+                            )
+                            BrandMarkOnly(model = model, provider = provider)
+                            Text(model, color = Forge.colors.text, style = Forge.type.sessionTitle)
+                        }
+                    }
+                }
+            }
+        }
+        rule.waitForIdle()
+        rule.onRoot().captureRoboImage("src/test/screenshots/$name.png")
+    }
+
+    @Test fun `provider marks dark`() = captureMarks("provider-marks-dark", dark = true)
+    @Test fun `provider marks light`() = captureMarks("provider-marks-light", dark = false)
 }

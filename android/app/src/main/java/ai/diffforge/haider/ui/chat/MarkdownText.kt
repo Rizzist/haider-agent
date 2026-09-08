@@ -51,10 +51,11 @@ internal fun MarkdownText(
                 is MarkdownBlock.Code -> Text(
                     text = literalCode(
                         block.text,
-                        colors.ember,
+                        colors.accent,
                         showCaret && last,
                         caretAlpha,
                     ),
+                    // mono: a fenced code block.
                     style = type.toolRow.copy(fontFamily = FontFamily.Monospace),
                     color = colors.chatText,
                     modifier = Modifier
@@ -76,7 +77,7 @@ internal fun MarkdownText(
                         .drawBehind {
                             val stroke = ForgeSpace.xxs.toPx()
                             drawLine(
-                                color = colors.ember.copy(alpha = 0.45f),
+                                color = colors.accent.copy(alpha = 0.45f),
                                 start = Offset(stroke / 2f, 0f),
                                 end = Offset(stroke / 2f, size.height),
                                 strokeWidth = stroke,
@@ -104,11 +105,15 @@ internal fun MarkdownText(
                         block.rows.joinToString("\n") { row -> row.joinToString("  │  ") },
                         colors.chatText,
                         colors.accentSoft,
-                        colors.ember,
+                        colors.accent,
                         showCaret && last,
                         caretAlpha,
                     ),
-                    style = type.toolRow,
+                    // A table of prose is prose. Only a table whose cells are
+                    // code needs the fixed-width face, and this renderer
+                    // cannot tell, so the default is the ramp people read
+                    // (verify-8 O5).
+                    style = type.chatBody,
                     color = colors.chatText,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -159,7 +164,7 @@ private fun InlineMarkdownLine(
         text,
         color,
         colors.accentSoft,
-        colors.ember,
+        colors.accent,
         showCaret,
         caretAlpha,
     )
@@ -201,6 +206,7 @@ private fun inlineMarkdown(
             text[cursor] == '`' -> {
                 val end = text.indexOf('`', cursor + 1)
                 if (end >= 0) {
+                    // mono: inline `code` spans.
                     withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = color.copy(alpha = 0.09f))) {
                         append(text.substring(cursor + 1, end))
                     }

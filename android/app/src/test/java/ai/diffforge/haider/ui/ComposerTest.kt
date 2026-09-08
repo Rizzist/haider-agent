@@ -6,6 +6,10 @@ import ai.diffforge.haider.ui.theme.ForgeSize
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -93,13 +97,25 @@ class ComposerTest {
     }
 
     @Test
-    fun `a running turn adds Stop beside Send, and there is exactly one Stop`() {
+    fun `a running turn puts Stop in the send circle, and there is one of it`() {
         val service = ComposeHost.install(FakeScenario.TurnRunning)
         rule.setHaiderApp(service)
         // Addition E: one Stop control in the whole app, and it is the
-        // composer's. The centred sticky chip is gone.
+        // composer's. H3 gives it the send circle rather than a seat beside
+        // it, so the button count does not grow mid-turn.
         assertEquals(1, rule.onAllNodesWithContentDescriptionSafe("Stop this turn"))
-        assertEquals(1, rule.onAllNodesWithContentDescriptionSafe("Send message"))
+        assertEquals(0, rule.onAllNodesWithContentDescriptionSafe("Send message"))
+        // The follow-up path E cared about is the keyboard's Send action, and
+        // the field advertises it.
+        // The composer's own field, not the drawer search box the closed
+        // drawer also composes.
+        val field = rule.onAllNodes(hasSetTextAction())
+            .fetchSemanticsNodes()
+            .maxBy { it.positionInRoot.y }
+        assertEquals(
+            ImeAction.Send,
+            field.config.getOrNull(SemanticsProperties.ImeAction),
+        )
     }
 
     @Test

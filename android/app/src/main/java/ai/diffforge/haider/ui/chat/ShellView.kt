@@ -79,6 +79,7 @@ fun ShellView(
             availability.reason?.let { reason ->
                 // The daemon's own code, in the one type face that is allowed
                 // to be monospace: this is machine output (addition F, G1).
+                // mono: the daemon's own reason code, quoted verbatim.
                 Text(reason, style = type.toolRow, color = colors.textMuted)
             }
         }

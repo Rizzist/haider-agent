@@ -9,6 +9,8 @@ import ai.diffforge.haider.ui.chat.Message
 import ai.diffforge.haider.ui.chat.Role
 import ai.diffforge.haider.ui.chat.ToolCall
 import ai.diffforge.haider.ui.chat.ToolStatus
+import ai.diffforge.haider.ui.state.CapabilityApproval
+import ai.diffforge.haider.ui.state.PermissionMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -84,6 +86,81 @@ class FakeDaemonService(
 
     /** Recorded calls, so a test can assert what the UI asked the daemon for. */
     val calls = mutableListOf<String>()
+
+    /**
+     * Auto by default, as the first-run step leaves it.
+     *
+     * The fake stays honest about what Auto *means*: it is the daemon that
+     * stops sending capability approvals, so in Auto this fake does not
+     * fabricate a `permission` needs-input for a device capability either. It
+     * still raises questions, secrets and provider refusals.
+     */
+    private val _permissionMode = MutableStateFlow(PermissionMode.Auto)
+    override val permissionMode: StateFlow<PermissionMode> = _permissionMode.asStateFlow()
+
+    override suspend fun setPermissionMode(mode: PermissionMode) {
+        calls += "tool.policy:${mode.name.lowercase()}"
+        _permissionMode.value = mode
+        applyAutoPolicy()
+    }
+
+    /**
+     * What Auto actually *does*: the policy resolves device-capability
+     * approvals instead of raising them.
+     *
+     * Round 9 modelled Auto as a UI filter, so switching to Auto with an
+     * unanswered `sms.list` card hid the card and left the session parked on
+     * "Needs you" with nothing to answer (verify-8 O1). A mode that changes
+     * what the daemon asks has to change the snapshot, not the drawing.
+     */
+    private fun applyAutoPolicy() {
+        if (_permissionMode.value != PermissionMode.Auto) return
+        _sessions.value = _sessions.value.map { row ->
+            val pending = row.needsInput
+            if (pending != null && CapabilityApproval.isDeviceCapabilityApproval(pending)) {
+                calls += "tool.policy.auto_resolved:${row.id}"
+                row.copy(
+                    needsInput = null,
+                    state = SessionVisualState.Running,
+                    runState = "running",
+                )
+            } else {
+                row
+            }
+        }
+    }
+
+    /** Sets the mode without asking the policy to run — test setup only. */
+    fun setPermissionModeForTest(mode: PermissionMode) {
+        _permissionMode.value = mode
+    }
+
+    /**
+     * Raises the device-capability approval a real daemon raises in Ask mode,
+     * so a test can watch what happens when the mode changes underneath it.
+     */
+    fun raiseDeviceApproval(sessionId: String) {
+        _sessions.value = _sessions.value.map { row ->
+            if (row.id != sessionId) {
+                row
+            } else {
+                row.copy(
+                    state = SessionVisualState.NeedsInput,
+                    runState = "parked_permission",
+                    needsInput = NeedsInput(
+                        kind = "permission",
+                        title = "Allow sms.list for the last 20 messages?",
+                        safeBody = listOf("The agent asked to read your recent texts."),
+                        menuId = "menu-sms-list",
+                        requestSeq = 91,
+                        workerGeneration = 3,
+                        sinceMs = nowMs - 4_000,
+                    ),
+                )
+            }
+        }
+        applyAutoPolicy()
+    }
 
     init {
         apply(scenario)
@@ -208,6 +285,9 @@ class FakeDaemonService(
 
     fun setSessions(rows: List<SessionRow>) {
         _sessions.value = rows
+        // Every path that publishes a roster runs the policy, so an approval
+        // can never sit unresolved in Auto (verify-8 O1).
+        applyAutoPolicy()
         _searchIndex.value = SearchIndexState(
             indexedSessions = rows.size,
             totalSessions = rows.size,

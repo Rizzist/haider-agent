@@ -90,13 +90,14 @@ fun SessionRowItem(
     Row(
         modifier = modifier
             .fillMaxWidth()
+            // 48 dp target, 40 dp painted band: the density the owner asked
+            // for, without a target the sweep would reject (round 10, R3).
+            // The click and the semantics stay on the full 48 dp node; only
+            // the painted band is 40 dp, inset by the vertical padding *after*
+            // the clickable. Putting the padding first measured the target at
+            // 40 dp, which is exactly what the sweep exists to catch
+            // (round 10, R3).
             .heightIn(min = ForgeSize.touch)
-            .clip(ForgeShapes.row)
-            .border(
-                ForgeSize.hairline,
-                if (selected) colors.accent else Color.Transparent,
-                ForgeShapes.row,
-            )
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .semantics(mergeDescendants = true) {
                 contentDescription = spoken
@@ -104,13 +105,26 @@ fun SessionRowItem(
                 this.selected = selected
                 customActions = actions
             }
-            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.sm),
+            .padding(vertical = ForgeSpace.xs)
+            .heightIn(min = ForgeSize.rowVisual)
+            .clip(ForgeShapes.cardTight)
+            .border(
+                ForgeSize.hairline,
+                if (selected) colors.accent else Color.Transparent,
+                ForgeShapes.cardTight,
+            )
+            .padding(horizontal = ForgeSpace.lg),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         SessionGlyph(
+            // Model first, provider as the fallback: a session on
+            // claude-opus-4-5 shows Anthropic's mark even when the roster row
+            // never named a provider (addition H5).
+            model = row.model,
             provider = row.provider,
             state = row.state,
             animate = SessionVisualStateFold.animates(row.state) && motionEnabled(),
+            ringAgainst = colors.surface,
         )
         Text(
             displayTitle(row),
@@ -118,7 +132,7 @@ fun SessionRowItem(
             color = if (selected) colors.text else colors.chatText,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(start = ForgeSpace.lg),
+            modifier = Modifier.padding(start = ForgeSpace.md),
         )
     }
 }

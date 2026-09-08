@@ -3,6 +3,8 @@ package ai.diffforge.haider.ui.start
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.state.PermissionSnapshot
+import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.state.SetupStep
 import ai.diffforge.haider.ui.state.SetupStepId
 import ai.diffforge.haider.ui.theme.Forge
@@ -53,12 +55,20 @@ fun SetupStepRow(
     index: Int,
     doneDetail: String?,
     onAction: () -> Unit,
+    permissions: PermissionSnapshot = PermissionSnapshot(),
+    notificationsGranted: Boolean = false,
+    onGrant: (AutonomyGrant) -> Unit = {},
 ) {
     val colors = Forge.colors
     val type = Forge.type
     // Re-keyed on `current`, so advancing a step opens the new one without
     // slamming shut a row the user opened deliberately.
-    var expanded by remember(step.current) { mutableStateOf(step.current) }
+    // Keyed on `done` as well: a step that goes green while another one is
+    // current must re-evaluate, or its rows stay collapsed forever
+    // (verify-8 O2).
+    var expanded by remember(step.current, step.done) {
+        mutableStateOf(step.current || (step.done && step.id == SetupStepId.Autonomy))
+    }
     val statusLine = when {
         step.done -> doneDetail ?: stringResource(R.string.setup_status_done)
         step.current -> stringResource(R.string.setup_status_now)
@@ -93,13 +103,33 @@ fun SetupStepRow(
                 style = type.sessionMeta,
                 color = if (step.done) colors.green else colors.textMuted,
             )
-            if (expanded && !step.done) {
-                Text(stringResource(bodyRes(step.id)), style = type.sessionMeta, color = colors.textMuted)
-                ForgeButton(
-                    text = stringResource(actionRes(step.id)),
-                    onClick = onAction,
-                    kind = ForgeButtonKind.Filled,
-                )
+            // The autonomy rows are the *only* place three of the four grants
+            // can be reached, so they survive the step going green: granting
+            // notifications used to mark it done and take SMS, accessibility
+            // and capture away with it (verify-8 O2).
+            val keepsRows = step.id == SetupStepId.Autonomy
+            if (expanded && (!step.done || keepsRows)) {
+                if (!step.done) {
+                    Text(
+                        stringResource(bodyRes(step.id)),
+                        style = type.sessionMeta,
+                        color = colors.textMuted,
+                    )
+                }
+                if (keepsRows) {
+                    AutonomyRows(
+                        permissions = permissions,
+                        notificationsGranted = notificationsGranted,
+                        onGrant = onGrant,
+                    )
+                }
+                if (!step.done) {
+                    ForgeButton(
+                        text = stringResource(actionRes(step.id)),
+                        onClick = onAction,
+                        kind = ForgeButtonKind.Filled,
+                    )
+                }
             }
         }
     }
@@ -150,21 +180,103 @@ private fun Marker(step: SetupStep, index: Int) {
 
 fun titleRes(id: SetupStepId): Int = when (id) {
     SetupStepId.RunService -> R.string.step_service_title
-    SetupStepId.Notifications -> R.string.step_notify_title
+    SetupStepId.Autonomy -> R.string.step_autonomy_title
     SetupStepId.Battery -> R.string.step_battery_title
     SetupStepId.Model -> R.string.step_model_title
 }
 
 fun bodyRes(id: SetupStepId): Int = when (id) {
     SetupStepId.RunService -> R.string.step_service_body
-    SetupStepId.Notifications -> R.string.step_notify_body
+    SetupStepId.Autonomy -> R.string.step_autonomy_body
     SetupStepId.Battery -> R.string.step_battery_body
     SetupStepId.Model -> R.string.step_model_body
 }
 
 fun actionRes(id: SetupStepId): Int = when (id) {
     SetupStepId.RunService -> R.string.step_service_action
-    SetupStepId.Notifications -> R.string.step_notify_action
+    SetupStepId.Autonomy -> R.string.step_autonomy_action
     SetupStepId.Battery -> R.string.step_battery_action
     SetupStepId.Model -> R.string.step_model_action
+}
+
+/** Which one-time popup a row asks for. */
+enum class AutonomyGrant { Notifications, Sms, Accessibility, ScreenCapture }
+
+@Composable
+private fun AutonomyRows(
+    permissions: PermissionSnapshot,
+    notificationsGranted: Boolean,
+    onGrant: (AutonomyGrant) -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+        AutonomyGrant.entries.forEach { grant ->
+            val standing = when (grant) {
+                AutonomyGrant.Notifications -> if (notificationsGranted) {
+                    PermissionStanding.Granted
+                } else {
+                    PermissionStanding.NotGranted
+                }
+                AutonomyGrant.Sms -> permissions.sms
+                AutonomyGrant.Accessibility -> permissions.accessibility
+                AutonomyGrant.ScreenCapture -> permissions.screenCapture
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = ForgeSize.touch),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        stringResource(
+                            when (grant) {
+                                AutonomyGrant.Notifications -> R.string.autonomy_row_notifications
+                                AutonomyGrant.Sms -> R.string.autonomy_row_sms
+                                AutonomyGrant.Accessibility -> R.string.autonomy_row_accessibility
+                                AutonomyGrant.ScreenCapture -> R.string.autonomy_row_capture
+                            },
+                        ),
+                        style = type.sessionTitle,
+                        color = colors.text,
+                    )
+                    Text(
+                        stringResource(
+                            when (grant) {
+                                AutonomyGrant.Notifications ->
+                                    R.string.autonomy_row_notifications_why
+                                AutonomyGrant.Sms -> R.string.autonomy_row_sms_why
+                                AutonomyGrant.Accessibility ->
+                                    R.string.autonomy_row_accessibility_why
+                                AutonomyGrant.ScreenCapture -> R.string.autonomy_row_capture_why
+                            },
+                        ),
+                        style = type.sessionMeta,
+                        color = colors.textMuted,
+                    )
+                    if (standing == PermissionStanding.Granted) {
+                        Text(
+                            stringResource(R.string.permission_granted),
+                            style = type.sessionMeta,
+                            color = colors.green,
+                        )
+                    }
+                }
+                if (standing != PermissionStanding.Granted) {
+                    ForgeButton(
+                        text = stringResource(
+                            if (grant == AutonomyGrant.Accessibility) {
+                                R.string.autonomy_action_open
+                            } else {
+                                R.string.autonomy_action_allow
+                            },
+                        ),
+                        onClick = { onGrant(grant) },
+                        kind = ForgeButtonKind.Ghost,
+                    )
+                }
+            }
+        }
+    }
 }
