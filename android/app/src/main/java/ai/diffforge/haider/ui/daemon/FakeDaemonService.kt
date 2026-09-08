@@ -115,14 +115,75 @@ class FakeDaemonService(
      */
     private fun applyAutoPolicy() {
         if (_permissionMode.value != PermissionMode.Auto) return
+        val resolved = mutableListOf<String>()
         _sessions.value = _sessions.value.map { row ->
             val pending = row.needsInput
             if (pending != null && CapabilityApproval.isDeviceCapabilityApproval(pending)) {
                 calls += "tool.policy.auto_resolved:${row.id}"
+                resolved += row.id
                 row.copy(
                     needsInput = null,
                     state = SessionVisualState.Running,
                     runState = "running",
+                )
+            } else {
+                row
+            }
+        }
+        // Running is not a resting state. Round 10 cleared the card, set
+        // Running and stopped there, so an Auto session sat "running" forever
+        // with nothing to show for it (verify-9 V2). The allowed call runs and
+        // the turn reaches a terminal snapshot, which is what the device check
+        // "Auto SMS-read turn completes with no card" observes.
+        resolved.forEach(::completeAutoTurn)
+    }
+
+    /**
+     * Finish the turn the policy just allowed: the tool result lands in the
+     * transcript, the assistant's line stops streaming, and the row goes Idle
+     * with no run id.
+     */
+    private fun completeAutoTurn(sessionId: String) {
+        transcripts.getOrPut(sessionId) { mutableListOf() }.let { messages ->
+            val index = messages.indexOfLast { it.streaming }
+            if (index >= 0) {
+                messages[index] = messages[index].copy(
+                    streaming = false,
+                    tools = messages[index].tools.map { tool ->
+                        if (tool.status == ToolStatus.Running) {
+                            tool.copy(status = ToolStatus.Completed, durationMs = 1_200L)
+                        } else {
+                            tool
+                        }
+                    },
+                )
+            } else {
+                messages += Message(
+                    id = nextMessageId++,
+                    role = Role.Agent,
+                    text = "Read your recent texts.",
+                    provider = "anthropic",
+                    tools = listOf(
+                        ToolCall(
+                            callId = "call-auto-$sessionId",
+                            name = "sms",
+                            summary = "sms.list",
+                            status = ToolStatus.Completed,
+                            result = null,
+                            durationMs = 1_200L,
+                        ),
+                    ),
+                )
+            }
+        }
+        _sessions.value = _sessions.value.map { row ->
+            if (row.id == sessionId) {
+                calls += "tool.policy.auto_completed:$sessionId"
+                row.copy(
+                    runId = null,
+                    state = SessionVisualState.Idle,
+                    runState = "idle",
+                    needsInput = null,
                 )
             } else {
                 row

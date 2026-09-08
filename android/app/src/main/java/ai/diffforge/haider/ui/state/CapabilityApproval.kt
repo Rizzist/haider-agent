@@ -23,21 +23,35 @@ import ai.diffforge.haider.ui.daemon.NeedsInput
 object CapabilityApproval {
 
     /**
-     * The device tools C4 exposes, minus `sms.send`.
+     * The exact tool names standing consent covers.
      *
-     * The owner asked for reading texts to be automated. Sending one is a
-     * message from the user to another person, and standing consent for that
-     * is not what "read my SMS without asking" meant.
+     * Exact, not substrings. Round 10 asked "does the text contain any covered
+     * name", so "Allow sms.send after reading sms.list?" matched `sms.list` and
+     * Auto consumed an approval that included sending a text to a person
+     * (verify-9 V1). `sms.send` is not here, and neither is anything the
+     * contract does not name.
      */
-    private val DEVICE_TOOLS = listOf(
+    private val COVERED = setOf(
         "sms.list",
         "sms.incoming",
         "screen.capture",
-        "screen.",
-        "a11y.",
-        "accessibility",
+        "a11y.tree",
+        "a11y.tap",
+        "a11y.type",
+        "a11y.swipe",
+        "a11y.back",
+        "a11y.home",
         "app.open",
     )
+
+    /**
+     * A dotted tool name as the daemon writes it.
+     *
+     * Anything that looks like one and is not in [COVERED] — `sms.send`, a
+     * name from a newer daemon, even a version string — leaves the card up.
+     * The failure direction is "ask", every time.
+     */
+    private val TOOL_TOKEN = Regex("""\b[a-z0-9_]+\.[a-z0-9_]+\b""")
 
     private val NEVER_SUPPRESSED_KINDS = setOf(
         "question",
@@ -51,15 +65,25 @@ object CapabilityApproval {
         "file",
     )
 
+    /** Every capability the card actually names. */
+    fun requestedCapabilities(needsInput: NeedsInput): Set<String> =
+        TOOL_TOKEN.findAll(
+            (listOf(needsInput.title) + needsInput.safeBody).joinToString(" ").lowercase(),
+        ).map { it.value }.toSet()
+
+    /**
+     * True only when the card names at least one capability and **every** one
+     * it names is covered.
+     */
     fun isDeviceCapabilityApproval(needsInput: NeedsInput): Boolean {
         if (needsInput.secretAnswer) return false
         val kind = needsInput.kind.lowercase()
         if (kind in NEVER_SUPPRESSED_KINDS) return false
         if (kind != "permission" && kind != "approval") return false
-        val text = (listOf(needsInput.title) + needsInput.safeBody)
-            .joinToString(" ")
-            .lowercase()
-        return DEVICE_TOOLS.any { text.contains(it) }
+        val requested = requestedCapabilities(needsInput)
+        // Named nothing recognisable: a person decides.
+        if (requested.isEmpty()) return false
+        return requested.all { it in COVERED }
     }
 
     /** What the surface should render, given the standing mode. */

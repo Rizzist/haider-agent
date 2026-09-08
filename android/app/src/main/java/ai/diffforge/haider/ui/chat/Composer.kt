@@ -48,6 +48,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -77,6 +78,12 @@ import androidx.compose.ui.text.style.TextOverflow
  * **disabled** with a description that says why — a control that pretends to
  * listen would be worse than one that admits it cannot.
  */
+/** The text area inside the field, excluding the controls beside it. */
+const val COMPOSER_TEXT_TAG = "composer_text"
+
+/** The painted pill inside a select's 48 dp target. */
+const val SELECT_INK_TAG = "select_ink"
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun Composer(
@@ -190,7 +197,8 @@ fun Composer(
                         Box(
                             modifier = Modifier
                                 .weight(1f)
-                                .padding(horizontal = ForgeSpace.sm),
+                                .padding(horizontal = ForgeSpace.sm)
+                                .testTag(COMPOSER_TEXT_TAG),
                         ) {
                             if (text.isEmpty()) {
                                 Text(
@@ -203,48 +211,45 @@ fun Composer(
                             }
                             inner()
                         }
+                        // Laid out *after* the text, not over it. Round 10
+                        // overlaid these on a full-width field, so a long line
+                        // ran underneath the mic and the send circle
+                        // (verify-9 V3).
+                        CircleControl(
+                            onClick = {},
+                            contentDescription = stringResource(R.string.cd_voice_unavailable),
+                            enabled = false,
+                        ) {
+                            Icon(
+                                Icons.Rounded.Mic,
+                                contentDescription = null,
+                                tint = colors.textMuted,
+                                modifier = Modifier.size(ForgeSize.iconSm),
+                            )
+                        }
+                        if (composer.showStop) {
+                            // Stop replaces send while a turn runs, and there
+                            // is still exactly one of it (addition E2).
+                            CircleControl(
+                                onClick = onStop,
+                                contentDescription = stringResource(R.string.cd_stop_turn),
+                                enabled = true,
+                                fill = colors.red.copy(alpha = 0.16f),
+                                outline = colors.red.copy(alpha = 0.45f),
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Stop,
+                                    contentDescription = null,
+                                    tint = colors.red,
+                                    modifier = Modifier.size(ForgeSize.iconSm),
+                                )
+                            }
+                        } else {
+                            SendCircle(composer = composer, onSend = onSend)
+                        }
                     }
                 },
             )
-            Row(
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = ForgeSpace.xs),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                CircleControl(
-                    onClick = {},
-                    contentDescription = stringResource(R.string.cd_voice_unavailable),
-                    enabled = false,
-                ) {
-                    Icon(
-                        Icons.Rounded.Mic,
-                        contentDescription = null,
-                        tint = colors.textMuted,
-                        modifier = Modifier.size(ForgeSize.iconSm),
-                    )
-                }
-                if (composer.showStop) {
-                    // Stop replaces send while a turn runs, and there is still
-                    // exactly one of it in the app (addition E2).
-                    CircleControl(
-                        onClick = onStop,
-                        contentDescription = stringResource(R.string.cd_stop_turn),
-                        enabled = true,
-                        fill = colors.red.copy(alpha = 0.16f),
-                        outline = colors.red.copy(alpha = 0.45f),
-                    ) {
-                        Icon(
-                            Icons.Rounded.Stop,
-                            contentDescription = null,
-                            tint = colors.red,
-                            modifier = Modifier.size(ForgeSize.iconSm),
-                        )
-                    }
-                } else {
-                    SendCircle(composer = composer, onSend = onSend)
-                }
-            }
         }
 
         // Only the disconnected / error line G5 allows.
@@ -291,6 +296,7 @@ private fun LabelledSelect(
         Row(
             modifier = Modifier
                 .height(ForgeSize.chip)
+                .testTag(SELECT_INK_TAG)
                 .clip(ForgeShapes.pill)
                 .background(colors.surfaceControl)
                 .border(ForgeSize.hairline, colors.border, ForgeShapes.pill)
