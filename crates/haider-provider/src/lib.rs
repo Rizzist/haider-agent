@@ -25,6 +25,8 @@ mod effort;
 #[cfg(test)]
 mod effort_tests;
 mod gemini;
+mod idle;
+pub use idle::{ProviderIdleDeadline, ProviderIdleTimeout};
 #[cfg(test)]
 mod gemini_tests;
 mod oauth_identity;
@@ -315,6 +317,7 @@ impl RouteGating {
 pub(crate) struct SseRequestContext {
     pub(crate) route_gating: RouteGating,
     pub(crate) turn_trace: Option<(TurnTraceContext, u64)>,
+    pub(crate) idle_deadline: Option<ProviderIdleDeadline>,
 }
 
 impl SseRequestContext {
@@ -326,6 +329,7 @@ impl SseRequestContext {
         Self {
             route_gating,
             turn_trace,
+            idle_deadline: ProviderIdleDeadline::current(),
         }
     }
 
@@ -2546,6 +2550,8 @@ pub(crate) async fn scope_prepared_wire<T>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderTimeoutReason {
+    /// No bytes or frames within the logical operation budget, across retries.
+    IdleTimeout,
     DeadlineExhausted,
     /// Request execution began, but response headers did not open within the
     /// provider's configured transport budget.
@@ -2628,6 +2634,8 @@ pub struct ProviderError {
     /// carrying the new reason retains every pre-v0.0.964 field prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_reason: Option<ProviderTimeoutReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<ProviderIdleTimeout>,
 }
 
 impl ProviderError {
@@ -2649,6 +2657,7 @@ impl ProviderError {
             budget_ms: None,
             presentation,
             timeout_reason: None,
+            idle_timeout: None,
         }
     }
 
@@ -3134,6 +3143,18 @@ impl Drop for ProviderStream {
 /// Asynchronous provider adapter contract.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Whole logical request idle budget, including transport retries/backoff.
+    /// Adapters without a configured idle policy retain their existing behavior.
+    fn idle_timeout(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Native adapters report received bytes before decoding and buffering.
+    /// Injected providers otherwise use received stream frames as progress.
+    fn reports_raw_progress(&self) -> bool {
+        false
+    }
+
     /// Whether a confirmed missing OS default route is authoritative for this
     /// adapter's current endpoint. Custom/local providers override this to
     /// false because they may remain healthy on loopback, LAN, or host-file

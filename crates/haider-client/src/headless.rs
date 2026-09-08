@@ -5091,6 +5091,9 @@ fn terminal_kind(
         HeadlessOutcome::Timeout => HeadlessTerminalKind::Timeout,
         HeadlessOutcome::Errored | HeadlessOutcome::InputRequired | HeadlessOutcome::Started => {
             match failure.map(|failure| &failure.code) {
+                Some(HeadlessFailureCode::Run(ErrorCode::IdleTimeout)) => {
+                    HeadlessTerminalKind::Timeout
+                }
                 Some(HeadlessFailureCode::Run(ErrorCode::BudgetExhausted)) => {
                     HeadlessTerminalKind::Budget
                 }

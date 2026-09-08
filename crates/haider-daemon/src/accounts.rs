@@ -9864,6 +9864,14 @@ impl std::fmt::Debug for IdentityAnnotatedProvider {
 
 #[async_trait::async_trait]
 impl Provider for IdentityAnnotatedProvider {
+    fn idle_timeout(&self) -> Option<std::time::Duration> {
+        self.inner.idle_timeout()
+    }
+
+    fn reports_raw_progress(&self) -> bool {
+        self.inner.reports_raw_progress()
+    }
+
     fn request_metadata_body_support(&self) -> haider_provider::RequestMetadataBodySupport {
         self.inner.request_metadata_body_support()
     }
