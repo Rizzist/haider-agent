@@ -83,9 +83,12 @@ class SessionDrawerTest {
     }
 
     @Test
-    fun `the drawer is a daemon line, a compose row, the list and Settings`() {
+    fun `the drawer head is one row, then the list and Settings`() {
         openDrawer()
-        assertTrue(rule.onAllNodesWithTextSafe("New chat") > 0)
+        // Round 10 merges the daemon line, New chat and the collapse chevron
+        // into a single row: New chat is an icon square now, so it is named by
+        // its description rather than a full-width label.
+        rule.onNodeWithContentDescription("New chat").assertIsDisplayed()
         rule.onNodeWithText("Running in background").assertIsDisplayed()
         assertTrue(rule.onAllNodesWithTextSafe("Settings") > 0)
         // Addition F: the identity block, the Model row and the Appearance row

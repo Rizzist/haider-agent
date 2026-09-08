@@ -81,6 +81,7 @@ fun SettingsScreen(
     onRestartDaemon: () -> Unit,
     onOpenAccessibility: () -> Unit,
     onGrantSms: () -> Unit,
+    onRequestScreenCapture: () -> Unit,
     onRequestNotifications: () -> Unit,
     onOpenBattery: () -> Unit,
     modifier: Modifier = Modifier,
@@ -244,7 +245,7 @@ fun SettingsScreen(
                         PermissionDetail.Sms -> onGrantSms()
                         PermissionDetail.Notifications -> onRequestNotifications()
                         PermissionDetail.Battery -> onOpenBattery()
-                        PermissionDetail.ScreenCapture -> Unit
+                        PermissionDetail.ScreenCapture -> onRequestScreenCapture()
                     }
                     detail = null
                 },
@@ -322,7 +323,10 @@ private fun PermissionDetailSheet(
         PermissionDetail.ScreenCapture -> Triple(
             R.string.settings_permission_screen,
             R.string.settings_permission_screen_body,
-            null,
+            // Android issues this per projection, so there is always something
+            // to do here — round 9 left the sheet with no action at all
+            // (verify-8 O2).
+            R.string.settings_permission_screen_action,
         )
         PermissionDetail.Sms -> Triple(
             R.string.settings_permission_sms,

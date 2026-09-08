@@ -213,6 +213,7 @@
     <string name="permission_not_granted">Not granted</string>
     <string name="permission_ask_each_time">Ask each time</string>
     <string name="permission_unknown">Not checked yet</string>
+    <string name="settings_permission_screen_action">Allow screen capture</string>
     <string name="setup_status_done">Done</string>
     <string name="setup_status_now">Now</string>
     <string name="setup_status_pending">Not yet</string>
@@ -267,7 +268,8 @@
     <string name="accounts_set_active">Use this account</string>
     <string name="accounts_unavailable">%1$s is unavailable — %2$s</string>
     <string name="accounts_key_never_leaves">The key is stored in the on-device vault. It is never written to a log or a transcript.</string>
-    <string name="accounts_key_staged">Validated and held in the vault. Save to finish, or Cancel to discard it.</string>
+    <string name="accounts_key_staged">Held in the vault, not checked yet. Save to sign in, or Cancel to discard it.</string>
+    <string name="accounts_key_signing_in">Signing in…</string>
 
     <!-- Content descriptions -->
     <string name="cd_open_sessions">Open sessions</string>

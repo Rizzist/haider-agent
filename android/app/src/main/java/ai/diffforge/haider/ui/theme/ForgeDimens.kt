@@ -31,27 +31,48 @@ object ForgeSize {
     val control = 44.dp
     val icon = 22.dp
     val iconMd = 20.dp
-    val iconSm = 18.dp
-    val avatar = 22.dp
+    val iconSm = 16.dp
+    /** Chevrons and other secondary marks (round 10, R1/R2). */
+    val iconXs = 14.dp
+    val avatar = 18.dp
 
     /** Session-row state rail. */
     val rail = 3.dp
     val hairline = 1.dp
-    /** The slim control row (addition H1); was a 56 dp two-line block. */
-    val header = 52.dp
-    /** A header control's visual: 40 dp inside a 48 dp target. */
-    val headerControl = 40.dp
-    /** A segment's painted height inside the header's pill toggle. */
-    val headerSegment = 32.dp
+    /** The slim control row (H1), tightened to the target height (round 10). */
+    val header = 48.dp
+    /** Below this the header state pill drops its word and keeps its mark. */
+    val statePillWordMin = 380.dp
+    /**
+     * A header control's painted size: 32 dp inside a 48 dp target.
+     *
+     * The owner's note was that the controls read too big. They do not get
+     * smaller *targets* — `minimumInteractiveComponentSize` grows a touch
+     * delegate the sweep cannot see — so the ink shrinks and the 48 dp
+     * clickable box stays (round 10, R1).
+     */
+    val headerControl = 32.dp
+    /** A segment's painted height inside the header's pill (reference 26 px). */
+    val headerSegment = 26.dp
     /** The reference empty-state icon tile (dashboard.js:39192 — 44 px). */
     val emptyTile = 44.dp
-    /** The reference composer field (dashboard.js:40056 — min 52 px). */
-    val composerField = 52.dp
-    /** The send / mic circles inside the field (dashboard.js:40094 — 34 px). */
-    val composerCircle = 34.dp
+    /** The composer field. 52 px is a desktop measure; 48 dp reads right here. */
+    val composerField = 48.dp
+    /** The attach / mic / send circles inside the field (round 10, R2). */
+    val composerCircle = 32.dp
     val drawerWidth = 322.dp
     val drawerInset = 56.dp
     val rowMin = 64.dp
+    /** A drawer session row's painted band inside its 48 dp target (R3). */
+    val rowVisual = 40.dp
+    /** The merged daemon + New chat row's ink (R3). */
+    val drawerRow = 44.dp
+    /** The drawer search field's ink (R3). */
+    val searchField = 40.dp
+    /** A tool row's painted height (R4). */
+    val toolRowHeight = 36.dp
+    /** The cross-session strip's ink (R4). */
+    val stripVisual = 40.dp
     val rowMinThreeLine = 82.dp
     val composerMin = 56.dp
     val contextRow = 32.dp
@@ -63,11 +84,11 @@ object ForgeSize {
     val activityDot = 5.dp
     /** The 24x24 viewport every ported vendor mark is drawn on. */
     val markViewport = 24.dp
-    /** Chip visual height. 36 dp inside a 48 dp target (addition F, S5). */
-    val chip = 36.dp
+    /** Chip and composer-select ink: 30 dp inside a 48 dp target (R2). */
+    val chip = 30.dp
     val segmented = 36.dp
     val bannerAction = 34.dp
-    val footerRow = 52.dp
+    val footerRow = 48.dp
     val newSessionRow = 46.dp
     val actionButton = 44.dp
     val stopChip = 28.dp

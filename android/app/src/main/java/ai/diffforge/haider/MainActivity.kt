@@ -14,6 +14,7 @@ import ai.diffforge.haider.ui.scaffold.SharedPreferencesBannerDismissals
 import ai.diffforge.haider.ui.scaffold.SystemAction
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.service.HaiderAccessibilityService
+import ai.diffforge.haider.transport.CapabilityBus
 import ai.diffforge.haider.service.ScreenConsentActivity
 import ai.diffforge.haider.ui.state.PermissionSnapshot
 import ai.diffforge.haider.ui.state.PermissionStanding
@@ -139,7 +140,14 @@ class MainActivity : ComponentActivity() {
         } else {
             PermissionStanding.NotGranted
         },
-        screenCapture = PermissionStanding.AskEachTime,
+        // The capture service publishes "screenCapture" on the bus while a
+        // projection is live. Reporting AskEachTime regardless made Settings
+        // claim consent was needed during an active projection (verify-8 O2).
+        screenCapture = if (CapabilityBus.granted.value.contains("screenCapture")) {
+            PermissionStanding.Granted
+        } else {
+            PermissionStanding.AskEachTime
+        },
         sms = if (
             ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_SMS) ==
             PackageManager.PERMISSION_GRANTED &&

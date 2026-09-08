@@ -20,6 +20,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -84,7 +85,14 @@ fun HaiderTopBar(
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
-    Column(modifier.testTag(HAIDER_TOP_BAR_TAG)) {
+    BoxWithConstraints(modifier.testTag(HAIDER_TOP_BAR_TAG)) {
+        // Below ~380 dp the five controls plus a word do not fit without
+        // ellipsising the word to "Runn…", which says less than the mark and
+        // its badge already do. The state stays in the pill's
+        // contentDescription either way, so nothing is lost to a screen
+        // reader (round 10, R1/verify-8 O3).
+        val showStateWord = maxWidth >= ForgeSize.statePillWordMin
+        Column {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -94,10 +102,11 @@ fun HaiderTopBar(
             horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
         ) {
             Box {
-                HeaderSquareButton(
+                HeaderCircleButton(
                     icon = Icons.Rounded.Menu,
                     contentDescription = drawerDescription(state),
                     onClick = onOpenDrawer,
+                    outlined = false,
                 )
                 val badge = badgeColor(state)
                 if (badge != null) {
@@ -110,25 +119,40 @@ fun HaiderTopBar(
                 }
             }
 
-            Box(Modifier.weight(1f))
-
-            ViewToggle(
-                tab = state.viewTab,
-                onSelect = onSelectTab,
-            )
-            StatePill(state = state, session = state.activeSession)
-            HeaderCircleButton(
-                icon = Icons.Rounded.Refresh,
-                contentDescription = stringResource(R.string.cd_refresh_session),
-                onClick = onRefresh,
-            )
-            HeaderCircleButton(
-                icon = if (dark) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
-                contentDescription = stringResource(
-                    if (dark) R.string.cd_use_light_theme else R.string.cd_use_dark_theme,
-                ),
-                onClick = onToggleTheme,
-            )
+            // The right cluster owns the slack, and inside it the pill is the
+            // *only* weighted child: it gets exactly what is left after the
+            // toggle and the two circles have their 48 dp, and no more.
+            // Unconstrained it squeezed the theme button to 28 dp at 360 dp
+            // (verify-8 O3); constrained against a second weighted sibling it
+            // split the row in half and ellipsised "Running" to "R…".
+            Row(
+                modifier = Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ViewToggle(
+                    tab = state.viewTab,
+                    onSelect = onSelectTab,
+                )
+                StatePill(
+                    state = state,
+                    session = state.activeSession,
+                    showWord = showStateWord,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                HeaderCircleButton(
+                    icon = Icons.Rounded.Refresh,
+                    contentDescription = stringResource(R.string.cd_refresh_session),
+                    onClick = onRefresh,
+                )
+                HeaderCircleButton(
+                    icon = if (dark) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
+                    contentDescription = stringResource(
+                        if (dark) R.string.cd_use_light_theme else R.string.cd_use_dark_theme,
+                    ),
+                    onClick = onToggleTheme,
+                )
+            }
         }
         Box(
             Modifier
@@ -136,59 +160,25 @@ fun HaiderTopBar(
                 .height(ForgeSize.hairline)
                 .background(colors.border),
         )
-    }
-}
-
-/** 40 dp rounded-8 hairline square, in a 48 dp target. */
-@Composable
-private fun HeaderSquareButton(
-    icon: ImageVector,
-    contentDescription: String,
-    onClick: () -> Unit,
-) {
-    val colors = Forge.colors
-    Box(
-        modifier = Modifier
-            .size(ForgeSize.touch)
-            .clickable(onClick = onClick)
-            .semantics {
-                this.contentDescription = contentDescription
-                this.role = Role.Button
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        Box(
-            Modifier
-                .size(ForgeSize.headerControl)
-                .clip(ForgeShapes.cardTight)
-                .background(colors.surface)
-                .border(ForgeSize.hairline, colors.borderStrong, ForgeShapes.cardTight),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                icon,
-                contentDescription = null,
-                tint = colors.textSoft,
-                modifier = Modifier.size(ForgeSize.iconMd),
-            )
         }
     }
 }
 
-/** The reference's 30 px header circle, at 40 dp in a 48 dp target. */
+/** The reference's 30 px header circle, at 32 dp in a 48 dp target. */
 @Composable
 private fun HeaderCircleButton(
     icon: ImageVector,
     contentDescription: String,
     onClick: () -> Unit,
+    outlined: Boolean = true,
 ) {
     val colors = Forge.colors
     ForgeIconButton(
         onClick = onClick,
         contentDescription = contentDescription,
-        background = colors.surface,
+        background = if (outlined) colors.surface else Color.Transparent,
         visual = ForgeSize.headerControl,
-        border = colors.borderStrong,
+        border = if (outlined) colors.borderStrong else null,
     ) {
         Icon(
             icon,
@@ -289,14 +279,20 @@ private fun ViewToggle(tab: SessionViewTab, onSelect: (SessionViewTab) -> Unit) 
  * in a word as well as a colour.
  */
 @Composable
-private fun StatePill(state: AppUiState, session: SessionRow?) {
+private fun StatePill(
+    state: AppUiState,
+    session: SessionRow?,
+    showWord: Boolean,
+    modifier: Modifier = Modifier,
+) {
     val colors = Forge.colors
     val type = Forge.type
     val (label, tone) = when {
         state.daemon is DaemonStatus.Failed -> stringResource(R.string.state_pill_error) to colors.red
         state.daemon !is DaemonStatus.Running ->
             stringResource(R.string.state_pill_offline) to colors.textMuted
-        session == null -> stringResource(R.string.state_pill_idle) to colors.textMuted
+        // Idle is "ready", and the reference tones ready green.
+        session == null -> stringResource(R.string.state_pill_idle) to colors.green
         else -> when (session.state) {
             SessionVisualState.Running ->
                 stringResource(R.string.state_pill_running) to colors.stateRunning
@@ -306,11 +302,11 @@ private fun StatePill(state: AppUiState, session: SessionRow?) {
                 stringResource(R.string.state_pill_error) to colors.stateErrored
             SessionVisualState.WaitingForNetwork ->
                 stringResource(R.string.state_pill_waiting) to colors.amber
-            else -> stringResource(R.string.state_pill_idle) to colors.textMuted
+            else -> stringResource(R.string.state_pill_idle) to colors.green
         }
     }
     Row(
-        modifier = Modifier
+        modifier = modifier
             .height(ForgeSize.headerControl)
             .clip(ForgeShapes.pill)
             .background(colors.surface)
@@ -328,13 +324,16 @@ private fun StatePill(state: AppUiState, session: SessionRow?) {
             animate = session?.state == SessionVisualState.Running && motionEnabled(),
             ringAgainst = colors.surface,
         )
-        Text(
-            label,
-            style = type.chip,
-            color = tone,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        if (showWord) {
+            Text(
+                label,
+                style = type.chip,
+                color = tone,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+        }
     }
 }
 

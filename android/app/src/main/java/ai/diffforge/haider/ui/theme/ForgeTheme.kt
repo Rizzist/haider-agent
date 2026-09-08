@@ -96,7 +96,7 @@ val ForgeDark = ForgeColors(
     accentInk = Color(0xFF060B12),
     accentWash = Color(0x143B82F6), // selBg
     accentLine = Color(0x807DB0FF), // selBorder rgba(125,176,255,0.5)
-    focusRing = Color(0x947DB0FF), // rgba(125,176,255,0.58)
+    focusRing = Color(0x3D4FA3FF), // selRing rgba(79,163,255,0.24)
     scrim = Color(0xA8020304),
     link = Color(0xFF7DB0FF),
     amber = Color(0xFFDFA55A),
@@ -174,6 +174,10 @@ data class ForgeType(
     val banner: TextStyle,
     val numeric: TextStyle,
     /** The letter inside a brand tile. */
+    /** The reference empty state's 16 sp / 860 line (dashboard.js:39178). */
+    val emptyTitle: TextStyle,
+    /** Its 13 sp muted sentence at line-height 1.6 (dashboard.js:39184). */
+    val emptyBody: TextStyle,
     val brandLetter: TextStyle,
     /** The tiny tracked label inside a composer select (dashboard.js:39694). */
     val selectLabel: TextStyle,
@@ -185,7 +189,7 @@ val ForgeTypography = ForgeType(
     thinking = TextStyle(fontFamily = FontFamily.Default, fontSize = 14.sp, lineHeight = 22.sp, fontWeight = FontWeight.Normal),
     toolRow = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp),
     toolStrong = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp, fontWeight = FontWeight.SemiBold),
-    chip = TextStyle(fontFamily = FontFamily.Default, fontSize = 11.sp, lineHeight = 14.sp, fontWeight = FontWeight.Medium),
+    chip = TextStyle(fontFamily = FontFamily.Default, fontSize = 12.sp, lineHeight = 15.sp, fontWeight = FontWeight.Medium),
     label = TextStyle(fontFamily = FontFamily.Default, fontSize = 10.sp, lineHeight = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.6.sp),
     h1 = TextStyle(fontFamily = FontFamily.Default, fontSize = 19.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold),
     h4 = TextStyle(fontFamily = FontFamily.Default, fontSize = 16.sp, lineHeight = 21.sp, fontWeight = FontWeight.SemiBold),
@@ -193,7 +197,7 @@ val ForgeTypography = ForgeType(
     sessionMeta = TextStyle(fontFamily = FontFamily.Default, fontSize = 12.sp, lineHeight = 16.sp, fontWeight = FontWeight.Normal),
     drawerSection = TextStyle(
         fontFamily = FontFamily.Default,
-        fontSize = 10.5.sp,
+        fontSize = 10.sp,
         lineHeight = 14.sp,
         fontWeight = FontWeight.Bold,
         letterSpacing = 0.9.sp,
@@ -206,6 +210,18 @@ val ForgeTypography = ForgeType(
         lineHeight = 16.sp,
         fontWeight = FontWeight.Medium,
     ),
+    emptyTitle = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontSize = 16.sp,
+        lineHeight = 21.sp,
+        fontWeight = FontWeight.ExtraBold,
+    ),
+    emptyBody = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontSize = 13.sp,
+        lineHeight = 21.sp,
+        fontWeight = FontWeight.Normal,
+    ),
     brandLetter = TextStyle(
         fontFamily = FontFamily.Default,
         fontSize = 9.sp,
@@ -214,7 +230,7 @@ val ForgeTypography = ForgeType(
     ),
     selectLabel = TextStyle(
         fontFamily = FontFamily.Default,
-        fontSize = 9.sp,
+        fontSize = 10.sp,
         lineHeight = 11.sp,
         fontWeight = FontWeight.Black,
         letterSpacing = 0.9.sp,

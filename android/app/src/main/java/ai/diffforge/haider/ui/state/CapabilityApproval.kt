@@ -22,10 +22,15 @@ import ai.diffforge.haider.ui.daemon.NeedsInput
  */
 object CapabilityApproval {
 
-    /** The device tools C4 exposes: `contracts-v1.md`, mobile capability table. */
+    /**
+     * The device tools C4 exposes, minus `sms.send`.
+     *
+     * The owner asked for reading texts to be automated. Sending one is a
+     * message from the user to another person, and standing consent for that
+     * is not what "read my SMS without asking" meant.
+     */
     private val DEVICE_TOOLS = listOf(
         "sms.list",
-        "sms.send",
         "sms.incoming",
         "screen.capture",
         "screen.",

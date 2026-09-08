@@ -6,6 +6,7 @@ import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.Skeleton
 import ai.diffforge.haider.ui.daemon.ProviderInventory
 import ai.diffforge.haider.ui.state.ModelNames
+import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.theme.Forge
@@ -19,6 +20,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -167,6 +170,11 @@ fun SessionPickerSheet(
                                 selected = model.id == currentModel && option.id == currentProvider,
                                 enabled = option.available,
                                 onClick = { submitted = true; onSelectModel(option.id, model.id) },
+                                // The mark belongs on the surface people
+                                // actually pick from (verify-8 O4).
+                                leading = {
+                                    BrandMarkOnly(model = model.id, provider = option.id)
+                                },
                             )
                         }
                     }
@@ -254,6 +262,7 @@ private fun PickerRow(
     selected: Boolean,
     enabled: Boolean,
     onClick: () -> Unit,
+    leading: (@Composable () -> Unit)? = null,
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -272,6 +281,10 @@ private fun PickerRow(
             },
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        leading?.let {
+            it()
+            Spacer(Modifier.width(ForgeSpace.md))
+        }
         Column(Modifier.weight(1f)) {
             Text(label, style = type.button, color = if (selected) colors.accent else colors.text)
             secondary?.let {

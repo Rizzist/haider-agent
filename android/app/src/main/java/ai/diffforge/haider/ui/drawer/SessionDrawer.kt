@@ -57,6 +57,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
@@ -158,16 +160,28 @@ fun SessionDrawer(
             .background(colors.surface)
             .padding(horizontal = ForgeSpace.lg),
     ) {
-        // The identity block is gone (addition F, D1), but the explicit
-        // collapse affordance it carried is not optional — swipe and scrim are
-        // gestures, and one of the two is invisible. It stays, alone.
+        // One row for both: the daemon's state on the left, New chat and the
+        // collapse chevron on the right. Round 9 spent three full rows here —
+        // a chevron alone, a status line, and a New chat row — which is the
+        // "not making good use of space" the owner meant (round 10, R3).
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = ForgeSize.touch),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
+            DaemonStatusRow(
+                status = state.daemon,
+                onStart = onStartDaemon,
+                onStop = onStopDaemon,
+                onOpenDetails = onOpenDaemonDetails,
+                modifier = Modifier.weight(1f),
+            )
+            NewSessionButton(onClick = onNewSession, onLongClick = onNewSessionWith)
             ForgeIconButton(
                 onClick = onClose,
                 contentDescription = stringResource(R.string.cd_close_sessions),
+                visual = ForgeSize.headerControl,
             ) {
                 Icon(
                     Icons.Rounded.ChevronLeft,
@@ -177,16 +191,6 @@ fun SessionDrawer(
                 )
             }
         }
-
-        DaemonStatusRow(
-            status = state.daemon,
-            onStart = onStartDaemon,
-            onStop = onStopDaemon,
-            onOpenDetails = onOpenDaemonDetails,
-            modifier = Modifier.padding(top = ForgeSpace.md),
-        )
-
-        NewSessionRow(onClick = onNewSession, onLongClick = onNewSessionWith)
 
         // Search replaces the filter chips: needs-input rows already float to
         // the top, so a filter for them was a second way to say the same thing
@@ -297,30 +301,27 @@ fun SessionDrawer(
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun NewSessionRow(onClick: () -> Unit, onLongClick: () -> Unit) {
+private fun NewSessionButton(onClick: () -> Unit, onLongClick: () -> Unit) {
     val colors = Forge.colors
-    val type = Forge.type
     val label = stringResource(R.string.drawer_new_chat)
     val withLabel = stringResource(R.string.drawer_new_session_with)
-    Row(
+    Box(
         modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = ForgeSize.touch)
-            .clip(ForgeShapes.row)
+            .size(ForgeSize.touch)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .semantics {
                 contentDescription = label
+                role = Role.Button
                 customActions = listOf(CustomAccessibilityAction(withLabel) { onLongClick(); true })
-            }
-            .padding(horizontal = ForgeSpace.lg),
-        verticalAlignment = Alignment.CenterVertically,
+            },
+        contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
-                .size(ForgeSize.avatar)
+                .size(ForgeSize.headerControl)
                 .clip(ForgeShapes.cardTight)
                 .background(colors.accentWash)
-                .border(ForgeSize.hairline, colors.accent.copy(alpha = 0.5f), ForgeShapes.cardTight),
+                .border(ForgeSize.hairline, colors.accentLine, ForgeShapes.cardTight),
             contentAlignment = Alignment.Center,
         ) {
             Icon(
@@ -330,12 +331,6 @@ private fun NewSessionRow(onClick: () -> Unit, onLongClick: () -> Unit) {
                 modifier = Modifier.size(ForgeSize.iconSm),
             )
         }
-        Text(
-            label,
-            style = type.sessionTitle,
-            color = colors.text,
-            modifier = Modifier.padding(start = ForgeSpace.lg),
-        )
     }
 }
 
@@ -346,12 +341,12 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = ForgeSpace.lg)
-            .heightIn(min = ForgeSize.touch)
+            .padding(vertical = ForgeSpace.xs)
+            .heightIn(min = ForgeSize.searchField)
             .clip(ForgeShapes.pill)
             .background(colors.surfaceControl)
             .border(ForgeSize.hairline, colors.border, ForgeShapes.pill)
-            .padding(horizontal = ForgeSpace.lg),
+            .padding(horizontal = ForgeSpace.md),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -368,11 +363,10 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
             cursorBrush = SolidColor(colors.accent),
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = ForgeSpace.md)
+                .padding(horizontal = ForgeSpace.sm)
                 .heightIn(min = ForgeSize.touch),
             decorationBox = { inner ->
-                // The field is 48 dp so it is a real target; its text still has
-                // to sit in the middle of that.
+                // The target is still 48 dp; only the painted pill is 40.
                 Box(
                     modifier = Modifier.height(ForgeSize.touch),
                     contentAlignment = Alignment.CenterStart,

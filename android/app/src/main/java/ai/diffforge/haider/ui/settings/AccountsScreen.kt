@@ -283,10 +283,14 @@ fun AccountsScreen(
                     )
                     Text(
                         stringResource(
-                            if (stagedHint) {
-                                R.string.accounts_key_staged
-                            } else {
-                                R.string.accounts_key_never_leaves
+                            when {
+                                // Staging is not validation and the commit has
+                                // not returned: saying "validated" while both
+                                // buttons are disabled was a claim about a call
+                                // still in flight (verify-8 O7).
+                                busy -> R.string.accounts_key_signing_in
+                                stagedHint -> R.string.accounts_key_staged
+                                else -> R.string.accounts_key_never_leaves
                             },
                         ),
                         style = type.sessionMeta,

@@ -69,7 +69,7 @@ fun DaemonStatusRow(
             .heightIn(min = ForgeSize.touch)
             .clip(ForgeShapes.row)
             .clickable(onClick = onOpenDetails)
-            .padding(horizontal = ForgeSpace.lg)
+            .padding(horizontal = ForgeSpace.md)
             .semantics { liveRegion = LiveRegionMode.Polite },
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -83,7 +83,7 @@ fun DaemonStatusRow(
         )
         Text(
             phrase(status),
-            style = type.sessionTitle,
+            style = type.chip,
             color = colors.text,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -95,6 +95,7 @@ fun DaemonStatusRow(
             is DaemonStatus.Running -> ForgeIconButton(
                 onClick = onStop,
                 contentDescription = stringResource(R.string.daemon_action_stop),
+                visual = ForgeSize.headerControl,
             ) {
                 Icon(
                     Icons.Rounded.Stop,
@@ -107,6 +108,7 @@ fun DaemonStatusRow(
                 onClick = onStart,
                 contentDescription = stringResource(R.string.daemon_action_start),
                 background = colors.accentWash,
+                visual = ForgeSize.headerControl,
             ) {
                 Icon(
                     Icons.Rounded.PlayArrow,

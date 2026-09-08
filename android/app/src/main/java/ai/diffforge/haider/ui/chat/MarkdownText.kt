@@ -109,8 +109,11 @@ internal fun MarkdownText(
                         showCaret && last,
                         caretAlpha,
                     ),
-                    // mono: a table only lines up in a fixed-width face.
-                    style = type.toolRow,
+                    // A table of prose is prose. Only a table whose cells are
+                    // code needs the fixed-width face, and this renderer
+                    // cannot tell, so the default is the ramp people read
+                    // (verify-8 O5).
+                    style = type.chatBody,
                     color = colors.chatText,
                     modifier = Modifier
                         .fillMaxWidth()

@@ -173,10 +173,24 @@ fun Composer(
                         modifier = Modifier.heightIn(min = ForgeSize.composerField),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        // Attach is on the left, where the owner asked for it,
+                        // and the text starts after it (round 10, R2).
+                        CircleControl(
+                            onClick = onAttach,
+                            contentDescription = stringResource(R.string.cd_attach),
+                            enabled = composer.inputEnabled,
+                        ) {
+                            Icon(
+                                Icons.Rounded.Attachment,
+                                contentDescription = null,
+                                tint = colors.textMuted,
+                                modifier = Modifier.size(ForgeSize.iconSm),
+                            )
+                        }
                         Box(
                             modifier = Modifier
                                 .weight(1f)
-                                .padding(start = ForgeSpace.xl, end = ForgeSpace.sm),
+                                .padding(horizontal = ForgeSpace.sm),
                         ) {
                             if (text.isEmpty()) {
                                 Text(
@@ -198,18 +212,6 @@ fun Composer(
                     .padding(end = ForgeSpace.xs),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                CircleControl(
-                    onClick = onAttach,
-                    contentDescription = stringResource(R.string.cd_attach),
-                    enabled = composer.inputEnabled,
-                ) {
-                    Icon(
-                        Icons.Rounded.Attachment,
-                        contentDescription = null,
-                        tint = colors.textMuted,
-                        modifier = Modifier.size(ForgeSize.iconSm),
-                    )
-                }
                 CircleControl(
                     onClick = {},
                     contentDescription = stringResource(R.string.cd_voice_unavailable),
@@ -292,7 +294,7 @@ private fun LabelledSelect(
                 .clip(ForgeShapes.pill)
                 .background(colors.surfaceControl)
                 .border(ForgeSize.hairline, colors.border, ForgeShapes.pill)
-                .padding(horizontal = ForgeSpace.md),
+                .padding(horizontal = ForgeSpace.sm),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
         ) {
@@ -309,7 +311,7 @@ private fun LabelledSelect(
                 Icons.Rounded.ExpandMore,
                 contentDescription = null,
                 tint = colors.textMuted,
-                modifier = Modifier.size(ForgeSize.iconSm),
+                modifier = Modifier.size(ForgeSize.iconXs),
             )
         }
     }

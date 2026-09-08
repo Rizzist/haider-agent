@@ -20,7 +20,6 @@ import ai.diffforge.haider.ui.settings.AccountsScreen
 import ai.diffforge.haider.ui.settings.SettingsScreen
 import ai.diffforge.haider.ui.start.AutonomyGrant
 import ai.diffforge.haider.ui.state.AppUiState
-import ai.diffforge.haider.ui.state.CapabilityApproval
 import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.start.StartSurface
 import ai.diffforge.haider.ui.state.BannerAction
@@ -189,6 +188,7 @@ fun HaiderApp(
                     onRestartDaemon = { viewModel.restartDaemon() },
                     onOpenAccessibility = { onSystemAction(SystemAction.OpenAccessibility) },
                     onGrantSms = { onSystemAction(SystemAction.GrantSms) },
+            onRequestScreenCapture = { onSystemAction(SystemAction.RequestScreenCapture) },
                     onRequestNotifications = { onSystemAction(SystemAction.RequestNotifications) },
                     onOpenBattery = { onSystemAction(SystemAction.OpenBattery) },
                 )
@@ -287,11 +287,14 @@ fun HaiderApp(
                 )
 
                 Box(Modifier.fillMaxWidth().weight(1f)) {
-                    // Auto answers device-capability approvals; everything
-                    // else still stops and asks (addition H6).
-                    val rawNeedsInput = state.activeSession?.needsInput
-                    val needsInput = rawNeedsInput
-                        ?.takeUnless { CapabilityApproval.suppresses(state.permissionMode, it) }
+                    // Never hidden. Auto means the *daemon* resolves device
+                    // approvals so none is raised; it does not mean the UI
+                    // draws over one that is still pending. Round 9 filtered
+                    // here, and switching to Auto with an unanswered sms.list
+                    // card left the session stranded — header "Needs you",
+                    // composer "Answer above…", and nothing to answer
+                    // (verify-8 O1).
+                    val needsInput = state.activeSession?.needsInput
                     if (state.viewTab == SessionViewTab.Shell) {
                         ShellView(availability = state.shell, modifier = Modifier.fillMaxSize())
                     } else if (state.messages.isEmpty() && needsInput == null) {

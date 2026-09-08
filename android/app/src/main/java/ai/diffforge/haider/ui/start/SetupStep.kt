@@ -63,7 +63,12 @@ fun SetupStepRow(
     val type = Forge.type
     // Re-keyed on `current`, so advancing a step opens the new one without
     // slamming shut a row the user opened deliberately.
-    var expanded by remember(step.current) { mutableStateOf(step.current) }
+    // Keyed on `done` as well: a step that goes green while another one is
+    // current must re-evaluate, or its rows stay collapsed forever
+    // (verify-8 O2).
+    var expanded by remember(step.current, step.done) {
+        mutableStateOf(step.current || (step.done && step.id == SetupStepId.Autonomy))
+    }
     val statusLine = when {
         step.done -> doneDetail ?: stringResource(R.string.setup_status_done)
         step.current -> stringResource(R.string.setup_status_now)
@@ -98,18 +103,33 @@ fun SetupStepRow(
                 style = type.sessionMeta,
                 color = if (step.done) colors.green else colors.textMuted,
             )
-            if (expanded && !step.done) {
-                Text(stringResource(bodyRes(step.id)), style = type.sessionMeta, color = colors.textMuted)
-                if (step.id == SetupStepId.Autonomy) {
-                    // One screen, four one-time popups, each with the reason it
-                    // is being asked for and its own real status (addition H6).
-                    AutonomyRows(permissions = permissions, onGrant = onGrant)
+            // The autonomy rows are the *only* place three of the four grants
+            // can be reached, so they survive the step going green: granting
+            // notifications used to mark it done and take SMS, accessibility
+            // and capture away with it (verify-8 O2).
+            val keepsRows = step.id == SetupStepId.Autonomy
+            if (expanded && (!step.done || keepsRows)) {
+                if (!step.done) {
+                    Text(
+                        stringResource(bodyRes(step.id)),
+                        style = type.sessionMeta,
+                        color = colors.textMuted,
+                    )
                 }
-                ForgeButton(
-                    text = stringResource(actionRes(step.id)),
-                    onClick = onAction,
-                    kind = ForgeButtonKind.Filled,
-                )
+                if (keepsRows) {
+                    AutonomyRows(
+                        permissions = permissions,
+                        notificationsGranted = notificationsGranted,
+                        onGrant = onGrant,
+                    )
+                }
+                if (!step.done) {
+                    ForgeButton(
+                        text = stringResource(actionRes(step.id)),
+                        onClick = onAction,
+                        kind = ForgeButtonKind.Filled,
+                    )
+                }
             }
         }
     }
@@ -183,15 +203,21 @@ fun actionRes(id: SetupStepId): Int = when (id) {
 enum class AutonomyGrant { Notifications, Sms, Accessibility, ScreenCapture }
 
 @Composable
-private fun AutonomyRows(permissions: PermissionSnapshot, onGrant: (AutonomyGrant) -> Unit) {
+private fun AutonomyRows(
+    permissions: PermissionSnapshot,
+    notificationsGranted: Boolean,
+    onGrant: (AutonomyGrant) -> Unit,
+) {
     val colors = Forge.colors
     val type = Forge.type
     Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
         AutonomyGrant.entries.forEach { grant ->
             val standing = when (grant) {
-                // Notifications live on the daemon environment, not in the
-                // Activity snapshot, so this row is driven by the step itself.
-                AutonomyGrant.Notifications -> null
+                AutonomyGrant.Notifications -> if (notificationsGranted) {
+                    PermissionStanding.Granted
+                } else {
+                    PermissionStanding.NotGranted
+                }
                 AutonomyGrant.Sms -> permissions.sms
                 AutonomyGrant.Accessibility -> permissions.accessibility
                 AutonomyGrant.ScreenCapture -> permissions.screenCapture

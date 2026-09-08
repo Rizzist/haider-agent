@@ -172,12 +172,12 @@ fun EmptySessionBlock(modifier: Modifier = Modifier) {
         }
         Text(
             stringResource(R.string.empty_session_title),
-            style = type.h1,
+            style = type.emptyTitle,
             color = colors.text,
         )
         Text(
             stringResource(R.string.empty_session_body),
-            style = type.sessionMeta,
+            style = type.emptyBody,
             color = colors.textMuted,
         )
     }
