@@ -246,6 +246,93 @@ class InstallerPackagingTests(unittest.TestCase):
         self.assertFalse((work / 'rerendered').exists())
 
     @unittest.skipIf(os.name == 'nt', 'POSIX shell uninstaller runs on macOS/Linux')
+    def test_standalone_uninstall_without_members_requires_prefix(self):
+        self.prepare()
+        downloads = self.root / 'Downloads ü'
+        downloads.mkdir()
+        script = downloads / 'haider-v0.0.970-x86_64-unknown-linux-gnu-uninstall-haider.sh'
+        script.write_bytes((self.root / 'payload/uninstall-haider.sh').read_bytes())
+        env = dict(os.environ, HOME=str(self.root))
+        env.pop('SUDO_USER', None)
+        result = subprocess.run(['sh', str(script)], env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertIn(f'nothing to uninstall at {downloads}; pass --prefix '
+                      'BIN_DIRECTORY (e.g. /usr/local/bin or ~/.local/bin)\n', result.stderr)
+        self.assertEqual('/usr/local/bin/haider' in result.stderr,
+                         Path('/usr/local/bin/haider').exists())
+        self.assertTrue(script.exists())
+        self.assertTrue((self.root / 'payload/haider').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX shell uninstaller runs on macOS/Linux')
+    def test_uninstall_explicit_empty_prefix_is_idempotent(self):
+        self.prepare()
+        prefix = self.root / 'empty bin ü'
+        prefix.mkdir()
+        # No-op must preserve both an installed helper and user state/agents.
+        (prefix / 'uninstall-haider.sh').write_text('retain helper')
+        home = self.root / 'home'
+        sentinels = [home / '.haider/sentinel',
+                     home / 'Library/LaunchAgents/ai.haidercode.haider.plist']
+        for path in sentinels:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('retain')
+        env = dict(os.environ, HOME=str(home))
+        env.pop('SUDO_USER', None)
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = subprocess.run(['sh', str(self.root / 'payload/uninstall-haider.sh'),
+                                         '--prefix', str(prefix)], env=env,
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, f'nothing to uninstall at {prefix}\n')
+                self.assertEqual((prefix / 'uninstall-haider.sh').read_text(), 'retain helper')
+                for path in sentinels:
+                    self.assertEqual(path.read_text(), 'retain')
+        self.assertTrue((self.root / 'payload/haider').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX shell uninstaller runs on macOS/Linux')
+    def test_uninstall_from_bin_prefix_removes_members_and_keeps_state(self):
+        manifest = self.prepare()
+        prefix = self.root / 'payload'
+        home = self.root / 'home'
+        (home / '.haider').mkdir(parents=True)
+        (home / '.haider/sentinel').write_text('retain')
+        (prefix / 'unrelated').write_text('retain')
+        env = dict(os.environ, HOME=str(home))
+        env.pop('SUDO_USER', None)
+        result = subprocess.run(['sh', './uninstall-haider.sh', '--keep-state'], cwd=prefix,
+                                env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Haider binaries removed.', result.stdout)
+        for member in manifest['members']:
+            self.assertFalse((prefix / member).exists())
+        self.assertFalse((prefix / 'uninstall-haider.sh').exists())
+        self.assertEqual((home / '.haider/sentinel').read_text(), 'retain')
+        self.assertEqual((prefix / 'unrelated').read_text(), 'retain')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX shell uninstaller runs on macOS/Linux')
+    def test_uninstall_refuses_dangling_member_symlink(self):
+        manifest = self.prepare()
+        prefix = self.root / 'payload'
+        for member in manifest['members']:
+            (prefix / member).unlink()
+        (prefix / 'haider').symlink_to(prefix / 'missing')
+        env = dict(os.environ, HOME=str(self.root))
+        env.pop('SUDO_USER', None)
+        for args in ([], ['--prefix', str(prefix)]):
+            with self.subTest(args=args):
+                result = subprocess.run(['sh', str(prefix / 'uninstall-haider.sh'), *args],
+                                        env=env, stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('Refusing symlink:', result.stderr)
+                self.assertTrue((prefix / 'haider').is_symlink())
+                self.assertTrue((prefix / 'uninstall-haider.sh').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX shell uninstaller runs on macOS/Linux')
     def test_tarball_uninstall_refuses_changed_binary_before_any_removal(self):
         self.prepare()
         prefix = self.root / 'payload'

@@ -2,16 +2,40 @@
 # Haider standalone/pkg uninstaller. Package-manager users should use their manager.
 set -eu
 prefix=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+prefix_explicit=0
 keep_state=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --prefix) [ "$#" -ge 2 ] || exit 2; prefix=$2; shift 2 ;;
+    --prefix) [ "$#" -ge 2 ] || exit 2; prefix=$2; prefix_explicit=1; shift 2 ;;
     --keep-state) keep_state=1; shift ;;
     *) echo 'usage: uninstall-haider.sh [--prefix BIN_DIRECTORY] [--keep-state]' >&2; exit 2 ;;
   esac
 done
 case "$prefix" in /*) ;; *) echo 'prefix must be absolute' >&2; exit 2 ;; esac
 [ "$prefix" != / ] || exit 2
+found_member=0
+for member in @MEMBERS@; do
+  # Include dangling symlinks so the safety checks below still refuse them.
+  if [ -e "$prefix/$member" ] || [ -L "$prefix/$member" ]; then
+    found_member=1
+    break
+  fi
+done
+if [ "$found_member" = 0 ]; then
+  if [ "$prefix_explicit" = 1 ]; then
+    printf 'nothing to uninstall at %s\n' "$prefix" >&2
+    exit 0
+  fi
+  printf 'nothing to uninstall at %s; pass --prefix BIN_DIRECTORY (e.g. /usr/local/bin or ~/.local/bin)\n' "$prefix" >&2
+  case "${0##*/}" in
+    haider-v[0-9]*-*-uninstall-haider.sh)
+      if [ -e /usr/local/bin/haider ]; then
+        printf 'found /usr/local/bin/haider; pass --prefix /usr/local/bin to select that installation\n' >&2
+      fi
+      ;;
+  esac
+  exit 3
+fi
 user_home=${HOME:?HOME must be set}
 user_id=$(id -u)
 if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
