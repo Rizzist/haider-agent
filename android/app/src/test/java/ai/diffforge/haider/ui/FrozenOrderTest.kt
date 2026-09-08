@@ -139,8 +139,12 @@ class FrozenOrderTest {
         before.forEach { (id, y) ->
             assertEquals("$id moved while the drawer was open", y, top(id), 0.1f)
         }
-        // And the change is visible where the row already was.
-        assertTrue(rule.onAllNodesWithTextSafe("RUNNING") > 0)
+        // The change shows in the glyph and in what the row speaks — the badge
+        // is gone (addition E).
+        assertTrue(
+            rule.onAllNodes(hasContentDescription("Running", substring = true))
+                .fetchSemanticsNodes().isNotEmpty(),
+        )
     }
 
     @Test

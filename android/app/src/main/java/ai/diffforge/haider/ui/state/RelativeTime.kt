@@ -57,6 +57,14 @@ object RelativeTime {
         }
     }
 
+    /** `41s` / `2m 05s`, for a finished tool call's own measured span. */
+    fun elapsed(durationMs: Long?): String {
+        if (durationMs == null || durationMs < 0L) return ""
+        val minutes = durationMs / MINUTE_MS
+        val seconds = (durationMs % MINUTE_MS) / 1000L
+        return if (minutes > 0) "${minutes}m ${"%02d".format(seconds)}s" else "${seconds}s"
+    }
+
     /** `2m 14s`, for the needs-input waiting footer. */
     fun waiting(sinceMs: Long?, nowMs: Long): String {
         if (sinceMs == null) return ""

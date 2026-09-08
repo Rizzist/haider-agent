@@ -158,21 +158,40 @@ fun SessionDrawer(
             .background(colors.surface)
             .padding(horizontal = ForgeSpace.lg),
     ) {
-        IdentityBlock(appVersion = appVersion, onClose = onClose)
+        // The identity block is gone (addition F, D1), but the explicit
+        // collapse affordance it carried is not optional — swipe and scrim are
+        // gestures, and one of the two is invisible. It stays, alone.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            ForgeIconButton(
+                onClick = onClose,
+                contentDescription = stringResource(R.string.cd_close_sessions),
+            ) {
+                Icon(
+                    Icons.Rounded.ChevronLeft,
+                    contentDescription = null,
+                    tint = colors.textMuted,
+                    modifier = Modifier.size(ForgeSize.iconSm),
+                )
+            }
+        }
 
-        DaemonStatusCard(
+        DaemonStatusRow(
             status = state.daemon,
-            activeTurns = state.sessions.count { it.runId != null },
-            elapsedRealtimeMs = elapsedMs,
             onStart = onStartDaemon,
             onStop = onStopDaemon,
             onOpenDetails = onOpenDaemonDetails,
-            modifier = Modifier.padding(bottom = ForgeSpace.lg),
+            modifier = Modifier.padding(top = ForgeSpace.md),
         )
 
         NewSessionRow(onClick = onNewSession, onLongClick = onNewSessionWith)
 
-        if (state.sessions.size > SEARCH_THRESHOLD) {
+        // Search replaces the filter chips: needs-input rows already float to
+        // the top, so a filter for them was a second way to say the same thing
+        // (addition F, D4).
+        if (state.sessions.isNotEmpty()) {
             SearchField(query = state.query, onQuery = onQuery)
             // Completeness is known only after coverage through each recorded
             // head, so say how far the index has got instead of implying it is
@@ -203,10 +222,6 @@ fun SessionDrawer(
                 )
             }
         }
-        if (state.sessions.size > FILTER_THRESHOLD) {
-            FilterRow(filter = state.filter, counts = counts, onFilter = onFilter)
-        }
-
         Box(Modifier.weight(1f)) {
             if (groups.isEmpty()) {
                 Text(
@@ -274,89 +289,53 @@ fun SessionDrawer(
     }
 }
 
-@Composable
-private fun IdentityBlock(appVersion: String, onClose: () -> Unit) {
-    val colors = Forge.colors
-    val type = Forge.type
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = ForgeSpace.xl, bottom = ForgeSpace.lg),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(ForgeSize.markLg)
-                .clip(ForgeShapes.card)
-                .background(colors.accentWash)
-                .border(ForgeSize.hairline, colors.accent, ForgeShapes.card),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text("H", style = type.h4, color = colors.accent)
-        }
-        Column(
-            Modifier
-                .weight(1f)
-                .padding(start = ForgeSpace.lg),
-        ) {
-            Text(stringResource(R.string.app_name), style = type.h4, color = colors.text)
-            Text(
-                stringResource(R.string.drawer_identity_line, appVersion),
-                style = type.numeric,
-                color = colors.textMuted,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        ForgeIconButton(
-            onClick = onClose,
-            contentDescription = stringResource(R.string.cd_close_sessions),
-        ) {
-            Icon(
-                Icons.Rounded.ChevronLeft,
-                contentDescription = null,
-                tint = colors.textSoft,
-                modifier = Modifier.size(ForgeSize.icon),
-            )
-        }
-    }
-}
-
 /**
- * One full-width target. "New session with…" is the long press, as the spec
- * intends: the same choices (model, effort) are a tap away in the footer's
- * Model row, so the gesture is never the only path.
+ * A compose row, not a call to action: an icon square and "New chat", sitting
+ * at the top of the list exactly like the desktop rail's (addition F, D3). The
+ * long press still opens "New session with…", and the model and effort are a
+ * tap away in the composer, so the gesture is never the only path.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun NewSessionRow(onClick: () -> Unit, onLongClick: () -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
-    val label = stringResource(R.string.drawer_new_session)
+    val label = stringResource(R.string.drawer_new_chat)
     val withLabel = stringResource(R.string.drawer_new_session_with)
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = ForgeSize.touch)
-            .clip(ForgeShapes.pill)
-            .background(colors.accentWash)
-            .border(ForgeSize.hairline, colors.accent, ForgeShapes.pill)
+            .clip(ForgeShapes.row)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .semantics {
                 contentDescription = label
                 customActions = listOf(CustomAccessibilityAction(withLabel) { onLongClick(); true })
             }
-            .padding(horizontal = ForgeSpace.xl),
+            .padding(horizontal = ForgeSpace.lg),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
     ) {
-        Icon(
-            Icons.Rounded.Add,
-            contentDescription = null,
-            tint = colors.accent,
-            modifier = Modifier.size(ForgeSize.iconSm),
+        Box(
+            modifier = Modifier
+                .size(ForgeSize.avatar)
+                .clip(ForgeShapes.cardTight)
+                .background(colors.accentWash)
+                .border(ForgeSize.hairline, colors.accent.copy(alpha = 0.5f), ForgeShapes.cardTight),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Rounded.Add,
+                contentDescription = null,
+                tint = colors.accent,
+                modifier = Modifier.size(ForgeSize.iconSm),
+            )
+        }
+        Text(
+            label,
+            style = type.sessionTitle,
+            color = colors.text,
+            modifier = Modifier.padding(start = ForgeSpace.lg),
         )
-        Text(label, style = type.button, color = colors.accent)
     }
 }
 
@@ -389,9 +368,15 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
             cursorBrush = SolidColor(colors.accent),
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = ForgeSpace.md),
+                .padding(horizontal = ForgeSpace.md)
+                .heightIn(min = ForgeSize.touch),
             decorationBox = { inner ->
-                Box {
+                // The field is 48 dp so it is a real target; its text still has
+                // to sit in the middle of that.
+                Box(
+                    modifier = Modifier.height(ForgeSize.touch),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
                     if (query.isEmpty()) {
                         Text(
                             stringResource(R.string.drawer_search_hint),
@@ -420,44 +405,6 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
 }
 
 @Composable
-private fun FilterRow(
-    filter: SessionFilter,
-    counts: ai.diffforge.haider.ui.state.SessionListCounts,
-    onFilter: (SessionFilter) -> Unit,
-) {
-    val colors = Forge.colors
-    val type = Forge.type
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = ForgeSize.touch),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
-    ) {
-        listOf(
-            Triple(SessionFilter.All, R.string.drawer_filter_all, counts.all),
-            Triple(SessionFilter.Running, R.string.drawer_filter_running, counts.running),
-            Triple(SessionFilter.NeedsInput, R.string.drawer_filter_needs_input, counts.needsInput),
-        ).forEach { (value, labelRes, count) ->
-            val label = stringResource(labelRes, count)
-            ForgeChip(
-                onClick = { onFilter(value) },
-                height = ForgeSize.filterChip,
-                selected = filter == value,
-                contentDescription = label,
-            ) {
-                Text(
-                    label,
-                    style = type.sessionMeta,
-                    color = if (filter == value) colors.accent else colors.textMuted,
-                    maxLines = 1,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun DrawerFooter(
     state: AppUiState,
     themeMode: ThemeMode,
@@ -474,61 +421,14 @@ private fun DrawerFooter(
                 .height(ForgeSize.hairline)
                 .background(colors.border),
         )
-        FooterRow(
-            icon = Icons.Rounded.Bolt,
-            primary = stringResource(R.string.drawer_footer_model),
-            secondary = state.models?.let {
-                ModelNames.full(it.current.provider, it.current.model, it.current.effort)
-            },
-            onClick = onOpenModel,
-        )
+        // One row. The model is a composer picker and the theme is on the top
+        // bar, so neither needs a second home down here (addition F, D5).
         FooterRow(
             icon = Icons.Rounded.Tune,
             primary = stringResource(R.string.drawer_footer_settings),
-            secondary = stringResource(R.string.drawer_footer_settings_secondary),
+            secondary = null,
             onClick = onOpenSettings,
         )
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = ForgeSize.footerRow),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                Icons.Rounded.Palette,
-                contentDescription = null,
-                tint = colors.textMuted,
-                modifier = Modifier.size(ForgeSize.iconSm),
-            )
-            Text(
-                stringResource(R.string.drawer_footer_appearance),
-                style = type.sessionTitle,
-                color = colors.text,
-                modifier = Modifier.padding(start = ForgeSpace.lg),
-            )
-            Box(Modifier.weight(1f))
-            Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xs)) {
-                listOf(
-                    ThemeMode.System to R.string.appearance_system,
-                    ThemeMode.Light to R.string.appearance_light,
-                    ThemeMode.Dark to R.string.appearance_dark,
-                ).forEach { (mode, labelRes) ->
-                    val label = stringResource(labelRes)
-                    ForgeChip(
-                        onClick = { onThemeMode(mode) },
-                        height = ForgeSize.filterChip,
-                        selected = themeMode == mode,
-                        contentDescription = label,
-                    ) {
-                        Text(
-                            label,
-                            style = type.sessionMeta,
-                            color = if (themeMode == mode) colors.accent else colors.textMuted,
-                        )
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -563,7 +463,7 @@ private fun FooterRow(
             secondary?.let {
                 Text(
                     it,
-                    style = type.numeric,
+                    style = type.sessionMeta,
                     color = colors.textMuted,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,

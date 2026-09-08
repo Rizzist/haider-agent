@@ -75,10 +75,8 @@ fun SessionActionsSheet(
             )
             ActionRow(R.string.action_rename) { onAction(SessionRowAction.Rename) }
             ActionRow(R.string.action_fork) { onAction(SessionRowAction.Fork) }
-            // No run_id means no active run, so there is nothing to stop.
-            if (row.runId != null) {
-                ActionRow(R.string.action_stop_turn) { onAction(SessionRowAction.StopTurn) }
-            }
+            // Stopping a turn is the composer's job and only the composer's
+            // (E2, verify-6 O2).
             ActionRow(R.string.action_copy_session_id) { onAction(SessionRowAction.CopyId) }
         }
     }

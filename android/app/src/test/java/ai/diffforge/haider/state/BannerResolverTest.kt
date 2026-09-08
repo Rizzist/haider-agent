@@ -118,14 +118,16 @@ class BannerResolverTest {
     }
 
     @Test
-    fun `a failed daemon names the reason and offers daemon details`() {
+    fun `a failed daemon names the reason and says what tapping does`() {
         val model = BannerResolver.resolve(
             BannerInputs(daemon = DaemonStatus.Failed("store_recovery_failed", "STORE")),
         ).model!!
         assertEquals(R.string.daemon_failed, model.detail!!.resId)
         assertEquals(listOf<Any>("store_recovery_failed"), model.detail.args)
-        assertEquals(BannerAction.OpenDaemonDetails, model.secondaryAction)
-        assertTrue(model.filledAction)
+        // The strip has no second button; details live in Settings -> Daemon
+        // and on the drawer's daemon row (addition F, D2/T1).
+        assertEquals(BannerAction.StartDaemon, model.action)
+        assertEquals(R.string.banner_stopped_action, model.actionLabel!!.resId)
     }
 
     @Test

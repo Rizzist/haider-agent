@@ -13,7 +13,8 @@ import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
 import ai.diffforge.haider.ui.components.ForgeIconButton
-import ai.diffforge.haider.ui.components.StatePill
+import ai.diffforge.haider.ui.components.SessionGlyph
+import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
@@ -36,13 +37,20 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -55,15 +63,24 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.launch
+
+/** Staging failed for a reason that is not the key: connection, expiry, capacity. */
+const val STAGING_UNAVAILABLE = "staging_unavailable"
 
 const val ACCOUNTS_KEY_FIELD_TAG = "accounts_key_field"
 const val ACCOUNTS_OAUTH_WAITING_TAG = "accounts_oauth_waiting"
@@ -111,6 +128,8 @@ fun AccountsScreen(
     // `account.login_api` claims. Holding the key past staging is the whole
     // finding — "Key validated" left the masked field populated.
     var stagedReference by remember { mutableStateOf<String?>(null) }
+    var addSheet by remember { mutableStateOf(false) }
+    var openAccount by remember { mutableStateOf<String?>(null) }
     val notice = localNotice ?: controllerNotice
 
     // The buffer never outlives the screen, however the screen ends.
@@ -194,41 +213,30 @@ fun AccountsScreen(
                 )
             } else {
                 snapshot.accounts.forEach { account ->
-                    AccountCard(
-                        account = account,
-                        onSetActive = {
-                            scope.launch { repository.setActive(account.alias); repository.refresh() }
-                        },
-                        onRemove = {
-                            scope.launch {
-                                repository.remove(account.alias)
-                                localNotice = "Account removed."
-                                repository.refresh()
-                            }
-                        },
-                    )
+                    AccountRow(account = account, onOpen = { openAccount = account.alias })
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+            // One action, two options behind it (addition F, A2).
+            if (mode == AddMode.None) {
                 ForgeButton(
-                    text = stringResource(R.string.accounts_add_api_key),
-                    onClick = {
-                        mode = if (mode == AddMode.ApiKey) AddMode.None else AddMode.ApiKey
-                        localNotice = null
-                        oauth.clearNotice()
+                    text = stringResource(R.string.accounts_add),
+                    onClick = { addSheet = true },
+                    leading = {
+                        Icon(
+                            Icons.Rounded.Add,
+                            contentDescription = null,
+                            tint = colors.accentInk,
+                            modifier = Modifier.size(ForgeSize.iconSm),
+                        )
                     },
-                    kind = if (mode == AddMode.ApiKey) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
                 )
-                ForgeButton(
-                    text = stringResource(R.string.accounts_sign_in),
-                    onClick = {
-                        mode = if (mode == AddMode.OAuth) AddMode.None else AddMode.OAuth
-                        localNotice = null
-                        oauth.clearNotice()
-                    },
-                    kind = if (mode == AddMode.OAuth) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
-                )
+            }
+
+            // Independent of the add form, and of whether this screen was
+            // recreated while the browser had the foreground (verify-6 O4).
+            attempt?.let { live ->
+                Card { LiveOAuthPanel(live = live, onOpenUrl = onOpenUrl, onCancel = { oauth.cancel() }) }
             }
 
             when (mode) {
@@ -284,38 +292,11 @@ fun AccountsScreen(
                         color = if (stagedHint) colors.accent else colors.textMuted,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-                        ForgeButton(
-                            text = stringResource(R.string.accounts_validate),
-                            onClick = {
-                                val chosen = provider ?: return@ForgeButton
-                                busy = true
-                                scope.launch {
-                                    try {
-                                        val result = secret.use { repository.validateApiKey(chosen, it) }
-                                        if (result is AccountResult.Ok) {
-                                            // Stage it, keep only the handle,
-                                            // and drop the key on the spot.
-                                            stagedReference = secret.use { repository.stageApiKey(it) }
-                                        }
-                                        localNotice = when (result) {
-                                            AccountResult.Ok -> if (stagedReference != null) {
-                                                "Key validated."
-                                            } else {
-                                                "invalid_api_key"
-                                            }
-                                            is AccountResult.Failed -> result.publicCode
-                                        }
-                                    } finally {
-                                        // Validated or refused, the plaintext
-                                        // does not outlive this handler.
-                                        clearSecret()
-                                        busy = false
-                                    }
-                                }
-                            },
-                            kind = ForgeButtonKind.Ghost,
-                            enabled = provider != null && keyText.isNotBlank() && !busy,
-                        )
+                        // No Validate button. The frozen wire has no
+                        // validation-only door: account.login_api is what
+                        // checks a key, and it commits at the same time. A
+                        // button that answered "Key validated." was describing
+                        // a call that does not exist (lane 971-3, UI-14).
                         ForgeButton(
                             text = stringResource(R.string.action_save),
                             onClick = {
@@ -327,7 +308,7 @@ fun AccountsScreen(
                                         val reference = stagedReference
                                             ?: secret.use { repository.stageApiKey(it) }
                                         result = if (reference == null) {
-                                            AccountResult.Failed("invalid_api_key")
+                                            AccountResult.Failed(STAGING_UNAVAILABLE)
                                         } else {
                                             repository.commitStagedApiKey(
                                                 chosen,
@@ -368,9 +349,11 @@ fun AccountsScreen(
                     }
                 }
 
-                AddMode.OAuth -> Card {
-                    val live = attempt
-                    if (live == null) {
+                // The live attempt is rendered above, outside this form: it
+                // belongs to a process-scoped controller and outlives the
+                // composition, so a browser return that resets `mode` must not
+                // make a running sign-in disappear (verify-6 O4).
+                AddMode.OAuth -> if (attempt == null) Card {
                         ProviderPicker(
                             providers = providers.filter { it.supportsOAuth },
                             selected = provider,
@@ -400,58 +383,88 @@ fun AccountsScreen(
                             },
                             enabled = provider != null && !busy,
                         )
-                    } else {
-                        Column(
-                            verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
-                            modifier = Modifier.testTag(ACCOUNTS_OAUTH_WAITING_TAG),
-                        ) {
-                            Text(
-                                when (live.phase) {
-                                    OAuthAttemptController.Phase.Waiting ->
-                                        if (live.flow.style == OAuthStyle.Device) {
-                                            stringResource(R.string.accounts_oauth_device)
-                                        } else {
-                                            stringResource(R.string.accounts_oauth_waiting)
-                                        }
-                                    OAuthAttemptController.Phase.Exchanging ->
-                                        stringResource(R.string.accounts_oauth_exchanging)
-                                    OAuthAttemptController.Phase.Claiming ->
-                                        stringResource(R.string.accounts_oauth_claiming)
-                                    OAuthAttemptController.Phase.Failed,
-                                    OAuthAttemptController.Phase.Committed,
-                                    -> stringResource(R.string.accounts_oauth_waiting)
-                                },
-                                style = type.chatBody,
-                                color = colors.text,
-                            )
-                            live.flow.userCode?.let {
-                                Text(
-                                    stringResource(R.string.accounts_oauth_code, it),
-                                    style = type.numeric,
-                                    color = colors.accent,
-                                )
-                            }
-                            Text(
-                                stringResource(R.string.accounts_oauth_return_hint),
-                                style = type.sessionMeta,
-                                color = colors.textMuted,
-                            )
-                            Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-                                live.flow.authorizationUrl?.let { url ->
-                                    ForgeButton(
-                                        text = stringResource(R.string.accounts_oauth_open_again),
-                                        onClick = { onOpenUrl(url) },
-                                        kind = ForgeButtonKind.Ghost,
-                                    )
-                                }
-                                ForgeButton(
-                                    text = stringResource(R.string.action_cancel),
-                                    onClick = { oauth.cancel() },
-                                    kind = ForgeButtonKind.Ghost,
-                                )
-                            }
+                }
+            }
+        }
+    }
+
+    if (addSheet) {
+        AddAccountSheet(
+            onDismiss = { addSheet = false },
+            onApiKey = { addSheet = false; mode = AddMode.ApiKey; localNotice = null },
+            onSignIn = { addSheet = false; mode = AddMode.OAuth; localNotice = null },
+        )
+    }
+    openAccount?.let { alias ->
+        snapshot.accounts.firstOrNull { it.alias == alias }?.let { account ->
+            AccountDetailSheet(
+                account = account,
+                onDismiss = { openAccount = null },
+                // Both of these return a result, and round 6 threw both away:
+                // a refused revision, a lost connection or a confirmation
+                // requirement announced "Account removed." anyway (lane 971-3
+                // handoff). Announce only what actually happened.
+                onSetActive = {
+                    openAccount = null
+                    scope.launch {
+                        when (val result = repository.setActive(account.alias)) {
+                            AccountResult.Ok -> localNotice = null
+                            is AccountResult.Failed -> localNotice = result.publicCode
                         }
+                        repository.refresh()
                     }
+                },
+                onRemove = {
+                    openAccount = null
+                    scope.launch {
+                        when (val result = repository.remove(account.alias)) {
+                            AccountResult.Ok -> localNotice = "Account removed."
+                            is AccountResult.Failed -> localNotice = result.publicCode
+                        }
+                        repository.refresh()
+                    }
+                },
+            )
+        }
+    }
+}
+
+/** The one Add action's two options. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddAccountSheet(
+    onDismiss: () -> Unit,
+    onApiKey: () -> Unit,
+    onSignIn: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+        containerColor = colors.surfaceRaised,
+        shape = ForgeShapes.sheet,
+    ) {
+        Column(
+            Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, bottom = ForgeSpace.xxxl),
+            verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+        ) {
+            Text(stringResource(R.string.accounts_add), style = type.h4, color = colors.text)
+            listOf(
+                stringResource(R.string.accounts_option_api_key) to onApiKey,
+                stringResource(R.string.accounts_option_sign_in) to onSignIn,
+            ).forEach { (label, action) ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = ForgeSize.touch)
+                        .clip(ForgeShapes.row)
+                        .clickable(onClick = action)
+                        .padding(horizontal = ForgeSpace.lg)
+                        .semantics { contentDescription = label; role = Role.Button },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(label, style = type.button, color = colors.text)
                 }
             }
         }
@@ -460,37 +473,98 @@ fun AccountsScreen(
 
 private enum class AddMode { None, ApiKey, OAuth }
 
+/**
+ * Provider glyph, label, identity line, and a check when it is the one in use.
+ * No ACTIVE badge (the check says it) and no Delete button on the row — a
+ * destructive action does not belong on a list row that is one mis-tap wide
+ * (addition F, A1/G3).
+ */
 @Composable
-private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () -> Unit) {
+private fun AccountRow(account: Account, onOpen: () -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
-    Card {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    account.label ?: account.identity ?: account.alias,
-                    style = type.sessionTitle,
-                    color = colors.text,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    listOfNotNull(
-                        account.provider,
-                        if (account.authKind == AuthKind.OAuth) "sign-in" else "API key",
-                        account.identity,
-                    ).joinToString(" · "),
-                    style = type.numeric,
-                    color = colors.textMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            if (account.active) {
-                StatePill(stringResource(R.string.accounts_active), colors.accent)
-            }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = ForgeSize.touch)
+            .clip(ForgeShapes.row)
+            .clickable(onClick = onOpen)
+            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SessionGlyph(
+            provider = account.provider,
+            state = SessionVisualState.Idle,
+            animate = false,
+        )
+        Column(
+            Modifier
+                .weight(1f)
+                .padding(start = ForgeSpace.lg),
+        ) {
+            Text(
+                account.label ?: account.alias,
+                style = type.sessionTitle,
+                color = colors.text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                listOfNotNull(
+                    account.identity,
+                    // An unknown auth kind says so; it does not default to a
+                    // credential type the daemon never named (971-3, UI-12).
+                    when (account.authKind) {
+                        AuthKind.OAuth -> "sign-in"
+                        AuthKind.ApiKey -> "API key"
+                        AuthKind.Unknown -> "sign-in method unknown"
+                    },
+                ).joinToString(" · "),
+                style = type.sessionMeta,
+                color = colors.textMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+        if (account.active) {
+            Icon(
+                Icons.Rounded.Check,
+                contentDescription = stringResource(R.string.accounts_active),
+                tint = colors.accent,
+                modifier = Modifier.size(ForgeSize.iconSm),
+            )
+        }
+    }
+}
+
+/** Delete lives here, behind a confirmation (addition F, A1). */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AccountDetailSheet(
+    account: Account,
+    onDismiss: () -> Unit,
+    onSetActive: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    var confirming by remember { mutableStateOf(false) }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+        containerColor = colors.surfaceRaised,
+        shape = ForgeShapes.sheet,
+    ) {
+        Column(
+            Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, bottom = ForgeSpace.xxxl),
+            verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
+        ) {
+            Text(account.label ?: account.alias, style = type.h4, color = colors.text)
+            Text(
+                listOfNotNull(account.provider, account.identity).joinToString(" · "),
+                style = type.sessionMeta,
+                color = colors.textMuted,
+            )
             if (!account.active) {
                 ForgeButton(
                     text = stringResource(R.string.accounts_set_active),
@@ -498,11 +572,31 @@ private fun AccountCard(account: Account, onSetActive: () -> Unit, onRemove: () 
                     kind = ForgeButtonKind.Ghost,
                 )
             }
-            ForgeButton(
-                text = stringResource(R.string.action_delete),
-                onClick = onRemove,
-                kind = ForgeButtonKind.Destructive,
-            )
+            if (confirming) {
+                Text(
+                    stringResource(R.string.accounts_delete_confirm),
+                    style = type.sessionMeta,
+                    color = colors.red,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+                    ForgeButton(
+                        text = stringResource(R.string.action_cancel),
+                        onClick = { confirming = false },
+                        kind = ForgeButtonKind.Ghost,
+                    )
+                    ForgeButton(
+                        text = stringResource(R.string.action_delete),
+                        onClick = onRemove,
+                        kind = ForgeButtonKind.Destructive,
+                    )
+                }
+            } else {
+                ForgeButton(
+                    text = stringResource(R.string.action_delete),
+                    onClick = { confirming = true },
+                    kind = ForgeButtonKind.Destructive,
+                )
+            }
         }
     }
 }
@@ -517,7 +611,7 @@ private fun ProviderPicker(
     val colors = Forge.colors
     val type = Forge.type
     Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-        Text(stringResource(R.string.accounts_provider), style = type.label, color = colors.textMuted)
+        Text(stringResource(R.string.accounts_provider), style = type.sessionMeta, color = colors.textMuted)
         // A fixed Row squeezed the fifth provider to a four-pixel sliver on a
         // 360 dp phone. Wrapping keeps every label its own full width.
         FlowRow(
@@ -557,8 +651,11 @@ private fun LabelledField(
 ) {
     val colors = Forge.colors
     val type = Forge.type
+    val focus = LocalFocusManager.current
     Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs)) {
-        Text(label.uppercase(), style = type.label, color = colors.textMuted)
+        // Sentence case: uppercase tracked labels are the drawer's alone
+        // (addition F, G2).
+        Text(label, style = type.sessionMeta, color = colors.textMuted)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -580,9 +677,13 @@ private fun LabelledField(
                 } else {
                     VisualTransformation.None
                 },
+                // A single-line field with no Done action left the keyboard up
+                // with nothing to dismiss it but the back gesture.
                 keyboardOptions = KeyboardOptions(
                     keyboardType = if (masked) KeyboardType.Password else KeyboardType.Text,
+                    imeAction = ImeAction.Done,
                 ),
+                keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
                 modifier = Modifier
                     .weight(1f)
                     .padding(vertical = ForgeSpace.md)
@@ -592,6 +693,73 @@ private fun LabelledField(
             trailing?.let {
                 Box(Modifier.padding(end = ForgeSpace.xs)) { it() }
             }
+        }
+    }
+}
+
+/**
+ * A sign-in that is already running.
+ *
+ * It is drawn from the process-scoped controller alone, so leaving for the
+ * browser and coming back — which recreates this screen with a fresh, empty
+ * add-form mode — still shows the waiting panel and its Cancel (verify-6 O4).
+ */
+@Composable
+private fun LiveOAuthPanel(
+    live: OAuthAttemptController.Attempt,
+    onOpenUrl: (String) -> Unit,
+    onCancel: () -> Unit,
+) {
+    val colors = Forge.colors
+    val type = Forge.type
+    Column(
+        verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+        modifier = Modifier.testTag(ACCOUNTS_OAUTH_WAITING_TAG),
+    ) {
+        Text(
+            when (live.phase) {
+                OAuthAttemptController.Phase.Waiting ->
+                    if (live.flow.style == OAuthStyle.Device) {
+                        stringResource(R.string.accounts_oauth_device)
+                    } else {
+                        stringResource(R.string.accounts_oauth_waiting)
+                    }
+                OAuthAttemptController.Phase.Exchanging ->
+                    stringResource(R.string.accounts_oauth_exchanging)
+                OAuthAttemptController.Phase.Claiming ->
+                    stringResource(R.string.accounts_oauth_claiming)
+                OAuthAttemptController.Phase.Failed,
+                OAuthAttemptController.Phase.Committed,
+                -> stringResource(R.string.accounts_oauth_waiting)
+            },
+            style = type.chatBody,
+            color = colors.text,
+        )
+        live.flow.userCode?.let {
+            Text(
+                stringResource(R.string.accounts_oauth_code, it),
+                style = type.numeric,
+                color = colors.accent,
+            )
+        }
+        Text(
+            stringResource(R.string.accounts_oauth_return_hint),
+            style = type.sessionMeta,
+            color = colors.textMuted,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+            live.flow.authorizationUrl?.let { url ->
+                ForgeButton(
+                    text = stringResource(R.string.accounts_oauth_open_again),
+                    onClick = { onOpenUrl(url) },
+                    kind = ForgeButtonKind.Ghost,
+                )
+            }
+            ForgeButton(
+                text = stringResource(R.string.action_cancel),
+                onClick = onCancel,
+                kind = ForgeButtonKind.Ghost,
+            )
         }
     }
 }

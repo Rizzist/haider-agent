@@ -7,7 +7,6 @@ import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.daemon.NeedsInput
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
-import ai.diffforge.haider.ui.components.StateDot
 import ai.diffforge.haider.ui.state.RelativeTime
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
@@ -99,7 +98,9 @@ fun InputRequiredCard(
             .semantics { liveRegion = LiveRegionMode.Assertive },
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
     ) {
-        Text(stringResource(R.string.ask_eyebrow), style = type.drawerSection, color = colors.accent)
+        // The accent border already marks this card; the uppercase eyebrow was
+        // shouting a label above a question that speaks for itself
+        // (addition F, S6/G2).
         Text(needsInput.displayTitle, style = type.h4, color = colors.text)
 
         // safe_body is rendered verbatim, never rewritten into prose — and a
@@ -253,13 +254,11 @@ fun InputRequiredCard(
             }
         }
 
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
-        ) {
-            StateDot(colors.stateNeedsInput)
+        // "waiting 2m", regular type, muted. The notification is not news to
+        // the person reading the card on the phone it arrived on.
+        RelativeTime.waiting(needsInput.sinceMs, nowMs).takeIf { it.isNotBlank() }?.let { waited ->
             Text(
-                stringResource(R.string.ask_waiting, RelativeTime.waiting(needsInput.sinceMs, nowMs)),
+                stringResource(R.string.ask_waiting, waited),
                 style = type.sessionMeta,
                 color = colors.textMuted,
             )

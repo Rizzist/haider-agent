@@ -43,13 +43,18 @@ class SessionDrawerTest {
     }
 
     @Test
-    fun `the drawer lists every local session with its state and model`() {
+    fun `rows are one line - glyph and title, nothing else`() {
         openDrawer()
         assertTrue(rule.onAllNodesWithTextSafe("Fix nav crash on back gesture") > 0)
         assertTrue(rule.onAllNodesWithTextSafe("Reply to Amir about the lease") > 0)
         assertTrue(rule.onAllNodesWithTextSafe("Port the settings screen") > 0)
-        // The state is a word, never colour alone. The pill is decorative — the
-        // merged row speaks the state, which is what TalkBack actually reads.
+        // Addition E: no model, no effort, no time, no badges on the row.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Sonnet 4.5 · high"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("RUNNING"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("NEEDS INPUT"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("FORKED"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("12m"))
+        // The state still reaches anyone not looking at colour.
         listOf("Running", "Needs input", "Errored", "Waiting for network").forEach { word ->
             assertTrue(
                 "no row spoke \"$word\"",
@@ -57,7 +62,6 @@ class SessionDrawerTest {
                     .fetchSemanticsNodes().isNotEmpty(),
             )
         }
-        assertTrue(rule.onAllNodesWithTextSafe("Sonnet 4.5 · high") > 0)
     }
 
     @Test
@@ -79,42 +83,48 @@ class SessionDrawerTest {
     }
 
     @Test
-    fun `new session, the daemon card and the footer rows are all present`() {
+    fun `the drawer is a daemon line, a compose row, the list and Settings`() {
         openDrawer()
-        assertTrue(rule.onAllNodesWithTextSafe("New session") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("New chat") > 0)
         rule.onNodeWithText("Running in background").assertIsDisplayed()
-        rule.onNodeWithText("Model").assertIsDisplayed()
         assertTrue(rule.onAllNodesWithTextSafe("Settings") > 0)
+        // Addition F: the identity block, the Model row and the Appearance row
+        // are gone; the theme lives on the top bar and the model in the composer.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Model"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Appearance"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("v0.0.971 · on this device"))
     }
 
     @Test
-    fun `a stopped daemon offers a one-tap Start in the card`() {
+    fun `a stopped daemon offers a one-tap Start on the daemon line`() {
         openDrawer(FakeScenario.DaemonStopped)
-        // Header subtitle and card phrase both say it; the card's action is what
-        // matters here.
         assertTrue(rule.onAllNodesWithTextSafe("Stopped") > 0)
-        assertTrue(rule.onAllNodesWithTextSafe("Start") > 0)
+        rule.onNodeWithContentDescription("Start").assertIsDisplayed()
     }
 
     @Test
-    fun `the resource line prints only the segments it knows`() {
+    fun `the stats line is not in the drawer at all`() {
+        // It moved to Settings -> Daemon, where somebody looking for numbers
+        // will look (addition F, D2/T1).
         openDrawer()
-        assertTrue(rule.onAllNodes(hasText("MB", substring = true)).fetchSemanticsNodes().isNotEmpty())
-        assertEquals(0, rule.onAllNodesWithTextSafe("0 MB"))
-        assertEquals(0, rule.onAllNodesWithTextSafe("up 0m"))
+        assertEquals(
+            0,
+            rule.onAllNodes(hasText("MB", substring = true)).fetchSemanticsNodes().size,
+        )
     }
 
     @Test
-    fun `filter chips narrow the list`() {
+    fun `the filter chips are gone and search took their place`() {
+        // Needs-input rows already float to the top, so a filter for them was a
+        // second way to say the same thing (addition F, D4).
         openDrawer()
-        rule.onNodeWithContentDescription("Running 1").performClick()
-        rule.waitForIdle()
-        assertTrue(rule.onAllNodesWithTextSafe("Fix nav crash on back gesture") > 0)
-        assertEquals(0, rule.onAllNodesWithTextSafe("Port the settings screen"))
+        assertEquals(0, rule.onAllNodes(hasContentDescription("Running 1")).fetchSemanticsNodes().size)
+        assertEquals(0, rule.onAllNodes(hasContentDescription("Needs input 1")).fetchSemanticsNodes().size)
+        rule.onNodeWithText("Search sessions").assertIsDisplayed()
     }
 
     @Test
-    fun `search appears once the roster is large`() {
+    fun `search is there whenever there is anything to search`() {
         openDrawer(FakeScenario.LargeRoster)
         rule.onNodeWithText("Search sessions").assertIsDisplayed()
     }

@@ -1,6 +1,9 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.components.ForgeButton
+import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
@@ -38,18 +41,25 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+
+/** Test handle for the refusal panel. */
+const val MODEL_REFUSAL_TAG = "model_refusal"
 
 @Composable
 fun ModelPicker(
     config: SessionConfig?,
     error: String?,
     busy: Boolean,
+    refusal: SelectionRefusal?,
     onSelectModel: (String, String) -> Unit,
     onSelectEffort: (String?) -> Unit,
+    onConfirmRefused: () -> Unit,
+    onDismissRefusal: () -> Unit,
     onRefresh: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -78,7 +88,7 @@ fun ModelPicker(
                     Text("Model & provider", style = type.h4, color = colors.text)
                     Text(
                         config?.let { "${it.current.provider} / ${it.current.model}" } ?: "Loading daemon catalog…",
-                        style = type.toolRow,
+                        style = type.sessionMeta,
                         color = colors.textMuted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -95,6 +105,30 @@ fun ModelPicker(
 
             val pendingSelection = pending
             when {
+                // What the daemon said, with the only button that may set
+                // confirm_new_epoch (lane 971-3 handoff).
+                refusal != null -> Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(ForgeSpace.xxl)
+                        .testTag(MODEL_REFUSAL_TAG),
+                    verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+                ) {
+                    Text("The daemon refused that change", style = type.h4, color = colors.text)
+                    Text(refusal.code, style = type.sessionMeta, color = colors.amber)
+                    Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+                        ForgeButton(
+                            text = "Change it anyway",
+                            onClick = onConfirmRefused,
+                            kind = ForgeButtonKind.Filled,
+                        )
+                        ForgeButton(
+                            text = "Keep the current one",
+                            onClick = onDismissRefusal,
+                            kind = ForgeButtonKind.Ghost,
+                        )
+                    }
+                }
                 pendingSelection != null -> CacheChangeConfirmation(
                     selection = pendingSelection,
                     onConfirm = {
@@ -142,9 +176,9 @@ private fun CacheChangeConfirmation(
         is PendingSelection.Effort -> selection.effort ?: "provider-default effort"
     }
     Column(modifier = Modifier.fillMaxWidth().padding(ForgeSpace.xxl)) {
-        Text("CONFIRM CACHE EPOCH", style = type.label, color = colors.amber)
-        Spacer(Modifier.size(ForgeSpace.md))
-        Text("Switch to $target?", style = type.h4, color = colors.text)
+        // The question is the title; the uppercase eyebrow above it said the
+        // same thing in a shout (addition F, G2).
+        Text("Switch to $target?", style = type.h4, color = colors.amber)
         Spacer(Modifier.size(ForgeSize.stateDot))
         Text(
             "This can invalidate stable prompt tokens and start a new context-cache epoch. " +
@@ -198,8 +232,8 @@ private fun CatalogList(
     ) {
         item {
             Text(
-                "EFFORT",
-                style = type.label,
+                "Effort",
+                style = type.sessionMeta,
                 color = colors.textMuted,
                 modifier = Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, top = ForgeSpace.xl, bottom = ForgeSpace.sm),
             )
@@ -225,7 +259,7 @@ private fun CatalogList(
                 if (selectedModel?.supportedEfforts.isNullOrEmpty()) {
                     Text(
                         "This model does not advertise an effort ladder.",
-                        style = type.toolRow,
+                        style = type.sessionMeta,
                         color = colors.textMuted,
                         modifier = Modifier.padding(horizontal = ForgeSpace.md, vertical = ForgeSpace.xs),
                     )
@@ -241,7 +275,9 @@ private fun CatalogList(
                 ) {
                     BrandMark(provider.id)
                     Spacer(Modifier.width(ForgeSpace.md))
-                    Text(provider.id.uppercase(), style = type.label, color = colors.textSoft)
+                    // The id is already the brand as it is written everywhere else
+                    // — "anthropic", not "ANTHROPIC" (addition F, G2).
+                    Text(provider.id, style = type.sessionTitle, color = colors.textSoft)
                     Spacer(Modifier.weight(1f))
                     Box(
                         Modifier.size(ForgeSize.stateDot).clip(CircleShape).background(
@@ -250,8 +286,8 @@ private fun CatalogList(
                     )
                     Spacer(Modifier.width(ForgeSpace.xs))
                     Text(
-                        if (available) "AVAILABLE" else provider.availability.uppercase(),
-                        style = type.label,
+                        if (available) "available" else provider.availability,
+                        style = type.sessionMeta,
                         color = if (available) colors.green else colors.textMuted,
                     )
                 }

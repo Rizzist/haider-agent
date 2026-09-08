@@ -14,9 +14,6 @@ enum class SendButtonState {
     /** Daemon stopped: start it, then send when ready. */
     StartAndSend,
 
-    /** A turn is running: `turn.cancel(run_id, worker_generation)`. */
-    Stop,
-
     /** Daemon starting: a spinner, no action. */
     Starting,
 
@@ -25,16 +22,28 @@ enum class SendButtonState {
     ;
 
     val enabled: Boolean
-        get() = this == Send || this == StartAndSend || this == Stop
+        get() = this == Send || this == StartAndSend
 }
 
 data class ComposerState(
     val button: SendButtonState,
-    /** A helper line, or null when there is nothing true to say. */
+    /**
+     * A helper line only for a state the user cannot otherwise see: the daemon
+     * is coming up, or setup is unfinished. The running and paused sentences
+     * are gone — the Stop control and the answer card already say those things,
+     * and saying them twice is the clutter, not the clarity (addition F, G5).
+     */
     val helperRes: Int? = null,
     val contentDescriptionRes: Int = R.string.cd_send,
     val placeholderRes: Int = R.string.composer_placeholder,
     val inputEnabled: Boolean = true,
+    /**
+     * Stop is **additive** to Send, not a replacement (SessionComposer.jsx:684):
+     * mid-turn Send is how a follow-up is queued, and swapping it for Stop
+     * would make that keyboard-only exactly when it matters. Present only when
+     * the snapshot names the run — never a guess.
+     */
+    val showStop: Boolean = false,
 )
 
 object SendButtonMatrix {
@@ -50,24 +59,26 @@ object SendButtonMatrix {
         daemon is DaemonStatus.Starting ||
             daemon is DaemonStatus.Restarting ||
             daemon is DaemonStatus.Stopping -> ComposerState(
+            // No helper line. G5 leaves the composer with the allowed
+            // error/disconnected sentence only, and the banner above already
+            // says "Starting Haider…" with a progress line (verify-6 O7).
             button = SendButtonState.Starting,
-            helperRes = R.string.composer_helper_starting,
             inputEnabled = false,
         )
         daemon is DaemonStatus.Running && inputRequired -> ComposerState(
             button = SendButtonState.Paused,
-            helperRes = R.string.composer_helper_paused,
             placeholderRes = R.string.composer_placeholder_paused,
             inputEnabled = false,
+            showStop = turnRunning,
         )
         daemon is DaemonStatus.Running && turnRunning -> ComposerState(
-            button = SendButtonState.Stop,
-            helperRes = R.string.composer_helper_running,
-            contentDescriptionRes = R.string.cd_stop_turn,
+            button = if (hasText) SendButtonState.Send else SendButtonState.Disabled,
+            showStop = true,
         )
         !setupComplete -> ComposerState(
             button = SendButtonState.Disabled,
-            helperRes = R.string.composer_helper_setup,
+            placeholderRes = R.string.start_composer_disabled,
+            inputEnabled = false,
         )
         daemon is DaemonStatus.Stopped || daemon is DaemonStatus.Failed -> if (hasText) {
             ComposerState(

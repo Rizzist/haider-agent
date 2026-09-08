@@ -7,15 +7,24 @@ import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.settings.ACCOUNTS_KEY_FIELD_TAG
 import ai.diffforge.haider.ui.settings.AccountsScreen
 import ai.diffforge.haider.ui.state.PermissionClassifier
+import ai.diffforge.haider.ui.theme.ForgeDark
 import ai.diffforge.haider.ui.theme.ForgeTheme
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.junit4.AndroidComposeTestRule
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performTextInput
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.MainScope
 import org.junit.Assert.assertEquals
@@ -25,12 +34,14 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 /**
  * The findings that only a real device could produce, pinned so they cannot
  * come back. Each of these passed the JVM suite before the app was ever run.
  */
 @RunWith(AndroidJUnit4::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [34], qualifiers = "w412dp-h915dp-xhdpi")
 class DeviceRegressionTest {
 
@@ -57,28 +68,78 @@ class DeviceRegressionTest {
     }
 
     @Test
-    fun `validating consumes the key instead of leaving it in the field`() {
+    fun `Save keeps its filled accent once the key is typed and the keyboard closes`() {
+        // Round 5, P2: on the device the Save button went from a solid ember
+        // pill to an invisible one the moment the IME came down. Nothing about
+        // its state had changed — `enabled` was still true — so the assertion
+        // has to be about the pixels, not the flag.
         accounts()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
-        rule.onNodeWithText("Validate").performClick()
         rule.waitForIdle()
-        // "Key validated" used to leave the masked key sitting there.
-        rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).assertTextEquals("")
-        rule.onNodeWithText("Key validated.").assertExists()
-        // It was staged, so Save has something to commit without the plaintext.
-        assertTrue(repository.calls.contains("vault.stage"))
+        // Close the IME the way a person does: focus leaves the field.
+        rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performImeAction()
+        rule.runOnUiThread {
+            WindowInsetsControllerCompat(rule.activity.window, rule.activity.window.decorView)
+                .hide(WindowInsetsCompat.Type.ime())
+        }
+        rule.waitForIdle()
+
+        rule.onNodeWithText("Save").assertIsEnabled()
+        val bounds = rule.onNodeWithText("Save").fetchSemanticsNode().boundsInWindow
+        val accent = ForgeDark.accent.toArgb()
+        var filled = 0
+        var total = 0
+        val window = rule.captureWindow()
+        for (y in bounds.top.toInt() until bounds.bottom.toInt()) {
+            for (x in bounds.left.toInt() until bounds.right.toInt()) {
+                if (x !in 0 until window.width || y !in 0 until window.height) continue
+                total++
+                if (window.getPixel(x, y) == accent) filled++
+            }
+        }
+        assertTrue("the Save button was not on screen to sample", total > 0)
+        // The pill is the visual height inside a 48 dp target, so a solid fill
+        // is a third of the node, not all of it. Before the fix it was zero.
+        assertTrue(
+            "Save painted $filled accent pixels of $total: the fill is gone",
+            filled > total / 3,
+        )
+    }
+
+    @Test
+    fun `saving consumes the key instead of leaving it in the field`() {
+        accounts()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("OpenAI").performClick()
+        rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
+        rule.onNodeWithText("Save").performClick()
+        rule.waitForIdle()
+        // Staged first, then committed from that reference: the plaintext is
+        // sent once, and there is no validate-only call between them
+        // (lane 971-3, UI-14). A successful save closes the form, which is why
+        // the field is gone rather than merely empty.
+        assertEquals(1, repository.calls.count { it == "vault.stage" })
+        assertTrue(repository.calls.contains("account.login_api"))
+        assertTrue(repository.snapshot.value.accounts.any { it.provider == "openai" })
     }
 
     @Test
     fun `a validated key saves from its staged reference alone`() {
         accounts()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
-        rule.onNodeWithText("Validate").performClick()
-        rule.waitForIdle()
         rule.onNodeWithText("Save").performClick()
         rule.waitForIdle()
         assertTrue(repository.calls.contains("account.login_api"))
@@ -88,13 +149,14 @@ class DeviceRegressionTest {
     }
 
     @Test
-    fun `cancelling after validation discards the staged reference`() {
+    fun `cancelling before saving discards the key`() {
         accounts()
-        rule.onNodeWithText("Add API key").performClick()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
-        rule.onNodeWithText("Validate").performClick()
-        rule.waitForIdle()
         rule.onNodeWithText("Cancel").performClick()
         rule.waitForIdle()
         assertFalse(repository.calls.contains("account.login_api"))
@@ -183,7 +245,12 @@ class DeviceRegressionTest {
         assertFalse(viewModel.state.value.environment.notificationsPermanentlyDenied)
         assertEquals(
             0,
-            rule.onAllNodesWithTextSafe("Android will not ask again. Turn them on in app settings."),
+            rule.onAllNodes(
+                androidx.compose.ui.test.hasContentDescription(
+                    "Android will not ask again",
+                    substring = true,
+                ),
+            ).fetchSemanticsNodes().size,
         )
         // The step is still the ordinary ask, not a trip to app settings.
         assertTrue(rule.onAllNodesWithTextSafe("Let Haider notify you") > 0)
@@ -203,10 +270,27 @@ class DeviceRegressionTest {
         )
         rule.waitForIdle()
         assertTrue(viewModel.state.value.environment.notificationsPermanentlyDenied)
+        // The strip is one line; the detail reaches the screen reader (F, S2).
         assertTrue(
-            rule.onAllNodesWithTextSafe(
-                "Android will not ask again. Turn them on in app settings.",
-            ) > 0,
+            rule.onAllNodes(
+                androidx.compose.ui.test.hasContentDescription(
+                    "Android will not ask again",
+                    substring = true,
+                ),
+            ).fetchSemanticsNodes().isNotEmpty(),
         )
     }
+
+    /**
+     * Robolectric has no window to PixelCopy from, so the pixels come from the
+     * decor view drawn into a software bitmap — the same thing Roborazzi does,
+     * without depending on a record flag being set.
+     */
+    private fun AndroidComposeTestRule<*, MainActivity>.captureWindow(): Bitmap {
+        val root = activity.window.decorView
+        val bitmap = Bitmap.createBitmap(root.width, root.height, Bitmap.Config.ARGB_8888)
+        runOnUiThread { root.draw(Canvas(bitmap)) }
+        return bitmap
+    }
+
 }

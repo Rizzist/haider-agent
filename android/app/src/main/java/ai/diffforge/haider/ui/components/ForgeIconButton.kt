@@ -53,11 +53,15 @@ fun ForgeIconButton(
         contentAlignment = Alignment.Center,
     ) {
         Box(
+            // The dimming layer comes FIRST so it encloses the fill it is
+            // dimming. Placed after `.background()` the layer covers only the
+            // content, which is how the Save button ended up with a fill that
+            // ignored its own state (round 5, P2).
             modifier = Modifier
+                .alpha(if (enabled) 1f else DISABLED_ALPHA)
                 .size(ForgeSize.control)
                 .clip(CircleShape)
-                .background(background)
-                .alpha(if (enabled) 1f else DISABLED_ALPHA),
+                .background(background),
             contentAlignment = Alignment.Center,
             content = { content() },
         )

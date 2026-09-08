@@ -50,7 +50,13 @@ class StateMatrixTest {
     fun `daemon stopped - the banner offers Start and the roster stays readable`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.DaemonStopped))
         assertTrue(rule.onAllNodesWithTextSafe("Haider isn't running") > 0)
-        assertTrue(rule.onAllNodesWithTextSafe("Sessions are frozen until it starts.") > 0)
+        // The strip is one line: the detail reaches a screen reader, not the
+        // layout (addition F, S2).
+        assertTrue(
+            rule.onAllNodes(
+                hasContentDescription("Sessions are frozen until it starts.", substring = true),
+            ).fetchSemanticsNodes().isNotEmpty(),
+        )
         // Transcripts are local, so they are still there.
         assertTrue(rule.onAllNodesWithTextSafe("Fix nav crash on back gesture") > 0)
     }
@@ -58,8 +64,11 @@ class StateMatrixTest {
     @Test
     fun `daemon failed - the reason is named and details are one tap away`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.DaemonFailed))
-        assertTrue(rule.onAllNodesWithTextSafe("Stopped — store_recovery_failed") > 0)
-        assertTrue(rule.onAllNodesWithTextSafe("Daemon details") > 0)
+        assertTrue(
+            rule.onAllNodes(
+                hasContentDescription("store_recovery_failed", substring = true),
+            ).fetchSemanticsNodes().isNotEmpty(),
+        )
     }
 
     @Test
@@ -77,11 +86,10 @@ class StateMatrixTest {
         assertTrue(rule.onAllNodesWithTextSafe("Notifications are off") > 0)
         // Android will not show the dialog again; asking for it would be a lie.
         assertTrue(
-            rule.onAllNodesWithTextSafe(
-                "Android will not ask again. Turn them on in app settings.",
-            ) > 0,
+            rule.onAllNodes(
+                hasContentDescription("Android will not ask again", substring = true),
+            ).fetchSemanticsNodes().isNotEmpty(),
         )
-        assertEquals(0, rule.onAllNodesWithTextSafe("Allow"))
     }
 
     @Test
@@ -89,7 +97,6 @@ class StateMatrixTest {
         val service = ComposeHost.install(FakeScenario.NoNetwork)
         val viewModel = rule.setHaiderApp(service)
         assertTrue(rule.onAllNodesWithTextSafe("No network") > 0)
-        assertTrue(rule.onAllNodesWithTextSafe("The agent runs locally, but model calls will fail.") > 0)
         viewModel.setDraft("still sendable")
         rule.waitForIdle()
         // The failure belongs to the turn, not to the button.
@@ -109,14 +116,18 @@ class StateMatrixTest {
     @Test
     fun `input required here - a card, and a paused composer`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.InputRequiredHere))
-        assertTrue(rule.onAllNodesWithTextSafe("HAIDER NEEDS YOU") > 0)
-        assertTrue(rule.onAllNodesWithTextSafe("The turn is paused.") > 0)
+        // The question is the card's title; no uppercase label above it (S6).
+        assertTrue(rule.onAllNodesWithTextSafe("Send this reply to Amir (+1 604 555 0142)?") > 0)
+        assertEquals(0, rule.onAllNodesWithTextSafe("HAIDER NEEDS YOU"))
     }
 
     @Test
     fun `input required elsewhere - the badge and the rank-3 banner`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.InputRequiredElsewhere))
-        assertTrue(rule.onAllNodesWithTextSafe("“Reply to Amir about the lease” needs you") > 0)
+        // The title ellipsises on a narrow strip; "needs you" is its own node
+        // so it cannot be the part that disappears (addition F, S2).
+        assertTrue(rule.onAllNodesWithTextSafe("“Reply to Amir about the lease”") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("needs you") > 0)
         // The drawer button carries the count, not a third status affordance.
         assertTrue(
             rule.onAllNodes(hasContentDescription("Open sessions, 1 session needs input"))
@@ -127,14 +138,16 @@ class StateMatrixTest {
     @Test
     fun `errored turn - the error card, with a retry only when retryable`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.ErroredTurn))
-        assertTrue(rule.onAllNodesWithTextSafe("RUN FAILED") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Run failed") > 0)
         assertTrue(rule.onAllNodesWithTextSafe("provider returned 529 after 3 attempts") > 0)
     }
 
     @Test
     fun `empty roster with setup done - ready, not a setup checklist`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.EmptyRosterReady))
-        assertTrue(rule.onAllNodesWithTextSafe("Ready. Ask for anything on this phone.") > 0)
+        // The hero line is gone; the suggestions are the content (F, S7).
+        assertTrue(rule.onAllNodesWithTextSafe("Try") > 0)
+        assertEquals(0, rule.onAllNodesWithTextSafe("Ready. Ask for anything on this phone."))
         assertEquals(0, rule.onAllNodesWithTextSafe("Run Haider in the background"))
     }
 

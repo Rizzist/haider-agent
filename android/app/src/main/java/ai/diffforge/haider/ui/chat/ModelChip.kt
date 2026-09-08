@@ -38,19 +38,18 @@ fun ModelChip(
 ) {
     val colors = Forge.colors
     val type = Forge.type
-    val label = stringResource(R.string.chip_model_label)
 
     when (state) {
         is ModelChipState.Resolved -> {
-            val value = listOfNotNull(state.shortModel, state.effort).joinToString(" · ")
+            // The value is the label. "MODEL Sonnet 4.5 · high" said the same
+            // thing three times; the effort has its own chip (addition F, S5).
             ForgeChip(
                 onClick = onOpenModel,
                 modifier = modifier,
                 contentDescription = "${stringResource(R.string.cd_change_model)}, ${state.fullModel}",
             ) {
-                Text(label, style = type.label, color = colors.textMuted)
                 Text(
-                    value,
+                    state.shortModel,
                     style = type.chip,
                     color = colors.textSoft,
                     maxLines = 1,
@@ -70,7 +69,6 @@ fun ModelChip(
             modifier = modifier,
             contentDescription = stringResource(R.string.chip_model_loading_cd),
         ) {
-            Text(label, style = type.label, color = colors.textMuted)
             Skeleton(width = ForgeSpace.huge * 2)
         }
 
@@ -94,7 +92,6 @@ fun ModelChip(
             modifier = modifier,
             contentDescription = stringResource(R.string.chip_model_no_daemon),
         ) {
-            Text(label, style = type.label, color = colors.textMuted)
             Text(
                 stringResource(R.string.chip_model_no_daemon),
                 style = type.chip,
@@ -108,7 +105,6 @@ fun ModelChip(
             modifier = modifier,
             contentDescription = stringResource(R.string.cd_change_model),
         ) {
-            Text(label, style = type.label, color = colors.textMuted)
             Text(stringResource(R.string.chip_model_changing), style = type.chip, color = colors.textSoft)
         }
     }

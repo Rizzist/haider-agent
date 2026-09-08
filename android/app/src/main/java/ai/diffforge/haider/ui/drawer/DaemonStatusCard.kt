@@ -2,8 +2,7 @@ package ai.diffforge.haider.ui.drawer
 
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.daemon.DaemonStatus
-import ai.diffforge.haider.ui.components.ForgeButton
-import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.components.ForgeIconButton
 import ai.diffforge.haider.ui.components.StateDot
 import ai.diffforge.haider.ui.state.RelativeTime
 import ai.diffforge.haider.ui.theme.Forge
@@ -11,15 +10,19 @@ import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -42,16 +45,17 @@ import androidx.compose.ui.text.style.TextOverflow
  * source is unknown is *omitted* rather than printed as `0`
  * (UI-SPEC 3.3.2, traps 6.6.5 and 6.6.7).
  */
+/**
+ * One line: a dot, a word, and a single icon button (addition F, D2).
+ *
+ * The card used to carry the whole resource line — sessions, active turns,
+ * megabytes, uptime — in a drawer whose job is to list sessions. Those numbers
+ * are diagnostics, so they moved to Settings -> Daemon, where somebody looking
+ * for them will actually look.
+ */
 @Composable
-fun DaemonStatusCard(
+fun DaemonStatusRow(
     status: DaemonStatus,
-    activeTurns: Int,
-    /**
-     * `SystemClock.elapsedRealtime()`, **not** wall-clock time: the service's
-     * `startedAtElapsedRealtimeMs` is monotonic, and subtracting it from a Unix
-     * timestamp produces an uptime of about fifty-seven years.
-     */
-    elapsedRealtimeMs: Long,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onOpenDetails: () -> Unit,
@@ -59,61 +63,63 @@ fun DaemonStatusCard(
 ) {
     val colors = Forge.colors
     val type = Forge.type
-    val running = status as? DaemonStatus.Running
-
-    Column(
+    Row(
         modifier = modifier
             .fillMaxWidth()
-            .clip(ForgeShapes.card)
-            .background(colors.surfaceRaised)
-            .border(ForgeSize.hairline, colors.border, ForgeShapes.card)
+            .heightIn(min = ForgeSize.touch)
+            .clip(ForgeShapes.row)
             .clickable(onClick = onOpenDetails)
-            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.lg)
+            .padding(horizontal = ForgeSpace.lg)
             .semantics { liveRegion = LiveRegionMode.Polite },
-        verticalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            StateDot(
-                when (status) {
-                    is DaemonStatus.Running -> colors.green
-                    DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping -> colors.amber
-                    DaemonStatus.Stopped -> colors.textMuted
-                    is DaemonStatus.Failed -> colors.red
-                },
-            )
-            Text(
-                phrase(status),
-                style = type.sessionTitle,
-                color = colors.text,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(start = ForgeSpace.md),
-            )
+        StateDot(
             when (status) {
-                is DaemonStatus.Running -> ForgeButton(
-                    text = stringResource(R.string.daemon_action_stop),
-                    onClick = onStop,
-                    kind = ForgeButtonKind.Ghost,
-                    minHeight = ForgeSize.bannerAction,
+                is DaemonStatus.Running -> colors.green
+                DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping -> colors.amber
+                DaemonStatus.Stopped -> colors.textMuted
+                is DaemonStatus.Failed -> colors.red
+            },
+        )
+        Text(
+            phrase(status),
+            style = type.sessionTitle,
+            color = colors.text,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = ForgeSpace.md),
+        )
+        when (status) {
+            is DaemonStatus.Running -> ForgeIconButton(
+                onClick = onStop,
+                contentDescription = stringResource(R.string.daemon_action_stop),
+            ) {
+                Icon(
+                    Icons.Rounded.Stop,
+                    contentDescription = null,
+                    tint = colors.textSoft,
+                    modifier = Modifier.size(ForgeSize.iconSm),
                 )
-                DaemonStatus.Stopped, is DaemonStatus.Failed -> ForgeButton(
-                    text = stringResource(R.string.daemon_action_start),
-                    onClick = onStart,
-                    kind = ForgeButtonKind.Filled,
-                    minHeight = ForgeSize.bannerAction,
+            }
+            DaemonStatus.Stopped, is DaemonStatus.Failed -> ForgeIconButton(
+                onClick = onStart,
+                contentDescription = stringResource(R.string.daemon_action_start),
+                background = colors.accentWash,
+            ) {
+                Icon(
+                    Icons.Rounded.PlayArrow,
+                    contentDescription = null,
+                    tint = colors.accent,
+                    modifier = Modifier.size(ForgeSize.iconSm),
                 )
-                DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping ->
-                    CircularProgressIndicator(
+            }
+            DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping ->
+                CircularProgressIndicator(
                     modifier = Modifier.size(ForgeSize.iconSm),
                     color = colors.amber,
                 )
-            }
-        }
-        val line = resourceLine(running, activeTurns, elapsedRealtimeMs)
-        if (line.isNotEmpty()) {
-            Text(line, style = type.numeric, color = colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -128,7 +134,10 @@ private fun phrase(status: DaemonStatus): String = when (status) {
     is DaemonStatus.Failed -> stringResource(R.string.daemon_failed, status.reason)
 }
 
-/** Each segment appears only when its source is known. */
+/**
+ * Each segment appears only when its source is known. Settings owns this line
+ * now; the drawer shows the state word alone (addition F, D2/T1).
+ */
 @Composable
 fun resourceLine(
     running: DaemonStatus.Running?,

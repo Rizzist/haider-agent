@@ -25,8 +25,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import ai.diffforge.haider.ui.components.ForgeChip
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.ArrowUpward
@@ -68,19 +66,18 @@ import androidx.compose.ui.text.style.TextOverflow
  */
 @Composable
 fun Composer(
+    showPickers: Boolean = true,
     text: String,
     onTextChange: (String) -> Unit,
     composer: ComposerState,
     chip: ModelChipState,
     contextTokens: Long?,
     contextExact: Boolean?,
-    provider: String?,
     effort: String?,
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStartDaemon: () -> Unit,
     onOpenModel: () -> Unit,
-    onOpenProvider: () -> Unit,
     onOpenEffort: () -> Unit,
     onRetryModels: () -> Unit,
     onAttach: () -> Unit,
@@ -96,25 +93,17 @@ fun Composer(
             .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.md),
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
     ) {
-        // Provider / model / effort, like the desktop composer's chips row
-        // (SessionComposer.jsx). Each opens a sheet; each is a shortcut with a
-        // full-size equivalent in the drawer footer and the model sheet.
+        // Two compact chips, no labels, and no horizontal scroll: they fit one
+        // row at 360 dp. The provider is folded into the model sheet, which is
+        // grouped by provider anyway (addition F, S5).
+        if (showPickers) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = ForgeSize.contextRow)
-                .horizontalScroll(rememberScrollState()),
+                .heightIn(min = ForgeSize.contextRow),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
         ) {
-            if (provider != null) {
-                ValueChip(
-                    labelRes = R.string.chip_provider_label,
-                    value = provider,
-                    contentDescription = stringResource(R.string.cd_change_provider),
-                    onClick = onOpenProvider,
-                )
-            }
             ModelChip(
                 state = chip,
                 onOpenModel = onOpenModel,
@@ -123,12 +112,12 @@ fun Composer(
             )
             if (effort != null) {
                 ValueChip(
-                    labelRes = R.string.chip_effort_label,
                     value = effort,
                     contentDescription = stringResource(R.string.cd_change_effort),
                     onClick = onOpenEffort,
                 )
             }
+            Box(Modifier.weight(1f))
             // Absent means unknown: no segment rather than a printed zero.
             ModelNames.tokens(contextTokens)?.let { tokens ->
                 Text(
@@ -137,11 +126,12 @@ fun Composer(
                     } else {
                         stringResource(R.string.composer_context_estimated, tokens)
                     },
-                    style = type.numeric,
+                    style = type.sessionMeta,
                     color = colors.textMuted,
                     maxLines = 1,
                 )
             }
+        }
         }
 
         Row(
@@ -197,11 +187,23 @@ fun Composer(
                     }
                 },
             )
-            SendControl(
-                composer = composer,
-                onSend = onSend,
-                onStop = onStop,
-            )
+            // Stop sits beside Send, never instead of it, and only when the
+            // snapshot names the run.
+            if (composer.showStop) {
+                ForgeIconButton(
+                    onClick = onStop,
+                    contentDescription = stringResource(R.string.cd_stop_turn),
+                    background = colors.red.copy(alpha = 0.16f),
+                ) {
+                    Icon(
+                        Icons.Rounded.Stop,
+                        contentDescription = null,
+                        tint = colors.red,
+                        modifier = Modifier.size(ForgeSize.iconSm),
+                    )
+                }
+            }
+            SendControl(composer = composer, onSend = onSend)
         }
 
         composer.helperRes?.let { helper ->
@@ -219,10 +221,9 @@ fun Composer(
     }
 }
 
-/** One labelled value chip: PROVIDER anthropic, EFFORT high. */
+/** A compact value chip: `high ▾`. The label is the value. */
 @Composable
 private fun ValueChip(
-    labelRes: Int,
     value: String,
     contentDescription: String,
     onClick: () -> Unit,
@@ -230,7 +231,6 @@ private fun ValueChip(
     val colors = Forge.colors
     val type = Forge.type
     ForgeChip(onClick = onClick, contentDescription = "$contentDescription, $value") {
-        Text(stringResource(labelRes), style = type.label, color = colors.textMuted)
         Text(
             value,
             style = type.chip,
@@ -248,11 +248,7 @@ private fun ValueChip(
 }
 
 @Composable
-private fun SendControl(
-    composer: ComposerState,
-    onSend: () -> Unit,
-    onStop: () -> Unit,
-) {
+private fun SendControl(composer: ComposerState, onSend: () -> Unit) {
     val colors = Forge.colors
     if (composer.button == SendButtonState.Starting) {
         Box(Modifier.size(ForgeSize.touch), contentAlignment = Alignment.Center) {
@@ -263,70 +259,19 @@ private fun SendControl(
         }
         return
     }
-    val stopping = composer.button == SendButtonState.Stop
-    val background = when {
-        stopping -> colors.red.copy(alpha = 0.16f)
-        composer.button.enabled -> colors.accent
-        else -> colors.surfaceControl
-    }
     ForgeIconButton(
-        onClick = if (stopping) onStop else onSend,
+        onClick = onSend,
         contentDescription = stringResource(composer.contentDescriptionRes),
         enabled = composer.button.enabled,
-        background = background,
+        background = if (composer.button.enabled) colors.accent else colors.surfaceControl,
     ) {
         Icon(
-            if (stopping) Icons.Rounded.Stop else Icons.Rounded.ArrowUpward,
+            Icons.Rounded.ArrowUpward,
             contentDescription = null,
             // A filled accent surface takes accentInk, never Color.White: white
             // on the 971 ember accent is 2.64:1 in dark (UI-SPEC 2.1).
-            tint = when {
-                stopping -> colors.red
-                composer.button.enabled -> colors.accentInk
-                else -> colors.textDisabled
-            },
+            tint = if (composer.button.enabled) colors.accentInk else colors.textDisabled,
             modifier = Modifier.size(ForgeSize.iconSm),
         )
-    }
-}
-
-/**
- * The sticky stop chip that floats above the composer while a turn streams.
- *
- * The chip is 28 dp, as UI-SPEC 3.5 draws it, but the *target* is a full 48 dp
- * box around it. It is not one of the three sanctioned sub-48 shortcuts, so it
- * does not get to be one: the pixels stay small and the touch area does not.
- */
-@Composable
-fun StickyStopChip(onStop: () -> Unit, modifier: Modifier = Modifier) {
-    val colors = Forge.colors
-    val type = Forge.type
-    val stopLabel = stringResource(R.string.cd_stop_turn)
-    Box(
-        modifier = modifier
-            .heightIn(min = ForgeSize.touch)
-            .clip(ForgeShapes.pill)
-            .clickable(onClick = onStop)
-            .semantics { contentDescription = stopLabel; role = Role.Button },
-        contentAlignment = Alignment.Center,
-    ) {
-        Row(
-            modifier = Modifier
-                .height(ForgeSize.stopChip)
-                .clip(ForgeShapes.pill)
-                .background(colors.red.copy(alpha = 0.16f))
-                .border(ForgeSize.hairline, colors.red.copy(alpha = 0.5f), ForgeShapes.pill)
-                .padding(horizontal = ForgeSpace.lg),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
-        ) {
-            Icon(
-                Icons.Rounded.Stop,
-                contentDescription = null,
-                tint = colors.red,
-                modifier = Modifier.size(ForgeSize.iconSm),
-            )
-            Text(stringResource(R.string.action_stop_turn), style = type.chip, color = colors.red)
-        }
     }
 }

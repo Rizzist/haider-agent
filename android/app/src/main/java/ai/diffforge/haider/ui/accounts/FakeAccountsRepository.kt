@@ -25,7 +25,21 @@ class FakeAccountsRepository(
 ) : AccountsRepository {
 
     private val _providers = MutableStateFlow(defaultProviders)
-    private val _snapshot = MutableStateFlow(AccountsSnapshot(revision = 1, accounts = seed))
+    private val _snapshot = MutableStateFlow(AccountsSnapshot(revision = SEED_REVISION, accounts = seed))
+
+    /**
+     * The fake owns an authoritative fixture, so it always knows its revision
+     * and never has to invent one. A production snapshot that states none stays
+     * null; this is the one place where a known revision may be incremented
+     * (lane 971-3 handoff, UI-12).
+     */
+    /** Set to make the vault refuse for a reason that is not the key. */
+    var stagingUnavailable = false
+
+    private val stagedLengths = mutableMapOf<String, Int>()
+
+    private fun nextRevision(current: AccountsSnapshot): Long =
+        (current.revision ?: SEED_REVISION) + 1
     private val _loadError = MutableStateFlow<String?>(null)
 
     override val providers: StateFlow<List<ProviderDescriptor>> = _providers.asStateFlow()
@@ -56,10 +70,7 @@ class FakeAccountsRepository(
         replaceExisting: Boolean,
     ): AccountResult {
         calls += AccountsRpcAdapter.METHOD_VAULT_STAGE
-        when (val validated = validateApiKey(provider, apiKey)) {
-            is AccountResult.Failed -> return validated
-            AccountResult.Ok -> Unit
-        }
+        if (apiKey.size < MIN_KEY_LENGTH) return AccountResult.Failed("invalid_api_key")
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_LOGIN_API
         nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
         val resolvedAlias = alias?.takeIf { it.isNotBlank() } ?: provider
@@ -68,7 +79,7 @@ class FakeAccountsRepository(
             return AccountResult.Failed("account_exists")
         }
         _snapshot.value = AccountsSnapshot(
-            revision = current.revision + 1,
+            revision = nextRevision(current),
             accounts = current.accounts.filterNot { it.alias == resolvedAlias } + Account(
                 alias = resolvedAlias,
                 provider = provider,
@@ -85,10 +96,15 @@ class FakeAccountsRepository(
 
     override suspend fun stageApiKey(apiKey: CharArray): String? {
         calls += AccountsRpcAdapter.METHOD_VAULT_STAGE
-        if (apiKey.size < MIN_KEY_LENGTH) return null
+        // Staging does not look at the key. A null here means the vault could
+        // not take it — connection, expiry, capacity — never "invalid key"
+        // (lane 971-3, UI-13).
+        if (stagingUnavailable) return null
         // The daemon returns an opaque handle; the bytes stay behind.
-        staged["vaultref-${apiKey.size}"] = "••••" + String(apiKey).takeLast(4)
-        return "vaultref-${apiKey.size}"
+        val reference = "vaultref-${apiKey.size}"
+        staged[reference] = "••••" + String(apiKey).takeLast(4)
+        stagedLengths[reference] = apiKey.size
+        return reference
     }
 
     override suspend fun commitStagedApiKey(
@@ -100,13 +116,17 @@ class FakeAccountsRepository(
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_LOGIN_API
         nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
         val hint = staged[vaultReference] ?: return AccountResult.Failed("unknown_vault_reference")
+        // login_api is where a key is actually checked (contracts-v1).
+        if (stagedLengths[vaultReference].let { it != null && it < MIN_KEY_LENGTH }) {
+            return AccountResult.Failed("invalid_api_key")
+        }
         val resolvedAlias = alias?.takeIf { it.isNotBlank() } ?: provider
         val current = _snapshot.value
         if (!replaceExisting && current.accounts.any { it.alias == resolvedAlias }) {
             return AccountResult.Failed("account_exists")
         }
         _snapshot.value = AccountsSnapshot(
-            revision = current.revision + 1,
+            revision = nextRevision(current),
             accounts = current.accounts.filterNot { it.alias == resolvedAlias } + Account(
                 alias = resolvedAlias,
                 provider = provider,
@@ -120,15 +140,17 @@ class FakeAccountsRepository(
         return AccountResult.Ok
     }
 
+    // Not "if it looks long enough, it is valid": there is no validate-only
+    // call to be a fake of (lane 971-3 handoff, UI-14).
     override suspend fun validateApiKey(provider: String, apiKey: CharArray): AccountResult =
-        if (apiKey.size < MIN_KEY_LENGTH) AccountResult.Failed("invalid_api_key") else AccountResult.Ok
+        AccountResult.Failed(VALIDATE_ONLY_UNAVAILABLE)
 
     override suspend fun remove(alias: String): AccountResult {
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_REMOVE
         nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
         val current = _snapshot.value
         _snapshot.value = AccountsSnapshot(
-            revision = current.revision + 1,
+            revision = nextRevision(current),
             accounts = current.accounts.filterNot { it.alias == alias },
         )
         return AccountResult.Ok
@@ -138,7 +160,7 @@ class FakeAccountsRepository(
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_SET_ACTIVE
         val current = _snapshot.value
         _snapshot.value = AccountsSnapshot(
-            revision = current.revision + 1,
+            revision = nextRevision(current),
             accounts = current.accounts.map { it.copy(active = it.alias == alias) },
         )
         return AccountResult.Ok
@@ -195,7 +217,7 @@ class FakeAccountsRepository(
         nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
         val current = _snapshot.value
         _snapshot.value = AccountsSnapshot(
-            revision = current.revision + 1,
+            revision = nextRevision(current),
             accounts = current.accounts.filterNot { it.alias == flow.alias } + Account(
                 alias = flow.alias,
                 provider = flow.provider,
@@ -218,6 +240,10 @@ class FakeAccountsRepository(
         _snapshot.value.accounts.any { it.provider == provider && it.alias == alias }
 
     companion object {
+        /** The installed fixture's own revision; never a stand-in for absence. */
+        const val SEED_REVISION = 1L
+        const val VALIDATE_ONLY_UNAVAILABLE = "validate_only_unavailable"
+
         const val MIN_KEY_LENGTH = 12
 
         val defaultProviders = listOf(

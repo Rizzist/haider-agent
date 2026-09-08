@@ -22,7 +22,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudOff
 import androidx.compose.material.icons.rounded.ErrorOutline
@@ -41,7 +44,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.semantics.traversalIndex
 import ai.diffforge.haider.ui.components.ForgeIconButton
 
@@ -72,53 +79,70 @@ fun StatusBanner(
     Column(
         modifier
             .fillMaxWidth()
-            .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.md)
+            .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.sm)
             // Announced before the transcript when it appears (UI-SPEC 4.2).
             .semantics {
                 liveRegion = LiveRegionMode.Polite
                 traversalIndex = -1f
             },
     ) {
+        // One line, 48 dp: glyph, what it is, and a chevron if tapping does
+        // something. The three-line body and the wide Open button said the same
+        // thing at four times the height (addition F, S2).
+        val actionable = model.action != null
+        val spoken = resolveLabel(model)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(ForgeShapes.card)
+                .heightIn(min = ForgeSize.touch)
+                .clip(ForgeShapes.row)
                 .background(colors.surfaceRaised)
-                .border(ForgeSize.hairline, tint.copy(alpha = 0.55f), ForgeShapes.card)
-                .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.lg),
+                .border(ForgeSize.hairline, tint.copy(alpha = 0.45f), ForgeShapes.row)
+                .then(
+                    if (actionable) {
+                        Modifier
+                            .clickable { onAction(model.action!!) }
+                            .semantics {
+                                contentDescription = spoken
+                                role = Role.Button
+                            }
+                    } else {
+                        Modifier
+                    },
+                )
+                .padding(horizontal = ForgeSpace.lg),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
         ) {
             Icon(
                 icon(model),
                 contentDescription = null,
                 tint = tint,
-                modifier = Modifier.size(ForgeSize.icon),
+                modifier = Modifier.size(ForgeSize.iconSm),
             )
-            Column(Modifier.weight(1f)) {
-                Text(resolve(model.title), style = type.banner, color = colors.text)
-                model.detail?.let {
-                    Text(resolve(it), style = type.toolRow, color = colors.textMuted)
-                }
-                if (model.secondaryAction != null && model.secondaryLabel != null) {
-                    Text(
-                        resolve(model.secondaryLabel),
-                        style = type.toolRow,
-                        color = colors.accent,
-                        modifier = Modifier
-                            .padding(top = ForgeSpace.xs)
-                            .clip(ForgeShapes.pill),
-                    )
-                }
+            Text(
+                resolve(model.title),
+                style = type.sessionTitle,
+                color = colors.text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            model.suffix?.let {
+                Text(
+                    resolve(it),
+                    style = type.sessionMeta,
+                    color = colors.textSoft,
+                    maxLines = 1,
+                )
             }
-            if (model.action != null && model.actionLabel != null) {
-                ForgeButton(
-                    text = resolve(model.actionLabel),
-                    onClick = { onAction(model.action) },
-                    kind = if (model.filledAction) ForgeButtonKind.Filled else ForgeButtonKind.Ghost,
-                    // The one sanctioned sub-48 dp control height; every banner
-                    // action has a full-size equivalent in Settings (UI-SPEC 4.3).
-                    minHeight = ForgeSize.bannerAction,
+            Box(Modifier.weight(1f))
+            if (actionable) {
+                Icon(
+                    Icons.Rounded.ChevronRight,
+                    contentDescription = null,
+                    tint = tint,
+                    modifier = Modifier.size(ForgeSize.iconSm),
                 )
             }
             if (model.dismissible) {
@@ -146,6 +170,15 @@ fun StatusBanner(
         }
     }
 }
+
+/** What the strip announces: its title, plus its detail for the screen reader. */
+@Composable
+private fun resolveLabel(model: BannerModel): String = listOfNotNull(
+    resolve(model.title),
+    model.suffix?.let { resolve(it) },
+    model.detail?.let { resolve(it) },
+    model.actionLabel?.let { resolve(it) },
+).joinToString(". ")
 
 @Composable
 private fun resolve(text: BannerText): String = when {

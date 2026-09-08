@@ -7,6 +7,7 @@ import ai.diffforge.haider.ui.daemon.RosterPaging
 import ai.diffforge.haider.ui.daemon.SearchIndexState
 import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.SearchOutcome
+import ai.diffforge.haider.ui.daemon.ShellAvailability
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.TurnCancel
 import ai.diffforge.haider.transport.SessionConfig
@@ -82,6 +83,8 @@ object SetupPlan {
 data class AppUiState(
     val daemon: DaemonStatus = DaemonStatus.Stopped,
     val environment: DaemonEnvironment = DaemonEnvironment(),
+    /** Android-side permission facts the Activity observed (verify-6 O3). */
+    val permissions: PermissionSnapshot = PermissionSnapshot(),
     val sessions: List<SessionRow> = emptyList(),
     val paging: RosterPaging = RosterPaging(),
     val activeSessionId: String? = null,
@@ -91,6 +94,8 @@ data class AppUiState(
     val catalogError: String? = null,
     val catalogRequestedAtMs: Long? = null,
     val selectionBusy: Boolean = false,
+    /** A selection the daemon refused, with what it would take to retry. */
+    val selectionRefusal: SelectionRefusal? = null,
     val overlay: Overlay = Overlay.None,
     val filter: SessionFilter = SessionFilter.All,
     val query: String = "",
@@ -105,6 +110,9 @@ data class AppUiState(
     val providers: ProviderInventory = ProviderInventory(),
     /** Non-null exactly while the drawer is open, freezing the rendered order. */
     val orderSnapshot: SessionListState.OrderSnapshot? = null,
+    /** Chat or Shell, per addition E's segmented switch. */
+    val viewTab: SessionViewTab = SessionViewTab.Chat,
+    val shell: ShellAvailability = ShellAvailability(),
     val answeredElsewhere: Set<String> = emptySet(),
 ) {
     val activeSession: SessionRow?
@@ -155,3 +163,21 @@ data class AppUiState(
 }
 
 enum class AttentionBadgeKind { None, NeedsInput, Running, Errored }
+
+/** The session surface's tabs. No Traj on a phone. */
+enum class SessionViewTab { Chat, Shell }
+
+/**
+ * The daemon refused a model or effort change.
+ *
+ * Round 4 wrapped both calls in `runCatching` and dropped the result, so a
+ * refusal — a required confirmation, a lost connection — looked like a change
+ * that had happened. The refusal is held here until a person answers it, and
+ * only their answer sets `confirm_new_epoch` (lane 971-3 handoff).
+ */
+data class SelectionRefusal(
+    val code: String,
+    val provider: String? = null,
+    val model: String? = null,
+    val effort: String? = null,
+)

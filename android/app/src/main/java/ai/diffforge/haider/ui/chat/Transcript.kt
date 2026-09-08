@@ -1,5 +1,6 @@
 package ai.diffforge.haider.ui.chat
 
+import ai.diffforge.haider.ui.state.RelativeTime
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.components.ForgeButton
@@ -161,7 +162,6 @@ private fun AgentTurn(message: Message, onRetry: () -> Unit) {
                 if (message.thinking.isNotEmpty()) ThinkingFold(message)
                 if (message.tools.isNotEmpty()) ToolCluster(message.id, message.tools, message.streaming)
                 if (message.text.isNotEmpty() || message.streaming) AssistantProse(message)
-                if (message.streaming && !message.status.isNullOrBlank()) LiveStatus(message.status)
                 message.error?.let { ErrorCard(it, message.errorRetryable, onRetry) }
             }
         }
@@ -207,25 +207,16 @@ private fun ThinkingFold(message: Message) {
                 tint = colors.ember,
                 modifier = Modifier.size(ForgeSize.iconMd),
             )
-            Text("Thinking", style = type.toolRow, color = colors.textMuted)
+            Text("Thinking", style = type.sessionMeta, color = colors.textMuted)
         }
         if (expanded) {
             Text(
                 message.thinking,
                 style = type.thinking,
                 color = colors.textMuted,
-                modifier = Modifier
-                    .padding(start = ForgeSpace.md, top = ForgeSpace.xs)
-                    .drawBehind {
-                        val stroke = ForgeSpace.xxs.toPx()
-                        drawLine(
-                            color = colors.ember.copy(alpha = 0.45f),
-                            start = Offset(stroke / 2f, 0f),
-                            end = Offset(stroke / 2f, size.height),
-                            strokeWidth = stroke,
-                        )
-                    }
-                    .padding(start = ForgeSpace.lg),
+                // The disclosure already marks this as thinking; the accent
+                // bar and the double indent were decoration (addition F, S4).
+                modifier = Modifier.padding(top = ForgeSpace.xs),
             )
         }
     }
@@ -247,32 +238,42 @@ private fun ToolCluster(messageId: Long, tools: List<ToolCall>, streaming: Boole
             .background(colors.surface)
             .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable { expanded = !expanded }
-                .minimumInteractiveComponentSize()
-                .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.KeyboardArrowRight,
-                contentDescription = if (expanded) "Collapse tool calls" else "Expand tool calls",
-                tint = colors.textMuted,
-                modifier = Modifier.size(ForgeSize.iconSm),
-            )
-            Spacer(Modifier.width(ForgeSpace.xs))
-            Text(
-                if (tools.size == 1) "1 tool call" else "${tools.size} tool calls",
-                style = type.toolRow,
-                color = colors.textSoft,
-            )
-            Spacer(Modifier.weight(1f))
-            ToolSummaryTags(tools)
+        // One call is one row. A "1 tool call / 1 RUNNING" header above a
+        // single row said the same thing twice and made the count a headline
+        // (addition F, S3). The count header earns its place from two.
+        if (tools.size > 1) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .minimumInteractiveComponentSize()
+                    .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.KeyboardArrowRight,
+                    contentDescription = if (expanded) "Collapse tool calls" else "Expand tool calls",
+                    tint = colors.textMuted,
+                    modifier = Modifier.size(ForgeSize.iconSm),
+                )
+                Spacer(Modifier.width(ForgeSpace.xs))
+                Text(
+                    "${tools.size} tool calls",
+                    style = type.sessionMeta,
+                    color = colors.textSoft,
+                )
+            }
         }
-        if (expanded) {
+        if (expanded || tools.size == 1) {
             tools.forEachIndexed { index, tool ->
-                if (index > 0) Box(Modifier.fillMaxWidth().background(colors.border).size(width = ForgeSize.hairline, height = ForgeSize.hairline))
+                if (index > 0) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(colors.border)
+                            .size(width = ForgeSize.hairline, height = ForgeSize.hairline),
+                    )
+                }
                 ToolRow(tool)
             }
         }
@@ -308,10 +309,26 @@ private fun ToolRow(tool: ToolCall) {
             } else {
                 Spacer(Modifier.weight(1f))
             }
+            // A finished call says how long it took, in the row itself, and
+            // only when the daemon supplied the number (S3, verify-6 O8).
+            tool.durationMs?.takeIf { tool.status != ToolStatus.Running }?.let {
+                Spacer(Modifier.width(ForgeSpace.md))
+                Text(
+                    RelativeTime.elapsed(it),
+                    style = type.sessionMeta,
+                    color = colors.textMuted,
+                    maxLines = 1,
+                )
+            }
             Spacer(Modifier.width(ForgeSpace.md))
+            // A dot and a lowercase word, not a bordered pill (addition F, G3).
             Box(Modifier.size(ForgeSize.stateDot).clip(CircleShape).background(toolStatusColor(tool.status)))
             Spacer(Modifier.width(ForgeSpace.xs))
-            Text(tool.status.label.uppercase(), style = type.label, color = toolStatusColor(tool.status))
+            Text(
+                tool.status.label.lowercase(),
+                style = type.sessionMeta,
+                color = toolStatusColor(tool.status),
+            )
         }
         if (detailOpen && !tool.result.isNullOrBlank()) {
             val result = remember(tool.result) { prettyToolResult(tool.result) }
@@ -330,18 +347,6 @@ private fun ToolRow(tool: ToolCall) {
                     .padding(ForgeSpace.md),
             )
         }
-    }
-}
-
-@Composable
-private fun LiveStatus(status: String) {
-    val colors = Forge.colors
-    val type = Forge.type
-    val alpha = if (motionEnabled()) pulsingStatusAlpha() else 1f
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(ForgeSize.stateDot).clip(CircleShape).background(colors.amber.copy(alpha = alpha)))
-        Spacer(Modifier.width(ForgeSpace.md))
-        Text(status, style = type.toolRow, color = colors.textMuted)
     }
 }
 
@@ -377,7 +382,8 @@ private fun ErrorCard(message: String, retryable: Boolean, onRetry: () -> Unit) 
             }
             .padding(start = ForgeSpace.lg, end = ForgeSpace.lg, top = ForgeSpace.md, bottom = ForgeSpace.md),
     ) {
-        Text("RUN FAILED", style = type.label, color = colors.red)
+        // State is a word, not a badge shout (addition F, G2/G3).
+        Text("Run failed", style = type.sessionTitle, color = colors.red)
         Spacer(Modifier.size(ForgeSpace.xxs))
         Text(message, style = type.userBody, color = colors.chatText)
         // ChatReply.Error.retryable was parsed and thrown away in 970.
@@ -429,29 +435,6 @@ private fun toolStatusColor(status: ToolStatus): Color {
         ToolStatus.Failed, ToolStatus.Rejected -> colors.red
         ToolStatus.Conflict -> colors.amber
         ToolStatus.Cancelled, ToolStatus.Unknown -> colors.textMuted
-    }
-}
-
-@Composable
-private fun ToolSummaryTags(tools: List<ToolCall>) {
-    val colors = Forge.colors
-    val type = Forge.type
-    val tags = listOf(
-        Triple(tools.count { it.status == ToolStatus.Completed }, "OK", colors.green),
-        Triple(
-            tools.count { it.status in setOf(ToolStatus.Failed, ToolStatus.Rejected) },
-            "FAILED",
-            colors.red,
-        ),
-        Triple(tools.count { it.status == ToolStatus.Running }, "RUNNING", colors.amber),
-        Triple(tools.count { it.status == ToolStatus.Conflict }, "CONFLICT", colors.amber),
-        Triple(tools.count { it.status == ToolStatus.Cancelled }, "CANCELLED", colors.textMuted),
-        Triple(tools.count { it.status == ToolStatus.Unknown }, "UNKNOWN", colors.textMuted),
-    ).filter { it.first > 0 }
-    Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm)) {
-        tags.forEach { (count, label, color) ->
-            Text("$count $label", style = type.label, color = color, maxLines = 1)
-        }
     }
 }
 

@@ -154,7 +154,6 @@ data class ForgeType(
     val label: TextStyle,
     val h1: TextStyle,
     val h4: TextStyle,
-    val statusPill: TextStyle,
     val sessionTitle: TextStyle,
     val sessionMeta: TextStyle,
     val drawerSection: TextStyle,
@@ -173,7 +172,6 @@ val ForgeTypography = ForgeType(
     label = TextStyle(fontFamily = FontFamily.Default, fontSize = 10.sp, lineHeight = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.6.sp),
     h1 = TextStyle(fontFamily = FontFamily.Default, fontSize = 19.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold),
     h4 = TextStyle(fontFamily = FontFamily.Default, fontSize = 16.sp, lineHeight = 21.sp, fontWeight = FontWeight.SemiBold),
-    statusPill = TextStyle(fontFamily = FontFamily.Default, fontSize = 11.sp, lineHeight = 13.sp, fontWeight = FontWeight.Bold),
     sessionTitle = TextStyle(fontFamily = FontFamily.Default, fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
     sessionMeta = TextStyle(fontFamily = FontFamily.Default, fontSize = 12.sp, lineHeight = 16.sp, fontWeight = FontWeight.Normal),
     drawerSection = TextStyle(

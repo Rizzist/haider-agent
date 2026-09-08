@@ -35,14 +35,22 @@ data class BannerModel(
     val severity: BannerSeverity,
     val title: BannerText,
     val detail: BannerText?,
-    val actionLabel: BannerText? = null,
+    /**
+     * Text pinned to the end of the strip. The title ellipsises when the
+     * session name is long; the suffix is the part that must survive, so it is
+     * its own node rather than the tail of one string (addition F, S2).
+     */
+    val suffix: BannerText? = null,
     val action: BannerAction? = null,
-    val filledAction: Boolean = false,
+    /**
+     * What tapping the strip does. The one-line strip has no button to print it
+     * on, so it is spoken rather than drawn — TalkBack still hears "Start
+     * Haider" where a sighted user reads a chevron (addition F, S2).
+     */
+    val actionLabel: BannerText? = null,
     val dismissible: Boolean = false,
     /** Rank 2 draws a 2 dp indeterminate progress line under the banner. */
     val progress: Boolean = false,
-    val secondaryLabel: BannerText? = null,
-    val secondaryAction: BannerAction? = null,
 )
 
 /** Which other session is asking for a human, if any. */
@@ -115,20 +123,16 @@ object BannerResolver {
                 severity = BannerSeverity.Error,
                 title = BannerText.of(R.string.banner_stopped_title),
                 detail = BannerText.of(R.string.daemon_failed, daemon.reason),
-                actionLabel = BannerText.of(R.string.banner_stopped_action),
                 action = BannerAction.StartDaemon,
-                filledAction = true,
-                secondaryLabel = BannerText.of(R.string.banner_daemon_details_action),
-                secondaryAction = BannerAction.OpenDaemonDetails,
+                actionLabel = BannerText.of(R.string.banner_stopped_action),
             )
             DaemonStatus.Stopped -> if (!inputs.firstRun) out += BannerModel(
                 rank = 1,
                 severity = BannerSeverity.Error,
                 title = BannerText.of(R.string.banner_stopped_title),
                 detail = BannerText.of(R.string.banner_stopped_body),
-                actionLabel = BannerText.of(R.string.banner_stopped_action),
                 action = BannerAction.StartDaemon,
-                filledAction = true,
+                actionLabel = BannerText.of(R.string.banner_stopped_action),
             )
             DaemonStatus.Starting, DaemonStatus.Restarting, DaemonStatus.Stopping ->
                 if (!inputs.firstRun) out += BannerModel(
@@ -147,9 +151,9 @@ object BannerResolver {
                 severity = BannerSeverity.Accent,
                 title = BannerText.of(R.string.banner_needs_you_title, asking.sessionTitle),
                 detail = BannerText.of(R.string.banner_needs_you_body, asking.waiting, asking.prompt),
-                actionLabel = BannerText.of(R.string.banner_needs_you_action),
+                suffix = BannerText.of(R.string.banner_needs_you_suffix),
                 action = BannerAction.OpenNeedsInput,
-                filledAction = true,
+                actionLabel = BannerText.of(R.string.banner_needs_you_action),
             )
         }
 
@@ -165,6 +169,11 @@ object BannerResolver {
                 } else {
                     BannerText.of(R.string.banner_notify_body)
                 },
+                action = if (inputs.notificationsPermanentlyDenied) {
+                    BannerAction.OpenAppSettings
+                } else {
+                    BannerAction.RequestNotifications
+                },
                 actionLabel = BannerText.of(
                     if (inputs.notificationsPermanentlyDenied) {
                         R.string.banner_notify_action_settings
@@ -172,11 +181,6 @@ object BannerResolver {
                         R.string.banner_notify_action
                     },
                 ),
-                action = if (inputs.notificationsPermanentlyDenied) {
-                    BannerAction.OpenAppSettings
-                } else {
-                    BannerAction.RequestNotifications
-                },
                 dismissible = true,
             )
         }
@@ -187,8 +191,8 @@ object BannerResolver {
                 severity = BannerSeverity.Warning,
                 title = BannerText.of(R.string.banner_battery_title),
                 detail = BannerText.of(R.string.banner_battery_body),
-                actionLabel = BannerText.of(R.string.banner_battery_action),
                 action = BannerAction.OpenBatterySettings,
+                actionLabel = BannerText.of(R.string.banner_battery_action),
                 dismissible = true,
             )
         }

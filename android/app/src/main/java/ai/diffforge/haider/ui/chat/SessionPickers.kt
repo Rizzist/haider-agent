@@ -42,7 +42,11 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 
 /** Which composer chip a picker sheet belongs to. */
-enum class PickerKind { Provider, Model, Effort }
+/**
+ * Two pickers, not three: the model sheet is grouped by provider, so choosing
+ * a model chooses its provider (addition F, S5).
+ */
+enum class PickerKind { Model, Effort }
 
 /**
  * Provider / model / effort pickers for the composer bar, matching the desktop
@@ -72,7 +76,6 @@ fun SessionPickerSheet(
     pending: Boolean,
     onRetry: () -> Unit,
     onDismiss: () -> Unit,
-    onSelectProvider: (String) -> Unit,
     onSelectModel: (provider: String, model: String) -> Unit,
     onSelectEffort: (String?) -> Unit,
 ) {
@@ -93,7 +96,6 @@ fun SessionPickerSheet(
             Text(
                 stringResource(
                     when (kind) {
-                        PickerKind.Provider -> R.string.picker_provider_title
                         PickerKind.Model -> R.string.picker_model_title
                         PickerKind.Effort -> R.string.picker_effort_title
                     },
@@ -103,27 +105,6 @@ fun SessionPickerSheet(
             )
 
             when (kind) {
-                PickerKind.Provider -> {
-                    if (inventory.providers.isEmpty()) EmptyInventory(pending, onRetry)
-                    inventory.providers.forEach { option ->
-                        PickerRow(
-                            label = option.label,
-                            secondary = if (option.available) {
-                                option.defaultModel?.let { ModelNames.short(it) }
-                            } else {
-                                stringResource(
-                                    R.string.picker_unavailable,
-                                    option.label,
-                                    option.unavailableReason.orEmpty(),
-                                )
-                            },
-                            selected = option.id == currentProvider,
-                            enabled = option.available,
-                            onClick = { onSelectProvider(option.id); onDismiss() },
-                        )
-                    }
-                }
-
                 PickerKind.Model -> {
                     if (inventory.providers.none { it.models.isNotEmpty() }) {
                         EmptyInventory(pending, onRetry)
@@ -131,9 +112,19 @@ fun SessionPickerSheet(
                     // Grouped by provider, as the desktop chip is.
                     inventory.providers.forEach { option ->
                         if (option.models.isEmpty()) return@forEach
+                        // Sentence case: the only uppercase left in the app is
+                        // the drawer's optional section headers (addition F, G2).
                         Text(
-                            option.label.uppercase(),
-                            style = type.drawerSection,
+                            if (option.available) {
+                                option.label
+                            } else {
+                                stringResource(
+                                    R.string.picker_unavailable,
+                                    option.label,
+                                    option.unavailableReason.orEmpty(),
+                                )
+                            },
+                            style = type.sessionMeta,
                             color = colors.textMuted,
                             modifier = Modifier.padding(top = ForgeSpace.md),
                         )
@@ -227,8 +218,9 @@ private fun PickerRow(
             Text(label, style = type.button, color = if (selected) colors.accent else colors.text)
             secondary?.let {
                 Text(
+                    // Metadata reads on the regular ramp (addition F, G1).
                     it,
-                    style = type.numeric,
+                    style = type.sessionMeta,
                     color = colors.textMuted,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,

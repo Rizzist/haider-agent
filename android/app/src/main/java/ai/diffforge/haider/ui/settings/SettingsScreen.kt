@@ -19,6 +19,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,10 +34,24 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.material.icons.rounded.Accessibility
+import androidx.compose.material.icons.rounded.Screenshot
+import androidx.compose.material.icons.rounded.Sms
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.BatteryFull
+import ai.diffforge.haider.ui.state.PermissionStanding
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -53,8 +69,9 @@ import androidx.compose.ui.text.style.TextOverflow
 @Composable
 fun SettingsScreen(
     state: AppUiState,
-    themeMode: ThemeMode,
+    @Suppress("UNUSED_PARAMETER") themeMode: ThemeMode,
     appVersion: String,
+    accountsSummary: String,
     elapsedRealtimeMs: Long,
     onBack: () -> Unit,
     onThemeMode: (ThemeMode) -> Unit,
@@ -70,6 +87,7 @@ fun SettingsScreen(
 ) {
     val colors = Forge.colors
     val type = Forge.type
+    var detail by remember { mutableStateOf<PermissionDetail?>(null) }
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -125,9 +143,18 @@ fun SettingsScreen(
                     state.sessions.count { it.runId != null },
                     elapsedRealtimeMs,
                 )
+                // Regular type: session counts and uptime are not code
+                // (addition F, G1).
                 if (line.isNotEmpty()) {
-                    Text(line, style = type.numeric, color = colors.textMuted)
+                    Text(line, style = type.sessionMeta, color = colors.textMuted)
                 }
+                // The version belongs here, not in the drawer or on the start
+                // screen (addition F, T1/D1/F1).
+                Text(
+                    stringResource(R.string.settings_about_version, appVersion),
+                    style = type.sessionMeta,
+                    color = colors.textMuted,
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
                     if (state.daemon is DaemonStatus.Running) {
                         ForgeButton(
@@ -152,83 +179,76 @@ fun SettingsScreen(
             SectionLabel(R.string.settings_section_accounts)
             NavigationRow(
                 title = stringResource(R.string.accounts_title),
-                subtitle = stringResource(R.string.accounts_add_api_key),
+                subtitle = accountsSummary,
                 onClick = onOpenAccounts,
             )
 
             SectionLabel(R.string.settings_section_permissions)
-            PermissionCard(
+            // Rows, not paragraphs: title, one-line status, chevron. The
+            // explanation and the action live on the row's detail sheet
+            // (addition F, T2).
+            // Every status below is read back from Android, not printed from
+            // a literal (verify-6 O3).
+            PermissionRow(
+                icon = Icons.Rounded.Accessibility,
                 title = stringResource(R.string.settings_permission_accessibility),
-                body = stringResource(R.string.settings_permission_accessibility_body),
-                action = stringResource(R.string.settings_permission_accessibility_action),
-                onClick = onOpenAccessibility,
+                status = standing(state.permissions.accessibility),
+                onClick = { detail = PermissionDetail.Accessibility },
             )
-            PermissionCard(
+            PermissionRow(
+                icon = Icons.Rounded.Screenshot,
                 title = stringResource(R.string.settings_permission_screen),
-                body = stringResource(R.string.settings_permission_screen_body),
-                action = null,
-                onClick = {},
+                status = standing(state.permissions.screenCapture),
+                onClick = { detail = PermissionDetail.ScreenCapture },
             )
-            PermissionCard(
+            PermissionRow(
+                icon = Icons.Rounded.Sms,
                 title = stringResource(R.string.settings_permission_sms),
-                body = stringResource(R.string.settings_permission_sms_body),
-                action = stringResource(R.string.settings_permission_sms_action),
-                onClick = onGrantSms,
+                status = standing(state.permissions.sms),
+                onClick = { detail = PermissionDetail.Sms },
             )
-            PermissionCard(
+            PermissionRow(
+                icon = Icons.Rounded.Notifications,
                 title = stringResource(R.string.settings_permission_notifications),
-                body = stringResource(R.string.settings_permission_notifications_body),
-                action = if (state.environment.notificationsGranted) {
-                    null
-                } else {
-                    stringResource(R.string.step_notify_action)
-                },
-                onClick = onRequestNotifications,
+                status = stringResource(
+                    if (state.environment.notificationsGranted) {
+                        R.string.permission_granted
+                    } else {
+                        R.string.permission_not_granted
+                    },
+                ),
+                onClick = { detail = PermissionDetail.Notifications },
             )
-            PermissionCard(
+            PermissionRow(
+                icon = Icons.Rounded.BatteryFull,
                 title = stringResource(R.string.settings_permission_battery),
-                body = stringResource(R.string.settings_permission_battery_body),
-                action = stringResource(R.string.step_battery_action),
-                onClick = onOpenBattery,
+                status = stringResource(
+                    if (state.environment.batteryRestricted) {
+                        R.string.permission_not_granted
+                    } else {
+                        R.string.permission_granted
+                    },
+                ),
+                onClick = { detail = PermissionDetail.Battery },
             )
 
-            SectionLabel(R.string.settings_section_appearance)
-            Card {
-                Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-                    listOf(
-                        ThemeMode.System to R.string.appearance_system,
-                        ThemeMode.Light to R.string.appearance_light,
-                        ThemeMode.Dark to R.string.appearance_dark,
-                    ).forEach { (mode, labelRes) ->
-                        val label = stringResource(labelRes)
-                        ForgeChip(
-                            onClick = { onThemeMode(mode) },
-                            selected = themeMode == mode,
-                            contentDescription = label,
-                        ) {
-                            Text(
-                                label,
-                                style = type.button,
-                                color = if (themeMode == mode) colors.accent else colors.textMuted,
-                            )
-                        }
-                    }
-                }
-            }
+        }
 
-            SectionLabel(R.string.settings_section_about)
-            Card {
-                Text(
-                    stringResource(R.string.settings_about_version, appVersion),
-                    style = type.sessionTitle,
-                    color = colors.text,
-                )
-                Text(
-                    stringResource(R.string.settings_about_body),
-                    style = type.sessionMeta,
-                    color = colors.textMuted,
-                )
-            }
+        detail?.let { open ->
+            PermissionDetailSheet(
+                detail = open,
+                onDismiss = { detail = null },
+                onAction = {
+                    when (open) {
+                        PermissionDetail.Accessibility -> onOpenAccessibility()
+                        PermissionDetail.Sms -> onGrantSms()
+                        PermissionDetail.Notifications -> onRequestNotifications()
+                        PermissionDetail.Battery -> onOpenBattery()
+                        PermissionDetail.ScreenCapture -> Unit
+                    }
+                    detail = null
+                },
+            )
         }
     }
 }
@@ -237,8 +257,8 @@ fun SettingsScreen(
 internal fun SectionLabel(labelRes: Int) {
     Text(
         stringResource(labelRes),
-        style = Forge.type.drawerSection,
-        color = Forge.colors.textMuted,
+        style = Forge.type.sessionTitle,
+        color = Forge.colors.textSoft,
         modifier = Modifier.padding(top = ForgeSpace.md),
     )
 }
@@ -257,21 +277,95 @@ internal fun Card(content: @Composable () -> Unit) {
     ) { content() }
 }
 
+/** Which permission's detail sheet is open. */
+internal enum class PermissionDetail { Accessibility, ScreenCapture, Sms, Notifications, Battery }
+
 @Composable
-private fun PermissionCard(title: String, body: String, action: String?, onClick: () -> Unit) {
+private fun PermissionRow(
+    icon: ImageVector,
+    title: String,
+    status: String,
+    onClick: () -> Unit,
+) {
+    // T2 asks for a leading icon; without it every row is a wall of text and
+    // the list cannot be scanned (verify-6 O9).
+    NavigationRow(title = title, subtitle = status, onClick = onClick, icon = icon)
+}
+
+/** The word for what Android said. An unobserved status says so. */
+@Composable
+private fun standing(value: PermissionStanding): String = stringResource(
+    when (value) {
+        PermissionStanding.Granted -> R.string.permission_granted
+        PermissionStanding.NotGranted -> R.string.permission_not_granted
+        PermissionStanding.AskEachTime -> R.string.permission_ask_each_time
+        PermissionStanding.Unknown -> R.string.permission_unknown
+    },
+)
+
+/** The explanation and the action, on the row that asked for them. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PermissionDetailSheet(
+    detail: PermissionDetail,
+    onDismiss: () -> Unit,
+    onAction: () -> Unit,
+) {
     val colors = Forge.colors
     val type = Forge.type
-    Card {
-        Text(title, style = type.sessionTitle, color = colors.text)
-        Text(body, style = type.sessionMeta, color = colors.textMuted)
-        if (action != null) {
-            ForgeButton(text = action, onClick = onClick, kind = ForgeButtonKind.Ghost)
+    val (titleRes, bodyRes, actionRes) = when (detail) {
+        PermissionDetail.Accessibility -> Triple(
+            R.string.settings_permission_accessibility,
+            R.string.settings_permission_accessibility_body,
+            R.string.settings_permission_accessibility_action,
+        )
+        PermissionDetail.ScreenCapture -> Triple(
+            R.string.settings_permission_screen,
+            R.string.settings_permission_screen_body,
+            null,
+        )
+        PermissionDetail.Sms -> Triple(
+            R.string.settings_permission_sms,
+            R.string.settings_permission_sms_body,
+            R.string.settings_permission_sms_action,
+        )
+        PermissionDetail.Notifications -> Triple(
+            R.string.settings_permission_notifications,
+            R.string.settings_permission_notifications_body,
+            R.string.step_notify_action,
+        )
+        PermissionDetail.Battery -> Triple(
+            R.string.settings_permission_battery,
+            R.string.settings_permission_battery_body,
+            R.string.step_battery_action,
+        )
+    }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+        containerColor = colors.surfaceRaised,
+        shape = ForgeShapes.sheet,
+    ) {
+        Column(
+            Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, bottom = ForgeSpace.xxxl),
+            verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
+        ) {
+            Text(stringResource(titleRes), style = type.h4, color = colors.text)
+            Text(stringResource(bodyRes), style = type.sessionMeta, color = colors.textMuted)
+            actionRes?.let {
+                ForgeButton(text = stringResource(it), onClick = onAction)
+            }
         }
     }
 }
 
 @Composable
-internal fun NavigationRow(title: String, subtitle: String?, onClick: () -> Unit) {
+internal fun NavigationRow(
+    title: String,
+    subtitle: String?,
+    onClick: () -> Unit,
+    icon: ImageVector? = null,
+) {
     val colors = Forge.colors
     val type = Forge.type
     Row(
@@ -285,6 +379,17 @@ internal fun NavigationRow(title: String, subtitle: String?, onClick: () -> Unit
             .padding(horizontal = ForgeSpace.xl),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        icon?.let {
+            Icon(
+                it,
+                contentDescription = null,
+                tint = colors.textSoft,
+                modifier = Modifier
+                    .size(ForgeSize.iconMd)
+                    .padding(end = ForgeSpace.xxs),
+            )
+            Spacer(Modifier.width(ForgeSpace.lg))
+        }
         Column(Modifier.weight(1f)) {
             Text(title, style = type.sessionTitle, color = colors.text)
             subtitle?.let {

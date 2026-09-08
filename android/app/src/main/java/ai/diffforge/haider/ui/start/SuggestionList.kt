@@ -13,10 +13,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ChevronRight
-import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -42,9 +38,9 @@ fun SuggestionList(onSuggestion: (String) -> Unit, modifier: Modifier = Modifier
     Column(modifier.fillMaxWidth()) {
         Text(
             stringResource(R.string.suggestions_header),
-            style = type.drawerSection,
+            style = type.sessionMeta,
             color = colors.textMuted,
-            modifier = Modifier.padding(top = ForgeSpace.xxl, bottom = ForgeSpace.md),
+            modifier = Modifier.padding(bottom = ForgeSpace.md),
         )
         Column(
             Modifier
@@ -72,6 +68,8 @@ fun SuggestionList(onSuggestion: (String) -> Unit, modifier: Modifier = Modifier
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(glyph, style = type.toolStrong, color = colors.textMuted)
+                    // The whole row is the target, so a chevron adds nothing
+                    // but a column of arrows (addition F, S7).
                     Text(
                         text,
                         style = type.chatBody,
@@ -79,12 +77,6 @@ fun SuggestionList(onSuggestion: (String) -> Unit, modifier: Modifier = Modifier
                         modifier = Modifier
                             .weight(1f)
                             .padding(horizontal = ForgeSpace.lg),
-                    )
-                    Icon(
-                        Icons.Rounded.ChevronRight,
-                        contentDescription = null,
-                        tint = colors.textMuted,
-                        modifier = Modifier.size(ForgeSize.iconSm),
                     )
                 }
             }

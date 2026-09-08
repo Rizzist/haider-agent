@@ -56,6 +56,11 @@ data class Account(
     val status: String,
 )
 
+/**
+ * [revision] is null when the daemon did not state one. Absent is not zero: a
+ * missing revision compared equal to a real first revision and made a stale
+ * snapshot look current (lane 971-3 handoff, UI-12).
+ */
 data class AccountsSnapshot(
     val revision: Long?,
     val accounts: List<Account>,

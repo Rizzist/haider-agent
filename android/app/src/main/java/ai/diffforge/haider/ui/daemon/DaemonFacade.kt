@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.chat.Message
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -171,6 +172,19 @@ data class ProviderInventory(
     }
 }
 
+/**
+ * Whether the session's shell view can do anything.
+ *
+ * The android-standalone tool policy disables `ProcessExec` outright
+ * (contracts-v1 C4), so on this platform the Shell tab has nothing to drive
+ * until a later lane ships an on-device shell. It says so, with the daemon's
+ * own reason, rather than presenting an inert terminal.
+ */
+data class ShellAvailability(
+    val available: Boolean = false,
+    val reason: String? = null,
+)
+
 /** Roster page state, so the drawer can scroll hundreds of sessions honestly. */
 data class RosterPaging(
     val loading: Boolean = false,
@@ -285,6 +299,9 @@ interface DaemonService {
 
     /** `provider.list` inventory, for the composer's provider/model pickers. */
     val providers: StateFlow<ProviderInventory>
+
+    /** Derived from `tools.inventory`: can this device run a shell at all? */
+    val shell: StateFlow<ShellAvailability>
     val catalogError: StateFlow<String?>
 
     /** When the catalog request went out; drives the model chip's 6 s deadline. */
@@ -322,8 +339,16 @@ interface DaemonService {
      * an answer may carry. The plaintext never leaves this call.
      */
     suspend fun stageMenuSecret(secret: CharArray): String
-    suspend fun selectModel(provider: String, model: String)
-    suspend fun selectEffort(effort: String?)
+    /**
+     * [confirmNewEpoch] is the user's own answer, never inferred.
+     *
+     * Switching model or effort can invalidate the prompt cache, and the daemon
+     * refuses until the caller says it understands that. The facade sends false
+     * unless a person has answered a refusal, so consent cannot be manufactured
+     * by a retry loop (lane 971-3 handoff).
+     */
+    suspend fun selectModel(provider: String, model: String, confirmNewEpoch: Boolean = false)
+    suspend fun selectEffort(effort: String?, confirmNewEpoch: Boolean = false)
     suspend fun refreshModels()
 
     /** `provider.list`; also the door the provider picker refreshes through. */
@@ -343,7 +368,7 @@ interface DaemonService {
     suspend fun transcript(sessionId: String): TranscriptLoad
 
     /** Collect for the active session. Production folds live pushes without reattaching per event. */
-    fun transcriptUpdates(sessionId: String): kotlinx.coroutines.flow.Flow<TranscriptLoad> =
+    fun transcriptUpdates(sessionId: String): Flow<TranscriptLoad> =
         kotlinx.coroutines.flow.flow { emit(transcript(sessionId)) }
 
     /** Progress of the local transcript index that drawer search reads. */

@@ -102,7 +102,7 @@ fun DaemonDetailsSheet(
                 Row(Modifier.fillMaxWidth()) {
                     Text(
                         label,
-                        style = type.label,
+                        style = type.sessionMeta,
                         color = colors.textMuted,
                         modifier = Modifier.padding(end = ForgeSpace.lg),
                     )

@@ -9,8 +9,10 @@ import ai.diffforge.haider.ui.chat.Message
 import ai.diffforge.haider.ui.chat.Role
 import ai.diffforge.haider.ui.chat.ToolCall
 import ai.diffforge.haider.ui.chat.ToolStatus
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -57,6 +59,11 @@ class FakeDaemonService(
     private val _catalogRequestedAtMs = MutableStateFlow<Long?>(null)
     private val _searchIndex = MutableStateFlow(SearchIndexState())
     private val _providers = MutableStateFlow(ProviderInventory())
+    private val _shell = MutableStateFlow(
+        // What `tools.inventory` reports on an android-standalone daemon:
+        // ProcessExec is neither advertised nor dispatchable (C4).
+        ShellAvailability(available = false, reason = "process_exec_disabled"),
+    )
 
     override val status: StateFlow<DaemonStatus> = _status.asStateFlow()
     override val environment: StateFlow<DaemonEnvironment> = _environment.asStateFlow()
@@ -68,6 +75,7 @@ class FakeDaemonService(
     override val catalogRequestedAtMs: StateFlow<Long?> = _catalogRequestedAtMs.asStateFlow()
     override val searchIndex: StateFlow<SearchIndexState> = _searchIndex.asStateFlow()
     override val providers: StateFlow<ProviderInventory> = _providers.asStateFlow()
+    override val shell: StateFlow<ShellAvailability> = _shell.asStateFlow()
 
     private val transcripts = mutableMapOf<String, MutableList<Message>>()
     private var hiddenPages: List<List<SessionRow>> = emptyList()
@@ -246,6 +254,11 @@ class FakeDaemonService(
         _providers.value = inventory
     }
 
+    /** So a later lane's on-device shell can be exercised before it exists. */
+    fun setShell(availability: ShellAvailability) {
+        _shell.value = availability
+    }
+
     override suspend fun start() {
         calls += "start"
         _status.value = DaemonStatus.Starting
@@ -285,7 +298,6 @@ class FakeDaemonService(
         }
         calls += "loadMoreSessions"
         _paging.value = _paging.value.copy(loading = true)
-        delay(1)
         val page = hiddenPages.first()
         hiddenPages = hiddenPages.drop(1)
         _sessions.value = _sessions.value + page
@@ -307,6 +319,10 @@ class FakeDaemonService(
             seenAtMs = nowMs,
             createdAtMs = nowMs,
         )
+        // A real create is a round trip: the id is not visible until it comes
+        // back. Publishing it synchronously hid the window in which a second
+        // caller sees no active session and creates another one.
+        yield()
         _sessions.value = listOf(row) + _sessions.value
         // A new session has no history: it must not inherit a default fixture,
         // or "open and chat" lands on somebody else's transcript.
@@ -364,7 +380,7 @@ class FakeDaemonService(
         }
         transcripts[sessionId]?.let { messages ->
             val index = messages.indexOfLast { it.streaming }
-            if (index >= 0) messages[index] = messages[index].copy(streaming = false, status = null)
+            if (index >= 0) messages[index] = messages[index].copy(streaming = false)
         }
     }
 
@@ -394,7 +410,9 @@ class FakeDaemonService(
         }
     }
 
-    override suspend fun selectModel(provider: String, model: String) {
+    override suspend fun selectModel(provider: String, model: String, confirmNewEpoch: Boolean) {
+        if (confirmNewEpoch) confirmedSelections++
+        nextSelectionFailure?.let { nextSelectionFailure = null; throw IllegalStateException(it) }
         calls += "selectModel:$provider/$model"
         val current = _models.value ?: return
         // The daemon re-derives effort when the model changes: an effort the
@@ -411,7 +429,9 @@ class FakeDaemonService(
         )
     }
 
-    override suspend fun selectEffort(effort: String?) {
+    override suspend fun selectEffort(effort: String?, confirmNewEpoch: Boolean) {
+        if (confirmNewEpoch) confirmedSelections++
+        nextSelectionFailure?.let { nextSelectionFailure = null; throw IllegalStateException(it) }
         val current = _models.value ?: return
         // The daemon refuses an unsupported effort; so does the fake, or the
         // UI would look correct against a catalog that would reject it.
@@ -463,7 +483,6 @@ class FakeDaemonService(
             role = Role.Agent,
             text = "",
             streaming = true,
-            status = "queued…",
             provider = _models.value?.current?.provider,
         )
         _sessions.value = _sessions.value.map {
@@ -474,6 +493,30 @@ class FakeDaemonService(
             }
         }
     }
+
+    /**
+     * True only because this fake installs an authoritative fixture and knows
+     * it. A real facade has to hydrate first (lane 971-3 handoff).
+     */
+    private val _rosterReady = MutableStateFlow(true)
+    override val rosterReady: StateFlow<Boolean> = _rosterReady.asStateFlow()
+
+    /** Set to make the next selection refuse, the way the daemon can. */
+    private var nextSelectionFailure: String? = null
+
+    /** How many selections carried the user's explicit confirmation. */
+    var confirmedSelections = 0
+        private set
+
+    fun failNextSelection(code: String) {
+        nextSelectionFailure = code
+    }
+
+    /** Overridable so a live scenario can push folded updates into a test. */
+    var transcriptStream: ((String) -> Flow<TranscriptLoad>)? = null
+
+    override fun transcriptUpdates(sessionId: String): Flow<TranscriptLoad> =
+        transcriptStream?.invoke(sessionId) ?: flow { emit(transcript(sessionId)) }
 
     override suspend fun transcript(sessionId: String): TranscriptLoad {
         calls += "session.attach:$sessionId"
@@ -757,7 +800,6 @@ class FakeDaemonService(
             text = "Reproduced it. The nav controller pops past the start destination.",
             thinking = "Checking the back stack invariants first.",
             streaming = true,
-            status = "shell · gradlew test — 41s",
             provider = "anthropic",
             tools = listOf(
                 ToolCall("call-1", "shell", "gradlew :app:test", ToolStatus.Running, null),
@@ -772,6 +814,11 @@ class FakeDaemonService(
             role = Role.Agent,
             text = "Drafted the reply. It needs your approval before it goes out.",
             provider = "anthropic",
+            // A finished call, with the duration the daemon reported: the row
+            // is where that number belongs now (S3, verify-6 O8).
+            tools = listOf(
+                ToolCall("call-sms", "sms", "read inbox", ToolStatus.Completed, null, durationMs = 41_000L),
+            ),
         ),
     )
 

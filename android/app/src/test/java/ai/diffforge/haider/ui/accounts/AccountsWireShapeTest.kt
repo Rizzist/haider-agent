@@ -183,8 +183,9 @@ class AccountsWireShapeTest {
         assertEquals("work", account.identity)
         assertEquals("ok", account.status)
         assertTrue(account.active)
-        // Older daemons omit the revision; that is 0, not an invented number.
-        assertEquals(0L, snapshot.revision)
+        // A daemon that omits the revision leaves it null. Absent is not zero:
+        // zero is a value a daemon can send (lane 971-3, UI-12).
+        assertNull(snapshot.revision)
     }
 
     @Test
