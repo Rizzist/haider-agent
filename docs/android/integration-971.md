@@ -102,13 +102,21 @@ question through the real worker/menu pipeline, then returns the same reply.
 Pass `expectedBuildId` to the instrumentation runner to compare loaded JNI
 metadata with the packaged native source ID. An `adb am instrument` exit of zero
 alone is not a passing test result; inspect its JUnit result.
+The embedded-turn test holds the replay control attachment through submission,
+matching the production facade. A separate attach followed by submit can race
+the replay collector's initial connection callback and lose its control lease.
 
 Run actual Android CLI layout/ADB interactions and inspect every captured
-screenshot on `Haider_API35`, stop that owned emulator, then repeat on
-`Haider_API35_16KB`. Both mini images are ARM64; x86_64 compilation is not x86_64
+screenshot on both `Haider_API35` and `Haider_API35_16KB`. Own only one named AVD
+at a time, stop it before starting the next, and never operate an instance owned
+by another lane. Both mini images are ARM64; x86_64 compilation is not x86_64
 device coverage. `android/tools/daemon_recovery_probe.py assert-ready` observes the
 real service without instrumentation teardown. Do not use instrumentation as an
 observer during a process-death/recovery experiment.
+During death, Android can briefly report the old service PID with an empty
+`Client:` dump. The probe treats that exact framework record as pending and
+retains the caller's deadline. It proves neither Ready nor service absence;
+unrecognized diagnostics still fail the probe.
 
 `mobile.sock` and standalone SMS/screen/accessibility transport remain a forward
 integration item. The legacy token/loopback bootstrap is suppressed in standalone

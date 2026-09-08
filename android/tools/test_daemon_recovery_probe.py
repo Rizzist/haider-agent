@@ -81,6 +81,19 @@ class RecoveryProbeTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Invalid Ready lifetime"):
             self.probe.assert_ready(timeout=0)
 
+    def test_empty_client_dump_during_death_is_pending_not_ready_or_absent(self):
+        self.output = f"SERVICE {COMPONENT} d1a9ea0 pid=3431 user=0\n  Client:\n"
+        self.assertEqual({"phase": None, "frameworkDiagnosticsPending": True}, self.probe.snapshot())
+        with self.assertRaisesRegex(AssertionError, "did not reach Ready"):
+            self.probe.assert_ready(timeout=0)
+        self.responses = [(255, "Stopping service\n", "Service stopped\n")]
+        with patch("daemon_recovery_probe.time.monotonic", side_effect=[0, 6]):
+            with self.assertRaisesRegex(AssertionError, "still present"):
+                self.probe.cleanup()
+        self.output += "  Permission Denial\n"
+        with self.assertRaisesRegex(RuntimeError, "diagnostics unavailable"):
+            self.probe.snapshot()
+
     def test_disabled_reads_only_lifecycle_state_and_rejects_active(self):
         self.output = json.dumps(dict(enabled=False, active=False))
         self.probe.assert_disabled()

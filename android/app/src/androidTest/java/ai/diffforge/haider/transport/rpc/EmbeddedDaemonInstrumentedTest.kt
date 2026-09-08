@@ -67,9 +67,13 @@ class EmbeddedDaemonInstrumentedTest {
             val cache = TranscriptCache(File(context.cacheDir, "integration-rpc-cache"))
             val replay = TranscriptRepository(client, scope, cache)
             try {
-                replay.attach(session, control = true)
-                val accepted = client.request(RpcMethods.submit(UUID.randomUUID().toString(),
-                    SessionCoordinate(session, digest.number("worker_generation")), "Reply with the deterministic test completion."))
+                // Keep the control attachment through submission, as the production facade does.
+                // Replay's initial CONNECTED callback can otherwise detach between these requests.
+                val accepted = replay.withControlAttachment(session) { epoch ->
+                    client.request(RpcMethods.submit(UUID.randomUUID().toString(),
+                        SessionCoordinate(session, digest.number("worker_generation")),
+                        "Reply with the deterministic test completion."), epoch)
+                }
                 assertEquals(session, accepted.string("session_id"))
                 withTimeout(30_000) {
                     while (client.request(RpcMethods.observe(session)).objectAt("digest").optionalString("run_state") != "idle") delay(100)

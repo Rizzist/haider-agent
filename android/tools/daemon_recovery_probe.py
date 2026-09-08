@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import re
 import subprocess
 import time
 
@@ -39,6 +40,14 @@ class RecoveryProbe:
         if f"SERVICE {COMPONENT} " in output and "pid=(not running)" in output:
             # Pending is neither Ready nor absence (cleanup must keep waiting).
             return {"phase": None, "frameworkProcessPending": True}
+        if re.fullmatch(
+            rf"SERVICE {re.escape(COMPONENT)} [0-9a-f]+ pid=\d+ user=\d+\s+Client:\s*",
+            output.strip(),
+        ):
+            # Death can leave the old PID in the framework record while its
+            # client dump is empty. Keep polling; this proves neither readiness
+            # nor absence, and the caller's existing deadline still applies.
+            return {"phase": None, "frameworkDiagnosticsPending": True}
         raise RuntimeError(f"Service diagnostics unavailable: {output}")
 
     def assert_ready(self, timeout=130):
