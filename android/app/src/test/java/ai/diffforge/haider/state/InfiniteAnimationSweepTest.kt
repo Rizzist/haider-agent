@@ -71,6 +71,25 @@ class InfiniteAnimationSweepTest {
     }
 
     @Test
+    fun `the markdown cache keys on the text and nothing that blinks`() {
+        val root = sourceRoot()
+        assumeTrue("source tree not reachable", root != null)
+        val markdown = File(root, "ui/chat/MarkdownText.kt").readText()
+        // Round 12 dropped the alpha from the key and left `showCaret` in it,
+        // so every caret flip still rebuilt the string and re-laid out the
+        // line (verify-11 O5). The key is the text and the colours only.
+        val key = Regex("""remember\(([^)]*)\)\s*\{\s*\n?\s*inlineMarkdown""")
+            .find(markdown)
+            ?.groupValues
+            ?.get(1)
+        assertTrue("no memoised inlineMarkdown call found", key != null)
+        assertTrue(
+            "the cache key still contains a blinking input: $key",
+            !key!!.contains("showCaret") && !key.contains("caret"),
+        )
+    }
+
+    @Test
     fun `the markdown builder takes no per-frame alpha`() {
         val root = sourceRoot()
         assumeTrue("source tree not reachable", root != null)

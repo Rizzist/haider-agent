@@ -596,7 +596,10 @@ fun HaiderApp(
                     daemon = state.daemon,
                     turnRunning = state.turnRunning,
                     inputRequired = state.needsInputHere,
-                    hasText = state.draft.isNotBlank(),
+                    // An image with no caption is a message. Round 12 asked
+                    // only about text, so Send sat Disabled with a staged
+                    // attachment on screen (verify-11 O8).
+                    hasText = state.draft.isNotBlank() || state.draftAttachments.isNotEmpty(),
                     setupComplete = state.setup.complete || state.sessions.isNotEmpty(),
                 )
                 val chip = ModelChipStateMachine.resolve(

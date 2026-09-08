@@ -242,12 +242,13 @@ private fun ToolCluster(messageId: Long, tools: List<ToolCall>, streaming: Boole
     LaunchedEffect(needsAttention, streaming) {
         if (needsAttention) expanded = true else if (!streaming) expanded = false
     }
+    // The CLUSTER paints nothing. It used to draw the card, which is what a
+    // golden scan measured as a 48 dp painted row: the container was the paint
+    // and the row inside it was only layout (verify-11 O4). Each row paints its
+    // own 36 dp body now, so one call is one band and two calls are two.
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(ForgeShapes.cardTight)
-            .background(colors.surface)
-            .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight),
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
     ) {
         // One call is one row. A "1 tool call / 1 RUNNING" header above a
         // single row said the same thing twice and made the count a headline
@@ -309,11 +310,18 @@ private fun ToolRow(tool: ToolCall) {
             .clickable(enabled = !tool.result.isNullOrBlank()) { detailOpen = !detailOpen },
         verticalArrangement = Arrangement.Center,
     ) {
+        // The paint lives on THIS node and the 48 dp parent stays transparent.
+        // Round 12 split the layout but left the container drawing its own
+        // background and border, so a golden scan still measured 96 px of
+        // painted row at 2x (verify-11 O4).
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = ForgeSize.toolRowHeight)
                 .testTag(TOOL_ROW_INK_TAG)
+                .clip(ForgeShapes.cardTight)
+                .background(colors.surface)
+                .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight)
                 .padding(horizontal = ForgeSpace.lg),
             verticalArrangement = Arrangement.Center,
         ) {

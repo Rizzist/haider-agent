@@ -112,6 +112,9 @@ object ForgeSize {
     val thumbnail = 56.dp
     /** The name column inside a file tile. */
     val attachmentLabel = 92.dp
+    /** The streaming caret's drawn bar (verify-11 O5). */
+    val caretWidth = 2.dp
+    val caretHeight = 20.dp
     /** Chip and composer-select ink: 30 dp inside a 48 dp target (R2). */
     val chip = 30.dp
     val segmented = 36.dp

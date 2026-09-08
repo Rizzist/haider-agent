@@ -8,6 +8,7 @@ import ai.diffforge.haider.ui.checkpoints.CheckpointOutcome
 import ai.diffforge.haider.ui.checkpoints.Checkpoints
 import ai.diffforge.haider.ui.checkpoints.CheckpointsUiState
 import ai.diffforge.haider.ui.daemon.DaemonService
+import ai.diffforge.haider.ui.daemon.Attachment
 import ai.diffforge.haider.ui.daemon.AttachmentLimits
 import ai.diffforge.haider.ui.daemon.Delivery
 import ai.diffforge.haider.ui.daemon.TurnRefused
@@ -64,6 +65,17 @@ class ChatViewModel(
 
     private val transcripts = mutableMapOf<String, List<Message>>()
     private val drafts = mutableMapOf<String, String>()
+
+    /**
+     * Staged attachments, per session — like [drafts], and for the same reason.
+     *
+     * Round 12 kept one global list, so an image staged in one session followed
+     * the user into the next one's composer and would have been submitted with
+     * somebody else's message (verify-11 O10). The notice is scoped the same
+     * way: a refusal belongs to the session that earned it.
+     */
+    private val draftAttachments = mutableMapOf<String, List<Attachment>>()
+    private val attachmentNotices = mutableMapOf<String, String?>()
     private var batterySkipped = false
     private var searchJob: Job? = null
     private var childTranscriptJob: Job? = null
@@ -116,7 +128,14 @@ class ChatViewModel(
             // collectLatest: switching sessions cancels the previous session's
             // stream rather than folding two transcripts into one screen.
             service.activeSessionId.collectLatest { id ->
-                update { it.copy(activeSessionId = id, draft = drafts[id].orEmpty()) }
+                update {
+                    it.copy(
+                        activeSessionId = id,
+                        draft = drafts[id].orEmpty(),
+                        draftAttachments = draftAttachments[id].orEmpty(),
+                        attachmentNotice = attachmentNotices[id],
+                    )
+                }
                 if (id == null) return@collectLatest
                 update { it.copy(transcriptLoading = true) }
                 // The stream performs the initial load itself and then emits
@@ -251,7 +270,7 @@ class ChatViewModel(
     fun send(mode: Delivery = Delivery.Steer) = viewModelScope.launch {
         val current = _state.value
         val text = current.draft.trim()
-        val attachments = current.draftAttachments
+        val attachments = draftAttachments[current.activeSessionId].orEmpty()
         if (text.isEmpty() && attachments.isEmpty()) return@launch
         if (current.daemon !is DaemonStatus.Running) service.start()
         val id = current.activeSessionId ?: service.createSession()
@@ -260,17 +279,20 @@ class ChatViewModel(
         val refusal = runCatching { service.send(id, text, attachments, mode) }
             .exceptionOrNull()
         if (refusal != null) {
-            update {
-                it.copy(
-                    attachmentNotice = (refusal as? TurnRefused)?.code ?: refusal.message,
-                    deliveryChooser = false,
-                )
-            }
+            noteAttachment(id, (refusal as? TurnRefused)?.code ?: refusal.message)
+            update { it.copy(deliveryChooser = false) }
             return@launch
         }
         drafts[id] = ""
+        draftAttachments.remove(id)
+        attachmentNotices.remove(id)
         update {
-            it.copy(draft = "", draftAttachments = emptyList(), deliveryChooser = false)
+            it.copy(
+                draft = "",
+                draftAttachments = emptyList(),
+                attachmentNotice = null,
+                deliveryChooser = false,
+            )
         }
     }
 
@@ -433,19 +455,42 @@ class ChatViewModel(
      * rather than guessed, and the draft is left alone.
      */
     fun attach(bytes: ByteArray, mime: String, name: String?) = viewModelScope.launch {
+        // The session as it was when staging *began*. Staging is a round trip,
+        // and the user can switch sessions during it; without this the block
+        // lands wherever they ended up (verify-11 O10).
+        val target = _state.value.activeSessionId ?: return@launch
         val staged = service.stageAttachment(bytes, mime, name)
         if (staged == null) {
-            update { it.copy(attachmentNotice = AttachmentLimits.TOO_LARGE) }
+            noteAttachment(target, AttachmentLimits.TOO_LARGE)
             return@launch
         }
-        update { it.copy(draftAttachments = it.draftAttachments + staged) }
+        draftAttachments[target] = draftAttachments[target].orEmpty() + staged
+        if (_state.value.activeSessionId == target) {
+            update { it.copy(draftAttachments = draftAttachments.getValue(target)) }
+        }
     }
 
-    fun removeAttachment(artifact: String) = update {
-        it.copy(draftAttachments = it.draftAttachments.filterNot { block -> block.artifact == artifact })
+    /** Records a refusal against the session it belongs to. */
+    private fun noteAttachment(sessionId: String, code: String?) {
+        attachmentNotices[sessionId] = code
+        if (_state.value.activeSessionId == sessionId) {
+            update { it.copy(attachmentNotice = code) }
+        }
     }
 
-    fun dismissAttachmentNotice() = update { it.copy(attachmentNotice = null) }
+    fun removeAttachment(artifact: String) {
+        val sessionId = _state.value.activeSessionId ?: return
+        draftAttachments[sessionId] = draftAttachments[sessionId].orEmpty()
+            .filterNot { block -> block.artifact == artifact }
+        update { it.copy(draftAttachments = draftAttachments.getValue(sessionId)) }
+        // Removing one is the way out of a too-many refusal, so the notice goes
+        // with it (verify-11 O9).
+        noteAttachment(sessionId, null)
+    }
+
+    fun dismissAttachmentNotice() {
+        _state.value.activeSessionId?.let { noteAttachment(it, null) }
+    }
 
     // ---------- steering ----------
 
@@ -759,17 +804,34 @@ class ChatViewModel(
      */
     fun createBranch(sessionId: String, name: String) = viewModelScope.launch {
         val row = session(sessionId) ?: return@launch
-        val node = row.mainHeadNodeId
-        if (node == null) {
+        val source = service.branchSelection.value[sessionId]
+        // The fork point and the source branch have to come from the SAME
+        // fact. Round 12 sent the selected branch as the source while forking
+        // at main's head, so choosing Plan B produced a branch that claimed
+        // Plan B as its parent and started from main (verify-11 O11).
+        val forkPoint = if (source == null) {
+            // The implicit main branch: the row's own published head.
+            row.mainHeadNodeId?.let { it to row.mainHeadSeq }
+        } else {
+            row.branches.firstOrNull { it.branchId == source }
+                ?.let { branch ->
+                    val node = branch.headNodeId
+                    val seq = branch.headSeq
+                    if (node != null && seq != null) node to seq else null
+                }
+        }
+        if (forkPoint == null) {
+            // Half a tuple is not sent: `branch.create` needs an exact
+            // (fork_node_id, fork_seq) pair from one published head.
             update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = NO_FORK_POINT)) }
             return@launch
         }
         val outcome = service.createBranch(
             sessionId = sessionId,
-            forkNodeId = node,
-            forkSeq = row.mainHeadSeq,
+            forkNodeId = forkPoint.first,
+            forkSeq = forkPoint.second,
             name = name.trim().ifBlank { null },
-            sourceBranchId = service.branchSelection.value[sessionId],
+            sourceBranchId = source,
         )
         when (outcome) {
             is BranchOutcome.Created -> {

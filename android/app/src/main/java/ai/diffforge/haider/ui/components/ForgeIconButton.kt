@@ -7,6 +7,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.ripple
@@ -43,7 +44,10 @@ fun ForgeIconButton(
     val interaction = remember { MutableInteractionSource() }
     Box(
         modifier = modifier
-            .size(ForgeSize.touch)
+            // requiredSize, not size: inside a 44 dp row (the drawer head)
+            // a plain `size` would be clamped to the parent and the target
+            // would silently become 44 (verify-11 O7).
+            .requiredSize(ForgeSize.touch)
             .clip(CircleShape)
             .semantics {
                 this.contentDescription = contentDescription

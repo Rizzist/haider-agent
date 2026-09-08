@@ -173,6 +173,7 @@ fun Composer(
                 attachments = attachments,
                 service = service,
                 modifier = Modifier.fillMaxWidth(),
+                onRemove = onRemoveAttachment,
             )
         }
         attachmentNotice?.let { code ->
