@@ -439,6 +439,10 @@ private fun Overlays(
     when (val overlay = state.overlay) {
         is Overlay.Picker -> SessionPickerSheet(
             kind = overlay.kind,
+            busy = state.selectionBusy,
+            refusal = state.selectionRefusal,
+            onConfirmRefused = viewModel::confirmRefusedSelection,
+            onDismissRefusal = viewModel::dismissSelectionRefusal,
             inventory = state.providers,
             currentProvider = state.models?.current?.provider,
             currentModel = state.models?.current?.model,

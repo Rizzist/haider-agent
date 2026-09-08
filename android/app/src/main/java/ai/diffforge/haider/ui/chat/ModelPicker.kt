@@ -47,9 +47,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 
-/** Test handle for the refusal panel. */
-const val MODEL_REFUSAL_TAG = "model_refusal"
-
 @Composable
 fun ModelPicker(
     config: SessionConfig?,
@@ -107,28 +104,11 @@ fun ModelPicker(
             when {
                 // What the daemon said, with the only button that may set
                 // confirm_new_epoch (lane 971-3 handoff).
-                refusal != null -> Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(ForgeSpace.xxl)
-                        .testTag(MODEL_REFUSAL_TAG),
-                    verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
-                ) {
-                    Text("The daemon refused that change", style = type.h4, color = colors.text)
-                    Text(refusal.code, style = type.sessionMeta, color = colors.amber)
-                    Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-                        ForgeButton(
-                            text = "Change it anyway",
-                            onClick = onConfirmRefused,
-                            kind = ForgeButtonKind.Filled,
-                        )
-                        ForgeButton(
-                            text = "Keep the current one",
-                            onClick = onDismissRefusal,
-                            kind = ForgeButtonKind.Ghost,
-                        )
-                    }
-                }
+                refusal != null -> SelectionRefusalPanel(
+                    refusal = refusal,
+                    onConfirm = onConfirmRefused,
+                    onKeep = onDismissRefusal,
+                )
                 pendingSelection != null -> CacheChangeConfirmation(
                     selection = pendingSelection,
                     onConfirm = {
@@ -294,7 +274,7 @@ private fun CatalogList(
                 provider.availabilityReason?.let { reason ->
                     Text(
                         reason,
-                        style = type.toolRow,
+                        style = type.sessionMeta,
                         color = colors.textMuted,
                         modifier = Modifier.padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.xxs),
                     )
@@ -318,7 +298,7 @@ private fun CatalogList(
             Text(
                 "Provider/model availability is daemon-owned. Unavailable rows are read-only. " +
                     "Changing model or effort may start a new context-cache epoch.",
-                style = type.toolRow,
+                style = type.sessionMeta,
                 color = colors.textMuted,
                 modifier = Modifier.padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.xl),
             )
@@ -353,7 +333,7 @@ private fun SelectionRow(
                 style = type.userBody,
                 color = if (selected || enabled) colors.chatText else colors.textDisabled,
             )
-            detail?.let { Text(it, style = type.toolRow, color = colors.textMuted) }
+            detail?.let { Text(it, style = type.sessionMeta, color = colors.textMuted) }
         }
         if (selected) {
             Icon(Icons.Rounded.Check, contentDescription = "Selected", tint = colors.accentSoft, modifier = Modifier.size(ForgeSize.iconSm))

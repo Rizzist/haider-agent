@@ -293,13 +293,16 @@ private fun ToolRow(tool: ToolCall) {
             .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            // mono: tool output, from the glyph to the result.
             Text(toolGlyph(tool.name), style = type.toolRow, color = colors.textMuted)
             Spacer(Modifier.width(ForgeSpace.md))
+            // mono: the tool's own name.
             Text(tool.name, style = type.toolStrong, color = colors.textSoft, maxLines = 1)
             if (tool.summary.isNotBlank()) {
                 Spacer(Modifier.width(ForgeSpace.md))
                 Text(
                     tool.summary,
+                    // mono: the command that was run.
                     style = type.toolRow,
                     color = colors.textMuted,
                     maxLines = 1,
@@ -334,6 +337,7 @@ private fun ToolRow(tool: ToolCall) {
             val result = remember(tool.result) { prettyToolResult(tool.result) }
             Text(
                 result,
+                // mono: the tool's raw result.
                 style = type.toolRow,
                 color = colors.chatText,
                 modifier = Modifier

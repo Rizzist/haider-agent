@@ -116,6 +116,8 @@ fun InputRequiredCard(
                 verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
             ) {
                 needsInput.bodyLines.forEach { line ->
+                    // mono: the literal proposal text the daemon is asking about — a
+                    // message body or a command, quoted exactly (S6).
                     Text(line, style = type.toolRow, color = colors.chatText)
                 }
             }

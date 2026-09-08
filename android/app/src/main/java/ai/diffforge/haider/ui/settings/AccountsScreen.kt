@@ -307,6 +307,15 @@ fun AccountsScreen(
                                     try {
                                         val reference = stagedReference
                                             ?: secret.use { repository.stageApiKey(it) }
+                                        // The moment the vault has it, this
+                                        // screen does not. Round 7 kept the
+                                        // plaintext in the field — revealable
+                                        // with the eye button — for the whole
+                                        // login round trip, which is exactly
+                                        // the window an over-the-shoulder
+                                        // reader needs (verify-7 P2).
+                                        clearSecret()
+                                        stagedReference = reference
                                         result = if (reference == null) {
                                             AccountResult.Failed(STAGING_UNAVAILABLE)
                                         } else {
@@ -738,6 +747,8 @@ private fun LiveOAuthPanel(
         live.flow.userCode?.let {
             Text(
                 stringResource(R.string.accounts_oauth_code, it),
+                // mono: a device code the person reads out character by
+                // character; proportional digits invite a misread.
                 style = type.numeric,
                 color = colors.accent,
             )

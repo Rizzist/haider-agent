@@ -55,6 +55,7 @@ internal fun MarkdownText(
                         showCaret && last,
                         caretAlpha,
                     ),
+                    // mono: a fenced code block.
                     style = type.toolRow.copy(fontFamily = FontFamily.Monospace),
                     color = colors.chatText,
                     modifier = Modifier
@@ -108,6 +109,7 @@ internal fun MarkdownText(
                         showCaret && last,
                         caretAlpha,
                     ),
+                    // mono: a table only lines up in a fixed-width face.
                     style = type.toolRow,
                     color = colors.chatText,
                     modifier = Modifier
@@ -201,6 +203,7 @@ private fun inlineMarkdown(
             text[cursor] == '`' -> {
                 val end = text.indexOf('`', cursor + 1)
                 if (end >= 0) {
+                    // mono: inline `code` spans.
                     withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = color.copy(alpha = 0.09f))) {
                         append(text.substring(cursor + 1, end))
                     }

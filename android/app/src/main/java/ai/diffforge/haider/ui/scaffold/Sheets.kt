@@ -106,7 +106,14 @@ fun DaemonDetailsSheet(
                         color = colors.textMuted,
                         modifier = Modifier.padding(end = ForgeSpace.lg),
                     )
-                    Text(value, style = type.numeric, color = colors.chatText)
+                    // A version, a generation and a pid are metadata and read
+                    // on the regular ramp (F-G1, verify-7).
+                    Text(
+                        value,
+                        // mono: paths a person pastes into a shell.
+                        style = if (label in PATH_LABELS) type.numeric else type.sessionMeta,
+                        color = colors.chatText,
+                    )
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
@@ -126,6 +133,9 @@ fun DaemonDetailsSheet(
         }
     }
 }
+
+/** Values a person copies into a shell; everything else is metadata. */
+private val PATH_LABELS = setOf("socket", "profile", "runtime")
 
 @Composable
 private fun SheetRow(label: String, onClick: () -> Unit) {

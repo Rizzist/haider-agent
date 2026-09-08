@@ -67,7 +67,7 @@ fun SuggestionList(onSuggestion: (String) -> Unit, modifier: Modifier = Modifier
                         },
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(glyph, style = type.toolStrong, color = colors.textMuted)
+                    Text(glyph, style = type.sessionTitle, color = colors.textMuted)
                     // The whole row is the target, so a chevron adds nothing
                     // but a column of arrows (addition F, S7).
                     Text(
