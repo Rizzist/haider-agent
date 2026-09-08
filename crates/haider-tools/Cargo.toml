@@ -12,6 +12,9 @@ path = "src/bin/haider-wayland-portal.rs"
 test = false
 bench = false
 
+[features]
+android-standalone = []
+
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true

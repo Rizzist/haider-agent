@@ -70,9 +70,9 @@ class TranscriptCache(private val directory: File) {
     }
     private fun file(session: String): File {
         val hash = MessageDigest.getInstance("SHA-256").digest(session.toByteArray()).joinToString("") { "%02x".format(it) }
-        // v1 discarded unknown item variants without recording incomplete coverage. A new
-        // projection must replay from zero instead of trusting those persisted cursors.
-        return File(directory, "$hash.replay-v2.jsonl")
+        // Projection changes replay from zero: v1 lost unknown items, and v2
+        // classified ordinary lifecycle/metric records as missing chat content.
+        return File(directory, "$hash.replay-v3.jsonl")
     }
     private fun atomic(file: File, contents: String) {
         val temp = File.createTempFile("cache-", ".tmp", directory)
@@ -89,10 +89,29 @@ class TranscriptCache(private val directory: File) {
             val payload = envelope.objectAt("payload")
             return when (payload.optionalString("type")) {
                 "user_message" -> obj("type" to "user_message", "text" to payload.optionalString("text"))
+                // These describe roster/lifecycle state, not transcript content.
+                // Do not persist their arbitrary additive fields in the display cache.
+                "session_state", "run_state", "session_seen", "session_renamed" -> obj("type" to "metadata")
+                "node_committed" -> {
+                    val node = payload["kind"] as? JsonObject
+                    val kind = node?.optionalString("kind")
+                    if (kind in setOf("user_turn", "assistant_commit") && node?.optionalString("text") != null)
+                        obj("type" to "history_node", "kind" to kind, "text" to node.optionalString("text"))
+                    else obj("type" to "unrendered")
+                }
                 "item" -> {
                     val item = payload["item"] as? JsonObject
                     val delta = payload["delta"] as? JsonObject
                     val kind = item?.optionalString("item")
+                    // Known counters have no message body. Keep unknown extensions,
+                    // budget interruptions and tool records visibly partial.
+                    if (item != null && kind == "extension" && delta == null && payload.optionalString("event") in setOf("started", "completed")) {
+                        val extension = item.optionalString("kind")
+                        if (extension == "context_footprint_v1" ||
+                            (extension == "provider_request_budget_v1" &&
+                                (item["data"] as? JsonObject)?.optionalString("phase") == "progress"))
+                            return obj("type" to "metadata")
+                    }
                     val value = when (kind) {
                         "agent_message", "incomplete_agent_message" -> obj("item" to kind, "text" to item.optionalString("text"))
                         "reasoning" -> obj("item" to kind, "summary" to item.optionalString("summary"))

@@ -141,8 +141,7 @@ fun AccountsScreen(
     DisposableEffect(Unit) {
         onDispose { secret.wipe(); custom.forget() }
     }
-    // A staged key that is validated but never saved says so, so the empty
-    // field does not read as "nothing happened".
+    // Staging clears the field; validation happens only when Save commits it.
     val stagedHint = stagedReference != null && keyText.isBlank()
     // There is one pending add form, ever (971-tui-fixes F1b), and whatever was
     // typed into the outgoing one goes with it: leaving a form clears its key,

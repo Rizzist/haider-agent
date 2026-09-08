@@ -132,7 +132,7 @@ class DeviceRegressionTest {
     }
 
     @Test
-    fun `a validated key saves from its staged reference alone`() {
+    fun `a staged key saves from its staged reference alone`() {
         accounts()
         rule.onNodeWithText("Add account").performClick()
         rule.waitForIdle()

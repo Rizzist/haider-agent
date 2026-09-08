@@ -1718,10 +1718,13 @@ dependencies = [
 name = "haider-accounts"
 version = "0.0.970"
 dependencies = [
+ "aes-gcm",
  "blake3",
+ "getrandom 0.3.4",
  "haider-platform",
  "haider-protocol",
  "hex",
+ "rustix 1.1.4",
  "security-framework",
  "serde",
  "serde_json",
@@ -1733,14 +1736,22 @@ dependencies = [
 name = "haider-android"
 version = "0.0.970"
 dependencies = [
+ "async-trait",
+ "haider-accounts",
  "haider-daemon",
  "haider-platform",
+ "haider-protocol",
+ "haider-provider",
  "haider-rpc",
  "jni 0.21.1",
  "ndk-context",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -1839,6 +1850,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rmp-serde",
+ "rusqlite",
  "russh",
  "rustix 1.1.4",
  "security-framework",
@@ -1908,9 +1920,12 @@ dependencies = [
  "libc",
  "ndk-context",
  "nix 0.31.3",
+ "reqwest",
  "rustix 1.1.4",
+ "rustls",
  "tempfile",
  "tokio",
+ "webpki-roots 1.0.9",
  "windows 0.54.0",
  "windows-sys 0.61.2",
 ]

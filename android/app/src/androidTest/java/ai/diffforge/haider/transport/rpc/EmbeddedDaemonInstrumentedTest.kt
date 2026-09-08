@@ -13,7 +13,7 @@ import org.junit.runner.RunWith
 import java.io.File
 import java.util.UUID
 
-/** Requires the integrated lane-1/2 app and its deterministic fake-provider catalog. */
+/** Requires the explicit debug-only native fixture on a disposable device. */
 @RunWith(AndroidJUnit4::class)
 class EmbeddedDaemonInstrumentedTest {
     @Test fun realBinderReadyUdsRosterAndFakeProviderTurn() = runBlocking<Unit> {
@@ -57,7 +57,9 @@ class EmbeddedDaemonInstrumentedTest {
             val requestedProvider = InstrumentationRegistry.getArguments().getString("fakeProvider", "fake")!!
             val fake = inventory.firstOrNull { it.string("provider") == requestedProvider }
                 ?: error("Deterministic fake-provider fixture is not installed; this is not live-provider authorization")
-            val model = fake.strings("models").firstOrNull() ?: error("Fake provider has no model")
+            // An injected provider need not invent a discovered catalog. Its
+            // explicit test model follows the daemon's unknown-inventory rule.
+            val model = InstrumentationRegistry.getArguments().getString("fakeModel", "fake-model")!!
             val created = client.request(RpcMethods.create(UUID.randomUUID().toString(),
                 File(context.filesDir, "haider/profiles/default/workspace").path, requestedProvider, model, 512))
             val session = created.string("session_id")
@@ -74,6 +76,10 @@ class EmbeddedDaemonInstrumentedTest {
                 }
                 assertTrue(client.request(RpcMethods.list()).objects("sessions").any { it.string("session_id") == session })
                 withTimeout(10_000) { while (cache.lastApplied(session) < accepted.number("accepted_seq")) delay(100) }
+                withTimeout(10_000) {
+                    while (cache.entries(session).none { it.display.toString().contains(
+                        "Haider integration fixture: the embedded daemon received your message over h.sock.") }) delay(100)
+                }
                 replay.detach(session)
             } finally { replay.close() }
         } finally {

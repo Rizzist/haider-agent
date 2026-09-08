@@ -20,6 +20,7 @@ class SessionListStateTest {
         lastActivityMs: Long? = now,
         seenAtMs: Long? = now,
         runId: String? = null,
+        runState: String? = if (runId != null) "running" else "idle",
         needsInput: NeedsInput? = null,
     ) = SessionRow(
         id = id,
@@ -28,10 +29,22 @@ class SessionListStateTest {
         lastActivityMs = lastActivityMs,
         seenAtMs = seenAtMs,
         runId = runId,
+        runState = runState,
         needsInput = needsInput,
     )
 
     private val asking = NeedsInput(kind = "approval", title = "Send it?")
+
+    @Test
+    fun `completed run identity does not keep a seen session active`() {
+        val rows = listOf("idle", "cancelled", "errored", "unknown", "future_state", null).mapIndexed { index, state ->
+            row("completed-$index", runId = "retained-$index", runState = state)
+        }
+        assertEquals(0, rows.count { it.hasActiveRun })
+        assertEquals(listOf(SessionGroupKind.Recent), SessionListState.groups(rows, rows.first().id).map { it.kind })
+        // Unseen activity still earns attention independently of run activity.
+        assertEquals(SessionGroupKind.Active, SessionListState.groupKind(rows.first().copy(seenAtMs = 0)))
+    }
 
     @Test
     fun `needs input outranks everything else`() {

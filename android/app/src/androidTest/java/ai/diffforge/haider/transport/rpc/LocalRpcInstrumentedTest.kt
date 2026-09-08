@@ -24,8 +24,12 @@ class LocalRpcInstrumentedTest {
         assertEquals(BuildConfig.VERSION_NAME, metadata.string("daemon_version"))
         assertEquals(1L, metadata.number("jni_version"))
         assertEquals(1L, metadata.number("wire_protocol"))
-        assertTrue(metadata.string("build_id").isNotBlank())
+        assertTrue(metadata.string("build_id").matches(Regex("[0-9a-f]{64}")))
+        InstrumentationRegistry.getArguments().getString("expectedBuildId")?.let {
+            assertEquals(it, metadata.string("build_id"))
+        }
         assertEquals(android.os.Build.SUPPORTED_ABIS.first(), metadata.string("abi"))
+        android.util.Log.i("HaiderNativeVerification", value)
     }
 
     @Test fun filesystemLocalSocketAuthenticatesPeerAndExchangesRustGolden() = runBlocking<Unit> {

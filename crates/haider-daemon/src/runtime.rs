@@ -212,10 +212,13 @@ pub struct DaemonTaskDiagnosticSnapshot {
     pub outcome: Option<String>,
     /// Connections admitted by the daemon since this task started.
     pub connection_admissions: u64,
+    /// Set once from the actual durable generation and bound endpoint, before Ready.
+    pub bootstrap: Option<haider_protocol::runtime::DaemonBootstrapMetadata>,
 }
 
 #[derive(Default)]
 struct DaemonTaskCompletion {
+    bootstrap: std::sync::OnceLock<haider_protocol::runtime::DaemonBootstrapMetadata>,
     finished: AtomicBool,
     outcome: StdMutex<Option<String>>,
     connection_admissions: Arc<AtomicU64>,
@@ -273,6 +276,7 @@ impl DaemonTaskDiagnostics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         DaemonTaskDiagnosticSnapshot {
+            bootstrap: self.completion.bootstrap.get().cloned(),
             state: self.readiness.current(),
             finished,
             outcome,
@@ -707,6 +711,7 @@ async fn run_inner(
         .validate()
         .map_err(|message| DaemonError::InvalidConfig { message })?;
     endpoint::validate_budget(config)?;
+    crate::android_workspace::initialize(config.android_workspace_dir.as_deref())?;
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         return shutdown_without_store(config, states, request, &shutdown);
@@ -732,11 +737,13 @@ async fn run_inner(
         }
         Err(error) => return Err(error.into()),
     };
-    haider_platform::publish_active_daemon_log(&config.store_dir).map_err(|error| {
-        DaemonError::Task {
-            message: format!("cannot publish active daemon log: {error}"),
-        }
-    })?;
+    if !crate::android_policy::enabled() {
+        haider_platform::publish_active_daemon_log(&config.store_dir).map_err(|error| {
+            DaemonError::Task {
+                message: format!("cannot publish active daemon log: {error}"),
+            }
+        })?;
+    }
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         drop(lease);
@@ -754,7 +761,12 @@ async fn run_inner(
     // reconcile every dispatched-without-terminal effect. Only after all of
     // this may a listener bind or Ready be advertised.
     states.publish(DaemonState::Recovering);
-    let store = SqliteStoreHandle::open_locked(lease).await?;
+    let store = match config.store_synchronous {
+        Some(synchronous) => {
+            SqliteStoreHandle::open_locked_with_synchronous(lease, synchronous).await?
+        }
+        None => SqliteStoreHandle::open_locked(lease).await?,
+    };
     states.mark_store_open();
     let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
     if let Err(error) = store.initialize_usage_history().await {
@@ -1231,10 +1243,32 @@ async fn run_inner(
     // Publish the live peer roster only after ordinary turn recovery has
     // handed previously accepted runs back to their workers. New peer input
     // then enters the same admission boundary as other live session input.
-    let peer_service = match crate::peer::PeerService::start(config.runtime_dir.clone(), &hub).await
-    {
-        Ok(service) => service,
-        Err(error) => {
+    if !crate::android_policy::enabled() {
+        let peer_service =
+            match crate::peer::PeerService::start(config.runtime_dir.clone(), &hub).await {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = worker_manager.shutdown().await;
+                    if let Some(broker) = &credential_broker {
+                        broker.abort_and_join().await;
+                    }
+                    if let Some(oauth) = &oauth_coordinator {
+                        oauth.abort_and_join().await;
+                    }
+                    if let Some(actor) = account_actor.as_mut() {
+                        actor.force_and_join().await;
+                    }
+                    if let Some(engine) = hook_engine.take() {
+                        engine.shutdown().await;
+                    }
+                    let _ = hub.shutdown().await;
+                    let _ = store.close().await;
+                    return Err(DaemonError::Task {
+                        message: format!("peer messaging startup failed: {error}"),
+                    });
+                }
+            };
+        if let Err(error) = hub.install_peer_service(peer_service) {
             let _ = worker_manager.shutdown().await;
             if let Some(broker) = &credential_broker {
                 broker.abort_and_join().await;
@@ -1251,29 +1285,9 @@ async fn run_inner(
             let _ = hub.shutdown().await;
             let _ = store.close().await;
             return Err(DaemonError::Task {
-                message: format!("peer messaging startup failed: {error}"),
+                message: format!("peer messaging installation failed: {error}"),
             });
         }
-    };
-    if let Err(error) = hub.install_peer_service(peer_service) {
-        let _ = worker_manager.shutdown().await;
-        if let Some(broker) = &credential_broker {
-            broker.abort_and_join().await;
-        }
-        if let Some(oauth) = &oauth_coordinator {
-            oauth.abort_and_join().await;
-        }
-        if let Some(actor) = account_actor.as_mut() {
-            actor.force_and_join().await;
-        }
-        if let Some(engine) = hook_engine.take() {
-            engine.shutdown().await;
-        }
-        let _ = hub.shutdown().await;
-        let _ = store.close().await;
-        return Err(DaemonError::Task {
-            message: format!("peer messaging installation failed: {error}"),
-        });
     }
     // Install both monitor seams before the accept task exists. From the
     // first authenticated APK frame onward, every valid SMS therefore has an
@@ -1391,6 +1405,12 @@ async fn run_inner(
     if let Some(delay) = config.inject_before_ready_delay {
         tokio::time::sleep(delay).await;
     }
+    let _ = diagnostics
+        .bootstrap
+        .set(haider_protocol::runtime::DaemonBootstrapMetadata {
+            daemon_generation,
+            endpoint_path: endpoint.path().to_path_buf(),
+        });
     states.mark_session_hub_accepting_turns();
     // Ready is published under the shutdown transition mutex, so a first
     // signal that races this point either wins (no Ready, drain from

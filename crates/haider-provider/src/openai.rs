@@ -171,7 +171,6 @@ fn build_openai_client(
 ) -> Result<reqwest::Client, ProviderError> {
     OPENAI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut client = crate::provider_http_client_builder()
-        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(match transport.retry_policy {
             OpenAiRetryPolicy::Never => reqwest::retry::never(),
@@ -250,8 +249,7 @@ pub(crate) async fn openai_compatible_catalog_transport(
         )
         .await?;
     }
-    let mut client = reqwest::Client::builder()
-        .no_proxy()
+    let mut client = haider_platform::native_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout)
@@ -5916,8 +5914,7 @@ pub async fn validate_openai_compatible_endpoint(
     policy: CompatibleOriginPolicy,
 ) -> Result<String, ProviderError> {
     let endpoints = compatible_endpoints(base_url, policy)?;
-    let mut client = reqwest::Client::builder()
-        .no_proxy()
+    let mut client = haider_platform::native_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout);

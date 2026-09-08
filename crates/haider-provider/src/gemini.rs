@@ -64,8 +64,7 @@ fn build_gemini_transport(
         resolver,
     )?);
     let transport = GeminiProvider::transport_config();
-    let client = reqwest::Client::builder()
-        .no_proxy()
+    let client = haider_platform::native_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(match transport.retry_policy {
             GeminiRetryPolicy::Never => reqwest::retry::never(),

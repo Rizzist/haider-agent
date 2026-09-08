@@ -157,7 +157,7 @@ class FakeAccountsRepository(
     // Not "if it looks long enough, it is valid": there is no validate-only
     // call to be a fake of (lane 971-3 handoff, UI-14).
     override suspend fun validateApiKey(provider: String, apiKey: CharArray): AccountResult =
-        AccountResult.Failed(VALIDATE_ONLY_UNAVAILABLE)
+        AccountResult.Failed(VALIDATE_ONLY_UNAVAILABLE).also { apiKey.fill('\u0000') }
 
     override suspend fun remove(alias: String): AccountResult {
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_REMOVE

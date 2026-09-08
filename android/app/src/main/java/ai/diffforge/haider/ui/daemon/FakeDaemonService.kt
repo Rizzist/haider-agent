@@ -41,7 +41,6 @@ import ai.diffforge.haider.ui.workflow.WorkflowGraphRead
 import ai.diffforge.haider.ui.workflow.WorkflowRpcAdapter
 import ai.diffforge.haider.ui.workflow.WorkflowWatchPage
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.StateFlow
@@ -99,6 +98,8 @@ class FakeDaemonService(
     private val _status = MutableStateFlow<DaemonStatus>(DaemonStatus.Stopped)
     private val _environment = MutableStateFlow(DaemonEnvironment())
     private val _sessions = MutableStateFlow<List<SessionRow>>(emptyList())
+    /** This fixture starts hydrated; tests can model delayed Binder/RPC readiness. */
+    override val rosterReady = MutableStateFlow(true)
     private val _paging = MutableStateFlow(RosterPaging())
     private val _activeSessionId = MutableStateFlow<String?>(null)
     private val _models = MutableStateFlow<SessionConfig?>(null)
@@ -934,13 +935,6 @@ class FakeDaemonService(
         _usage.value = snapshot
     }
 
-    /**
-     * True only because this fake installs an authoritative fixture and knows
-     * it. A real facade has to hydrate first (lane 971-3 handoff).
-     */
-    private val _rosterReady = MutableStateFlow(true)
-    override val rosterReady: StateFlow<Boolean> = _rosterReady.asStateFlow()
-
     /** Set to make the next selection refuse, the way the daemon can. */
     private var nextSelectionFailure: String? = null
 
@@ -1132,7 +1126,7 @@ class FakeDaemonService(
 
     private fun running() = DaemonStatus.Running(
         DaemonInfo(
-            version = "0.0.971",
+            version = "0.0.970",
             generation = 4L,
             pid = 4711,
             socketPath = "/data/user/0/ai.diffforge.haider/files/haider/runtime/android-default/h.sock",

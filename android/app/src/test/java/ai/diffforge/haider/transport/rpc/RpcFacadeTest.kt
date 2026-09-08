@@ -5,6 +5,7 @@ import ai.diffforge.haider.ui.accounts.AuthKind
 import ai.diffforge.haider.ui.accounts.OAuthFlow as UiFlow
 import ai.diffforge.haider.ui.accounts.OAuthStatus as UiStatus
 import ai.diffforge.haider.ui.daemon.*
+import ai.diffforge.haider.ui.state.PermissionMode
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.*
@@ -19,7 +20,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 class RpcFacadeTest {
-    private fun snapshot(generation: Long = 1) = DaemonServiceSnapshot(true, DaemonPhase.Ready, "0.0.971", "0.0.971", 1,
+    private fun snapshot(generation: Long = 1) = DaemonServiceSnapshot(true, DaemonPhase.Ready, "0.0.970", "0.0.970", 1,
         generation, RpcEndpoint("/private/h.sock", 1, generation), 0, null, NetworkState.Available, true, false,
         null, false, 1, 10, 200)
     private class Daemon(private val owner: CoroutineScope, private val deferredMethod: String? = null,
@@ -36,7 +37,7 @@ class RpcFacadeTest {
                             RpcWire.read(peer.getInputStream())!!
                             writePeer(peer, obj("v" to 1, "kind" to "welcome", "protocol" to 1,
                                 "instance_id" to "facade", "daemon_generation" to 1, "frame_limit" to RpcWire.MAX_BODY,
-                                "daemon_version" to "0.0.971", "profile_id" to "android-default",
+                                "daemon_version" to "0.0.970", "profile_id" to "android-default",
                                 "capabilities_granted" to JsonArray(listOf("view", "control").map(::JsonPrimitive))))
                             while (isActive) {
                                 val frame = RpcWire.read(peer.getInputStream()) ?: break
@@ -150,6 +151,15 @@ class RpcFacadeTest {
             ui.markSeen("s") // Drawer action before any selected-session attachment.
             ui.activate("s")
             withTimeout(5000) { ui.models.first { it != null } }
+            assertFalse(ui.shell.value.available)
+            assertEquals("process_exec_disabled", ui.shell.value.reason)
+            assertEquals(PermissionMode.Ask, ui.permissionMode.value)
+            assertEquals(setOf(PermissionMode.Ask), ui.supportedPermissionModes)
+            ui.setPermissionMode(PermissionMode.Ask)
+            val policyFailure = runCatching { ui.setPermissionMode(PermissionMode.Auto) }.exceptionOrNull()
+            assertEquals("permission_mode_unavailable", policyFailure?.message)
+            assertEquals(PermissionMode.Ask, ui.permissionMode.value)
+            assertFalse(daemon.requests.any { it.string("method") == "tool.policy" })
             assertEquals(listOf("high"), ui.providers.value.effortsFor("p", "m"))
             assertEquals(4096L, ui.providers.value.model("p", "m")!!.contextWindow)
             assertTrue(ui.providers.value.effortsFor("p", "absent").isEmpty())
@@ -158,6 +168,15 @@ class RpcFacadeTest {
             assertEquals(false, ui.sessions.value.first().fast)
             assertFalse(ui.paging.value.hasMore); assertNull(ui.paging.value.cursor)
             val before = daemon.requests.size; ui.loadMoreSessions(); assertEquals(before, daemon.requests.size)
+            ui.selectModel("p", "m")
+            assertFalse(daemon.requests.last { it.string("method") == "session.select_model" }.containsKey("confirm_new_epoch"))
+            ui.selectModel("p", "m", confirmNewEpoch = true)
+            assertEquals(JsonPrimitive(true), daemon.requests.last { it.string("method") == "session.select_model" }["confirm_new_epoch"])
+            ui.selectEffort("high")
+            assertFalse(daemon.requests.last { it.string("method") == "session.select_effort" }.containsKey("confirm_new_epoch"))
+            ui.selectEffort("high", confirmNewEpoch = true)
+            assertEquals(JsonPrimitive(true), daemon.requests.last { it.string("method") == "session.select_effort" }["confirm_new_epoch"])
+
             ui.markSeen("s"); ui.rename("s", "renamed"); ui.stopTurn("s")
             val cancelled = daemon.requests.last { it.string("method") == "turn.cancel" }
             assertEquals("run", cancelled.string("run_id")); assertEquals(7L, cancelled.number("worker_generation"))
@@ -169,6 +188,17 @@ class RpcFacadeTest {
             assertEquals("stable-menu-command", daemon.requests.last { it.string("method") == "menu.answer" }.string("command_id"))
             ui.selectModel("p", "m"); ui.selectEffort("high"); ui.selectProvider("p"); ui.refreshModels()
             ui.send("s", "hello")
+            assertEquals("steer", daemon.requests.last { it.string("method") == "turn.submit" }.string("mode"))
+            ui.send("s", "queued", mode = Delivery.Queue)
+            assertEquals("queue", daemon.requests.last { it.string("method") == "turn.submit" }.string("mode"))
+            val submissions = daemon.requests.count { it.string("method") == "turn.submit" }
+            val attachmentFailure = runCatching {
+                ui.send("s", "keep my attachment", listOf(Attachment.TextFile("blake3:synthetic", "fixture.txt", 1)))
+            }.exceptionOrNull()
+            assertEquals("attachment_transport_unavailable", (attachmentFailure as? TurnRefused)?.code)
+            assertEquals(submissions, daemon.requests.count { it.string("method") == "turn.submit" })
+            assertFalse(ui.queue.value.supported)
+            assertFalse(ui.usage.value.supported)
             assertTrue(daemon.requests.filter { it.string("method") == "session.attach" }.all { it.string("mode") == "control" })
             val transcript = ui.transcript("s")
             assertTrue(transcript is TranscriptLoad.Complete)
@@ -565,7 +595,7 @@ class RpcFacadeTest {
         assertEquals(AuthKind.Unknown, RpcAccountsRepository.account(Account("a", "p", null, "future", false, null, "unknown")).authKind)
         assertTrue(RpcAccountsRepository.status(OAuthStatus("future", null, null)) is UiStatus.Failed)
         for (state in RpcConnectionState.entries) assertEquals(state.ordinal, RpcUiMapping.dataPlane(state).ordinal)
-        assertEquals("0.0.971", RpcUiMapping.target(snapshot())!!.appVersion)
+        assertEquals("0.0.970", RpcUiMapping.target(snapshot())!!.appVersion)
         assertNull(RpcUiMapping.target(snapshot().copy(phase = DaemonPhase.Stopping)))
         assertThrows(RpcProtocolException::class.java) { RpcUiMapping.target(snapshot().copy(daemonGeneration = 99)) }
     }

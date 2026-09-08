@@ -3682,6 +3682,15 @@ impl HubConnection {
                 None,
             );
         }
+        if crate::android_policy::request_denied(&body) {
+            return self.respond_error(
+                request_id,
+                "capability_denied",
+                "capability is unavailable in android-standalone",
+                false,
+                None,
+            );
+        }
         match body {
             RequestBody::CommandList {
                 query,
@@ -19902,6 +19911,10 @@ async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
     tokio::task::spawn_blocking(move || {
         let canonical = std::fs::canonicalize(&cwd)
             .map_err(|error| format!("cannot canonicalize session cwd: {error}"))?;
+        if crate::android_policy::enabled() {
+            crate::android_workspace::validate(&canonical)
+                .map_err(|_| "workspace is outside the immutable Android ceiling".to_owned())?;
+        }
         let canonical_text = canonical
             .to_str()
             .ok_or_else(|| "canonical session cwd is not valid UTF-8".to_owned())?

@@ -5,18 +5,17 @@ The frozen authority is `docs/android/contracts-v1.md`. These tasks require the 
 native task; no stub `.so`, skipped native task, or stale artifact is substituted.
 
 ```sh
-source ~/.config/android/env.sh
-python3 scripts/android/wait-for-build.py
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p haider-rpc --locked
-python3 scripts/android/wait-for-build.py
-gradle -p android :app:testPhoneDebugUnitTest :app:testPhoneReleaseUnitTest \
+source /Users/rizzist/Developer/haiderharness/env.sh
+/Users/rizzist/Developer/haiderharness/runtime/build-slot.sh android-rpc -- cargo test -p haider-rpc --locked
+/Users/rizzist/Developer/haiderharness/runtime/build-slot.sh android-jvm -- gradle -p android :app:testPhoneDebugUnitTest :app:testPhoneReleaseUnitTest \
   :app:testEmulatorDebugUnitTest --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2
 python3 -m unittest discover -s scripts/android -p 'test_*.py'
 ```
 
-Wait again before each build on the shared Mac. The guard polls every 60 seconds for at most
-30 minutes, requiring load below 6, free+inactive memory above 3 GiB, and no other Gradle JVM.
-The native child rechecks admission while excluding only its owning Gradle ancestors.
+On the shared Mac, wrap every Cargo, Gradle and xtask invocation with the machine-wide
+`runtime/build-slot.sh <label> -- <command...>` helper. It owns admission, quiet markers,
+two build slots and Cargo resource limits. The Gradle slot covers its nested native task;
+no separate load or process-count admission runs inside it. Isolated CI owns its runner.
 
 `gradle -p android :app:assemblePhoneRelease :app:assembleEmulatorDebug` invokes
 `buildHaiderNative` once, then copies the appropriate ABI to
@@ -80,7 +79,7 @@ Rust wire fixtures are direct JVM resources. The only new fixture is generated f
 `EventPayload` types with:
 
 ```sh
-UPDATE_ANDROID_GOLDEN=1 cargo test -p haider-rpc --test android_projection_golden_tests
+UPDATE_ANDROID_GOLDEN=1 /Users/rizzist/Developer/haiderharness/runtime/build-slot.sh android-golden -- cargo test -p haider-rpc --test android_projection_golden_tests
 ```
 
 ## Advisory device tiers

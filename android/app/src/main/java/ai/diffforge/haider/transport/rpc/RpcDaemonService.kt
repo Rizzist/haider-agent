@@ -2,6 +2,7 @@ package ai.diffforge.haider.transport.rpc
 
 import ai.diffforge.haider.transport.*
 import ai.diffforge.haider.ui.daemon.*
+import ai.diffforge.haider.ui.state.PermissionMode
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.*
@@ -13,6 +14,7 @@ import java.util.UUID
 /** Lane 2 supplies this port from its sequenced Binder snapshots; null revokes authority on Binder death. */
 interface RpcControlPlane {
     val snapshots: StateFlow<DaemonServiceSnapshot?>
+    val notificationsPermanentlyDenied: StateFlow<Boolean> get() = MutableStateFlow(false)
     suspend fun start()
     suspend fun stop()
     suspend fun restart()
@@ -56,11 +58,24 @@ class RpcDaemonService(
         .stateIn(owner, SharingStarted.Eagerly, false)
     override val paging = roster.loading.map { RosterPaging(loading = it) }.stateIn(owner, SharingStarted.Eagerly, RosterPaging())
     override val activeSessionId: StateFlow<String?> = selected.asStateFlow()
+    // Existing interactive sessions preserve daemon approval gates. The frozen
+    // RPC contract has no mutation for the UI's new standing-consent mode.
+    override val permissionMode: StateFlow<PermissionMode> = MutableStateFlow(PermissionMode.Ask).asStateFlow()
+    override val supportedPermissionModes = setOf(PermissionMode.Ask)
+    override suspend fun setPermissionMode(mode: PermissionMode) {
+        if (mode !in supportedPermissionModes) throw IOException("permission_mode_unavailable")
+    }
+    // C4 is an immutable platform ceiling, independent of provider/session grants.
+    override val shell: StateFlow<ShellAvailability> =
+        MutableStateFlow(ShellAvailability(available = false, reason = "process_exec_disabled")).asStateFlow()
     override val models: StateFlow<SessionConfig?> = catalog.asStateFlow()
     override val providers: StateFlow<ProviderInventory> = inventory.asStateFlow()
     override val catalogError: StateFlow<String?> = catalogFailure.asStateFlow()
     override val catalogRequestedAtMs: StateFlow<Long?> = catalogTime.asStateFlow()
-    override val environment = control.snapshots.map { it?.let(DaemonSnapshotMapping::toEnvironment) ?: DaemonEnvironment(network = NetworkState.Unknown) }
+    override val environment = combine(control.snapshots, control.notificationsPermanentlyDenied) { snapshot, denied ->
+        (snapshot?.let(DaemonSnapshotMapping::toEnvironment) ?: DaemonEnvironment(network = NetworkState.Unknown))
+            .copy(notificationsPermanentlyDenied = denied)
+    }
         .stateIn(owner, SharingStarted.Eagerly, DaemonEnvironment(network = NetworkState.Unknown))
     override val status = combine(control.snapshots, client.state, sessions, roster.ready) { snapshot, state, rows, ready ->
         if (snapshot?.phase == DaemonPhase.Ready && state == RpcConnectionState.CONNECTED &&
@@ -189,13 +204,13 @@ class RpcDaemonService(
         val epoch = client.connectionEpoch
         secrets.entries.removeAll { it.value.expiresAtMs <= now || it.value.coordinates.epoch != epoch }
     }
-    override suspend fun selectModel(provider: String, model: String) {
+    override suspend fun selectModel(provider: String, model: String, confirmNewEpoch: Boolean) {
         val id = selected.value ?: throw IOException("no_active_session")
-        mutation(operationKey("model", id, provider, model)) { RpcMethods.selectModel(it, at(id), provider, model) }
+        mutation(operationKey("model", id, provider, model, confirmNewEpoch.toString())) { RpcMethods.selectModel(it, at(id), provider, model, confirmNewEpoch) }
     }
-    override suspend fun selectEffort(effort: String?) {
+    override suspend fun selectEffort(effort: String?, confirmNewEpoch: Boolean) {
         val id = selected.value ?: throw IOException("no_active_session")
-        mutation(operationKey("effort", id, effort.orEmpty())) { RpcMethods.selectEffort(it, at(id), effort) }
+        mutation(operationKey("effort", id, effort.orEmpty(), confirmNewEpoch.toString())) { RpcMethods.selectEffort(it, at(id), effort, confirmNewEpoch) }
     }
     override suspend fun selectProvider(provider: String) {
         val model = accountSource.providers.value.firstOrNull { it.id == provider }?.defaultModel ?: throw IOException("provider_default_model_unavailable")
@@ -229,9 +244,32 @@ class RpcDaemonService(
                     provider.modelDetails.firstOrNull { it.id == name } ?: SessionModel(name, null, emptyList(), null)
                 }) })
     }
-    override suspend fun send(sessionId: String, text: String) {
-        mutation(operationKey("send", sessionId, text)) { RpcMethods.submit(it, at(sessionId), text) }
+    override suspend fun send(sessionId: String, text: String, attachments: List<Attachment>, mode: Delivery) {
+        // UI parity added CAS attachments after this integration's frozen chat
+        // seam. Refuse unsupported blocks before submitting any part of a turn.
+        if (attachments.isNotEmpty()) throw TurnRefused("attachment_transport_unavailable")
+        try {
+            mutation(operationKey("send", sessionId, text, mode.wire)) {
+                RpcMethods.submit(it, at(sessionId), text, mode = mode.wire)
+            }
+        } catch (error: RpcRemoteException) {
+            throw TurnRefused(error.code)
+        }
     }
+
+    // Explicit unavailable snapshots for the UI parity doors that have no
+    // production adapter yet, matching the facade's fleet/workflow defaults.
+    override suspend fun stageAttachment(bytes: ByteArray, mime: String, name: String?): Attachment? = null
+    override suspend fun attachmentBytes(artifact: String): ByteArray? = null
+    override val queue: StateFlow<QueueSnapshot> =
+        MutableStateFlow(QueueSnapshot(error = "queue_transport_unavailable")).asStateFlow()
+    override suspend fun refreshQueue(sessionId: String) = Unit
+    override suspend fun removeQueued(sessionId: String, id: String, revision: Long): Nothing =
+        throw IOException("queue_transport_unavailable")
+    override suspend fun promoteQueued(sessionId: String, id: String, revision: Long): Nothing =
+        throw IOException("queue_transport_unavailable")
+    override val usage: StateFlow<UsageSnapshot> = MutableStateFlow(UsageSnapshot()).asStateFlow()
+    override suspend fun refreshUsage() = Unit
     private fun cachedTranscript(sessionId: String, error: String? = null): TranscriptLoad {
         val entries = replay.transcript(sessionId)
         val row = roster.sessions.value.firstOrNull { it.sessionId == sessionId }

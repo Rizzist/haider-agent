@@ -3,6 +3,7 @@ package ai.diffforge.haider.daemon
 import android.content.ContextWrapper
 import android.os.Process
 import android.system.Os
+import android.system.OsConstants
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.*
@@ -13,6 +14,20 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class PrivateDaemonFilesInstrumentedTest {
+    @Test fun appSelinuxAllowsPathHandlesForPrivateDirectoryAncestors() {
+        val root = InstrumentationRegistry.getInstrumentation().targetContext.filesDir.canonicalFile
+        // Linux O_PATH is not exposed by Android's public OsConstants API.
+        // Match rustix::fs::OFlags::PATH under the actual target app's SELinux domain.
+        val pathOnly = 0x200000 or OsConstants.O_NOFOLLOW or OsConstants.O_CLOEXEC
+        generateSequence(root) { it.parentFile }.forEach { ancestor ->
+            val handle = Os.open(ancestor.path, pathOnly, 0)
+            try { assertTrue(OsConstants.S_ISDIR(Os.fstat(handle).st_mode)) }
+            finally { Os.close(handle) }
+        }
+        val readable = Os.open(root.path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW, 0)
+        try { Os.fsync(readable) } finally { Os.close(readable) }
+    }
+
     @Test fun privateAtomicStateAndSymlinkFailure() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val root = File(context.cacheDir, "daemon-file-test-${UUID.randomUUID()}").apply { mkdir() }

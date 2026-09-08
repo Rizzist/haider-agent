@@ -36,6 +36,9 @@ class RecoveryProbe:
                 return json.loads(line.strip()[len(MARKER):])
         if "No services match:" in output:
             return None  # Absence must not create a service merely to observe it.
+        if f"SERVICE {COMPONENT} " in output and "pid=(not running)" in output:
+            # Pending is neither Ready nor absence (cleanup must keep waiting).
+            return {"phase": None, "frameworkProcessPending": True}
         raise RuntimeError(f"Service diagnostics unavailable: {output}")
 
     def assert_ready(self, timeout=130):

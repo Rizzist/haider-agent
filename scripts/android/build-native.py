@@ -76,8 +76,8 @@ def main():
         if key.startswith(('CC_', 'CXX_', 'AR_', 'RANLIB_', 'CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER', 'CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER')):
             env.pop(key)
     args.output.mkdir(parents=True, exist_ok=True)
-    # Recheck before Cargo too, excluding only the already-admitted owning Gradle ancestors.
-    subprocess.run([sys.executable, str(ROOT / "scripts/android/wait-for-build.py"), "--ignore-ancestors"], check=True)
+    # The caller owns scheduling for the whole Gradle/native build. Nested
+    # admission can deadlock a shared slot or starve an already admitted build.
     command = ['cargo', 'ndk', '-t', 'arm64-v8a', '-t', 'x86_64', '-P', '26', 'build', '-p', 'haider-android', '--release', '--locked']
     print('+ ' + ' '.join(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)

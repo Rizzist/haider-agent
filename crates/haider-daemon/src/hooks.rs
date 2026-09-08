@@ -3823,6 +3823,9 @@ async fn run_command(
     store: &haider_core::SqliteStoreHandle,
     mut shutdown: watch::Receiver<bool>,
 ) -> HookProcessResult {
+    if crate::android_policy::enabled() {
+        return failed_process_output("android-standalone disables shell hooks");
+    }
     if *shutdown.borrow() {
         return cancelled_process_output();
     }
@@ -4168,6 +4171,9 @@ async fn run_subscriber(
     mut events: mpsc::Receiver<SubscriberMessage>,
     run_override: bool,
 ) {
+    if crate::android_policy::enabled() {
+        return;
+    }
     let mut attempt = 0u32;
     let mut backoff = SUBSCRIBE_BACKOFF_MIN;
     let mut pending = None::<SubscriberMessage>;
@@ -4336,6 +4342,9 @@ async fn subscriber_backoff(
 fn spawn_subscriber(
     definition: &HookDefinition,
 ) -> Option<(tokio::process::Child, haider_platform::ProcessGroup)> {
+    if crate::android_policy::enabled() {
+        return None;
+    }
     let cwd_fd = open_canonical_directory(&definition.workspace_cwd)?;
     #[cfg(unix)]
     let mut command = hook_command(&definition.command, std::env::var_os("SHELL"));

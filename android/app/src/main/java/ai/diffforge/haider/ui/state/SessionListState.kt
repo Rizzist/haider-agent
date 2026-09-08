@@ -99,7 +99,7 @@ object SessionListState {
     fun tier(row: SessionRow, activeId: String?): Int = when {
         row.needsInput != null || row.state == SessionVisualState.NeedsInput -> 0
         row.unseen && row.id != activeId -> 1
-        row.runId != null -> 1
+        row.hasActiveRun -> 1
         else -> 2
     }
 

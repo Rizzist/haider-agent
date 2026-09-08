@@ -2677,7 +2677,8 @@ fn timed_out_search_output(
 
 impl SearchCollector {
     fn new(max_preview_bytes: usize, max_matches: usize) -> ToolResult<Self> {
-        let complete = tempfile::NamedTempFile::new()
+        let complete = haider_platform::native_temp_directory()
+            .and_then(tempfile::NamedTempFile::new_in)
             .map_err(|error| ToolError::io("create search result spool", "<search>", error))?;
         Ok(Self {
             preview: String::new(),
@@ -7370,6 +7371,7 @@ fn remove_path_staging(parent: &OwnedFd, name: &OsStr, display_path: &Path) {
 
 #[cfg(unix)]
 fn remove_entry_at(parent: &OwnedFd, leaf: &OsStr, display_path: &Path) -> ToolResult<()> {
+    require_public_android_path(display_path)?;
     let metadata = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| anchored_io_error("inspect delete target", display_path, error))?;
     if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
@@ -7412,6 +7414,8 @@ fn copy_entry_at(
     destination_path: &Path,
     structural: &mut Vec<u8>,
 ) -> ToolResult<()> {
+    require_public_android_path(source_path)?;
+    require_public_android_path(destination_path)?;
     let metadata = rustix::fs::statat(source_parent, source_leaf, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| anchored_io_error("inspect copy source", source_path, error))?;
     match FileType::from_raw_mode(metadata.st_mode) {
@@ -7903,8 +7907,7 @@ fn open_locked_current_at(
         let source_fd =
             openat_nofollow(parent, leaf, OFlags::RDONLY, "open for patch", display_path)?;
         let source = fs::File::from(source_fd);
-        source
-            .lock()
+        haider_platform::lock_file_exclusive(&source)
             .map_err(|error| ToolError::io("lock for patch", display_path, error))?;
         let locked = rustix::fs::fstat(&source)
             .map_err(|error| ToolError::io("inspect locked patch", display_path, error))?;
@@ -7980,6 +7983,7 @@ fn remove_temporary(parent: &OwnedFd, name: &OsStr) {
 }
 
 fn anchored_relative_path(workspace_root: &Path, canonical_path: &Path) -> ToolResult<PathBuf> {
+    require_public_android_path(canonical_path)?;
     let relative =
         canonical_path
             .strip_prefix(workspace_root)
@@ -8702,6 +8706,7 @@ fn resolve_workspace_path(
         }
     };
     require_under_root(workspace_root, requested_path, &resolved)?;
+    require_public_android_path(&resolved)?;
     Ok(resolved)
 }
 
@@ -9139,4 +9144,17 @@ mod windows_tests {
             vec![target.file_name().expect("target name").to_owned()]
         );
     }
+}
+
+fn require_public_android_path(path: &Path) -> ToolResult<()> {
+    if cfg!(feature = "android-standalone")
+        && path
+            .components()
+            .any(|c| c.as_os_str() == ".haider-lockdown")
+    {
+        return Err(ToolError::invalid_argument(
+            "Android provider sandbox is reserved",
+        ));
+    }
+    Ok(())
 }

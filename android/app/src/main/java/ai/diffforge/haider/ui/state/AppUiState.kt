@@ -178,6 +178,7 @@ data class AppUiState(
     /** `usage.report`, for the footer. */
     val usage: ai.diffforge.haider.ui.daemon.UsageSnapshot =
         ai.diffforge.haider.ui.daemon.UsageSnapshot(),
+    val supportedPermissionModes: Set<PermissionMode> = PermissionMode.entries.toSet(),
     val sessions: List<SessionRow> = emptyList(),
     val paging: RosterPaging = RosterPaging(),
     val activeSessionId: String? = null,

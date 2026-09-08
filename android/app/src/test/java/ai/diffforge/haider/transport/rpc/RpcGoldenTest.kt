@@ -275,7 +275,7 @@ class RpcGoldenTest {
             assertFalse(repository.coverage.value.complete)
             assertEquals("unsupported_display_events", repository.coverage.value.error)
             val file = dir.listFiles()!!.single()
-            assertTrue(file.renameTo(File(dir, file.name.replace("replay-v2", "replay-v1"))))
+            assertTrue(file.renameTo(File(dir, file.name.replace("replay-v3", "replay-v2"))))
             assertEquals(0L, TranscriptCache(dir).lastApplied("session-1"))
             // A roster head rollback must not preserve/search a cursor from a lost future.
             repository.indexAll(listOf(row.copy(headSeq = 0)))

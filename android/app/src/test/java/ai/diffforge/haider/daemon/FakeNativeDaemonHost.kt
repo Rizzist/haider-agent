@@ -3,7 +3,7 @@ package ai.diffforge.haider.daemon
 /** Test-only native substitute: never installed in production dependencies. */
 internal class FakeNativeDaemonHost : NativeDaemonHost {
     val calls = mutableListOf<String>()
-    var versionJson = """{"jni_version":1,"daemon_version":"0.0.971","wire_protocol":1,"build_id":"test","abi":"x86_64"}"""
+    var versionJson = """{"jni_version":1,"daemon_version":"0.0.970","wire_protocol":1,"build_id":"test","abi":"x86_64"}"""
     @Volatile var observation = """{"jni_version":1,"phase":"Recovering","daemon_generation":41}"""
     var initStatus = NativeStatus.OK
     var startStatus = NativeStatus.OK

@@ -871,7 +871,7 @@ impl HttpArchiveSource {
                 attempt.error("antigravity archive redirect left the approved Google origin")
             }
         });
-        let client = reqwest::Client::builder()
+        let client = haider_platform::http_client_builder()
             .timeout(DOWNLOAD_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_STALL_TIMEOUT)
@@ -1210,6 +1210,12 @@ impl AntigravityInstaller {
         pin: &AntigravityPin,
         source: &dyn ArchiveSource,
     ) -> Result<InstallOutcome, AntigravityInstallError> {
+        if crate::android_policy::enabled() {
+            return Err(AntigravityInstallError::UnsupportedPlatform {
+                os: "android-standalone".into(),
+                arch: std::env::consts::ARCH.into(),
+            });
+        }
         validate_version(pin.version)?;
         let expected_digest = decode_pinned_digest(pin)?;
         self.prepare_root()?;

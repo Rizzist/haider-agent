@@ -690,6 +690,7 @@ private fun Overlays(
             refusal = state.selectionRefusal,
             permissionMode = state.permissionMode,
             onSelectPermissionMode = viewModel::selectPermissionMode,
+            supportedPermissionModes = state.supportedPermissionModes,
             onConfirmRefused = viewModel::confirmRefusedSelection,
             onDismissRefusal = viewModel::dismissSelectionRefusal,
             inventory = state.providers,

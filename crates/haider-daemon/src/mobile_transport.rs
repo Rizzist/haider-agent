@@ -576,7 +576,9 @@ pub(crate) async fn start_if_enabled(
     default_model: String,
     instance_id: String,
 ) -> Result<Option<MobileTransportServer>, DaemonError> {
-    if !mobile_apk_enabled() {
+    // Standalone chat uses h.sock. The reverse-capability UDS is integrated
+    // in the forward lane; never bootstrap legacy token transport here.
+    if crate::android_policy::enabled() || !mobile_apk_enabled() {
         return Ok(None);
     }
     MobileTransportServer::start(

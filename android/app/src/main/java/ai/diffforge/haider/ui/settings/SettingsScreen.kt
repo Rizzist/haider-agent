@@ -148,7 +148,7 @@ fun SettingsScreen(
                 )
                 val line = resourceLine(
                     state.daemon as? DaemonStatus.Running,
-                    state.sessions.count { it.runId != null },
+                    state.sessions.count { it.hasActiveRun },
                     elapsedRealtimeMs,
                 )
                 // Regular type: session counts and uptime are not code

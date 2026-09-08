@@ -124,6 +124,7 @@ impl RuntimeDirectory {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn configured_daemon_temp_path(runtime_dir: &Path) -> Option<PathBuf> {
     let candidate = std::env::temp_dir();
     let expected_parent = runtime_dir.join("tmp");
@@ -132,6 +133,12 @@ fn configured_daemon_temp_path(runtime_dir: &Path) -> Option<PathBuf> {
         .is_some_and(|name| name.to_string_lossy().starts_with(".haiderd-tmp-"));
     (candidate.parent() == Some(expected_parent.as_path()) && is_daemon_private)
         .then_some(candidate)
+}
+
+#[cfg(target_os = "android")]
+fn configured_daemon_temp_path(_runtime_dir: &Path) -> Option<PathBuf> {
+    // Embedded temp users receive the C3 tmp_dir explicitly; no ambient TMPDIR.
+    None
 }
 
 impl Drop for RuntimeDirectory {

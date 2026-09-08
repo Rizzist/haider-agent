@@ -110,7 +110,7 @@ class ShoutSweepTest {
         assertTrue(!shouts("Draw the DAG"))
         // The list is names, not a licence: an invented one still shouts.
         assertTrue(shouts("XYZ"))
-        assertTrue(!shouts("Haider 0.0.971"))
+        assertTrue(!shouts("Haider 0.0.970"))
         assertTrue(!shouts("5 sessions · 3 active · 58 MB · up 4h12m"))
     }
 

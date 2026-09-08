@@ -96,7 +96,7 @@ class SessionDrawerTest {
         // "Model" is now a composer select label, so the assertion is about
         // the drawer's own subtree rather than the whole screen.
         assertEquals(0, rule.onAllNodesWithTextSafe("Appearance"))
-        assertEquals(0, rule.onAllNodesWithTextSafe("v0.0.971 · on this device"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("v0.0.970 · on this device"))
     }
 
     @Test

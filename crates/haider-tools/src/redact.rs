@@ -71,6 +71,13 @@ struct Span {
 
 /// Paths search/glob never reveal, even when hidden-file traversal is enabled.
 pub(crate) fn is_sensitive_path(path: &Path) -> bool {
+    if cfg!(feature = "android-standalone")
+        && path
+            .components()
+            .any(|c| c.as_os_str() == ".haider-lockdown")
+    {
+        return true;
+    }
     let components = path
         .components()
         .filter_map(|component| component.as_os_str().to_str())

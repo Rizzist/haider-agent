@@ -19,8 +19,8 @@ class DaemonSnapshotMappingTest {
     ) = DaemonServiceSnapshot(
         enabled = true,
         phase = phase,
-        appVersion = "0.0.971",
-        nativeVersion = "0.0.971",
+        appVersion = "0.0.970",
+        nativeVersion = "0.0.970",
         wireProtocol = 1,
         daemonGeneration = 12,
         rpcEndpoint = endpoint,

@@ -87,7 +87,7 @@ pub(crate) struct PathCliPresenceProbe;
 
 impl CliPresenceProbe for PathCliPresenceProbe {
     fn is_present(&self, program: &str) -> bool {
-        haider_platform::program_on_path(program)
+        !crate::android_policy::enabled() && haider_platform::program_on_path(program)
     }
 }
 
@@ -97,6 +97,12 @@ pub(crate) struct TokioInstallCommandRunner;
 #[async_trait]
 impl InstallCommandRunner for TokioInstallCommandRunner {
     async fn run(&self, recipe: &TrustedInstallCommand) -> io::Result<InstallCommandOutcome> {
+        if crate::android_policy::enabled() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "android-standalone disables CLI runners",
+            ));
+        }
         const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
         let mut command = tokio::process::Command::new(&recipe.executable);
         command
@@ -187,6 +193,13 @@ where
         &self,
         required: &TypedAgentRequiredCli,
     ) -> Result<TypedAgentInstallDisposition, TypedAgentInstallerError> {
+        if crate::android_policy::enabled() {
+            return Err(TypedAgentInstallerError::new(
+                TypedAgentInstallerErrorCode::UnsupportedRecipe,
+                "CLI installation is unavailable in android-standalone",
+                None,
+            ));
+        }
         required.validate().map_err(|_| {
             TypedAgentInstallerError::new(
                 TypedAgentInstallerErrorCode::InvalidRequiredCli,

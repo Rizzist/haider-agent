@@ -14,7 +14,7 @@ verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
 
 
-def fixture(machine=183, alignment=16384, relro=True, version='0.0.971'):
+def fixture(machine=183, alignment=16384, relro=True, version='0.0.970'):
     metadata = json.dumps(dict(format=1, daemon_version=version, abi='arm64-v8a', api=26,
                               jni_version=1, wire_protocol=1, build_id='a' * 64)).encode()
     names = b'\0.shstrtab\0.haider.build\0'
@@ -77,7 +77,7 @@ def readelf_tool():
 
 class NativeGateTest(unittest.TestCase):
     def test_valid_static_elf(self):
-        self.assertEqual(verify.inspect_elf(fixture(), 'arm64-v8a', '0.0.971')['api'], 26)
+        self.assertEqual(verify.inspect_elf(fixture(), 'arm64-v8a', '0.0.970')['api'], 26)
 
     def test_verify_so_rejects_real_dt_needed_entries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -95,13 +95,13 @@ class NativeGateTest(unittest.TestCase):
         for data in (fixture(machine=62), fixture(alignment=4096), fixture(relro=False),
                      fixture(version='wrong'), fixture()[:80], b'not an ELF'):
             with self.subTest(data=data[:20]), self.assertRaises(verify.InvalidNative):
-                verify.inspect_elf(data, 'arm64-v8a', '0.0.971')
+                verify.inspect_elf(data, 'arm64-v8a', '0.0.970')
 
     def test_et_dyn_required(self):
         data = bytearray(fixture())
         struct.pack_into('<H', data, 16, 2)
         with self.assertRaisesRegex(verify.InvalidNative, 'ET_DYN'):
-            verify.inspect_elf(data, 'arm64-v8a', '0.0.971')
+            verify.inspect_elf(data, 'arm64-v8a', '0.0.970')
 
 
 class ApkGateTest(unittest.TestCase):
@@ -124,16 +124,16 @@ class ApkGateTest(unittest.TestCase):
             def so(path, abi, version, readelf):
                 checked.append((path.name, version))
                 return verify.inspect_elf(path.read_bytes(), abi, version)
-            with patch.object(verify.subprocess, 'check_output', return_value="package: versionName='0.0.971'"), \
+            with patch.object(verify.subprocess, 'check_output', return_value="package: versionName='0.0.970'"), \
                     patch.object(verify.subprocess, 'run') as align, patch.object(verify, 'verify_so', side_effect=so):
-                result = verify.verify_apk(apk, 'arm64-v8a', '0.0.971', 'readelf', 'zipalign', 'aapt2')
+                result = verify.verify_apk(apk, 'arm64-v8a', '0.0.970', 'readelf', 'zipalign', 'aapt2')
                 align.assert_called_once()
             return result, checked
 
     def test_checks_compose_and_haider_libraries(self):
         result, checked = self.verify_archive()
         self.assertEqual(set(result['libraries']), verify.PACKAGED_LIBRARIES)
-        self.assertEqual(set(checked), {('libhaider.so', '0.0.971'), ('libandroidx.graphics.path.so', None)})
+        self.assertEqual(set(checked), {('libhaider.so', '0.0.970'), ('libandroidx.graphics.path.so', None)})
 
     def test_rejects_missing_extra_wrong_abi_duplicate_and_bad_alignment(self):
         correct = ['lib/arm64-v8a/' + name for name in sorted(verify.PACKAGED_LIBRARIES)]
@@ -148,7 +148,7 @@ class ApkGateTest(unittest.TestCase):
         data = bytearray(fixture())
         struct.pack_into('<I', data, 68, 7)
         with self.assertRaisesRegex(verify.InvalidNative, 'writable executable'):
-            verify.inspect_elf(data, 'arm64-v8a', '0.0.971')
+            verify.inspect_elf(data, 'arm64-v8a', '0.0.970')
 
 
 if __name__ == '__main__':

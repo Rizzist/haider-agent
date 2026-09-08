@@ -14,6 +14,10 @@ pub struct DaemonConfig {
     pub profile_id: String,
     /// Root of the profile store — the lifetime lock and SQLite journal.
     pub store_dir: PathBuf,
+    /// Standalone filesystem ceiling, distinct from provider lockdown bookkeeping.
+    pub android_workspace_dir: Option<PathBuf>,
+    /// Embedded hosts supply a typed WAL policy; None preserves desktop environment behavior.
+    pub store_synchronous: Option<haider_protocol::runtime::StoreSynchronous>,
     /// Per-profile runtime directory (forced to `0700`) holding the socket,
     /// pid file, and daemon temporary directory (R2).
     pub runtime_dir: PathBuf,
@@ -107,6 +111,8 @@ impl DaemonConfig {
         Self {
             profile_id: profile_id.into(),
             store_dir: store_dir.into(),
+            store_synchronous: None,
+            android_workspace_dir: None,
             // The client applies this same idempotent derivation before it
             // computes the endpoint, preserving one launcher/daemon path.
             runtime_dir: haider_platform::owner_scoped_runtime_directory(&runtime_dir),

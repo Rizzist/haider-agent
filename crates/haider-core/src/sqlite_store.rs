@@ -132,6 +132,17 @@ impl SqliteStoreHandle {
         run_blocking(move || Store::open_locked(lease).and_then(Self::from_store)).await
     }
 
+    /// Opens an embedded store with no process-wide synchronous override.
+    pub async fn open_locked_with_synchronous(
+        lease: ProfileLease,
+        synchronous: haider_protocol::runtime::StoreSynchronous,
+    ) -> Result<Self, HaiderError> {
+        run_blocking(move || {
+            Store::open_locked_with_synchronous(lease, synchronous).and_then(Self::from_store)
+        })
+        .await
+    }
+
     /// Opens or creates `root` without blocking the calling runtime worker.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, HaiderError> {
         let root = root.as_ref().to_path_buf();

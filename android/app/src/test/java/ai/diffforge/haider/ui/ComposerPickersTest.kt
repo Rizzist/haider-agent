@@ -171,7 +171,21 @@ class ComposerPickersTest {
         rule.waitForIdle()
         assertTrue("the app must open into a session", viewModel.state.value.activeSessionId != null)
         assertEquals(0, rule.onAllNodesWithTextSafe("Run Haider in the background"))
-        assertTrue(service.calls.any { it.startsWith("activate:") })
+        assertEquals(service.activeSessionId.value, viewModel.state.value.activeSessionId)
+        assertEquals(1, service.calls.count { it == "createSession" })
+    }
+
+    @Test
+    fun `repeated readiness notifications create once after the authoritative roster`() {
+        val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
+        service.rosterReady.value = false
+        val viewModel = rule.setHaiderApp(service)
+        rule.runOnIdle { repeat(3) { viewModel.ensureActiveSession() } }
+        assertTrue(service.calls.none { it == "createSession" })
+        rule.runOnIdle { service.rosterReady.value = true }
+        rule.waitForIdle()
+        assertEquals(1, service.calls.count { it == "createSession" })
+        assertEquals(service.activeSessionId.value, viewModel.state.value.activeSessionId)
     }
 
     @Test
@@ -181,5 +195,75 @@ class ComposerPickersTest {
         rule.waitForIdle()
         assertEquals(null, viewModel.state.value.activeSessionId)
         assertTrue(service.calls.none { it == "createSession" })
+    }
+
+    @Test
+    fun `a cold session hint waits for the roster without starting the daemon`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val running = service.status.value
+        service.rosterReady.value = false
+        service.setStatus(ai.diffforge.haider.ui.daemon.DaemonStatus.Starting)
+        val target = service.sessions.value.last().id
+        val viewModel = rule.setHaiderApp(service)
+        rule.runOnIdle { viewModel.activate(target) }
+        assertTrue(service.calls.none { it == "activate:$target" })
+        rule.runOnIdle { service.rosterReady.value = true; service.setStatus(running) }
+        rule.waitForIdle()
+        assertEquals(target, service.activeSessionId.value)
+        assertEquals(1, service.calls.count { it == "activate:$target" })
+        assertTrue(service.calls.none { it == "start" || it == "createSession" })
+    }
+
+    @Test
+    fun `a stale ready roster cannot authorize navigation during startup`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val running = service.status.value
+        service.setStatus(ai.diffforge.haider.ui.daemon.DaemonStatus.Starting)
+        val target = service.sessions.value.last().id
+        val viewModel = rule.setHaiderApp(service)
+        rule.runOnIdle { viewModel.activate(target) }
+        assertTrue(service.calls.none { it == "activate:$target" })
+        rule.runOnIdle { service.setStatus(running) }
+        rule.waitForIdle()
+        assertEquals(target, service.activeSessionId.value)
+        assertEquals(1, service.calls.count { it == "activate:$target" })
+    }
+
+    @Test
+    fun `queued cold navigation cannot block an explicit start and send`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        service.setStatus(ai.diffforge.haider.ui.daemon.DaemonStatus.Stopped)
+        service.rosterReady.value = false
+        val target = service.sessions.value.last().id
+        val viewModel = rule.setHaiderApp(service)
+        rule.runOnIdle { viewModel.activate(target) }
+        assertTrue(service.calls.none { it == "start" || it == "activate:$target" })
+        rule.runOnIdle {
+            viewModel.setDraft("Resume after a cold session hint")
+            viewModel.send()
+        }
+        assertEquals(1, service.calls.count { it == "start" })
+        assertTrue(service.calls.none { it.startsWith("turn.submit:") })
+        rule.runOnIdle { service.rosterReady.value = true }
+        rule.waitForIdle()
+        assertEquals(target, service.activeSessionId.value)
+        assertEquals(1, service.calls.count { it == "turn.submit:$target:steer:0" })
+    }
+
+    @Test
+    fun `start and send waits for the roster and creates only one session`() {
+        val service = ComposeHost.install(FakeScenario.EmptyRosterStopped)
+        service.rosterReady.value = false
+        val viewModel = rule.setHaiderApp(service)
+        rule.runOnIdle {
+            viewModel.setDraft("A queued first turn")
+            viewModel.send()
+        }
+        assertEquals(1, service.calls.count { it == "start" })
+        assertTrue(service.calls.none { it == "createSession" || it.startsWith("turn.submit:") })
+        rule.runOnIdle { service.rosterReady.value = true }
+        rule.waitForIdle()
+        assertEquals(1, service.calls.count { it == "createSession" })
+        assertEquals(1, service.calls.count { it.startsWith("turn.submit:") })
     }
 }

@@ -61,6 +61,16 @@ class RecoveryProbeTest(unittest.TestCase):
         self.assertEqual([["adb", "-s", "owned-emulator", "shell", "dumpsys", "activity",
                            "service", COMPONENT]], self.commands)
 
+    def test_starting_framework_record_is_polled_but_never_ready(self):
+        self.output = f"SERVICE {COMPONENT} d809b03 pid=(not running)\n"
+        self.assertEqual({"phase": None, "frameworkProcessPending": True}, self.probe.snapshot())
+        with self.assertRaisesRegex(AssertionError, "did not reach Ready"):
+            self.probe.assert_ready(timeout=0)
+        self.responses = [(255, "Stopping service\n", "Service stopped\n")]
+        with patch("daemon_recovery_probe.time.monotonic", side_effect=[0, 6]):
+            with self.assertRaisesRegex(AssertionError, "still present"):
+                self.probe.cleanup()
+
     def test_ready_requires_foreground_lifetime_and_endpoint(self):
         state = dict(phase="READY", enabled=True, started=True, hasEndpoint=True,
                      generation=1, destroyed=False)

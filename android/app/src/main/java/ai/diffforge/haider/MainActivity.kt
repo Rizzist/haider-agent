@@ -1,12 +1,9 @@
 package ai.diffforge.haider
 
 import ai.diffforge.haider.ui.accounts.AccountsRepository
-import ai.diffforge.haider.ui.accounts.FakeAccountsRepository
 import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.daemon.DaemonIntents
 import ai.diffforge.haider.ui.daemon.DaemonService
-import ai.diffforge.haider.ui.daemon.FakeDaemonService
-import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.scaffold.BANNER_PREFERENCES
 import ai.diffforge.haider.ui.scaffold.HaiderApp
@@ -54,18 +51,25 @@ import androidx.lifecycle.ViewModelProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import androidx.browser.customtabs.CustomTabsIntent
 
-/**
- * Process-wide wiring.
- *
- * [AppContainer] is the seam lane 971-3 moves: swapping [FakeDaemonService] for
- * `TransportDaemonService` (and the fake accounts repository for the RPC-backed
- * one) is a change to two lambdas, because everything above depends on the
- * interfaces, not the implementations.
- */
+/** Application-scoped Binder, RPC and OAuth ownership. Tests may inject their own factories. */
 object AppContainer {
-    var daemonFactory: (Context) -> DaemonService = { FakeDaemonService(FakeScenario.FirstRun) }
-    var accountsFactory: (Context) -> AccountsRepository = { FakeAccountsRepository() }
+    var daemonFactory: (Context) -> DaemonService = { context ->
+        // The native host independently enforces FLAG_DEBUGGABLE, owner, mode,
+        // and link checks. This selects an honest fixture label for device tests.
+        val fixture = BuildConfig.DEBUG && java.io.File(context.filesDir,
+            "haider/runtime/android-default/fake-provider.enabled").isFile
+        ai.diffforge.haider.transport.rpc.RpcDaemonService(scope,
+            ai.diffforge.haider.daemon.BinderRpcControlPlane(context, scope),
+            java.io.File(context.filesDir, "haider/ui-cache/display"),
+            java.io.File(context.filesDir, "haider/profiles/default/workspace").path,
+            if (fixture) "fake" else "anthropic",
+            if (fixture) "fake-model" else context.getString(R.string.daemon_default_model), 8192)
+    }
+    var accountsFactory: (Context) -> AccountsRepository = { context ->
+        (daemon(context) as ai.diffforge.haider.transport.rpc.RpcDaemonService).accounts
+    }
 
     /**
      * False in the Robolectric Compose tests: the test rule owns this
@@ -214,6 +218,13 @@ class MainActivity : ComponentActivity() {
             ),
         )[ChatViewModel::class.java]
         this.viewModel = viewModel
+        // The first explicit launcher action opts into the on-phone daemon.
+        // Subsequent launches preserve Stop, and OAuth/notification returns never enable it.
+        if (AppContainer.activityBootstrap && intent?.action == Intent.ACTION_MAIN &&
+            !permissionPreferences().getBoolean("initial_launcher_start", false)) {
+            permissionPreferences().edit().putBoolean("initial_launcher_start", true).apply()
+            viewModel.startDaemon()
+        }
 
         val themeStore = ThemePreferences.store(this)
         val bannerPreferences = getSharedPreferences(BANNER_PREFERENCES, Context.MODE_PRIVATE)
@@ -288,13 +299,13 @@ class MainActivity : ComponentActivity() {
         if (intent == null) return
         val data = intent.data
         if (data != null &&
-            data.scheme == DaemonIntents.DEEP_LINK_SCHEME &&
-            data.host == DaemonIntents.OAUTH_RETURN_HOST
+            intent.action == Intent.ACTION_VIEW && data.toString() == "haider://oauth/return"
         ) {
             viewModel.openOverlay(Overlay.Settings)
             return
         }
         when (intent.action) {
+            ai.diffforge.haider.daemon.DaemonIntents.OPEN_SETTINGS -> viewModel.openOverlay(Overlay.Settings)
             DaemonIntents.OPEN_SESSION, DaemonIntents.OPEN_INPUT -> {
                 val sessionId = intent.getStringExtra(DaemonIntents.EXTRA_SESSION_ID)
                 if (!sessionId.isNullOrBlank()) viewModel.activate(sessionId)
@@ -399,9 +410,10 @@ class MainActivity : ComponentActivity() {
 
     private fun openUrl(url: String) {
         runCatching {
-            startActivity(
-                Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            )
+            CustomTabsIntent.Builder()
+                .addMenuItem(getString(R.string.oauth_return_to_haider),
+                    ai.diffforge.haider.daemon.DaemonIntents.returnToSettings(this))
+                .build().launchUrl(this, Uri.parse(url))
         }
     }
 }
@@ -413,5 +425,5 @@ private const val KEY_NOTIFICATIONS_REQUESTED = "notifications_requested"
 object BuildConfigVersion {
     fun name(context: Context): String = runCatching {
         context.packageManager.getPackageInfo(context.packageName, 0).versionName
-    }.getOrNull().orEmpty().ifEmpty { "0.0.971" }
+    }.getOrNull().orEmpty().ifEmpty { BuildConfig.VERSION_NAME }
 }

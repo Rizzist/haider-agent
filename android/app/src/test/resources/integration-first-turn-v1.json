@@ -1,0 +1,403 @@
+[
+  {
+    "seq": 1,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "state": "created",
+      "type": "session_state"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 2,
+    "render": {
+      "ui": false,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "type": "hidden_fixture"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 3,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "seen_at_ms": 1788838638033,
+      "type": "session_seen"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 4,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "state": "queued",
+      "type": "run_state"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 5,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "attachments": [],
+      "mode": "queue",
+      "text": "Hello from API35 integration",
+      "type": "user_message"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 6,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "kind": {
+        "attachments": [],
+        "kind": "user_turn",
+        "text": "Hello from API35 integration"
+      },
+      "node": "node-6",
+      "type": "node_committed"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 7,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "state": "active_run",
+      "type": "session_state"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 8,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "title": "hello-from-api35",
+      "type": "session_renamed"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 9,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "state": "thinking",
+      "type": "run_state"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 10,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "event": "started",
+      "item": {
+        "data": {
+          "cached_input_tokens": 0,
+          "input_tokens": 1454,
+          "output_tokens": 0,
+          "reserved_output_tokens": 8192,
+          "truth": "estimated",
+          "used_tokens": 1454
+        },
+        "item": "extension",
+        "kind": "context_footprint_v1"
+      },
+      "item_id": "item-1",
+      "type": "item"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 11,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "event": "completed",
+      "item": {
+        "data": {
+          "cached_input_tokens": 0,
+          "input_tokens": 1454,
+          "output_tokens": 0,
+          "reserved_output_tokens": 8192,
+          "truth": "estimated",
+          "used_tokens": 1454
+        },
+        "item": "extension",
+        "kind": "context_footprint_v1"
+      },
+      "item_id": "item-1",
+      "type": "item"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 12,
+    "render": {
+      "ui": false,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "type": "hidden_fixture"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 13,
+    "render": {
+      "ui": false,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "type": "hidden_fixture"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 14,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "event": "started",
+      "item": {
+        "data": {
+          "budget": {
+            "hard_cap": 64,
+            "tranche": 32
+          },
+          "phase": "progress",
+          "used": 1
+        },
+        "item": "extension",
+        "kind": "provider_request_budget_v1"
+      },
+      "item_id": "item-3",
+      "type": "item"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 15,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "event": "completed",
+      "item": {
+        "data": {
+          "budget": {
+            "hard_cap": 64,
+            "tranche": 32
+          },
+          "phase": "progress",
+          "used": 1
+        },
+        "item": "extension",
+        "kind": "provider_request_budget_v1"
+      },
+      "item_id": "item-3",
+      "type": "item"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 16,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "state": "streaming",
+      "type": "run_state"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 17,
+    "render": {
+      "ui": false,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "type": "hidden_fixture"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 18,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "event": "started",
+      "item": {
+        "item": "agent_message",
+        "text": ""
+      },
+      "item_id": "item-4",
+      "type": "item"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 19,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "delta": {
+        "delta": "text",
+        "text": "Haider integration fixture: the embedded daemon received your message over h.sock."
+      },
+      "event": "delta",
+      "item_id": "item-4",
+      "type": "item"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 20,
+    "render": {
+      "ui": false,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "type": "hidden_fixture"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 21,
+    "render": {
+      "ui": false,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "type": "hidden_fixture"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 22,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "event": "completed",
+      "item": {
+        "item": "agent_message",
+        "text": "Haider integration fixture: the embedded daemon received your message over h.sock."
+      },
+      "item_id": "item-4",
+      "type": "item"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 23,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "kind": {
+        "kind": "assistant_commit",
+        "text": "Haider integration fixture: the embedded daemon received your message over h.sock.",
+        "verdict": {
+          "verdict": "not_applicable"
+        }
+      },
+      "node": "node-23",
+      "type": "node_committed"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 24,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "state": "done",
+      "type": "run_state"
+    },
+    "session_id": "integration-session"
+  },
+  {
+    "seq": 25,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "interrupted": false,
+      "state": "idle",
+      "type": "session_state"
+    },
+    "session_id": "integration-session"
+  }
+]

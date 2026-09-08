@@ -112,7 +112,7 @@ class StartSurfaceTest {
         assertEquals(0, rule.onAllNodesWithTextSafe("Keep it alive on One UI"))
         // Addition F, F1/S7: no logo, no version line, no "Ready." sentence.
         assertEquals(0, rule.onAllNodesWithTextSafe("Ready. Ask for anything on this phone."))
-        assertEquals(0, rule.onAllNodesWithTextSafe("v0.0.971 · no server, no Termux"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("v0.0.970 · no server, no Termux"))
     }
 
     @Test

@@ -97,6 +97,7 @@ fun SessionPickerSheet(
     onSelectPermissionMode: (PermissionMode) -> Unit,
     onConfirmRefused: () -> Unit,
     onDismissRefusal: () -> Unit,
+    supportedPermissionModes: Set<PermissionMode> = PermissionMode.entries.toSet(),
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -208,12 +209,12 @@ fun SessionPickerSheet(
                             ),
                             secondary = stringResource(
                                 when (mode) {
-                                    PermissionMode.Auto -> R.string.permission_mode_auto_detail
+                                    PermissionMode.Auto -> if (mode in supportedPermissionModes) R.string.permission_mode_auto_detail else R.string.permission_mode_auto_unavailable
                                     PermissionMode.Ask -> R.string.permission_mode_ask_detail
                                 },
                             ),
                             selected = mode == permissionMode,
-                            enabled = mode != permissionMode,
+                            enabled = mode != permissionMode && mode in supportedPermissionModes,
                             onClick = { onSelectPermissionMode(mode); onDismiss() },
                         )
                     }

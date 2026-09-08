@@ -21,7 +21,7 @@ class RpcLivenessTest {
         override fun readTimeout(milliseconds: Int) { socket.soTimeout = milliseconds }
         override fun close() = socket.close()
     }
-    private val target = RpcTarget("/test/h.sock", 1, 1, "0.0.971")
+    private val target = RpcTarget("/test/h.sock", 1, 1, "0.0.970")
     private fun welcome() = obj("v" to 1, "kind" to "welcome", "protocol" to 1, "instance_id" to "idle-test",
         "daemon_generation" to 1, "daemon_version" to target.appVersion, "profile_id" to "android-default",
         "frame_limit" to RpcWire.MAX_BODY, "capabilities_granted" to JsonArray(listOf("view", "control").map(::JsonPrimitive)))

@@ -23,11 +23,23 @@ class CancelCoordinateTest {
 
     @Test
     fun `both coordinates pass through unchanged`() {
-        val running = SessionRow(id = "s", runId = "run-9", workerGeneration = 6)
+        val running = SessionRow(id = "s", runId = "run-9", runState = "running", workerGeneration = 6)
         val coordinates = TurnCancel.coordinates(running)!!
         assertEquals("s", coordinates.sessionId)
         assertEquals("run-9", coordinates.runId)
         assertEquals(6L, coordinates.workerGeneration)
+    }
+
+    @Test
+    fun `a retained terminal run id never offers Stop`() {
+        for (state in listOf("idle", "cancelled", "errored", "unknown", "future_state", null)) {
+            assertNull(state, TurnCancel.coordinates(SessionRow(id = "s", runId = "completed-run",
+                runState = state, workerGeneration = 6)))
+        }
+        for (state in listOf("running", "waiting_for_route", "parked_permission", "parked_input", "effect_unknown")) {
+            assertEquals("live-run", TurnCancel.coordinates(SessionRow(id = "s", runId = "live-run",
+                runState = state, workerGeneration = 6))?.runId)
+        }
     }
 
     @Test

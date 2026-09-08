@@ -1855,6 +1855,11 @@ pub struct ContextCompactionOutcome {
 
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
+    /// Hard platform availability precedes actor grant/exposure handling. A false
+    /// result routes to the dispatcher's normal unsupported-tool outcome.
+    fn platform_tool_supported(&self, _name: &str) -> bool {
+        true
+    }
     /// Re-checks daemon-owned authority immediately before any tool route,
     /// including actor-owned request/plan/todo handling. Implementations use
     /// this narrow hook to fail closed when external session state changed
@@ -8367,7 +8372,13 @@ impl HarnessActor {
         // declarations present in its resolved grant-filtered pack. This
         // actor-side fence covers request/plan/todo before the general
         // dispatcher is reached.
-        if !tool_call_within_advertised_ceiling(&self.config, &tools[index].name) {
+        let platform_supported = self
+            .dispatcher
+            .as_ref()
+            .is_none_or(|dispatcher| dispatcher.platform_tool_supported(&tools[index].name));
+        if platform_supported
+            && !tool_call_within_advertised_ceiling(&self.config, &tools[index].name)
+        {
             let authority = if self.config.agent_id.is_some() {
                 "child"
             } else if self.config.tool_exposure.is_some() {

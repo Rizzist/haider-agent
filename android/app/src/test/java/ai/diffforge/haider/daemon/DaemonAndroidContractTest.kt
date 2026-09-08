@@ -20,10 +20,10 @@ import org.robolectric.annotation.Config
 class DaemonAndroidContractTest {
     private val context get() = RuntimeEnvironment.getApplication()
     @Test fun parcelRoundTripsEveryFieldAndNullPresenceBit() {
-        val full = DaemonServiceSnapshot(true, "READY", "0.0.971", "0.0.971", 1, 41,
+        val full = DaemonServiceSnapshot(true, "READY", "0.0.970", "0.0.970", 1, 41,
             RpcEndpoint("/private/h.sock", 1, 41), 2, 99, "AVAILABLE", true, true,
             "INTERNAL", true, 71, 800, 4096)
-        for (snapshot in listOf(full, DaemonServiceSnapshot(appVersion = "0.0.971"))) {
+        for (snapshot in listOf(full, DaemonServiceSnapshot(appVersion = "0.0.970"))) {
             val parcel = Parcel.obtain()
             try {
                 snapshot.writeToParcel(parcel, 0)
@@ -37,7 +37,7 @@ class DaemonAndroidContractTest {
             full.writeToParcel(parcel, 0); parcel.setDataPosition(0)
             assertEquals(1, parcel.readInt())
             assertEquals("READY", parcel.readString())
-            assertEquals("0.0.971", parcel.readString()); assertEquals("0.0.971", parcel.readString())
+            assertEquals("0.0.970", parcel.readString()); assertEquals("0.0.970", parcel.readString())
             assertEquals(1, parcel.readInt()); assertEquals(41L, parcel.readLong())
             assertEquals(1, parcel.readInt()); assertEquals("/private/h.sock", parcel.readString())
             assertEquals(1, parcel.readInt()); assertEquals(41L, parcel.readLong())

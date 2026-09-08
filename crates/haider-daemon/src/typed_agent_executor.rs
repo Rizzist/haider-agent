@@ -102,6 +102,13 @@ pub(crate) fn prepare_typed_dispatch(
         }
     })?;
 
+    if crate::android_policy::enabled() && !contract.required_clis.is_empty() {
+        return Err(TypedAgentDispatchRefusal {
+            code: "capability_denied",
+            message: "typed-agent CLIs are unavailable in android-standalone".into(),
+            install_job: None,
+        });
+    }
     if !contract.required_clis.is_empty() {
         let Some(job) = install_job else {
             return Err(TypedAgentDispatchRefusal {

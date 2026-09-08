@@ -29,9 +29,9 @@ class RpcClientTest {
         }
     }
     companion object {
-        private val target = RpcTarget("/private/h.sock", 1, 4, "0.0.971")
+        private val target = RpcTarget("/private/h.sock", 1, 4, "0.0.970")
         private fun welcome() = obj("v" to 1, "kind" to "welcome", "protocol" to 1, "instance_id" to "test-instance",
-            "daemon_generation" to 4, "frame_limit" to 1048576, "profile_id" to "android-default", "daemon_version" to "0.0.971",
+            "daemon_generation" to 4, "frame_limit" to 1048576, "profile_id" to "android-default", "daemon_version" to "0.0.970",
             "lifecycle_phase" to "ready", "capabilities_granted" to JsonArray(listOf("view", "control").map(::JsonPrimitive)))
     }
 

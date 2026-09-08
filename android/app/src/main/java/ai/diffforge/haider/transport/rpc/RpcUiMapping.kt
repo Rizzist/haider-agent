@@ -49,6 +49,15 @@ internal object RpcUiMapping {
             val display = entry.display
             when (display.optionalString("type")) {
                 "user_message" -> messages["user:${entry.seq}"] = Message(entry.seq, Role.User, display.optionalString("text").orEmpty())
+                "history_node" -> {
+                    val role = if (display.optionalString("kind") == "user_turn") Role.User else Role.Agent
+                    val text = display.string("text")
+                    // Current journals commit a node after its message/item. Older
+                    // histories can contain only the node: retain that text once.
+                    val previous = messages.values.lastOrNull()
+                    if (previous == null || previous.role != role || previous.text != text)
+                        messages["node:${entry.seq}"] = Message(entry.seq, role, text)
+                }
                 "item" -> {
                     val key = display.optionalString("item_id") ?: continue
                     val previous = messages[key] ?: Message(entry.seq, Role.Agent, "")

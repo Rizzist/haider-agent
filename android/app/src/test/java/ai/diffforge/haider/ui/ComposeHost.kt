@@ -7,6 +7,7 @@ import ai.diffforge.haider.ui.accounts.FakeAccountsRepository
 import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.daemon.FakeDaemonService
+import ai.diffforge.haider.ui.daemon.DaemonService
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.scaffold.HaiderApp
 import ai.diffforge.haider.ui.scaffold.InMemoryBannerDismissals
@@ -37,7 +38,7 @@ object ComposeHost {
 
 /** Renders the whole app against a fake daemon, in a fixed theme. */
 fun ComposeContentTestRule.setHaiderApp(
-    service: FakeDaemonService,
+    service: DaemonService,
     accounts: AccountsRepository = FakeAccountsRepository(),
     oauth: OAuthAttemptController? = null,
     dark: Boolean = true,
@@ -53,7 +54,7 @@ fun ComposeContentTestRule.setHaiderApp(
             service = service,
             accounts = accounts,
             oauth = controller,
-            appVersion = "0.0.971",
+            appVersion = "0.0.970",
             themeMode = themeMode,
             onThemeMode = {},
             onSystemAction = onSystemAction,

@@ -19,3 +19,6 @@ target-linux/
 # Lane A/B binary stashes (built haider/haiderd copies) must never be committed (registry #97)
 /.*-baseline/
 /.*-candidate/
+
+# Generated Kotlin compiler session state
+/android/.kotlin/

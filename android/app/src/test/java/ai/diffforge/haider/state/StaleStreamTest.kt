@@ -22,7 +22,7 @@ import org.junit.Test
  * does not exist.
  */
 class StaleStreamTest {
-    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.971", generation = 1))
+    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.970", generation = 1))
 
     private fun state(runId: String?, streaming: Boolean) = AppUiState(
         daemon = running,
@@ -31,6 +31,7 @@ class StaleStreamTest {
             SessionRow(
                 id = "s",
                 runId = runId,
+                runState = if (runId != null) "running" else "idle",
                 workerGeneration = 4,
                 state = if (runId != null) SessionVisualState.Running else SessionVisualState.Idle,
             ),

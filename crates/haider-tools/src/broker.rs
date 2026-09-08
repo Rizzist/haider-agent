@@ -1187,6 +1187,42 @@ impl EffectBroker {
         }
         let workspace_dir = haider_platform::open_workspace_directory(&workspace_root)
             .map_err(|error| ToolError::io("open workspace root", &workspace_root, error))?;
+        Self::new_anchored_at(
+            journal,
+            workspace_root,
+            workspace_dir,
+            session_id,
+            worker_generation,
+            started_at_ms,
+        )
+    }
+
+    /// Embedding ceiling: consumes the caller's already anchored workspace.
+    pub fn new_anchored(
+        journal: Box<dyn JournalSink>,
+        workspace_root: std::path::PathBuf,
+        workspace_dir: haider_platform::WorkspaceDirectory,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> ToolResult<Self> {
+        Self::new_anchored_at(
+            journal,
+            workspace_root,
+            workspace_dir,
+            session_id,
+            worker_generation,
+            unix_time_ms(),
+        )
+    }
+
+    fn new_anchored_at(
+        journal: Box<dyn JournalSink>,
+        workspace_root: std::path::PathBuf,
+        workspace_dir: haider_platform::WorkspaceDirectory,
+        session_id: SessionId,
+        worker_generation: u64,
+        started_at_ms: u64,
+    ) -> ToolResult<Self> {
         Ok(Self {
             journal: BrokerJournal::new(journal),
             workspace_root,

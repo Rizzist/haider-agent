@@ -18,7 +18,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BannerResolverTest {
-    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.971", generation = 1))
+    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.970", generation = 1))
     private val asking = NeedsInputElsewhere("s-2", "Reply to Amir", "Send it?", "2m 14s")
 
     @Test

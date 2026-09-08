@@ -13,6 +13,10 @@
 //!   credential is delegated to [`RotationCallback`]; this crate applies the
 //!   decision mechanically and ships no policy (that lands in D3b).
 
+#[cfg(unix)]
+mod encrypted_file_vault;
+#[cfg(all(unix, test))]
+mod encrypted_file_vault_tests;
 mod env_bridge;
 mod file_vault;
 #[cfg(test)]
@@ -27,6 +31,8 @@ mod source_registry;
 mod store;
 mod vault;
 
+#[cfg(unix)]
+pub use encrypted_file_vault::EncryptedFileVault;
 pub use env_bridge::import_env;
 pub use file_vault::FileVault;
 pub use haider_protocol::credential::{

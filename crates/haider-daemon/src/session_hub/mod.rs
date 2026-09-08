@@ -4563,6 +4563,9 @@ impl SessionHub {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
     ) -> Result<SessionCreateOutcome, SessionHubError> {
+        if crate::android_policy::enabled() {
+            crate::android_workspace::validate(std::path::Path::new(&command.cwd))?;
+        }
         let actor = self.actor_for(command.session_id.clone()).await?;
         let (completed, result) = oneshot::channel();
         actor
@@ -4702,6 +4705,13 @@ impl SessionHub {
             self.cache_committed_fork_scope(&created.session_id)?;
             self.publish_committed_fork(&created, None).await?;
             return Ok(SessionForkOutcome::IdempotentReplay { created });
+        }
+        if crate::android_policy::enabled() {
+            let metadata = self
+                .session_metadata(&source_session_id)
+                .await?
+                .ok_or_else(crate::android_policy::denied)?;
+            crate::android_workspace::validate(std::path::Path::new(&metadata.cwd))?;
         }
         let mut reservation = Some(self.reserve_fork_candidate(&candidate_session_id)?);
         if self
@@ -5066,6 +5076,9 @@ impl SessionHub {
         &self,
         command: SessionWorkspaceSetCommand,
     ) -> Result<SessionWorkspaceSetOutcome, SessionHubError> {
+        if crate::android_policy::enabled() {
+            crate::android_workspace::validate(std::path::Path::new(&command.path))?;
+        }
         let actor = self.actor_for(command.session_id.clone()).await?;
         let (completed, result) = oneshot::channel();
         actor

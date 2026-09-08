@@ -212,7 +212,7 @@ class DeclutterTest {
         val viewModel = rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
         viewModel.openOverlay(Overlay.Settings)
         rule.waitForIdle()
-        assertTrue(rule.onAllNodesWithTextSafe("Haider 0.0.971") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Haider 0.0.970") > 0)
         assertTrue(rule.onAllNodesWithTextSafe("5 sessions · 3 active · 58 MB · up 4h12m") > 0)
     }
 

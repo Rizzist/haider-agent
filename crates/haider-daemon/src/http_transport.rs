@@ -23,8 +23,7 @@ impl SharedHttpTransport {
 }
 
 fn build_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
-        .no_proxy()
+    haider_platform::native_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(DEFAULT_REQUEST_TIMEOUT)

@@ -135,6 +135,10 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
                 val itemId = p.optionalString("item_id")
                 when (p.optionalString("type")) {
                     "user_message" -> text["user:${entry.seq}"] = entry.seq to (p.optionalString("text") ?: "")
+                    "history_node" -> {
+                        val value = p.string("text")
+                        if (text.values.lastOrNull()?.second != value) text["node:${entry.seq}"] = entry.seq to value
+                    }
                     "item" -> if (itemId != null) {
                         val item = p["item"] as? JsonObject
                         val delta = p["delta"] as? JsonObject

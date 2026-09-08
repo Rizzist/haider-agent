@@ -36,7 +36,7 @@ internal class TestHaiderDaemonService : HaiderDaemonService() {
         override fun version(): String {
             promotedBeforeVersion = shadowOf(this@TestHaiderDaemonService).lastForegroundNotification != null
             val appVersion = packageManager.getPackageInfo(packageName, 0).versionName!!
-            return fake.version().replace("0.0.971", appVersion)
+            return fake.version().replace("0.0.970", appVersion)
         }
     }
 }

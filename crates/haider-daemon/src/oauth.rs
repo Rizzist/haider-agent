@@ -569,8 +569,7 @@ impl OAuthIdentityVerifier for OpenAiIdentityVerifier {
         if let Ok(mut slot) = self.guard_probe.lock() {
             slot.replace(Arc::clone(&origin_guard));
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
+        let client = haider_platform::native_http_client_builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(TOKEN_TIMEOUT)
@@ -4932,6 +4931,11 @@ async fn send_callback_page(
     status: u16,
     html: &str,
 ) -> std::io::Result<()> {
+    #[cfg(target_os = "android")]
+    let html = html.replace(
+        "</main>",
+        "<p><a href=\"haider://oauth/return\">Return to Haider</a></p></main>",
+    );
     let reason = if status == 200 { "OK" } else { "Bad Request" };
     let headers = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nPragma: no-cache\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",

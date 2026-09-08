@@ -180,7 +180,9 @@ open class HaiderDaemonService : Service() {
     }
     protected open fun createNativeHost(): NativeDaemonHost = JniNativeDaemonHost(applicationContext)
     /** Lane 3 supplies its full-RPC View adapter at this seam. Never substitute fake data here. */
-    protected open fun createSessionRosterSource(): SessionRosterSource = UnavailableSessionRosterSource()
+    protected open fun createSessionRosterSource(): SessionRosterSource =
+        ai.diffforge.haider.transport.rpc.RpcSessionRosterSource(
+            java.io.File(filesDir, "haider/ui-cache/notifier"), packagedVersion())
 
     private fun enqueueStartedAction(action: String) {
         // Execute in our identity, after returning from the Binder call. No native work here.
@@ -196,6 +198,8 @@ open class HaiderDaemonService : Service() {
     }
 
     private fun publishSnapshot(snapshot: DaemonServiceSnapshot) {
+        if (snapshot.phase != latest.phase) android.util.Log.i("HaiderDaemon",
+            "phase=${snapshot.phase} generation=${snapshot.daemonGeneration}")
         latest = snapshot
         if (!destroyed) {
             callbacks.execute {

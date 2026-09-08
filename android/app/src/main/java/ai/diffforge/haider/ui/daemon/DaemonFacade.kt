@@ -133,7 +133,7 @@ data class SessionRow(
      * field, decides between "no workflow" and "not read".
      */
     val workflow: ai.diffforge.haider.ui.workflow.SessionWorkflow? = null,
-    /** null ⇒ no active run ⇒ render no Stop button. */
+    /** A completed run may retain its ID; use [hasActiveRun] for activity. */
     val runId: String? = null,
     val workerGeneration: Long = 0L,
     val headSeq: Long = 0L,
@@ -159,6 +159,12 @@ data class SessionRow(
     val mainHeadNodeId: String? = null,
     val mainHeadSeq: Long = 0L,
 ) {
+    val hasActiveRun: Boolean
+        get() = runId != null && when (runState) {
+            "running", "waiting_for_route", "parked_permission", "parked_input", "effect_unknown" -> true
+            else -> false
+        }
+
     val unseen: Boolean
         get() = lastActivityMs != null && seenAtMs != null && lastActivityMs > seenAtMs
 }
@@ -327,6 +333,9 @@ object TurnCancel {
      */
     fun coordinates(row: SessionRow?): CancelCoordinates? {
         val runId = row?.runId ?: return null
+        // Current daemons may retain the terminal run's identity in an idle
+        // summary. Identity alone does not authorize a Stop affordance.
+        if (!row.hasActiveRun) return null
         return CancelCoordinates(row.id, runId, row.workerGeneration)
     }
 }
@@ -366,9 +375,11 @@ interface DaemonService : WorkflowDaemon, LoomDaemon {
      * sets it through, not a local flag.
      */
     val permissionMode: StateFlow<PermissionMode>
+    /** Modes supported by this adapter's actual policy contract. */
+    val supportedPermissionModes: Set<PermissionMode> get() = PermissionMode.entries.toSet()
     suspend fun setPermissionMode(mode: PermissionMode)
 
-    /** Derived from `tools.inventory`: can this device run a shell at all? */
+    /** Platform shell availability. Standalone C4 excludes local process execution. */
     val shell: StateFlow<ShellAvailability>
     val catalogError: StateFlow<String?>
 

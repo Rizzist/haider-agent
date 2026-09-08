@@ -253,8 +253,6 @@
     <string name="accounts_alias">Name (optional)</string>
     <string name="accounts_api_key">API key</string>
     <string name="accounts_api_key_hint">Paste the key</string>
-    <string name="accounts_validate">Validate</string>
-    <string name="accounts_validated">Key validated.</string>
     <string name="accounts_saved">API key added and validated.</string>
     <string name="accounts_removed">Account removed.</string>
     <string name="accounts_remove_confirm">Remove %1$s?</string>
@@ -355,6 +353,7 @@
     <string name="branches_fork_point">A branch forks at an exact committed node. Checkpoints record file changes and carry no node, so a new branch starts at this session\'s head.</string>
     <string name="branches_head">Head %1$d</string>
     <string name="action_checkpoints">Checkpoints and branches</string>
+    <string name="permission_mode_auto_unavailable">Automatic approvals are not available in this build.</string>
 
     <!-- Content descriptions -->
     <string name="cd_open_sessions">Open sessions</string>

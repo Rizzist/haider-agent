@@ -16,7 +16,7 @@ import org.junit.Test
  * makes that impossible.
  */
 class ModelChipStateTest {
-    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.971", generation = 1))
+    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.970", generation = 1))
     private val requestedAt = 1_000_000L
 
     private fun config(model: String = "claude-sonnet-4-5") = SessionConfig(

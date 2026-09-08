@@ -3,12 +3,14 @@ package ai.diffforge.haider.ui
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.daemon.DaemonService
 import ai.diffforge.haider.ui.daemon.NeedsInput
 import ai.diffforge.haider.ui.scaffold.HAIDER_TOP_BAR_TAG
 import ai.diffforge.haider.ui.state.CapabilityApproval
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.state.PermissionMode
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -159,6 +161,24 @@ class ReferenceUiTest {
         // reported back (addition H6).
         assertTrue(service.calls.contains("tool.policy:ask"))
         assertEquals(PermissionMode.Ask, viewModel.state.value.permissionMode)
+    }
+
+    @Test
+    fun `a production policy ceiling disables unsupported auto without sending a mutation`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        service.setPermissionModeForTest(PermissionMode.Ask)
+        val restricted = object : DaemonService by service {
+            override val supportedPermissionModes = setOf(PermissionMode.Ask)
+        }
+        val viewModel = rule.setHaiderApp(restricted)
+        viewModel.openOverlay(Overlay.Picker(PickerKind.Permissions))
+        rule.waitForIdle()
+        rule.onNodeWithText("Auto").assertIsNotEnabled()
+        rule.onNodeWithText("Automatic approvals are not available in this build.").assertIsDisplayed()
+        viewModel.selectPermissionMode(PermissionMode.Auto)
+        rule.waitForIdle()
+        assertEquals(PermissionMode.Ask, viewModel.state.value.permissionMode)
+        assertFalse(service.calls.any { it.startsWith("tool.policy:") })
     }
 
     @Test

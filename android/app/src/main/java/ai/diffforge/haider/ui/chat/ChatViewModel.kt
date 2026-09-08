@@ -36,12 +36,13 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -59,7 +60,10 @@ class ChatViewModel(
     private val searchDebounceMs: Long = SEARCH_DEBOUNCE_MS,
 ) : ViewModel() {
 
-    private val _state = MutableStateFlow(AppUiState())
+    private val _state = MutableStateFlow(AppUiState(
+        permissionMode = service.permissionMode.value,
+        supportedPermissionModes = service.supportedPermissionModes,
+    ))
     val state: StateFlow<AppUiState> = _state.asStateFlow()
 
     private val transcripts = mutableMapOf<String, List<Message>>()
@@ -68,13 +72,7 @@ class ChatViewModel(
     private var searchJob: Job? = null
     private var childTranscriptJob: Job? = null
     private var commandSeq = 0L
-
-    /**
-     * Declared before `init`, because the status collector below can call
-     * [ensureActiveSession] during construction — a mutex declared after it is
-     * still null when the first Running arrives.
-     */
-    private val creationGate = Mutex()
+    private val activeSessionMutex = Mutex()
 
     init {
         viewModelScope.launch {
@@ -213,14 +211,34 @@ class ChatViewModel(
     fun loadMoreSessions() = viewModelScope.launch { service.loadMoreSessions() }
 
     fun newSession(model: String? = null, effort: String? = null) = viewModelScope.launch {
-        val id = service.createSession(model, effort)
-        loadTranscript(id)
+        withReadyRoster {
+            val id = service.createSession(model, effort)
+            loadTranscript(id)
+        }
     }
 
     fun activate(sessionId: String) = viewModelScope.launch {
-        service.activate(sessionId)
-        service.markSeen(sessionId)
-        loadTranscript(sessionId)
+        withReadyRoster {
+            service.activate(sessionId)
+            service.markSeen(sessionId)
+            loadTranscript(sessionId)
+        }
+    }
+
+    /** A cold notification may arrive before the Binder connection's first roster. */
+    private suspend fun withReadyRoster(startIfNeeded: Boolean = false, action: suspend () -> Unit) {
+        try {
+            // A queued cold navigation can own the selection lock while it
+            // waits for Ready. An explicit Start-and-send must still start it.
+            if (startIfNeeded && service.status.value !is DaemonStatus.Running) service.start()
+            activeSessionMutex.withLock {
+                combine(service.status, service.rosterReady) { status, ready ->
+                    status is DaemonStatus.Running && ready
+                }.first { it }
+                action()
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: Exception) { update { it.copy(transcriptNotice = "Session unavailable. Try again.") } }
     }
 
     fun rename(sessionId: String, title: String) = viewModelScope.launch {
@@ -253,24 +271,29 @@ class ChatViewModel(
         val text = current.draft.trim()
         val attachments = current.draftAttachments
         if (text.isEmpty() && attachments.isEmpty()) return@launch
-        if (current.daemon !is DaemonStatus.Running) service.start()
-        val id = current.activeSessionId ?: service.createSession()
-        // The daemon's refusal is the daemon's to word: too_many_attachments
-        // and attachments_too_large are its codes, shown verbatim.
-        val refusal = runCatching { service.send(id, text, attachments, mode) }
-            .exceptionOrNull()
-        if (refusal != null) {
-            update {
-                it.copy(
-                    attachmentNotice = (refusal as? TurnRefused)?.code ?: refusal.message,
-                    deliveryChooser = false,
-                )
+        withReadyRoster(startIfNeeded = true) {
+            val id = service.activeSessionId.value ?: service.createSession()
+            try {
+                service.send(id, text, attachments, mode)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (refusal: Exception) {
+                update {
+                    it.copy(
+                        attachmentNotice = (refusal as? TurnRefused)?.code ?: refusal.message,
+                        deliveryChooser = false,
+                    )
+                }
+                return@withReadyRoster
             }
-            return@launch
-        }
-        drafts[id] = ""
-        update {
-            it.copy(draft = "", draftAttachments = emptyList(), deliveryChooser = false)
+            // Preserve text or attachments edited while startup or RPC was pending.
+            if (_state.value.activeSessionId == id && _state.value.draft == current.draft &&
+                _state.value.draftAttachments == attachments
+            ) {
+                drafts[id] = ""
+                update { it.copy(draft = "", draftAttachments = emptyList(), deliveryChooser = false) }
+            }
+            loadTranscript(id)
         }
     }
 
@@ -382,6 +405,7 @@ class ChatViewModel(
                 it.copy(
                     selectionBusy = false,
                     selectionRefusal = failure?.let { error ->
+                        if (error is kotlinx.coroutines.CancellationException) throw error
                         SelectionRefusal(
                             code = error.message ?: "selection_refused",
                             provider = provider,
@@ -401,6 +425,7 @@ class ChatViewModel(
             it.copy(
                 selectionBusy = false,
                 selectionRefusal = failure?.let { error ->
+                    if (error is kotlinx.coroutines.CancellationException) throw error
                     SelectionRefusal(code = error.message ?: "selection_refused", effort = effort)
                 },
             )
@@ -486,7 +511,15 @@ class ChatViewModel(
      * the mode the UI shows is whatever the facade reports back (addition H6).
      */
     fun selectPermissionMode(mode: PermissionMode) = viewModelScope.launch {
-        service.setPermissionMode(mode)
+        if (mode in service.supportedPermissionModes) {
+            runCatching { service.setPermissionMode(mode) }.onFailure(::selectionFailed)
+        }
+    }
+
+    private fun selectionFailed(error: Throwable) {
+        if (error is kotlinx.coroutines.CancellationException) throw error
+        val code = (error as? ai.diffforge.haider.transport.rpc.RpcRemoteException)?.code ?: "selection_unavailable"
+        update { it.copy(catalogError = code) }
     }
 
     fun refreshModels() = viewModelScope.launch { service.refreshModels() }
@@ -495,7 +528,7 @@ class ChatViewModel(
 
     fun selectProvider(provider: String) = viewModelScope.launch {
         update { it.copy(selectionBusy = true, catalogRequestedAtMs = clock()) }
-        runCatching { service.selectProvider(provider) }
+        runCatching { service.selectProvider(provider) }.onFailure(::selectionFailed)
         update { it.copy(selectionBusy = false) }
     }
 
@@ -862,23 +895,17 @@ class ChatViewModel(
      * Lanes 1/2/3 only have to make the facade truthful; this path is wired.
      */
     fun ensureActiveSession() = viewModelScope.launch {
-        // Several Running emissions arrive in a row on a real connection, and
-        // each used to race the others into createSession(). The mutex makes
-        // this one operation at a time, and every fact it decides on is read
-        // *inside* the lock — a roster read taken before waiting is already
-        // stale by the time the wait ends (lane 971-3 handoff).
-        creationGate.withLock {
-            if (service.activeSessionId.value != null) return@withLock
-            if (_state.value.daemon !is DaemonStatus.Running) return@withLock
-            // Nothing may be created against a roster that has not hydrated
-            // against this epoch's baseline: that is how a second session
-            // appears beside one that already existed.
+        activeSessionMutex.withLock {
+            if (service.status.value !is DaemonStatus.Running) return@withLock
             service.rosterReady.first { it }
-            if (service.activeSessionId.value != null) return@withLock
-            val candidate = SessionListState.order(service.sessions.value, null).firstOrNull()
-            val id = candidate?.id ?: service.createSession()
-            service.activate(id)
-            service.markSeen(id)
+            if (service.status.value !is DaemonStatus.Running || service.activeSessionId.value != null) return@withLock
+            try {
+                val candidate = SessionListState.order(service.sessions.value, null).firstOrNull()
+                val id = candidate?.id ?: service.createSession()
+                if (service.activeSessionId.value != id) service.activate(id)
+                service.markSeen(id)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: Exception) { update { it.copy(transcriptNotice = "Session unavailable. Try again.") } }
         }
     }
 
@@ -889,32 +916,23 @@ class ChatViewModel(
      * The notice is surfaced, never swallowed.
      */
     private fun loadTranscript(sessionId: String) {
-        viewModelScope.launch { applyTranscript(sessionId, service.transcript(sessionId)) }
+        viewModelScope.launch {
+            update { it.copy(transcriptLoading = true) }
+            val load = service.transcript(sessionId)
+            applyTranscript(sessionId, load)
+        }
     }
 
-    /**
-     * Complete, Partial and Unavailable all stay visible. An unsupported tool
-     * or display payload is deliberately Partial: it is not hidden behind a
-     * Complete result (lane 971-3 handoff).
-     */
     private fun applyTranscript(sessionId: String, load: TranscriptLoad) {
         transcripts[sessionId] = load.messages
         val notice = when (load) {
             is TranscriptLoad.Complete -> null
-            is TranscriptLoad.Partial ->
-                "History up to ${load.loadedThroughSeq} of ${load.headSeq} — ${load.reason}"
+            is TranscriptLoad.Partial -> "History up to ${load.loadedThroughSeq} of ${load.headSeq} — ${load.reason}"
             is TranscriptLoad.Unavailable -> load.reason
         }
         update {
-            if (it.activeSessionId == sessionId) {
-                it.copy(
-                    messages = load.messages,
-                    transcriptLoading = false,
-                    transcriptNotice = notice,
-                )
-            } else {
-                it.copy(transcriptLoading = false)
-            }
+            if (it.activeSessionId == sessionId) it.copy(messages = load.messages,
+                transcriptLoading = false, transcriptNotice = notice) else it
         }
     }
 

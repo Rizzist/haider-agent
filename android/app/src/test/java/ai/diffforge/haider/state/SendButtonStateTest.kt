@@ -13,7 +13,7 @@ import org.junit.Test
 
 /** The whole UI-SPEC 3.6 send-button matrix. */
 class SendButtonStateTest {
-    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.971", generation = 1))
+    private val running = DaemonStatus.Running(DaemonInfo(version = "0.0.970", generation = 1))
 
     @Test
     fun `running and idle with no text is disabled`() {

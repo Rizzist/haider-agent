@@ -10,7 +10,7 @@ class DaemonEngineTest {
     private val snapshots = mutableListOf<DaemonServiceSnapshot>()
     private var terminated = 0
     private var vault = VaultDekProvider { use -> ByteArray(32) { 7 }.let { try { use(it) } finally { it.fill(0) } } }
-    private fun engine() = DaemonEngine(host, vault, store, clock, "0.0.971", "{}", "/private/runtime/h.sock", "{}",
+    private fun engine() = DaemonEngine(host, vault, store, clock, "0.0.970", "{}", "/private/runtime/h.sock", "{}",
         snapshots::add, { terminated++ }).also { it.restore(null) }
 
     @Test fun disabledBindingDoesNotLoadNative() {
@@ -154,7 +154,7 @@ class DaemonEngineTest {
     }
     @Test fun versionMismatchNeverStartsOrUnwraps() {
         vault = VaultDekProvider { error("must not unwrap") }
-        host.versionJson = host.versionJson.replace("0.0.971", "0.0.970")
+        host.versionJson = host.versionJson.replace("0.0.970", "0.0.969")
         val engine = engine(); engine.startUserInitiated()
         assertEquals("NATIVE_VERSION_MISMATCH", engine.snapshot.errorCode)
         assertEquals(listOf("version"), host.calls)
@@ -187,7 +187,7 @@ class DaemonEngineTest {
     }
     @Test fun packageUpdateIsNotUserStopOrUnexpectedCrashOnLegacyAndModernAndroid() {
         store.state = PersistedLifecycle(enabled = true, active = true, updateUntilUnixMs = clock.wall + 120_000)
-        val legacy = DaemonEngine(host, vault, store, clock, "0.0.971", "{}", "/private/runtime/h.sock", "{}", snapshots::add, {})
+        val legacy = DaemonEngine(host, vault, store, clock, "0.0.970", "{}", "/private/runtime/h.sock", "{}", snapshots::add, {})
         legacy.restore(ProcessExit(clock.wall, true, legacyUserRequested = true))
         assertTrue(store.state.enabled)
         assertTrue(store.state.crashes.isEmpty())
@@ -196,14 +196,14 @@ class DaemonEngineTest {
         assertNull(store.state.updateUntilUnixMs)
 
         store.state = PersistedLifecycle(enabled = true, active = true)
-        val modern = DaemonEngine(host, vault, store, clock, "0.0.971", "{}", "/private/runtime/h.sock", "{}", snapshots::add, {})
+        val modern = DaemonEngine(host, vault, store, clock, "0.0.970", "{}", "/private/runtime/h.sock", "{}", snapshots::add, {})
         modern.restore(ProcessExit(clock.wall, false, packageUpdated = true))
         assertTrue(store.state.enabled)
         assertTrue(store.state.crashes.isEmpty())
     }
     @Test fun unambiguousUserStopOverridesPendingUpdate() {
         store.state = PersistedLifecycle(enabled = true, active = true, updateUntilUnixMs = clock.wall + 120_000)
-        val engine = DaemonEngine(host, vault, store, clock, "0.0.971", "{}", "/private/runtime/h.sock", "{}", snapshots::add, {})
+        val engine = DaemonEngine(host, vault, store, clock, "0.0.970", "{}", "/private/runtime/h.sock", "{}", snapshots::add, {})
         engine.restore(ProcessExit(clock.wall, true))
         assertFalse(store.state.enabled)
         assertNull(store.state.updateUntilUnixMs)
