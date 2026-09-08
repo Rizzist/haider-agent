@@ -218,7 +218,14 @@ class WorkflowSurfacesTest {
         // The scripted draft has a real defect, and the daemon's own typed
         // location is shown.
         rule.onNodeWithText("2 problems to fix").assertExists()
-        rule.onNodeWithText("unknown_agent_type", substring = true).assertExists()
+        // The daemon's typed code and its exact one-based location, not just
+        // the prose: `code` is what a caller branches on.
+        rule.onAllNodesWithText("unknown_agent_type", substring = true)
+            .onFirst()
+            .assertExists()
+        rule.onAllNodesWithText("line 7, column 38", substring = true)
+            .onFirst()
+            .assertExists()
         // Pressing Register does nothing: a confirm of a document carrying
         // errors would only ask the daemon for a refusal.
         rule.onNodeWithText("Register").performClick()

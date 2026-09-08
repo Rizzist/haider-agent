@@ -398,7 +398,7 @@
         <item quantity="one">%1$d problem to fix</item>
         <item quantity="other">%1$d problems to fix</item>
     </plurals>
-    <string name="authoring_error_line">Line %1$d, column %2$d · %3$s · %4$s</string>
+    <string name="authoring_error_line">%1$s · line %2$d, column %3$d · %4$s</string>
     <string name="authoring_refused">Nothing was registered. The daemon returned no confirmation.</string>
     <string name="authoring_failed">The daemon refused: %1$s</string>
     <string name="authoring_unavailable">Authoring is unavailable on this daemon (%1$s).</string>

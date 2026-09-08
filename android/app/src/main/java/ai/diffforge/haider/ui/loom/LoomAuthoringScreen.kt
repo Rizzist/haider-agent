@@ -278,14 +278,22 @@ private fun DraftEditor(
             color = colors.red,
         )
         errors.forEach { error ->
+            // The typed code and the exact one-based location first: those are
+            // what a person matches against the document, and what a caller
+            // would branch on. `message` is display prose and follows.
             Text(
                 stringResource(
                     R.string.authoring_error_line,
+                    error.code,
                     error.line,
                     error.column,
                     error.field,
-                    error.message,
                 ),
+                style = type.sessionMeta,
+                color = colors.textSoft,
+            )
+            Text(
+                error.message,
                 style = type.sessionMeta,
                 color = colors.textMuted,
             )
@@ -416,7 +424,22 @@ private fun Field(
             enabled = enabled,
             textStyle = style.copy(color = colors.text),
             cursorBrush = SolidColor(colors.accent),
-            modifier = Modifier.fillMaxWidth().testTag(tag),
+            // A text field is a clickable node, and a one-line field inside a
+            // tall box was 18 dp of it: the box looked like the target and only
+            // the line was. The field fills the box instead, so what a person
+            // aims at is what takes the tap (the touch sweep caught this).
+            modifier = Modifier
+                .fillMaxWidth()
+                // Fills its box, and never smaller than a target: the prose
+                // box is 56 dp, so the inset alone would have left a 32 dp
+                // field and traded one undersized node for another.
+                .heightIn(
+                    min = maxOf(
+                        ForgeSize.touch,
+                        minHeight - ForgeSpace.lg - ForgeSpace.lg,
+                    ),
+                )
+                .testTag(tag),
         )
     }
 }
