@@ -9,7 +9,9 @@ import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.PermissionSnapshot
+import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.state.SessionFilter
 import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.state.SessionListState
@@ -126,6 +128,9 @@ class ChatViewModel(
         }
         viewModelScope.launch {
             service.shell.collect { availability -> update { it.copy(shell = availability) } }
+        }
+        viewModelScope.launch {
+            service.permissionMode.collect { mode -> update { it.copy(permissionMode = mode) } }
         }
     }
 
@@ -355,6 +360,14 @@ class ChatViewModel(
 
     fun dismissSelectionRefusal() = update { it.copy(selectionRefusal = null) }
 
+    /**
+     * The daemon owns the policy, so this is a request, not a local toggle:
+     * the mode the UI shows is whatever the facade reports back (addition H6).
+     */
+    fun selectPermissionMode(mode: PermissionMode) = viewModelScope.launch {
+        service.setPermissionMode(mode)
+    }
+
     fun refreshModels() = viewModelScope.launch { service.refreshModels() }
 
     fun refreshProviders() = viewModelScope.launch { service.refreshProviders() }
@@ -417,8 +430,11 @@ class ChatViewModel(
      * pushes what it observed. Called on resume and after a permission result
      * (verify-6 O3).
      */
-    fun onPermissionsObserved(snapshot: PermissionSnapshot) =
+    fun onPermissionsObserved(snapshot: PermissionSnapshot) {
         update { it.copy(permissions = snapshot) }
+        // The autonomy step is done when notifications and SMS are both in.
+        recomputeSetup()
+    }
 
     fun skipBatteryStep() {
         batterySkipped = true
@@ -498,6 +514,7 @@ class ChatViewModel(
                 batteryRestricted = current.environment.batteryRestricted,
                 batterySkipped = batterySkipped,
                 modelResolved = current.models != null,
+                smsGranted = current.permissions.sms == PermissionStanding.Granted,
             ),
         )
     }

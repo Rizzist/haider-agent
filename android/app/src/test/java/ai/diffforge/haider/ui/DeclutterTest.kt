@@ -1,7 +1,7 @@
 package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
-import ai.diffforge.haider.ui.chat.SESSION_VIEW_HEADER_TAG
+import ai.diffforge.haider.ui.scaffold.SESSION_VIEW_HEADER_TAG
 import ai.diffforge.haider.ui.chat.SHELL_VIEW_TAG
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.daemon.ShellAvailability

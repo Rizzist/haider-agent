@@ -6,6 +6,7 @@ import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.Skeleton
 import ai.diffforge.haider.ui.daemon.ProviderInventory
 import ai.diffforge.haider.ui.state.ModelNames
+import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
@@ -52,7 +53,7 @@ import androidx.compose.ui.text.style.TextOverflow
  * Two pickers, not three: the model sheet is grouped by provider, so choosing
  * a model chooses its provider (addition F, S5).
  */
-enum class PickerKind { Model, Effort }
+enum class PickerKind { Model, Effort, Permissions }
 
 /**
  * Provider / model / effort pickers for the composer bar, matching the desktop
@@ -88,6 +89,8 @@ fun SessionPickerSheet(
     onDismiss: () -> Unit,
     onSelectModel: (provider: String, model: String) -> Unit,
     onSelectEffort: (String?) -> Unit,
+    permissionMode: PermissionMode,
+    onSelectPermissionMode: (PermissionMode) -> Unit,
     onConfirmRefused: () -> Unit,
     onDismissRefusal: () -> Unit,
 ) {
@@ -117,6 +120,7 @@ fun SessionPickerSheet(
                     when (kind) {
                         PickerKind.Model -> R.string.picker_model_title
                         PickerKind.Effort -> R.string.picker_effort_title
+                        PickerKind.Permissions -> R.string.picker_permissions_title
                     },
                 ),
                 style = type.h4,
@@ -165,6 +169,32 @@ fun SessionPickerSheet(
                                 onClick = { submitted = true; onSelectModel(option.id, model.id) },
                             )
                         }
+                    }
+                }
+
+                // Auto is the owner's "model work should be automated": one
+                // standing consent, given once, instead of a card per SMS read
+                // (addition H6). Ask is the only other value — there is no
+                // per-tool matrix to get lost in.
+                PickerKind.Permissions -> {
+                    PermissionMode.entries.forEach { mode ->
+                        PickerRow(
+                            label = stringResource(
+                                when (mode) {
+                                    PermissionMode.Auto -> R.string.permission_mode_auto
+                                    PermissionMode.Ask -> R.string.permission_mode_ask
+                                },
+                            ),
+                            secondary = stringResource(
+                                when (mode) {
+                                    PermissionMode.Auto -> R.string.permission_mode_auto_detail
+                                    PermissionMode.Ask -> R.string.permission_mode_ask_detail
+                                },
+                            ),
+                            selected = mode == permissionMode,
+                            enabled = mode != permissionMode,
+                            onClick = { onSelectPermissionMode(mode); onDismiss() },
+                        )
                     }
                 }
 

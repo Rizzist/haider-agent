@@ -51,7 +51,7 @@ internal fun MarkdownText(
                 is MarkdownBlock.Code -> Text(
                     text = literalCode(
                         block.text,
-                        colors.ember,
+                        colors.accent,
                         showCaret && last,
                         caretAlpha,
                     ),
@@ -77,7 +77,7 @@ internal fun MarkdownText(
                         .drawBehind {
                             val stroke = ForgeSpace.xxs.toPx()
                             drawLine(
-                                color = colors.ember.copy(alpha = 0.45f),
+                                color = colors.accent.copy(alpha = 0.45f),
                                 start = Offset(stroke / 2f, 0f),
                                 end = Offset(stroke / 2f, size.height),
                                 strokeWidth = stroke,
@@ -105,7 +105,7 @@ internal fun MarkdownText(
                         block.rows.joinToString("\n") { row -> row.joinToString("  │  ") },
                         colors.chatText,
                         colors.accentSoft,
-                        colors.ember,
+                        colors.accent,
                         showCaret && last,
                         caretAlpha,
                     ),
@@ -161,7 +161,7 @@ private fun InlineMarkdownLine(
         text,
         color,
         colors.accentSoft,
-        colors.ember,
+        colors.accent,
         showCaret,
         caretAlpha,
     )

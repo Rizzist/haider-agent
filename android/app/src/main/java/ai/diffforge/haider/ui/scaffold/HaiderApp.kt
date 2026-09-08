@@ -10,7 +10,6 @@ import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.InputRequiredCard
 import ai.diffforge.haider.ui.chat.ModelPicker
-import ai.diffforge.haider.ui.chat.SessionViewHeader
 import ai.diffforge.haider.ui.chat.ShellView
 import ai.diffforge.haider.ui.chat.Transcript
 import ai.diffforge.haider.ui.drawer.RenameSheet
@@ -19,6 +18,10 @@ import ai.diffforge.haider.ui.drawer.SessionDrawer
 import ai.diffforge.haider.ui.drawer.SessionRowAction
 import ai.diffforge.haider.ui.settings.AccountsScreen
 import ai.diffforge.haider.ui.settings.SettingsScreen
+import ai.diffforge.haider.ui.start.AutonomyGrant
+import ai.diffforge.haider.ui.state.AppUiState
+import ai.diffforge.haider.ui.state.CapabilityApproval
+import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.start.StartSurface
 import ai.diffforge.haider.ui.state.BannerAction
 import ai.diffforge.haider.ui.state.BannerInputs
@@ -259,7 +262,11 @@ fun HaiderApp(
                     onToggleTheme = {
                         onThemeMode(if (dark) ThemeMode.Light else ThemeMode.Dark)
                     },
-                    onAction = { action -> viewModel.applyTopBarAction(action) },
+                    onRefresh = {
+                        viewModel.refreshRoster()
+                        viewModel.refreshModels()
+                    },
+                    onSelectTab = viewModel::selectViewTab,
                 )
                 StatusBanner(
                     model = resolution.model,
@@ -279,17 +286,12 @@ fun HaiderApp(
                     onDismiss = { rank -> dismissals.dismiss(rank, nowMs) },
                 )
 
-                // The session surface's own slim row: Chat | Shell.
-                if (state.activeSessionId != null) {
-                    SessionViewHeader(
-                        tab = state.viewTab,
-                        shellAvailable = state.shell.available,
-                        onSelect = viewModel::selectViewTab,
-                    )
-                }
-
                 Box(Modifier.fillMaxWidth().weight(1f)) {
-                    val needsInput = state.activeSession?.needsInput
+                    // Auto answers device-capability approvals; everything
+                    // else still stops and asks (addition H6).
+                    val rawNeedsInput = state.activeSession?.needsInput
+                    val needsInput = rawNeedsInput
+                        ?.takeUnless { CapabilityApproval.suppresses(state.permissionMode, it) }
                     if (state.viewTab == SessionViewTab.Shell) {
                         ShellView(availability = state.shell, modifier = Modifier.fillMaxSize())
                     } else if (state.messages.isEmpty() && needsInput == null) {
@@ -301,15 +303,33 @@ fun HaiderApp(
                             onStepAction = { step ->
                                 when (step) {
                                     SetupStepId.RunService -> viewModel.startDaemon()
-                                    SetupStepId.Notifications ->
-                                        onSystemAction(SystemAction.RequestNotifications)
+                                    // "Allow all four": Android will only show
+                                    // one dialog at a time, so this starts the
+                                    // sequence at the first thing still
+                                    // outstanding and `onResume` brings the
+                                    // next one up (addition H6).
+                                    SetupStepId.Autonomy -> onSystemAction(
+                                        nextAutonomyRequest(state),
+                                    )
                                     SetupStepId.Battery -> onSystemAction(SystemAction.OpenBattery)
                                     SetupStepId.Model ->
                                         viewModel.openOverlay(Overlay.Picker(PickerKind.Model))
                                 }
                             },
                             // Fills the composer; the user stays the author.
-                            onSuggestion = viewModel::setDraft,
+                            onGrant = { grant ->
+                                onSystemAction(
+                                    when (grant) {
+                                        AutonomyGrant.Notifications ->
+                                            SystemAction.RequestNotifications
+                                        AutonomyGrant.Sms -> SystemAction.GrantSms
+                                        AutonomyGrant.Accessibility ->
+                                            SystemAction.OpenAccessibility
+                                        AutonomyGrant.ScreenCapture ->
+                                            SystemAction.RequestScreenCapture
+                                    },
+                                )
+                            },
                             onSelectSession = viewModel::activate,
                             onSeeAllSessions = { scope.launch { drawerState.open() } },
                         )
@@ -396,14 +416,16 @@ fun HaiderApp(
                         onTextChange = viewModel::setDraft,
                         composer = composerState,
                         chip = chip,
-                        contextTokens = state.activeSession?.footprintTokens,
-                        contextExact = state.activeSession?.footprintExact,
                         effort = state.models?.current?.effort,
+                        permissionMode = state.permissionMode,
                         onSend = { viewModel.send() },
                         onStop = { viewModel.stopTurn() },
                         onStartDaemon = { viewModel.startDaemon() },
                         onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
                         onOpenEffort = { viewModel.openOverlay(Overlay.Picker(PickerKind.Effort)) },
+                        onOpenPermissions = {
+                            viewModel.openOverlay(Overlay.Picker(PickerKind.Permissions))
+                        },
                         onRetryModels = { viewModel.refreshModels() },
                         onAttach = { viewModel.openOverlay(Overlay.Attach) },
                         modifier = Modifier.widthIn(max = ForgeSize.readableMax),
@@ -441,6 +463,8 @@ private fun Overlays(
             kind = overlay.kind,
             busy = state.selectionBusy,
             refusal = state.selectionRefusal,
+            permissionMode = state.permissionMode,
+            onSelectPermissionMode = viewModel::selectPermissionMode,
             onConfirmRefused = viewModel::confirmRefusedSelection,
             onDismissRefusal = viewModel::dismissSelectionRefusal,
             inventory = state.providers,
@@ -522,6 +546,13 @@ sealed interface SystemAction {
     data object OpenBattery : SystemAction
     data object OpenAccessibility : SystemAction
     data object GrantSms : SystemAction
+
+    /**
+     * MediaProjection consent. Android issues it per projection session and
+     * has no pre-grant, so this is asked on first run and again whenever the
+     * projection token is gone — never treated as a stored permission.
+     */
+    data object RequestScreenCapture : SystemAction
     data object Screenshot : SystemAction
     data object PickFile : SystemAction
     data class CopyText(val text: String) : SystemAction
@@ -538,14 +569,16 @@ fun ChatViewModel.applyRowAction(sessionId: String, action: SessionRowAction) {
     }
 }
 
-fun ChatViewModel.applyTopBarAction(action: TopBarAction) {
-    val sessionId = state.value.activeSessionId
-    when (action) {
-        TopBarAction.SessionDetails -> sessionId?.let { openOverlay(Overlay.SessionActions(it)) }
-        TopBarAction.Rename -> sessionId?.let {
-            openOverlay(Overlay.Rename(it, session(it)?.title.orEmpty()))
-        }
-        TopBarAction.Fork -> sessionId?.let { fork(it) }
-        TopBarAction.Settings -> openOverlay(Overlay.Settings)
-    }
+/**
+ * The next outstanding autonomy popup, in the order H6 lists them.
+ *
+ * Android shows one system dialog at a time, so "Allow all four" starts the
+ * sequence rather than firing four intents that would stack on each other.
+ */
+fun nextAutonomyRequest(state: AppUiState): SystemAction = when {
+    !state.environment.notificationsGranted -> SystemAction.RequestNotifications
+    state.permissions.sms != PermissionStanding.Granted -> SystemAction.GrantSms
+    state.permissions.accessibility != PermissionStanding.Granted ->
+        SystemAction.OpenAccessibility
+    else -> SystemAction.RequestScreenCapture
 }

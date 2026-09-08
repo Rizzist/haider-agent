@@ -108,9 +108,14 @@ fun SessionRowItem(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         SessionGlyph(
+            // Model first, provider as the fallback: a session on
+            // claude-opus-4-5 shows Anthropic's mark even when the roster row
+            // never named a provider (addition H5).
+            model = row.model,
             provider = row.provider,
             state = row.state,
             animate = SessionVisualStateFold.animates(row.state) && motionEnabled(),
+            ringAgainst = colors.surface,
         )
         Text(
             displayTitle(row),

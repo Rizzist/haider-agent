@@ -35,7 +35,9 @@ class StateMatrixTest {
     fun `first run - the checklist is the message`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.FirstRun))
         assertTrue(rule.onAllNodesWithTextSafe("Run Haider in the background") > 0)
-        assertTrue(rule.onAllNodesWithTextSafe("Setting up · step 1 of 4") > 0)
+        // The header carries no title or subtitle any more (addition H1), so
+        // the checklist is the only thing saying where setup is.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Setting up · step 1 of 4"))
         // No banner competes with the checklist.
         assertEquals(0, rule.onAllNodesWithTextSafe("Haider isn't running"))
     }
@@ -145,8 +147,8 @@ class StateMatrixTest {
     @Test
     fun `empty roster with setup done - ready, not a setup checklist`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.EmptyRosterReady))
-        // The hero line is gone; the suggestions are the content (F, S7).
-        assertTrue(rule.onAllNodesWithTextSafe("Try") > 0)
+        // The reference empty block is the content (addition H2).
+        assertTrue(rule.onAllNodesWithTextSafe("No session yet.") > 0)
         assertEquals(0, rule.onAllNodesWithTextSafe("Ready. Ask for anything on this phone."))
         assertEquals(0, rule.onAllNodesWithTextSafe("Run Haider in the background"))
     }

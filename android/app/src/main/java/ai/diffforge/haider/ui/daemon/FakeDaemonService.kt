@@ -9,6 +9,7 @@ import ai.diffforge.haider.ui.chat.Message
 import ai.diffforge.haider.ui.chat.Role
 import ai.diffforge.haider.ui.chat.ToolCall
 import ai.diffforge.haider.ui.chat.ToolStatus
+import ai.diffforge.haider.ui.state.PermissionMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -500,6 +501,22 @@ class FakeDaemonService(
      */
     private val _rosterReady = MutableStateFlow(true)
     override val rosterReady: StateFlow<Boolean> = _rosterReady.asStateFlow()
+
+    /**
+     * Auto by default, as the first-run step leaves it.
+     *
+     * The fake stays honest about what Auto *means*: it is the daemon that
+     * stops sending capability approvals, so in Auto this fake does not
+     * fabricate a `permission` needs-input for a device capability either. It
+     * still raises questions, secrets and provider refusals.
+     */
+    private val _permissionMode = MutableStateFlow(PermissionMode.Auto)
+    override val permissionMode: StateFlow<PermissionMode> = _permissionMode.asStateFlow()
+
+    override suspend fun setPermissionMode(mode: PermissionMode) {
+        calls += "tool.policy:${mode.name.lowercase()}"
+        _permissionMode.value = mode
+    }
 
     /** Set to make the next selection refuse, the way the daemon can. */
     private var nextSelectionFailure: String? = null

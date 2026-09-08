@@ -1,15 +1,23 @@
 package ai.diffforge.haider.ui.scaffold
 
 import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.AttentionBadge
+import ai.diffforge.haider.ui.components.ForgeIconButton
+import ai.diffforge.haider.ui.components.SessionGlyph
 import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.SessionVisualState
-import ai.diffforge.haider.ui.components.AttentionBadge
-import ai.diffforge.haider.ui.components.ForgeIconButton
-import ai.diffforge.haider.ui.components.StateDot
-import ai.diffforge.haider.ui.state.AppUiState
+import ai.diffforge.haider.ui.components.motionEnabled
 import ai.diffforge.haider.ui.state.AttentionBadgeKind
+import ai.diffforge.haider.ui.state.AppUiState
+import ai.diffforge.haider.ui.state.SessionViewTab
+import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeShapes
+import ai.diffforge.haider.ui.theme.ForgeSize
+import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,51 +27,51 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Chat
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.Menu
-import androidx.compose.material.icons.rounded.MoreVert
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
-import ai.diffforge.haider.ui.theme.Forge
-import ai.diffforge.haider.ui.theme.ForgeSize
-import ai.diffforge.haider.ui.theme.ForgeSpace
 
 const val HAIDER_TOP_BAR_TAG = "haider_top_bar"
-
-/** What the header overflow can do. */
-enum class TopBarAction {
-    SessionDetails,
-    Rename,
-    Fork,
-    Settings,
-}
+const val SESSION_VIEW_HEADER_TAG = "session_view_header"
+const val HEADER_STATE_PILL_TAG = "header_state_pill"
 
 /**
- * 56 dp, one hairline, and interactive controls that are all the same shape
- * (UI-SPEC 3.1): the drawer button, the appearance toggle and the overflow.
- * The title is not one of them — it is data.
+ * One slim control row (owner addition H1).
  *
- * 970 crammed a bordered pill next to two bordered circles in 48 dp boxes, each
- * with different padding (D1), and printed `model ?: "Diff Forge AI"` on the
- * second line — a product name standing in for data that never arrived (D2).
- * Here the second line renders only when it has something true to say, and the
- * daemon's state lives in the drawer card, the banner and the badge instead.
+ * The owner's note was "way too big header". It was: a 56 dp bar with a title
+ * line, a conditional second line, and a separate slim row below it for the
+ * Chat|Shell switch — three rows of chrome above a chat. The reference
+ * (`dashboard.js:39296` TerminalChatHeaderBar) has no title at all, because the
+ * title is data and the drawer already lists it in an outlined row.
+ *
+ * So: a hamburger square on the left, and on the right the Chat|Shell pill
+ * (`:39389`/`:39490`), the state pill (`:18940`), a refresh circle and the
+ * theme circle (`:39640`). Every visual is 40 dp inside a 48 dp target.
+ *
+ * There is no overflow menu any more either. Everything it held is reachable
+ * where it belongs: Rename / Fork / Copy id on the drawer row's own sheet,
+ * Settings in the drawer footer, daemon details on the drawer's daemon row.
  */
 @Composable
 fun HaiderTopBar(
@@ -71,134 +79,56 @@ fun HaiderTopBar(
     dark: Boolean,
     onOpenDrawer: () -> Unit,
     onToggleTheme: () -> Unit,
-    onAction: (TopBarAction) -> Unit,
+    onRefresh: () -> Unit,
+    onSelectTab: (SessionViewTab) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
-    val type = Forge.type
-    var menuOpen by remember { mutableStateOf(false) }
-    val session = state.activeSession
-    val subtitle = subtitle(state, session)
-
     Column(modifier.testTag(HAIDER_TOP_BAR_TAG)) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = ForgeSize.header)
-                .padding(horizontal = ForgeSpace.xs),
+                .padding(horizontal = ForgeSpace.md),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
         ) {
             Box {
-                ForgeIconButton(
-                    onClick = onOpenDrawer,
+                HeaderSquareButton(
+                    icon = Icons.Rounded.Menu,
                     contentDescription = drawerDescription(state),
-                ) {
-                    Icon(
-                        Icons.Rounded.Menu,
-                        contentDescription = null,
-                        tint = colors.textSoft,
-                        modifier = Modifier.size(ForgeSize.icon),
-                    )
-                }
+                    onClick = onOpenDrawer,
+                )
                 val badge = badgeColor(state)
                 if (badge != null) {
                     AttentionBadge(
                         color = badge,
                         modifier = Modifier
                             .align(Alignment.TopEnd)
-                            .padding(top = ForgeSpace.md, end = ForgeSpace.md),
+                            .padding(top = ForgeSpace.xs, end = ForgeSpace.xs),
                     )
                 }
             }
 
-            // The title is data, not a control. Making it clickable made the
-            // header a three-target bar, which is exactly what 6.3.1 forbids;
-            // "Session details" lives in the overflow instead.
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = ForgeSize.touch)
-                    .padding(horizontal = ForgeSpace.md),
-                verticalArrangement = Arrangement.Center,
-            ) {
-                Text(
-                    title(state, session),
-                    style = type.sessionTitle,
-                    color = colors.text,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                // Never a placeholder string: absent means the line is absent
-                // and line 1 vertically centres.
-                if (subtitle != null) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
-                    ) {
-                        subtitle.dot?.let { StateDot(it) }
-                        Text(
-                            subtitle.text,
-                            style = type.sessionMeta,
-                            color = colors.textMuted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
+            Box(Modifier.weight(1f))
 
-            // Addition D: light/dark stays on the bar, beside the overflow.
-            ForgeIconButton(
-                onClick = onToggleTheme,
+            ViewToggle(
+                tab = state.viewTab,
+                onSelect = onSelectTab,
+            )
+            StatePill(state = state, session = state.activeSession)
+            HeaderCircleButton(
+                icon = Icons.Rounded.Refresh,
+                contentDescription = stringResource(R.string.cd_refresh_session),
+                onClick = onRefresh,
+            )
+            HeaderCircleButton(
+                icon = if (dark) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
                 contentDescription = stringResource(
                     if (dark) R.string.cd_use_light_theme else R.string.cd_use_dark_theme,
                 ),
-            ) {
-                Icon(
-                    if (dark) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
-                    contentDescription = null,
-                    tint = colors.textSoft,
-                    modifier = Modifier.size(ForgeSize.icon),
-                )
-            }
-
-            Box {
-                ForgeIconButton(
-                    onClick = { menuOpen = true },
-                    contentDescription = stringResource(R.string.cd_more_options),
-                ) {
-                    Icon(
-                        Icons.Rounded.MoreVert,
-                        contentDescription = null,
-                        tint = colors.textSoft,
-                        modifier = Modifier.size(ForgeSize.icon),
-                    )
-                }
-                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    OverflowItem(R.string.action_session_details, session != null) {
-                        menuOpen = false
-                        onAction(TopBarAction.SessionDetails)
-                    }
-                    OverflowItem(R.string.action_rename, session != null) {
-                        menuOpen = false
-                        onAction(TopBarAction.Rename)
-                    }
-                    OverflowItem(R.string.action_fork, session != null) {
-                        menuOpen = false
-                        onAction(TopBarAction.Fork)
-                    }
-                    // No Stop here. E2 puts the one turn Stop on the composer,
-                    // and an overflow entry alongside it was two Stops on one
-                    // screen (verify-6 O2). No Clear either: there is no
-                    // session.clear RPC, so it could only ever have emptied the
-                    // local view while the daemon kept every message —
-                    // contracts-v1 forbids exactly that (verify-6 O1).
-                    OverflowItem(R.string.action_settings, true) {
-                        menuOpen = false
-                        onAction(TopBarAction.Settings)
-                    }
-                }
-            }
+                onClick = onToggleTheme,
+            )
         }
         Box(
             Modifier
@@ -209,78 +139,203 @@ fun HaiderTopBar(
     }
 }
 
+/** 40 dp rounded-8 hairline square, in a 48 dp target. */
 @Composable
-private fun OverflowItem(labelRes: Int, enabled: Boolean, onClick: () -> Unit) {
+private fun HeaderSquareButton(
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
     val colors = Forge.colors
-    val label = stringResource(labelRes)
-    DropdownMenuItem(
-        text = {
-            Text(
-                label,
-                style = Forge.type.button,
-                color = if (enabled) colors.text else colors.textMuted,
+    Box(
+        modifier = Modifier
+            .size(ForgeSize.touch)
+            .clickable(onClick = onClick)
+            .semantics {
+                this.contentDescription = contentDescription
+                this.role = Role.Button
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            Modifier
+                .size(ForgeSize.headerControl)
+                .clip(ForgeShapes.cardTight)
+                .background(colors.surface)
+                .border(ForgeSize.hairline, colors.borderStrong, ForgeShapes.cardTight),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = colors.textSoft,
+                modifier = Modifier.size(ForgeSize.iconMd),
             )
-        },
-        enabled = enabled,
-        onClick = onClick,
-        modifier = Modifier.semantics { contentDescription = label },
-    )
+        }
+    }
 }
 
-private data class Subtitle(val text: String, val dot: androidx.compose.ui.graphics.Color?)
-
+/** The reference's 30 px header circle, at 40 dp in a 48 dp target. */
 @Composable
-private fun title(state: AppUiState, session: SessionRow?): String = when {
-    session == null -> stringResource(R.string.header_fallback_title)
-    !session.title.isNullOrBlank() -> session.title
-    // A blank title is a new session, not a raw id: "Session s-new-" was the
-    // id leaking into the face S7 says it must never reach (verify-6 O6).
-    else -> stringResource(R.string.header_new_session)
-}
-
-@Composable
-private fun subtitle(state: AppUiState, session: SessionRow?): Subtitle? {
+private fun HeaderCircleButton(
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
     val colors = Forge.colors
-    if (!state.setup.complete && session == null) {
-        return Subtitle(
-            stringResource(
-                R.string.app_subtitle_setup,
-                state.setup.currentIndex + 1,
-                state.setup.total,
-            ),
-            null,
+    ForgeIconButton(
+        onClick = onClick,
+        contentDescription = contentDescription,
+        background = colors.surface,
+        visual = ForgeSize.headerControl,
+        border = colors.borderStrong,
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = colors.textSoft,
+            modifier = Modifier.size(ForgeSize.iconSm),
         )
     }
-    val daemonWord = when (state.daemon) {
-        DaemonStatus.Starting, DaemonStatus.Restarting -> stringResource(R.string.daemon_starting)
-        DaemonStatus.Stopping -> stringResource(R.string.daemon_stopping)
-        DaemonStatus.Stopped -> stringResource(R.string.daemon_stopped)
-        is DaemonStatus.Failed -> stringResource(R.string.daemon_stopped)
-        is DaemonStatus.Running -> null
-    }
-    // Same slot, same voice: the session states below are lowercase, so the
-    // daemon word is too (addition F, G3).
-    if (daemonWord != null) return Subtitle(daemonWord.lowercase(), colors.textMuted)
-    if (session == null) return null
+}
 
-    // The state word and nothing else: the model and the effort are composer
-    // chips, and repeating them here was the header saying what the composer
-    // already says (addition F, S1/G4).
-    val stateWord = when (session.state) {
-        SessionVisualState.Running -> stringResource(R.string.state_running).lowercase()
-        SessionVisualState.NeedsInput -> stringResource(R.string.state_needs_input).lowercase()
-        SessionVisualState.Errored -> stringResource(R.string.state_errored).lowercase()
-        SessionVisualState.WaitingForNetwork -> stringResource(R.string.state_waiting_network).lowercase()
-        SessionVisualState.Idle, SessionVisualState.Unknown -> null
-    } ?: return null
-    val dot = when (session.state) {
-        SessionVisualState.Running -> colors.stateRunning
-        SessionVisualState.NeedsInput -> colors.stateNeedsInput
-        SessionVisualState.Errored -> colors.stateErrored
-        SessionVisualState.WaitingForNetwork -> colors.amber
-        else -> null
+/**
+ * Chat | Shell, as the reference's pill (`:39389`): hairline strong border,
+ * radius 999, surface fill, active segment on the accent wash with an inset
+ * hairline.
+ *
+ * The painted pill is 40 dp and each segment's *target* is 48 dp, laid over it,
+ * because the touch-target rule has no exemptions and a 26 px desktop button is
+ * not a phone target.
+ */
+@Composable
+private fun ViewToggle(tab: SessionViewTab, onSelect: (SessionViewTab) -> Unit) {
+    val colors = Forge.colors
+    val entries = SessionViewTab.entries
+    Box(
+        modifier = Modifier.testTag(SESSION_VIEW_HEADER_TAG),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            Modifier
+                .height(ForgeSize.headerControl)
+                .clip(ForgeShapes.pill)
+                .background(colors.surface)
+                .border(ForgeSize.hairline, colors.borderStrong, ForgeShapes.pill)
+                .padding(ForgeSpace.xxs),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            entries.forEach { candidate ->
+                val active = candidate == tab
+                Box(
+                    Modifier
+                        .width(ForgeSize.touch)
+                        .height(ForgeSize.headerSegment)
+                        .clip(ForgeShapes.pill)
+                        .background(if (active) colors.accentWash else Color.Transparent)
+                        .then(
+                            if (active) {
+                                Modifier.border(
+                                    ForgeSize.hairline,
+                                    colors.borderStrong,
+                                    ForgeShapes.pill,
+                                )
+                            } else {
+                                Modifier
+                            },
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        when (candidate) {
+                            SessionViewTab.Chat -> Icons.Rounded.Chat
+                            SessionViewTab.Shell -> Icons.Rounded.Terminal
+                        },
+                        contentDescription = null,
+                        tint = if (active) colors.text else colors.textMuted,
+                        modifier = Modifier.size(ForgeSize.iconSm),
+                    )
+                }
+            }
+        }
+        Row {
+            entries.forEach { candidate ->
+                val label = stringResource(
+                    when (candidate) {
+                        SessionViewTab.Chat -> R.string.tab_chat
+                        SessionViewTab.Shell -> R.string.tab_shell
+                    },
+                )
+                Box(
+                    Modifier
+                        .size(ForgeSize.touch)
+                        .clickable { onSelect(candidate) }
+                        .semantics {
+                            contentDescription = label
+                            role = Role.Tab
+                            selected = candidate == tab
+                        },
+                )
+            }
+        }
     }
-    return Subtitle(stateWord, dot)
+}
+
+/**
+ * The reference's selected-state pill (`:18940`): the session's brand mark and
+ * one word, toned green / amber / red, breathing while a turn runs.
+ *
+ * This is the only place the header says anything about state, and it says it
+ * in a word as well as a colour.
+ */
+@Composable
+private fun StatePill(state: AppUiState, session: SessionRow?) {
+    val colors = Forge.colors
+    val type = Forge.type
+    val (label, tone) = when {
+        state.daemon is DaemonStatus.Failed -> stringResource(R.string.state_pill_error) to colors.red
+        state.daemon !is DaemonStatus.Running ->
+            stringResource(R.string.state_pill_offline) to colors.textMuted
+        session == null -> stringResource(R.string.state_pill_idle) to colors.textMuted
+        else -> when (session.state) {
+            SessionVisualState.Running ->
+                stringResource(R.string.state_pill_running) to colors.stateRunning
+            SessionVisualState.NeedsInput ->
+                stringResource(R.string.state_pill_needs_you) to colors.stateNeedsInput
+            SessionVisualState.Errored ->
+                stringResource(R.string.state_pill_error) to colors.stateErrored
+            SessionVisualState.WaitingForNetwork ->
+                stringResource(R.string.state_pill_waiting) to colors.amber
+            else -> stringResource(R.string.state_pill_idle) to colors.textMuted
+        }
+    }
+    Row(
+        modifier = Modifier
+            .height(ForgeSize.headerControl)
+            .clip(ForgeShapes.pill)
+            .background(colors.surface)
+            .border(ForgeSize.hairline, colors.borderStrong, ForgeShapes.pill)
+            .padding(horizontal = ForgeSpace.md)
+            .testTag(HEADER_STATE_PILL_TAG)
+            .semantics { contentDescription = label },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
+    ) {
+        SessionGlyph(
+            model = session?.model,
+            provider = session?.provider,
+            state = session?.state ?: SessionVisualState.Idle,
+            animate = session?.state == SessionVisualState.Running && motionEnabled(),
+            ringAgainst = colors.surface,
+        )
+        Text(
+            label,
+            style = type.chip,
+            color = tone,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
 }
 
 @Composable
@@ -295,12 +350,12 @@ private fun drawerDescription(state: AppUiState): String = when (state.attention
 }
 
 @Composable
-private fun badgeColor(state: AppUiState): androidx.compose.ui.graphics.Color? {
+private fun badgeColor(state: AppUiState): Color? {
     val colors = Forge.colors
     return when (state.attentionBadge) {
         AttentionBadgeKind.NeedsInput -> colors.stateNeedsInput
-        AttentionBadgeKind.Running -> colors.stateRunning
         AttentionBadgeKind.Errored -> colors.stateErrored
+        AttentionBadgeKind.Running -> colors.stateRunning
         AttentionBadgeKind.None -> null
     }
 }

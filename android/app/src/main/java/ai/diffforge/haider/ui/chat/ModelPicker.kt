@@ -1,6 +1,7 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.state.SelectionRefusal
@@ -253,7 +254,7 @@ private fun CatalogList(
                     modifier = Modifier.fillMaxWidth().padding(start = ForgeSpace.xl, end = ForgeSpace.xl, top = ForgeSpace.xl, bottom = ForgeSpace.sm),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    BrandMark(provider.id)
+                    BrandMarkOnly(model = null, provider = provider.id)
                     Spacer(Modifier.width(ForgeSpace.md))
                     // The id is already the brand as it is written everywhere else
                     // — "anthropic", not "ANTHROPIC" (addition F, G2).

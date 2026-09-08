@@ -28,6 +28,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -58,7 +61,7 @@ fun StartSurface(
     nowMs: Long,
     elapsedRealtimeMs: Long,
     onStepAction: (SetupStepId) -> Unit,
-    onSuggestion: (String) -> Unit,
+    onGrant: (AutonomyGrant) -> Unit,
     onSelectSession: (String) -> Unit,
     onSeeAllSessions: () -> Unit,
     modifier: Modifier = Modifier,
@@ -109,24 +112,22 @@ fun StartSurface(
                         index = index,
                         doneDetail = doneDetail(step.id, state, running, elapsedRealtimeMs),
                         onAction = { onStepAction(step.id) },
+                        permissions = state.permissions,
+                        notificationsGranted = state.environment.notificationsGranted,
+                        onGrant = onGrant,
                     )
                 }
             }
         }
 
-        // One brand-new session is not a "recent sessions" list; it is the
-        // session the user is looking at. Suggestions are more use than a
-        // one-row roster of itself.
-        // Suggestions are the content once there is nothing left to set up.
-        // Before that they are a list of things the app cannot do yet
-        // (addition F, F2).
+        // The reference empty state, and nothing else: a tile, a line, a
+        // sentence (dashboard.js:39168). The suggestion list is gone — it was
+        // a menu of things to type in a surface whose only job is to say the
+        // composer is the way in (addition H2, supersedes S7).
         if (!setup.complete) {
             Unit
         } else if (state.sessions.size <= 1) {
-            SuggestionList(
-                onSuggestion = onSuggestion,
-                modifier = Modifier.testTag(START_FIRST_CHILD_TAG),
-            )
+            EmptySessionBlock(modifier = Modifier.testTag(START_FIRST_CHILD_TAG))
         } else {
             RecentSessions(
                 state = state,
@@ -135,6 +136,50 @@ fun StartSurface(
                 onSeeAllSessions = onSeeAllSessions,
             )
         }
+    }
+}
+
+/**
+ * `TerminalChatEmpty` + `TerminalChatIconWrap` (dashboard.js:39168, :39192):
+ * a 44 dp accent-washed tile with an accent-line border and a bright terminal
+ * mark, a 16 sp bold line, and a 13 sp muted sentence.
+ */
+@Composable
+fun EmptySessionBlock(modifier: Modifier = Modifier) {
+    val colors = Forge.colors
+    val type = Forge.type
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = ForgeSpace.xxxl),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
+    ) {
+        Box(
+            Modifier
+                .size(ForgeSize.emptyTile)
+                .clip(ForgeShapes.cardTight)
+                .background(colors.accentWash)
+                .border(ForgeSize.hairline, colors.accentLine, ForgeShapes.cardTight),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Rounded.Terminal,
+                contentDescription = null,
+                tint = colors.accentSoft,
+                modifier = Modifier.size(ForgeSize.icon),
+            )
+        }
+        Text(
+            stringResource(R.string.empty_session_title),
+            style = type.h1,
+            color = colors.text,
+        )
+        Text(
+            stringResource(R.string.empty_session_body),
+            style = type.sessionMeta,
+            color = colors.textMuted,
+        )
     }
 }
 
@@ -206,7 +251,7 @@ private fun doneDetail(
             RelativeTime.duration(info.startedAtElapsedRealtimeMs, elapsedRealtimeMs),
         )
     }
-    SetupStepId.Notifications -> stringResource(R.string.step_notify_done)
+    SetupStepId.Autonomy -> stringResource(R.string.step_autonomy_done)
     SetupStepId.Battery -> stringResource(R.string.step_battery_done)
     SetupStepId.Model -> state.models?.let {
         stringResource(

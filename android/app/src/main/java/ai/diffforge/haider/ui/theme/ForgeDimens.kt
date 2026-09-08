@@ -37,7 +37,18 @@ object ForgeSize {
     /** Session-row state rail. */
     val rail = 3.dp
     val hairline = 1.dp
-    val header = 56.dp
+    /** The slim control row (addition H1); was a 56 dp two-line block. */
+    val header = 52.dp
+    /** A header control's visual: 40 dp inside a 48 dp target. */
+    val headerControl = 40.dp
+    /** A segment's painted height inside the header's pill toggle. */
+    val headerSegment = 32.dp
+    /** The reference empty-state icon tile (dashboard.js:39192 — 44 px). */
+    val emptyTile = 44.dp
+    /** The reference composer field (dashboard.js:40056 — min 52 px). */
+    val composerField = 52.dp
+    /** The send / mic circles inside the field (dashboard.js:40094 — 34 px). */
+    val composerCircle = 34.dp
     val drawerWidth = 322.dp
     val drawerInset = 56.dp
     val rowMin = 64.dp
@@ -46,6 +57,12 @@ object ForgeSize {
     val contextRow = 32.dp
     val stateDot = 6.dp
     val badgeDot = 9.dp
+    /** The brand mark inside the 22 dp avatar slot (modelBrand.jsx: 13 px). */
+    val brandMark = 14.dp
+    /** The activity badge inside its ring (modelBrand.jsx: 5 px). */
+    val activityDot = 5.dp
+    /** The 24x24 viewport every ported vendor mark is drawn on. */
+    val markViewport = 24.dp
     /** Chip visual height. 36 dp inside a 48 dp target (addition F, S5). */
     val chip = 36.dp
     val segmented = 36.dp

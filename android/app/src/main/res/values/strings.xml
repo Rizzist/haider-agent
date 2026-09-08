@@ -9,6 +9,40 @@
     <!-- Header -->
     <string name="app_subtitle_setup">Setting up · step %1$d of %2$d</string>
     <string name="header_new_session">New session</string>
+    <string name="cd_refresh_session">Refresh</string>
+    <string name="empty_session_title">No session yet.</string>
+    <string name="empty_session_body">Send a message below to start.</string>
+    <string name="select_label_model">Model</string>
+    <string name="select_label_effort">Effort</string>
+    <string name="select_label_permissions">Permissions</string>
+    <string name="select_value_default">Default</string>
+    <string name="permission_mode_auto">Auto</string>
+    <string name="permission_mode_ask">Ask</string>
+    <string name="cd_change_permissions">Change what Haider may do on its own</string>
+    <string name="cd_voice_unavailable">Voice input is not in this build</string>
+    <string name="picker_permissions_title">What Haider may do on its own</string>
+    <string name="permission_mode_auto_detail">Read SMS, capture the screen, tap and type — without asking each time. Questions, secrets and provider refusals still stop and ask.</string>
+    <string name="permission_mode_ask_detail">Ask before every device action.</string>
+    <string name="step_autonomy_title">Let Haider work on its own</string>
+    <string name="step_autonomy_body">Haider asks for these once. After that it reads your texts, looks at your screen and taps for you without stopping to ask each time — that is what Auto means, and you can change it to Ask in the composer.</string>
+    <string name="step_autonomy_action">Allow all four</string>
+    <string name="step_autonomy_done">Haider can work unattended</string>
+    <string name="autonomy_row_notifications">Notifications</string>
+    <string name="autonomy_row_notifications_why">So a session that needs you can say so while the app is closed.</string>
+    <string name="autonomy_row_sms">Texts</string>
+    <string name="autonomy_row_sms_why">Reading and sending SMS, which is the thing you asked it to automate.</string>
+    <string name="autonomy_row_accessibility">Tap and type</string>
+    <string name="autonomy_row_accessibility_why">Opens Android settings; turn Haider on there and come back.</string>
+    <string name="autonomy_row_capture">See the screen</string>
+    <string name="autonomy_row_capture_why">Android issues this one per capture session and cannot pre-grant it, so it is asked again when the session ends.</string>
+    <string name="autonomy_action_allow">Allow</string>
+    <string name="autonomy_action_open">Open settings</string>
+    <string name="state_pill_idle">Idle</string>
+    <string name="state_pill_running">Running</string>
+    <string name="state_pill_needs_you">Needs you</string>
+    <string name="state_pill_waiting">Waiting</string>
+    <string name="state_pill_error">Error</string>
+    <string name="state_pill_offline">Offline</string>
     <string name="header_fallback_title">Haider</string>
 
     <!-- Start surface -->

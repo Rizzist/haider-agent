@@ -34,7 +34,13 @@ sealed interface Overlay {
 }
 
 /** The four (or three, below SDK 33) first-run steps. */
-enum class SetupStepId { RunService, Notifications, Battery, Model }
+/**
+ * [Autonomy] is the owner's "model work should be automated": one step that
+ * asks for every one-time OS popup at once — notifications, SMS, the
+ * accessibility service and the screen-capture consent — instead of a card per
+ * action later (addition H6).
+ */
+enum class SetupStepId { RunService, Autonomy, Battery, Model }
 
 data class SetupStep(
     val id: SetupStepId,
@@ -59,10 +65,17 @@ object SetupPlan {
         batteryRestricted: Boolean,
         batterySkipped: Boolean,
         modelResolved: Boolean,
+        smsGranted: Boolean = false,
     ): SetupState {
         val done = buildList {
             add(SetupStepId.RunService to daemonRunning)
-            if (notificationsSupported) add(SetupStepId.Notifications to notificationsGranted)
+            // Only notifications gate the step. SMS, the accessibility
+            // service and the capture consent are asked for on the same screen
+            // and each reports its own status, but none of them may block
+            // setup: addition D says a running daemon opens straight into a
+            // session, and a device where the user declined SMS must not be
+            // parked on a checklist forever.
+            if (notificationsSupported) add(SetupStepId.Autonomy to notificationsGranted)
             add(SetupStepId.Battery to (!batteryRestricted || batterySkipped))
             add(SetupStepId.Model to modelResolved)
         }
@@ -85,6 +98,8 @@ data class AppUiState(
     val environment: DaemonEnvironment = DaemonEnvironment(),
     /** Android-side permission facts the Activity observed (verify-6 O3). */
     val permissions: PermissionSnapshot = PermissionSnapshot(),
+    /** What the daemon lets the model do unattended (addition H6). */
+    val permissionMode: PermissionMode = PermissionMode.Auto,
     val sessions: List<SessionRow> = emptyList(),
     val paging: RosterPaging = RosterPaging(),
     val activeSessionId: String? = null,

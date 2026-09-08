@@ -9,6 +9,7 @@ import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.accounts.OAuthStyle
 import ai.diffforge.haider.ui.accounts.ProviderDescriptor
 import ai.diffforge.haider.ui.accounts.SecretBuffer
+import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
@@ -501,11 +502,7 @@ private fun AccountRow(account: Account, onOpen: () -> Unit) {
             .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.sm),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SessionGlyph(
-            provider = account.provider,
-            state = SessionVisualState.Idle,
-            animate = false,
-        )
+        BrandMarkOnly(model = null, provider = account.provider)
         Column(
             Modifier
                 .weight(1f)

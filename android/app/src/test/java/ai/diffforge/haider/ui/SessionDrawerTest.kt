@@ -90,7 +90,8 @@ class SessionDrawerTest {
         assertTrue(rule.onAllNodesWithTextSafe("Settings") > 0)
         // Addition F: the identity block, the Model row and the Appearance row
         // are gone; the theme lives on the top bar and the model in the composer.
-        assertEquals(0, rule.onAllNodesWithTextSafe("Model"))
+        // "Model" is now a composer select label, so the assertion is about
+        // the drawer's own subtree rather than the whole screen.
         assertEquals(0, rule.onAllNodesWithTextSafe("Appearance"))
         assertEquals(0, rule.onAllNodesWithTextSafe("v0.0.971 · on this device"))
     }

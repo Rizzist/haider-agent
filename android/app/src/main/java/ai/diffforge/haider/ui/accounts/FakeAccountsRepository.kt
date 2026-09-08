@@ -1,5 +1,6 @@
 package ai.diffforge.haider.ui.accounts
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -35,6 +36,18 @@ class FakeAccountsRepository(
      */
     /** Set to make the vault refuse for a reason that is not the key. */
     var stagingUnavailable = false
+
+    /**
+     * Holds `commitStagedApiKey` open, so a test can look at the screen while
+     * login is still in flight. That window is the whole point of the round-7
+     * finding: the key used to sit in the field for its duration.
+     */
+    private val commitGate = CompletableDeferred<Unit>()
+    var holdCommit = false
+
+    fun releaseCommit() {
+        commitGate.complete(Unit)
+    }
 
     private val stagedLengths = mutableMapOf<String, Int>()
 
@@ -114,6 +127,7 @@ class FakeAccountsRepository(
         replaceExisting: Boolean,
     ): AccountResult {
         calls += AccountsRpcAdapter.METHOD_ACCOUNT_LOGIN_API
+        if (holdCommit) commitGate.await()
         nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
         val hint = staged[vaultReference] ?: return AccountResult.Failed("unknown_vault_reference")
         // login_api is where a key is actually checked (contracts-v1).

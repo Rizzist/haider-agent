@@ -14,6 +14,7 @@ import ai.diffforge.haider.ui.scaffold.SharedPreferencesBannerDismissals
 import ai.diffforge.haider.ui.scaffold.SystemAction
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.service.HaiderAccessibilityService
+import ai.diffforge.haider.service.ScreenConsentActivity
 import ai.diffforge.haider.ui.state.PermissionSnapshot
 import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.state.PermissionClassifier
@@ -332,6 +333,10 @@ class MainActivity : ComponentActivity() {
                     android.Manifest.permission.RECEIVE_SMS,
                 ),
             )
+            // MediaProjection consent: a transparent system activity issues
+            // it and starts the capture service on OK (addition H6).
+            SystemAction.RequestScreenCapture ->
+                startActivity(Intent(this, ScreenConsentActivity::class.java))
             SystemAction.Screenshot, SystemAction.PickFile -> Unit
             is SystemAction.CopyText -> {
                 val clipboard = getSystemService(ClipboardManager::class.java)

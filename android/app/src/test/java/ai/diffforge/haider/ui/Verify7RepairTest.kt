@@ -106,19 +106,20 @@ class Verify7RepairTest {
         rule.onNodeWithContentDescription("API key").performClick()
         rule.waitForIdle()
         rule.onNodeWithContentDescription("OpenAI").performClick()
-        // A key the fake will refuse at login, so the form is still on screen
-        // when the assertion runs — the exact window the finding is about.
-        rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("short")
+        // The commit is held open, so this assertion runs in exactly the
+        // window the finding is about: the vault has the key and login has not
+        // come back yet.
+        repository.holdCommit = true
+        rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("fake-971-verify-only-1234")
         rule.onNodeWithText("Save").performClick()
         rule.waitForIdle()
 
-        // It was staged, refused, and the field is empty either way.
         assertTrue(repository.calls.contains("vault.stage"))
+        assertTrue("login has not returned yet", repository.calls.contains("account.login_api"))
         val field = rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).fetchSemanticsNode()
         val editable = field.config.getOrNull(SemanticsProperties.EditableText)?.text.orEmpty()
         assertEquals("the plaintext survived staging", "", editable)
-        // And nothing on screen can reveal it again.
-        rule.onNodeWithContentDescription("Show the key").assertIsDisplayed()
-        assertEquals(0, rule.onAllNodesWithTextSafe("short"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("fake-971-verify-only-1234"))
+        repository.releaseCommit()
     }
 }

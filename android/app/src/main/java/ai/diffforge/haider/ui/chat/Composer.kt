@@ -1,33 +1,39 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.ForgeIconButton
+import ai.diffforge.haider.ui.state.ComposerState
 import ai.diffforge.haider.ui.state.ModelChipState
 import ai.diffforge.haider.ui.state.ModelNames
-import ai.diffforge.haider.ui.state.ComposerState
+import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.SendButtonState
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import ai.diffforge.haider.ui.components.ForgeChip
-import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.material.icons.rounded.Attachment
+import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -46,24 +52,32 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 
 /**
- * Two rows: a 32 dp context row and the input row (UI-SPEC 3.6).
+ * The reference composer (owner addition H3).
  *
- * The 970 chip row forced `heightIn(min = 48.dp)` *and* vertical padding inside
- * a horizontal scroller, so a 48 dp pill sat above a 50 dp input and ate 100 dp
- * of the short axis (D5). The chip is 32 dp now and grows its touch box, not its
- * pixels. The placeholder moved from `textDisabled` (2.85:1) to `textMuted`
- * (5.27:1), which is D7.
+ * `TerminalChatComposerControls` (dashboard.js:39675) is a wrapping row of
+ * labelled pill selects, and `TerminalChatTextarea` (:40056) is a 52 px field
+ * at radius 26 with the send (:40094) and mic (:40156) circles sitting inside
+ * its right edge. Round 8's composer was two bare chips over a 56 dp rounded
+ * row — the owner's "not good looking composer".
  *
- * Voice is not shipped in 971: Android has no mic capture path
- * (docs/android-port-scope.md:186-191). The slot is reserved; no dead button is
- * drawn.
+ * The labels come back for exactly these three selects, which is the one
+ * exemption H3 grants to G2: a value alone cannot say whether `Auto` is the
+ * permission mode or the effort. Everything else in the app stays label-free.
+ *
+ * Voice: Android has no mic capture path in 971
+ * (`docs/android-port-scope.md:186-191`). The circle is drawn because the
+ * reference composer has it and the owner asked for it, and it is drawn
+ * **disabled** with a description that says why — a control that pretends to
+ * listen would be worse than one that admits it cannot.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun Composer(
     showPickers: Boolean = true,
@@ -71,14 +85,14 @@ fun Composer(
     onTextChange: (String) -> Unit,
     composer: ComposerState,
     chip: ModelChipState,
-    contextTokens: Long?,
-    contextExact: Boolean?,
     effort: String?,
+    permissionMode: PermissionMode,
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStartDaemon: () -> Unit,
     onOpenModel: () -> Unit,
     onOpenEffort: () -> Unit,
+    onOpenPermissions: () -> Unit,
     onRetryModels: () -> Unit,
     onAttach: () -> Unit,
     modifier: Modifier = Modifier,
@@ -90,76 +104,44 @@ fun Composer(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.md),
-        verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
+            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
+        verticalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
     ) {
-        // Two compact chips, no labels, and no horizontal scroll: they fit one
-        // row at 360 dp. The provider is folded into the model sheet, which is
-        // grouped by provider anyway (addition F, S5).
         if (showPickers) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = ForgeSize.contextRow),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),
-        ) {
-            ModelChip(
-                state = chip,
-                onOpenModel = onOpenModel,
-                onRetry = onRetryModels,
-                onStartDaemon = onStartDaemon,
-            )
-            if (effort != null) {
-                ValueChip(
-                    value = effort,
+            // FlowRow, not a scrolling row: below 360 dp the third select wraps
+            // to a second line rather than hiding off the right edge.
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
+                verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
+            ) {
+                ModelSelect(
+                    state = chip,
+                    onOpenModel = onOpenModel,
+                    onRetry = onRetryModels,
+                    onStartDaemon = onStartDaemon,
+                )
+                LabelledSelect(
+                    label = stringResource(R.string.select_label_effort),
+                    value = effort ?: stringResource(R.string.select_value_default),
                     contentDescription = stringResource(R.string.cd_change_effort),
                     onClick = onOpenEffort,
                 )
-            }
-            Box(Modifier.weight(1f))
-            // Absent means unknown: no segment rather than a printed zero.
-            ModelNames.tokens(contextTokens)?.let { tokens ->
-                Text(
-                    if (contextExact == true) {
-                        stringResource(R.string.composer_context_exact, tokens)
-                    } else {
-                        stringResource(R.string.composer_context_estimated, tokens)
-                    },
-                    style = type.sessionMeta,
-                    color = colors.textMuted,
-                    maxLines = 1,
+                LabelledSelect(
+                    label = stringResource(R.string.select_label_permissions),
+                    value = stringResource(
+                        when (permissionMode) {
+                            PermissionMode.Auto -> R.string.permission_mode_auto
+                            PermissionMode.Ask -> R.string.permission_mode_ask
+                        },
+                    ),
+                    contentDescription = stringResource(R.string.cd_change_permissions),
+                    onClick = onOpenPermissions,
                 )
             }
-        }
         }
 
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = ForgeSize.composerMin)
-                .clip(ForgeShapes.composer)
-                .background(colors.surfaceRaised)
-                .border(
-                    ForgeSize.hairline,
-                    if (focused) colors.focusRing else colors.borderStrong,
-                    ForgeShapes.composer,
-                )
-                .padding(horizontal = ForgeSpace.xs),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            ForgeIconButton(
-                onClick = onAttach,
-                contentDescription = stringResource(R.string.cd_attach),
-                enabled = composer.inputEnabled,
-            ) {
-                Icon(
-                    Icons.Rounded.Add,
-                    contentDescription = null,
-                    tint = colors.textSoft,
-                    modifier = Modifier.size(ForgeSize.icon),
-                )
-            }
+        Box(modifier = Modifier.fillMaxWidth()) {
             BasicTextField(
                 value = text,
                 onValueChange = onTextChange,
@@ -167,45 +149,103 @@ fun Composer(
                 textStyle = type.chatBody.copy(color = colors.text),
                 cursorBrush = SolidColor(colors.accent),
                 maxLines = 6,
+                // H3 puts Stop in the send circle while a turn runs, which
+                // would otherwise take the mid-turn follow-up with it — the
+                // exact objection addition E raised about replacing Send. The
+                // keyboard's own Send action keeps that path open.
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(
+                    onSend = { if (composer.button.enabled) onSend() },
+                ),
                 modifier = Modifier
-                    .weight(1f)
-                    .onFocusChanged { focused = it.isFocused }
-                    .padding(vertical = ForgeSpace.md)
-                    // The field is a target in its own right, not just the row
-                    // around it, so the minimum goes inside the padding.
-                    .heightIn(min = ForgeSize.touch),
+                    .fillMaxWidth()
+                    .heightIn(min = ForgeSize.composerField)
+                    .clip(ForgeShapes.composer)
+                    .background(colors.surfaceControl)
+                    .border(
+                        ForgeSize.hairline,
+                        if (focused) colors.focusRing else colors.border,
+                        ForgeShapes.composer,
+                    )
+                    .onFocusChanged { focused = it.isFocused },
                 decorationBox = { inner ->
-                    Box {
-                        if (text.isEmpty()) {
-                            Text(
-                                stringResource(composer.placeholderRes),
-                                style = type.chatBody,
-                                color = colors.textMuted,
-                            )
+                    Row(
+                        modifier = Modifier.heightIn(min = ForgeSize.composerField),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(start = ForgeSpace.xl, end = ForgeSpace.sm),
+                        ) {
+                            if (text.isEmpty()) {
+                                Text(
+                                    stringResource(composer.placeholderRes),
+                                    style = type.chatBody,
+                                    color = colors.textMuted,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            inner()
                         }
-                        inner()
                     }
                 },
             )
-            // Stop sits beside Send, never instead of it, and only when the
-            // snapshot names the run.
-            if (composer.showStop) {
-                ForgeIconButton(
-                    onClick = onStop,
-                    contentDescription = stringResource(R.string.cd_stop_turn),
-                    background = colors.red.copy(alpha = 0.16f),
+            Row(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = ForgeSpace.xs),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircleControl(
+                    onClick = onAttach,
+                    contentDescription = stringResource(R.string.cd_attach),
+                    enabled = composer.inputEnabled,
                 ) {
                     Icon(
-                        Icons.Rounded.Stop,
+                        Icons.Rounded.Attachment,
                         contentDescription = null,
-                        tint = colors.red,
+                        tint = colors.textMuted,
                         modifier = Modifier.size(ForgeSize.iconSm),
                     )
                 }
+                CircleControl(
+                    onClick = {},
+                    contentDescription = stringResource(R.string.cd_voice_unavailable),
+                    enabled = false,
+                ) {
+                    Icon(
+                        Icons.Rounded.Mic,
+                        contentDescription = null,
+                        tint = colors.textMuted,
+                        modifier = Modifier.size(ForgeSize.iconSm),
+                    )
+                }
+                if (composer.showStop) {
+                    // Stop replaces send while a turn runs, and there is still
+                    // exactly one of it in the app (addition E2).
+                    CircleControl(
+                        onClick = onStop,
+                        contentDescription = stringResource(R.string.cd_stop_turn),
+                        enabled = true,
+                        fill = colors.red.copy(alpha = 0.16f),
+                        outline = colors.red.copy(alpha = 0.45f),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Stop,
+                            contentDescription = null,
+                            tint = colors.red,
+                            modifier = Modifier.size(ForgeSize.iconSm),
+                        )
+                    }
+                } else {
+                    SendCircle(composer = composer, onSend = onSend)
+                }
             }
-            SendControl(composer = composer, onSend = onSend)
         }
 
+        // Only the disconnected / error line G5 allows.
         composer.helperRes?.let { helper ->
             Text(
                 stringResource(helper),
@@ -221,34 +261,132 @@ fun Composer(
     }
 }
 
-/** A compact value chip: `high ▾`. The label is the value. */
+/**
+ * `TerminalChatComposerControl` (:39685): a hairline pill carrying a tiny
+ * tracked uppercase label, the value, and a chevron.
+ */
 @Composable
-private fun ValueChip(
+private fun LabelledSelect(
+    label: String,
     value: String,
     contentDescription: String,
     onClick: () -> Unit,
+    enabled: Boolean = true,
+    leading: (@Composable () -> Unit)? = null,
 ) {
     val colors = Forge.colors
     val type = Forge.type
-    ForgeChip(onClick = onClick, contentDescription = "$contentDescription, $value") {
-        Text(
-            value,
-            style = type.chip,
-            color = colors.textSoft,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+    Box(
+        modifier = Modifier
+            .heightIn(min = ForgeSize.touch)
+            .clickable(enabled = enabled, onClick = onClick)
+            .semantics {
+                this.contentDescription = "$contentDescription, $value"
+                this.role = Role.Button
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            modifier = Modifier
+                .height(ForgeSize.chip)
+                .clip(ForgeShapes.pill)
+                .background(colors.surfaceControl)
+                .border(ForgeSize.hairline, colors.border, ForgeShapes.pill)
+                .padding(horizontal = ForgeSpace.md),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
+        ) {
+            leading?.invoke()
+            Text(label, style = type.selectLabel, color = colors.textMuted, maxLines = 1)
+            Text(
+                value,
+                style = type.chip,
+                color = colors.text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Icon(
+                Icons.Rounded.ExpandMore,
+                contentDescription = null,
+                tint = colors.textMuted,
+                modifier = Modifier.size(ForgeSize.iconSm),
+            )
+        }
+    }
+}
+
+/** MODEL, with the brand mark folded in: the provider sheet is inside it. */
+@Composable
+private fun ModelSelect(
+    state: ModelChipState,
+    onOpenModel: () -> Unit,
+    onRetry: () -> Unit,
+    onStartDaemon: () -> Unit,
+) {
+    val label = stringResource(R.string.select_label_model)
+    when (state) {
+        is ModelChipState.Resolved -> LabelledSelect(
+            label = label,
+            value = state.shortModel,
+            contentDescription = stringResource(R.string.cd_change_model),
+            onClick = onOpenModel,
+            leading = {
+                BrandMarkOnly(model = state.fullModel, provider = state.provider)
+            },
         )
-        Icon(
-            Icons.Rounded.ExpandMore,
-            contentDescription = null,
-            tint = colors.textMuted,
-            modifier = Modifier.size(ForgeSize.iconSm),
+        ModelChipState.Loading -> LabelledSelect(
+            label = label,
+            value = stringResource(R.string.select_value_default),
+            contentDescription = stringResource(R.string.chip_model_loading_cd),
+            onClick = onOpenModel,
+            enabled = false,
+        )
+        is ModelChipState.Error -> LabelledSelect(
+            label = label,
+            value = stringResource(R.string.chip_model_error),
+            contentDescription = stringResource(R.string.chip_model_error),
+            onClick = onRetry,
+        )
+        ModelChipState.DaemonDown -> LabelledSelect(
+            label = label,
+            value = stringResource(R.string.chip_model_no_daemon),
+            contentDescription = stringResource(R.string.chip_model_no_daemon),
+            onClick = onStartDaemon,
+        )
+        ModelChipState.Changing -> LabelledSelect(
+            label = label,
+            value = stringResource(R.string.chip_model_changing),
+            contentDescription = stringResource(R.string.cd_change_model),
+            onClick = onOpenModel,
+            enabled = false,
         )
     }
 }
 
+/** A 34 dp circle inside a 48 dp target, as the reference draws them. */
 @Composable
-private fun SendControl(composer: ComposerState, onSend: () -> Unit) {
+private fun CircleControl(
+    onClick: () -> Unit,
+    contentDescription: String,
+    enabled: Boolean,
+    fill: androidx.compose.ui.graphics.Color? = null,
+    outline: androidx.compose.ui.graphics.Color? = null,
+    content: @Composable () -> Unit,
+) {
+    val colors = Forge.colors
+    ForgeIconButton(
+        onClick = onClick,
+        contentDescription = contentDescription,
+        enabled = enabled,
+        background = fill ?: androidx.compose.ui.graphics.Color.Transparent,
+        visual = ForgeSize.composerCircle,
+        border = outline ?: colors.border,
+        content = content,
+    )
+}
+
+@Composable
+private fun SendCircle(composer: ComposerState, onSend: () -> Unit) {
     val colors = Forge.colors
     if (composer.button == SendButtonState.Starting) {
         Box(Modifier.size(ForgeSize.touch), contentAlignment = Alignment.Center) {
@@ -259,18 +397,17 @@ private fun SendControl(composer: ComposerState, onSend: () -> Unit) {
         }
         return
     }
-    ForgeIconButton(
+    CircleControl(
         onClick = onSend,
         contentDescription = stringResource(composer.contentDescriptionRes),
         enabled = composer.button.enabled,
-        background = if (composer.button.enabled) colors.accent else colors.surfaceControl,
+        fill = colors.accentWash,
+        outline = colors.accentLine,
     ) {
         Icon(
             Icons.Rounded.ArrowUpward,
             contentDescription = null,
-            // A filled accent surface takes accentInk, never Color.White: white
-            // on the 971 ember accent is 2.64:1 in dark (UI-SPEC 2.1).
-            tint = if (composer.button.enabled) colors.accentInk else colors.textDisabled,
+            tint = colors.accentSoft,
             modifier = Modifier.size(ForgeSize.iconSm),
         )
     }

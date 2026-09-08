@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui.components
 
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -13,6 +14,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -20,17 +22,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.clearAndSetSemantics
 
 /**
- * The brand-dot for one session, ported from the desktop rail's icon strip
- * (`SessionsRail.jsx:41`, `modelBrand.jsx`): the mark of the provider the
- * session is on, falling back to a plain dot when the family is unknown.
+ * The brand mark for one session's model, with the desktop rail's activity
+ * badge (`modelBrand.jsx` `ModelBrandIcon`).
  *
- * In the minimalist row this glyph is the *only* visual state channel, so it
- * carries the accent: needs-input takes the accent colour, errored takes red,
- * and a running session breathes. The word itself lives in the row's merged
- * `contentDescription`, which is what keeps state from being colour-only.
+ * Round 6 shipped text glyphs — "✳", "D", "AI" — which is what the owner asked
+ * about; these are the real vendor marks, resolved by **model** id first and
+ * provider only as a fallback (addition H5). The badge is the state channel: a
+ * 5 dp dot at the bottom-right, green while a turn runs, amber while it waits
+ * for a human, red on error, absent when idle. The word itself still lives in
+ * the row's merged `contentDescription`, so state is never colour-only.
  */
 @Composable
 fun SessionGlyph(
@@ -38,68 +42,126 @@ fun SessionGlyph(
     state: SessionVisualState,
     animate: Boolean,
     modifier: Modifier = Modifier,
+    model: String? = null,
+    /** The rail/ground colour the badge rings itself against. */
+    ringAgainst: Color? = null,
 ) {
     val colors = Forge.colors
-    val (mark, brand) = providerMark(provider)
-    val tint = when (state) {
+    val family = modelBrandFor(model, provider)
+    val brand = family?.let { if (colors.isDark) it.color else it.colorLight } ?: colors.textDisabled
+    val badge = when (state) {
+        SessionVisualState.Running -> colors.stateRunning
         SessionVisualState.NeedsInput -> colors.stateNeedsInput
-        SessionVisualState.Errored -> colors.stateErrored
         SessionVisualState.WaitingForNetwork -> colors.amber
-        else -> brand
+        SessionVisualState.Errored -> colors.stateErrored
+        else -> null
     }
     // Errored never animates — nothing pulses for a corpse.
-    val alpha = if (animate && state == SessionVisualState.Running) {
-        val transition = rememberInfiniteTransition(label = "glyph-breath")
+    val pulse = if (animate && state == SessionVisualState.Running) {
+        val transition = rememberInfiniteTransition(label = "badge-pulse")
         transition.animateFloat(
             initialValue = 0.45f,
             targetValue = 1f,
-            animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
-            label = "glyph-breath-alpha",
+            animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse),
+            label = "badge-pulse-alpha",
         ).value
     } else {
         1f
     }
     Box(
-        modifier = modifier
-            .clearAndSetSemantics { }
-            .size(ForgeSize.avatar)
-            .alpha(alpha)
-            .clip(CircleShape)
-            .background(tint.copy(alpha = 0.14f))
-            .border(ForgeSize.hairline, tint.copy(alpha = 0.5f), CircleShape),
+        modifier = modifier.clearAndSetSemantics { }.size(ForgeSize.avatar),
         contentAlignment = Alignment.Center,
     ) {
+        val mark = markFor(family?.key)
         if (mark == null) {
-            // Unknown family: the plain status dot the desktop falls back to.
+            // Unknown family keeps the plain status dot the desktop falls back
+            // to; a letter tile is only for brands the catalogue actually names.
+            if (family?.letter != null) {
+                Box(
+                    Modifier
+                        .size(ForgeSize.brandMark)
+                        .clip(ForgeShapes.cardTight)
+                        .background(brand),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(family.letter, style = Forge.type.brandLetter, color = colors.surface)
+                }
+            } else {
+                Box(
+                    Modifier
+                        .size(ForgeSize.stateDot)
+                        .clip(CircleShape)
+                        .background(badge ?: colors.textDisabled),
+                )
+            }
+        } else {
+            Icon(
+                mark,
+                contentDescription = null,
+                tint = brand,
+                modifier = Modifier.size(ForgeSize.brandMark),
+            )
+        }
+        if (badge != null) {
             Box(
                 Modifier
-                    .size(ForgeSize.stateDot)
+                    .align(Alignment.BottomEnd)
+                    .size(ForgeSize.badgeDot)
                     .clip(CircleShape)
-                    .background(tint),
-            )
-        } else {
-            Text(mark, style = Forge.type.label, color = tint)
+                    .background(ringAgainst ?: colors.bg),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    Modifier
+                        .size(ForgeSize.activityDot)
+                        .alpha(pulse)
+                        .clip(CircleShape)
+                        .background(badge),
+                )
+            }
         }
     }
 }
 
-/** Substring detection over the provider id, as `modelBrand.jsx:89` does. */
+/** The brand's own tile, without state: pickers and account rows. */
 @Composable
-private fun providerMark(provider: String?): Pair<String?, Color> {
+fun BrandMarkOnly(model: String?, provider: String?, modifier: Modifier = Modifier) {
     val colors = Forge.colors
-    val normalized = provider.orEmpty().lowercase()
-    return when {
-        "anthropic" in normalized || "claude" in normalized -> "✳" to Color(0xFFD97757)
-        "gemini" in normalized || "google" in normalized -> "✦" to Color(0xFF4E86F5)
-        "deepseek" in normalized -> "D" to Color(0xFF4D6BFE)
-        "qwen" in normalized -> "Q" to Color(0xFF615CED)
-        "kimi" in normalized || "moonshot" in normalized -> "K" to Color(0xFF16A8F0)
-        "mistral" in normalized -> "M" to Color(0xFFFF7000)
-        "llama" in normalized || "meta" in normalized -> "L" to Color(0xFF0668E1)
-        "glm" in normalized || "zhipu" in normalized -> "G" to Color(0xFF3859FF)
-        "grok" in normalized || "xai" in normalized -> "X" to colors.text
-        "openai" in normalized || "codex" in normalized -> "AI" to colors.text
-        normalized.isBlank() -> null to colors.textMuted
-        else -> null to colors.textMuted
+    val family = modelBrandFor(model, provider)
+    val brand = family?.let { if (colors.isDark) it.color else it.colorLight } ?: colors.textMuted
+    val mark = markFor(family?.key)
+    Box(modifier = modifier.size(ForgeSize.avatar), contentAlignment = Alignment.Center) {
+        when {
+            mark != null -> Icon(
+                mark,
+                contentDescription = null,
+                tint = brand,
+                modifier = Modifier.size(ForgeSize.brandMark),
+            )
+            family?.letter != null -> Box(
+                Modifier
+                    .size(ForgeSize.brandMark)
+                    .clip(ForgeShapes.cardTight)
+                    .background(brand),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(family.letter, style = Forge.type.brandLetter, color = colors.surface)
+            }
+            else -> Box(
+                Modifier
+                    .size(ForgeSize.stateDot)
+                    .clip(CircleShape)
+                    .background(colors.textDisabled),
+            )
+        }
     }
+}
+
+private fun markFor(key: String?): ImageVector? = when (key) {
+    "openai" -> OpenAiMark
+    "claude" -> ClaudeMark
+    "gemini" -> GeminiMark
+    "deepseek" -> DeepSeekMark
+    "grok" -> GrokMark
+    else -> null
 }

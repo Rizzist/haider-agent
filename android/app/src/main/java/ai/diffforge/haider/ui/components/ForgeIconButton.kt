@@ -3,6 +3,7 @@ package ai.diffforge.haider.ui.components
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -33,6 +35,9 @@ fun ForgeIconButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     background: Color = Color.Transparent,
+    /** The painted circle's diameter; the target stays 48 dp. */
+    visual: Dp = ForgeSize.control,
+    border: Color? = null,
     content: @Composable () -> Unit,
 ) {
     val interaction = remember { MutableInteractionSource() }
@@ -59,9 +64,16 @@ fun ForgeIconButton(
             // ignored its own state (round 5, P2).
             modifier = Modifier
                 .alpha(if (enabled) 1f else DISABLED_ALPHA)
-                .size(ForgeSize.control)
+                .size(visual)
                 .clip(CircleShape)
-                .background(background),
+                .background(background)
+                .then(
+                    if (border != null) {
+                        Modifier.border(ForgeSize.hairline, border, CircleShape)
+                    } else {
+                        Modifier
+                    },
+                ),
             contentAlignment = Alignment.Center,
             content = { content() },
         )
