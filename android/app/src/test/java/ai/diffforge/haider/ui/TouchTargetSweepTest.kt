@@ -3,6 +3,7 @@ package ai.diffforge.haider.ui
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.fleet.subagentChipTag
 import ai.diffforge.haider.ui.state.Overlay
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsNode
@@ -14,8 +15,10 @@ import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -154,6 +157,40 @@ class TouchTargetSweepTest {
     fun `the daemon details sheet has no undersized targets`() {
         open(overlay = Overlay.DaemonDetails)
         sweep("daemon details")
+    }
+
+    // ---------- delegation surfaces (lane 971-UI-fleet) ----------
+
+    @Test
+    fun `the subagent strip has no undersized targets`() {
+        open(FakeScenario.Fleet)
+        sweep("subagent strip")
+    }
+
+    @Test
+    fun `a drawer with nested families has no undersized targets`() {
+        open(FakeScenario.Fleet)
+        rule.onAllNodes(hasContentDescription("Open sessions", substring = true))
+            .onFirst()
+            .performClick()
+        rule.waitForIdle()
+        sweep("fleet drawer")
+    }
+
+    @Test
+    fun `the child transcript has no undersized targets`() {
+        open(FakeScenario.Fleet)
+        rule.onNodeWithTag(subagentChipTag("agent-auditor")).performScrollTo().performClick()
+        rule.waitForIdle()
+        sweep("child transcript")
+    }
+
+    @Test
+    fun `the fleet panel has no undersized targets`() {
+        val viewModel = open(FakeScenario.Fleet)
+        viewModel.openFleet()
+        rule.waitForIdle()
+        sweep("fleet panel")
     }
 
     @Test

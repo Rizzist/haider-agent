@@ -33,7 +33,50 @@ sealed interface Overlay {
     data object Accounts : Overlay
     data class SessionActions(val sessionId: String) : Overlay
     data class Rename(val sessionId: String, val current: String) : Overlay
+
+    /** The cross-session subagent panel (lane 971-UI-fleet). */
+    data object Fleet : Overlay
+
+    /**
+     * One descendant's own transcript, read-only.
+     *
+     * [agentId] is the fleet's selection coordinate and [parentSessionId] the
+     * lineage the daemon published; both are carried verbatim so the screen can
+     * say "unknown" rather than infer either from the session it came from.
+     */
+    data class ChildTranscript(
+        val sessionId: String,
+        val agentId: String?,
+        val parentSessionId: String?,
+    ) : Overlay
 }
+
+/**
+ * What this client has read about subagents (lane 971-UI-fleet).
+ *
+ * [active] and [subagents] describe the session on screen; [panel] is keyed by
+ * the parent session each snapshot was read for, because a fleet snapshot is
+ * only ever true of the session it was requested for.
+ */
+data class FleetState(
+    val active: ai.diffforge.haider.ui.daemon.FleetLoad =
+        ai.diffforge.haider.ui.daemon.FleetLoad.Unread,
+    val subagents: ai.diffforge.haider.ui.daemon.SubagentLoad =
+        ai.diffforge.haider.ui.daemon.SubagentLoad.Unread,
+    val panel: Map<String, ai.diffforge.haider.ui.daemon.FleetLoad> = emptyMap(),
+    val panelLoading: Boolean = false,
+)
+
+/** One descendant's replayed transcript, mounted read-only beside its parent. */
+data class ChildTranscriptState(
+    val sessionId: String,
+    val agentId: String?,
+    val parentSessionId: String?,
+    val messages: List<Message> = emptyList(),
+    val loading: Boolean = true,
+    /** Set when the replay came back partial or unavailable; never hidden. */
+    val notice: String? = null,
+)
 
 /** The four (or three, below SDK 33) first-run steps. */
 /**
@@ -144,6 +187,16 @@ data class AppUiState(
     val viewTab: SessionViewTab = SessionViewTab.Chat,
     val shell: ShellAvailability = ShellAvailability(),
     val answeredElsewhere: Set<String> = emptySet(),
+    /** Subagent reads for the visible session and for the fleet panel. */
+    val fleet: FleetState = FleetState(),
+    /** The read-only descendant transcript, non-null only while it is open. */
+    val childTranscript: ChildTranscriptState? = null,
+    /**
+     * Families the user has folded *away from* their default, so the default
+     * can follow the child count without a stale boolean stranding a choice
+     * ([SessionTree.expanded]).
+     */
+    val familyToggles: Set<String> = emptySet(),
 ) {
     val activeSession: SessionRow?
         get() = sessions.firstOrNull { it.id == activeSessionId }

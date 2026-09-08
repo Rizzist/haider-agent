@@ -19,6 +19,11 @@ import ai.diffforge.haider.ui.drawer.RenameSheet
 import ai.diffforge.haider.ui.drawer.SessionActionsSheet
 import ai.diffforge.haider.ui.drawer.SessionDrawer
 import ai.diffforge.haider.ui.drawer.SessionRowAction
+import ai.diffforge.haider.ui.daemon.FleetModel
+import ai.diffforge.haider.ui.daemon.FleetLoad
+import ai.diffforge.haider.ui.fleet.ChildTranscriptScreen
+import ai.diffforge.haider.ui.fleet.FleetSheet
+import ai.diffforge.haider.ui.fleet.SubagentStrip
 import ai.diffforge.haider.ui.settings.AccountsScreen
 import ai.diffforge.haider.ui.settings.SettingsScreen
 import ai.diffforge.haider.ui.start.AutonomyGrant
@@ -216,6 +221,36 @@ fun HaiderApp(
                 )
                 return@ForgeTheme
             }
+            // A descendant's own transcript is a screen, not a sheet: it hosts
+            // a full replay and its own input-required card, and a sheet over
+            // the parent would put two transcripts on one surface.
+            is Overlay.ChildTranscript -> {
+                val open = state.childTranscript
+                if (open != null) {
+                    val roots = (state.fleet.active as? FleetLoad.Snapshot)
+                        ?.snapshot?.roots.orEmpty()
+                    ChildTranscriptScreen(
+                        state = open,
+                        node = FleetModel.find(roots, open.agentId),
+                        // The child's own roster row, when the daemon lists it:
+                        // that is where its needs-input card and coordinates
+                        // come from. Absent, the screen shows no card at all.
+                        row = viewModel.session(open.sessionId),
+                        parentTitle = viewModel.session(open.parentSessionId)?.title
+                            ?: open.parentSessionId,
+                        nowMs = nowMs,
+                        answeredElsewhere = state.answeredElsewhere,
+                        onBack = viewModel::closeOverlay,
+                        onAnswer = { rendered, key, index, text ->
+                            viewModel.answer(rendered, key, index, text)
+                        },
+                        onAnswerSecret = { rendered, key, index, secret ->
+                            viewModel.answerSecret(rendered, key, index, secret)
+                        },
+                    )
+                    return@ForgeTheme
+                }
+            }
             else -> Unit
         }
 
@@ -258,6 +293,11 @@ fun HaiderApp(
                         onOpenSettings = { viewModel.openOverlay(Overlay.Settings) },
                         onThemeMode = onThemeMode,
                         onLoadMore = { viewModel.loadMoreSessions() },
+                        onToggleFamily = { viewModel.toggleFamily(it) },
+                        onOpenFleet = {
+                            scope.launch { drawerState.close() }
+                            viewModel.openFleet()
+                        },
                         nowMsProvider = nowMsProvider,
                         elapsedRealtimeProvider = elapsedRealtimeProvider,
                         modifier = Modifier.windowInsetsPadding(WindowInsets.safeDrawing),
@@ -405,6 +445,24 @@ fun HaiderApp(
                                 )
                                 }
                             }
+                            // The session's own delegated agents, from
+                            // `session.observe` (frame.rs:2271). Renders
+                            // nothing when the daemon published none.
+                            SubagentStrip(
+                                load = state.fleet.subagents,
+                                fleet = state.fleet.active,
+                                // A chip comes from *this* session's observe
+                                // digest, so this session is its parent by
+                                // construction — not an inferred one.
+                                onOpenChild = { childId, agentId ->
+                                    viewModel.openChildTranscript(
+                                        sessionId = childId,
+                                        agentId = agentId,
+                                        parentSessionId = state.activeSessionId,
+                                    )
+                                },
+                                onOpenFleet = { viewModel.openFleet() },
+                            )
                             state.transcriptNotice?.let { notice ->
                                 Text(
                                     notice,
@@ -603,6 +661,24 @@ private fun Overlays(
                 onAction = { action -> viewModel.applyRowAction(row.id, action) },
             )
         }
+        Overlay.Fleet -> FleetSheet(
+            panel = state.fleet.panel,
+            sessions = state.sessions,
+            loading = state.fleet.panelLoading,
+            onDismiss = viewModel::closeOverlay,
+            onJump = { sessionId ->
+                viewModel.closeOverlay()
+                viewModel.activate(sessionId)
+            },
+            onOpenChild = { childId, agentId, parentId ->
+                viewModel.openChildTranscript(
+                    sessionId = childId,
+                    agentId = agentId,
+                    parentSessionId = parentId,
+                )
+            },
+            onRefresh = { viewModel.openFleet() },
+        )
         is Overlay.Rename -> RenameSheet(
             current = overlay.current,
             onDismiss = viewModel::closeOverlay,
