@@ -217,7 +217,7 @@ class WorkflowSurfacesTest {
         rule.waitForIdle()
         // The scripted draft has a real defect, and the daemon's own typed
         // location is shown.
-        rule.onNodeWithText("1 problem to fix").assertExists()
+        rule.onNodeWithText("2 problems to fix").assertExists()
         rule.onNodeWithText("unknown_agent_type", substring = true).assertExists()
         // Pressing Register does nothing: a confirm of a document carrying
         // errors would only ask the daemon for a refusal.

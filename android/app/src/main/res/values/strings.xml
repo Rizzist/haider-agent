@@ -314,7 +314,10 @@
     <string name="workflow_read_failed">The workflow graph could not be read: %1$s</string>
     <string name="workflow_edges_unpublished">This graph\'s ast published no topology edges, so no edges are drawn.</string>
     <string name="workflow_fact_not_published">not published</string>
-    <string name="workflow_fact_phase_line">%1$s · %2$d active</string>
+    <plurals name="workflow_fact_phase_line">
+        <item quantity="one">%1$s · %2$d node activated</item>
+        <item quantity="other">%1$s · %2$d nodes activated</item>
+    </plurals>
     <string name="workflow_fact_fence">ast digest %1$s</string>
     <string name="workflow_fact_cursors">read through %1$s · watching from %2$s</string>
     <string name="workflow_fact_edges">%1$d edges · %2$d back · %3$d back-edge activations</string>

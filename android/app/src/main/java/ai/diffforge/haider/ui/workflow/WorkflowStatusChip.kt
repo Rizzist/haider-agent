@@ -81,7 +81,11 @@ fun WorkflowStatusChip(
     ForgeChip(
         onClick = onClick,
         enabled = openable,
-        selected = openable,
+        // Deliberately not `selected`. An accented pill here stacked a second
+        // blue outline directly under the needs-input banner and competed with
+        // it; the phase-toned mark and the chevron already say "door", and the
+        // banner keeps the one accent the screen has room for.
+        selected = false,
         contentDescription = if (openable) {
             stringResource(R.string.cd_open_workflow, label)
         } else {

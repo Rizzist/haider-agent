@@ -210,9 +210,15 @@ fun LoomsScreen(
                 kind = ForgeButtonKind.Ghost,
             )
 
-            if (state.installJobs.isNotEmpty()) {
+            // Only the jobs no row above could show. Each agent type already
+            // carries its own install state, and listing it twice makes the
+            // screen look like it has twice as much to say.
+            val orphanJobs = state.installJobs.filter { job ->
+                registry.agentTypes.none { it.id == job.agentTypeId }
+            }
+            if (orphanJobs.isNotEmpty()) {
                 SectionLabel(stringResource(R.string.looms_section_installs))
-                state.installJobs.forEach { job -> InstallRow(job) }
+                orphanJobs.forEach { job -> InstallRow(job) }
             }
         }
     }
@@ -361,7 +367,10 @@ private fun ArchiveButton(
         ),
         onClick = { onSetArchived(!archived) },
         enabled = !busy,
-        kind = if (archived) ForgeButtonKind.Ghost else ForgeButtonKind.Destructive,
+        // Ghost, not destructive. Archiving is a selection state with its own
+        // undo one tap away; painting it red borrows the weight of a delete for
+        // something that deletes nothing.
+        kind = ForgeButtonKind.Ghost,
         minHeight = ForgeSize.bannerAction,
     )
 }

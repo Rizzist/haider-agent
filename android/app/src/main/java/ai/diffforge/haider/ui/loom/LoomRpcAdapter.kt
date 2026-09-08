@@ -248,8 +248,11 @@ object LoomRpcAdapter {
             val wrapper = row.optJSONObject("record")
             val record = wrapper?.optJSONObject("record") ?: wrapper
             val kind = entryKind(wrapper?.stringOrNull("kind") ?: entry?.stringOrNull("kind"))
-            val isArchived = ref?.archived == true
-            if (isArchived && ref != null) archivedRefs += ref
+            // Archive state is the baseline's, not the record's: only an entry
+            // the baseline itself marked archived joins the archived list.
+            val archivedRef = ref?.takeIf { it.archived }
+            archivedRef?.let { archivedRefs += it }
+            val isArchived = archivedRef != null
             when (kind) {
                 LoomEntryKind.AgentType -> record?.let {
                     agents += parseAgentType(it, isArchived).copy(

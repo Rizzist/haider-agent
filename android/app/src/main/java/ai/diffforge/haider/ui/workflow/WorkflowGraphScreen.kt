@@ -62,6 +62,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -301,8 +302,9 @@ private fun GraphFacts(
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
     ) {
         Text(
-            stringResource(
-                R.string.workflow_fact_phase_line,
+            pluralStringResource(
+                R.plurals.workflow_fact_phase_line,
+                snapshot.activeNodes.size,
                 snapshot.phaseRaw ?: notPublished,
                 snapshot.activeNodes.size,
             ),
@@ -429,6 +431,7 @@ private fun DagCanvas(
                     val nodeWpx = nodeW.toPx()
                     val nodeHpx = nodeH.toPx()
                     val padPx = pad.toPx()
+                    val layerGapPx = layerGap.toPx()
                     val stroke = ForgeSize.graphEdge.toPx()
                     val arrow = ForgeSize.graphArrow.toPx()
                     val dashes = PathEffect.dashPathEffect(
@@ -465,16 +468,25 @@ private fun DagCanvas(
                         val fromX = fromXdp.toPx()
                         val fromY = fromYdp.toPx()
                         if (route.backward) {
+                            // Down into the empty band between layers, right to
+                            // the gutter, up the outside, then in at the
+                            // target's right edge. Leaving at the source's own
+                            // mid-height ran the line straight through its
+                            // sibling card, which read as an edge between the
+                            // two of them — a fork drawn as a dependency.
                             val gutter = size.width - padPx * 0.35f
-                            val startPoint = Offset(fromX + nodeWpx, fromY + nodeHpx / 2f)
+                            val bandY = fromY + nodeHpx + layerGapPx / 2f
+                            val startPoint = Offset(fromX + nodeWpx * 0.72f, fromY + nodeHpx)
                             val endPoint = Offset(toX + nodeWpx, toY + nodeHpx / 2f)
-                            // Out to the gutter, up the side, back in: the
-                            // return path is drawn where a forward edge never
-                            // is, so a retry cannot be mistaken for progress.
                             val path = Path().apply {
                                 moveTo(startPoint.x, startPoint.y)
                                 cubicTo(
-                                    gutter, startPoint.y,
+                                    startPoint.x, bandY,
+                                    gutter, bandY,
+                                    gutter, bandY,
+                                )
+                                cubicTo(
+                                    gutter, (bandY + endPoint.y) / 2f,
                                     gutter, endPoint.y,
                                     endPoint.x, endPoint.y,
                                 )
