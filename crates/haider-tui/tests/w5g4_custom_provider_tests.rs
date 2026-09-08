@@ -298,8 +298,15 @@ fn a_failed_configure_reopens_the_fields_with_the_reason() {
     assert_eq!(card.origin, "http://127.0.0.1:8000/v1", "fields kept");
 }
 
-/// The two accounts-screen cards are mutually exclusive — neither can
-/// open over the other (each would fight for the same key routing).
+/// The two accounts-screen cards are mutually exclusive — never two at once,
+/// because each would fight for the same key routing.
+///
+/// 971 F1(b) changed HOW: a second choice from the `[+ …]` grid REPLACES the
+/// pending form instead of being silently refused (the owner's screenshot had
+/// a pending `deepseek · API key` form and an `add custom server` form stacked
+/// in one viewport, and the refusal made the grid feel dead). A form already
+/// holding typed secret bytes asks first — `pending_replace_asks_before_a_typed_key_is_dropped`
+/// in `w971_tui_fixes_tests` owns that half.
 #[test]
 fn the_cards_are_mutually_exclusive() {
     let mut model = accounts_model();
@@ -308,7 +315,11 @@ fn the_cards_are_mutually_exclusive() {
     model.handle_hit(Hit::AccountAdd(
         haider_tui::app::AccountAddKind::OpenAiOAuth,
     ));
-    assert!(model.oauth_add.is_none(), "oauth card refused over custom");
+    assert!(
+        model.oauth_add.is_some(),
+        "the oauth card REPLACES the untouched custom card"
+    );
+    assert!(model.custom_add.is_none(), "never two cards at once");
 
     let mut model = accounts_model();
     model.handle_hit(Hit::AccountAdd(
@@ -316,7 +327,11 @@ fn the_cards_are_mutually_exclusive() {
     ));
     assert!(model.oauth_add.is_some());
     open_card(&mut model);
-    assert!(model.custom_add.is_none(), "custom card refused over oauth");
+    assert!(
+        model.custom_add.is_some(),
+        "the custom card REPLACES the oauth card"
+    );
+    assert!(model.oauth_add.is_none(), "never two cards at once");
 }
 
 /// MUTATION CHECK (W5g-4): offer the card without the daemon feature gate

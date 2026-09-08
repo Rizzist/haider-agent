@@ -368,6 +368,23 @@ pub struct AccountsState {
     pub adoption_candidate: Option<haider_rpc::DeviceCredentialCandidateWire>,
     /// Notice identity already shown on this TUI session.
     pub adoption_noticed: HashSet<String>,
+    /// 971 F1(a) — the scroll offset, in lines, over the account rows, the
+    /// enrolled sources and the pending add-form. RENDER is the single
+    /// scroll authority (the `/providers` law, F2b): the frame writes the
+    /// true max and reconciles this offset against its OWN line layout, so
+    /// a resize or a card opening can never bank invisible debt.
+    pub scroll: std::cell::Cell<u16>,
+    /// The frame-written maximum scroll (lines beyond the viewport).
+    pub scroll_max: std::cell::Cell<u16>,
+    /// Armed by a row-cursor move: the next frame scrolls the cursor's row
+    /// into view, then clears the latch. An OPEN add-form outranks it —
+    /// a total-modal card the user cannot see is the W5g-5 trap.
+    pub follow_cursor: std::cell::Cell<bool>,
+    /// 971 F1(b) — the add the user chose while a pending form still held
+    /// TYPED SECRET BYTES. One line asks before the discard; ⏎ replaces the
+    /// form with this add, esc keeps what is there. `None` whenever nothing
+    /// is awaiting that answer (an untouched form is replaced silently).
+    pub pending_replace: Option<AccountAddKind>,
 }
 
 /// Round 4 — a plan proposal's identity for scroll-reset purposes: menu id
@@ -5468,6 +5485,16 @@ pub struct AppModel {
     /// frame) has replaced is unrepresentable — the geometry twin of the
     /// text-revision guard.
     pub geometry_epoch: std::cell::Cell<u64>,
+    /// 971 F2 — the LAST frame's shared bottom-band geometry: the composer
+    /// rows a surface drew (`None` when the surface draws no composer) and
+    /// the status line under them. Written by `render` under the same
+    /// `scroll_max` discipline as `geometry_epoch` (frame feedback through
+    /// a shared borrow, never reducer state); the layout tests read the
+    /// rectangles the frame ACTUALLY produced instead of re-deriving them.
+    pub composer_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
+    /// The status line's rectangle from the last frame, or `None` when the
+    /// sacred-input ladder shed the row entirely.
+    pub status_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// Monotonic login ATTEMPT mint (TUI6.3 fix 1; TUI6.5 re-scope) —
     /// each card open AND each submit takes the next value (the identity
     /// is per stage ISSUANCE, not per card); never reused, so a retired
@@ -5776,6 +5803,8 @@ impl Default for AppModel {
             transcript_view: std::cell::Cell::new(ratatui::layout::Rect::default()),
             status_width: std::cell::Cell::new(0),
             geometry_epoch: std::cell::Cell::new(0),
+            composer_rect: std::cell::Cell::new(None),
+            status_rect: std::cell::Cell::new(None),
             login_attempt_seq: 0,
             sticky_suppressed: std::cell::Cell::new(false),
             hovered: None,
@@ -6895,6 +6924,15 @@ impl AppModel {
                     && self.screen != Screen::Loom
                 {
                     self.request_clipboard_paste();
+                    return;
+                }
+                // 971 F1(b): the one-line "replace the pending form?"
+                // confirm OUTRANKS every accounts-card modality below —
+                // it answers a gesture the user just made on that card's
+                // own surface, so the card must not read ⏎ as a commit of
+                // the secret it is still holding.
+                if self.screen == Screen::Accounts && self.accounts.pending_replace.is_some() {
+                    self.accounts_replace_key(key.code);
                     return;
                 }
                 // The masked login card OWNS the keyboard while it is open
@@ -10694,6 +10732,11 @@ impl AppModel {
         // a reveal never survives into a later visit, whichever way the
         // last one ended (esc, ⌃C, a screen switch).
         self.accounts.revealed = false;
+        // 971 F1(a): a visit opens at the TOP. A scroll offset banked on a
+        // previous roster would land the reader mid-list on a screen whose
+        // rows the daemon is about to replace.
+        self.accounts.scroll.set(0);
+        self.accounts.pending_replace = None;
         self.switch_surface(Screen::Accounts);
         self.requests.push(AppRequest::AccountsRefresh);
         // Local-login detection rides screen entry. The report is
@@ -10710,6 +10753,7 @@ impl AppModel {
     /// RESTORES the mask (P1) — a reveal is per-visit.
     fn exit_accounts(&mut self) {
         self.accounts.revealed = false;
+        self.accounts.pending_replace = None;
         let target = if self.active_session.is_some()
             || !self.projection.entries().is_empty()
             || self.session_name.is_some()
@@ -11870,6 +11914,213 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// Open the add-form for one `[+ …]` choice — the ONE dispatch shared
+    /// by the provider grid on `/accounts` and `/providers`, the `/providers`
+    /// preset keys, and the 971 F1(b) replace confirm. Every arm is gated on
+    /// what the connected daemon actually serves (report §4.1): a method the
+    /// daemon cannot honour states the reason instead of opening a card that
+    /// would bounce obscurely.
+    fn open_account_add(&mut self, kind: AccountAddKind) {
+        match kind {
+            // API-key adds ride the existing masked LoginCard flow
+            // (TUI6 total modality; the alias field prefills from
+            // the provider).
+            AccountAddKind::OpenAiApi => self.open_login_card("openai", None),
+            AccountAddKind::AnthropicApi => self.open_login_card("anthropic", None),
+            // B6b: the Gemini adapter (B6a) shipped with NO feature
+            // bit, so provider-listing truth gates the button — a
+            // daemon that does not list the provider would bounce
+            // the eventual account.login_api obscurely.
+            AccountAddKind::GeminiApi => {
+                if self.daemon_lists_provider("gemini") {
+                    self.open_login_card("gemini", None);
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("Gemini accounts"));
+                    self.dirty = true;
+                }
+            }
+            AccountAddKind::DeepSeekApi => {
+                if self.daemon_lists_provider("deepseek") {
+                    self.open_login_card("deepseek", None);
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("DeepSeek accounts"));
+                    self.dirty = true;
+                }
+            }
+            AccountAddKind::HaiderCodeApi => {
+                if self.daemon_lists_provider("haider-code") {
+                    self.open_login_card("haider-code", None);
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("Haider Code accounts"));
+                    self.dirty = true;
+                }
+            }
+            AccountAddKind::XaiApi => {
+                if self.daemon_lists_provider("xai") {
+                    self.open_login_card("xai", None);
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("xAI accounts"));
+                    self.dirty = true;
+                }
+            }
+            // OAuth adds run the REAL loopback flow (W5e-1): the
+            // card drives account.oauth_start/status + account.add
+            // live, and the sim's simulated authorize in demo.
+            AccountAddKind::OpenAiOAuth | AccountAddKind::AnthropicOAuth => {
+                // Feature-gated (report §4.1): never offer a method
+                // the connected daemon cannot serve.
+                if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1) {
+                    self.open_oauth_add(kind);
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("OAuth sign-in"));
+                    self.dirty = true;
+                }
+            }
+            // B6b: device flows ride their own feature bit (shipped
+            // beside kimi-oauth, then shared by grok-oauth), with
+            // the same §4.1 gate as the PKCE pair above.
+            AccountAddKind::KimiOAuth => {
+                if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
+                    self.open_oauth_add(kind);
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("Kimi OAuth sign-in"));
+                    self.dirty = true;
+                }
+            }
+            AccountAddKind::GrokOAuth => {
+                if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
+                    self.open_oauth_add(kind);
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("Grok OAuth sign-in"));
+                    self.dirty = true;
+                }
+            }
+            // 970: the ACP adapter ships with NO feature bit (the
+            // B6a/Gemini precedent), so `provider.list` truth is its
+            // capability signal — a daemon that does not list the
+            // class would bounce the eventual account obscurely.
+            AccountAddKind::GoogleAntigravity => {
+                if self.daemon_lists_provider(GOOGLE_ANTIGRAVITY_PROVIDER) {
+                    self.open_antigravity_add();
+                } else {
+                    self.accounts.message =
+                        Some(self.stale_daemon_note("Google Antigravity accounts"));
+                    self.dirty = true;
+                }
+            }
+            // The custom card is the provider.configure front door
+            // (W5g-4): demo shows the sim's fabrication card, live
+            // shows the editable name/origin fields.
+            AccountAddKind::Custom => {
+                if self.mode.fabricates_locally()
+                    || self.daemon_serves(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1)
+                {
+                    self.open_custom_add();
+                } else {
+                    self.accounts.message = Some(self.stale_daemon_note("custom providers"));
+                    self.dirty = true;
+                }
+            }
+            AccountAddKind::HuggingFace => {
+                self.open_huggingface_preset();
+            }
+            AccountAddKind::OpencodeZen => {
+                self.open_opencode_zen_preset();
+            }
+            AccountAddKind::OpencodeGo => {
+                self.open_opencode_go_preset();
+            }
+            AccountAddKind::Ollama => {
+                self.open_ollama_preset();
+            }
+            AccountAddKind::LmStudio => {
+                self.open_lmstudio_preset();
+            }
+            AccountAddKind::AzureOpenAi => {
+                self.open_azure_card();
+            }
+            AccountAddKind::Bedrock => {
+                self.open_bedrock_card();
+            }
+            AccountAddKind::Vertex => {
+                self.open_vertex_card();
+            }
+        }
+    }
+
+    /// 971 F1(b) — at most ONE pending add-form on `/accounts`. Choosing a
+    /// provider while a form is pending REPLACES that form: an untouched one
+    /// is discarded silently; one that already holds TYPED SECRET BYTES asks
+    /// first, in a single line (⏎ replaces · esc keeps it), because those
+    /// bytes are unrecoverable once dropped. Returns whether the caller may
+    /// open its form now.
+    fn accounts_replace_pending_add(&mut self, kind: AccountAddKind) -> bool {
+        if self.accounts.pending_replace == Some(kind) {
+            // The answered confirm: this discard is authorised.
+            self.accounts.pending_replace = None;
+        } else if let Some(pending) = self.pending_account_secret() {
+            self.accounts.pending_replace = Some(kind);
+            self.accounts.message = Some(format!(
+                "discard the pending {pending} entry? enter replaces it · esc keeps it"
+            ));
+            self.dirty = true;
+            return false;
+        }
+        self.close_pending_account_form();
+        true
+    }
+
+    /// The provider whose pending add-form already holds typed secret bytes,
+    /// if any. Only the MASKED fields count: an untouched alias or origin
+    /// prefill is chrome the user never authored.
+    fn pending_account_secret(&self) -> Option<String> {
+        if let Some(card) = self.login.as_ref()
+            && card.masked_len() > 0
+        {
+            return Some(card.provider.clone());
+        }
+        if let Some(card) = self.custom_add.as_ref()
+            && card.masked_key_len() > 0
+        {
+            return Some(card.name.clone());
+        }
+        None
+    }
+
+    /// Close whatever add-form is pending on `/accounts`, retiring its
+    /// attempt through the owning cancel path so no late reply lands on a
+    /// dead card. Silent by construction: the replacing add states its own
+    /// outcome, and a cancel note about a form the user just replaced would
+    /// only contradict it.
+    fn close_pending_account_form(&mut self) {
+        self.antigravity_consent = None;
+        if self.oauth_add.is_some() {
+            self.cancel_oauth_add();
+        }
+        if self.custom_add.is_some() {
+            self.cancel_custom_add();
+        }
+        self.close_login_card();
+        self.accounts.message = None;
+    }
+
+    /// The keys of the 971 F1(b) replace confirm. It outranks every accounts
+    /// card modality — it is the answer to a gesture made ON that card's
+    /// surface, so the card must not eat ⏎ as a commit of the key it holds.
+    fn accounts_replace_key(&mut self, code: KeyCode) {
+        let Some(kind) = self.accounts.pending_replace else {
+            return;
+        };
+        match code {
+            KeyCode::Enter => self.handle_hit(Hit::AccountAdd(kind)),
+            KeyCode::Esc => {
+                self.accounts.pending_replace = None;
+                self.accounts.message = None;
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
     /// Opens the `+ Add custom server` card. The name prefills
     /// with the smallest free `custom[-N]` against the provider registry;
     /// the origin with the sim's demo URL (a real vLLM default).
@@ -12797,6 +13048,7 @@ impl AppModel {
             }
             KeyCode::Up => {
                 self.accounts.cursor = self.accounts.cursor.saturating_sub(1);
+                self.accounts.follow_cursor.set(true);
                 self.dirty = true;
             }
             KeyCode::Down => {
@@ -12804,6 +13056,33 @@ impl AppModel {
                 if total > 0 {
                     self.accounts.cursor = (self.accounts.cursor + 1).min(total - 1);
                 }
+                self.accounts.follow_cursor.set(true);
+                self.dirty = true;
+            }
+            // 971 F1(a): the screen SCROLLS — a long roster, its enrolled
+            // sources and a pending add-form no longer push each other off
+            // the frame. The `/providers` discipline (F2b): the reducer only
+            // nudges the offset, the frame reconciles it against the true
+            // max it just measured.
+            KeyCode::PageUp => {
+                self.accounts
+                    .scroll
+                    .set(self.accounts.scroll.get().saturating_sub(8));
+                self.dirty = true;
+            }
+            KeyCode::PageDown => {
+                let max = self.accounts.scroll_max.get();
+                self.accounts
+                    .scroll
+                    .set(self.accounts.scroll.get().saturating_add(8).min(max));
+                self.dirty = true;
+            }
+            KeyCode::Home => {
+                self.accounts.scroll.set(0);
+                self.dirty = true;
+            }
+            KeyCode::End => {
+                self.accounts.scroll.set(self.accounts.scroll_max.get());
                 self.dirty = true;
             }
             KeyCode::Char('r') => {
@@ -17459,8 +17738,15 @@ impl AppModel {
         // login-parked draft (ring destroyed), the screen flipped under
         // the open card, and the card's Esc-restore later clobbered the
         // session draft. The card has no hit targets of its own, so the
-        // gate is total.
-        if self.login.is_some() {
+        // gate is total — with ONE exception since 971 F1(b): the `[+ …]`
+        // provider grid on `/accounts`, whose entire effect is "replace this
+        // card". That is precisely the gesture the owner is refused today (a
+        // pending key card silently swallows the click on another provider),
+        // and it runs the card's OWN close path — the parked draft is
+        // restored, the attempt retired, and the screen never flips.
+        if self.login.is_some()
+            && !(self.screen == Screen::Accounts && matches!(hit, Hit::AccountAdd(_)))
+        {
             return;
         }
         if self.screen == Screen::Loom
@@ -17544,135 +17830,11 @@ impl AppModel {
                     self.enter_accounts();
                 }
                 self.accounts.message = None;
-                match kind {
-                    // API-key adds ride the existing masked LoginCard flow
-                    // (TUI6 total modality; the alias field prefills from
-                    // the provider).
-                    AccountAddKind::OpenAiApi => self.open_login_card("openai", None),
-                    AccountAddKind::AnthropicApi => self.open_login_card("anthropic", None),
-                    // B6b: the Gemini adapter (B6a) shipped with NO feature
-                    // bit, so provider-listing truth gates the button — a
-                    // daemon that does not list the provider would bounce
-                    // the eventual account.login_api obscurely.
-                    AccountAddKind::GeminiApi => {
-                        if self.daemon_lists_provider("gemini") {
-                            self.open_login_card("gemini", None);
-                        } else {
-                            self.accounts.message = Some(self.stale_daemon_note("Gemini accounts"));
-                            self.dirty = true;
-                        }
-                    }
-                    AccountAddKind::DeepSeekApi => {
-                        if self.daemon_lists_provider("deepseek") {
-                            self.open_login_card("deepseek", None);
-                        } else {
-                            self.accounts.message =
-                                Some(self.stale_daemon_note("DeepSeek accounts"));
-                            self.dirty = true;
-                        }
-                    }
-                    AccountAddKind::HaiderCodeApi => {
-                        if self.daemon_lists_provider("haider-code") {
-                            self.open_login_card("haider-code", None);
-                        } else {
-                            self.accounts.message =
-                                Some(self.stale_daemon_note("Haider Code accounts"));
-                            self.dirty = true;
-                        }
-                    }
-                    AccountAddKind::XaiApi => {
-                        if self.daemon_lists_provider("xai") {
-                            self.open_login_card("xai", None);
-                        } else {
-                            self.accounts.message = Some(self.stale_daemon_note("xAI accounts"));
-                            self.dirty = true;
-                        }
-                    }
-                    // OAuth adds run the REAL loopback flow (W5e-1): the
-                    // card drives account.oauth_start/status + account.add
-                    // live, and the sim's simulated authorize in demo.
-                    AccountAddKind::OpenAiOAuth | AccountAddKind::AnthropicOAuth => {
-                        // Feature-gated (report §4.1): never offer a method
-                        // the connected daemon cannot serve.
-                        if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1) {
-                            self.open_oauth_add(kind);
-                        } else {
-                            self.accounts.message = Some(self.stale_daemon_note("OAuth sign-in"));
-                            self.dirty = true;
-                        }
-                    }
-                    // B6b: device flows ride their own feature bit (shipped
-                    // beside kimi-oauth, then shared by grok-oauth), with
-                    // the same §4.1 gate as the PKCE pair above.
-                    AccountAddKind::KimiOAuth => {
-                        if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
-                            self.open_oauth_add(kind);
-                        } else {
-                            self.accounts.message =
-                                Some(self.stale_daemon_note("Kimi OAuth sign-in"));
-                            self.dirty = true;
-                        }
-                    }
-                    AccountAddKind::GrokOAuth => {
-                        if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
-                            self.open_oauth_add(kind);
-                        } else {
-                            self.accounts.message =
-                                Some(self.stale_daemon_note("Grok OAuth sign-in"));
-                            self.dirty = true;
-                        }
-                    }
-                    // 970: the ACP adapter ships with NO feature bit (the
-                    // B6a/Gemini precedent), so `provider.list` truth is its
-                    // capability signal — a daemon that does not list the
-                    // class would bounce the eventual account obscurely.
-                    AccountAddKind::GoogleAntigravity => {
-                        if self.daemon_lists_provider(GOOGLE_ANTIGRAVITY_PROVIDER) {
-                            self.open_antigravity_add();
-                        } else {
-                            self.accounts.message =
-                                Some(self.stale_daemon_note("Google Antigravity accounts"));
-                            self.dirty = true;
-                        }
-                    }
-                    // The custom card is the provider.configure front door
-                    // (W5g-4): demo shows the sim's fabrication card, live
-                    // shows the editable name/origin fields.
-                    AccountAddKind::Custom => {
-                        if self.mode.fabricates_locally()
-                            || self.daemon_serves(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1)
-                        {
-                            self.open_custom_add();
-                        } else {
-                            self.accounts.message =
-                                Some(self.stale_daemon_note("custom providers"));
-                            self.dirty = true;
-                        }
-                    }
-                    AccountAddKind::HuggingFace => {
-                        self.open_huggingface_preset();
-                    }
-                    AccountAddKind::OpencodeZen => {
-                        self.open_opencode_zen_preset();
-                    }
-                    AccountAddKind::OpencodeGo => {
-                        self.open_opencode_go_preset();
-                    }
-                    AccountAddKind::Ollama => {
-                        self.open_ollama_preset();
-                    }
-                    AccountAddKind::LmStudio => {
-                        self.open_lmstudio_preset();
-                    }
-                    AccountAddKind::AzureOpenAi => {
-                        self.open_azure_card();
-                    }
-                    AccountAddKind::Bedrock => {
-                        self.open_bedrock_card();
-                    }
-                    AccountAddKind::Vertex => {
-                        self.open_vertex_card();
-                    }
+                // 971 F1(b): ONE pending add-form at a time — the choice
+                // REPLACES whatever is open, and only a form already holding
+                // typed secret bytes gets a confirm before the discard.
+                if self.accounts_replace_pending_add(kind) {
+                    self.open_account_add(kind);
                 }
             }
             Hit::ProviderModel { provider, model } if self.screen == Screen::Providers => {
@@ -18082,6 +18244,21 @@ impl AppModel {
             } else {
                 (self.session_browser_sel + 3).min(last)
             };
+            self.dirty = true;
+            return;
+        }
+        // 971 F1(a): the accounts screen rides the same wheel discipline —
+        // the gesture the owner reached for first when the roster and a
+        // pending form outgrew the frame.
+        if self.screen == Screen::Accounts {
+            let max = self.accounts.scroll_max.get();
+            let current = self.accounts.scroll.get().min(max);
+            let next = if up {
+                current.saturating_sub(3)
+            } else {
+                current.saturating_add(3).min(max)
+            };
+            self.accounts.scroll.set(next);
             self.dirty = true;
             return;
         }

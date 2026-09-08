@@ -68,7 +68,9 @@ fn add_row_is_bottom_anchored_even_when_empty() {
         .expect("add row rendered");
     let hint_row = rows
         .iter()
-        .position(|row| row.contains("click an account to make it active"))
+        // 971 F1(c): the hint's key map degrades by width, so match the
+        // stem both cuts share.
+        .position(|row| row.contains("click an account"))
         .expect("hints rendered");
     // Bottom block: buttons(8, since U1 added the OpenCode Zen/Go row,
     // G4a the Ollama/LM Studio row, G4b the Azure/Bedrock/Vertex row, 940

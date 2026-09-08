@@ -95,7 +95,7 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
 47|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-48|click an account to make it active · + adds via OAuth / API · x removes · r reveals · esc back                                                                  |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×94; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×66
+48|click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×116; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×44
 49| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                                                                                                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118

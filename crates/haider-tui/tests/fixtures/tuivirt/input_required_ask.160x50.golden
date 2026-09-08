@@ -81,21 +81,21 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
 40|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-41|───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
+41|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+42|───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×149; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2
-42|? Which migration strategy should the agent take?                                                                                                               |
+43|? Which migration strategy should the agent take?                                                                                                               |
    ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×49; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×111
-43|The event store has two candidate schemas.                                                                                                                      |
+44|The event store has two candidate schemas.                                                                                                                      |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-44|Pick one — the agent is blocked until you answer.                                                                                                               |
+45|Pick one — the agent is blocked until you answer.                                                                                                               |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-45|type your answer below · ⏎ answers · esc interrupts                                                                                                             |
+46|type your answer below · ⏎ answers · esc interrupts                                                                                                             |
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×51; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×109
-46|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                                                                         [ ◉ talk ]  |
+47|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                                                                         [ ◉ talk ]  |
    ~ Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/BOLD×2; Rgb(15, 15, 15)/Rgb(217, 181, 68)/NONE×1; Rgb(139, 148, 158)/Rgb(26, 26, 26)/NONE×70; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×73; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/NONE×6; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2
-47|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+48|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
-48|                                                                                                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
 49| [ ? INPUT_REQUIRED ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                                                    |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×20; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106

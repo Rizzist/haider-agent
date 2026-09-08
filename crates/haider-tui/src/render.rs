@@ -811,6 +811,11 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
+    // 971 F2: the frame publishes the bottom geometry it actually produced
+    // (the `scroll_max` discipline). `render_composer` stamps the composer
+    // rect; a surface that draws none leaves it cleared.
+    model.composer_rect.set(None);
+    model.status_rect.set((status_height > 0).then_some(status));
     // F2a: the full-screen /model picker COVERS the body while open —
     // it owns the keys, so it owns the pixels and the hit map too.
     if model.ssh_terminal.is_some() {
@@ -1404,24 +1409,17 @@ fn render_launcher(
     // row becomes the rule, net zero rows; it sheds first under pressure
     // exactly as the gap did.
     let band_rule_h = gap;
-    let [
-        header_area,
-        header_rule,
-        content_area,
-        palette_area,
-        rule_area,
-        composer_area,
-        band_rule_area,
-    ] = Layout::vertical([
+    // 971 F2: the shared bottom-band authority places the launcher's band —
+    // the reference placement every other surface now matches.
+    let band = bottom_band(area, rule_h, composer_rows, band_rule_h, 0);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.composer, band.close);
+    let [header_area, header_rule, content_area, palette_area] = Layout::vertical([
         Constraint::Length(header_h),
         Constraint::Length(header_rule_h),
         Constraint::Min(content_min),
         Constraint::Length(palette_height),
-        Constraint::Length(rule_h),
-        Constraint::Length(composer_rows),
-        Constraint::Length(band_rule_h),
     ])
-    .areas(area);
+    .areas(band.content);
 
     let sanctum = SanctumLine::new(model.sanctum_tier);
     let identity = &model.identity;
@@ -2484,11 +2482,19 @@ fn render_accounts(
         })
         .map(derived_antigravity_source)
         .collect();
+    // 971 F1(a): ONE scrolling body — the account rows, their enrolled
+    // sources and the (single) pending add-form. The provider grid and the
+    // hint line are the pinned chrome below it, so a tall roster or an open
+    // form can no longer push the way OUT of the screen off the frame.
     let mut lines: Vec<Line<'_>> = Vec::new();
-    // (line index, hit) pairs resolved to rects after layout.
+    // (body line index, hit) pairs resolved to rects after layout.
     let mut line_hits: Vec<(usize, Hit)> = Vec::new();
-    // Add-row buttons: (footer line, column offset, width, hit).
-    let mut add_button_rects: Vec<(usize, u16, u16, Hit)> = Vec::new();
+    // The pending add-form's own buttons: (card line, column, width, hit).
+    let mut card_rects: Vec<(usize, u16, u16, Hit)> = Vec::new();
+    // The pinned provider grid: (chrome line, column, width, hit).
+    let mut chrome_rects: Vec<(usize, u16, u16, Hit)> = Vec::new();
+    // The body line the row cursor sits on, for the follow latch.
+    let mut cursor_line: Option<usize> = None;
 
     lines.push(Line::from(vec![
         Span::styled(
@@ -2502,7 +2508,16 @@ fn render_accounts(
             theme.dim_style(),
         ),
     ]));
-    if let Some(message) = &model.accounts.message {
+    // The action note rides under the head — EXCEPT while the 971 F1(b)
+    // replace confirm is up: that one line belongs beside the form it is
+    // asking about, down in the card block, not at the top of a body the
+    // reader has scrolled away from.
+    if let Some(message) = model
+        .accounts
+        .message
+        .as_ref()
+        .filter(|_| model.accounts.pending_replace.is_none())
+    {
         lines.push(Line::styled(message.clone(), theme.gold_style()));
     }
     // 970 owner decision: `google-antigravity` ships ENABLED BY DEFAULT with
@@ -2681,6 +2696,9 @@ fn render_accounts(
             if model.accounts.cursor == index || model.hovered.as_ref() == Some(&row_hit) {
                 line = hover_band(line, true, area.width, theme);
             }
+            if model.accounts.cursor == index {
+                cursor_line = Some(lines.len());
+            }
             line_hits.push((lines.len(), row_hit));
             lines.push(line);
             for source in model
@@ -2727,11 +2745,21 @@ fn render_accounts(
         }
     }
 
-    // The ONE global add row (sim tui.js:3621-3628) + hints — anchored to
-    // the BOTTOM of the screen (owner ask 2026-07-30: with few or zero
-    // accounts the flowed position sat awkwardly high). `footer_lines`
-    // renders at area.bottom − its height; the list keeps the top.
-    let mut footer_lines: Vec<Line<'_>> = Vec::new();
+    // The pending add-form, at the FOOT of the scrolling body (971 F1: at
+    // most one is ever open, and the frame keeps it in view — a total-modal
+    // card the reader cannot see is the W5g-5 trap). The provider grid and
+    // the hint line follow as pinned chrome.
+    let mut card_lines: Vec<Line<'_>> = Vec::new();
+    // 971 F1(b): the replace confirm leads the block — the question and the
+    // form it would discard are read together.
+    if let Some(message) = model
+        .accounts
+        .message
+        .as_ref()
+        .filter(|_| model.accounts.pending_replace.is_some())
+    {
+        card_lines.push(Line::styled(format!("  {message}"), theme.warn_style()));
+    }
     // The masked key card, when open on THIS screen — the `+ … (API)`
     // buttons and the custom card's chain both land it here, and the
     // composer band that usually hosts it does not exist on /accounts.
@@ -2739,14 +2767,14 @@ fn render_accounts(
     // W5g-5 live probe found it: keys vanished into a card no frame
     // drew).
     if let Some(card) = model.login.as_ref() {
-        footer_lines.extend(login_lines(card, theme, area.width));
-        footer_lines.push(Line::raw(""));
+        card_lines.extend(login_lines(card, theme, area.width));
+        card_lines.push(Line::raw(""));
     }
     // 970 — the Google Antigravity disclosure sits where every other accounts
     // card does, and owns the keyboard the same way (`[1]` / `[2]`).
     if model.antigravity_consent.is_some() {
-        footer_lines.extend(antigravity_consent_lines(theme, area.width));
-        footer_lines.push(Line::raw(""));
+        card_lines.extend(antigravity_consent_lines(theme, area.width));
+        card_lines.push(Line::raw(""));
     }
     // The OAuth add card (W5e-1, sim authFlow MenuBox tui.js:3629-3682) —
     // rendered with the bottom chrome, above the add row.
@@ -2763,7 +2791,7 @@ fn render_accounts(
             _ if agent_owned => "OAuth (Google's own agent)",
             _ => "OAuth (loopback PKCE)",
         };
-        footer_lines.push(Line::from(vec![
+        card_lines.push(Line::from(vec![
             Span::styled("◉ ", theme.gold_style()),
             Span::styled(
                 format!("authorize {} — {flow}", card.title),
@@ -2772,7 +2800,7 @@ fn render_accounts(
         ]));
         match &card.phase {
             crate::app::OAuthAddPhase::Starting => {
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     if agent_owned {
                         // The install was consented on the disclosure card;
                         // this is the honest report of what that consent set
@@ -2785,7 +2813,7 @@ fn render_accounts(
                 ));
             }
             crate::app::OAuthAddPhase::WaitingBrowser { origin, .. } => {
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     if agent_owned {
                         // SECURITY: the agent's sign-in URL, its query and the
                         // authorization code never reach a rendered line — only
@@ -2810,11 +2838,11 @@ fn render_accounts(
                     },
                     theme.dim_style(),
                 ));
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     format!("  alias: {} · usage billed to the subscription", card.alias),
                     theme.faint_style(),
                 ));
-                footer_lines.push(Line::from(vec![Span::styled(
+                card_lines.push(Line::from(vec![Span::styled(
                     "  [1] open the link again · [2] cancel",
                     theme.gold_style(),
                 )]));
@@ -2823,7 +2851,7 @@ fn render_accounts(
                 // Device-honest copy (B2b-m3 polish c): a device grant has
                 // no loopback listening — the user enters the code at the
                 // verification URL and the daemon polls until approval.
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     format!(
                         "  enter the code at {} — the daemon polls until you approve",
                         if url.is_empty() {
@@ -2834,110 +2862,250 @@ fn render_accounts(
                     ),
                     theme.dim_style(),
                 ));
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     format!("  alias: {} · usage billed to the subscription", card.alias),
                     theme.faint_style(),
                 ));
-                footer_lines.push(Line::from(vec![Span::styled(
+                card_lines.push(Line::from(vec![Span::styled(
                     "  [1] open the link again · [2] cancel",
                     theme.gold_style(),
                 )]));
             }
             crate::app::OAuthAddPhase::Exchanging => {
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     "  approved — exchanging the code…",
                     theme.pulse_ink(theme.gold, model.anim_phase),
                 ));
             }
             crate::app::OAuthAddPhase::Adding => {
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     "  committing the account…",
                     theme.pulse_ink(theme.gold, model.anim_phase),
                 ));
             }
             crate::app::OAuthAddPhase::Failed { message } => {
-                footer_lines.push(Line::styled(format!("  ✗ {message}"), theme.err_style()));
+                card_lines.push(Line::styled(format!("  ✗ {message}"), theme.err_style()));
                 // §5.3 collision recovery: the alias is editable in place
                 // and ⏎ retries the flow under it (digits are alias
                 // characters, so no `[1]`/`[2]` key map here).
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     format!("  alias ❯ {}▏", card.alias),
                     theme.text_style(),
                 ));
-                footer_lines.push(Line::styled(
+                card_lines.push(Line::styled(
                     "  ⏎ try again with this alias · esc close",
                     theme.gold_style(),
                 ));
             }
         }
-        footer_lines.push(Line::raw(""));
+        card_lines.push(Line::raw(""));
     }
     // The `+ Add custom server` card (W5g-4; sim MenuBox
     // tui.js:3629-3682). Demo = the sim's verbatim fabrication card; live
     // = the editable name/origin fields (the provider.configure front
     // door).
-    push_custom_card_lines(
-        model,
-        theme,
-        area.width,
-        &mut footer_lines,
-        &mut add_button_rects,
-    );
+    push_custom_card_lines(model, theme, area.width, &mut card_lines, &mut card_rects);
+    // ---- The bottom chrome, bottom-up: the hint line, the provider grid,
+    // and the pending form above them ----
+    //
     // 970: the first-login disclosure is the safeguard that REPLACES a policy
     // gate, so it has to stay readable at 80 columns. Its total modality
-    // already makes the add row dead while it is open, so the row yields to
+    // already makes the add row dead while it is open, so the grid yields to
     // it rather than pushing the warning off a small terminal.
+    let mut grid_lines: Vec<Line<'_>> = Vec::new();
+    let mut grid_rects: Vec<(usize, u16, u16, Hit)> = Vec::new();
     if model.antigravity_consent.is_none() {
-        push_account_add_buttons(model, theme, &mut footer_lines, &mut add_button_rects);
+        push_account_add_buttons(model, theme, &mut grid_lines, &mut grid_rects);
     }
-    footer_lines.push(Line::raw(""));
-    footer_lines.push(Line::styled(
-        "click an account to make it active · + adds via OAuth / API · x removes · r reveals · esc back",
-        theme.faint_style(),
-    ));
-
-    let footer_height = footer_lines.len() as u16;
-    let footer_top = area.y + area.height.saturating_sub(footer_height);
-    // The list gets everything above the footer (truncated if it would
-    // collide; the footer is the fixed chrome).
-    let list_height = footer_top.saturating_sub(area.y);
-    lines.truncate(list_height as usize);
-    frame.render_widget(Paragraph::new(lines.clone()), area);
-    let footer_area = Rect {
-        x: area.x,
-        y: footer_top,
-        width: area.width,
-        height: footer_height.min(area.height),
+    // 971 F1(c): the hint line — the way OUT of the screen — is pinned to the
+    // last body row ALWAYS. Its key map degrades by WIDTH so `esc back`
+    // survives at 80 columns (the `/providers` hint-splitting precedent); it
+    // used to be one 94-cell line a narrow frame simply cut off.
+    let hint_lines: Vec<Line<'_>> = vec![
+        Line::raw(""),
+        Line::styled(
+            if area.width >= 118 {
+                "click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back"
+            } else {
+                "click an account · + adds · x removes · r reveals · PgUp/PgDn scroll · esc back"
+            },
+            theme.faint_style(),
+        ),
+    ];
+    // The pin ladder. Everything is pinned while the roster still gets a few
+    // rows; under pressure the pending FORM unpins first (the scroll body
+    // keeps it in view by itself, below), then the grid (reachable by
+    // scrolling, the F2b `/providers` fallback). The hint never unpins.
+    const BODY_MIN: u16 = 3;
+    let room = |pinned: usize| {
+        u16::try_from(pinned).is_ok_and(|height| area.height.saturating_sub(height) >= BODY_MIN)
     };
-    frame.render_widget(Paragraph::new(footer_lines), footer_area);
+    let pin_card = room(card_lines.len() + grid_lines.len() + hint_lines.len());
+    let pin_grid = if pin_card {
+        true
+    } else {
+        room(grid_lines.len() + hint_lines.len())
+    };
 
-    // Resolve hits: full-width rows for accounts (top block coordinates),
-    // column rects for the bottom-anchored buttons (footer coordinates).
-    for (line_index, hit) in line_hits {
-        let y = area.y + line_index as u16;
-        if y >= footer_top {
-            continue; // truncated behind the footer
+    // Column rects that live in BODY coordinates and therefore scroll.
+    let mut body_column_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
+    let mut chrome_lines: Vec<Line<'_>> = Vec::new();
+    let card_start = lines.len();
+    if pin_card {
+        let base = chrome_lines.len();
+        chrome_rects.extend(
+            card_rects
+                .into_iter()
+                .map(|(line, x, width, hit)| (base + line, x, width, hit)),
+        );
+        chrome_lines.extend(card_lines);
+    } else {
+        let base = lines.len();
+        body_column_hits.extend(
+            card_rects
+                .into_iter()
+                .map(|(line, x, width, hit)| (base + line, x, width, hit)),
+        );
+        lines.extend(card_lines);
+    }
+    // Non-empty only while an UNPINNED form is in the body — which is
+    // exactly when the frame has to scroll to keep it in view.
+    let card_end = lines.len();
+    if pin_grid {
+        let base = chrome_lines.len();
+        chrome_rects.extend(
+            grid_rects
+                .into_iter()
+                .map(|(line, x, width, hit)| (base + line, x, width, hit)),
+        );
+        chrome_lines.extend(grid_lines);
+    } else {
+        let base = lines.len();
+        body_column_hits.extend(
+            grid_rects
+                .into_iter()
+                .map(|(line, x, width, hit)| (base + line, x, width, hit)),
+        );
+        lines.extend(grid_lines);
+    }
+    chrome_lines.extend(hint_lines);
+    let chrome_height = u16::try_from(chrome_lines.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let [body_area, chrome_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(chrome_height)]).areas(area);
+
+    // RENDER is the single scroll authority (the `/providers` law, F2b): the
+    // frame writes the true max, reconciles the offset, and resolves the
+    // follow latches against ITS OWN line layout. An OPEN add-form outranks
+    // the row cursor — its field must be on screen for the keystrokes it is
+    // already swallowing to be visible anywhere.
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(body_area.height);
+    model.accounts.scroll_max.set(max_scroll);
+    let mut scroll = model.accounts.scroll.get().min(max_scroll);
+    let follow_cursor = model.accounts.follow_cursor.take();
+    let card_open = card_end > card_start
+        && (model.login.is_some()
+            || model.custom_add.is_some()
+            || model.oauth_add.is_some()
+            || model.antigravity_consent.is_some());
+    let follow = if card_open {
+        // The card's LAST line — its commit/hint row — is what has to land;
+        // a card taller than the body then shows its tail, which is where
+        // the focused field and the key map are.
+        Some(card_end.saturating_sub(1))
+    } else if follow_cursor {
+        cursor_line
+    } else {
+        None
+    };
+    if let Some(line) = follow.and_then(|line| u16::try_from(line).ok()) {
+        if line < scroll {
+            scroll = line;
+        } else if line >= scroll.saturating_add(body_area.height) {
+            scroll = line
+                .saturating_add(1)
+                .saturating_sub(body_area.height)
+                .min(max_scroll);
         }
-        hits.push((
+    }
+    model.accounts.scroll.set(scroll);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
+    // The house scroll indicator: `⋮` gutter marks on the edge rows while
+    // content hides beyond them (menu_block's vocabulary, `/providers`
+    // parity).
+    if scroll > 0 && body_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("⋮", theme.faint_style())),
             Rect {
-                x: area.x,
-                y,
-                width: area.width,
+                x: body_area.x,
+                y: body_area.y,
+                width: 1.min(body_area.width),
                 height: 1,
             },
-            hit,
-        ));
+        );
     }
-    for (footer_line, x, width, hit) in add_button_rects {
-        let y = footer_top + footer_line as u16;
-        if y >= area.y + area.height || x >= area.width {
+    if scroll < max_scroll && body_area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("⋮", theme.faint_style())),
+            Rect {
+                x: body_area.x,
+                y: body_area.y + body_area.height - 1,
+                width: 1.min(body_area.width),
+                height: 1,
+            },
+        );
+    }
+    if chrome_height > 0 {
+        frame.render_widget(Paragraph::new(chrome_lines), chrome_area);
+    }
+
+    // Resolve hits. Body rows scroll, so a row hidden above or below the
+    // viewport emits NOTHING (the seam guard: a hit is a visible region).
+    let visible = |line: usize| -> Option<u16> {
+        let line = u16::try_from(line).ok()?;
+        let offset = line.checked_sub(scroll)?;
+        (offset < body_area.height).then_some(body_area.y + offset)
+    };
+    for (line_index, hit) in line_hits {
+        if let Some(y) = visible(line_index) {
+            hits.push((
+                Rect {
+                    x: body_area.x,
+                    y,
+                    width: body_area.width,
+                    height: 1,
+                },
+                hit,
+            ));
+        }
+    }
+    for (line_index, x, width, hit) in body_column_hits {
+        if let Some(y) = visible(line_index)
+            && x < body_area.width
+        {
+            hits.push((
+                Rect {
+                    x: body_area.x + x,
+                    y,
+                    width: width.min(body_area.width - x),
+                    height: 1,
+                },
+                hit,
+            ));
+        }
+    }
+    for (chrome_line, x, width, hit) in chrome_rects {
+        let y = chrome_area.y + u16::try_from(chrome_line).unwrap_or(u16::MAX);
+        if y >= chrome_area.y + chrome_area.height || x >= chrome_area.width {
             continue;
         }
         hits.push((
             Rect {
-                x: area.x + x,
+                x: chrome_area.x + x,
                 y,
-                width: width.min(area.width - x),
+                width: width.min(chrome_area.width - x),
                 height: 1,
             },
             hit,
@@ -5585,12 +5753,12 @@ fn render_session(
         chrome + input_height + transcript_min,
         input_rule_h,
     );
-    if band_rule_h > 0 {
-        if budget > 0 {
-            budget -= 1;
-        } else {
-            gap = 0;
-        }
+    // 971 F2: the spacer row is no longer PAINTED under the band, but the
+    // ledger above still reserves it in `fixed` — so when the budget is
+    // empty the rule simply inherits that reserved row, and the old
+    // `gap = 0` release has nothing left to do.
+    if band_rule_h > 0 && budget > 0 {
+        budget -= 1;
     }
     if palette_height > budget {
         palette_height = 0;
@@ -5674,6 +5842,24 @@ fn render_session(
     };
     let lead_waiting = breathe(want_lead, &mut budget);
     let lead_todos = breathe(want_todos_lead, &mut budget);
+    // 971 F2 (owner report): the spacer row used to sit UNDER the closing
+    // rule, so the session's band floated one row higher than the main
+    // menu's — the one screen the owner reads most was the odd one out. The
+    // band is placed by the shared authority now, and the row that spacer
+    // held falls to the TRANSCRIPT's `Min` region: the stream's own trailing
+    // blank line is the breathing row above the band (S2 item 5), so a
+    // second one here would only re-cramp the rhythm the other way. The
+    // ledger still counts `gap` exactly as it did, so every shed rung and
+    // panel budget is unchanged.
+    let band = bottom_band(
+        area,
+        input_rule_h,
+        input_height,
+        band_rule_h,
+        subtree_height,
+    );
+    let (rule_area, composer_area, band_rule_area, subtree_area) =
+        (band.rule, band.composer, band.close, band.below);
     let [
         header_area,
         header_rule,
@@ -5689,11 +5875,6 @@ fn render_session(
         throughput_area,
         retry_area,
         screen_control_area,
-        rule_area,
-        composer_area,
-        band_rule_area,
-        subtree_area,
-        _gap,
     ] = Layout::vertical([
         Constraint::Length(header_h),
         Constraint::Length(header_rule_h),
@@ -5709,13 +5890,8 @@ fn render_session(
         Constraint::Length(throughput_height),
         Constraint::Length(retry_height),
         Constraint::Length(screen_control_height),
-        Constraint::Length(input_rule_h),
-        Constraint::Length(input_height),
-        Constraint::Length(band_rule_h),
-        Constraint::Length(subtree_height),
-        Constraint::Length(gap),
     ])
-    .areas(area);
+    .areas(band.content);
 
     // Header (sim SessHead, tui.js:5183): [← main] chip · mark · bold GOLD
     // product · dim version · dir / dim session line with a GOLD head
@@ -8293,21 +8469,29 @@ fn render_loom(
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     // The composer band owns the foot of the tab; the registry gets the rest.
+    //
+    // 971 F2 (owner report): the loom/workflows band used to run to the very
+    // last row of the body, so its composer sat a row LOWER than the main
+    // menu's and the status line crowded it. It goes through the shared band
+    // authority now — opening rule, composer, closing rule — which is what
+    // every other surface has always drawn.
     let composer_rows = composer_height(model, area.width);
-    let band = composer_rows.saturating_add(1);
-    let list_height = area.height.saturating_sub(band);
-    let list_area = Rect::new(area.x, area.y, area.width, list_height);
-    let rule_area = Rect::new(area.x, area.y.saturating_add(list_height), area.width, 1);
-    let composer_area = Rect::new(
-        area.x,
-        area.y.saturating_add(list_height).saturating_add(1),
-        area.width,
-        composer_rows,
-    );
+    let band = bottom_band(area, 1, composer_rows, 1, 0);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.composer, band.close);
     // Painted BEFORE the registry so every early-return path below still
     // leaves the operator a live composer to type into.
     render_composer(model, theme, frame, rule_area, composer_area, hits);
-    let area = list_area;
+    if band_rule_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(band_rule_area.width as usize),
+                theme.frame_style(),
+            ))
+            .style(theme.text_style()),
+            band_rule_area,
+        );
+    }
+    let area = band.content;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let on_types = model.loom_pane == LoomPane::Types;
     let catalog_available =
@@ -10128,26 +10312,25 @@ fn render_subagent(
     // that used to ride under it (session parity): the band rests at ONE
     // text row between its rules; the chip transcript's own trailing
     // blank line carries the breathing room instead.
-    let [
-        header_area,
-        header_rule,
-        transcript_area,
-        rule_area,
-        composer_area,
-        band_rule_area,
-        subtree_area,
-        _gap,
-    ] = Layout::vertical([
+    // 971 F2: session parity through the shared band authority, and the same
+    // treatment of the spacer row — it leaves the band's foot and falls to
+    // the transcript's `Min` region, whose own trailing blank line is the
+    // breathing row above the band.
+    let band = bottom_band(
+        area,
+        input_rule_h,
+        input_height,
+        band_rule_h,
+        subtree_height,
+    );
+    let (rule_area, composer_area, band_rule_area, subtree_area) =
+        (band.rule, band.composer, band.close, band.below);
+    let [header_area, header_rule, transcript_area] = Layout::vertical([
         Constraint::Length(header_h),
         Constraint::Length(header_rule_h),
         Constraint::Min(transcript_min),
-        Constraint::Length(input_rule_h),
-        Constraint::Length(input_height),
-        Constraint::Length(band_rule_h),
-        Constraint::Length(subtree_height),
-        Constraint::Length(gap),
     ])
-    .areas(area);
+    .areas(band.content);
 
     // ---- SubHead breadcrumb (tui.js:3430-3483) ----
     let mut crumb_spans: Vec<Span<'_>> = vec![Span::raw(" ")];
@@ -10518,26 +10701,17 @@ fn render_aura(
     // border-top (tui.js:5497); it sheds under pressure exactly as the
     // gap did.
     let band_rule_h = gap;
-    let [
-        bar_area,
-        bar_rule,
-        orb_area,
-        columns_area,
-        transcript_area,
-        rule_area,
-        composer_area,
-        band_rule_area,
-    ] = Layout::vertical([
+    // 971 F2: the same shared band authority as every other surface.
+    let band = bottom_band(area, input_rule_h, composer_h, band_rule_h, 0);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.composer, band.close);
+    let [bar_area, bar_rule, orb_area, columns_area, transcript_area] = Layout::vertical([
         Constraint::Length(bar_h),
         Constraint::Length(bar_rule_h),
         Constraint::Length(orb_h),
         Constraint::Length(columns_h),
         Constraint::Min(transcript_min),
-        Constraint::Length(input_rule_h),
-        Constraint::Length(composer_h),
-        Constraint::Length(band_rule_h),
     ])
-    .areas(area);
+    .areas(band.content);
 
     // ---- Top bar: ◉ AURA + chips (engine ⇄ · audio · exit ⤶) ----
     let mut bar = vec![
@@ -11678,6 +11852,74 @@ fn band_rule_reserve(area_h: u16, outranking: u16, top_rule_h: u16) -> u16 {
     u16::from(top_rule_h > 0 && area_h > outranking)
 }
 
+/// The rectangles of the shared bottom band (971 F2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BandRects {
+    /// Everything ABOVE the band — the surface lays its own regions out in
+    /// here (header, transcript, panels, palette …).
+    pub content: Rect,
+    /// The gold rule that OPENS the band.
+    pub rule: Rect,
+    /// The composer rows (or the card/menu that replaces them).
+    pub composer: Rect,
+    /// The frame rule that CLOSES the band.
+    pub close: Rect,
+    /// Rows the surface keeps BELOW the band (the SubTree ledger).
+    pub below: Rect,
+}
+
+/// THE bottom-layout authority (971 F2 — owner report: the composer sat one
+/// row higher on the session screen and one or two rows lower on the loom /
+/// workflows tab than it does in the main menu). Every surface that draws an
+/// input band now anchors it through this ONE function, so the rule, the
+/// composer rows and the closing rule land on the same rows of the body on
+/// every screen, and the status line below them never covers a composer row.
+///
+/// Anatomy, bottom-up: `below` (a SubTree, when the surface keeps one) ·
+/// the closing frame rule · the composer rows · the opening gold rule ·
+/// then the surface's own content. Callers still own their sacred-input
+/// ledgers — this only places what those ledgers granted, and applies the
+/// last-resort floor: on a frame too short for the whole band the rows
+/// below it yield first, then the closing rule, then the opening rule; the
+/// composer's own rows never do (its cursor row is sacred on every
+/// surface).
+fn bottom_band(area: Rect, rule_h: u16, composer_h: u16, close_h: u16, below_h: u16) -> BandRects {
+    let composer_h = composer_h.min(area.height);
+    let mut rule_h = rule_h;
+    let mut close_h = close_h;
+    let mut below_h = below_h;
+    let fits = |rule: u16, close: u16, below: u16| {
+        rule.saturating_add(composer_h)
+            .saturating_add(close)
+            .saturating_add(below)
+            <= area.height
+    };
+    if !fits(rule_h, close_h, below_h) {
+        below_h = 0;
+    }
+    if !fits(rule_h, close_h, below_h) {
+        close_h = 0;
+    }
+    if !fits(rule_h, close_h, below_h) {
+        rule_h = 0;
+    }
+    let [content, rule, composer, close, below] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(rule_h),
+        Constraint::Length(composer_h),
+        Constraint::Length(close_h),
+        Constraint::Length(below_h),
+    ])
+    .areas(area);
+    BandRects {
+        content,
+        rule,
+        composer,
+        close,
+        below,
+    }
+}
+
 pub(crate) fn composer_text_budget(width: u16) -> usize {
     (width as usize).saturating_sub(COMPOSER_PAD + 2 + 1).max(1)
 }
@@ -11770,6 +12012,10 @@ fn render_composer(
     if row_area.height == 0 {
         return;
     }
+    // 971 F2: the rows this band actually landed on, published for the
+    // frame (`scroll_max` discipline) — the layout tests read the real
+    // rectangle instead of re-deriving one.
+    model.composer_rect.set(Some(row_area));
     // F2c: the band's TOP BORDER carries the session identity at its
     // right end — `model · oauth|api · reasoning [· fast]`, NO alias —
     // right above the talk chip; the status bar keeps state + tokens.

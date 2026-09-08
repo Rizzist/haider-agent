@@ -7,95 +7,95 @@
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
 03| ❯ prompt 4 — please continue the work                                                                                                                          |
    ~ Rgb(242, 242, 242)/Rgb(25, 25, 25)/UNDERLINED×1; Rgb(229, 122, 74)/Rgb(25, 25, 25)/BOLD | UNDERLINED×2; Rgb(242, 242, 242)/Rgb(25, 25, 25)/UNDERLINED×157
-04| ■ haider                                                                                                                                                       |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-05| ▏ row 18 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-06|                                                                                                                                                                |
+04|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-07| ■ haider                                                                                                                                                       |
+05| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-08| ▏ row 19 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+06| ▏ row 18 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-09|                                                                                                                                                                |
+07|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-10| ❯ prompt 5 — please continue the work                                                                                                                          |
+08| ■ haider                                                                                                                                                       |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
+09| ▏ row 19 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
+10|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+11| ❯ prompt 5 — please continue the work                                                                                                                          |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×35; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×122
-11|                                                                                                                                                                |
+12|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-12| ■ haider                                                                                                                                                       |
+13| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-13| ▏ row 20 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+14| ▏ row 20 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-14|                                                                                                                                                                |
+15|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-15| ■ haider                                                                                                                                                       |
+16| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-16| ▏ row 21 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+17| ▏ row 21 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-17|                                                                                                                                                                |
+18|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-18| ■ haider                                                                                                                                                       |
+19| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-19| ▏ row 22 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+20| ▏ row 22 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-20|                                                                                                                                                                |
+21|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-21| ■ haider                                                                                                                                                       |
+22| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-22| ▏ row 23 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+23| ▏ row 23 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-23|                                                                                                                                                                |
+24|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-24| ❯ prompt 6 — please continue the work                                                                                                                          |
+25| ❯ prompt 6 — please continue the work                                                                                                                          |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×35; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×122
-25|                                                                                                                                                                |
+26|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-26| ■ haider                                                                                                                                                       |
+27| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-27| ▏ row 24 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+28| ▏ row 24 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-28|                                                                                                                                                                |
+29|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-29| ■ haider                                                                                                                                                       |
+30| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-30| ▏ row 25 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+31| ▏ row 25 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-31|                                                                                                                                                                |
+32|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-32| ■ haider                                                                                                                                                       |
+33| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-33| ▏ row 26 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+34| ▏ row 26 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-34|                                                                                                                                                                |
+35|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-35| ■ haider                                                                                                                                                       |
+36| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-36| ▏ row 27 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+37| ▏ row 27 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-37|                                                                                                                                                                |
+38|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-38| ❯ prompt 7 — please continue the work                                                                                                                          |
+39| ❯ prompt 7 — please continue the work                                                                                                                          |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×35; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×122
-39|                                                                                                                                                                |
+40|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-40| ■ haider                                                                                                                                                       |
+41| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-41| ▏ row 28 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
+42| ▏ row 28 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×157
-42|                                                                                                                                                                |
+43|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-43| ■ haider                                                                                                                                                       |
+44| ■ haider                                                                                                                                                       |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×151
-44| ▏ row 29 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                 Jump to bottom ↓ |
+45| ▏ row 29 — a representative agent line with enough words to wrap at a normal terminal width and exercise the measurement path                 Jump to bottom ↓ |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×139; Rgb(242, 242, 242)/Rgb(25, 25, 25)/UNDERLINED×18
-45|───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
+46|───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×149; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2
-46|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                                                                         [ ◉ talk ]  |
+47|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                                                                         [ ◉ talk ]  |
    ~ Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/BOLD×2; Rgb(15, 15, 15)/Rgb(217, 181, 68)/NONE×1; Rgb(139, 148, 158)/Rgb(26, 26, 26)/NONE×70; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×73; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/NONE×6; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2
-47|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+48|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
-48|                                                                                                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
 49| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
