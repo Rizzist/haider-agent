@@ -39,7 +39,6 @@ import androidx.compose.ui.text.input.VisualTransformation
  * sweep can see and a thumb can miss.
  */
 @Composable
-@Composable
 internal fun LabelledField(
     label: String,
     value: String,
