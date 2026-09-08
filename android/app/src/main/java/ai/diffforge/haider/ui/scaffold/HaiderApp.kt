@@ -10,6 +10,8 @@ import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.InputRequiredCard
 import ai.diffforge.haider.ui.chat.ModelPicker
+import ai.diffforge.haider.ui.checkpoints.BranchSheet
+import ai.diffforge.haider.ui.checkpoints.CheckpointsSheet
 import ai.diffforge.haider.ui.chat.ShellView
 import ai.diffforge.haider.ui.chat.Transcript
 import ai.diffforge.haider.ui.drawer.RenameSheet
@@ -536,8 +538,51 @@ private fun Overlays(
             onDismiss = viewModel::closeOverlay,
             onRename = { title -> viewModel.rename(overlay.sessionId, title) },
         )
+        is Overlay.Checkpoints -> CheckpointsSheet(
+            state = state.checkpoints,
+            // The branch the timeline was read on, named as the sheet shows it
+            // elsewhere. `checkpoint.list` is branch-scoped, so this is part of
+            // what the list means, not decoration.
+            branchName = branchName(state, overlay.sessionId),
+            onDismiss = viewModel::closeOverlay,
+            onRefresh = { viewModel.loadCheckpoints(overlay.sessionId) },
+            onLoadMore = viewModel::loadMoreCheckpoints,
+            onConfirm = viewModel::confirmCheckpointGesture,
+            onApply = viewModel::applyCheckpointGesture,
+        )
+        is Overlay.Branches -> viewModel.session(overlay.sessionId)?.let { row ->
+            BranchSheet(
+                branches = row.branches,
+                selectedBranchId = state.branchSelection[overlay.sessionId],
+                // `branch.create` forks at an exact node; a row without one has
+                // no fork point, and the sheet offers no create rather than
+                // sending half a coordinate.
+                forkPointSeq = row.mainHeadNodeId?.let { row.mainHeadSeq },
+                notice = state.checkpoints.branchNotice,
+                onDismiss = viewModel::closeOverlay,
+                onSelect = { branchId -> viewModel.selectBranch(overlay.sessionId, branchId) },
+                onCreate = { name -> viewModel.createBranch(overlay.sessionId, name) },
+            )
+        }
         else -> Unit
     }
+}
+
+/**
+ * The branch a session's next turn goes on, by name.
+ *
+ * Null for the implicit main branch: main has no registry row and no id, so
+ * there is no name to show and the sheet says nothing rather than inventing one.
+ */
+private fun branchName(state: AppUiState, sessionId: String): String? {
+    val branchId = state.branchSelection[sessionId] ?: return null
+    return state.sessions.firstOrNull { it.id == sessionId }
+        ?.branches
+        ?.firstOrNull { it.branchId == branchId }
+        ?.name
+        // Selected but not in the published list: name the id rather than
+        // silently showing main.
+        ?: branchId
 }
 
 /** Everything the UI needs from the platform, kept out of the composables. */
@@ -568,6 +613,8 @@ fun ChatViewModel.applyRowAction(sessionId: String, action: SessionRowAction) {
             Overlay.Rename(sessionId, session(sessionId)?.title.orEmpty()),
         )
         SessionRowAction.Fork -> fork(sessionId)
+        SessionRowAction.Checkpoints -> openCheckpoints(sessionId)
+        SessionRowAction.Branches -> openBranches(sessionId)
         SessionRowAction.CopyId -> closeOverlay()
     }
 }

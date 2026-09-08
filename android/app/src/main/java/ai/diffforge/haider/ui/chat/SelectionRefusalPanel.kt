@@ -2,7 +2,10 @@ package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.state.SelectionRefusal
+import ai.diffforge.haider.ui.state.SelectionRefusalCodes
+import ai.diffforge.haider.ui.state.SelectionRefusalKind
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 
 /** Test handle for the refusal panel, on whichever surface is showing it. */
 const val MODEL_REFUSAL_TAG = "model_refusal"
@@ -44,16 +48,61 @@ fun SelectionRefusalPanel(
             .testTag(MODEL_REFUSAL_TAG),
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
     ) {
-        Text("The daemon refused that change", style = type.h4, color = colors.text)
+        val kind = SelectionRefusalCodes.kind(refusal.code)
+        Text(stringResource(R.string.model_refusal_title), style = type.h4, color = colors.text)
         Text(refusal.code, style = type.sessionMeta, color = colors.amber)
-        Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
-            ForgeButton(
-                text = "Change it anyway",
-                onClick = onConfirm,
-                kind = ForgeButtonKind.Filled,
+        // What the code MEANS for the row that was tapped, where this client
+        // can say it from the coordinates it already sent. Nothing is inferred
+        // beyond the code itself.
+        when {
+            refusal.code.contains(SelectionRefusalCodes.MODEL_UNKNOWN) &&
+                refusal.model != null && refusal.provider != null ->
+                Text(
+                    stringResource(
+                        R.string.model_refusal_unknown,
+                        refusal.model,
+                        refusal.provider,
+                    ),
+                    style = type.sessionMeta,
+                    color = colors.textMuted,
+                )
+            refusal.code.contains(SelectionRefusalCodes.PROVIDER_UNAVAILABLE) &&
+                refusal.provider != null ->
+                Text(
+                    stringResource(R.string.model_refusal_provider, refusal.provider),
+                    style = type.sessionMeta,
+                    color = colors.textMuted,
+                )
+            else -> Unit
+        }
+        if (kind != SelectionRefusalKind.Confirmable) {
+            // A retry with `confirm_new_epoch` is the same request plus one
+            // field, and this refusal is not about consent. Saying so is the
+            // honest alternative to a button that would be refused identically.
+            Text(
+                stringResource(R.string.model_refusal_terminal),
+                style = type.sessionMeta,
+                color = colors.textMuted,
             )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+            // ONLY a confirmation refusal gets the button that sets
+            // `confirm_new_epoch`, and only a person's tap sets it.
+            if (kind == SelectionRefusalKind.Confirmable) {
+                ForgeButton(
+                    text = stringResource(R.string.model_refusal_confirm),
+                    onClick = onConfirm,
+                    kind = ForgeButtonKind.Filled,
+                )
+            }
             ForgeButton(
-                text = "Keep the current one",
+                text = stringResource(
+                    if (kind == SelectionRefusalKind.Confirmable) {
+                        R.string.model_refusal_keep
+                    } else {
+                        R.string.model_refusal_close
+                    },
+                ),
                 onClick = onKeep,
                 kind = ForgeButtonKind.Ghost,
             )

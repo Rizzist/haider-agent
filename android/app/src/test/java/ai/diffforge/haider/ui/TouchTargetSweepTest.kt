@@ -139,6 +139,31 @@ class TouchTargetSweepTest {
     }
 
     @Test
+    fun `the accounts custom-server form has no undersized targets`() {
+        open(overlay = Overlay.Accounts)
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Add a custom server").performClick()
+        rule.waitForIdle()
+        rule.waitForIdle()
+        sweep("accounts custom-server form")
+    }
+
+    @Test
+    fun `the checkpoints sheet has no undersized targets`() {
+        val viewModel = open()
+        viewModel.openCheckpoints("s-nav")
+        rule.waitForIdle()
+        sweep("checkpoints")
+    }
+
+    @Test
+    fun `the branches sheet has no undersized targets`() {
+        open(overlay = Overlay.Branches("s-nav"))
+        sweep("branches")
+    }
+
+    @Test
     fun `the model picker sheet has no undersized targets`() {
         open(overlay = Overlay.Picker(PickerKind.Model))
         sweep("model picker")

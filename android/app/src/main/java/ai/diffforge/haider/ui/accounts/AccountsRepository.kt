@@ -1,6 +1,15 @@
 package ai.diffforge.haider.ui.accounts
 
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * The default [AccountsRepository.providerRevision]: one shared, permanently
+ * empty flow, so an implementation that never read a revision does not
+ * manufacture a new one on every access.
+ */
+private val NO_PROVIDER_REVISION: StateFlow<Long?> = MutableStateFlow<Long?>(null).asStateFlow()
 
 /**
  * Provider and account management on the phone, shaped by the frozen account
@@ -49,7 +58,44 @@ data class ProviderDescriptor(
     val modelDetails: Map<String, ModelDetail> = emptyMap(),
     val defaultModel: String? = null,
     val apiFamily: String? = null,
+    /**
+     * `ProviderSummaryWire.inventory_authority` — whether discovery may veto a
+     * model id for this provider (frame.rs:1217). Advisory means a router or
+     * local server that commonly omits otherwise valid passthrough ids from
+     * `/v1/models`, so a model the catalog does not list may still be accepted.
+     * Unknown keeps the conservative behaviour for older summaries.
+     */
+    val inventoryAuthority: ModelInventoryAuthority = ModelInventoryAuthority.Unknown,
+    /**
+     * `ProviderSummaryWire.endpoint`, when the daemon published one. It is
+     * shown on a custom row so a person can tell two local servers apart; the
+     * client never derives "is this custom" from it, because the wire carries
+     * no such flag and a built-in adapter may state an endpoint too.
+     */
+    val endpoint: String? = null,
 )
+
+/**
+ * `ModelInventoryAuthorityWire` (frame.rs:1226).
+ *
+ * Only [Advisory] licenses a free-text model id: an authoritative catalog is
+ * the daemon's own and a miss there is a real miss, while Unknown is an older
+ * summary that says nothing and is treated conservatively.
+ */
+enum class ModelInventoryAuthority(val wire: String) {
+    Authoritative("authoritative"),
+    Advisory("advisory"),
+    Unknown("unknown"),
+    ;
+
+    /** True when a model id outside the published inventory may still be selected. */
+    val acceptsCustomModelId: Boolean get() = this == Advisory
+
+    companion object {
+        fun of(wire: String?): ModelInventoryAuthority =
+            entries.firstOrNull { it.wire == wire } ?: Unknown
+    }
+}
 
 /** One row of `ProviderSummaryWire.model_details`. */
 data class ModelDetail(
@@ -130,6 +176,23 @@ sealed interface AccountResult {
     data class Failed(val publicCode: String) : AccountResult
 }
 
+/**
+ * What `provider.models_probe` returned.
+ *
+ * The probe is read-only: no provider, account, credential or cache is written
+ * by any of these outcomes, and a staged key is borrowed rather than consumed.
+ */
+sealed interface CustomModelsProbe {
+    data class Models(val models: List<String>, val defaultModel: String?) : CustomModelsProbe
+
+    /** A typed `ProviderProbeFailureWire`. The card offers a manual id instead. */
+    data class Failed(val failure: CustomProbeFailure, val detail: String? = null) :
+        CustomModelsProbe
+
+    /** The daemon does not serve `provider_models_probe_v1`. */
+    data class Unavailable(val reason: String) : CustomModelsProbe
+}
+
 interface AccountsRepository {
     val providers: StateFlow<List<ProviderDescriptor>>
     val snapshot: StateFlow<AccountsSnapshot>
@@ -174,6 +237,47 @@ interface AccountsRepository {
 
     /** `provider.list`, the inventory both the pickers and this screen read. */
     suspend fun refreshProviders()
+
+    /**
+     * The `provider.list` revision the current [providers] snapshot was read at.
+     *
+     * Null is "the daemon did not state one" and is not zero. `provider.configure`
+     * still requires an `expected_revision`, and the TUI sends zero in that case
+     * (`submit_custom_add`: `self.providers.revision.unwrap_or(0)`); this client
+     * does the same, and does it in one place so the substitution is visible.
+     */
+    val providerRevision: StateFlow<Long?> get() = NO_PROVIDER_REVISION
+
+    /**
+     * `provider.models_probe` — read-only discovery for a server that does not
+     * exist yet. [probeVaultReference] is borrowed, not consumed; a keyless
+     * probe passes none.
+     */
+    suspend fun probeCustomModels(
+        provider: String,
+        origin: String,
+        apiFamily: String,
+        keyless: Boolean,
+        probeVaultReference: String? = null,
+    ): CustomModelsProbe = CustomModelsProbe.Unavailable(
+        AccountsRpcAdapter.FEATURE_PROVIDER_MODELS_PROBE_V1,
+    )
+
+    /**
+     * `provider.configure` — the durable create, under [expectedRevision].
+     *
+     * The staged reference is deliberately NOT passed here once a probe has
+     * borrowed it: it is spent by the following [commitStagedApiKey].
+     */
+    suspend fun configureCustomProvider(
+        provider: String,
+        origin: String,
+        apiFamily: String,
+        authRequirement: String,
+        models: List<String>,
+        defaultModel: String?,
+        expectedRevision: Long,
+    ): AccountResult = AccountResult.Failed(AccountsRpcAdapter.FEATURE_PROVIDER_CONFIGURE_V1)
 
     /** `account.remove` with the revision it was read at. */
     suspend fun remove(alias: String): AccountResult

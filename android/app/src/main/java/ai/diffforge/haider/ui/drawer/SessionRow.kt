@@ -38,7 +38,17 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 
-enum class SessionRowAction { Rename, Fork, CopyId }
+enum class SessionRowAction {
+    Rename,
+    Fork,
+
+    /** The session's durable workspace timeline: undo, redo, roll back a turn. */
+    Checkpoints,
+
+    /** Which branch the session's next turn is submitted on, and creating one. */
+    Branches,
+    CopyId,
+}
 
 /** The painted band inside a session row's 48 dp target. */
 const val SESSION_ROW_INK_TAG = "session_row_ink"
@@ -85,6 +95,12 @@ fun SessionRowItem(
         })
         add(CustomAccessibilityAction(stringResource(R.string.action_fork)) {
             onAction(SessionRowAction.Fork); true
+        })
+        add(CustomAccessibilityAction(stringResource(R.string.action_checkpoints)) {
+            onAction(SessionRowAction.Checkpoints); true
+        })
+        add(CustomAccessibilityAction(stringResource(R.string.branches_title)) {
+            onAction(SessionRowAction.Branches); true
         })
         // No Stop custom action: TalkBack must not offer a second turn Stop
         // that the screen does not have (E2, verify-6 O2).

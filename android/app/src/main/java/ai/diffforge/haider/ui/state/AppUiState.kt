@@ -11,6 +11,7 @@ import ai.diffforge.haider.ui.daemon.ShellAvailability
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.TurnCancel
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.checkpoints.CheckpointsUiState
 import ai.diffforge.haider.ui.chat.Message
 
 /**
@@ -31,6 +32,12 @@ sealed interface Overlay {
     data object Accounts : Overlay
     data class SessionActions(val sessionId: String) : Overlay
     data class Rename(val sessionId: String, val current: String) : Overlay
+
+    /** The session's durable workspace timeline, with undo/redo/rollback. */
+    data class Checkpoints(val sessionId: String) : Overlay
+
+    /** Which branch the session's next turn is submitted on, and creating one. */
+    data class Branches(val sessionId: String) : Overlay
 }
 
 /** The four (or three, below SDK 33) first-run steps. */
@@ -129,6 +136,13 @@ data class AppUiState(
     val viewTab: SessionViewTab = SessionViewTab.Chat,
     val shell: ShellAvailability = ShellAvailability(),
     val answeredElsewhere: Set<String> = emptySet(),
+    /** The checkpoints sheet's state, for the one session it is open on. */
+    val checkpoints: CheckpointsUiState = CheckpointsUiState(),
+    /**
+     * Which branch each session's next `turn.submit` carries. An absent entry
+     * is the implicit main branch — never a branch id this client made up.
+     */
+    val branchSelection: Map<String, String> = emptyMap(),
 ) {
     val activeSession: SessionRow?
         get() = sessions.firstOrNull { it.id == activeSessionId }

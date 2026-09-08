@@ -136,3 +136,8 @@ internal fun textUnder(
 internal fun androidx.compose.ui.test.junit4.ComposeTestRule.onAllNodesWithTextSafe(
     text: String,
 ): Int = onAllNodes(androidx.compose.ui.test.hasText(text)).fetchSemanticsNodes().size
+
+/** Counts matching test-tag nodes without failing when there are none. */
+internal fun androidx.compose.ui.test.junit4.ComposeTestRule.onAllNodesWithTagSafe(
+    tag: String,
+): Int = onAllNodes(androidx.compose.ui.test.hasTestTag(tag)).fetchSemanticsNodes().size

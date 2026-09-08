@@ -22,6 +22,8 @@ import org.json.JSONObject
  * | `account.set_active` | frame.rs:4060 | `{command_id, alias, confirm_new_epoch?}` — **no** `expected_revision` |
  * | `account.list` | resp frame.rs:5216 | `{descriptors: CredentialDescriptor[], revision?}` — the key is **descriptors** |
  * | `provider.list` | resp frame.rs:5237 | `{providers: ProviderSummaryWire[], revision}`, each row keyed `provider` / `auth_methods` / `availability` |
+ * | `provider.models_probe` | frame.rs:4117 / resp frame.rs:5253 | request `{provider, origin, api_family, keyless, probe_vault_reference?}` — READ-ONLY, **no `command_id`**, because discovery is not a durable mutation; response `{provider, models, default_model?}` |
+ * | `provider.configure` | frame.rs:4134 | `{command_id, provider, api_family?, origin?, auth_requirement?, enabled, models, default_model?, probe_vault_reference?, trust?, expected_revision}` — `expected_revision` is REQUIRED, and `probe_vault_reference` is omitted once a probe has already borrowed the stage |
  *
  * `CredentialDescriptor` (haider-protocol `credential.rs:60`) is
  * `{alias, provider, auth_method, identity, status: {status}, active, label?}`;
@@ -47,6 +49,15 @@ object AccountsRpcAdapter {
     const val METHOD_OAUTH_START = "account.oauth_start"
     const val METHOD_OAUTH_STATUS = "account.oauth_status"
     const val METHOD_OAUTH_CANCEL = "account.oauth_cancel"
+    const val METHOD_PROVIDER_MODELS_PROBE = "provider.models_probe"
+    const val METHOD_PROVIDER_CONFIGURE = "provider.configure"
+
+    /** `FEATURE_PROVIDER_MODELS_PROBE_V1` / `FEATURE_PROVIDER_CONFIGURE_V1` (frame.rs:343,349). */
+    const val FEATURE_PROVIDER_CONFIGURE_V1 = "provider_configure_v1"
+    const val FEATURE_PROVIDER_MODELS_PROBE_V1 = "provider_models_probe_v1"
+
+    /** `ErrorData::ProviderProbeFailed` (frame.rs:5636), tagged on `kind`. */
+    const val ERROR_PROVIDER_PROBE_FAILED = "provider_probe_failed"
 
     /** `StagePurpose` (frame.rs:1549). */
     const val PURPOSE_API_KEY = "api_key"
@@ -198,6 +209,73 @@ object AccountsRpcAdapter {
         .put("attempt_id", attemptId)
         .put("oauth_reference", oauthReference)
 
+    // ---------- custom servers ----------
+
+    /**
+     * Read-only discovery, before any provider exists.
+     *
+     * There is deliberately no `command_id`: the TUI pins that this is not a
+     * durable mutation (`probe.command_id().is_none()`). A staged reference is
+     * BORROWED — the daemon leaves it available for the later `login_api` — and
+     * a keyless probe carries none at all.
+     */
+    fun providerModelsProbeRequest(
+        provider: String,
+        origin: String,
+        apiFamily: String,
+        keyless: Boolean,
+        probeVaultReference: String? = null,
+    ): JSONObject = JSONObject()
+        .put("method", METHOD_PROVIDER_MODELS_PROBE)
+        .put("provider", provider)
+        .put("origin", origin)
+        .put("api_family", apiFamily)
+        .put("keyless", keyless)
+        .putIfPresent("probe_vault_reference", probeVaultReference)
+
+    /**
+     * The durable create.
+     *
+     * `expected_revision` is required and is the `provider.list` revision the
+     * form was read at. `probe_vault_reference` is omitted when a probe already
+     * borrowed the stage: the reference is spent by `account.login_api`, not
+     * here (`keyed_custom_server_stages_discovers_picks_then_configures_and_
+     * consumes_one_reference` pins `probe_vault_reference: None`).
+     */
+    fun providerConfigureRequest(
+        commandId: String,
+        provider: String,
+        origin: String,
+        apiFamily: String,
+        authRequirement: String,
+        models: List<String>,
+        defaultModel: String?,
+        expectedRevision: Long,
+        enabled: Boolean = true,
+        probeVaultReference: String? = null,
+    ): JSONObject = JSONObject()
+        .put("method", METHOD_PROVIDER_CONFIGURE)
+        .put("command_id", commandId)
+        .put("provider", provider)
+        .put("api_family", apiFamily)
+        .put("origin", origin)
+        .put("auth_requirement", authRequirement)
+        .put("enabled", enabled)
+        .put("models", JSONArray(models))
+        .putIfPresent("default_model", defaultModel)
+        .putIfPresent("probe_vault_reference", probeVaultReference)
+        .put("expected_revision", expectedRevision)
+
+    fun parseProviderModelsProbe(body: JSONObject): Pair<List<String>, String?> {
+        val array = body.optJSONArray("models") ?: JSONArray()
+        val models = (0 until array.length()).mapNotNull { array.optString(it).ifBlank { null } }
+        return models to body.optStringOrNull("default_model")
+    }
+
+    /** `ProviderProbeFailureWire` (frame.rs:5737) out of an error body's typed data. */
+    fun parseProbeFailure(data: JSONObject?): CustomProbeFailure =
+        CustomProbeFailure.of(data?.optStringOrNull("failure"))
+
     // ---------- parsers ----------
 
     fun parseProviders(body: JSONObject): List<ProviderDescriptor> {
@@ -228,6 +306,13 @@ object AccountsRpcAdapter {
                 modelDetails = item.modelDetails(),
                 defaultModel = item.optStringOrNull("default_model"),
                 apiFamily = item.optStringOrNull("api_family"),
+                // Absent is Unknown, and Unknown is conservative: a summary
+                // that never named an authority does not license a free-text
+                // model id (frame.rs:1217).
+                inventoryAuthority = ModelInventoryAuthority.of(
+                    item.optStringOrNull("inventory_authority"),
+                ),
+                endpoint = item.optStringOrNull("endpoint"),
             )
         }
     }

@@ -2,6 +2,21 @@ package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
 import ai.diffforge.haider.ui.accounts.AccountsRpcAdapter
+import ai.diffforge.haider.ui.checkpoints.BranchOutcome
+import ai.diffforge.haider.ui.checkpoints.BranchView
+import ai.diffforge.haider.ui.checkpoints.CHECKPOINT_KINDS
+import ai.diffforge.haider.ui.checkpoints.CHECKPOINT_ORIGINS
+import ai.diffforge.haider.ui.checkpoints.CheckpointCategory
+import ai.diffforge.haider.ui.checkpoints.CheckpointCursorState
+import ai.diffforge.haider.ui.checkpoints.CheckpointListResult
+import ai.diffforge.haider.ui.checkpoints.CheckpointOutcome
+import ai.diffforge.haider.ui.checkpoints.CheckpointPage
+import ai.diffforge.haider.ui.checkpoints.CheckpointPathView
+import ai.diffforge.haider.ui.checkpoints.CheckpointReceiptView
+import ai.diffforge.haider.ui.checkpoints.CheckpointUnavailable
+import ai.diffforge.haider.ui.checkpoints.CheckpointView
+import ai.diffforge.haider.ui.checkpoints.Checkpoints
+import ai.diffforge.haider.ui.checkpoints.CheckpointRpcAdapter
 import ai.diffforge.haider.transport.SessionModel
 import ai.diffforge.haider.transport.SessionProvider
 import ai.diffforge.haider.transport.SessionSelection
@@ -616,7 +631,13 @@ class FakeDaemonService(
     }
 
     override suspend fun send(sessionId: String, text: String) {
-        calls += "chat.send:$sessionId"
+        // `turn.submit` carries `branch_id` when one is chosen and OMITS it for
+        // the implicit main branch (frame.rs:3697; wire transcript entry 82).
+        // The composer never passes a branch: the facade holds the selection,
+        // so choosing a branch in the sheet threads through every later send
+        // without the send path knowing branches exist.
+        val branch = _branchSelection.value[sessionId]
+        calls += if (branch == null) "chat.send:$sessionId" else "chat.send:$sessionId:branch=$branch"
         val messages = transcripts.getOrPut(sessionId) { mutableListOf() }
         messages += Message(nextMessageId++, Role.User, text)
         messages += Message(
@@ -761,6 +782,17 @@ class FakeDaemonService(
                 available = false,
                 unavailableReason = "No account configured",
             ),
+            ProviderOption(
+                id = "local-lab",
+                label = "local-lab",
+                models = listOf(
+                    ModelOption("router-fast", emptyList(), null, 128_000),
+                    ModelOption("router-deep", emptyList(), null, 128_000),
+                ),
+                defaultModel = "router-deep",
+                available = true,
+                unavailableReason = null,
+            ),
         ),
     )
 
@@ -793,6 +825,21 @@ class FakeDaemonService(
                 availabilityReason = "No account configured",
                 defaultModel = null,
                 models = listOf(SessionModel("gpt-5", 400_000, listOf("medium"), "medium")),
+            ),
+            // A custom compatible server. Its inventory is ADVISORY, which is
+            // the only thing that licenses a free-text model id: routers omit
+            // ids from /v1/models that their chat wire still accepts.
+            SessionProvider(
+                id = "local-lab",
+                enabled = true,
+                availability = "available",
+                availabilityReason = null,
+                defaultModel = "router-deep",
+                models = listOf(
+                    SessionModel("router-fast", 128_000, emptyList(), null),
+                    SessionModel("router-deep", 128_000, emptyList(), null),
+                ),
+                inventoryAuthority = "advisory",
             ),
         ),
     )
@@ -846,6 +893,23 @@ class FakeDaemonService(
             runId = "run-nav",
             workerGeneration = 6,
             headSeq = 981,
+            // Main is implicit and carries no registry row, exactly as the wire
+            // states; only the named ref is listed.
+            branches = listOf(
+                BranchView(
+                    branchId = "branch-plan-b",
+                    name = "Plan B",
+                    forkNodeId = "node-fork-1",
+                    forkSeq = 41,
+                    createdSeq = 52,
+                    createdAtMs = nowMs - 90 * 60_000,
+                    headNodeId = "node-plan-b-head",
+                    headSeq = 60,
+                ),
+            ),
+            activeBranchId = null,
+            mainHeadNodeId = "node-nav-head",
+            mainHeadSeq = 981,
         ),
         SessionRow(
             id = "s-route",
@@ -884,6 +948,8 @@ class FakeDaemonService(
             seenAtMs = nowMs - 3 * 24 * 60 * 60_000L,
             forkedFrom = ForkProvenance("s-nav", 44),
             headSeq = 44,
+            mainHeadNodeId = "node-old-head",
+            mainHeadSeq = 44,
         ),
         SessionRow(
             id = "s-unknown",
@@ -974,9 +1040,291 @@ class FakeDaemonService(
         ),
     )
 
+    // ---------- checkpoints and branches ----------
+
+    private val _branchSelection = MutableStateFlow<Map<String, String>>(emptyMap())
+    override val branchSelection: StateFlow<Map<String, String>> = _branchSelection.asStateFlow()
+
+    /**
+     * The journal, newest LAST, exactly as a store would hold it. Every read
+     * sorts it newest-first; nothing here is pre-sorted for the UI's benefit.
+     */
+    private val journal = mutableMapOf<String, MutableList<CheckpointView>>()
+    private var nextCheckpointSeq = 0L
+
+    /** Set to make the daemon look like one that does not serve `checkpoint_v1`. */
+    var checkpointsUnavailable = false
+
+    /** Set to make the daemon look like one that does not serve `branch_create_v1`. */
+    var branchCreateUnavailable = false
+
+    /** Forces the NEXT mutation's outcome; typed refusals are not reachable otherwise. */
+    var nextCheckpointOutcome: CheckpointOutcome? = null
+
+    override suspend fun selectBranch(sessionId: String, branchId: String?) {
+        calls += "branch.select:$sessionId:${branchId ?: "main"}"
+        _branchSelection.value = _branchSelection.value.toMutableMap().apply {
+            // Absence IS main. Storing a sentinel would make main a branch id,
+            // and `turn.submit` would then carry one for the implicit branch.
+            if (branchId == null) remove(sessionId) else put(sessionId, branchId)
+        }
+    }
+
+    override suspend fun checkpoints(
+        sessionId: String,
+        branchId: String?,
+        cursor: Long?,
+        limit: Int,
+    ): CheckpointListResult {
+        calls += CheckpointRpcAdapter.METHOD_CHECKPOINT_LIST + ":" + sessionId
+        if (checkpointsUnavailable) {
+            return CheckpointListResult.Unavailable(CheckpointUnavailable.FEATURE_ABSENT)
+        }
+        val rows = Checkpoints.newestFirst(
+            journal.getOrPut(sessionId) { seededJournal(sessionId) }
+                .filter { it.branchId == branchId },
+        )
+        // Newest-first paging: a cursor is the last emitted sequence and the
+        // next page is strictly OLDER than it (checkpoint.rs:110).
+        val page = rows.filter { cursor == null || (it.seq ?: Long.MAX_VALUE) < cursor }
+        val window = page.take(limit)
+        val more = page.size > window.size
+        return CheckpointListResult.Page(
+            CheckpointPage(
+                checkpoints = window,
+                nextCursor = if (more) window.lastOrNull()?.seq else null,
+                cursorState = if (more) CheckpointCursorState.More else CheckpointCursorState.End,
+            ),
+        )
+    }
+
+    override suspend fun undoCheckpoint(
+        sessionId: String,
+        target: String,
+        branchId: String?,
+    ): CheckpointOutcome = mutate(
+        method = CheckpointRpcAdapter.METHOD_CHECKPOINT_UNDO,
+        origin = "undo",
+        sessionId = sessionId,
+        branchId = branchId,
+        target = target,
+    )
+
+    override suspend fun redoCheckpoint(
+        sessionId: String,
+        target: String,
+        branchId: String?,
+    ): CheckpointOutcome = mutate(
+        method = CheckpointRpcAdapter.METHOD_CHECKPOINT_REDO,
+        origin = "redo",
+        sessionId = sessionId,
+        branchId = branchId,
+        target = target,
+    )
+
+    override suspend fun rollbackTurn(
+        sessionId: String,
+        runId: String,
+        branchId: String?,
+    ): CheckpointOutcome {
+        calls += CheckpointRpcAdapter.METHOD_CHECKPOINT_ROLLBACK_TURN + ":" + runId
+        nextCheckpointOutcome?.let { nextCheckpointOutcome = null; return it }
+        if (checkpointsUnavailable) {
+            return CheckpointOutcome.Unavailable(CheckpointUnavailable.FEATURE_ABSENT)
+        }
+        val rows = journal.getOrPut(sessionId) { seededJournal(sessionId) }
+        val restored = rows.filter { it.runId == runId }.mapNotNull { it.checkpointId }
+        if (restored.isEmpty()) return CheckpointOutcome.Failed("run_unknown")
+        val recorded = record(
+            sessionId = sessionId,
+            branchId = branchId,
+            runId = runId,
+            origin = "rollback_turn",
+            sourceCheckpointId = restored.last(),
+            paths = rows.filter { it.runId == runId }.flatMap { it.paths },
+        )
+        rows += recorded
+        return CheckpointOutcome.Committed(
+            CheckpointReceiptView(recorded, restored, WORKER_GENERATION),
+        )
+    }
+
+    override suspend fun createBranch(
+        sessionId: String,
+        forkNodeId: String,
+        forkSeq: Long,
+        name: String?,
+        sourceBranchId: String?,
+    ): BranchOutcome {
+        calls += CheckpointRpcAdapter.METHOD_BRANCH_CREATE + ":" + sessionId
+        if (branchCreateUnavailable) {
+            return BranchOutcome.Unavailable(CheckpointUnavailable.BRANCH_FEATURE_ABSENT)
+        }
+        val row = _sessions.value.firstOrNull { it.id == sessionId }
+            ?: return BranchOutcome.Failed("session_unknown")
+        // The daemon normalizes the name and always returns one; an empty
+        // request name is not echoed back as an empty branch name.
+        val resolved = name?.trim().orEmpty().ifBlank { "branch-${row.branches.size + 1}" }
+        val branch = BranchView(
+            branchId = "branch-${resolved.lowercase().replace(' ', '-')}",
+            name = resolved,
+            sourceBranchId = sourceBranchId,
+            forkNodeId = forkNodeId,
+            forkSeq = forkSeq,
+            createdSeq = row.headSeq + 1,
+            createdAtMs = nowMs,
+            headNodeId = forkNodeId,
+            headSeq = forkSeq,
+        )
+        _sessions.value = _sessions.value.map {
+            if (it.id == sessionId) it.copy(branches = it.branches + branch) else it
+        }
+        return BranchOutcome.Created(branch)
+    }
+
+    private fun mutate(
+        method: String,
+        origin: String,
+        sessionId: String,
+        branchId: String?,
+        target: String,
+    ): CheckpointOutcome {
+        calls += "$method:$target"
+        nextCheckpointOutcome?.let { nextCheckpointOutcome = null; return it }
+        if (checkpointsUnavailable) {
+            return CheckpointOutcome.Unavailable(CheckpointUnavailable.FEATURE_ABSENT)
+        }
+        val rows = journal.getOrPut(sessionId) { seededJournal(sessionId) }
+        val ordered = Checkpoints.newestFirst(rows.filter { it.branchId == branchId })
+        val source = if (target == Checkpoints.TARGET_LAST) {
+            ordered.firstOrNull { it.addressable }
+        } else {
+            ordered.firstOrNull { it.checkpointId == target }
+        } ?: return CheckpointOutcome.Failed("checkpoint_unknown")
+        val recorded = record(
+            sessionId = sessionId,
+            branchId = branchId,
+            runId = source.runId,
+            origin = origin,
+            sourceCheckpointId = source.checkpointId,
+            paths = source.paths,
+        )
+        // An undo/redo is itself an ordinary append-only journal entry and can
+        // be undone in turn (checkpoint.rs:43), so it goes on the end.
+        rows += recorded
+        return CheckpointOutcome.Committed(
+            CheckpointReceiptView(
+                checkpoint = recorded,
+                restoredCheckpointIds = listOfNotNull(source.checkpointId),
+                workerGeneration = WORKER_GENERATION,
+            ),
+        )
+    }
+
+    private fun record(
+        sessionId: String,
+        branchId: String?,
+        runId: String?,
+        origin: String,
+        sourceCheckpointId: String?,
+        paths: List<CheckpointPathView>,
+    ): CheckpointView {
+        nextCheckpointSeq += 1
+        return CheckpointView(
+            checkpointId = "checkpoint-$origin-$nextCheckpointSeq",
+            sessionId = sessionId,
+            branchId = branchId,
+            runId = runId,
+            effectId = "effect-$nextCheckpointSeq",
+            callId = "call-$nextCheckpointSeq",
+            seq = SEED_SEQ_BASE + nextCheckpointSeq,
+            workspaceRevision = "workspace-$nextCheckpointSeq",
+            kind = CheckpointCategory.of("write", CHECKPOINT_KINDS),
+            origin = CheckpointCategory.of(origin, CHECKPOINT_ORIGINS),
+            sourceCheckpointId = sourceCheckpointId,
+            paths = paths,
+            postDigest = "blake3:post-$nextCheckpointSeq",
+            recordedAtMs = nowMs,
+        )
+    }
+
+    /**
+     * Two turns' worth of durable edits, plus the two honest edge cases the
+     * sheet has to render: an entry whose pre-image was too large to freeze,
+     * and an entry whose `kind` this client does not recognise.
+     */
+    private fun seededJournal(sessionId: String): MutableList<CheckpointView> {
+        if (sessionId != "s-nav") return mutableListOf()
+        nextCheckpointSeq = maxOf(nextCheckpointSeq, 5)
+        fun row(
+            index: Int,
+            run: String,
+            kind: String,
+            origin: String,
+            paths: List<CheckpointPathView>,
+        ) = CheckpointView(
+            checkpointId = "checkpoint-nav-$index",
+            sessionId = sessionId,
+            branchId = null,
+            runId = run,
+            effectId = "effect-nav-$index",
+            callId = "call-nav-$index",
+            seq = SEED_SEQ_BASE + index,
+            workspaceRevision = "workspace-nav-$index",
+            kind = CheckpointCategory.of(kind, CHECKPOINT_KINDS),
+            origin = CheckpointCategory.of(origin, CHECKPOINT_ORIGINS),
+            sourceCheckpointId = null,
+            paths = paths,
+            postDigest = "blake3:nav-$index",
+            recordedAtMs = nowMs - (6 - index) * 60_000L,
+        )
+        return mutableListOf(
+            row(
+                1, "run-nav-1", "create", "tool",
+                listOf(CheckpointPathView("app/src/main/java/NavHost.kt", postDigest = "blake3:a")),
+            ),
+            row(
+                2, "run-nav-1", "edit", "tool",
+                listOf(
+                    CheckpointPathView(
+                        "app/src/main/java/NavHost.kt",
+                        preDigest = "blake3:a",
+                        postDigest = "blake3:b",
+                        preArtifact = "blake3:artifact-a",
+                    ),
+                ),
+            ),
+            row(
+                3, "run-nav-2", "write", "tool",
+                listOf(
+                    CheckpointPathView(
+                        "app/src/main/assets/dump.bin",
+                        preDigest = "blake3:big",
+                        postDigest = "blake3:big-post",
+                        truncatedReason = "pre-image exceeds 8388608 bytes",
+                    ),
+                ),
+            ),
+            row(
+                4, "run-nav-2", "delete", "tool",
+                listOf(CheckpointPathView("app/src/main/java/Legacy.kt", preDigest = "blake3:c")),
+            ),
+            // A kind this client does not know. It renders the daemon's own
+            // word and says it does not recognise it, rather than dropping the
+            // row or folding it into a neighbour.
+            row(5, "run-nav-2", "rename", "tool", emptyList()),
+        )
+    }
+
     companion object {
         /** Bounds a runaway cursor rather than paging forever. */
         const val MAX_SEARCH_PAGES = 64
+
+        /** The generation every seeded checkpoint receipt is fenced against. */
+        const val WORKER_GENERATION: Long = 6
+
+        /** Journal sequences start well above zero; zero is a producer placeholder. */
+        const val SEED_SEQ_BASE: Long = 400
 
         /** A fixed wall clock so screenshots are byte-stable. */
         const val FIXED_NOW: Long = 1_772_000_000_000L

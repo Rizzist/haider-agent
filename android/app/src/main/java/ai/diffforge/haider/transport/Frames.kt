@@ -63,6 +63,16 @@ data class SessionProvider(
     val availabilityReason: String?,
     val defaultModel: String?,
     val models: List<SessionModel>,
+    /**
+     * `ProviderSummaryWire.inventory_authority` (frame.rs:1226) — whether the
+     * published list is the last word on which model ids exist.
+     *
+     * "advisory" is a user-configured, OpenAI-compatible server whose
+     * `/v1/models` commonly omits ids its chat wire still accepts, so a model
+     * outside the list may be selected. Absent stays "unknown", which is
+     * conservative: an older summary that said nothing does not license one.
+     */
+    val inventoryAuthority: String = "unknown",
 )
 
 data class SessionConfig(

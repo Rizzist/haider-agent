@@ -222,6 +222,7 @@
     <string name="accounts_add">Add account</string>
     <string name="accounts_option_api_key">API key</string>
     <string name="accounts_option_sign_in">Sign in with a provider</string>
+    <string name="accounts_option_custom_server">Add a custom server</string>
     <string name="accounts_delete_confirm">Remove this account? Haider will stop using it immediately.</string>
     <string name="start_composer_disabled">Start Haider to begin</string>
     <string name="settings_permission_accessibility">Accessibility</string>
@@ -270,6 +271,86 @@
     <string name="accounts_key_never_leaves">The key is stored in the on-device vault. It is never written to a log or a transcript.</string>
     <string name="accounts_key_staged">Held in the vault, not checked yet. Save to sign in, or Cancel to discard it.</string>
     <string name="accounts_key_signing_in">Signing in…</string>
+
+    <!-- Custom servers -->
+    <string name="accounts_custom_title">Custom server</string>
+    <string name="accounts_custom_name">Name</string>
+    <string name="accounts_custom_name_invalid">A name without spaces, please — it is also the account alias.</string>
+    <string name="accounts_custom_origin">Base URL</string>
+    <string name="accounts_custom_auth">Authentication</string>
+    <string name="accounts_custom_auth_key">API key</string>
+    <string name="accounts_custom_auth_none">No auth</string>
+    <string name="accounts_custom_family">API flavour</string>
+    <string name="accounts_custom_key_probe">The key goes to the on-device vault first, and is only borrowed to read the server\'s model list.</string>
+    <string name="accounts_custom_keyless">No credential is stored for a server that does not ask for one.</string>
+    <string name="accounts_custom_probing">Reading the server\'s model list…</string>
+    <string name="accounts_custom_creating">Creating the server…</string>
+    <string name="accounts_custom_discover">Discover models</string>
+    <string name="accounts_custom_create">Add server</string>
+    <string name="accounts_custom_model">Model</string>
+    <string name="accounts_custom_model_manual">Model id</string>
+
+    <!-- Custom model ids -->
+    <string name="model_custom_entry">Custom model…</string>
+    <string name="model_custom_field">Model id</string>
+    <string name="model_custom_hint">This server accepts ids its list does not carry, so a passthrough id is worth trying.</string>
+    <string name="model_custom_use">Use this model</string>
+    <string name="model_refusal_terminal">Confirming will not change this: the daemon refused the row itself.</string>
+    <string name="model_refusal_unknown">%1$s is not in %2$s\'s known model list.</string>
+    <string name="model_refusal_provider">%1$s cannot be created on this daemon.</string>
+    <string name="model_refusal_keep">Keep the current one</string>
+    <string name="model_refusal_confirm">Change it anyway</string>
+    <string name="model_refusal_close">Close</string>
+    <string name="model_refusal_title">The daemon refused that change</string>
+
+    <!-- Checkpoints and branches -->
+    <string name="checkpoints_title">Checkpoints</string>
+    <string name="checkpoints_subtitle">Durable workspace edits, newest first</string>
+    <string name="checkpoints_unavailable">This daemon does not keep a checkpoint timeline.</string>
+    <string name="checkpoints_empty">No checkpoints yet.</string>
+    <string name="checkpoints_loading">Reading the checkpoint timeline…</string>
+    <string name="checkpoints_end">No more checkpoints.</string>
+    <string name="checkpoints_more">Load more</string>
+    <string name="checkpoints_cursor_invalid">The next page marker was not a position, so paging stopped here.</string>
+    <string name="checkpoints_seq">Entry %1$d</string>
+    <string name="checkpoints_seq_absent">Position not published</string>
+    <string name="checkpoints_unrecognised">%1$s (this app does not know that %2$s)</string>
+    <string name="checkpoints_absent">not published</string>
+    <string name="checkpoints_kind">Kind</string>
+    <string name="checkpoints_origin">Origin</string>
+    <string name="checkpoints_paths">Touched paths</string>
+    <string name="checkpoints_paths_absent">Touched paths not published.</string>
+    <string name="checkpoints_path_truncated">%1$s — no pre-image was frozen: %2$s</string>
+    <string name="checkpoints_turn">This turn</string>
+    <string name="checkpoints_turn_absent">Run not published — this turn cannot be rolled back.</string>
+    <string name="checkpoints_undo">Undo</string>
+    <string name="checkpoints_redo">Redo</string>
+    <string name="checkpoints_rollback">Roll back this turn</string>
+    <string name="checkpoints_refresh">Refresh</string>
+    <string name="checkpoints_no_id">This entry carries no id, so it cannot be undone or redone.</string>
+    <string name="checkpoints_confirm_undo">Undo this edit? The files it changed go back to the bytes it froze.</string>
+    <string name="checkpoints_confirm_redo">Redo this edit? The files go back to what the entry produced.</string>
+    <string name="checkpoints_confirm_rollback">Roll back this whole turn? Every durable edit the run made is restored at once, or none of them is.</string>
+    <string name="checkpoints_confirm_yes">Yes, do it</string>
+    <string name="checkpoints_conflict">The workspace moved under this entry, so nothing was changed.</string>
+    <string name="checkpoints_conflict_path">Path</string>
+    <string name="checkpoints_conflict_expected">Expected</string>
+    <string name="checkpoints_conflict_current">Now</string>
+    <string name="checkpoints_rollback_conflict">Nothing was restored. %1$d path matched and %2$d moved underneath.</string>
+    <string name="checkpoints_branch_mismatch">That entry belongs to another branch, so it was not applied here.</string>
+    <string name="checkpoints_receipt">Done. The daemon restored %1$d entry.</string>
+    <string name="checkpoints_receipt_none">Done. The daemon restored no entries.</string>
+    <string name="checkpoints_failed">The checkpoint action failed — %1$s</string>
+    <string name="branches_title">Branches</string>
+    <string name="branches_main">Main</string>
+    <string name="branches_switch_hint">The branch you pick here carries on the next message you send.</string>
+    <string name="branches_current">In use</string>
+    <string name="branches_create">New branch from here</string>
+    <string name="branches_name">Branch name</string>
+    <string name="branches_no_fork_point">This session has no published head node, so there is nothing to branch from yet.</string>
+    <string name="branches_fork_point">A branch forks at an exact committed node. Checkpoints record file changes and carry no node, so a new branch starts at this session\'s head.</string>
+    <string name="branches_head">Head %1$d</string>
+    <string name="action_checkpoints">Checkpoints and branches</string>
 
     <!-- Content descriptions -->
     <string name="cd_open_sessions">Open sessions</string>

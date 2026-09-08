@@ -184,6 +184,103 @@ class FakeAccountsRepository(
         calls += AccountsRpcAdapter.METHOD_PROVIDER_LIST
     }
 
+    // ---------- custom servers ----------
+
+    private val _providerRevision = MutableStateFlow<Long?>(PROVIDER_SEED_REVISION)
+    override val providerRevision: StateFlow<Long?> = _providerRevision.asStateFlow()
+
+    /** What the next probe answers. Default: a router that lists two ids. */
+    var nextProbe: CustomModelsProbe = CustomModelsProbe.Models(
+        models = listOf("router-fast", "router-deep"),
+        defaultModel = "router-deep",
+    )
+
+    /** Every reference a probe was handed, so a test can prove it was borrowed. */
+    val probedReferences = mutableListOf<String?>()
+
+    /**
+     * Holds the probe open, so a test can abandon the attempt while discovery
+     * is still out — the window the TUI's abandoned-reply pin covers.
+     */
+    private val probeGate = CompletableDeferred<Unit>()
+    var holdProbe = false
+
+    fun releaseProbe() {
+        probeGate.complete(Unit)
+    }
+
+    /** The `provider.configure` bodies this fake accepted, as public coordinates. */
+    val configured = mutableListOf<ConfiguredProvider>()
+
+    data class ConfiguredProvider(
+        val provider: String,
+        val origin: String,
+        val apiFamily: String,
+        val authRequirement: String,
+        val models: List<String>,
+        val defaultModel: String?,
+        val expectedRevision: Long,
+    )
+
+    override suspend fun probeCustomModels(
+        provider: String,
+        origin: String,
+        apiFamily: String,
+        keyless: Boolean,
+        probeVaultReference: String?,
+    ): CustomModelsProbe {
+        calls += AccountsRpcAdapter.METHOD_PROVIDER_MODELS_PROBE
+        probedReferences += probeVaultReference
+        if (holdProbe) probeGate.await()
+        // The probe BORROWS the stage. A staged reference is still claimable by
+        // `account.login_api` afterwards, so it is deliberately not removed.
+        return nextProbe
+    }
+
+    override suspend fun configureCustomProvider(
+        provider: String,
+        origin: String,
+        apiFamily: String,
+        authRequirement: String,
+        models: List<String>,
+        defaultModel: String?,
+        expectedRevision: Long,
+    ): AccountResult {
+        calls += AccountsRpcAdapter.METHOD_PROVIDER_CONFIGURE
+        nextFailure?.let { nextFailure = null; return AccountResult.Failed(it) }
+        // The daemon refuses an enabled create with no inventory and no default.
+        if (models.isEmpty() || defaultModel.isNullOrBlank()) {
+            return AccountResult.Failed("provider_inventory_required")
+        }
+        val current = _providerRevision.value ?: PROVIDER_SEED_REVISION
+        if (expectedRevision != current) return AccountResult.Failed("provider_revision_conflict")
+        configured += ConfiguredProvider(
+            provider = provider,
+            origin = origin,
+            apiFamily = apiFamily,
+            authRequirement = authRequirement,
+            models = models,
+            defaultModel = defaultModel,
+            expectedRevision = expectedRevision,
+        )
+        _providerRevision.value = current + 1
+        _providers.value = _providers.value.filterNot { it.id == provider } + ProviderDescriptor(
+            id = provider,
+            label = provider,
+            supportsApiKey = authRequirement == CustomAuthMode.ApiKey.wire,
+            supportsOAuth = false,
+            models = models,
+            defaultModel = defaultModel,
+            apiFamily = apiFamily,
+            // A user-configured compatible server publishes an ADVISORY
+            // inventory: routers routinely omit valid passthrough ids, so a
+            // model the list does not carry may still be selectable.
+            inventoryAuthority = ModelInventoryAuthority.Advisory,
+            endpoint = origin,
+        )
+        return AccountResult.Ok
+    }
+
     override suspend fun startOAuth(
         provider: String,
         desiredAlias: String?,
@@ -256,6 +353,9 @@ class FakeAccountsRepository(
     companion object {
         /** The installed fixture's own revision; never a stand-in for absence. */
         const val SEED_REVISION = 1L
+
+        /** The `provider.list` revision the seeded provider fixture was read at. */
+        const val PROVIDER_SEED_REVISION = 7L
         const val VALIDATE_ONLY_UNAVAILABLE = "validate_only_unavailable"
 
         const val MIN_KEY_LENGTH = 12

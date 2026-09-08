@@ -1,5 +1,12 @@
 package ai.diffforge.haider.ui.chat
 
+import ai.diffforge.haider.ui.checkpoints.BranchOutcome
+import ai.diffforge.haider.ui.checkpoints.CheckpointCursorState
+import ai.diffforge.haider.ui.checkpoints.CheckpointGesture
+import ai.diffforge.haider.ui.checkpoints.CheckpointListResult
+import ai.diffforge.haider.ui.checkpoints.CheckpointOutcome
+import ai.diffforge.haider.ui.checkpoints.Checkpoints
+import ai.diffforge.haider.ui.checkpoints.CheckpointsUiState
 import ai.diffforge.haider.ui.daemon.DaemonService
 import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.daemon.MissingRunCoordinates
@@ -131,6 +138,11 @@ class ChatViewModel(
         }
         viewModelScope.launch {
             service.permissionMode.collect { mode -> update { it.copy(permissionMode = mode) } }
+        }
+        viewModelScope.launch {
+            service.branchSelection.collect { selection ->
+                update { it.copy(branchSelection = selection) }
+            }
         }
     }
 
@@ -378,6 +390,179 @@ class ChatViewModel(
         update { it.copy(selectionBusy = false) }
     }
 
+    // ---------- checkpoints and branches ----------
+
+    /**
+     * Opens the sheet and reads the timeline from authority.
+     *
+     * The state is replaced, not merged: a page read for the session that was
+     * open before must never be rendered under this one's title.
+     */
+    fun openCheckpoints(sessionId: String) {
+        update {
+            it.copy(
+                overlay = Overlay.Checkpoints(sessionId),
+                checkpoints = CheckpointsUiState(sessionId = sessionId, loading = true),
+            )
+        }
+        loadCheckpoints(sessionId)
+    }
+
+    fun openBranches(sessionId: String) = openOverlay(Overlay.Branches(sessionId))
+
+    /** Re-reads the first page. Every mutation ends here rather than editing rows. */
+    fun loadCheckpoints(sessionId: String, cursor: Long? = null) = viewModelScope.launch {
+        // Even the spinner belongs to the session it was asked for: a read for
+        // a session the sheet has left must not make this one look busy.
+        update {
+            if (it.checkpoints.sessionId != sessionId) {
+                it
+            } else {
+                it.copy(checkpoints = it.checkpoints.copy(loading = true))
+            }
+        }
+        val branch = _state.value.branchSelection[sessionId]
+        val result = service.checkpoints(sessionId, branch, cursor)
+        update { current ->
+            // A page that came back for a session the sheet has since left is
+            // dropped, not shown.
+            if (current.checkpoints.sessionId != sessionId) return@update current
+            current.copy(
+                checkpoints = when (result) {
+                    is CheckpointListResult.Page -> current.checkpoints.copy(
+                        rows = if (cursor == null) {
+                            result.page.checkpoints
+                        } else {
+                            Checkpoints.merge(current.checkpoints.rows.orEmpty(), result.page.checkpoints)
+                        },
+                        nextCursor = result.page.nextCursor,
+                        cursorState = result.page.cursorState,
+                        loading = false,
+                        unavailable = null,
+                        error = null,
+                        // A successful re-read is how a conflict is dismissed,
+                        // after the person has looked at the moved workspace.
+                        conflict = null,
+                        rollbackConflict = null,
+                        branchMismatch = null,
+                    )
+                    is CheckpointListResult.Unavailable -> current.checkpoints.copy(
+                        loading = false,
+                        unavailable = result.reason,
+                    )
+                    is CheckpointListResult.Failed -> current.checkpoints.copy(
+                        loading = false,
+                        error = result.code,
+                    )
+                },
+            )
+        }
+    }
+
+    fun loadMoreCheckpoints() {
+        val state = _state.value.checkpoints
+        val sessionId = state.sessionId ?: return
+        if (state.loading || state.busy) return
+        if (state.cursorState != CheckpointCursorState.More) return
+        loadCheckpoints(sessionId, state.nextCursor ?: return)
+    }
+
+    /** Nothing destructive happens on one tap: the gesture waits for a confirm. */
+    fun confirmCheckpointGesture(gesture: CheckpointGesture?) =
+        update { it.copy(checkpoints = it.checkpoints.copy(confirming = gesture)) }
+
+    /** Runs the confirmed gesture, then re-reads the timeline from authority. */
+    fun applyCheckpointGesture() = viewModelScope.launch {
+        val state = _state.value.checkpoints
+        val sessionId = state.sessionId ?: return@launch
+        val gesture = state.confirming ?: return@launch
+        val branch = _state.value.branchSelection[sessionId]
+        update {
+            it.copy(
+                checkpoints = it.checkpoints.clearedOutcome().copy(
+                    pending = gesture,
+                    confirming = null,
+                ),
+            )
+        }
+        val outcome = when (gesture) {
+            is CheckpointGesture.Undo -> service.undoCheckpoint(sessionId, gesture.target, branch)
+            is CheckpointGesture.Redo -> service.redoCheckpoint(sessionId, gesture.target, branch)
+            is CheckpointGesture.Rollback -> service.rollbackTurn(sessionId, gesture.runId, branch)
+        }
+        var committed = false
+        update { current ->
+            if (current.checkpoints.sessionId != sessionId) return@update current
+            val next = when (outcome) {
+                is CheckpointOutcome.Committed -> {
+                    committed = true
+                    current.checkpoints.copy(receipt = outcome.receipt)
+                }
+                is CheckpointOutcome.Conflict -> current.checkpoints.copy(conflict = outcome.conflict)
+                is CheckpointOutcome.RollbackConflict ->
+                    current.checkpoints.copy(rollbackConflict = outcome.conflict)
+                is CheckpointOutcome.BranchMismatch ->
+                    current.checkpoints.copy(branchMismatch = outcome.mismatch)
+                is CheckpointOutcome.Unavailable ->
+                    current.checkpoints.copy(unavailable = outcome.reason)
+                is CheckpointOutcome.Failed -> current.checkpoints.copy(error = outcome.code)
+            }
+            current.copy(checkpoints = next.copy(pending = null))
+        }
+        // Only a committed receipt licenses a re-read. A conflict is terminal
+        // for the gesture, and re-reading here would clear the very notice the
+        // person has not seen yet.
+        if (committed) loadCheckpoints(sessionId)
+    }
+
+    /**
+     * Chooses the branch this session's next turn is submitted on.
+     *
+     * There is no `branch.switch` on the wire: nothing already committed moves.
+     * The timeline is re-read because `checkpoint.list` is branch-scoped.
+     */
+    fun selectBranch(sessionId: String, branchId: String?) = viewModelScope.launch {
+        service.selectBranch(sessionId, branchId)
+        if (_state.value.checkpoints.sessionId == sessionId) {
+            update { it.copy(checkpoints = it.checkpoints.copy(rows = null, loading = true)) }
+            loadCheckpoints(sessionId)
+        }
+    }
+
+    /**
+     * `branch.create` at the row's own published head node.
+     *
+     * A row with no head node has nothing to fork from, and half a coordinate
+     * is not sent: the sheet says so instead.
+     */
+    fun createBranch(sessionId: String, name: String) = viewModelScope.launch {
+        val row = session(sessionId) ?: return@launch
+        val node = row.mainHeadNodeId
+        if (node == null) {
+            update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = NO_FORK_POINT)) }
+            return@launch
+        }
+        val outcome = service.createBranch(
+            sessionId = sessionId,
+            forkNodeId = node,
+            forkSeq = row.mainHeadSeq,
+            name = name.trim().ifBlank { null },
+            sourceBranchId = _state.value.branchSelection[sessionId],
+        )
+        when (outcome) {
+            is BranchOutcome.Created -> {
+                update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = null)) }
+                // Created is not selected: the next turn moves only because
+                // somebody chose it, which is the same rule the refusal path has.
+                service.refreshRoster()
+            }
+            is BranchOutcome.Unavailable ->
+                update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = outcome.reason)) }
+            is BranchOutcome.Failed ->
+                update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = outcome.code)) }
+        }
+    }
+
     // ---------- surfaces ----------
 
     fun openOverlay(overlay: Overlay) = update { it.copy(overlay = overlay) }
@@ -532,6 +717,13 @@ class ChatViewModel(
          * (lane 971-3 handoff).
          */
         const val ALREADY_RESOLVED = "already_resolved"
+
+        /**
+         * Stated when a branch was asked for at a session with no published
+         * head node. `branch.create` needs an exact `(fork_node_id, fork_seq)`
+         * pair from one fact, so half of it is not sent.
+         */
+        const val NO_FORK_POINT = "branch_fork_point_unpublished"
 
         fun factory(
             service: DaemonService,

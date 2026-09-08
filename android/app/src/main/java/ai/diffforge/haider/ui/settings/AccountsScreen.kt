@@ -4,7 +4,11 @@ import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.accounts.Account
 import ai.diffforge.haider.ui.accounts.AccountResult
 import ai.diffforge.haider.ui.accounts.AccountsRepository
+import ai.diffforge.haider.ui.accounts.AddAccountForm
+import ai.diffforge.haider.ui.accounts.AddAccountFormPolicy
 import ai.diffforge.haider.ui.accounts.AuthKind
+import ai.diffforge.haider.ui.accounts.CustomAuthMode
+import ai.diffforge.haider.ui.accounts.CustomServerController
 import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.accounts.OAuthStyle
 import ai.diffforge.haider.ui.accounts.ProviderDescriptor
@@ -117,7 +121,7 @@ fun AccountsScreen(
     val attempt by oauth.attempt.collectAsState()
     val controllerNotice by oauth.notice.collectAsState()
 
-    var mode by remember { mutableStateOf(AddMode.None) }
+    var mode by remember { mutableStateOf(AddAccountForm.None) }
     var provider by remember { mutableStateOf<String?>(null) }
     var alias by remember { mutableStateOf("") }
     var keyText by remember { mutableStateOf("") }
@@ -131,22 +135,39 @@ fun AccountsScreen(
     var stagedReference by remember { mutableStateOf<String?>(null) }
     var addSheet by remember { mutableStateOf(false) }
     var openAccount by remember { mutableStateOf<String?>(null) }
-    val notice = localNotice ?: controllerNotice
 
-    // The buffer never outlives the screen, however the screen ends.
+    // The custom-server card runs four doors deep and holds its own key, so it
+    // has its own controller and its own buffer — the API-key form's `secret`
+    // is not shared with it, and neither buffer can outlive its form.
+    val custom = remember(repository) { CustomServerController(repository) }
+    val customForm by custom.form.collectAsState()
+    val customNotice by custom.notice.collectAsState()
+    var customKeyText by remember { mutableStateOf("") }
+    val notice = localNotice ?: customNotice ?: controllerNotice
+
+    // Neither buffer outlives the screen, however the screen ends.
     DisposableEffect(Unit) {
-        onDispose { secret.wipe() }
+        onDispose { secret.wipe(); custom.forget() }
     }
     // A staged key that is validated but never saved says so, so the empty
     // field does not read as "nothing happened".
     val stagedHint = stagedReference != null && keyText.isBlank()
-    // Leaving the API-key form for any reason clears the key with it.
+    // There is one pending add form, ever (971-tui-fixes F1b), and whatever was
+    // typed into the outgoing one goes with it: leaving a form clears its key,
+    // its staged reference and its fields, so a replaced form cannot leave an
+    // abandoned secret behind the one now on screen.
     LaunchedEffect(mode) {
-        if (mode != AddMode.ApiKey) {
+        if (AddAccountFormPolicy.discardsSecret(AddAccountForm.ApiKey, mode)) {
             secret.wipe()
             keyText = ""
             revealKey = false
             stagedReference = null
+        }
+        if (AddAccountFormPolicy.discardsSecret(AddAccountForm.CustomServer, mode)) {
+            custom.close()
+            customKeyText = ""
+        } else if (customForm == null) {
+            custom.open()
         }
     }
     LaunchedEffect(Unit) {
@@ -219,7 +240,7 @@ fun AccountsScreen(
             }
 
             // One action, two options behind it (addition F, A2).
-            if (mode == AddMode.None) {
+            if (mode == AddAccountForm.None) {
                 ForgeButton(
                     text = stringResource(R.string.accounts_add),
                     onClick = { addSheet = true },
@@ -241,9 +262,9 @@ fun AccountsScreen(
             }
 
             when (mode) {
-                AddMode.None -> Unit
+                AddAccountForm.None -> Unit
 
-                AddMode.ApiKey -> Card {
+                AddAccountForm.ApiKey -> Card {
                     ProviderPicker(
                         providers = providers.filter { it.supportsApiKey },
                         selected = provider,
@@ -339,7 +360,7 @@ fun AccountsScreen(
                                     when (result) {
                                         AccountResult.Ok -> {
                                             localNotice = "API key added and validated."
-                                            mode = AddMode.None
+                                            mode = AddAccountForm.None
                                             alias = ""
                                             repository.refresh()
                                         }
@@ -355,7 +376,7 @@ fun AccountsScreen(
                             text = stringResource(R.string.action_cancel),
                             onClick = {
                                 forgetStaging()
-                                mode = AddMode.None
+                                mode = AddAccountForm.None
                             },
                             kind = ForgeButtonKind.Ghost,
                             enabled = !busy,
@@ -367,7 +388,7 @@ fun AccountsScreen(
                 // belongs to a process-scoped controller and outlives the
                 // composition, so a browser return that resets `mode` must not
                 // make a running sign-in disappear (verify-6 O4).
-                AddMode.OAuth -> if (attempt == null) Card {
+                AddAccountForm.SignIn -> if (attempt == null) Card {
                         ProviderPicker(
                             providers = providers.filter { it.supportsOAuth },
                             selected = provider,
@@ -398,6 +419,40 @@ fun AccountsScreen(
                             enabled = provider != null && !busy,
                         )
                 }
+
+                // The custom-server card. Its whole flow lives in the
+                // controller, so this branch only renders what the form says
+                // and hands gestures back — the same split the OAuth panel has.
+                AddAccountForm.CustomServer -> customForm?.let { form ->
+                    Card {
+                        CustomServerCard(
+                            form = form,
+                            keyText = customKeyText,
+                            onKeyText = { value ->
+                                customKeyText = value
+                                custom.setKey(value)
+                            },
+                            onEdit = custom::edit,
+                            onAuthMode = { authMode ->
+                                if (authMode == CustomAuthMode.None) customKeyText = ""
+                                custom.setAuthMode(authMode)
+                            },
+                            onSubmit = {
+                                // The plaintext leaves this screen with the
+                                // gesture that submits it, not when the round
+                                // trip happens to finish.
+                                customKeyText = ""
+                                scope.launch {
+                                    if (custom.submit()) mode = AddAccountForm.None
+                                }
+                            },
+                            onCancel = {
+                                customKeyText = ""
+                                mode = AddAccountForm.None
+                            },
+                        )
+                    }
+                }
             }
         }
     }
@@ -405,8 +460,15 @@ fun AccountsScreen(
     if (addSheet) {
         AddAccountSheet(
             onDismiss = { addSheet = false },
-            onApiKey = { addSheet = false; mode = AddMode.ApiKey; localNotice = null },
-            onSignIn = { addSheet = false; mode = AddMode.OAuth; localNotice = null },
+            onApiKey = { addSheet = false; mode = AddAccountForm.ApiKey; localNotice = null },
+            onSignIn = { addSheet = false; mode = AddAccountForm.SignIn; localNotice = null },
+            onCustomServer = {
+                addSheet = false
+                // Opening the card replaces any pending form, and the effect on
+                // `mode` wipes what the outgoing one was holding.
+                mode = AddAccountFormPolicy.open(AddAccountForm.CustomServer)
+                localNotice = null
+            },
         )
     }
     openAccount?.let { alias ->
@@ -443,13 +505,14 @@ fun AccountsScreen(
     }
 }
 
-/** The one Add action's two options. */
+/** The one Add action's three options. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddAccountSheet(
     onDismiss: () -> Unit,
     onApiKey: () -> Unit,
     onSignIn: () -> Unit,
+    onCustomServer: () -> Unit,
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -467,6 +530,7 @@ private fun AddAccountSheet(
             listOf(
                 stringResource(R.string.accounts_option_api_key) to onApiKey,
                 stringResource(R.string.accounts_option_sign_in) to onSignIn,
+                stringResource(R.string.accounts_option_custom_server) to onCustomServer,
             ).forEach { (label, action) ->
                 Row(
                     modifier = Modifier
@@ -484,8 +548,6 @@ private fun AddAccountSheet(
         }
     }
 }
-
-private enum class AddMode { None, ApiKey, OAuth }
 
 /**
  * Provider glyph, label, identity line, and a check when it is the one in use.
@@ -651,7 +713,7 @@ private fun ProviderPicker(
 }
 
 @Composable
-private fun LabelledField(
+internal fun LabelledField(
     label: String,
     value: String,
     onValueChange: (String) -> Unit,
