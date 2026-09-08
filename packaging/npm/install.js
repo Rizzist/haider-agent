@@ -40,7 +40,14 @@ function downloadAttemptMs(maxBytes) {
   return (FETCH_CONNECT_SECONDS + Math.ceil(maxBytes / FETCH_TRANSFER_BYTES_PER_SECOND)) * 1000;
 }
 
-async function download(url, { maxBytes = FETCH_ARCHIVE_BYTES, attemptMs = downloadAttemptMs(maxBytes), get = https.get } = {}) {
+async function download(url, {
+  maxBytes = FETCH_ARCHIVE_BYTES,
+  attemptMs = downloadAttemptMs(maxBytes),
+  get = https.get,
+  // Tests can expire a deadline after observing real network events.
+  setTimeout: scheduleTimeout = setTimeout,
+  clearTimeout: cancelTimeout = clearTimeout
+} = {}) {
   let lastError;
   for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
     try {
@@ -52,14 +59,14 @@ async function download(url, { maxBytes = FETCH_ARCHIVE_BYTES, attemptMs = downl
         const finish = (error, value) => {
           if (settled) return;
           settled = true;
-          clearTimeout(timer);
+          cancelTimeout(timer);
           // Includes every redirect body, even when it never ends. Replacing
           // only the latest request would leave earlier sockets alive.
           for (const resource of resources) resource.destroy();
           if (error) reject(error);
           else resolve(value);
         };
-        const timer = setTimeout(() => finish(new Error(`Download attempt timed out for ${url}`)), attemptMs);
+        const timer = scheduleTimeout(() => finish(new Error(`Download attempt timed out for ${url}`)), attemptMs);
         const visit = (currentUrl, redirects) => {
           if (settled) return;
           try {

@@ -1,18 +1,23 @@
 name: ship-gate
 on:
   workflow_call:
+    outputs:
+      artifact_run_id:
+        description: Run holding the exact-SHA unsigned macOS release artifact
+        value: ${{ jobs.verdict.outputs.artifact_run_id }}
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [wave-*, main]
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  # Static workflow name avoids sharing the caller's group when release.yml
-  # invokes this reusable workflow.
-  group: ship-gate-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+  # Serialize the same candidate across wave/main/reusable calls, then reuse
+  # completed evidence. Never cancel the measurement that a tag is waiting on.
+  group: ship-gate-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,7 +25,24 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+  reuse:
+    name: completed ship-gate evidence for this SHA
+    runs-on: ubuntu-latest
+    outputs:
+      satisfied: ${{ steps.lookup.outputs.satisfied }}
+      artifact_run_id: ${{ steps.lookup.outputs.artifact_run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA"
+          --artifact "release-build-aarch64-apple-darwin-$GITHUB_SHA"
+
   evidence:
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
     name: exact-SHA cross-platform and CI evidence
     runs-on: ubuntu-latest
     # 2 workflows * 120 polls * 60 s = 240 min, plus 5 min setup/API margin.
@@ -36,8 +58,37 @@ jobs:
           EVIDENCE_SHA: ${{ github.sha }}
         run: bash scripts/release/require-evidence.sh "$EVIDENCE_SHA"
 
+  build-macos-release:
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
+    name: shared macOS release build (aarch64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        run: bash scripts/check-unsafe-counts.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-release-aarch64
+      - name: build unsigned release payload
+        run: |
+          source scripts/release/macos-release-env.sh
+          cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target aarch64-apple-darwin
+          python3 scripts/release/macos-build-artifact.py pack --sha "$GITHUB_SHA" --bundle release-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-build-aarch64-apple-darwin-${{ github.sha }}
+          path: release-build/
+          if-no-files-found: error
+          retention-days: 14
+
   behaviour:
-    needs: evidence
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
     name: probe ladder (demo + live, CI profile)
     runs-on: macos-15
     steps:
@@ -63,7 +114,8 @@ jobs:
               "$GITHUB_WORKSPACE/target/ci/haiderd"
 
   render-benchmark:
-    needs: evidence
+    needs: reuse
+    if: needs.reuse.outputs.satisfied != 'true'
     name: render benchmark (true release profile)
     runs-on: macos-15
     steps:
@@ -76,15 +128,15 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-ship-render-release-profile
+          shared-key: macos-release-aarch64
       # Ledger row 17 is a shape gate: first and cached frames fit 33 ms at
       # 10k/50k/200k, with the curve flat in N. This job deliberately stays
       # --release; debug builds announce a timing SKIP.
       - name: virtual transcript shape (release — ledger row 17)
-        run: cargo test --release -p haider-tui --test tuivirt_shape_bench_tests --locked -- --nocapture
+        run: cargo test --release --target aarch64-apple-darwin -p haider-tui --test tuivirt_shape_bench_tests --locked -- --nocapture
 
   daemon-footprint:
-    needs: evidence
+    needs: build-macos-release
     name: daemon footprint budget (release profile)
     runs-on: macos-15
     steps:
@@ -98,18 +150,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-ship-daemon-footprint-release-profile
-      - name: build daemon and deterministic footprint driver
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-aarch64-apple-darwin-${{ github.sha }}
+          path: release-build
+      - name: verify and restore unsigned release payload
+        run: |
+          source scripts/release/macos-release-env.sh
+          python3 scripts/release/macos-build-artifact.py restore --sha "$GITHUB_SHA" --bundle release-build
+      - name: build deterministic footprint driver
         env:
           RUST_MIN_STACK: 8388608
           HAIDER_DISCOVERY_DISABLED: 1
           HAIDER_TEST_DEVICE_NAME: test-mac
         run: |
-          cargo build --release --locked -p haider-daemond
           cargo build --locked -p haider-client --example memdaemon_workload
       - name: enforce settled daemon footprint budgets
         run: >-
           python3 scripts/perf/daemon-footprint-budget.py
-          --daemon "$GITHUB_WORKSPACE/target/release/haiderd"
+          --daemon "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/haiderd"
           --driver "$GITHUB_WORKSPACE/target/debug/examples/memdaemon_workload"
           --output "$GITHUB_WORKSPACE/target/daemon-footprint/measurement.json"
           --artifacts-dir "$GITHUB_WORKSPACE/target/daemon-footprint/process-reports"
@@ -123,14 +182,14 @@ jobs:
           retention-days: 14
 
   client-footprint:
-    needs: evidence
+    needs: build-macos-release
     name: client footprint (settled macOS release)
     # Registry #80: typed run terminality is distinct from aggregate session
     # settlement. TODO(2026-09-02): after three consecutive green runs of this
-    # job on main, land a follow-up that removes continue-on-error and records
+    # measurement on main, remove its step-level continue-on-error and record
     # those run IDs in docs/testing/v0.0.970/cfbcal.md. Tag/reusable runs do not
     # count toward the three-run registry note.
-    continue-on-error: true
+    # Setup/download/integrity are required; only the budget stays advisory.
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -145,15 +204,19 @@ jobs:
           shared-key: macos-ship-client-footprint-release-profile
       - name: footprint harness self-test
         run: python3 scripts/perf/client-footprint-budget.py --self-test
-      - name: build release client and daemon
-        env:
-          RUST_MIN_STACK: 8388608
-          HAIDER_DISCOVERY_DISABLED: 1
-          HAIDER_TEST_DEVICE_NAME: test-mac
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-aarch64-apple-darwin-${{ github.sha }}
+          path: release-build
+      - name: verify and restore unsigned release payload
         run: |
-          cargo build --release -p haider-cli -p haider-daemond -p haider-tui-exe --locked
-          test "$(stat -f %z target/release/haiderd)" -gt 10485760
+          source scripts/release/macos-release-env.sh
+          python3 scripts/release/macos-build-artifact.py restore --sha "$GITHUB_SHA" --bundle release-build
+      - name: require a full release daemon
+        run: test "$(stat -f %z target/aarch64-apple-darwin/release/haiderd)" -gt 10485760
       - name: calibrate and enforce settled client footprint budgets (N=5)
+        id: measurement
+        continue-on-error: true
         run: |
           mkdir -p "$RUNNER_TEMP/client-footprint"
           failures=0
@@ -162,7 +225,7 @@ jobs:
             local output="$2"
             local budget="$3"
             if ! python3 scripts/perf/client-footprint-budget.py \
-              --haider target/release/haider \
+              --haider target/aarch64-apple-darwin/release/haider \
               --surface "$surface" \
               --output "$RUNNER_TEMP/client-footprint/$output" \
               --calibrate \
@@ -183,6 +246,12 @@ jobs:
             echo "$failures client-footprint surface(s) failed; available calibration evidence was retained" >&2
             exit 1
           fi
+      - name: record advisory client measurement outcome
+        if: always()
+        env:
+          MEASUREMENT_OUTCOME: ${{ steps.measurement.outcome }}
+        run: |
+          echo "Client footprint measurement outcome: $MEASUREMENT_OUTCOME (registry #80 advisory)" >> "$GITHUB_STEP_SUMMARY"
       - name: upload footprint evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -191,3 +260,28 @@ jobs:
           path: ${{ runner.temp }}/client-footprint
           if-no-files-found: error
           retention-days: 90
+
+  verdict:
+    name: verdict
+    if: always()
+    needs: [reuse, evidence, build-macos-release, behaviour, render-benchmark, daemon-footprint, client-footprint]
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_run_id: ${{ steps.verdict.outputs.artifact_run_id }}
+    steps:
+      - name: require every gate or completed exact-SHA reuse
+        id: verdict
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          REUSED: ${{ needs.reuse.outputs.satisfied }}
+          ARTIFACT_RUN_ID: ${{ needs.reuse.outputs.artifact_run_id }}
+        run: |
+          if [ "$REUSED" = true ]; then
+            jq -e '.reuse.result == "success"' <<< "$RESULTS"
+          else
+            # Skipped/cancelled dependencies are failures too. The existing
+            # client measurement retains its registry-#80 advisory policy.
+            jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+            ARTIFACT_RUN_ID="$GITHUB_RUN_ID"
+          fi
+          echo "artifact_run_id=$ARTIFACT_RUN_ID" >> "$GITHUB_OUTPUT"

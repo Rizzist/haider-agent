@@ -85,34 +85,117 @@ def fake_download_environment(root: Path, prefix: Path, version: str) -> dict[st
 
 class DownloadBudgetTests(unittest.TestCase):
     def test_npm_stalled_body_and_redirects_share_each_attempt_deadline(self):
+        attempt_ms = 400
+        attempts = 2
+        # Only a deadlock watchdog uses wall time, with 10x the total budget.
+        watchdog_ms = attempt_ms * attempts * 10
         code = r'''
 const assert = require('assert');
 const http = require('http');
 const {download} = require(process.argv[1]);
+const attemptMs = Number(process.argv[2]);
+const attempts = Number(process.argv[3]);
+const watchdogMs = Number(process.argv[4]);
 (async () => {
-  let requests = 0;
+  const requests = [];
+  const timers = [];
+  const pending = new Set();
+  const requestTimers = [];
+  const responseTimers = [];
+  const expired = [];
+  const clientResources = [];
   const sockets = new Set();
+  const socketClosures = [];
+  let closedSockets = 0;
+  const pendingIds = () => Array.from(pending, timer => timer.id);
+  const state = () => JSON.stringify({requests, requestTimers, responseTimers, expired,
+    timers: timers.map(({id, delay}) => ({id, delay})), pending: pendingIds(),
+    openSockets: sockets.size, closedSockets,
+    clientDestroyed: clientResources.map(resource => resource.destroyed)});
   const server = http.createServer((req, res) => {
-    requests++;
+    requests.push(req.url);
     if (req.url === '/redirect') {
-      setTimeout(() => {res.writeHead(302, {location: '/stall'}); res.write('redirect body never ends');}, 15);
+      res.writeHead(302, {location: '/stall'});
+      res.write('redirect body never ends');
     } else {res.writeHead(200); res.write('partial');}
   });
-  server.on('connection', socket => {sockets.add(socket); socket.on('close', () => sockets.delete(socket));});
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socketClosures.push(new Promise(resolve => socket.once('close', () => {
+      sockets.delete(socket);
+      closedSockets++;
+      resolve();
+    })));
+  });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const checkDownload = async () => {
+    await assert.rejects(download(`http://127.0.0.1:${server.address().port}/redirect`, {
+      attemptMs,
+      setTimeout(callback, delay) {
+        const timer = {id: timers.length + 1, callback, delay};
+        timers.push(timer);
+        pending.add(timer);
+        return timer;
+      },
+      clearTimeout(timer) {pending.delete(timer);},
+      get(url, options, onResponse) {
+        requestTimers.push(pendingIds());
+        const timer = timers[timers.length - 1];
+        const request = http.get(url, options, response => {
+          clientResources.push(response);
+          responseTimers.push(pendingIds());
+          onResponse(response);
+          if (response.statusCode === 200) {
+            response.once('data', () => {
+              // The terminal body has arrived and both server responses stay
+              // open. Only this event expires the attempt's original timer;
+              // runner load cannot consume the next attempt's budget.
+              if (pending.has(timer)) {
+                expired.push(timer.id);
+                timer.callback();
+              }
+            });
+          }
+        });
+        clientResources.push(request);
+        return request;
+      }
+    }), /timed out/);
+    const attemptIds = Array.from({length: attempts}, (_, index) => index + 1);
+    const perHopTimers = attemptIds.flatMap(id => [[id], [id]]);
+    assert.deepStrictEqual(requests, attemptIds.flatMap(() => ['/redirect', '/stall']),
+      'exactly two attempts, each following one redirect');
+    assert.deepStrictEqual(timers.map(timer => timer.delay), attemptIds.map(() => attemptMs),
+      'one full deadline must be scheduled per attempt');
+    assert.deepStrictEqual(requestTimers, perHopTimers, 'redirect requests share the original deadline');
+    assert.deepStrictEqual(responseTimers, perHopTimers, 'redirect and terminal bodies share the original deadline');
+    assert.deepStrictEqual(expired, attemptIds, 'each attempt expires only after its terminal body arrives');
+    assert.equal(pending.size, 0, 'settled attempts cancel their timers');
+    assert(clientResources.every(resource => resource.destroyed), 'client resources destroyed before rejection');
+    // Peer close notifications are asynchronous; observe them instead of sleeping.
+    await Promise.all(socketClosures);
+    assert.equal(sockets.size, 0, 'all redirect and terminal sockets must close');
+    assert.equal(closedSockets, attempts * 2, 'each redirect and terminal socket reports closure');
+    console.log(state());
+  };
+  let watchdog;
   try {
-    const start = performance.now();
-    await assert.rejects(download(`http://127.0.0.1:${server.address().port}/redirect`, {get: http.get, attemptMs: 400}), /timed out/);
-    const elapsed = performance.now() - start;
-    assert.equal(requests, 4, 'exactly two attempts, each following one redirect');
-    assert(elapsed < 2400, `attempts exceeded their shared deadline: ${elapsed}`);  // 6x one attempt: two attempts plus setup slack
-    assert(elapsed >= 700, `unexpected early timeout: ${elapsed}`);  // two 400 ms attempts minus scheduler slack
-    await new Promise(resolve => setTimeout(resolve, 30));
-    assert.equal(sockets.size, 0, 'all redirect and terminal sockets must close before return');
-  } finally {for (const socket of sockets) socket.destroy(); server.close();}
+    await Promise.race([checkDownload(), new Promise((_, reject) => {
+      watchdog = setTimeout(() => reject(new Error(`fixture watchdog exceeded ${watchdogMs} ms`)), watchdogMs);
+    })]);
+  } catch (error) {
+    console.error(`download fixture state: ${state()}`);
+    throw error;
+  } finally {
+    clearTimeout(watchdog);
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
 })().catch(error => {console.error(error); process.exitCode = 1;});
 '''
-        result = subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js")], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js"),
+                                 str(attempt_ms), str(attempts), str(watchdog_ms)],
+                                capture_output=True, text=True, timeout=watchdog_ms / 1000 * 2)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_shell_retry_discards_partial_body_and_fetches_resources_concurrently(self):

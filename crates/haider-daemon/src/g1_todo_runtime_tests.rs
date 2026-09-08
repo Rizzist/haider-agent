@@ -31,6 +31,16 @@ use haider_provider::{FakeProvider, FakeStep, MessageRole, Provider, TurnRequest
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
+#[cfg(not(windows))]
+const VERIFIED_COMMAND: &str = "echo verified";
+// `echo` is Write-Output on Windows: its first use imports a PowerShell
+// module. This provenance fixture needs only stdout and a successful exit,
+// so keep it independent of module discovery/initialization on cold runners.
+// Disabling autoload pins that property if the fixture is changed later.
+#[cfg(windows)]
+const VERIFIED_COMMAND: &str =
+    "$PSModuleAutoLoadingPreference='None';[Console]::Out.WriteLine('verified')";
+
 struct FixedProviderFactory {
     provider: Arc<FakeProvider>,
 }
@@ -290,7 +300,10 @@ impl World {
                         EventPayload::ToolResult { call_id, result }
                             if !result.status.is_completed() =>
                         {
-                            return Err(format!("tool {call_id} did not complete: {result:?}"));
+                            return Err(format!(
+                                "tool {call_id} returned status={:?}, reason={:?}: {result:?}",
+                                result.status, result.reason
+                            ));
                         }
                         _ => {}
                     }
@@ -620,7 +633,7 @@ async fn verified_slot_resolves_journal_provenance_with_slim_live_and_replayed_r
         (
             "verify-command",
             "process_exec",
-            serde_json::json!({"command":"echo verified"}),
+            serde_json::json!({"command":VERIFIED_COMMAND}),
         ),
         (
             "verify-evidence",
