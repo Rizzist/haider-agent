@@ -46,6 +46,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.runtime.SideEffect
 import androidx.core.view.WindowCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import androidx.lifecycle.ViewModelProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -283,8 +286,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Cancelled in `onPause`: the bus outlives the Activity, the watch does not. */
+    private var capabilityWatch: Job? = null
+
     override fun onResume() {
         super.onResume()
+        // A projection can start or die while this screen is up — the capture
+        // service publishes it on the bus — and round 10 only read the bus
+        // when something else happened to sample permissions, so Settings
+        // showed a stale row (verify-9 V5).
+        capabilityWatch?.cancel()
+        capabilityWatch = lifecycleScope.launch {
+            CapabilityBus.granted.collect { publishPermissions() }
+        }
         if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityResumed(this)
         // The user may have granted it in system settings while we were away.
         syncNotificationPermission()
@@ -323,6 +337,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         if (AppContainer.activityBootstrap) ApkUpdateCoordinator.onActivityPaused(this)
+        capabilityWatch?.cancel()
+        capabilityWatch = null
         super.onPause()
     }
 

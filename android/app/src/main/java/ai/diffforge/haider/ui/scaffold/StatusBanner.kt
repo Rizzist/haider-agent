@@ -94,10 +94,10 @@ fun StatusBanner(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                // The click and the semantics sit on the 48 dp node; the strip
+                // paints 40 inside it. Round 10 put the inset before the
+                // clickable, so the *target* shrank to 40 (verify-9 V4).
                 .heightIn(min = ForgeSize.touch)
-                .clip(ForgeShapes.row)
-                .background(colors.surfaceRaised)
-                .border(ForgeSize.hairline, tint.copy(alpha = 0.45f), ForgeShapes.row)
                 .then(
                     if (actionable) {
                         Modifier
@@ -110,6 +110,11 @@ fun StatusBanner(
                         Modifier
                     },
                 )
+                .padding(vertical = ForgeSpace.xs)
+                .heightIn(min = ForgeSize.stripVisual)
+                .clip(ForgeShapes.row)
+                .background(colors.surfaceRaised)
+                .border(ForgeSize.hairline, tint.copy(alpha = 0.45f), ForgeShapes.row)
                 .padding(horizontal = ForgeSpace.lg),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md),

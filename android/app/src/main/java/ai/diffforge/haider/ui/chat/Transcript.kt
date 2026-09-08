@@ -293,9 +293,12 @@ private fun ToolRow(tool: ToolCall) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .heightIn(min = ForgeSize.touch)
             .clickable(enabled = !tool.result.isNullOrBlank()) { detailOpen = !detailOpen }
-            .minimumInteractiveComponentSize()
-            .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
+            .padding(vertical = ForgeSpace.xs)
+            .heightIn(min = ForgeSize.toolRowHeight)
+            .padding(horizontal = ForgeSpace.lg),
+        verticalArrangement = Arrangement.Center,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             // mono: tool output, from the glyph to the result.

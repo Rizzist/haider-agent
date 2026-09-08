@@ -16,7 +16,9 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -27,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
@@ -36,6 +39,9 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 
 enum class SessionRowAction { Rename, Fork, CopyId }
+
+/** The painted band inside a session row's 48 dp target. */
+const val SESSION_ROW_INK_TAG = "session_row_ink"
 
 /**
  * One line: the provider glyph and the title. That is the whole row.
@@ -87,53 +93,55 @@ fun SessionRowItem(
         })
     }
 
-    Row(
+    // Two nodes on purpose: the 48 dp one takes the click and the semantics,
+    // the 40 dp one takes the paint. One node cannot be both, and a pin that
+    // measures the wrong one cannot tell them apart (round 10 R3, verify-9 V6).
+    Box(
         modifier = modifier
             .fillMaxWidth()
-            // 48 dp target, 40 dp painted band: the density the owner asked
-            // for, without a target the sweep would reject (round 10, R3).
-            // The click and the semantics stay on the full 48 dp node; only
-            // the painted band is 40 dp, inset by the vertical padding *after*
-            // the clickable. Putting the padding first measured the target at
-            // 40 dp, which is exactly what the sweep exists to catch
-            // (round 10, R3).
-            .heightIn(min = ForgeSize.touch)
+            .height(ForgeSize.touch)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .semantics(mergeDescendants = true) {
                 contentDescription = spoken
                 stateWord?.let { stateDescription = it }
                 this.selected = selected
                 customActions = actions
-            }
-            .padding(vertical = ForgeSpace.xs)
-            .heightIn(min = ForgeSize.rowVisual)
-            .clip(ForgeShapes.cardTight)
-            .border(
-                ForgeSize.hairline,
-                if (selected) colors.accent else Color.Transparent,
-                ForgeShapes.cardTight,
-            )
-            .padding(horizontal = ForgeSpace.lg),
-        verticalAlignment = Alignment.CenterVertically,
+            },
+        contentAlignment = Alignment.Center,
     ) {
-        SessionGlyph(
-            // Model first, provider as the fallback: a session on
-            // claude-opus-4-5 shows Anthropic's mark even when the roster row
-            // never named a provider (addition H5).
-            model = row.model,
-            provider = row.provider,
-            state = row.state,
-            animate = SessionVisualStateFold.animates(row.state) && motionEnabled(),
-            ringAgainst = colors.surface,
-        )
-        Text(
-            displayTitle(row),
-            style = type.sessionTitle,
-            color = if (selected) colors.text else colors.chatText,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(start = ForgeSpace.md),
-        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(ForgeSize.rowVisual)
+                .testTag(SESSION_ROW_INK_TAG)
+                .clip(ForgeShapes.cardTight)
+                .border(
+                    ForgeSize.hairline,
+                    if (selected) colors.accent else Color.Transparent,
+                    ForgeShapes.cardTight,
+                )
+                .padding(horizontal = ForgeSpace.lg),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SessionGlyph(
+                // Model first, provider as the fallback: a session on
+                // claude-opus-4-5 shows Anthropic's mark even when the roster
+                // row never named a provider (addition H5).
+                model = row.model,
+                provider = row.provider,
+                state = row.state,
+                animate = SessionVisualStateFold.animates(row.state) && motionEnabled(),
+                ringAgainst = colors.surface,
+            )
+            Text(
+                displayTitle(row),
+                style = type.sessionTitle,
+                color = if (selected) colors.text else colors.chatText,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(start = ForgeSpace.md),
+            )
+        }
     }
 }
 

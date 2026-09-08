@@ -54,6 +54,11 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
@@ -65,6 +70,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
+import androidx.compose.ui.platform.LocalDensity
 
 /**
  * The drawer: identity, daemon card and New session fixed at the top, the
@@ -338,15 +344,35 @@ private fun NewSessionButton(onClick: () -> Unit, onLongClick: () -> Unit) {
 private fun SearchField(query: String, onQuery: (String) -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
+    // The field is the target, so it keeps all 48 dp; the pill is *painted*
+    // 40 dp behind it. Insetting with padding shrank the field itself to 40,
+    // which is the same mistake in the other direction (verify-9 V4).
+    val inset = with(LocalDensity.current) { ForgeSpace.xs.toPx() }
+    val radius = with(LocalDensity.current) { ForgeSize.searchField.toPx() / 2f }
+    val stroke = with(LocalDensity.current) { ForgeSize.hairline.toPx() }
+    val fill = colors.surfaceControl
+    val line = colors.border
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = ForgeSpace.xs)
-            .heightIn(min = ForgeSize.searchField)
-            .clip(ForgeShapes.pill)
-            .background(colors.surfaceControl)
-            .border(ForgeSize.hairline, colors.border, ForgeShapes.pill)
-            .padding(horizontal = ForgeSpace.md),
+            .height(ForgeSize.touch)
+            .drawBehind {
+                val corner = CornerRadius(radius, radius)
+                drawRoundRect(
+                    color = fill,
+                    topLeft = Offset(0f, inset),
+                    size = Size(size.width, size.height - inset * 2),
+                    cornerRadius = corner,
+                )
+                drawRoundRect(
+                    color = line,
+                    topLeft = Offset(stroke / 2f, inset + stroke / 2f),
+                    size = Size(size.width - stroke, size.height - inset * 2 - stroke),
+                    cornerRadius = corner,
+                    style = Stroke(width = stroke),
+                )
+            }
+            .padding(horizontal = ForgeSpace.lg),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -364,11 +390,12 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
             modifier = Modifier
                 .weight(1f)
                 .padding(horizontal = ForgeSpace.sm)
+                // The field itself is the target and stays 48 dp; the pill
+                // around it paints 40 (verify-9 V4).
                 .heightIn(min = ForgeSize.touch),
             decorationBox = { inner ->
-                // The target is still 48 dp; only the painted pill is 40.
                 Box(
-                    modifier = Modifier.height(ForgeSize.touch),
+                    modifier = Modifier.height(ForgeSize.searchField),
                     contentAlignment = Alignment.CenterStart,
                 ) {
                     if (query.isEmpty()) {

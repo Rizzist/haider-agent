@@ -42,8 +42,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -85,6 +89,8 @@ fun HaiderTopBar(
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
+    val hairlinePx = with(LocalDensity.current) { ForgeSize.hairline.toPx() }
+    val borderColor = colors.border
     BoxWithConstraints(modifier.testTag(HAIDER_TOP_BAR_TAG)) {
         // Below ~380 dp the five controls plus a word do not fit without
         // ellipsising the word to "Runn…", which says less than the mark and
@@ -96,7 +102,18 @@ fun HaiderTopBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = ForgeSize.header)
+                // The hairline is painted at the row's own bottom edge, so
+                // the header is 48 dp *including* it and the controls inside
+                // still get their full 48 (verify-9 V4/V6).
+                .height(ForgeSize.header)
+                .drawBehind {
+                    val stroke = hairlinePx
+                    drawRect(
+                        color = borderColor,
+                        topLeft = Offset(0f, size.height - stroke),
+                        size = Size(size.width, stroke),
+                    )
+                }
                 .padding(horizontal = ForgeSpace.md),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
@@ -154,12 +171,6 @@ fun HaiderTopBar(
                 )
             }
         }
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(ForgeSize.hairline)
-                .background(colors.border),
-        )
         }
     }
 }

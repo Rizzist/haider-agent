@@ -1,10 +1,15 @@
 package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
+import ai.diffforge.haider.ui.chat.COMPOSER_TEXT_TAG
+import ai.diffforge.haider.ui.chat.SELECT_INK_TAG
+import ai.diffforge.haider.ui.drawer.SESSION_ROW_INK_TAG
+import androidx.compose.ui.test.onAllNodesWithTag
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.scaffold.HAIDER_TOP_BAR_TAG
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.CapabilityApproval
 import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.theme.ForgeSize
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -18,6 +23,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -44,6 +50,20 @@ class ProportionTest {
 
     private fun dp(px: Float) = with(rule.density) { px.toDp() }
 
+    /**
+     * The numbers the brief specifies, written out.
+     *
+     * Deliberately not `ForgeSize.*`: a pin that reads the token it is
+     * checking passes when the token moves, which is exactly what the
+     * row-shrink control proved about round 10's version (verify-9 V6).
+     */
+    private object Spec {
+        const val HEADER = 48f
+        const val TARGET = 48f
+        const val SELECT_INK = 30f
+        const val ROW_INK = 40f
+    }
+
     // ---------- R1: the header is 48 dp with 32 dp visuals ----------
 
     @Test
@@ -51,11 +71,10 @@ class ProportionTest {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
         rule.waitForIdle()
         val bar = rule.onNodeWithTag(HAIDER_TOP_BAR_TAG).fetchSemanticsNode()
-        // Header + hairline. Round 9 was 52 dp of controls under a title.
-        assertTrue(
-            "the header is ${dp(bar.size.height.toFloat())}",
-            dp(bar.size.height.toFloat()) <= ForgeSize.header + ForgeSize.hairline,
-        )
+        // 48 dp for everything, hairline included — round 10 tolerated the
+        // hairline on top of the budget, which is a 49 dp header with a pin
+        // that says 48 (verify-9 V6).
+        assertEquals(Spec.HEADER, dp(bar.size.height.toFloat()).value, 0.5f)
     }
 
     @Test
@@ -100,23 +119,24 @@ class ProportionTest {
     }
 
     @Test
-    fun `the composer selects are compact`() {
+    fun `the select paints 30 dp inside a 48 dp target`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
         rule.waitForIdle()
-        // The painted pill, found by walking to the text inside the target.
-        val select = rule.onNode(
-            androidx.compose.ui.test.hasText("Auto"),
-            useUnmergedTree = true,
-        ).fetchSemanticsNode()
-        assertTrue(
-            "the value text is ${dp(select.size.height.toFloat())} tall",
-            dp(select.size.height.toFloat()) < ForgeSize.chip,
-        )
-        // Its target is still a target.
+        // Round 10 measured the *text*, which is smaller than the pill either
+        // way and so could not fail (verify-9 V6). The pill is the layout node
+        // between the target and the text: the target's only child.
         val target = rule.onNode(hasContentDescription("Change what Haider may do on its own, Auto"))
             .fetchSemanticsNode()
-        val minPx = with(rule.density) { ForgeSize.touch.toPx() }
-        assertTrue(target.size.height >= minPx)
+        assertEquals(Spec.TARGET, dp(target.size.height.toFloat()).value, 0.5f)
+        val pill = rule.onAllNodesWithTag(SELECT_INK_TAG, useUnmergedTree = true)
+            .fetchSemanticsNodes()
+            .first()
+        assertEquals(
+            "the pill paints ${dp(pill.size.height.toFloat())}",
+            Spec.SELECT_INK,
+            dp(pill.size.height.toFloat()).value,
+            1.5f,
+        )
     }
 
     // ---------- R3: the drawer head is one row ----------
@@ -145,10 +165,20 @@ class ProportionTest {
         val row = rule.onAllNodes(
             hasContentDescription("Fix nav crash on back gesture", substring = true),
         ).fetchSemanticsNodes().first()
-        val minPx = with(rule.density) { ForgeSize.touch.toPx() }
-        assertTrue("the row target is ${row.size.height}px", row.size.height >= minPx)
-        // Twelve of them fit a 915 dp phone alongside the head and the footer.
-        assertTrue(dp(row.size.height.toFloat()) <= ForgeSize.touch)
+        // Interaction bounds exactly 48 dp…
+        assertEquals(Spec.TARGET, dp(row.size.height.toFloat()).value, 0.5f)
+        // …and the band it paints is 40 dp, measured on the painted node
+        // itself. A semantics walk cannot find it — the paint carries no
+        // semantics — so the ink is tagged (verify-9 V6).
+        val ink = rule.onAllNodesWithTag(SESSION_ROW_INK_TAG, useUnmergedTree = true)
+            .fetchSemanticsNodes()
+            .first()
+        assertEquals(
+            "the row paints ${dp(ink.size.height.toFloat())}",
+            Spec.ROW_INK,
+            dp(ink.size.height.toFloat()).value,
+            1.5f,
+        )
     }
 
     // ---------- verify-8 O1: Auto resolves, never hides ----------
@@ -248,4 +278,99 @@ class ProportionTest {
         rule.waitForIdle()
         assertTrue(rule.onAllNodesWithTextSafe("Running") > 0)
     }
+
+    // ---------- verify-9 V1: every requested action must be covered ----------
+
+    @Test
+    fun `a mixed approval keeps its card even in Auto`() {
+        val mixed = needsInputOf(
+            "permission",
+            "Allow sms.send after reading sms.list?",
+        )
+        // Round 10 asked "does the text mention anything covered", so this was
+        // consumed on the strength of sms.list (verify-9 V1).
+        assertEquals(
+            setOf("sms.send", "sms.list"),
+            CapabilityApproval.requestedCapabilities(mixed),
+        )
+        assertFalse(CapabilityApproval.suppresses(PermissionMode.Auto, mixed))
+    }
+
+    @Test
+    fun `an unknown action keeps its card`() {
+        listOf(
+            "Allow sms.forward for the last message?",
+            "Allow contacts.read?",
+            "Allow a11y.dangerous_new_thing?",
+            "Allow this?",
+        ).forEach {
+            assertFalse(
+                "$it must still ask",
+                CapabilityApproval.suppresses(PermissionMode.Auto, needsInputOf("permission", it)),
+            )
+        }
+    }
+
+    @Test
+    fun `a wholly covered request is still covered`() {
+        listOf(
+            "Allow sms.list for the last 20 messages?",
+            "Allow screen.capture and a11y.tree?",
+            "Allow app.open for Settings?",
+        ).forEach {
+            assertTrue(
+                "$it should be covered",
+                CapabilityApproval.suppresses(PermissionMode.Auto, needsInputOf("permission", it)),
+            )
+        }
+    }
+
+    // ---------- verify-9 V2: the allowed turn finishes ----------
+
+    @Test
+    fun `an Auto SMS-read turn completes and leaves no card`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        service.setPermissionModeForTest(PermissionMode.Ask)
+        val viewModel = rule.setHaiderApp(service)
+        service.raiseDeviceApproval("s-nav")
+        rule.waitForIdle()
+        viewModel.selectPermissionMode(PermissionMode.Auto)
+        rule.waitForIdle()
+
+        val row = viewModel.session("s-nav")
+        assertEquals(null, row?.needsInput)
+        // Terminal, not "running for ever" — round 10 stopped at Running
+        // (verify-9 V2).
+        assertEquals("idle", row?.runState)
+        assertEquals(null, row?.runId)
+        assertTrue(service.calls.contains("tool.policy.auto_completed:s-nav"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Allow sms.list for the last 20 messages?"))
+    }
+
+    // ---------- verify-9 V3: the text never runs under the controls ----------
+
+    @Test
+    fun `a long line stops before the mic, it does not run under it`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        viewModel.setDraft(
+            "A line long enough to reach the right edge of the field and keep going past it",
+        )
+        rule.waitForIdle()
+        // The text *area*, not the field's interaction node: tapping anywhere
+        // in the pill should still focus it, but the glyphs must stop before
+        // the controls (verify-9 V3).
+        val textArea = rule.onNodeWithTag(COMPOSER_TEXT_TAG, useUnmergedTree = true)
+            .fetchSemanticsNode()
+        val mic = rule.onNode(hasContentDescription("Voice input is not in this build"))
+            .fetchSemanticsNode()
+        val textRight = textArea.positionInRoot.x + textArea.size.width
+        assertTrue(
+            "the text ends at $textRight and the mic starts at ${mic.positionInRoot.x}",
+            textRight <= mic.positionInRoot.x + 1f,
+        )
+    }
+
+    private fun needsInputOf(kind: String, title: String) =
+        ai.diffforge.haider.ui.daemon.NeedsInput(kind = kind, title = title)
 }
