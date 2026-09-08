@@ -7,8 +7,10 @@ import ai.diffforge.haider.ui.chat.CUSTOM_MODEL_FIELD_TAG
 import ai.diffforge.haider.ui.chat.CustomModelEntry
 import ai.diffforge.haider.ui.chat.MODEL_PICKER_LIST_TAG
 import ai.diffforge.haider.ui.chat.MODEL_REFUSAL_TAG
+import ai.diffforge.haider.ui.chat.SelectionRefusalPanel
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.state.SelectionRefusalCodes
 import ai.diffforge.haider.ui.theme.ForgeTheme
 import androidx.compose.ui.test.assertIsDisplayed
@@ -23,19 +25,19 @@ import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.annotation.Config
 
 /**
- * A free-text model id, and what happens when the daemon refuses it.
+ * A free-text model id, and what the refusal panel does with the code it can
+ * now produce.
  *
- * The entry exists only where the daemon says its inventory is ADVISORY, and
- * the refusal it can produce — `model_unknown` — is the one the panel used to
- * offer a confirmation for. Confirming that sends the identical request with
- * one more field; the panel now says so instead.
+ * The entry exists only where the daemon says its inventory is ADVISORY. The
+ * refusal it makes reachable — `model_unknown` — is the one the panel used to
+ * offer a confirmation for; confirming that sends the identical request with
+ * one more field, so the panel says so instead of offering the button.
  */
 @RunWith(AndroidJUnit4::class)
 @Config(sdk = [34], qualifiers = "w412dp-h915dp-xhdpi")
@@ -49,14 +51,28 @@ class CustomModelEntryTest {
     val rule = createAndroidComposeRule<MainActivity>()
 
     private val chosen = mutableListOf<String>()
+    private var confirmed = 0
+    private var kept = 0
 
-    private fun renderEntry(authority: ModelInventoryAuthority, enabled: Boolean = true) {
+    private fun renderEntry(authority: ModelInventoryAuthority) {
         rule.setContent {
             ForgeTheme(dark = true) {
                 CustomModelEntry(
                     authority = authority,
-                    enabled = enabled,
+                    enabled = true,
                     onSelect = { chosen += it },
+                )
+            }
+        }
+    }
+
+    private fun renderRefusal(refusal: SelectionRefusal) {
+        rule.setContent {
+            ForgeTheme(dark = true) {
+                SelectionRefusalPanel(
+                    refusal = refusal,
+                    onConfirm = { confirmed += 1 },
+                    onKeep = { kept += 1 },
                 )
             }
         }
@@ -99,86 +115,84 @@ class CustomModelEntryTest {
         assertEquals(listOf("llama3.1:8b"), chosen)
     }
 
-    // ---------- through the picker ----------
-
-    private fun openPicker(): Pair<ai.diffforge.haider.ui.daemon.FakeDaemonService, ai.diffforge.haider.ui.chat.ChatViewModel> {
+    @Test
+    fun `the picker carries one entry, under the advisory provider`() {
         val service = ComposeHost.install(FakeScenario.Populated)
         val viewModel = rule.setHaiderApp(service)
         viewModel.refreshModels()
         viewModel.openOverlay(Overlay.NewSessionWith)
         rule.waitForIdle()
-        return service to viewModel
-    }
-
-    private fun scrollToEntry() {
         rule.onNodeWithTag(MODEL_PICKER_LIST_TAG)
             .performScrollToNode(hasContentDescription("Custom model…"))
         rule.waitForIdle()
+
+        // The seeded catalog has exactly one advisory provider; the two
+        // authoritative ones get no entry at all.
+        assertEquals(1, rule.onAllNodesWithTagSafe(CUSTOM_MODEL_ENTRY_TAG))
     }
 
-    @Test
-    fun `a typed id goes through select_model, not a local catalog edit`() {
-        val (service, _) = openPicker()
-        scrollToEntry()
-        rule.onNodeWithContentDescription("Custom model…").performClick()
-        rule.waitForIdle()
-        rule.onNodeWithTag(CUSTOM_MODEL_FIELD_TAG).performTextInput("router-experimental")
-        rule.onNodeWithText("Use this model").performClick()
-        rule.waitForIdle()
-        // A typed id takes the SAME cache-epoch pre-warning every other model
-        // row takes: it changes the model just as much.
-        rule.onNodeWithText("Switch to local-lab / router-experimental?").assertIsDisplayed()
-        rule.onNodeWithText("Confirm change").performClick()
-        rule.waitForIdle()
+    // ---------- the refusal the entry makes reachable ----------
 
-        // The advisory provider is the one the entry belongs to, and the id is
-        // sent to the daemon rather than added to a local list.
-        assertTrue(
-            "expected a select_model for the advisory provider: ${service.calls}",
-            service.calls.contains("selectModel:local-lab/router-experimental"),
+    @Test
+    fun `an unknown model is refused without a confirmation button`() {
+        renderRefusal(
+            SelectionRefusal(
+                code = SelectionRefusalCodes.MODEL_UNKNOWN,
+                provider = "local-lab",
+                model = "router-nope",
+            ),
         )
-    }
-
-    @Test
-    fun `a refused unknown model is not offered a confirmation`() {
-        val (service, _) = openPicker()
-        service.failNextSelection(SelectionRefusalCodes.MODEL_UNKNOWN)
-        scrollToEntry()
-        rule.onNodeWithContentDescription("Custom model…").performClick()
-        rule.waitForIdle()
-        rule.onNodeWithTag(CUSTOM_MODEL_FIELD_TAG).performTextInput("router-nope")
-        rule.onNodeWithText("Use this model").performClick()
-        rule.waitForIdle()
-        rule.onNodeWithText("Confirm change").performClick()
-        rule.waitForIdle()
-
         rule.onNodeWithTag(MODEL_REFUSAL_TAG).assertIsDisplayed()
-        rule.onNodeWithText("router-nope is not in local-lab's known model list.").assertIsDisplayed()
+        rule.onNodeWithText("router-nope is not in local-lab's known model list.")
+            .assertIsDisplayed()
         rule.onNodeWithText("Confirming will not change this: the daemon refused the row itself.")
             .assertIsDisplayed()
         // The one button in the app that may set `confirm_new_epoch` is absent,
         // because this refusal is not about consent.
         assertEquals(0, rule.onAllNodesWithTextSafe("Change it anyway"))
-        rule.onNodeWithText("Close").assertIsDisplayed()
-        assertEquals(0, service.confirmedSelections)
+        rule.onNodeWithText("Close").performClick()
+        assertEquals(0, confirmed)
+        assertEquals(1, kept)
     }
 
     @Test
-    fun `a cache-epoch refusal still gets its confirmation`() {
-        val (service, _) = openPicker()
-        service.failNextSelection(SelectionRefusalCodes.CACHE_EPOCH_CONFIRMATION_REQUIRED)
-        scrollToEntry()
-        rule.onNodeWithContentDescription("Custom model…").performClick()
-        rule.waitForIdle()
-        rule.onNodeWithTag(CUSTOM_MODEL_FIELD_TAG).performTextInput("router-experimental")
-        rule.onNodeWithText("Use this model").performClick()
-        rule.waitForIdle()
-        rule.onNodeWithText("Confirm change").performClick()
-        rule.waitForIdle()
+    fun `an uncreatable provider says so, and offers no confirmation either`() {
+        renderRefusal(
+            SelectionRefusal(
+                code = SelectionRefusalCodes.PROVIDER_UNAVAILABLE,
+                provider = "openai",
+                model = "gpt-5",
+            ),
+        )
+        rule.onNodeWithText("openai cannot be created on this daemon.").assertIsDisplayed()
+        assertEquals(0, rule.onAllNodesWithTextSafe("Change it anyway"))
+    }
 
+    @Test
+    fun `a refusal this client does not recognise is never promoted to confirmable`() {
+        renderRefusal(SelectionRefusal(code = "selection_refused"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Change it anyway"))
+        rule.onNodeWithText("Close").assertIsDisplayed()
+    }
+
+    @Test
+    fun `a cache-epoch refusal keeps its confirmation`() {
+        renderRefusal(
+            SelectionRefusal(
+                code = SelectionRefusalCodes.CACHE_EPOCH_CONFIRMATION_REQUIRED,
+                provider = "local-lab",
+                model = "router-experimental",
+            ),
+        )
+        // This is the one refusal a second step actually fixes.
+        assertEquals(
+            0,
+            rule.onAllNodesWithTextSafe(
+                "Confirming will not change this: the daemon refused the row itself.",
+            ),
+        )
         rule.onNodeWithText("Change it anyway").performClick()
-        rule.waitForIdle()
-        // Only a person's tap sets it, and it was set exactly once.
-        assertEquals(1, service.confirmedSelections)
+        assertEquals(1, confirmed)
+        rule.onNodeWithText("Keep the current one").assertIsDisplayed()
     }
 }

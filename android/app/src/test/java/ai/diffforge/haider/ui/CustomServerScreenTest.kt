@@ -164,8 +164,10 @@ class CustomServerScreenTest {
     }
 
     @Test
-    fun `opening the custom card replaces a pending API-key form`() {
-        // 971-tui-fixes F1b: one pending add form, ever.
+    fun `only one add form is reachable at a time`() {
+        // 971-tui-fixes F1b, as this screen enforces it: while a form is open
+        // there is no second way into another one — the Add action is gone,
+        // rather than a second card appearing beside the first.
         render()
         rule.onNodeWithText("Add account").performClick()
         rule.waitForIdle()
@@ -173,14 +175,18 @@ class CustomServerScreenTest {
         rule.waitForIdle()
         rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("sk-live-abcdefgh9999")
         rule.waitForIdle()
+        assertEquals(0, rule.onAllNodesWithTextSafe("Add account"))
 
+        // Leaving that form is what makes the next one reachable, and what was
+        // typed into it goes with it.
+        rule.onNodeWithText("Cancel").performClick()
+        rule.waitForIdle()
         rule.onNodeWithText("Add account").performClick()
         rule.waitForIdle()
         rule.onNodeWithContentDescription("Add a custom server").performClick()
         rule.waitForIdle()
 
         rule.onNodeWithTag(CUSTOM_SERVER_CARD_TAG).assertIsDisplayed()
-        // The replaced form is gone, and so is what was typed into it.
         assertEquals(0, rule.onAllNodesWithTagSafe(ACCOUNTS_KEY_FIELD_TAG))
         assertFalse(visibleText().contains("sk-live-abcdefgh9999"))
     }

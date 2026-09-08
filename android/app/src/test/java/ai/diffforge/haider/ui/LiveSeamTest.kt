@@ -7,6 +7,7 @@ import ai.diffforge.haider.ui.chat.Role
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.SelectionRefusalCodes
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -99,14 +100,22 @@ class LiveSeamTest {
     @Test
     fun `a refused model change is shown, and only a person can confirm it`() {
         val service = ComposeHost.install(FakeScenario.Populated)
-        service.failNextSelection("confirm_new_epoch_required")
+        // `cache_epoch_confirmation_required` is the code the daemon actually
+        // sends (frame.rs:271). The fixture used to arm
+        // "confirm_new_epoch_required", which is the name of a REQUEST FIELD and
+        // is not a code any frame carries — the same class of defect the roster
+        // already fixed once for `already_resolved`. The panel now classifies the
+        // code to decide whether a confirmation can fix the refusal at all, so an
+        // invented code correctly gets no confirm button.
+        service.failNextSelection(SelectionRefusalCodes.CACHE_EPOCH_CONFIRMATION_REQUIRED)
         val viewModel = rule.setHaiderApp(service)
         viewModel.openOverlay(Overlay.ModelPicker)
         viewModel.selectModel("anthropic", "claude-opus-4-5")
         rule.waitForIdle()
 
         rule.onNodeWithTag(MODEL_REFUSAL_TAG).assertIsDisplayed()
-        rule.onNodeWithText("confirm_new_epoch_required").assertIsDisplayed()
+        rule.onNodeWithText(SelectionRefusalCodes.CACHE_EPOCH_CONFIRMATION_REQUIRED)
+            .assertIsDisplayed()
         // Nothing has been confirmed yet.
         assertEquals(0, service.confirmedSelections)
 
