@@ -65,6 +65,30 @@ object ForgeSize {
     val rowMin = 64.dp
     /** A drawer session row's painted band inside its 48 dp target (R3). */
     val rowVisual = 40.dp
+
+    /**
+     * One delegation level's indent in the drawer, and the elbow the connector
+     * draws into the child row. 12 dp keeps a depth-3 family readable inside a
+     * 322 dp drawer, where the desktop's 16 px would not.
+     */
+    val treeIndent = 12.dp
+    val treeElbow = 6.dp
+
+    /** The family count/aggregate control's ink, inside its 48 dp target. */
+    val familyPill = 26.dp
+
+    /** A subagent chip's ink on the session header strip. */
+    val subagentChip = 28.dp
+
+    /**
+     * How much of a subagent's task one chip may show. A chip is a glance, not
+     * a row: at the transcript's 220 dp two chips already fill a 412 dp phone
+     * and the third sits off-screen entirely.
+     */
+    val subagentTaskMax = 116.dp
+
+    /** The fleet panel's own scroll ceiling, so a sheet cannot eat the screen. */
+    val fleetListMax = 360.dp
     /** The merged daemon + New chat row's ink (R3). */
     val drawerRow = 44.dp
     /** The drawer search field's ink (R3). */

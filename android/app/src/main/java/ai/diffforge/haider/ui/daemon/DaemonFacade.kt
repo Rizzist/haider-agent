@@ -412,7 +412,44 @@ interface DaemonService {
 
     /** Title/metadata plus indexed transcript content, honest about coverage. */
     suspend fun search(query: String): SearchOutcome
+
+    // ---------- subagents and the descendant fleet (lane 971-UI-fleet) ----------
+
+    /**
+     * `session.fleet` (frame.rs:3495): the bounded descendant tree and the
+     * daemon's own rollup, read-only and receipt-free.
+     *
+     * The default is [FleetLoad.Unavailable] rather than an empty snapshot: an
+     * implementation that has not wired the read has not learned that a session
+     * has no subagents, and the two must not render the same.
+     */
+    suspend fun fleet(sessionId: String): FleetLoad =
+        FleetLoad.Unavailable(FLEET_NOT_WIRED)
+
+    /**
+     * `session.observe`'s `subagents` (frame.rs:2271) for one session — the
+     * chip state on the session header.
+     *
+     * Same rule as [fleet]: not-wired is its own answer, never an empty roster.
+     */
+    suspend fun subagents(sessionId: String): SubagentLoad =
+        SubagentLoad.Unavailable(SUBAGENTS_NOT_WIRED)
 }
+
+/** What one `session.observe` said about a session's subagents. */
+sealed interface SubagentLoad {
+    /** Empty for every case but [Observed]: nothing invents a roster. */
+    val subagents: List<Subagent> get() = emptyList()
+
+    /** Nobody has asked yet. Distinct from a digest that listed none. */
+    data object Unread : SubagentLoad
+    data class Observed(override val subagents: List<Subagent>) : SubagentLoad
+    data class Unavailable(val reason: String) : SubagentLoad
+}
+
+/** The daemon-facing reason strings for an unwired fleet seam. */
+const val FLEET_NOT_WIRED = "session_fleet_not_wired"
+const val SUBAGENTS_NOT_WIRED = "session_observe_subagents_not_wired"
 
 // ---------- history ----------
 

@@ -44,6 +44,14 @@ enum class FakeScenario {
     EmptyRosterStopped,
     Populated,
     LargeRoster,
+
+    /**
+     * Delegation: two parents with children, one of them deep enough to nest,
+     * one wide enough to arrive collapsed, a child parked on a human, a
+     * bounded snapshot, an agent the observe digest lists that the bounded
+     * snapshot omitted, and a session whose fleet read the daemon refuses.
+     */
+    Fleet,
 }
 
 class FakeDaemonService(
@@ -332,6 +340,13 @@ class FakeDaemonService(
                 setSessions(populatedRoster())
                 _activeSessionId.value = "s-nav"
                 transcripts["s-nav"] = runningTranscript()
+            }
+            FakeScenario.Fleet -> {
+                _status.value = running()
+                setSessions(populatedRoster() + fleetRoster())
+                _activeSessionId.value = "s-fleet"
+                transcripts["s-fleet"] = runningTranscript()
+                transcripts["s-fleet-b"] = childTranscript()
             }
             FakeScenario.LargeRoster -> {
                 _status.value = running()
@@ -710,6 +725,86 @@ class FakeDaemonService(
         return SearchOutcome(hits = hits, index = index, complete = index.complete)
     }
 
+    // ---------- subagents and the fleet ----------
+
+    /**
+     * `session.fleet` (frame.rs:3495).
+     *
+     * The fixtures model the shapes the wire really produces, including the two
+     * a client is most likely to get wrong: a node with no children **and** a
+     * non-zero `folded_children` (bounded, not a leaf), and a snapshot whose
+     * `truncated`/`complete` pair says the tree is not all of it.
+     */
+    override suspend fun fleet(sessionId: String): FleetLoad {
+        calls += "${FleetRpcAdapter.METHOD_SESSION_FLEET}:$sessionId"
+        fleetOverride?.invoke(sessionId)?.let { return it }
+        return when (sessionId) {
+            "s-fleet" -> FleetLoad.Snapshot(fleetSnapshot())
+            "s-swarm" -> FleetLoad.Snapshot(swarmSnapshot())
+            // A daemon that does not offer `session_fleet_v1` (frame.rs:395)
+            // says so; the panel prints the reason rather than an empty list.
+            "s-broken" -> FleetLoad.Unavailable("session_fleet_v1 unsupported")
+            // Everything else: the daemon answered, and the answer is none.
+            else -> FleetLoad.Snapshot(
+                FleetSnapshot(
+                    sessionId = sessionId,
+                    generatedAtMs = nowMs,
+                    nodeLimit = NODE_LIMIT,
+                    depthLimit = DEPTH_LIMIT,
+                    roots = emptyList(),
+                    rollup = FleetRollup(
+                        nodeCount = 0,
+                        maxDepth = 0,
+                        metricsComplete = true,
+                        complete = true,
+                    ),
+                    truncated = false,
+                ),
+            )
+        }
+    }
+
+    override suspend fun subagents(sessionId: String): SubagentLoad {
+        calls += "${FleetRpcAdapter.METHOD_SESSION_OBSERVE}.subagents:$sessionId"
+        subagentOverride?.invoke(sessionId)?.let { return it }
+        return SubagentLoad.Observed(
+            when (sessionId) {
+                "s-fleet" -> listOf(
+                    Subagent(
+                        agentId = "agent-scout",
+                        callsign = "scout",
+                        task = "Map every transport call site",
+                        state = FleetStateView.of("live"),
+                        provider = "anthropic",
+                    ),
+                    Subagent(
+                        agentId = "agent-auditor",
+                        callsign = "auditor",
+                        task = "Check the frame contracts",
+                        state = FleetStateView.of("waiting"),
+                        provider = "openai",
+                    ),
+                    // No callsign: the chip must show a marked id fallback, and
+                    // this agent is deliberately absent from the bounded
+                    // snapshot, so its child session is not addressable and the
+                    // chip opens the panel rather than guessing a session id.
+                    Subagent(
+                        agentId = "agent-7f2c91ab4de0",
+                        callsign = null,
+                        task = "Re-run the wire fixtures",
+                        state = FleetStateView.of("queued"),
+                        provider = null,
+                    ),
+                )
+                else -> emptyList()
+            },
+        )
+    }
+
+    /** Overrides for a test that needs a refused or failed read. */
+    var fleetOverride: ((String) -> FleetLoad?)? = null
+    var subagentOverride: ((String) -> SubagentLoad?)? = null
+
     /** The paged read cache: one `session.read` call per bounded range. */
     private suspend fun readThroughCache(row: SessionRow): TranscriptLoad {
         readCache[row.id]?.let { return it }
@@ -898,6 +993,264 @@ class FakeDaemonService(
         ),
     )
 
+    /**
+     * Two delegating parents and their children.
+     *
+     * `parent_session_id` is the daemon's own edge (frame.rs:1949), so these
+     * are ordinary roster rows that happen to name a parent — exactly what a
+     * real `session.list` returns for a delegated session.
+     */
+    private fun fleetRoster(): List<SessionRow> = listOf(
+        SessionRow(
+            id = "s-fleet",
+            title = "Refactor the transport layer",
+            state = SessionVisualState.Running,
+            runState = "running",
+            provider = "anthropic",
+            model = "claude-sonnet-4-5",
+            effort = "high",
+            lastActivityMs = nowMs - 3_000,
+            seenAtMs = nowMs,
+            turnCount = 7,
+            runId = "run-fleet",
+            workerGeneration = 5,
+            headSeq = 612,
+        ),
+        SessionRow(
+            id = "s-fleet-a",
+            title = "scout · map transport call sites",
+            state = SessionVisualState.Running,
+            runState = "running",
+            provider = "anthropic",
+            model = "claude-sonnet-4-5",
+            lastActivityMs = nowMs - 9_000,
+            seenAtMs = nowMs,
+            parentSessionId = "s-fleet",
+            kind = "subagent",
+            runId = "run-fleet-a",
+            workerGeneration = 5,
+            headSeq = 88,
+        ),
+        SessionRow(
+            id = "s-fleet-a1",
+            title = "probe · read the frame tests",
+            state = SessionVisualState.Idle,
+            runState = "idle",
+            provider = "anthropic",
+            model = "claude-sonnet-4-5",
+            lastActivityMs = nowMs - 20_000,
+            seenAtMs = nowMs,
+            parentSessionId = "s-fleet-a",
+            kind = "subagent",
+            headSeq = 12,
+        ),
+        // A child parked on a human. The family it belongs to therefore sorts
+        // into NEEDS YOU as a whole: nesting must not bury an agent that is
+        // asking for something.
+        SessionRow(
+            id = "s-fleet-b",
+            title = "auditor · check the frame contracts",
+            state = SessionVisualState.NeedsInput,
+            runState = "parked_input",
+            provider = "openai",
+            model = "gpt-5",
+            lastActivityMs = nowMs - 30_000,
+            seenAtMs = nowMs - 30_000,
+            parentSessionId = "s-fleet",
+            kind = "subagent",
+            runId = "run-fleet-b",
+            workerGeneration = 5,
+            headSeq = 41,
+            needsInput = NeedsInput(
+                kind = "question",
+                title = "Which contract version should the audit assume?",
+                safeBody = listOf("Both v1 and v2 frames are present in the fixtures."),
+                menuId = "menu-audit",
+                requestSeq = 12,
+                workerGeneration = 5,
+                sinceMs = nowMs - 26_000,
+                options = listOf(
+                    MenuOption("v1", "Assume v1"),
+                    MenuOption("v2", "Assume v2"),
+                ),
+            ),
+        ),
+        SessionRow(
+            id = "s-fleet-c",
+            title = "scribe · write the migration note",
+            state = SessionVisualState.Idle,
+            runState = "idle",
+            provider = "anthropic",
+            model = "claude-sonnet-4-5",
+            lastActivityMs = nowMs - 4 * 60_000,
+            seenAtMs = nowMs - 4 * 60_000,
+            parentSessionId = "s-fleet",
+            kind = "subagent",
+            headSeq = 30,
+        ),
+        SessionRow(
+            id = "s-swarm",
+            title = "Sweep the dependency tree",
+            state = SessionVisualState.Running,
+            runState = "running",
+            provider = "anthropic",
+            model = "claude-opus-4-1",
+            effort = "medium",
+            lastActivityMs = nowMs - 60_000,
+            seenAtMs = nowMs - 60_000,
+            runId = "run-swarm",
+            workerGeneration = 2,
+            headSeq = 210,
+        ),
+        // Five children: over COLLAPSE_THRESHOLD, so this family arrives folded
+        // and the parent's pill is the only thing standing in for them.
+    ) + (1..5).map { index ->
+        SessionRow(
+            id = "s-swarm-$index",
+            title = "worker $index · audit module $index",
+            state = if (index == 2) SessionVisualState.Errored else SessionVisualState.Running,
+            runState = if (index == 2) "errored" else "running",
+            provider = "anthropic",
+            model = "claude-opus-4-1",
+            lastActivityMs = nowMs - index * 11_000L,
+            seenAtMs = nowMs - index * 11_000L,
+            parentSessionId = "s-swarm",
+            kind = "subagent",
+            runId = if (index == 2) null else "run-swarm-$index",
+            workerGeneration = 2,
+            headSeq = index.toLong(),
+        )
+    }
+
+    /**
+     * The bounded snapshot for `s-fleet`.
+     *
+     * `scribe` carries `folded_children = 2` with an empty child list: the two
+     * agents under it exist and were not returned. The snapshot says
+     * `truncated = true` and the rollup says `complete = false`, which is the
+     * only combination that may be drawn as bounded.
+     */
+    private fun fleetSnapshot(): FleetSnapshot = FleetSnapshot(
+        sessionId = "s-fleet",
+        generatedAtMs = nowMs,
+        nodeLimit = NODE_LIMIT,
+        depthLimit = DEPTH_LIMIT,
+        roots = listOf(
+            FleetNode(
+                agentId = "agent-scout",
+                sessionId = "s-fleet-a",
+                callsign = "scout",
+                model = "claude-sonnet-4-5",
+                provider = "anthropic",
+                task = "Map every transport call site",
+                depth = 1,
+                parentSessionId = "s-fleet",
+                state = FleetStateView.of("live"),
+                metrics = FleetNodeMetrics(
+                    startedAtMs = nowMs - 120_000,
+                    live = true,
+                    toolAttempts = 14,
+                    usage = FleetUsage(41_200, 3_100, 18_000, 900),
+                ),
+                children = listOf(
+                    FleetNode(
+                        agentId = "agent-probe",
+                        sessionId = "s-fleet-a1",
+                        callsign = "probe",
+                        provider = "anthropic",
+                        task = "Read the frame tests",
+                        depth = 2,
+                        parentSessionId = "s-fleet-a",
+                        parentAgentId = "agent-scout",
+                        state = FleetStateView.of("queued"),
+                    ),
+                ),
+            ),
+            FleetNode(
+                agentId = "agent-auditor",
+                sessionId = "s-fleet-b",
+                callsign = "auditor",
+                model = "gpt-5",
+                provider = "openai",
+                task = "Check the frame contracts",
+                depth = 1,
+                parentSessionId = "s-fleet",
+                state = FleetStateView.of("waiting"),
+                metrics = FleetNodeMetrics(
+                    startedAtMs = nowMs - 90_000,
+                    live = true,
+                    toolAttempts = 3,
+                ),
+            ),
+            FleetNode(
+                agentId = "agent-scribe",
+                sessionId = "s-fleet-c",
+                callsign = "scribe",
+                provider = "anthropic",
+                task = "Write the migration note",
+                depth = 1,
+                parentSessionId = "s-fleet",
+                state = FleetStateView.of("done"),
+                // Bounded, not a leaf: two real children were not returned.
+                foldedChildren = 2,
+            ),
+        ),
+        rollup = FleetRollup(
+            nodeCount = 4,
+            states = FleetStateCounts(queued = 1, live = 1, waiting = 1, done = 1),
+            maxDepth = 2,
+            elapsedMs = 214_000,
+            toolAttempts = 17,
+            // One node has no durable usage truth, so the total is absent
+            // rather than a partial sum presented as a whole one.
+            usage = null,
+            metricsComplete = false,
+            complete = false,
+        ),
+        truncated = true,
+    )
+
+    /** A complete snapshot, so the bounded banner has something to contrast. */
+    private fun swarmSnapshot(): FleetSnapshot = FleetSnapshot(
+        sessionId = "s-swarm",
+        generatedAtMs = nowMs,
+        nodeLimit = NODE_LIMIT,
+        depthLimit = DEPTH_LIMIT,
+        roots = (1..5).map { index ->
+            FleetNode(
+                agentId = "agent-worker-$index",
+                sessionId = "s-swarm-$index",
+                callsign = "worker $index",
+                provider = "anthropic",
+                task = "Audit module $index",
+                depth = 1,
+                parentSessionId = "s-swarm",
+                state = FleetStateView.of(if (index == 2) "failed" else "live"),
+            )
+        },
+        rollup = FleetRollup(
+            nodeCount = 5,
+            states = FleetStateCounts(live = 4, failed = 1),
+            maxDepth = 1,
+            elapsedMs = 402_000,
+            toolAttempts = 61,
+            usage = FleetUsage(120_000, 9_400, 44_000, 2_100),
+            metricsComplete = true,
+            complete = true,
+        ),
+        truncated = false,
+    )
+
+    private fun childTranscript(): MutableList<Message> = mutableListOf(
+        Message(nextMessageId++, Role.User, "Check the frame contracts against the fixtures."),
+        Message(
+            id = nextMessageId++,
+            role = Role.Agent,
+            text = "Both v1 and v2 frames are present. I need to know which one to assume.",
+            provider = "openai",
+        ),
+    )
+
     private fun largeRoster(count: Int): List<SessionRow> = (0 until count).map { index ->
         SessionRow(
             id = "s-%04d".format(index),
@@ -983,5 +1336,13 @@ class FakeDaemonService(
 
         /** A fixed *monotonic* clock; uptime is measured against this one. */
         const val FIXED_UPTIME: Long = 40_000_000L
+
+        /**
+         * The bounds the daemon applies to one `session.fleet` read
+         * (frame.rs:87). They are echoed in every snapshot so a bounded one can
+         * say what it was bounded by.
+         */
+        const val NODE_LIMIT = 64
+        const val DEPTH_LIMIT = 4
     }
 }
