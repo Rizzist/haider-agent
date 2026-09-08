@@ -16,6 +16,14 @@ pub const HELP_INTRO_TEXT: &[&str] = &[
     "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
     "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
     "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
+    // 971-tui-collapse: tool rows are COLLAPSED by default — one summary row
+    // (name · exit · lines · duration) plus a `└` first result line, with
+    // consecutive same-tool calls folded into `Ran N …`. Every gesture is
+    // listed with BOTH paths: a terminal configured to swallow Option (tmux,
+    // iTerm, Terminal.app — it is the mac compose key) delivers no ⌥ chord,
+    // so the typed command is the one that always arrives.
+    "tool rows — ⌥T or ⌃O expand/collapse every row · ⌥N/⌥P walk one · ⏎/space or click cycles it (collapsed → expanded → show all) · ⌥V verbosity",
+    "  Alt-free — /collapse [all|expand|next|prev] · /verbosity [quiet|normal|verbose] · /tasks (the background-task line under the composer, also ⌥S)",
 ];
 
 /// Builds the help command rows from the exact shared projection used by
@@ -46,6 +54,14 @@ pub const HELP_TEXT: &[&str] = &[
     "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
     "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
     "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
+    // 971-tui-collapse: tool rows are COLLAPSED by default — one summary row
+    // (name · exit · lines · duration) plus a `└` first result line, with
+    // consecutive same-tool calls folded into `Ran N …`. Every gesture is
+    // listed with BOTH paths: a terminal configured to swallow Option (tmux,
+    // iTerm, Terminal.app — it is the mac compose key) delivers no ⌥ chord,
+    // so the typed command is the one that always arrives.
+    "tool rows — ⌥T or ⌃O expand/collapse every row · ⌥N/⌥P walk one · ⏎/space or click cycles it (collapsed → expanded → show all) · ⌥V verbosity",
+    "  Alt-free — /collapse [all|expand|next|prev] · /verbosity [quiet|normal|verbose] · /tasks (the background-task line under the composer, also ⌥S)",
     "  /queue <steer|subturn|turn> mid-turn input — safe boundary, next tool call, or turn end",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
     "  /provider [name]   anthropic · openai · gemini · kimi · grok · xai · deepseek",

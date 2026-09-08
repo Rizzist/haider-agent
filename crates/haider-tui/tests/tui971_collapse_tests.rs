@@ -11,12 +11,13 @@ use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::ids::{ItemId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem};
-use haider_tui::app::{AppModel, Hit, RuntimeMode, Screen};
+use haider_tui::app::{AppEvent, AppModel, Hit, RuntimeMode, Screen};
 use haider_tui::toolfold::{
     self as tf, RowFacts, RowState, Segment, Tone, ToolFold, ToolTiming, Verbosity,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 // ---------------------------------------------------------- fixtures ----
 
@@ -35,6 +36,22 @@ fn session_model() -> AppModel {
     model.screen = Screen::Session;
     model.clock_ms = 1_700_000_000_000;
     model
+}
+
+/// Type a slash line and send it — the public key path, never a private
+/// reducer entry, because the fallback's whole point is that it survives
+/// the keyboard.
+fn submit(model: &mut AppModel, text: &str) {
+    for c in text.chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
 }
 
 fn apply(model: &mut AppModel, payload: EventPayload) {
@@ -1343,4 +1360,162 @@ fn a_tail_cut_at_the_front_never_speaks_with_a_mid_line_fragment() {
         tf::subline_segments_from("whole line\n", false, 0).is_some(),
         "an uncut tail keeps its first line"
     );
+}
+
+// ---- 12. round 2: the dedupe, and the Alt-free paths -----------------
+
+#[test]
+fn the_counts_have_exactly_one_source_on_the_frame() {
+    // Owner DEDUPE ruling: the `▾ subagents` row's `· N shell · N monitor`
+    // run is retired; the band's task line is the single source.
+    let mut model = tasks_model(2, 3);
+    model.chips = Vec::new();
+    let painted = rows(&model, 120, 40);
+    assert_eq!(
+        painted
+            .iter()
+            .filter(|row| row.contains("2 shells"))
+            .count(),
+        1,
+        "the counts appear once: {painted:#?}"
+    );
+    assert!(
+        !painted.iter().any(|row| row.contains("· 2 shells ·")),
+        "the retired right-aligned band-row run is gone"
+    );
+    assert!(
+        !painted.iter().any(|row| row.contains("subagents")),
+        "with no subagents that panel owes no row at all"
+    );
+}
+
+#[test]
+fn an_expanded_shell_or_monitor_row_opens_its_overlay() {
+    let mut model = tasks_model(1, 1);
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_MONITOR_CONTROL_V1.into());
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SHELL_REGISTRY_V1.into());
+    model.toggle_tasks_line();
+    model.handle_hit(Hit::MonitorStatus);
+    assert!(model.monitors_open);
+    model.monitors_open = false;
+    model.handle_hit(Hit::ShellStatus);
+    assert!(
+        model.shells_open,
+        "the doors 970 owner item 1 hung on the counts follow them here"
+    );
+}
+
+/// Every ⌥ chord this wave added has a path that survives a terminal
+/// configured to swallow Option (tmux · iTerm · Terminal.app — it is the
+/// mac compose key). ⌃O for the blanket toggle, typed commands for the rest.
+#[test]
+fn every_alt_gesture_has_an_alt_free_path() {
+    let mut model = session_model();
+    tool(
+        &mut model,
+        "t1",
+        "verify",
+        ToolStatus::Completed,
+        "candidate",
+    );
+    tool(&mut model, "t2", "grep", ToolStatus::Completed, "hits");
+
+    // ⌥T ← ⌃O
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(model.toolfold.all_expanded(), "⌃O is ⌥T's twin");
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(!model.toolfold.all_expanded());
+
+    // ⌥T ← /collapse (idempotent, unlike a flip)
+    submit(&mut model, "/collapse expand");
+    assert!(model.toolfold.all_expanded());
+    submit(&mut model, "/collapse expand");
+    assert!(model.toolfold.all_expanded(), "a typed command is absolute");
+    submit(&mut model, "/collapse all");
+    assert!(!model.toolfold.all_expanded());
+    submit(&mut model, "/collapse");
+    assert!(model.toolfold.all_expanded(), "bare /collapse toggles");
+    submit(&mut model, "/collapse");
+
+    // ⌥N/⌥P ← /collapse next|prev
+    submit(&mut model, "/collapse next");
+    assert_eq!(model.toolfold.focus(), Some("t2"));
+    submit(&mut model, "/collapse prev");
+    assert_eq!(model.toolfold.focus(), Some("t1"));
+
+    // ⌥V ← /verbosity
+    submit(&mut model, "/verbosity quiet");
+    assert_eq!(model.toolfold.verbosity(), Verbosity::Quiet);
+    submit(&mut model, "/verbosity");
+    assert_eq!(
+        model.toolfold.verbosity(),
+        Verbosity::Normal,
+        "bare /verbosity cycles"
+    );
+
+    // ⌥S ← /tasks
+    assert!(!model.tasks_line_expanded);
+    submit(&mut model, "/tasks");
+    assert!(model.tasks_line_expanded);
+    submit(&mut model, "/tasks");
+    assert!(!model.tasks_line_expanded);
+}
+
+#[test]
+fn a_mistyped_fallback_argument_is_refused_with_its_vocabulary() {
+    let mut model = session_model();
+    submit(&mut model, "/verbosity loud");
+    let flash = model.flash.clone().expect("a refusal names the vocabulary");
+    assert!(
+        flash.contains("quiet") && flash.contains("verbose"),
+        "{flash}"
+    );
+    assert_eq!(
+        model.toolfold.verbosity(),
+        Verbosity::Normal,
+        "a refused argument changes nothing"
+    );
+    submit(&mut model, "/collapse sideways");
+    let flash = model.flash.clone().expect("same for /collapse");
+    assert!(
+        flash.contains("expand") && flash.contains("next"),
+        "{flash}"
+    );
+}
+
+/// Both paths are DOCUMENTED — a chord nobody can discover is not a
+/// fallback (owner ruling 4: "document both in the key hints").
+#[test]
+fn the_key_hints_name_both_paths() {
+    for copy in [
+        haider_tui::commands::HELP_INTRO_TEXT,
+        haider_tui::commands::HELP_TEXT,
+    ] {
+        let text = copy.join("\n");
+        for needle in [
+            "⌥T",
+            "⌃O",
+            "⌥N",
+            "⌥V",
+            "⌥S",
+            "/collapse",
+            "/verbosity",
+            "/tasks",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the key hints must name {needle}: {text}"
+            );
+        }
+    }
 }

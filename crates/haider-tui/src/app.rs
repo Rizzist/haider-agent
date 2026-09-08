@@ -8076,6 +8076,17 @@ impl AppModel {
                 KeyCode::Char('t') => self.cycle_theme(),
                 // ⌃G = the token panel (sim tui.js binding).
                 KeyCode::Char('g') => self.toggle_token_panel(),
+                // 971-tui-collapse round 2 (owner ruling 4): ⌃O is ⌥T's
+                // Alt-free twin. tmux, iTerm and Terminal.app can each be
+                // configured to swallow Option entirely (it is the compose
+                // key on a mac keyboard), so every gesture this wave added
+                // has a non-Alt path — ⌃O here, and a typed command for the
+                // rest (`/collapse`, `/verbosity`, `/tasks`). ⌃B is
+                // deliberately NOT used: it is tmux's own default prefix,
+                // which is exactly the terminal this fallback exists for.
+                KeyCode::Char('o') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
+                    self.toggle_all_tool_rows();
+                }
                 // TUI5 items 2+3 — readline editing keys, Claude Code
                 // parity: ⌃A/⌃E line edges, ⌃W word-back, ⌃K kill-to-end,
                 // ⌃U kill-to-start. Only while the composer actually owns
@@ -15111,6 +15122,44 @@ impl AppModel {
                     self.select_account(&alias);
                 }
             }
+            // 971-tui-collapse round 2 (owner ruling 4): the Alt-free path
+            // to every gesture this wave added. Typed commands, because a
+            // terminal that swallows Option still delivers text — and
+            // because a name is discoverable where a chord is not. They are
+            // display-only, so they work in demo and live alike.
+            //
+            // NOT in the palette catalog: `COMMANDS` is shared with the
+            // daemon's `command.list` door, and widening it is a protocol
+            // change this lane does not make. `/help`'s keys line documents
+            // them instead (see `commands::HELP_INTRO_TEXT`).
+            "collapse" | "toolrows" => match arg.as_deref() {
+                Some("all") | Some("collapse") | Some("collapsed") => {
+                    self.set_all_tool_rows(false);
+                }
+                Some("expand") | Some("expanded") => self.set_all_tool_rows(true),
+                Some("next") => self.move_tool_focus(true),
+                Some("prev") | Some("previous") => self.move_tool_focus(false),
+                Some("toggle") | None => self.toggle_all_tool_rows(),
+                Some(other) => {
+                    self.flash = Some(format!(
+                        "· /collapse {other}? — all · expand · next · prev (bare toggles every tool row)"
+                    ));
+                    self.dirty = true;
+                }
+            },
+            "verbosity" | "verbose" => match arg.as_deref() {
+                None => self.cycle_tool_verbosity(),
+                Some(name) => match crate::toolfold::Verbosity::parse(name) {
+                    Some(verbosity) => self.set_tool_verbosity(verbosity),
+                    None => {
+                        self.flash = Some(format!(
+                            "· /verbosity {name}? — quiet · normal · verbose (bare cycles)"
+                        ));
+                        self.dirty = true;
+                    }
+                },
+            },
+            "tasks" => self.toggle_tasks_line(),
             "" => {}
             other => {
                 // W-C M1: a user-loaded custom command merges OVER (never
@@ -15338,20 +15387,17 @@ impl AppModel {
             .count()
     }
 
-    /// The right-aligned counts on the `▾ subagents` band row (970 owner
-    /// item 1). Empty when there is nothing running — the row then collapses
-    /// exactly as it did before.
-    #[must_use]
-    pub fn band_counts(&self) -> Vec<crate::taskrows::BandCount> {
-        crate::taskrows::band_counts(self.live_shell_count(), self.monitor_count)
-    }
-
     // ---- 971-tui-collapse: the band's background-task line ----
 
     /// ⌥S / a click on the line — expand it into the per-task list, or fold
     /// it back. Collapsed is the default and the resting state.
     pub fn toggle_tasks_line(&mut self) {
         self.tasks_line_expanded = !self.tasks_line_expanded;
+        self.flash = Some(if self.tasks_line_expanded {
+            "· background tasks expanded — ⌥S · /tasks".to_owned()
+        } else {
+            "· background tasks collapsed — ⌥S · /tasks".to_owned()
+        });
         self.dirty = true;
     }
 
@@ -15617,13 +15663,28 @@ impl AppModel {
         true
     }
 
-    /// ⌥T — every tool row at once.
+    /// ⌥T / ⌃O / `/collapse` — every tool row at once.
     pub fn toggle_all_tool_rows(&mut self) {
         self.toolfold.toggle_all();
+        self.note_tool_rows_state();
+    }
+
+    /// `/collapse all|expand` — the same law, stated absolutely rather
+    /// than as a flip, so a typed command is idempotent.
+    pub fn set_all_tool_rows(&mut self, expanded: bool) {
+        if self.toolfold.all_expanded() != expanded {
+            self.toolfold.toggle_all();
+        }
+        self.note_tool_rows_state();
+    }
+
+    fn note_tool_rows_state(&mut self) {
+        // The flash names BOTH paths, because the Alt one is the one a
+        // terminal can swallow.
         self.flash = Some(if self.toolfold.all_expanded() {
-            "· tool rows expanded (⌥T collapses)".to_owned()
+            "· tool rows expanded — ⌥T · ⌃O · /collapse".to_owned()
         } else {
-            "· tool rows collapsed (⌥T expands)".to_owned()
+            "· tool rows collapsed — ⌥T · ⌃O · /collapse".to_owned()
         });
         self.dirty = true;
     }
@@ -15641,7 +15702,10 @@ impl AppModel {
     pub fn set_tool_verbosity(&mut self, verbosity: crate::toolfold::Verbosity) {
         self.toolfold.set_verbosity(verbosity);
         self.verbosity_commits = self.verbosity_commits.saturating_add(1);
-        self.flash = Some(format!("· tool output: {}", verbosity.name()));
+        self.flash = Some(format!(
+            "· tool output: {} — ⌥V · /verbosity",
+            verbosity.name()
+        ));
         self.dirty = true;
     }
 

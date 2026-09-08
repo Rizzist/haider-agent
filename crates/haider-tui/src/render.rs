@@ -7975,12 +7975,13 @@ fn waiting_for_agents(model: &AppModel) -> Option<String> {
 /// the subagent screen.
 fn subtree_needed(model: &AppModel, on_subagent: bool) -> u16 {
     if model.chips.is_empty() {
-        // 970 owner item 1: with no subagents the panel still owes ONE row
-        // whenever background work is running, because that row is now the
-        // only place the shells/monitors counts appear (the status-bar
-        // segments are gone). With nothing running at all it collapses
-        // entirely, exactly as before.
-        return u16::from(!model.band_counts().is_empty());
+        // 971-tui-collapse SUPERSEDES 970 owner item 1's counts-only row
+        // (owner ruling, round 2 — DEDUPE): the band's background-task line
+        // under the composer is now the SINGLE source for the shells /
+        // monitors / agents counts, and it reports agents and background
+        // tasks besides. With no subagents this panel has nothing of its
+        // own to say, so it owes no row at all.
+        return 0;
     }
     if model.subtree_collapsed {
         return 1;
@@ -8187,82 +8188,26 @@ fn render_subtree(
     if area.height == 0 {
         return;
     }
-    let has_chips = !model.chips.is_empty();
+    // 971-tui-collapse round 2 (owner DEDUPE ruling): with no subagents
+    // there is no panel. The shells/monitors counts 970 owner item 1 parked
+    // on this row moved to the band's background-task line under the
+    // composer, which is now their single source — the reader was seeing
+    // them twice within three rows.
+    if model.chips.is_empty() {
+        return;
+    }
     let arrow = if model.subtree_collapsed {
         "▸"
     } else {
         "▾"
     };
-    // 970 owner item 1: Claude Code's task line — the band's header row
-    // carries the background counts RIGHT-ALIGNED (`· 2 shells · 1 monitor`),
-    // each one its own click target. With no subagents the left half is
-    // simply absent and the counts stand alone on the row.
-    let mut header: Vec<Span<'static>> = if has_chips {
-        vec![
-            Span::styled(format!("{arrow} subagents"), theme.gold_style()),
-            Span::styled(format!(" — {}", subtree_counts(model)), theme.dim_style()),
-        ]
-    } else {
-        Vec::new()
-    };
-    let counts = model.band_counts();
-    // Measured BEFORE the pad so the hit rects land on the glyphs the
-    // reader actually sees, not on the gap.
-    let counts_width = crate::taskrows::band_counts_text(&counts).chars().count();
-    let header_width = Line::from(header.clone()).width();
-    // A ≥2-cell gap: the counts must never kiss the subagent summary. When
-    // the row cannot hold both, the counts yield — the panel's own state is
-    // the more important half of the row.
-    let count_spans_fit =
-        !counts.is_empty() && header_width + 2 + counts_width <= area.width as usize;
-    let mut count_hits: Vec<(u16, u16, Hit)> = Vec::new();
-    if count_spans_fit {
-        let pad = (area.width as usize)
-            .saturating_sub(header_width)
-            .saturating_sub(counts_width);
-        header.push(Span::raw(" ".repeat(pad)));
-        let mut cursor = header_width + pad;
-        for (index, count) in counts.iter().enumerate() {
-            if index > 0 {
-                header.push(Span::raw(" "));
-                cursor += 1;
-            }
-            let width = count.text.chars().count();
-            let hit = match count.kind {
-                crate::taskrows::BandCountKind::Shells => Hit::ShellStatus,
-                crate::taskrows::BandCountKind::Monitors => Hit::MonitorStatus,
-            };
-            if let (Ok(x), Ok(width_u16)) = (u16::try_from(cursor), u16::try_from(width)) {
-                count_hits.push((x, width_u16, hit));
-            }
-            header.push(Span::styled(count.text.clone(), theme.dim_style()));
-            cursor += width;
-        }
-    }
+    let header: Vec<Span<'static>> = vec![
+        Span::styled(format!("{arrow} subagents"), theme.gold_style()),
+        Span::styled(format!(" — {}", subtree_counts(model)), theme.dim_style()),
+    ];
     let mut lines = vec![Line::from(header)];
-    // The counts are pushed FIRST: `hit_rect_at` takes the FIRST rect that
-    // contains the pointer, and the toggle's row-wide rect would otherwise
-    // swallow every click on them.
-    for (x, width, hit) in count_hits {
-        let x = area.x.saturating_add(x);
-        let end = area.x.saturating_add(area.width);
-        if x < end {
-            hits.push((
-                Rect::new(x, area.y, width.min(end.saturating_sub(x)), 1),
-                hit,
-            ));
-        }
-    }
-    // With no subagents there is no panel to collapse — the row is counts
-    // only, so it carries no toggle.
-    let mut row_hits: Vec<(usize, Hit)> = if has_chips {
-        vec![(0, Hit::SubTreeToggle)]
-    } else {
-        Vec::new()
-    };
-    // No chips means no map to draw — the counts-only row stands alone and
-    // owes neither the ⌂ home row nor a tree.
-    if has_chips && !model.subtree_collapsed {
+    let mut row_hits: Vec<(usize, Hit)> = vec![(0, Hit::SubTreeToggle)];
+    if !model.subtree_collapsed {
         if let Some(summary) = subtree_metrics_summary(model) {
             lines.push(Line::styled(format!("  {summary}"), theme.dim_style()));
         }
@@ -12211,14 +12156,33 @@ fn render_task_line(
         area.width,
         theme,
     )];
+    // The overlay doors 970 owner item 1 hung on the retired counts row
+    // move here with the counts (round 2 DEDUPE ruling): a shell row opens
+    // `/shells`, a monitor row opens `/monitors`. Pushed BEFORE the
+    // summary's row-wide toggle because `hit_rect_at` takes the FIRST rect
+    // containing the pointer.
+    let mut row_hits: Vec<(u16, Hit)> = Vec::new();
     if status.expanded {
         let (listed, hidden) = status.listed();
-        rows.extend(listed.iter().map(|row| {
-            toned_line(
+        for (index, row) in listed.iter().enumerate() {
+            rows.push(toned_line(
                 &crate::statusline::StatusLine::row_segments(row, cells),
                 theme,
-            )
-        }));
+            ));
+            let door = match row.kind {
+                crate::statusline::RowKind::Shell => Some(Hit::ShellStatus),
+                crate::statusline::RowKind::Monitor => Some(Hit::MonitorStatus),
+                // A subagent's own door is the fleet, which is screen-scoped
+                // (970's guard); an agent row keeps hover chrome only rather
+                // than a door that silently does nothing off-session.
+                crate::statusline::RowKind::Main
+                | crate::statusline::RowKind::Agent
+                | crate::statusline::RowKind::Task => None,
+            };
+            if let (Some(door), Ok(offset)) = (door, u16::try_from(index + 1)) {
+                row_hits.push((offset, door));
+            }
+        }
         if hidden > 0 {
             rows.push(toned_line(
                 &crate::statusline::StatusLine::overflow_segments(hidden),
@@ -12231,6 +12195,19 @@ fn render_task_line(
         Paragraph::new(Text::from(rows)).style(theme.text_style()),
         area,
     );
+    for (offset, hit) in row_hits {
+        if offset < area.height {
+            hits.push((
+                Rect {
+                    x: area.x,
+                    y: area.y.saturating_add(offset),
+                    width: area.width,
+                    height: 1,
+                },
+                hit,
+            ));
+        }
+    }
     hits.push((
         Rect {
             x: area.x,

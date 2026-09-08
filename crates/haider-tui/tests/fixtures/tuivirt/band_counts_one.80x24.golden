@@ -31,8 +31,8 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 15| ✳ Waiting for 1 background agent to finish                                     |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×37
-16|▾ subagents — ◐ 1 working                                  · 1 shell · 1 monitor|
-   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×34; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×11
+16|▾ subagents — ◐ 1 working                                                       |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×55
 17| ⌂ session — back to the main transcript                                        |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×3; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×37; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×40
 18| └─ ◐ Husayn (r) · docs · fable-5 · macbook — starting…             ↓ 100 tokens|
