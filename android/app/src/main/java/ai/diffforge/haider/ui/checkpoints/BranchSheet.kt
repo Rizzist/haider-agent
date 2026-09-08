@@ -3,15 +3,14 @@ package ai.diffforge.haider.ui.checkpoints
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.components.LabelledField
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -19,7 +18,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
@@ -37,7 +35,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -141,31 +138,12 @@ fun BranchSheet(
                     style = type.sessionMeta,
                     color = colors.textSoft,
                 )
-                Text(
-                    stringResource(R.string.branches_name),
-                    style = type.sessionMeta,
-                    color = colors.textMuted,
+                LabelledField(
+                    label = stringResource(R.string.branches_name),
+                    value = name,
+                    onValueChange = { name = it },
+                    tag = BRANCHES_NAME_FIELD_TAG,
                 )
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = ForgeSize.touch)
-                        .clip(ForgeShapes.cardTight)
-                        .background(colors.surfaceControl)
-                        .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight)
-                        .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.lg),
-                ) {
-                    BasicTextField(
-                        value = name,
-                        onValueChange = { name = it },
-                        singleLine = true,
-                        textStyle = type.chatBody.copy(color = colors.text),
-                        cursorBrush = SolidColor(colors.accent),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag(BRANCHES_NAME_FIELD_TAG),
-                    )
-                }
                 ForgeButton(
                     text = stringResource(R.string.branches_create),
                     onClick = { onCreate(name) },

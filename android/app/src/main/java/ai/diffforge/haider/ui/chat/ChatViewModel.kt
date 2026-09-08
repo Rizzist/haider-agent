@@ -421,7 +421,10 @@ class ChatViewModel(
                 it.copy(checkpoints = it.checkpoints.copy(loading = true))
             }
         }
-        val branch = _state.value.branchSelection[sessionId]
+        // The facade owns the selection, so it is read from there rather than
+        // from the mirrored copy in state: the mirror is one collector hop
+        // behind a switch, and `checkpoint.list` is branch-scoped.
+        val branch = service.branchSelection.value[sessionId]
         val result = service.checkpoints(sessionId, branch, cursor)
         update { current ->
             // A page that came back for a session the sheet has since left is
@@ -476,7 +479,7 @@ class ChatViewModel(
         val state = _state.value.checkpoints
         val sessionId = state.sessionId ?: return@launch
         val gesture = state.confirming ?: return@launch
-        val branch = _state.value.branchSelection[sessionId]
+        val branch = service.branchSelection.value[sessionId]
         update {
             it.copy(
                 checkpoints = it.checkpoints.clearedOutcome().copy(
@@ -547,7 +550,7 @@ class ChatViewModel(
             forkNodeId = node,
             forkSeq = row.mainHeadSeq,
             name = name.trim().ifBlank { null },
-            sourceBranchId = _state.value.branchSelection[sessionId],
+            sourceBranchId = service.branchSelection.value[sessionId],
         )
         when (outcome) {
             is BranchOutcome.Created -> {

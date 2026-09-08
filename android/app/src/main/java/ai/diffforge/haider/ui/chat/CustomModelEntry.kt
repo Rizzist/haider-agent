@@ -4,23 +4,18 @@ import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.accounts.ModelInventoryAuthority
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
+import ai.diffforge.haider.ui.components.LabelledField
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -30,15 +25,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.input.ImeAction
 
 /** Test handles for the custom-model entry. */
 const val CUSTOM_MODEL_ENTRY_TAG = "custom_model_entry"
@@ -73,7 +65,6 @@ fun CustomModelEntry(
     if (!authority.acceptsCustomModelId) return
     val colors = Forge.colors
     val type = Forge.type
-    val focus = LocalFocusManager.current
     var open by remember { mutableStateOf(false) }
     var id by remember { mutableStateOf("") }
     val valid = CustomModelId.ok(id)
@@ -104,29 +95,12 @@ fun CustomModelEntry(
             return@Column
         }
 
-        Text(stringResource(R.string.model_custom_field), style = type.sessionMeta, color = colors.textMuted)
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .heightIn(min = ForgeSize.touch)
-                .clip(ForgeShapes.cardTight)
-                .background(colors.surfaceControl)
-                .border(ForgeSize.hairline, colors.border, ForgeShapes.cardTight)
-                .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.lg),
-        ) {
-            BasicTextField(
-                value = id,
-                onValueChange = { id = it },
-                singleLine = true,
-                textStyle = type.chatBody.copy(color = colors.text),
-                cursorBrush = SolidColor(colors.accent),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag(CUSTOM_MODEL_FIELD_TAG),
-            )
-        }
+        LabelledField(
+            label = stringResource(R.string.model_custom_field),
+            value = id,
+            onValueChange = { id = it },
+            tag = CUSTOM_MODEL_FIELD_TAG,
+        )
         Text(
             stringResource(R.string.model_custom_hint),
             style = type.sessionMeta,
