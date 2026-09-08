@@ -7,6 +7,30 @@ fn binary(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+fn bundle() -> tempfile::TempDir {
+    // Keep the fixture on the prebuilt executable's filesystem so publishing
+    // it can use a hard link instead of opening an executable inode for write.
+    tempfile::tempdir_in(
+        Path::new(env!("CARGO_BIN_EXE_haider"))
+            .parent()
+            .expect("binary directory"),
+    )
+    .expect("bundle")
+}
+
+fn publish_cli(directory: &Path) -> PathBuf {
+    // The prebuilt binary is immutable throughout this test binary. A copy
+    // opens a writer that a parallel fork can retain until exec, even after
+    // copy returns. Syncing/renaming that same inode cannot revoke such an fd.
+    // Link an already-closed executable, then replace the destination so a
+    // writer of an old fixture cannot make this inode ETXTBSY either.
+    let staged = directory.join(binary("haider-staged"));
+    let cli = directory.join(binary("haider"));
+    std::fs::hard_link(env!("CARGO_BIN_EXE_haider"), &staged).expect("immutable thin client");
+    std::fs::rename(staged, &cli).expect("publish thin client");
+    cli
+}
+
 fn command(cli: &Path, home: &Path) -> Command {
     let mut command = Command::new(cli);
     command
@@ -66,10 +90,9 @@ fn main() {{
 
 #[test]
 fn every_interactive_verb_executes_payload_with_original_arguments_and_exit_status() {
-    let directory = tempfile::tempdir().expect("bundle");
+    let directory = bundle();
     let home = tempfile::tempdir().expect("home");
-    let cli = directory.path().join(binary("haider"));
-    std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+    let cli = publish_cli(directory.path());
     probe(directory.path());
     for args in [
         vec![],
@@ -122,9 +145,8 @@ fn every_interactive_verb_executes_payload_with_original_arguments_and_exit_stat
 
 #[test]
 fn every_headless_verb_never_executes_the_observable_payload() {
-    let directory = tempfile::tempdir().expect("bundle");
-    let cli = directory.path().join(binary("haider"));
-    std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+    let directory = bundle();
+    let cli = publish_cli(directory.path());
     probe(directory.path());
     for args in [
         vec!["--version"],
@@ -200,10 +222,24 @@ fn every_headless_verb_never_executes_the_observable_payload() {
 
 #[test]
 fn missing_or_mismatched_payload_fails_before_profile_creation_but_version_stays_local() {
-    let directory = tempfile::tempdir().expect("bundle");
+    let directory = bundle();
     let home = tempfile::tempdir().expect("home");
-    let cli = directory.path().join(binary("haider"));
-    std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+    #[cfg(target_os = "linux")]
+    let old_writer = {
+        let cli = directory.path().join(binary("haider"));
+        std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("old thin client");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&cli)
+            .expect("hold old executable open for writing");
+        let error = command(&cli, home.path())
+            .arg("--version")
+            .output()
+            .expect_err("an executable with a live writer must fail before routing");
+        assert_eq!(error.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        writer
+    };
+    let cli = publish_cli(directory.path());
     for present in [false, true] {
         if present {
             std::fs::write(
@@ -228,6 +264,8 @@ fn missing_or_mismatched_payload_fails_before_profile_creation_but_version_stays
         assert_eq!(launch.status.code(), Some(69));
         assert!(!home.path().join("profile").exists());
     }
+    #[cfg(target_os = "linux")]
+    drop(old_writer);
 }
 
 #[test]
@@ -267,10 +305,9 @@ fn only_the_actual_payload_contains_its_complete_build_identity() {
 
 #[test]
 fn self_test_rejects_a_payload_from_another_version_before_running_the_daemon() {
-    let directory = tempfile::tempdir().expect("bundle");
+    let directory = bundle();
     let home = tempfile::tempdir().expect("home");
-    let cli = directory.path().join(binary("haider"));
-    std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+    let cli = publish_cli(directory.path());
     let payload = probe(directory.path());
     std::fs::rename(&payload, directory.path().join(binary("haiderd"))).expect("observable daemon");
     std::fs::write(

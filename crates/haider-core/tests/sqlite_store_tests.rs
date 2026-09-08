@@ -281,11 +281,14 @@ async fn durable_generation_prevents_same_millisecond_restart_id_collisions() {
         .expect("second store closes cleanly");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn explicit_close_drops_cached_statements_and_allows_immediate_reopen() {
-    // "Immediate" means no sleep or retry. The bound leaves room for blocking
-    // pool scheduling and Windows handle teardown while still detecting a
-    // close task that is genuinely stuck.
+    // "Immediate" means reopen after the close completion, with no sleep or
+    // retry. Close flushes cached statements, closes SQLite (including WAL
+    // cleanup), then releases the profile lock, all on spawn_blocking. Tokio
+    // inhibits paused-time advancement while blocking work is queued/running,
+    // so Windows filesystem retries and runner scheduling cannot race this
+    // completion deadline. The CI driver bounds a genuinely stuck OS call.
     const CLOSE_DEADLINE: Duration = Duration::from_secs(10);
 
     let root = tempfile::tempdir().expect("temporary profile");
@@ -300,14 +303,32 @@ async fn explicit_close_drops_cached_statements_and_allows_immediate_reopen() {
             .is_empty()
     );
 
+    // Retain a clone so a missing explicit close cannot pass via final Drop.
+    let observed = first.clone();
+    let state = || {
+        format!(
+            "generation={}, fault={:?}, owner_token={}, wal={}, shm={}",
+            observed.worker_generation(),
+            observed.profile_fault(),
+            root.path().join("lock.owner").exists(),
+            root.path().join("store.sqlite-wal").exists(),
+            root.path().join("store.sqlite-shm").exists(),
+        )
+    };
     timeout(CLOSE_DEADLINE, first.close())
         .await
-        .expect("close completes")
+        .unwrap_or_else(|error| panic!("close completion: {error}; {}", state()))
         .expect("close succeeds");
     let reopened = timeout(CLOSE_DEADLINE, SqliteStoreHandle::open(root.path()))
         .await
-        .expect("immediate reopen completes")
-        .expect("profile lock was released");
+        .unwrap_or_else(|error| panic!("immediate reopen completion: {error}; {}", state()))
+        .unwrap_or_else(|error| panic!("profile lock was released: {error}; {}", state()));
+    let closed = observed
+        .session_ids()
+        .await
+        .expect_err("every clone observes the explicit close");
+    assert_eq!(closed.code, ErrorCode::Internal);
+    assert_eq!(closed.message, "SQLite store handle is closed");
     reopened.close().await.expect("reopened handle closes");
 }
 
