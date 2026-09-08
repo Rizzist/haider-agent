@@ -115,6 +115,13 @@ data class SessionRow(
     val parentSessionId: String? = null,
     val kind: String? = null,
     val needsInput: NeedsInput? = null,
+    /**
+     * `SessionSnapshot.workflow` (frame.rs:2299) — the session's own
+     * `GraphStatus`, under `session_workflow_state_v1`. Null means the roster
+     * carried none, which is why the chip's own state machine, and not this
+     * field, decides between "no workflow" and "not read".
+     */
+    val workflow: ai.diffforge.haider.ui.workflow.SessionWorkflow? = null,
     /** null ⇒ no active run ⇒ render no Stop button. */
     val runId: String? = null,
     val workerGeneration: Long = 0L,
@@ -286,7 +293,13 @@ object TurnCancel {
 
 // ---------- the service the UI talks to ----------
 
-interface DaemonService {
+/**
+ * Lane 971-UI-workflows extends the facade by inheritance, not by editing the
+ * body: [WorkflowDaemon] and [LoomDaemon] carry their own honest defaults, so an
+ * implementation that has not wired those doors reports the daemon feature it
+ * would need instead of failing to compile or, worse, answering emptily.
+ */
+interface DaemonService : WorkflowDaemon, LoomDaemon {
     val status: StateFlow<DaemonStatus>
 
     /** Network / notification / battery signals, from the C2 snapshot. */

@@ -49,6 +49,20 @@ sealed interface Overlay {
         val agentId: String?,
         val parentSessionId: String?,
     ) : Overlay
+
+    // ---------- lane 971-UI-workflows ----------
+
+    /**
+     * The live workflow graph for one session. Three full screens, because each
+     * hosts a flow with its own back stack: a graph drills into child sessions,
+     * and authoring is a multi-step exchange with the daemon that a sheet
+     * dismissed by a stray tap would lose.
+     */
+    data class WorkflowGraph(val sessionId: String, val graphId: String? = null) : Overlay
+    data object Looms : Overlay
+    data class LoomAuthoring(
+        val kind: ai.diffforge.haider.ui.loom.LoomAuthorKind,
+    ) : Overlay
 }
 
 /**

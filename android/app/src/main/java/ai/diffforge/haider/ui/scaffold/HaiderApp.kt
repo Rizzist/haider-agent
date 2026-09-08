@@ -1,7 +1,16 @@
 package ai.diffforge.haider.ui.scaffold
 
+import ai.diffforge.haider.AppContainer
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.accounts.AccountsRepository
+import ai.diffforge.haider.ui.loom.LoomAuthoringController
+import ai.diffforge.haider.ui.loom.LoomAuthoringScreen
+import ai.diffforge.haider.ui.loom.LoomController
+import ai.diffforge.haider.ui.loom.LoomsScreen
+import ai.diffforge.haider.ui.workflow.WorkflowChipModel
+import ai.diffforge.haider.ui.workflow.WorkflowController
+import ai.diffforge.haider.ui.workflow.WorkflowGraphScreen
+import ai.diffforge.haider.ui.workflow.WorkflowStatusChip
 import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.chat.SessionPickerSheet
@@ -67,6 +76,7 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -78,6 +88,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
@@ -190,7 +201,83 @@ fun HaiderApp(
             )
         }
 
-        when (state.overlay) {
+        // ---------- lane 971-UI-workflows: the three full screens ----------
+        // Controllers live here rather than inside a branch: a screen that is
+        // recomposed away and back must not restart its watch loop from zero.
+        val daemonService = AppContainer.daemon(LocalContext.current)
+        val workflowController = remember(daemonService) {
+            WorkflowController(daemonService, scope)
+        }
+        val loomController = remember(daemonService) { LoomController(daemonService, scope) }
+        val authoringController = remember(daemonService) {
+            LoomAuthoringController(daemonService, scope)
+        }
+
+        when (val overlay = state.overlay) {
+            is Overlay.WorkflowGraph -> {
+                LaunchedEffect(overlay.sessionId, overlay.graphId) {
+                    workflowController.open(
+                        sessionId = overlay.sessionId,
+                        sessionTitle = viewModel.session(overlay.sessionId)?.title
+                            ?: overlay.sessionId,
+                        graphId = overlay.graphId,
+                    )
+                }
+                DisposableEffect(Unit) { onDispose { workflowController.close() } }
+                val workflowState by workflowController.state.collectAsState()
+                WorkflowGraphScreen(
+                    state = workflowState,
+                    onBack = viewModel::closeOverlay,
+                    onToggleAst = workflowController::toggleAst,
+                    onSelectNode = { workflowController.selectNode(it) },
+                    // The drill-in is the daemon's own `parent_attempt` →
+                    // `child_session_id` mapping; nothing here matches a name.
+                    onOpenChild = { link ->
+                        viewModel.activate(link.childSessionId)
+                        viewModel.openOverlay(
+                            Overlay.WorkflowGraph(link.childSessionId, link.childGraphId),
+                        )
+                    },
+                    onRefresh = workflowController::refresh,
+                )
+                return@ForgeTheme
+            }
+            Overlay.Looms -> {
+                LaunchedEffect(Unit) { loomController.refresh() }
+                val loomState by loomController.state.collectAsState()
+                LoomsScreen(
+                    state = loomState,
+                    onBack = { viewModel.openOverlay(Overlay.Settings) },
+                    onRefresh = { loomController.refresh() },
+                    onIncludeArchived = loomController::setIncludeArchived,
+                    onSetArchived = { kind, id, archived, fence ->
+                        loomController.setArchived(kind, id, archived, fence)
+                    },
+                    onAuthor = { kind ->
+                        authoringController.setKind(kind)
+                        viewModel.openOverlay(Overlay.LoomAuthoring(kind))
+                    },
+                )
+                return@ForgeTheme
+            }
+            is Overlay.LoomAuthoring -> {
+                val authoringState by authoringController.state.collectAsState()
+                LoomAuthoringScreen(
+                    state = authoringState,
+                    onBack = { viewModel.openOverlay(Overlay.Looms) },
+                    onKind = authoringController::setKind,
+                    onProse = authoringController::setProse,
+                    onText = authoringController::setText,
+                    // The draft is generated with the active session's own
+                    // provider/model, which is why it needs one.
+                    onDraft = { state.activeSessionId?.let(authoringController::draft) },
+                    onRevise = authoringController::revise,
+                    onValidate = authoringController::validate,
+                    onConfirm = authoringController::confirm,
+                    onStartOver = authoringController::reset,
+                )
+                return@ForgeTheme
+            }
             Overlay.Settings -> {
                 SettingsScreen(
                     state = state,
@@ -201,6 +288,7 @@ fun HaiderApp(
                     onBack = viewModel::closeOverlay,
                     onThemeMode = onThemeMode,
                     onOpenAccounts = { viewModel.openOverlay(Overlay.Accounts) },
+                    onOpenLooms = { viewModel.openOverlay(Overlay.Looms) },
                     onStartDaemon = { viewModel.startDaemon() },
                     onStopDaemon = { viewModel.stopDaemon() },
                     onRestartDaemon = { viewModel.restartDaemon() },
@@ -358,6 +446,22 @@ fun HaiderApp(
                     },
                     onDismiss = { rank -> dismissals.dismiss(rank, nowMs) },
                 )
+
+                // The session's own workflow, from the roster row that rendered
+                // it. A session with none draws nothing at all: most have none,
+                // and a permanent "No workflow" line above every chat is chrome.
+                state.activeSession?.let { row ->
+                    WorkflowStatusChip(
+                        state = WorkflowChipModel.resolve(
+                            workflow = row.workflow,
+                            // A subagent's workflow opens the same screen; the
+                            // chip only says which specialist is running it.
+                            agentType = row.agentType,
+                        ),
+                        onClick = { viewModel.openOverlay(Overlay.WorkflowGraph(row.id)) },
+                        modifier = Modifier.padding(start = ForgeSpace.md),
+                    )
+                }
 
                 Box(Modifier.fillMaxWidth().weight(1f)) {
                     // Never hidden. Auto means the *daemon* resolves device
