@@ -5,6 +5,7 @@ import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.SessionGlyph
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.loom.LoomAuthorKind
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeSpace
@@ -22,6 +23,8 @@ import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
@@ -163,6 +166,114 @@ class ScreenshotTest {
     // A ModalBottomSheet renders in its own window, so `onRoot()` cannot name
     // one node for it. The picker sheets are asserted behaviourally in
     // ComposerPickersTest instead of photographed here.
+
+    // ---------- lane 971-UI-workflows ----------
+
+    private fun captureWorkflow(
+        name: String,
+        dark: Boolean,
+        scenario: FakeScenario = FakeScenario.WorkflowRunning,
+        overlay: Overlay = Overlay.WorkflowGraph("s-nav"),
+        then: (() -> Unit)? = null,
+    ) = capture(name, scenario, dark, overlay = overlay, then = then)
+
+    @Test fun `workflow graph dark`() = captureWorkflow("workflow-graph-dark", true)
+    @Test fun `workflow graph light`() = captureWorkflow("workflow-graph-light", false)
+
+    @Test fun `workflow graph selected dark`() = captureWorkflow(
+        "workflow-graph-selected-dark",
+        true,
+    ) {
+        rule.onNodeWithTag("workflow_node_IMPLEMENT").performClick()
+        rule.waitForIdle()
+    }
+
+    @Test fun `workflow graph selected light`() = captureWorkflow(
+        "workflow-graph-selected-light",
+        false,
+    ) {
+        rule.onNodeWithTag("workflow_node_IMPLEMENT").performClick()
+        rule.waitForIdle()
+    }
+
+    @Test fun `workflow ast dark`() = captureWorkflow("workflow-ast-dark", true) {
+        rule.onNodeWithText("AST").performClick()
+        rule.waitForIdle()
+    }
+
+    @Test fun `workflow ast light`() = captureWorkflow("workflow-ast-light", false) {
+        rule.onNodeWithText("AST").performClick()
+        rule.waitForIdle()
+    }
+
+    @Test fun `workflow unavailable dark`() = captureWorkflow(
+        "workflow-unavailable-dark",
+        true,
+        scenario = FakeScenario.WorkflowUnavailable,
+    )
+
+    @Test fun `workflow unavailable light`() = captureWorkflow(
+        "workflow-unavailable-light",
+        false,
+        scenario = FakeScenario.WorkflowUnavailable,
+    )
+
+    @Test fun `workflow none dark`() = captureWorkflow(
+        "workflow-none-dark",
+        true,
+        overlay = Overlay.WorkflowGraph("s-route"),
+    )
+
+    @Test fun `workflow none light`() = captureWorkflow(
+        "workflow-none-light",
+        false,
+        overlay = Overlay.WorkflowGraph("s-route"),
+    )
+
+    @Test fun `looms dark`() = captureWorkflow(
+        "looms-dark",
+        true,
+        overlay = Overlay.Looms,
+    )
+
+    @Test fun `looms light`() = captureWorkflow(
+        "looms-light",
+        false,
+        overlay = Overlay.Looms,
+    )
+
+    @Test fun `looms unavailable dark`() = captureWorkflow(
+        "looms-unavailable-dark",
+        true,
+        scenario = FakeScenario.LoomUnavailable,
+        overlay = Overlay.Looms,
+    )
+
+    @Test fun `looms unavailable light`() = captureWorkflow(
+        "looms-unavailable-light",
+        false,
+        scenario = FakeScenario.LoomUnavailable,
+        overlay = Overlay.Looms,
+    )
+
+    private fun captureAuthoring(name: String, dark: Boolean, drafted: Boolean) = captureWorkflow(
+        name,
+        dark,
+        overlay = Overlay.LoomAuthoring(LoomAuthorKind.AgentType),
+    ) {
+        if (drafted) {
+            rule.onNodeWithTag("loom_authoring_prose").performTextReplacement("a planner")
+            rule.waitForIdle()
+            rule.onNodeWithText("Draft it").performClick()
+            rule.waitForIdle()
+        }
+    }
+
+    @Test fun `authoring prompt dark`() = captureAuthoring("authoring-prompt-dark", true, false)
+    @Test fun `authoring prompt light`() = captureAuthoring("authoring-prompt-light", false, false)
+    @Test fun `authoring draft dark`() = captureAuthoring("authoring-draft-dark", true, true)
+    @Test fun `authoring draft light`() = captureAuthoring("authoring-draft-light", false, true)
+
 }
 
 /**

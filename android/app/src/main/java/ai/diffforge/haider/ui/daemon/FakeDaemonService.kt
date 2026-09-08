@@ -9,8 +9,22 @@ import ai.diffforge.haider.ui.chat.Message
 import ai.diffforge.haider.ui.chat.Role
 import ai.diffforge.haider.ui.chat.ToolCall
 import ai.diffforge.haider.ui.chat.ToolStatus
+import ai.diffforge.haider.ui.loom.LoomAuthorConfirmed
+import ai.diffforge.haider.ui.loom.LoomAuthorDraft
+import ai.diffforge.haider.ui.loom.LoomAuthorError
+import ai.diffforge.haider.ui.loom.LoomAuthorKind
+import ai.diffforge.haider.ui.loom.LoomEntryKind
+import ai.diffforge.haider.ui.loom.LoomFence
+import ai.diffforge.haider.ui.loom.LoomInstallJob
+import ai.diffforge.haider.ui.loom.LoomRegistry
+import ai.diffforge.haider.ui.loom.LoomRpcAdapter
+import ai.diffforge.haider.ui.loom.LoomValidation
 import ai.diffforge.haider.ui.state.CapabilityApproval
 import ai.diffforge.haider.ui.state.PermissionMode
+import ai.diffforge.haider.ui.workflow.ChildGraphLink
+import ai.diffforge.haider.ui.workflow.WorkflowGraphRead
+import ai.diffforge.haider.ui.workflow.WorkflowRpcAdapter
+import ai.diffforge.haider.ui.workflow.WorkflowWatchPage
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -44,6 +58,15 @@ enum class FakeScenario {
     EmptyRosterStopped,
     Populated,
     LargeRoster,
+
+    /** A session running the fake workflow, mid-retry (lane 971-UI-workflows). */
+    WorkflowRunning,
+
+    /** The same session on a daemon that does not advertise `workflow_graph_v1`. */
+    WorkflowUnavailable,
+
+    /** The daemon carries no Loom registry: the screen says so and offers nothing. */
+    LoomUnavailable,
 }
 
 class FakeDaemonService(
@@ -341,7 +364,117 @@ class FakeDaemonService(
                 _paging.value = RosterPaging(hasMore = hiddenPages.isNotEmpty(), cursor = "p1")
                 _activeSessionId.value = all.first().id
             }
+            // The workflow surfaces. The roster is the populated one, because a
+            // workflow is a fact about a session and not a mode the app is in.
+            FakeScenario.WorkflowRunning -> {
+                _status.value = running()
+                setSessions(populatedRoster())
+                _activeSessionId.value = "s-nav"
+                transcripts["s-nav"] = runningTranscript()
+            }
+            FakeScenario.WorkflowUnavailable -> {
+                _status.value = running()
+                workflowLoom.graphUnavailable = true
+                setSessions(populatedRoster())
+                _activeSessionId.value = "s-nav"
+                transcripts["s-nav"] = runningTranscript()
+            }
+            FakeScenario.LoomUnavailable -> {
+                _status.value = running()
+                workflowLoom.loomUnavailableReason = workflowLoom.loomFeature
+                workflowLoom.authoringUnavailableReason = "no_model_selected"
+                setSessions(populatedRoster())
+                _activeSessionId.value = "s-nav"
+            }
         }
+    }
+
+    // ---------- workflow + Loom (lane 971-UI-workflows) ----------
+
+    /**
+     * The scripted workflow/Loom daemon.
+     *
+     * Public so a test can walk its recorded activation steps: the screen is
+     * driven by daemon facts arriving in order, and a test that cannot advance
+     * them can only ever check one frame of a live surface.
+     */
+    val workflowLoom = FakeWorkflowLoom()
+
+    override suspend fun workflowGraphState(sessionId: String, graphId: String?): WorkflowGraphRead {
+        calls += "${WorkflowRpcAdapter.METHOD_GRAPH_STATE}:$sessionId"
+        // Only the session the fixture actually runs a workflow on has one. A
+        // fake that answered for every id would hide the "no live graph" path,
+        // which is the state most sessions are in.
+        val row = _sessions.value.firstOrNull { it.id == sessionId }
+        if (row?.workflow == null) return WorkflowGraphRead.NoGraph
+        return workflowLoom.graphState()
+    }
+
+    override suspend fun workflowGraphWatch(
+        sessionId: String,
+        afterCursor: String,
+        limit: Int,
+    ): WorkflowWatchPage {
+        calls += "${WorkflowRpcAdapter.METHOD_GRAPH_WATCH}:$sessionId:$afterCursor"
+        return workflowLoom.watch(afterCursor, limit)
+    }
+
+    override suspend fun childGraphLinks(sessionId: String): List<ChildGraphLink> =
+        workflowLoom.childLinks()
+
+    override suspend fun loomList(includeArchived: Boolean): LoomRegistry? {
+        calls += "${LoomRpcAdapter.METHOD_LIST}:$includeArchived"
+        if (workflowLoom.loomUnavailableReason != null) return null
+        return workflowLoom.loomList(includeArchived)
+    }
+
+    override suspend fun loomUnavailable(): String? = workflowLoom.loomUnavailableReason
+
+    override suspend fun loomInstallJobs(): List<LoomInstallJob> {
+        if (workflowLoom.loomUnavailableReason != null) return emptyList()
+        calls += LoomRpcAdapter.METHOD_INSTALL_STATUS
+        return workflowLoom.installJobs()
+    }
+
+    override suspend fun loomSetArchived(
+        kind: LoomEntryKind,
+        id: String,
+        archived: Boolean,
+        fence: LoomFence,
+    ): Boolean {
+        val method = if (archived) LoomRpcAdapter.METHOD_ARCHIVE else LoomRpcAdapter.METHOD_UNARCHIVE
+        // The fence is recorded with the call: an archive without the revision
+        // it read is a compare-and-set against a value nobody observed.
+        calls += "$method:$id:${fence.expectedRev}"
+        return workflowLoom.setArchived(kind, id, archived, fence)
+    }
+
+    override suspend fun loomValidate(kind: LoomAuthorKind, text: String): LoomValidation {
+        calls += LoomRpcAdapter.METHOD_VALIDATE
+        return workflowLoom.validation(text)
+    }
+
+    override suspend fun loomAuthorDraft(
+        sessionId: String,
+        kind: LoomAuthorKind,
+        prose: String,
+    ): LoomAuthorDraft {
+        calls += "${LoomRpcAdapter.METHOD_AUTHOR_DRAFT}:$sessionId"
+        return workflowLoom.authorDraft(kind, prose)
+    }
+
+    override suspend fun loomAuthorRevise(draft: LoomAuthorDraft, text: String): LoomAuthorDraft {
+        calls += "${LoomRpcAdapter.METHOD_AUTHOR_REVISE}:${draft.authoringId}:${draft.revision}"
+        return workflowLoom.authorRevise(draft, text)
+    }
+
+    override suspend fun loomAuthorConfirm(
+        draft: LoomAuthorDraft,
+        text: String,
+        registryFence: LoomFence?,
+    ): Pair<LoomAuthorConfirmed?, List<LoomAuthorError>> {
+        calls += "${LoomRpcAdapter.METHOD_AUTHOR_CONFIRM}:${draft.authoringId}:${draft.revision}"
+        return workflowLoom.authorConfirm(draft, text)
     }
 
     fun setSessions(rows: List<SessionRow>) {
@@ -846,6 +979,9 @@ class FakeDaemonService(
             runId = "run-nav",
             workerGeneration = 6,
             headSeq = 981,
+            // The only row with a workflow. Every other session reads "no
+            // workflow", which is the state most sessions are actually in.
+            workflow = FakeWorkflowLoom.SESSION_WORKFLOW,
         ),
         SessionRow(
             id = "s-route",

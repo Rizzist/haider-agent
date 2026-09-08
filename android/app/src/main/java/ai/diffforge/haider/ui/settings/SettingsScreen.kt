@@ -36,6 +36,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material.icons.rounded.Accessibility
+import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.Screenshot
 import androidx.compose.material.icons.rounded.Sms
 import androidx.compose.material.icons.rounded.Notifications
@@ -76,6 +77,8 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onThemeMode: (ThemeMode) -> Unit,
     onOpenAccounts: () -> Unit,
+    /** The Loom registry: agent types and workflows (lane 971-UI-workflows). */
+    onOpenLooms: () -> Unit = {},
     onStartDaemon: () -> Unit,
     onStopDaemon: () -> Unit,
     onRestartDaemon: () -> Unit,
@@ -182,6 +185,17 @@ fun SettingsScreen(
                 title = stringResource(R.string.accounts_title),
                 subtitle = accountsSummary,
                 onClick = onOpenAccounts,
+            )
+
+            // Lane 971-UI-workflows: the Loom registry lives behind one row
+            // rather than a fourth drawer destination — it is inventory a
+            // person visits, not a place they work.
+            SectionLabel(R.string.settings_section_looms)
+            NavigationRow(
+                title = stringResource(R.string.looms_title),
+                subtitle = stringResource(R.string.settings_looms_row),
+                onClick = onOpenLooms,
+                icon = Icons.Rounded.AccountTree,
             )
 
             SectionLabel(R.string.settings_section_permissions)

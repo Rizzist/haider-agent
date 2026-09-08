@@ -93,6 +93,41 @@ object ForgeSize {
     val actionButton = 44.dp
     val stopChip = 28.dp
 
+    // ---------- workflow DAG canvas (lane 971-UI-workflows) ----------
+
+    /**
+     * A node card. Wide enough for an uppercase graph node name plus its phase
+     * word at the app's own scale, and 62 dp tall so the card is its own target
+     * without a separate touch box: a DAG node is a thing you tap.
+     */
+    val graphNodeWidth = 148.dp
+    val graphNodeHeight = 62.dp
+
+    /** Between siblings in one layer, and between layers. */
+    val graphColumnGap = 20.dp
+    val graphLayerGap = 44.dp
+
+    /** Breathing room around the whole graph, and where an input stub is drawn. */
+    val graphCanvasPad = 28.dp
+
+    val graphEdge = 2.dp
+    val graphDash = 6.dp
+    val graphDashGap = 5.dp
+    val graphArrow = 7.dp
+
+    /** The phase dot on a node card, and the accent bar down its left edge. */
+    val graphPhaseDot = 8.dp
+    val graphNodeRail = 3.dp
+
+    /** One level of indent in the activation-AST tree. */
+    val astIndent = 14.dp
+
+    /** The agent-type colour/glyph tile in the Looms list. */
+    val loomGlyphTile = 34.dp
+
+    /** The authoring editor's minimum height, so a draft is readable at once. */
+    val authoringEditorMin = 200.dp
+
     /** Tablet affordance retained from the existing transcript. */
     val readableMax = 776.dp
     val sheetMax = 640.dp
