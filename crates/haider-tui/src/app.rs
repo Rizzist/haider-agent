@@ -5495,6 +5495,13 @@ pub struct AppModel {
     /// The status line's rectangle from the last frame, or `None` when the
     /// sacred-input ladder shed the row entirely.
     pub status_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
+    /// The shared bottom band's INPUT SLOT from the last frame — the rows
+    /// between its opening and closing rules. On a surface with a composer
+    /// that is the composer itself; on `/accounts`, which has none, it is
+    /// the pinned key-map line. Every surface that draws a band publishes
+    /// the same rectangle here, which is the 971 F2 invariant the layout
+    /// tests read.
+    pub band_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// Monotonic login ATTEMPT mint (TUI6.3 fix 1; TUI6.5 re-scope) —
     /// each card open AND each submit takes the next value (the identity
     /// is per stage ISSUANCE, not per card); never reused, so a retired
@@ -5805,6 +5812,7 @@ impl Default for AppModel {
             geometry_epoch: std::cell::Cell::new(0),
             composer_rect: std::cell::Cell::new(None),
             status_rect: std::cell::Cell::new(None),
+            band_rect: std::cell::Cell::new(None),
             login_attempt_seq: 0,
             sticky_suppressed: std::cell::Cell::new(false),
             hovered: None,
@@ -6924,6 +6932,16 @@ impl AppModel {
                     && self.screen != Screen::Loom
                 {
                     self.request_clipboard_paste();
+                    return;
+                }
+                // 971 F1(a), verify round 1 (Astra: PageDown and the wheel
+                // died inside the DeepSeek key card at both sizes): the
+                // roster's PAGING gestures are screen navigation, not form
+                // input, so they run BEFORE every card modality below. Only
+                // the paging pair is taken — Home/End are caret keys inside
+                // the custom card's fields, and every printable key stays
+                // private to the form that is holding it.
+                if self.accounts_scroll_gesture(key.code) {
                     return;
                 }
                 // 971 F1(b): the one-line "replace the pending form?"
@@ -12055,10 +12073,11 @@ impl AppModel {
     /// bytes are unrecoverable once dropped. Returns whether the caller may
     /// open its form now.
     fn accounts_replace_pending_add(&mut self, kind: AccountAddKind) -> bool {
-        if self.accounts.pending_replace == Some(kind) {
-            // The answered confirm: this discard is authorised.
-            self.accounts.pending_replace = None;
-        } else if let Some(pending) = self.pending_account_secret() {
+        // Verify round 1 (Astra): a REPEATED grid click is not an answer. It
+        // only re-aims the pending question, however many times it lands —
+        // typed secret bytes are dropped by the explicit ⏎ in
+        // `accounts_replace_key` and by nothing else.
+        if let Some(pending) = self.pending_account_secret() {
             self.accounts.pending_replace = Some(kind);
             self.accounts.message = Some(format!(
                 "discard the pending {pending} entry? enter replaces it · esc keeps it"
@@ -12066,8 +12085,43 @@ impl AppModel {
             self.dirty = true;
             return false;
         }
+        self.accounts.pending_replace = None;
         self.close_pending_account_form();
         true
+    }
+
+    /// The `/accounts` paging gestures, routed AHEAD of every add-form's
+    /// modality (971 F1(a), verify round 1). Returns whether the key was
+    /// consumed here.
+    ///
+    /// PRECEDENCE NOTE: while a form is open the frame still keeps it in
+    /// view. It is PINNED below the roster whenever the frame affords the
+    /// pin, and then the roster pages under it exactly as it does with no
+    /// form at all; on a frame too short to pin it, keeping the total-modal
+    /// card on screen outranks the page (an invisible card eating keystrokes
+    /// is the W5g-5 trap), so the offset the frame chooses wins.
+    fn accounts_scroll_gesture(&mut self, code: KeyCode) -> bool {
+        if self.screen != Screen::Accounts {
+            return false;
+        }
+        match code {
+            KeyCode::PageUp => {
+                self.accounts
+                    .scroll
+                    .set(self.accounts.scroll.get().saturating_sub(8));
+                self.dirty = true;
+                true
+            }
+            KeyCode::PageDown => {
+                let max = self.accounts.scroll_max.get();
+                self.accounts
+                    .scroll
+                    .set(self.accounts.scroll.get().saturating_add(8).min(max));
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The provider whose pending add-form already holds typed secret bytes,
@@ -12107,12 +12161,21 @@ impl AppModel {
     /// The keys of the 971 F1(b) replace confirm. It outranks every accounts
     /// card modality — it is the answer to a gesture made ON that card's
     /// surface, so the card must not eat ⏎ as a commit of the key it holds.
+    ///
+    /// This ⏎ is the ONE door through which typed secret bytes are dropped:
+    /// it discards the form and opens the chosen add directly, never back
+    /// through the grid hit that would only re-ask.
     fn accounts_replace_key(&mut self, code: KeyCode) {
         let Some(kind) = self.accounts.pending_replace else {
             return;
         };
         match code {
-            KeyCode::Enter => self.handle_hit(Hit::AccountAdd(kind)),
+            KeyCode::Enter => {
+                self.accounts.pending_replace = None;
+                self.close_pending_account_form();
+                self.open_account_add(kind);
+                self.dirty = true;
+            }
             KeyCode::Esc => {
                 self.accounts.pending_replace = None;
                 self.accounts.message = None;
@@ -12121,6 +12184,7 @@ impl AppModel {
             _ => {}
         }
     }
+
     /// Opens the `+ Add custom server` card. The name prefills
     /// with the smallest free `custom[-N]` against the provider registry;
     /// the origin with the sim's demo URL (a real vLLM default).
@@ -13063,20 +13127,10 @@ impl AppModel {
             // sources and a pending add-form no longer push each other off
             // the frame. The `/providers` discipline (F2b): the reducer only
             // nudges the offset, the frame reconciles it against the true
-            // max it just measured.
-            KeyCode::PageUp => {
-                self.accounts
-                    .scroll
-                    .set(self.accounts.scroll.get().saturating_sub(8));
-                self.dirty = true;
-            }
-            KeyCode::PageDown => {
-                let max = self.accounts.scroll_max.get();
-                self.accounts
-                    .scroll
-                    .set(self.accounts.scroll.get().saturating_add(8).min(max));
-                self.dirty = true;
-            }
+            // max it just measured. PgUp/PgDn were lifted OUT of this arm in
+            // verify round 1 (`accounts_scroll_gesture`) so a pending form
+            // cannot swallow them; Home/End stay here, because inside an
+            // open card they belong to the field's caret.
             KeyCode::Home => {
                 self.accounts.scroll.set(0);
                 self.dirty = true;
@@ -18229,6 +18283,23 @@ impl AppModel {
     /// the view. The frame's own reconcile stays as the backstop (sim
     /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
+        // 971 F1(a), verify round 1: the `/accounts` roster scrolls under
+        // the wheel even while an add-form is open — the wheel is never form
+        // input, and the card stays pinned in view above the offset it moves
+        // (Astra: the DeepSeek card swallowed the wheel at both sizes). It
+        // therefore runs BEFORE the modal gate below.
+        if self.screen == Screen::Accounts && !self.help_open {
+            let max = self.accounts.scroll_max.get();
+            let current = self.accounts.scroll.get().min(max);
+            let next = if up {
+                current.saturating_sub(3)
+            } else {
+                current.saturating_add(3).min(max)
+            };
+            self.accounts.scroll.set(next);
+            self.dirty = true;
+            return;
+        }
         // The login gate joins the help gate (TUI6.2c finding 7 —
         // consistency: nothing scrolls beneath a modal).
         if self.help_open || self.login.is_some() {
@@ -18244,21 +18315,6 @@ impl AppModel {
             } else {
                 (self.session_browser_sel + 3).min(last)
             };
-            self.dirty = true;
-            return;
-        }
-        // 971 F1(a): the accounts screen rides the same wheel discipline —
-        // the gesture the owner reached for first when the roster and a
-        // pending form outgrew the frame.
-        if self.screen == Screen::Accounts {
-            let max = self.accounts.scroll_max.get();
-            let current = self.accounts.scroll.get().min(max);
-            let next = if up {
-                current.saturating_sub(3)
-            } else {
-                current.saturating_add(3).min(max)
-            };
-            self.accounts.scroll.set(next);
             self.dirty = true;
             return;
         }

@@ -1411,8 +1411,8 @@ fn render_launcher(
     let band_rule_h = gap;
     // 971 F2: the shared bottom-band authority places the launcher's band —
     // the reference placement every other surface now matches.
-    let band = bottom_band(area, rule_h, composer_rows, band_rule_h, 0);
-    let (rule_area, composer_area, band_rule_area) = (band.rule, band.composer, band.close);
+    let band = bottom_band(model, area, rule_h, composer_rows, band_rule_h);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.slot, band.close);
     let [header_area, header_rule, content_area, palette_area] = Layout::vertical([
         Constraint::Length(header_h),
         Constraint::Length(header_rule_h),
@@ -2905,8 +2905,8 @@ fn render_accounts(
     // = the editable name/origin fields (the provider.configure front
     // door).
     push_custom_card_lines(model, theme, area.width, &mut card_lines, &mut card_rects);
-    // ---- The bottom chrome, bottom-up: the hint line, the provider grid,
-    // and the pending form above them ----
+    // ---- The bottom chrome, bottom-up: the shared band carrying the key
+    // map, then the provider grid and the pending form above it ----
     //
     // 970: the first-login disclosure is the safeguard that REPLACES a policy
     // gate, so it has to stay readable at 80 columns. Its total modality
@@ -2917,34 +2917,42 @@ fn render_accounts(
     if model.antigravity_consent.is_none() {
         push_account_add_buttons(model, theme, &mut grid_lines, &mut grid_rects);
     }
-    // 971 F1(c): the hint line — the way OUT of the screen — is pinned to the
-    // last body row ALWAYS. Its key map degrades by WIDTH so `esc back`
+    // 971 F1(c) + F2, verify round 1: the hint line — the way OUT of the
+    // screen — rides the SHARED BOTTOM BAND, so this screen's band lands on
+    // the same rows as every other view's.
+    //
+    // OWNER RULING (round 2, accepted): `/accounts` takes the band's GEOMETRY
+    // AND FRAMING and NOT a composer. It is a single-key surface — `r`
+    // reveals, `x` removes, every bare printable key is a command — so a
+    // composer here would take the keyboard away from the screen's whole
+    // vocabulary. The slot carries the key map instead, framed by the same
+    // opening and closing rules, and the map degrades by WIDTH so `esc back`
     // survives at 80 columns (the `/providers` hint-splitting precedent); it
     // used to be one 94-cell line a narrow frame simply cut off.
-    let hint_lines: Vec<Line<'_>> = vec![
-        Line::raw(""),
-        Line::styled(
-            if area.width >= 118 {
-                "click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back"
-            } else {
-                "click an account · + adds · x removes · r reveals · PgUp/PgDn scroll · esc back"
-            },
-            theme.faint_style(),
-        ),
-    ];
-    // The pin ladder. Everything is pinned while the roster still gets a few
-    // rows; under pressure the pending FORM unpins first (the scroll body
-    // keeps it in view by itself, below), then the grid (reachable by
-    // scrolling, the F2b `/providers` fallback). The hint never unpins.
+    let hint = Line::styled(
+        if area.width >= 118 {
+            "click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back"
+        } else {
+            "click an account · + adds · x removes · r reveals · PgUp/PgDn scroll · esc back"
+        },
+        theme.faint_style(),
+    );
+    let band = bottom_band(model, area, 1, 1, 1);
+    let inner = band.content;
+    // The pin ladder INSIDE the band's content. Everything is pinned while
+    // the roster still gets a few rows; under pressure the pending FORM
+    // unpins first (the scroll body keeps it in view by itself, below), then
+    // the grid (reachable by scrolling, the F2b `/providers` fallback). The
+    // band itself never unpins.
     const BODY_MIN: u16 = 3;
     let room = |pinned: usize| {
-        u16::try_from(pinned).is_ok_and(|height| area.height.saturating_sub(height) >= BODY_MIN)
+        u16::try_from(pinned).is_ok_and(|height| inner.height.saturating_sub(height) >= BODY_MIN)
     };
-    let pin_card = room(card_lines.len() + grid_lines.len() + hint_lines.len());
+    let pin_card = room(card_lines.len() + grid_lines.len());
     let pin_grid = if pin_card {
         true
     } else {
-        room(grid_lines.len() + hint_lines.len())
+        room(grid_lines.len())
     };
 
     // Column rects that live in BODY coordinates and therefore scroll.
@@ -2988,12 +2996,28 @@ fn render_accounts(
         );
         lines.extend(grid_lines);
     }
-    chrome_lines.extend(hint_lines);
     let chrome_height = u16::try_from(chrome_lines.len())
         .unwrap_or(u16::MAX)
-        .min(area.height);
+        .min(inner.height);
     let [body_area, chrome_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(chrome_height)]).areas(area);
+        Layout::vertical([Constraint::Min(0), Constraint::Length(chrome_height)]).areas(inner);
+    // The band: opening rule, the key map in the slot, closing rule.
+    let rule_line = |width: u16| {
+        Paragraph::new(Line::styled(
+            "─".repeat(width as usize),
+            theme.frame_style(),
+        ))
+        .style(theme.text_style())
+    };
+    if band.rule.height > 0 {
+        frame.render_widget(rule_line(band.rule.width), band.rule);
+    }
+    if band.slot.height > 0 {
+        frame.render_widget(Paragraph::new(hint), band.slot);
+    }
+    if band.close.height > 0 {
+        frame.render_widget(rule_line(band.close.width), band.close);
+    }
 
     // RENDER is the single scroll authority (the `/providers` law, F2b): the
     // frame writes the true max, reconciles the offset, and resolves the
@@ -3011,10 +3035,16 @@ fn render_accounts(
             || model.oauth_add.is_some()
             || model.antigravity_consent.is_some());
     let follow = if card_open {
-        // The card's LAST line — its commit/hint row — is what has to land;
-        // a card taller than the body then shows its tail, which is where
-        // the focused field and the key map are.
-        Some(card_end.saturating_sub(1))
+        // The card's last row WITH INK on it — its commit/hint line. The
+        // separator blank that closes every card block is not content, and
+        // following it would spend one of the body's rows on nothing and
+        // push the card's title off the top of a short frame.
+        Some(
+            lines[card_start..card_end]
+                .iter()
+                .rposition(|line| line.width() > 0)
+                .map_or(card_end.saturating_sub(1), |offset| card_start + offset),
+        )
     } else if follow_cursor {
         cursor_line
     } else {
@@ -5851,15 +5881,17 @@ fn render_session(
     // second one here would only re-cramp the rhythm the other way. The
     // ledger still counts `gap` exactly as it did, so every shed rung and
     // panel budget is unchanged.
-    let band = bottom_band(
-        area,
-        input_rule_h,
-        input_height,
-        band_rule_h,
-        subtree_height,
-    );
-    let (rule_area, composer_area, band_rule_area, subtree_area) =
-        (band.rule, band.composer, band.close, band.below);
+    //
+    // Verify round 1 (Astra): the SubTree ledger moved with it. It used to
+    // ride BELOW the closing rule, which put this screen's composer three
+    // rows above every other surface's whenever a child was running — the
+    // owner asked for ONE row for the composer on every view, and a panel
+    // that shifts it is the same defect in a different costume. The ledger
+    // is ordinary content now, the last panel above the band, and the band's
+    // opening rule is the separator it always had (970 bug 1: a rule, never
+    // a blank).
+    let band = bottom_band(model, area, input_rule_h, input_height, band_rule_h);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.slot, band.close);
     let [
         header_area,
         header_rule,
@@ -5870,6 +5902,7 @@ fn render_session(
         graph_area,
         _lead_todos,
         todos_area,
+        subtree_area,
         queue_area,
         palette_area,
         throughput_area,
@@ -5885,6 +5918,13 @@ fn render_session(
         Constraint::Length(graph_height),
         Constraint::Length(lead_todos),
         Constraint::Length(todos_height),
+        // Verify round 1: the SubTree ledger is an ordinary panel above the
+        // band now, and it takes the slot its documented PRIORITY already
+        // gave it — palette → ⧗ queue → SubTree → todos, higher priority
+        // nearer the band. The palette and the ambient meter rows keep their
+        // adjacency to the composer; a live interaction under the cursor must
+        // not be pushed off the band by a map of background work.
+        Constraint::Length(subtree_height),
         Constraint::Length(queue_height),
         Constraint::Length(palette_height),
         Constraint::Length(throughput_height),
@@ -8476,8 +8516,8 @@ fn render_loom(
     // authority now — opening rule, composer, closing rule — which is what
     // every other surface has always drawn.
     let composer_rows = composer_height(model, area.width);
-    let band = bottom_band(area, 1, composer_rows, 1, 0);
-    let (rule_area, composer_area, band_rule_area) = (band.rule, band.composer, band.close);
+    let band = bottom_band(model, area, 1, composer_rows, 1);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.slot, band.close);
     // Painted BEFORE the registry so every early-return path below still
     // leaves the operator a live composer to type into.
     render_composer(model, theme, frame, rule_area, composer_area, hits);
@@ -10315,20 +10355,16 @@ fn render_subagent(
     // 971 F2: session parity through the shared band authority, and the same
     // treatment of the spacer row — it leaves the band's foot and falls to
     // the transcript's `Min` region, whose own trailing blank line is the
-    // breathing row above the band.
-    let band = bottom_band(
-        area,
-        input_rule_h,
-        input_height,
-        band_rule_h,
-        subtree_height,
-    );
-    let (rule_area, composer_area, band_rule_area, subtree_area) =
-        (band.rule, band.composer, band.close, band.below);
-    let [header_area, header_rule, transcript_area] = Layout::vertical([
+    // breathing row above the band. Verify round 1: the SubTree ledger moved
+    // above the band here too, so the child view's composer lands on the
+    // same row as every other surface's.
+    let band = bottom_band(model, area, input_rule_h, input_height, band_rule_h);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.slot, band.close);
+    let [header_area, header_rule, transcript_area, subtree_area] = Layout::vertical([
         Constraint::Length(header_h),
         Constraint::Length(header_rule_h),
         Constraint::Min(transcript_min),
+        Constraint::Length(subtree_height),
     ])
     .areas(band.content);
 
@@ -10702,8 +10738,8 @@ fn render_aura(
     // gap did.
     let band_rule_h = gap;
     // 971 F2: the same shared band authority as every other surface.
-    let band = bottom_band(area, input_rule_h, composer_h, band_rule_h, 0);
-    let (rule_area, composer_area, band_rule_area) = (band.rule, band.composer, band.close);
+    let band = bottom_band(model, area, input_rule_h, composer_h, band_rule_h);
+    let (rule_area, composer_area, band_rule_area) = (band.rule, band.slot, band.close);
     let [bar_area, bar_rule, orb_area, columns_area, transcript_area] = Layout::vertical([
         Constraint::Length(bar_h),
         Constraint::Length(bar_rule_h),
@@ -11856,67 +11892,64 @@ fn band_rule_reserve(area_h: u16, outranking: u16, top_rule_h: u16) -> u16 {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BandRects {
     /// Everything ABOVE the band — the surface lays its own regions out in
-    /// here (header, transcript, panels, palette …).
+    /// here (header, transcript, panels, palette, the SubTree ledger …).
     pub content: Rect,
     /// The gold rule that OPENS the band.
     pub rule: Rect,
-    /// The composer rows (or the card/menu that replaces them).
-    pub composer: Rect,
+    /// The band's INPUT SLOT: the composer rows, or — on a surface with no
+    /// composer, `/accounts` — its pinned key-map line.
+    pub slot: Rect,
     /// The frame rule that CLOSES the band.
     pub close: Rect,
-    /// Rows the surface keeps BELOW the band (the SubTree ledger).
-    pub below: Rect,
 }
 
 /// THE bottom-layout authority (971 F2 — owner report: the composer sat one
 /// row higher on the session screen and one or two rows lower on the loom /
-/// workflows tab than it does in the main menu). Every surface that draws an
-/// input band now anchors it through this ONE function, so the rule, the
-/// composer rows and the closing rule land on the same rows of the body on
-/// every screen, and the status line below them never covers a composer row.
+/// workflows tab than it does in the main menu). Every surface that draws a
+/// bottom band anchors it through this ONE function, so the opening rule,
+/// the slot and the closing rule land on the same rows of the body on every
+/// screen, and the status line below them never covers a slot row.
 ///
-/// Anatomy, bottom-up: `below` (a SubTree, when the surface keeps one) ·
-/// the closing frame rule · the composer rows · the opening gold rule ·
-/// then the surface's own content. Callers still own their sacred-input
-/// ledgers — this only places what those ledgers granted, and applies the
-/// last-resort floor: on a frame too short for the whole band the rows
-/// below it yield first, then the closing rule, then the opening rule; the
-/// composer's own rows never do (its cursor row is sacred on every
-/// surface).
-fn bottom_band(area: Rect, rule_h: u16, composer_h: u16, close_h: u16, below_h: u16) -> BandRects {
-    let composer_h = composer_h.min(area.height);
+/// The band is the LAST thing in the body — nothing is placed under it.
+/// Verify round 1 (Astra) closed the one exemption that remained: the
+/// SubTree ledger used to ride BELOW the band on the session and subagent
+/// screens, which pushed their composer three rows up from everyone else's.
+/// The ledger is ordinary content now and sits in `content`, above the
+/// opening rule.
+///
+/// Callers still own their sacred-input ledgers — this only places what
+/// those ledgers granted, and applies the last-resort floor: on a frame too
+/// short for the whole band the closing rule yields first, then the opening
+/// rule; the slot's own rows never do (the composer's cursor row is sacred
+/// on every surface).
+fn bottom_band(model: &AppModel, area: Rect, rule_h: u16, slot_h: u16, close_h: u16) -> BandRects {
+    let slot_h = slot_h.min(area.height);
     let mut rule_h = rule_h;
     let mut close_h = close_h;
-    let mut below_h = below_h;
-    let fits = |rule: u16, close: u16, below: u16| {
-        rule.saturating_add(composer_h)
-            .saturating_add(close)
-            .saturating_add(below)
-            <= area.height
-    };
-    if !fits(rule_h, close_h, below_h) {
-        below_h = 0;
-    }
-    if !fits(rule_h, close_h, below_h) {
+    let fits =
+        |rule: u16, close: u16| rule.saturating_add(slot_h).saturating_add(close) <= area.height;
+    if !fits(rule_h, close_h) {
         close_h = 0;
     }
-    if !fits(rule_h, close_h, below_h) {
+    if !fits(rule_h, close_h) {
         rule_h = 0;
     }
-    let [content, rule, composer, close, below] = Layout::vertical([
+    let [content, rule, slot, close] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(rule_h),
-        Constraint::Length(composer_h),
+        Constraint::Length(slot_h),
         Constraint::Length(close_h),
-        Constraint::Length(below_h),
     ])
     .areas(area);
+    // The frame publishes the band it produced (the `scroll_max`
+    // discipline): the layout tests read the rectangle that was actually
+    // drawn instead of re-deriving one.
+    model.band_rect.set((slot.height > 0).then_some(slot));
     BandRects {
         content,
         rule,
-        composer,
+        slot,
         close,
-        below,
     }
 }
 

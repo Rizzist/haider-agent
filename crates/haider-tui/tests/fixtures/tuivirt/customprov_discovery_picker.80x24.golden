@@ -7,43 +7,43 @@
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×59; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×21
 03|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-04|                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-05|◉ add custom server — local or web                                              |
+04|◉ add custom server — local or web                                              |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×32; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×46
-06|  custom · http://127.0.0.1:8000/v1                                             |
+05|  custom · http://127.0.0.1:8000/v1                                             |
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×35; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×45
-07|  models · 3 discovered                                                         |
+06|  models · 3 discovered                                                         |
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×23; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×57
-08|    llama3.1:8b                                                                 |
+07|    llama3.1:8b                                                                 |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-09|  ❯ qwen2.5:7b                                                                  |
+08|  ❯ qwen2.5:7b                                                                  |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×66
-10|    mistral-small                                                               |
+09|    mistral-small                                                               |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-11|  ⏎ create · ↑/↓ model · tab connection · esc cancel                            |
+10|  ⏎ create · ↑/↓ model · tab connection · esc cancel                            |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×52; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×28
-12|                                                                                |
+11|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-13|[+ OpenAI (OAuth)]  [+ Anthropic (OAuth)]  [+ OpenAI (API)]                     |
+12|[+ OpenAI (OAuth)]  [+ Anthropic (OAuth)]  [+ OpenAI (API)]                     |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×21
-14|[+ Anthropic (API)]  [+ Kimi (OAuth)]  [+ Grok (OAuth)]  [+ Gemini (API)]       |
+13|[+ Anthropic (API)]  [+ Kimi (OAuth)]  [+ Grok (OAuth)]  [+ Gemini (API)]       |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×7
-15|[+ Google Antigravity (OAuth)]                                                  |
+14|[+ Google Antigravity (OAuth)]                                                  |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×50
-16|[+ Haider Code (API)]  [+ DeepSeek (API)]  [+ xAI (API)]                        |
+15|[+ Haider Code (API)]  [+ DeepSeek (API)]  [+ xAI (API)]                        |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×24
-17|[+ HuggingFace]  [+ OpenCode Zen]  [+ OpenCode Go]                              |
+16|[+ HuggingFace]  [+ OpenCode Zen]  [+ OpenCode Go]                              |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×30
-18|[+ Ollama (local)]  [+ LM Studio (local)]                                       |
+17|[+ Ollama (local)]  [+ LM Studio (local)]                                       |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
-19|[+ Azure OpenAI]  [+ Bedrock (Claude)]  [+ Vertex (Claude)]                     |
+18|[+ Azure OpenAI]  [+ Bedrock (Claude)]  [+ Vertex (Claude)]                     |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×20; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×21
-20|[+ Add custom server]                                                           |
+19|[+ Add custom server]                                                           |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×59
-21|                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-22|click an account · + adds · x removes · r reveals · PgUp/PgDn scroll · esc back |
+20|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+21|click an account · + adds · x removes · r reveals · PgUp/PgDn scroll · esc back |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×79; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+22|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
 23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38

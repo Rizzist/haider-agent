@@ -6,9 +6,15 @@
 //! too high), and the loom/workflows tab ran its band to the last row of the
 //! body with no closing rule at all (band one row too low). The main menu was
 //! the one surface that had it right. `render::bottom_band` is the single
-//! authority now, so the opening rule, the composer rows and the closing rule
-//! land on identical rows of the body on every screen, and the status line
-//! never crowds a composer row.
+//! authority now, so the opening rule, the slot and the closing rule land on
+//! identical rows of the body on every screen, and the status line never
+//! crowds a slot row.
+//!
+//! Verify round 1 (Astra) closed the two exemptions round 0 left: the SubTree
+//! ledger, which used to be drawn BELOW the band and lifted the session and
+//! child views three rows off everyone else, is ordinary content above the
+//! band now; and `/accounts`, which has no composer at all, draws the same
+//! band with its pinned key-map line in the slot.
 //!
 //! F1. `/accounts` stacked the roster, the enrolled sources, a pending API-key
 //! form AND a pending custom-server form in a fixed viewport, so at 120x40 the
@@ -20,9 +26,12 @@
 //! cross-view equality test fails on the session, loom and workflows rows.
 //! Drop the closing-rule row from the loom band and its composer moves down
 //! one. Restore the `_gap` row under the session band and the moved-down-by-
-//! one assertion fails. Drop the `accounts_replace_pending_add` gate and two
-//! forms are pending at once. Remove the pinned hint and the last body row
-//! stops being the hint line.
+//! one assertion fails. Put the SubTree ledger back under the band and the
+//! ledger views leave the equality set. Drop the `accounts_replace_pending_add`
+//! gate and two forms are pending at once. Remove the pinned band and the last
+//! body rows stop being rule/hint/rule. Move the accounts paging gestures back
+//! behind form modality and PgDn/wheel die inside a pending card again. Let a
+//! repeated grid hit answer the confirm and a typed key is dropped with no ⏎.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use haider_tui::app::{
@@ -100,50 +109,82 @@ fn loom_model(pane: LoomPane) -> AppModel {
     model
 }
 
-fn subagent_model() -> AppModel {
-    let mut model = on_screen(Screen::Subagent);
-    model.chips.push(ChipModel::from_seed(ChipSeed {
-        agent: "t1-audit".to_owned(),
+fn chip(agent: &str, name: &str) -> ChipModel {
+    ChipModel::from_seed(ChipSeed {
+        agent: agent.to_owned(),
         parent: None,
         ros: None,
         callsign: "Ammar".to_owned(),
         hon: "(r)",
         full: "Ammar ibn Yasir".to_owned(),
-        name: "audit".to_owned(),
+        name: name.to_owned(),
         model: "fable-5".to_owned(),
         device: "test-lion-box".to_owned(),
         state: ChipDisplayState::Running,
         tokens: 100,
         prefill: Vec::new(),
-    }));
+    })
+}
+
+fn subagent_model() -> AppModel {
+    let mut model = on_screen(Screen::Subagent);
+    model.chips.push(chip("t1-audit", "audit"));
     model.view_path = vec!["t1-audit".to_owned()];
     model
 }
 
-/// The surfaces that draw an input band with nothing under it. The main menu
-/// leads: its placement is the reference the others were brought onto.
-///
-/// The subagent screen is deliberately absent: its SubTree ledger is drawn
-/// BELOW the band by design (TUI6 item 6 — `❯ message …` → rule → `▾
-/// subagents`), so its band is anchored above those rows rather than on the
-/// last body row. Its shape is pinned by
-/// `the_subagent_band_keeps_the_shared_shape_above_its_subtree`, and a
-/// session screen with chips shows the same anatomy.
-fn banded_views() -> Vec<(&'static str, AppModel)> {
+/// A session with the SubTree ledger open. Verify round 1 (Astra) found this
+/// shape three rows off everyone else's, because the ledger used to be drawn
+/// BELOW the band; it is ordinary content above the band now, so this view
+/// belongs in the equality set like any other.
+fn session_with_ledger() -> AppModel {
+    let mut model = on_screen(Screen::Session);
+    model.chips.push(chip("t1-docs", "docs"));
+    model
+}
+
+/// The surfaces that draw the shared bottom band with a COMPOSER in its slot.
+/// The main menu leads: its placement is the reference the others were
+/// brought onto.
+fn composer_views() -> Vec<(&'static str, AppModel)> {
     vec![
         ("main menu", on_screen(Screen::Launcher)),
         ("session", on_screen(Screen::Session)),
+        ("session with ledger", session_with_ledger()),
+        ("subagent", subagent_model()),
         ("loom", loom_model(LoomPane::Types)),
         ("workflows", loom_model(LoomPane::Workflows)),
         ("aura", on_screen(Screen::Aura)),
     ]
 }
 
+/// Every surface that draws the band.
+///
+/// OWNER RULING (verify round 2, accepted): `/accounts` gets the band's
+/// GEOMETRY AND FRAMING with its key-map line in the slot, and no composer.
+/// The screen is a single-key surface — `r` reveals, `x` removes, every bare
+/// printable key is a command — so a composer there would take the keyboard
+/// away from the screen's whole vocabulary. The invariant this suite holds it
+/// to is therefore `band_rect`, identical to every other view's, while
+/// `composer_rect` stays `None` here.
+fn banded_views() -> Vec<(&'static str, AppModel)> {
+    let mut views = composer_views();
+    views.push(("accounts", on_screen(Screen::Accounts)));
+    views
+}
+
 /// Every full-screen surface, banded or not — the status line is theirs too.
+///
+/// DOCUMENTED EXCLUSION (verify round 2, accepted for this lane): the
+/// read-only report screens — `/providers`, `/usage`, `/tools`, `/hooks`,
+/// `/tree`, the fleet, graph and session browsers — are asserted on the
+/// STATUS ROW only, not on the band. They draw their own footers, and those
+/// footers are not one row: `/providers` pins the provider grid plus three
+/// hint lines (actions, presets, enterprise), which cannot occupy a one-row
+/// band slot without redesigning the footer itself. Bringing them onto the
+/// band is a separate lane, not a gap in this one.
 fn all_views() -> Vec<(&'static str, AppModel)> {
     let mut views = banded_views();
-    views.push(("subagent", subagent_model()));
-    views.push(("accounts", on_screen(Screen::Accounts)));
     views.push(("providers", on_screen(Screen::Providers)));
     views.push(("tools", on_screen(Screen::Tools)));
     views.push(("tree", on_screen(Screen::Tree)));
@@ -154,16 +195,18 @@ fn all_views() -> Vec<(&'static str, AppModel)> {
 // F2 — one shared bottom layout
 // ---------------------------------------------------------------------------
 
+/// EVERY view that draws the band — a session with a running child and
+/// `/accounts` included — puts its slot on the same rows.
 #[test]
-fn every_banded_view_places_the_composer_on_the_same_rows() {
+fn every_banded_view_places_the_band_on_the_same_rows() {
     for (width, height) in SIZES {
         let mut reference: Option<(&str, Rect)> = None;
         for (name, model) in banded_views() {
             let _ = draw(&model, width, height);
             let rect = model
-                .composer_rect
+                .band_rect
                 .get()
-                .unwrap_or_else(|| panic!("{name} at {width}x{height}: drew no composer"));
+                .unwrap_or_else(|| panic!("{name} at {width}x{height}: drew no band"));
             // Fully visible: inside the frame, and clear of the status line.
             let status = model
                 .status_rect
@@ -181,10 +224,29 @@ fn every_banded_view_places_the_composer_on_the_same_rows() {
                 None => reference = Some((name, rect)),
                 Some((first, expected)) => assert_eq!(
                     rect, expected,
-                    "{name} at {width}x{height}: composer {rect:?} differs from {first}'s \
+                    "{name} at {width}x{height}: band slot {rect:?} differs from {first}'s \
                      {expected:?} — the bottom band is one layout for every view"
                 ),
             }
+        }
+    }
+}
+
+/// And on every view whose slot holds a COMPOSER, the composer IS that slot.
+#[test]
+fn every_composer_view_fills_the_shared_band_slot() {
+    for (width, height) in SIZES {
+        for (name, model) in composer_views() {
+            let _ = draw(&model, width, height);
+            let composer = model
+                .composer_rect
+                .get()
+                .unwrap_or_else(|| panic!("{name} at {width}x{height}: drew no composer"));
+            let band = model.band_rect.get().expect("band");
+            assert_eq!(
+                composer, band,
+                "{name} at {width}x{height}: the composer is not the band's slot"
+            );
         }
     }
 }
@@ -227,7 +289,7 @@ fn the_band_closes_with_a_rule_on_the_last_body_row_everywhere() {
     for (width, height) in SIZES {
         for (name, model) in banded_views() {
             let (rows, _) = draw(&model, width, height);
-            let rect = model.composer_rect.get().expect("composer");
+            let rect = model.band_rect.get().expect("band");
             let close = usize::from(rect.y + rect.height);
             assert_eq!(
                 close,
@@ -243,43 +305,43 @@ fn the_band_closes_with_a_rule_on_the_last_body_row_everywhere() {
     }
 }
 
-/// The subagent screen keeps rows BELOW its band (the SubTree ledger), so its
-/// band is anchored above them — the same three-row anatomy the shared layout
-/// draws everywhere: opening rule, composer rows, closing rule, then whatever
-/// the surface keeps underneath.
+/// The SubTree ledger is ordinary content ABOVE the band now — the seam it
+/// once had below the band is what put the child view's composer three rows
+/// off everyone else's (verify round 1). The ledger still reads straight into
+/// the band with a rule between and no blank row.
 #[test]
-fn the_subagent_band_keeps_the_shared_shape_above_its_subtree() {
-    let is_rule = |row: &str| {
-        let trimmed = row.trim_end();
-        !trimmed.is_empty() && trimmed.chars().all(|c| c == '\u{2500}' || c == ' ')
-    };
+fn the_subtree_ledger_reads_into_the_band_from_above() {
     for (width, height) in SIZES {
-        let model = subagent_model();
-        let (rows, _) = draw(&model, width, height);
-        let rect = model.composer_rect.get().expect("subagent composer");
-        let opening = usize::from(rect.y) - 1;
-        let closing = usize::from(rect.y + rect.height);
-        // The OPENING rule carries the surface identity at its right end
-        // (`──── fable-5 ──`), so it is recognised by its leading glyph.
-        assert!(
-            rows[opening].starts_with('\u{2500}'),
-            "subagent at {width}x{height}: no opening rule above the band: {:?}",
-            rows[opening]
-        );
-        assert!(
-            is_rule(&rows[closing]),
-            "subagent at {width}x{height}: no closing rule under the band: {:?}",
-            rows[closing]
-        );
-        assert!(
-            rows[closing + 1].contains("subagents"),
-            "subagent at {width}x{height}: the SubTree follows the closing rule: {:?}",
-            rows[closing + 1]
-        );
-        assert!(
-            usize::from(rect.y + rect.height) < usize::from(height) - 1,
-            "subagent at {width}x{height}: the band leaves the frame"
-        );
+        for (name, model) in [
+            ("subagent", subagent_model()),
+            ("session with ledger", session_with_ledger()),
+        ] {
+            let (rows, _) = draw(&model, width, height);
+            let rect = model.band_rect.get().expect("band");
+            let opening = usize::from(rect.y) - 1;
+            let ledger = rows
+                .iter()
+                .position(|row| row.contains("subagents"))
+                .unwrap_or_else(|| panic!("{name} at {width}x{height}: no ledger: {rows:?}"));
+            assert!(
+                ledger < opening,
+                "{name} at {width}x{height}: the ledger sits above the band"
+            );
+            // The OPENING rule carries the surface identity at its right end
+            // (`──── fable-5 ──`), so it is recognised by its leading glyph.
+            assert!(
+                rows[opening].starts_with('\u{2500}'),
+                "{name} at {width}x{height}: no opening rule above the band: {:?}",
+                rows[opening]
+            );
+            assert!(
+                rows[ledger..opening]
+                    .iter()
+                    .all(|row| !row.trim().is_empty()),
+                "{name} at {width}x{height}: a blank row splits the ledger from the band: {:?}",
+                &rows[ledger..opening]
+            );
+        }
     }
 }
 
@@ -333,16 +395,19 @@ fn crowded_accounts() -> AppModel {
 }
 
 #[test]
-fn the_accounts_hint_line_stays_pinned_on_the_last_body_row() {
+fn the_accounts_hint_line_stays_pinned_in_the_band_slot() {
     for (width, height) in SIZES {
         let model = crowded_accounts();
         let (rows, _) = draw(&model, width, height);
-        let last_body = usize::from(height) - 2;
+        // Verify round 1: the key map lives in the SHARED band's slot, so it
+        // is the row above the closing rule — the row a composer occupies on
+        // every other view.
+        let slot = model.band_rect.get().expect("accounts band");
+        assert_eq!(usize::from(slot.y), usize::from(height) - 3);
         assert!(
-            rows[last_body].contains("esc back"),
-            "accounts at {width}x{height}: the hint line is not pinned to the last body \
-             row, got {:?}",
-            rows[last_body]
+            rows[usize::from(slot.y)].contains("esc back"),
+            "accounts at {width}x{height}: the hint line is not in the band slot, got {:?}",
+            rows[usize::from(slot.y)]
         );
         assert!(
             model.accounts.scroll_max.get() > 0,
@@ -498,4 +563,172 @@ fn a_pending_form_holding_a_typed_key_asks_before_it_is_replaced() {
         "the confirmed discard closed the card"
     );
     assert!(model.custom_add.is_some(), "the chosen form opened");
+}
+
+// ---------------------------------------------------------------------------
+// Verify round 1 (Astra) — the gestures a pending form used to swallow, and
+// the click that used to answer its own question
+// ---------------------------------------------------------------------------
+
+/// A pending add-form is modal for TEXT, never for navigation. PageUp/PageDown
+/// and the wheel are screen gestures and reach the roster with a DeepSeek key
+/// card or a custom-server card open — Astra measured byte-identical frames
+/// before and after each of them at both sizes.
+#[test]
+fn a_pending_form_never_swallows_the_paging_gestures() {
+    for kind in [AccountAddKind::DeepSeekApi, AccountAddKind::Custom] {
+        for (width, height) in SIZES {
+            let mut model = crowded_accounts();
+            let _ = draw(&model, width, height);
+            model.handle_hit(Hit::AccountAdd(kind));
+            assert!(
+                model.login.is_some() || model.custom_add.is_some(),
+                "{kind:?}: the form opens"
+            );
+            let _ = draw(&model, width, height);
+            let rest = model.accounts.scroll.get();
+
+            key(&mut model, KeyCode::PageDown);
+            let (paged_rows, _) = draw(&model, width, height);
+            let paged = model.accounts.scroll.get();
+            assert!(
+                paged > rest,
+                "{kind:?} at {width}x{height}: PgDn died inside the form ({rest} → {paged})"
+            );
+            assert!(
+                model.login.is_some() || model.custom_add.is_some(),
+                "{kind:?} at {width}x{height}: paging must not close the form"
+            );
+            // The focused field is still on screen — paging the roster under
+            // a pinned form never hides what the keystrokes are landing in.
+            assert!(
+                paged_rows
+                    .iter()
+                    .any(|row| row.contains("API key") || row.contains("add custom server")),
+                "{kind:?} at {width}x{height}: the form left the frame: {paged_rows:?}"
+            );
+
+            key(&mut model, KeyCode::PageUp);
+            let _ = draw(&model, width, height);
+            assert!(
+                model.accounts.scroll.get() < paged,
+                "{kind:?} at {width}x{height}: PgUp died inside the form"
+            );
+
+            model.handle_wheel(false);
+            let _ = draw(&model, width, height);
+            let wheeled = model.accounts.scroll.get();
+            model.handle_wheel(true);
+            let _ = draw(&model, width, height);
+            assert!(
+                model.accounts.scroll.get() < wheeled,
+                "{kind:?} at {width}x{height}: the wheel died inside the form"
+            );
+        }
+    }
+}
+
+/// Typed secret bytes are dropped by the explicit ⏎ and by NOTHING else. A
+/// repeated grid click only re-aims the question, however many times it lands
+/// (Astra: two clicks on `+ Add custom server` discarded a typed DeepSeek key
+/// with no Enter between them).
+#[test]
+fn a_repeated_grid_click_never_answers_the_discard_confirm() {
+    let mut model = crowded_accounts();
+    let _ = draw(&model, 120, 40);
+    model.handle_hit(Hit::AccountAdd(AccountAddKind::DeepSeekApi));
+    for character in "SECRET-971".chars() {
+        key(&mut model, KeyCode::Char(character));
+    }
+    let typed = model.login.as_ref().expect("card").masked_len();
+    assert!(typed > 0);
+
+    for click in 1..=4 {
+        model.handle_hit(Hit::AccountAdd(AccountAddKind::Custom));
+        assert_eq!(
+            model.accounts.pending_replace,
+            Some(AccountAddKind::Custom),
+            "click {click}: the question stays pending"
+        );
+        assert_eq!(
+            model.login.as_ref().map(|card| card.masked_len()),
+            Some(typed),
+            "click {click}: the typed key survives an unanswered click"
+        );
+        assert!(model.custom_add.is_none(), "click {click}: nothing opened");
+    }
+
+    // A click on a DIFFERENT provider re-aims the same question.
+    model.handle_hit(Hit::AccountAdd(AccountAddKind::GeminiApi));
+    assert_eq!(
+        model.accounts.pending_replace,
+        Some(AccountAddKind::GeminiApi),
+        "the question follows the latest choice"
+    );
+    assert!(model.login.is_some(), "and still nothing was discarded");
+
+    // Only ⏎ drops the bytes, and it opens exactly the last choice.
+    key(&mut model, KeyCode::Enter);
+    assert!(model.accounts.pending_replace.is_none());
+    assert_eq!(
+        model.login.as_ref().map(|card| card.provider.clone()),
+        Some("gemini".to_owned()),
+        "the confirmed choice is the one that opened"
+    );
+}
+
+/// Verify round 1 (Astra): the scroll CLAMP needed coverage that a mutation
+/// removing it would fail. A banked offset is reconciled against the frame
+/// that actually measured the body — a taller frame or a shorter roster both
+/// shrink the true maximum, and an offset kept past it scrolls the reader
+/// into blank space below the last account.
+#[test]
+fn a_banked_accounts_offset_folds_to_the_frame_that_measured_it() {
+    let has_rows = |rows: &[String]| {
+        rows.iter()
+            .any(|row| row.contains("[api key]") || row.contains("[oauth]"))
+    };
+
+    // (a) The frame grows.
+    let mut model = crowded_accounts();
+    let _ = draw(&model, 80, 24);
+    key(&mut model, KeyCode::End);
+    let _ = draw(&model, 80, 24);
+    let deep = model.accounts.scroll.get();
+    assert!(deep > 0, "a deep offset is banked at the short frame");
+
+    let (rows, _) = draw(&model, 80, 70);
+    let max = model.accounts.scroll_max.get();
+    assert!(
+        deep > max,
+        "the banked offset really is past the taller frame's end"
+    );
+    assert!(
+        model.accounts.scroll.get() <= max,
+        "the offset folds to the frame's own max ({} > {max})",
+        model.accounts.scroll.get()
+    );
+    assert!(
+        has_rows(&rows),
+        "the taller frame shows roster rows, not blank space past the end: {rows:?}"
+    );
+
+    // (b) The roster shrinks under a banked offset.
+    let mut model = crowded_accounts();
+    let _ = draw(&model, 80, 24);
+    key(&mut model, KeyCode::End);
+    let _ = draw(&model, 80, 24);
+    let deep = model.accounts.scroll.get();
+    model.accounts.apply_snapshot(seed_account_rows(), Some(2));
+    let (rows, _) = draw(&model, 80, 24);
+    let max = model.accounts.scroll_max.get();
+    assert!(deep > max, "the shorter roster really moves the end up");
+    assert!(
+        model.accounts.scroll.get() <= max,
+        "the offset folds when the daemon replaces the rows"
+    );
+    assert!(
+        has_rows(&rows),
+        "the shorter roster is on screen, not scrolled past: {rows:?}"
+    );
 }

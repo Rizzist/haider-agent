@@ -1511,12 +1511,21 @@ fn subagent_band_closes_with_a_rule_above_the_subtree() {
     let model = subagent_model();
     let (rows, _, terminal) = draw(&model, 100, 30);
     let below = assert_two_rules(&rows, "message Husayn", "message Husayn", "subagent");
-    // The closing rule separates the band from the SubTree map — the
-    // precise gap the owner's screenshot showed missing.
+    // A RULE separates the band from the SubTree map — the precise gap the
+    // owner's screenshot showed missing. 971 F2 (verify round 1) moved the
+    // ledger from below the band to ABOVE it, because a ledger under the
+    // band lifted this screen's composer three rows off the row every other
+    // view puts it on; the band's OPENING rule does the separating now, and
+    // the closing rule still ends the band on the last body row.
     let subtree_y = row_of(&rows, "subagents") as usize;
     assert!(
-        below < subtree_y,
-        "the closing rule sits BETWEEN the band and ▼ subagents"
+        subtree_y < below,
+        "the SubTree map sits above the band, separated by its opening rule"
+    );
+    assert_eq!(
+        below,
+        rows.len() - 2,
+        "the closing rule is the last body row"
     );
     // Frame ink, like every closing rule (sim border-top: frame).
     let theme = model.theme.theme();

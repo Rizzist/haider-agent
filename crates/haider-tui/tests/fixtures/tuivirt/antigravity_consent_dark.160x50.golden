@@ -69,33 +69,33 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
 34|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-35|                                                                                                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-36|◉ Google Antigravity — the sign-in is Google's, not Haider's                                                                                                    |
+35|◉ Google Antigravity — the sign-in is Google's, not Haider's                                                                                                    |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×58; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×100
-37|  Google's own official antigravity-acp agent performs the OAuth and keeps the token — no Google credential ever enters Haider's vault.                         |
+36|  Google's own official antigravity-acp agent performs the OAuth and keeps the token — no Google credential ever enters Haider's vault.                         |
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×135; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×25
-38|  That agent is proprietary Google software, run under Google's terms (antigravity.google/terms).                                                               |
+37|  That agent is proprietary Google software, run under Google's terms (antigravity.google/terms).                                                               |
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×97; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×63
-39|  · first run downloads ~316 MB (macOS arm64; ~682 MB on Linux x86_64)                                                                                          |
+38|  · first run downloads ~316 MB (macOS arm64; ~682 MB on Linux x86_64)                                                                                          |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×70; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×90
-40|  · ~885 MiB on disk once installed (~2.0 GB on Linux)                                                                                                          |
+39|  · ~885 MiB on disk once installed (~2.0 GB on Linux)                                                                                                          |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×54; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106
-41|  · ~225 MiB resident while running · about 15 s to cold start                                                                                                  |
+40|  · ~225 MiB resident while running · about 15 s to cold start                                                                                                  |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×98
-42|  ⚠ terms warning                                                                                                                                               |
+41|  ⚠ terms warning                                                                                                                                               |
    ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×17; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×143
-43|    Google's published terms restrict third-party access to Gemini subscriptions/Antigravity; Google ships this ACP agent for editors and reportedly does not   |
+42|    Google's published terms restrict third-party access to Gemini subscriptions/Antigravity; Google ships this ACP agent for editors and reportedly does not   |
    ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×158; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2
-44|    enforce the clause — use at your own risk.                                                                                                                  |
+43|    enforce the clause — use at your own risk.                                                                                                                  |
    ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×46; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×114
-45|  [1] install Google's agent and sign in · [2] cancel                                                                                                           |
+44|  [1] install Google's agent and sign in · [2] cancel                                                                                                           |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×53; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×107
-46|                                                                                                                                                                |
+45|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-47|                                                                                                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-48|click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back                                            |
+46|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
+47|click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back                                            |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×116; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×44
+48|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
 49| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                                                                                                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118

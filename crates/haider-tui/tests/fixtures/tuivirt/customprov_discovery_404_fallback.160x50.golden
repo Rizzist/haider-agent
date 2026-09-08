@@ -63,39 +63,39 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
 31|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-32|                                                                                                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-33|◉ add custom server — local or web                                                                                                                              |
+32|◉ add custom server — local or web                                                                                                                              |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×32; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×126
-34|  custom · http://127.0.0.1:8000/v1                                                                                                                             |
+33|  custom · http://127.0.0.1:8000/v1                                                                                                                             |
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×35; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×125
-35|  server returned 404 for /models — type the model id                                                                                                           |
+34|  server returned 404 for /models — type the model id                                                                                                           |
    ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×53; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×107
-36|  model    ❯ ▏                                                                                                                                                  |
+35|  model    ❯ ▏                                                                                                                                                  |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-37|  ⏎ create · tab connection · esc cancel                                                                                                                        |
+36|  ⏎ create · tab connection · esc cancel                                                                                                                        |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×120
-38|                                                                                                                                                                |
+37|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-39|[+ OpenAI (OAuth)]  [+ Anthropic (OAuth)]  [+ OpenAI (API)]                                                                                                     |
+38|[+ OpenAI (OAuth)]  [+ Anthropic (OAuth)]  [+ OpenAI (API)]                                                                                                     |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×101
-40|[+ Anthropic (API)]  [+ Kimi (OAuth)]  [+ Grok (OAuth)]  [+ Gemini (API)]                                                                                       |
+39|[+ Anthropic (API)]  [+ Kimi (OAuth)]  [+ Grok (OAuth)]  [+ Gemini (API)]                                                                                       |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×87
-41|[+ Google Antigravity (OAuth)]                                                                                                                                  |
+40|[+ Google Antigravity (OAuth)]                                                                                                                                  |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×130
-42|[+ Haider Code (API)]  [+ DeepSeek (API)]  [+ xAI (API)]                                                                                                        |
+41|[+ Haider Code (API)]  [+ DeepSeek (API)]  [+ xAI (API)]                                                                                                        |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×104
-43|[+ HuggingFace]  [+ OpenCode Zen]  [+ OpenCode Go]                                                                                                              |
+42|[+ HuggingFace]  [+ OpenCode Zen]  [+ OpenCode Go]                                                                                                              |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×110
-44|[+ Ollama (local)]  [+ LM Studio (local)]                                                                                                                       |
+43|[+ Ollama (local)]  [+ LM Studio (local)]                                                                                                                       |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
-45|[+ Azure OpenAI]  [+ Bedrock (Claude)]  [+ Vertex (Claude)]                                                                                                     |
+44|[+ Azure OpenAI]  [+ Bedrock (Claude)]  [+ Vertex (Claude)]                                                                                                     |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×20; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×101
-46|[+ Add custom server]                                                                                                                                           |
+45|[+ Add custom server]                                                                                                                                           |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×139
-47|                                                                                                                                                                |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-48|click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back                                            |
+46|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
+47|click an account to make it active · + adds via OAuth / API · x removes · r reveals · ↑↓ PgUp/PgDn scroll · esc back                                            |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×116; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×44
+48|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
 49| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                                                                                                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
