@@ -37,7 +37,7 @@ enum class SelectionRefusalKind {
 
 /** The stable refusal codes, spelled as the daemon sends them. */
 object SelectionRefusalCodes {
-    /** `ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED` (frame.rs:273). */
+    /** `ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED` (frame.rs:271). */
     const val CACHE_EPOCH_CONFIRMATION_REQUIRED = "cache_epoch_confirmation_required"
 
     /** `ERROR_CODE_MODEL_UNKNOWN` (frame.rs:257). */
@@ -49,7 +49,7 @@ object SelectionRefusalCodes {
     /** `ERROR_CODE_EFFORT_UNSUPPORTED` (frame.rs:262). */
     const val EFFORT_UNSUPPORTED = "effort_unsupported"
 
-    /** `ERROR_CODE_FAST_UNSUPPORTED` (frame.rs:267). */
+    /** `ERROR_CODE_FAST_UNSUPPORTED` (frame.rs:266). */
     const val FAST_UNSUPPORTED = "fast_unsupported"
 
     private val terminal = setOf(

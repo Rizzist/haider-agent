@@ -64,7 +64,7 @@ data class SessionProvider(
     val defaultModel: String?,
     val models: List<SessionModel>,
     /**
-     * `ProviderSummaryWire.inventory_authority` (frame.rs:1226) — whether the
+     * `ProviderSummaryWire.inventory_authority` (frame.rs:1227) — whether the
      * published list is the last word on which model ids exist.
      *
      * "advisory" is a user-configured, OpenAI-compatible server whose

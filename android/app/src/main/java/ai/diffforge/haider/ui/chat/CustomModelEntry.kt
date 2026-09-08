@@ -40,7 +40,7 @@ const val CUSTOM_MODEL_FIELD_TAG = "custom_model_field"
  * A free-text model id, for providers that accept one.
  *
  * Only an ADVISORY inventory licenses this row (`ModelInventoryAuthorityWire`,
- * frame.rs:1226): a router or local server routinely omits ids from its
+ * frame.rs:1227): a router or local server routinely omits ids from its
  * `/v1/models` that its chat wire still serves, and `ModelInventoryStatusWire`
  * names that case explicitly — "`Unlisted` is not `Available`: it is an honest
  * advisory-catalog miss that a custom compatible server may still accept".

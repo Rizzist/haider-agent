@@ -60,7 +60,7 @@ data class ProviderDescriptor(
     val apiFamily: String? = null,
     /**
      * `ProviderSummaryWire.inventory_authority` — whether discovery may veto a
-     * model id for this provider (frame.rs:1217). Advisory means a router or
+     * model id for this provider (frame.rs:1216). Advisory means a router or
      * local server that commonly omits otherwise valid passthrough ids from
      * `/v1/models`, so a model the catalog does not list may still be accepted.
      * Unknown keeps the conservative behaviour for older summaries.
@@ -76,7 +76,7 @@ data class ProviderDescriptor(
 )
 
 /**
- * `ModelInventoryAuthorityWire` (frame.rs:1226).
+ * `ModelInventoryAuthorityWire` (frame.rs:1227).
  *
  * Only [Advisory] licenses a free-text model id: an authoritative catalog is
  * the daemon's own and a miss there is a real miss, while Unknown is an older

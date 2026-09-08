@@ -27,7 +27,7 @@ package ai.diffforge.haider.ui.checkpoints
 /** `CheckpointKind` (checkpoint.rs:22). */
 val CHECKPOINT_KINDS: Set<String> = setOf("edit", "write", "create", "delete", "move")
 
-/** `CheckpointOrigin` (checkpoint.rs:46). Undo/redo/rollback are ordinary history. */
+/** `CheckpointOrigin` (checkpoint.rs:47). Undo/redo/rollback are ordinary history. */
 val CHECKPOINT_ORIGINS: Set<String> = setOf("tool", "undo", "redo", "rollback_turn")
 
 /**
@@ -50,7 +50,7 @@ data class CheckpointCategory(
     }
 }
 
-/** One `CheckpointPath` (checkpoint.rs:68). */
+/** One `CheckpointPath` (checkpoint.rs:69). */
 data class CheckpointPathView(
     val path: String,
     val preDigest: String? = null,
@@ -70,7 +70,7 @@ data class CheckpointPathView(
     val truncated: Boolean get() = truncatedReason != null
 }
 
-/** One `CheckpointRecorded` row (checkpoint.rs:84), as the sheet needs it. */
+/** One `CheckpointRecorded` row (checkpoint.rs:87), as the sheet needs it. */
 data class CheckpointView(
     val checkpointId: String?,
     val sessionId: String?,
@@ -127,7 +127,7 @@ data class CheckpointPage(
 /** One turn's worth of checkpoints, in list order. `run_id` is the rollback coordinate. */
 data class CheckpointTurnGroup(val runId: String?, val checkpoints: List<CheckpointView>)
 
-/** A typed `checkpoint_conflict` (frame.rs:5701, checkpoint.rs:119). */
+/** A typed `checkpoint_conflict` (frame.rs:5701, checkpoint.rs:124). */
 data class CheckpointConflictView(
     val path: String?,
     val expectedDigest: String?,
@@ -135,7 +135,7 @@ data class CheckpointConflictView(
 )
 
 /**
- * A typed `checkpoint_rollback_conflict` (checkpoint.rs:129).
+ * A typed `checkpoint_rollback_conflict` (checkpoint.rs:135).
  *
  * All-or-nothing: [verified] names every path whose freshness matched and
  * **nothing was restored**. The sheet says that out loud, because a list of
@@ -153,7 +153,7 @@ data class CheckpointBranchMismatchView(
     val requestedBranchId: String?,
 )
 
-/** `CheckpointMutationReceipt` (checkpoint.rs:139). Post-mutation authority. */
+/** `CheckpointMutationReceipt` (checkpoint.rs:141). Post-mutation authority. */
 data class CheckpointReceiptView(
     val checkpoint: CheckpointView?,
     /**

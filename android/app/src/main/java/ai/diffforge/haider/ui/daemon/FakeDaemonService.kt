@@ -1085,7 +1085,7 @@ class FakeDaemonService(
                 .filter { it.branchId == branchId },
         )
         // Newest-first paging: a cursor is the last emitted sequence and the
-        // next page is strictly OLDER than it (checkpoint.rs:110).
+        // next page is strictly OLDER than it (checkpoint.rs:114).
         val page = rows.filter { cursor == null || (it.seq ?: Long.MAX_VALUE) < cursor }
         val window = page.take(limit)
         val more = page.size > window.size

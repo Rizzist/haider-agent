@@ -23,7 +23,7 @@ import org.json.JSONObject
  * | `account.list` | resp frame.rs:5216 | `{descriptors: CredentialDescriptor[], revision?}` — the key is **descriptors** |
  * | `provider.list` | resp frame.rs:5237 | `{providers: ProviderSummaryWire[], revision}`, each row keyed `provider` / `auth_methods` / `availability` |
  * | `provider.models_probe` | frame.rs:4117 / resp frame.rs:5253 | request `{provider, origin, api_family, keyless, probe_vault_reference?}` — READ-ONLY, **no `command_id`**, because discovery is not a durable mutation; response `{provider, models, default_model?}` |
- * | `provider.configure` | frame.rs:4134 | `{command_id, provider, api_family?, origin?, auth_requirement?, enabled, models, default_model?, probe_vault_reference?, trust?, expected_revision}` — `expected_revision` is REQUIRED, and `probe_vault_reference` is omitted once a probe has already borrowed the stage |
+ * | `provider.configure` | frame.rs:4133 | `{command_id, provider, api_family?, origin?, auth_requirement?, enabled, models, default_model?, probe_vault_reference?, trust?, expected_revision}` — `expected_revision` is REQUIRED, and `probe_vault_reference` is omitted once a probe has already borrowed the stage |
  *
  * `CredentialDescriptor` (haider-protocol `credential.rs:60`) is
  * `{alias, provider, auth_method, identity, status: {status}, active, label?}`;
@@ -308,7 +308,7 @@ object AccountsRpcAdapter {
                 apiFamily = item.optStringOrNull("api_family"),
                 // Absent is Unknown, and Unknown is conservative: a summary
                 // that never named an authority does not license a free-text
-                // model id (frame.rs:1217).
+                // model id (frame.rs:1216).
                 inventoryAuthority = ModelInventoryAuthority.of(
                     item.optStringOrNull("inventory_authority"),
                 ),
