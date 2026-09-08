@@ -18,6 +18,7 @@ pub(crate) mod session_provider;
 pub(crate) mod session_recover;
 pub(crate) mod session_retract;
 pub(crate) mod session_seen;
+pub(crate) mod session_transcript;
 pub(crate) mod session_workspace;
 pub(crate) mod shell_registry;
 pub mod ssh;
@@ -153,6 +154,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
         Command::Sessions(rest) => observe::sessions_command(rest).await,
         Command::SessionProvider(rest) => session_provider::command(rest).await,
         Command::SessionRetract(rest) => session_retract::command(rest).await,
+        Command::SessionTranscript(rest) => session_transcript::command(rest).await,
         Command::Session(rest) => observe::session_command(rest).await,
         Command::Account(rest) => account::account_command(rest).await,
         Command::Provider(rest) => provider::provider_command(rest).await,
@@ -206,6 +208,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session provider rebind --session <id> --provider <id> [--base-url <url>] [--account <name>], \
                  session workspace set <path>, session <id> workspace set <path>, \
+                 session transcript <id> [--after SEQ] [--limit N] [--output json|text], \
                  session retract --session <id> [--json], \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  account list [--json], account use <alias> [--confirm], account source list [--json], account source add <codex|claude_file|grok|kimi_code_home> <root> [--label <label>], account source remove <source-id>, account source scan [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \

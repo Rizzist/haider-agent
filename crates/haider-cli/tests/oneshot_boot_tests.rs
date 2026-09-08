@@ -1286,3 +1286,92 @@ fn fresh_profile_status_is_typed_without_a_daemon_and_reports_the_build_version_
     );
     profile.stop_daemon_cleanly();
 }
+
+/// The real control executable reads the existing profile journal through
+/// session.read, with no subscription or mutation of the source session.
+#[test]
+fn session_transcript_cli_reads_pages_and_preserves_redaction() {
+    let profile = Profile::new();
+    let output = bounded_output(
+        profile
+            .lingering()
+            .env(FAKE_PROVIDER_ENV, fake_script())
+            .args([
+                "run",
+                "--provider",
+                "fake",
+                "--jsonl",
+                "handoff marker [REDACTED]",
+            ]),
+        "seed transcript",
+    );
+    assert_success(&output, "seed transcript");
+    let (accepted, _) = parse_jsonl(&output);
+    let session_id = accepted["session_id"].as_str().expect("session id");
+    let whole = bounded_output(
+        profile.command().args([
+            "session",
+            "transcript",
+            session_id,
+            "--limit",
+            "1024",
+            "--output",
+            "json",
+        ]),
+        "transcript JSON",
+    );
+    assert_success(&whole, "transcript JSON");
+    let whole: serde_json::Value = serde_json::from_slice(&whole.stdout).expect("page JSON");
+    assert_eq!(whole["session_id"], session_id);
+    assert_eq!(whole["has_more"], false);
+    let head = whole["head_seq"].as_u64().expect("head");
+    let mut cursor = 0;
+    let mut rows = Vec::new();
+    loop {
+        let page = bounded_output(
+            profile.command().args([
+                "session",
+                "transcript",
+                session_id,
+                "--after",
+                &cursor.to_string(),
+                "--limit",
+                "3",
+                "--output",
+                "json",
+            ]),
+            "transcript page",
+        );
+        assert_success(&page, "transcript page");
+        let page: serde_json::Value = serde_json::from_slice(&page.stdout).expect("page JSON");
+        assert_eq!(
+            page["head_seq"], head,
+            "reading did not append to the source"
+        );
+        assert!(page["next_after_seq"].as_u64().expect("next") > cursor);
+        cursor = page["next_after_seq"].as_u64().expect("next");
+        rows.extend(page["rows"].as_array().expect("rows").iter().cloned());
+        if page["has_more"] == false {
+            break;
+        }
+    }
+    assert_eq!(serde_json::Value::Array(rows), whole["rows"]);
+    let text = bounded_output(
+        profile.command().args([
+            "session",
+            "transcript",
+            session_id,
+            "--limit",
+            "1024",
+            "--output",
+            "text",
+        ]),
+        "transcript text",
+    );
+    assert_success(&text, "transcript text");
+    let text = String::from_utf8(text.stdout).expect("UTF-8");
+    assert!(text.contains("user: handoff marker [REDACTED]"), "{text}");
+    assert!(text.contains("assistant: fake response: hello"), "{text}");
+    assert!(text.contains("terminal: Done"), "{text}");
+    profile.stop_daemon_cleanly();
+}

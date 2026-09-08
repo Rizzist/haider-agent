@@ -17278,15 +17278,23 @@ impl HubConnection {
                 None,
             );
         }
-        let envelopes = self
+        let Some((head, envelopes)) = self
             .hub
-            .inner
-            .store
-            .read(&session_id, range.start_seq.saturating_sub(1), limit)
+            .read_session_journal(&session_id, range.start_seq - 1, limit)
             .await?
+        else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        };
+        let envelopes = envelopes
             .into_iter()
             .take_while(|envelope| envelope.seq <= range.end_seq)
-            .collect::<Vec<_>>();
+            .collect();
         let metadata = self.hub.inner.store.session_metadata(&session_id).await?;
         let initial_model = metadata
             .as_ref()

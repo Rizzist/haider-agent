@@ -26,6 +26,7 @@ mod process;
 mod redact;
 mod repo;
 mod request_input;
+mod session_transcript;
 mod shell;
 mod spawn_subagent;
 mod tasks;
@@ -83,6 +84,8 @@ pub use haider_protocol::mobile::{
     SmsMessage,
 };
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
+pub use session_transcript::{parse_session_transcript, session_transcript_manifest};
+
 pub use list_models::{
     LIST_MODELS_FILTER_MAX_BYTES, LIST_MODELS_ROW_CAP, ListModels, list_models_manifest,
 };

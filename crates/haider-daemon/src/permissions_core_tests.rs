@@ -838,6 +838,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "computer",
             "monitor",
             "list_models",
+            "session_transcript",
             "peer_list",
             "peer_send",
             "ssh_list",
@@ -1628,7 +1629,11 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         0,
     );
     let registry = registered_tools();
-    assert_eq!(authorized.len(), 27, "26 former tools plus list_tools");
+    assert_eq!(
+        authorized.len(),
+        28,
+        "27 former tools plus session_transcript"
+    );
     let full_prefix: usize = authorized
         .iter()
         .map(|tool| {
@@ -1650,14 +1655,15 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // manual bytes remain zero. Full schema growth cannot waive the pipe gate.
     // Shipgate clarifies interactive/autonomous request_input prose (+96
     // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
+    // session_transcript adds 687 bytes only to the full discovered catalog.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_686;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_373;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_637;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_324;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_636;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_323;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_631;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_318;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1676,7 +1682,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         - 2;
     let expected_pipe_bytes =
         EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
-    assert_eq!(registered_tools().len(), 30);
+    assert_eq!(registered_tools().len(), 31);
     assert_eq!(
         tools.len(),
         9,
