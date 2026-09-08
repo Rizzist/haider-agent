@@ -154,6 +154,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
         Command::SessionProvider(rest) => session_provider::command(rest).await,
         Command::SessionRetract(rest) => session_retract::command(rest).await,
         Command::Session(rest) => observe::session_command(rest).await,
+        Command::SessionSubmit(rest) => run::session_submit_command(rest).await,
         Command::Account(rest) => account::account_command(rest).await,
         Command::Provider(rest) => provider::provider_command(rest).await,
         Command::Lockdown(rest) => lockdown::lockdown_command(rest).await,

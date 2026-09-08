@@ -4218,6 +4218,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
     assert_eq!(
         parse_run_options(&["hello".into()]),
         Ok(RunOptions {
+            session_id: None,
             prompt: "hello".into(),
             prompt_stdin: false,
             resume_run_id: None,
@@ -4450,10 +4451,11 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     write_final(&mut json, RunOutput::Json, &done).expect("json");
     assert_eq!(
         String::from_utf8(json.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"turn_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&json).expect("v1 JSON");
-    assert_eq!(value.as_object().expect("object").len(), 16);
+    assert_eq!(value.as_object().expect("object").len(), 17);
+    assert_eq!(value["turn_id"], value["run_id"]);
     assert_eq!(value["provider"], "fake");
     assert_eq!(value["model"], "fake-model");
     assert!(value["usage"].is_null());
@@ -4591,11 +4593,12 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
         assert_eq!(
             String::from_utf8(bytes.clone()).expect("failure utf8"),
             format!(
-                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{error}}}\n"
+                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"turn_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{error}}}\n"
             )
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("failure object");
-        assert_eq!(value.as_object().expect("object").len(), 16);
+        assert_eq!(value.as_object().expect("object").len(), 17);
+        assert_eq!(value["turn_id"], value["run_id"]);
         assert!(value["response"].is_null());
         assert_eq!(
             value["error"].is_null(),
@@ -4706,7 +4709,7 @@ fn run_json_reports_attachments_additively() {
     write_final(&mut bytes, RunOutput::Json, &attached).expect("attachment JSON");
     assert_eq!(
         String::from_utf8(bytes.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"turn_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("attachment object");
     assert_eq!(value["attachments"]["count"], 2);
@@ -4836,4 +4839,113 @@ fn tui_rejects_bad_theme() {
         .output()
         .expect("binary runs");
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn ordinary_session_submit_cli_and_stdin_alias_keep_one_native_session() {
+    let fixture = haider();
+    let profile = fixture.profile.clone();
+    let workspace = profile.parent().expect("profile parent").join("workspace");
+    let run = |args: &[&str], input: Option<&[u8]>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+        configure_test_home(&mut command, &profile);
+        command
+            .current_dir(&workspace)
+            .env("HAIDER_PROFILE_DIR", &profile)
+            .env("HAIDER_DISCOVERY_DISABLED", "1")
+            .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
+            .env_remove("HAIDER_MODEL")
+            .args(args);
+        let output = bounded_output(&mut command, input);
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("run JSON")
+    };
+    let first = run(
+        &[
+            "run",
+            "--provider",
+            "fake",
+            "--output",
+            "json",
+            "first prompt",
+        ],
+        None,
+    );
+    let id = first["session_id"].as_str().expect("native session");
+    let second = run(
+        &["run", "--session", id, "--output", "json", "second prompt"],
+        None,
+    );
+    let third = run(
+        &["session", "submit", id, "--output", "json", "-"],
+        Some(b"third prompt\n"),
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    let mut last_seq = 0;
+    for result in [&first, &second, &third] {
+        assert_eq!(result["session_id"], id);
+        assert_eq!(result["outcome"], "done");
+        assert_eq!(result["turn_id"], result["run_id"]);
+        assert!(ids.insert(result["run_id"].as_str().expect("run id")));
+        let events = result["events"].as_array().expect("events");
+        assert!(
+            events.first().expect("first event")["seq"]
+                .as_u64()
+                .expect("seq")
+                > last_seq
+        );
+        last_seq = events.last().expect("last event")["seq"]
+            .as_u64()
+            .expect("seq");
+    }
+    assert!(
+        third["events"].to_string().contains("third prompt"),
+        "stdin text reached the journal"
+    );
+}
+
+#[test]
+fn ordinary_session_submission_is_separate_from_budget_resume() {
+    let parsed = parse_run_options(&[
+        "--session".into(),
+        "native-id".into(),
+        "--output".into(),
+        "json".into(),
+        "-".into(),
+    ])
+    .expect("session stdin");
+    assert_eq!(parsed.session_id, Some(SessionId::new("native-id")));
+    assert!(parsed.prompt_stdin);
+    assert_eq!(parsed.resume_run_id, None);
+    assert_eq!(parsed.output, RunOutput::Json);
+    for flags in [
+        vec!["--resume", "run-id"],
+        vec!["--start"],
+        vec!["--provider", "fake"],
+        vec!["--model", "another"],
+        vec!["--read-only"],
+        vec!["--allow-exec"],
+        vec!["--max-tokens", "10"],
+        vec!["--seed", "42"],
+        vec!["--session", "duplicate"],
+    ] {
+        let mut args = vec!["--session".into(), "native-id".into(), "prompt".into()];
+        args.extend(flags.into_iter().map(String::from));
+        assert!(parse_run_options(&args).is_err(), "{args:?}");
+    }
+    for args in [
+        vec!["--session"],
+        vec!["--session", ""],
+        vec!["--session", "--json"],
+        vec!["--session", "native-id"],
+    ] {
+        assert!(
+            parse_run_options(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
+        );
+    }
 }

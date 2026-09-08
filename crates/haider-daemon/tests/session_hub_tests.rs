@@ -10882,3 +10882,55 @@ async fn a_pre_receipt_rejection_leaves_the_command_id_retryable() {
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
+
+#[tokio::test]
+async fn closed_session_read_and_attach_return_explicit_error_without_recreation() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("closed-ordinary-submit");
+    create_typed_session(&store, &session_id, "fake").await;
+    hub.delete_session(session_id.clone())
+        .await
+        .expect("delete quiescent session");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    for body in [
+        RequestBody::SessionRead {
+            session_id: session_id.clone(),
+            range: haider_rpc::SeqRange {
+                start_seq: 1,
+                end_seq: 1,
+            },
+        },
+        RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq: 0,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+    ] {
+        connection
+            .request(RequestId::new("closed-request"), body)
+            .await
+            .expect("request routes");
+        let response = sink.next().await;
+        assert!(
+            matches!(response, WireFrame::Response { body: ResponseBody::Error { ref code, retryable: false, .. }, .. } if code == "session_closed"),
+            "{response:?}"
+        );
+    }
+    assert_eq!(
+        store.latest_seq(&session_id).await.expect("deleted head"),
+        0
+    );
+    hub.shutdown().await.expect("hub stops");
+}

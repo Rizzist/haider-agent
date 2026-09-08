@@ -17245,6 +17245,15 @@ impl HubConnection {
         session_id: SessionId,
         range: SeqRange,
     ) -> Result<(), SessionHubError> {
+        if lock(&self.hub.inner.deleting_sessions)?.contains(&session_id) {
+            return self.respond_error(
+                request_id,
+                "session_closed",
+                "session is closed or being deleted",
+                false,
+                None,
+            );
+        }
         let head = self.hub.inner.store.latest_seq(&session_id).await?;
         if head == 0 {
             return self.respond_error(
@@ -17671,6 +17680,15 @@ impl HubConnection {
         mode: AttachMode,
         sealed_replay: bool,
     ) -> Result<(), SessionHubError> {
+        if lock(&self.hub.inner.deleting_sessions)?.contains(&session_id) {
+            return self.respond_error(
+                request_id,
+                "session_closed",
+                "session is closed or being deleted",
+                false,
+                None,
+            );
+        }
         if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
             return self.respond_error(
                 request_id,

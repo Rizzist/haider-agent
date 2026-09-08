@@ -16,13 +16,14 @@ use haider_client::{
     autospawn_daemon_lifetime, headless_run_events, headless_run_status, load_attachment,
     resolve_profile, resume_headless_with_event_mode_and_interrupts,
     run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
+    submit_headless_with_event_mode_and_interrupts,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::ceiling::{INTERNAL_CEILING_EXIT_CODE, InternalCeilingTerminalV1};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::headless::{HeadlessRunEventPayload, RunBudgetV1, durable_run_terminal_v1};
-use haider_protocol::ids::RunId;
+use haider_protocol::ids::{RunId, SessionId};
 #[cfg(test)]
 use haider_protocol::menu::Menu;
 use haider_protocol::menu::{DecisionKind, MenuKind};
@@ -83,6 +84,7 @@ pub(crate) struct RunOptions {
     pub attachments: Vec<PathBuf>,
     pub budget: RunBudgetV1,
     pub resume_run_id: Option<RunId>,
+    pub session_id: Option<SessionId>,
     pub seed: Option<u64>,
 }
 
@@ -137,6 +139,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     let mut request_tranche = None;
     let mut max_requests = None;
     let mut resume_run_id = None;
+    let mut session_id = None;
     let mut seed = None;
     let mut index = 0;
 
@@ -183,6 +186,15 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 action = RunAction::Replay(parse_run_id(value, "--replay")?);
             }
             "--replay" => return Err("only one lifecycle action may be requested".into()),
+            "--session" if session_id.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .filter(|value| !value.trim().is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| "--session requires a native session id".to_owned())?;
+                session_id = Some(SessionId::new(value.clone()));
+            }
+            "--session" => return Err("duplicate --session flag".into()),
             "--resume" if resume_run_id.is_none() => {
                 index += 1;
                 let value = rest
@@ -371,6 +383,28 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
         request_budget.validate()?;
         budget.request_budget = Some(request_budget);
     }
+    if session_id.is_some() {
+        if resume_run_id.is_some() || action != RunAction::Execute {
+            return Err(
+                "--session cannot be combined with --resume or another lifecycle action".into(),
+            );
+        }
+        if provider.is_some()
+            || model.is_some()
+            || effort.is_some()
+            || fast.is_some()
+            || account.is_some()
+            || ssh_scope.is_some()
+            || read_only
+            || allow_writes_seen
+            || allow_exec_seen
+            || auto_allow_seen
+            || !budget.is_empty()
+            || seed.is_some()
+        {
+            return Err("--session inherits the session's configuration and request ceiling; configuration and run-budget overrides are not accepted".into());
+        }
+    }
     if resume_run_id.is_some() && action != RunAction::Execute {
         return Err("--resume cannot be combined with another lifecycle action".into());
     }
@@ -455,6 +489,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             prompt,
             prompt_stdin,
             resume_run_id,
+            session_id,
             action,
             output,
             timeout,
@@ -573,6 +608,12 @@ pub(crate) fn parse_timeout(value: &str) -> Result<Duration, String> {
         return Err("--timeout must not exceed 24h".into());
     }
     Ok(duration)
+}
+
+pub(crate) async fn session_submit_command(rest: &[String]) -> ExitCode {
+    let mut args = vec!["--session".to_owned()];
+    args.extend_from_slice(rest);
+    run_command(&args).await
 }
 
 pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
@@ -809,21 +850,33 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         prompt: options.prompt.clone(),
         attachments,
         durable_attachments: Vec::new(),
-        provider: provider.clone(),
-        model: request_model,
+        provider: if options.session_id.is_some() {
+            None
+        } else {
+            provider.clone()
+        },
+        model: if options.session_id.is_some() {
+            None
+        } else {
+            request_model
+        },
         max_tokens: profile.default_max_tokens,
         budget: options.budget.clone(),
         seed: options.seed,
         replay_of: None,
-        journal_pin: true,
+        journal_pin: options.session_id.is_none(),
         detached: options.action == RunAction::Start,
-        permission_overrides: execution_permission_overrides(
-            None,
-            options.read_only,
-            options.allow_writes,
-            options.allow_exec,
-            options.auto_allow,
-        ),
+        permission_overrides: if options.session_id.is_some() {
+            SessionPermissionOverridesV1::default()
+        } else {
+            execution_permission_overrides(
+                None,
+                options.read_only,
+                options.allow_writes,
+                options.allow_exec,
+                options.auto_allow,
+            )
+        },
         trust_hooks: options.trust_hooks,
         timeout: options.timeout,
         terminal_grace: haider_client::DEFAULT_TERMINAL_GRACE,
@@ -843,7 +896,18 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     };
     let (interrupt_sender, interrupt_receiver) = mpsc::unbounded_channel();
     let signal_forwarder = tokio::spawn(forward_sigints(interrupt_sender));
-    let result = if let Some(source_run_id) = options.resume_run_id.clone() {
+    let result = if let Some(session_id) = options.session_id.clone() {
+        submit_headless_with_event_mode_and_interrupts(
+            &profile,
+            ensure,
+            request,
+            session_id,
+            events,
+            event_mode,
+            Some(interrupt_receiver),
+        )
+        .await
+    } else if let Some(source_run_id) = options.resume_run_id.clone() {
         resume_headless_with_event_mode_and_interrupts(
             &profile,
             ensure,
@@ -1036,6 +1100,7 @@ Permission options:\n\
   --auto-allow      Compatibility alias; autonomous runs already resolve Ask to Allow\n\
   --trust-hooks     Trust configured hooks for this run\n\
 \n\
+Use --session ID to submit an ordinary turn to an existing native session.\n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
 --timeout <duration>, --start, --status, --stop, and --replay.";
 
@@ -1685,7 +1750,7 @@ fn write_error_json(
     let outcome = failure.outcome;
     let retryable = failure.retryable;
     let line = format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"turn_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
     );
     output.write_all(line.as_bytes())?;
     output.write_all(b"\n")?;
@@ -2036,6 +2101,8 @@ struct RunJson<'a> {
     schema: &'static str,
     session_id: &'a str,
     run_id: &'a str,
+    // A native ordinary turn is identified by its run id; no second id is minted.
+    turn_id: &'a str,
     provider: &'a str,
     model: &'a str,
     attachments: RunJsonAttachments<'a>,
@@ -2078,6 +2145,7 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
             schema: "haider.run.v1",
             session_id: result.session_id.as_str(),
             run_id: result.run_id.as_str(),
+            turn_id: result.run_id.as_str(),
             provider: &result.provider,
             model: &result.model,
             attachments: RunJsonAttachments {
