@@ -46,6 +46,13 @@ sh ./haider-vVERSION-TARGET-uninstall-haider.sh --prefix /absolute/install/bin
 sh ./haider-vVERSION-TARGET-uninstall-haider.sh --prefix /absolute/install/bin --keep-state
 ```
 
+Without `--prefix`, the script defaults to its own directory. If that directory
+contains none of the release's binaries (for example, when run from Downloads),
+it prints a `--prefix` hint to stderr and exits with code **3**. A versioned
+standalone download also points out `/usr/local/bin/haider` if it exists.
+An explicitly supplied `--prefix` with no release members prints a one-line
+notice and exits **0**, so repeated uninstalls are safe.
+
 Use the script from the same release as the installed binaries. It removes only
 that release's members and an installed `uninstall-haider.sh`; unrelated files
 remain. Package-manager installations should be removed with their manager.
