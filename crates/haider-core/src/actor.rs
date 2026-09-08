@@ -3587,6 +3587,7 @@ impl HarnessActor {
         // retry of the same logical request. Starting above zero preserves
         // the restored logical count and freezes wfcont's volatile provider
         // view; the durable physical attempt ordinal still advances below.
+        let mut operation_idle = haider_provider::ProviderIdleDeadline::default();
         let mut provider_attempt = usize::from(
             route_wait.is_some()
                 || (self.config.recovery_request_local_usage && provider_request_count > 0),
@@ -3612,7 +3613,7 @@ impl HarnessActor {
         let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
         if route_wait.is_some() {
             match self
-                .wait_for_provider_route(&run_id, &cancel, &provider)
+                .wait_for_provider_route(&run_id, &cancel, &provider, &operation_idle)
                 .await
             {
                 Ok(()) => thinking_pending = false,
@@ -4508,12 +4509,16 @@ impl HarnessActor {
                 .as_ref()
                 .map(TurnTraceContext::now_us_from_accept);
             let trusts_default_route_absence = attempt_provider.trusts_default_route_absence();
+            let reports_raw_progress = attempt_provider.reports_raw_progress();
             let opening_provider = Arc::clone(&attempt_provider);
             let provider_deadline_state = Arc::clone(&self.provider_deadline_state);
             let provider_request_ref = &provider_request;
             let request_metadata_body_support = opening_provider.request_metadata_body_support();
             let auxiliary_recorder = self.config.provider_request_attempt_recorder.clone();
             let opening_correlation = request_correlation.clone();
+            // The same clock survives every attempt and its retry wait.
+            operation_idle.begin_attempt(provider.idle_timeout());
+            let opening_idle = operation_idle.clone();
             let mut opening = Box::pin(before_provider_request_deadline(
                 self.config.provider_deadline,
                 async move {
@@ -4521,8 +4526,9 @@ impl HarnessActor {
                     // after the next request has positive deadline admission.
                     // Until then, a prior retry remains in its admission state.
                     provider_deadline_state.begin_provider_request();
-                    let open =
-                        opening_provider.stream_prepared_turn_ref(provider_request_ref, prepared);
+                    let open = opening_idle.scope(
+                        opening_provider.stream_prepared_turn_ref(provider_request_ref, prepared),
+                    );
                     match auxiliary_recorder {
                         Some(recorder) => {
                             haider_provider::scope_provider_request_with_recorder(
@@ -4606,6 +4612,7 @@ impl HarnessActor {
                         }
                         continue;
                     }
+                    error = operation_idle.wait() => Err(error),
                     opened = &mut opening => opened,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
@@ -4829,8 +4836,9 @@ impl HarnessActor {
                                 .await;
                         }
                         replay.capture(&message, &reasoning, &refusal_reason);
+                        operation_idle.record_error(&error);
                         match self
-                            .wait_for_provider_route(&run_id, &cancel, &provider)
+                            .wait_for_provider_route(&run_id, &cancel, &provider, &operation_idle)
                             .await
                         {
                             Ok(()) => thinking_pending = false,
@@ -4864,6 +4872,7 @@ impl HarnessActor {
                                 ProviderRetryContext {
                                     run_id: &run_id,
                                     cancel: &cancel,
+                                    idle: &operation_idle,
                                 },
                                 &mut provider_attempt,
                                 &mut provider,
@@ -5026,6 +5035,7 @@ impl HarnessActor {
                         }
                         continue;
                     }
+                    error = operation_idle.wait() => Some(Err(error)),
                     item = stream.recv() => item,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
@@ -5102,6 +5112,16 @@ impl HarnessActor {
                     }
                     }
                 };
+
+                if !reports_raw_progress
+                    && let Some(Ok(event)) = &next
+                    && !matches!(
+                        event,
+                        StreamEvent::NetworkUnavailable | StreamEvent::NetworkRestored
+                    )
+                {
+                    operation_idle.observe_progress();
+                }
 
                 // The session writer arbitrates this boundary against retract
                 // acceptance. Do this before the cancellation check: a response
@@ -5327,8 +5347,9 @@ impl HarnessActor {
                                 .await;
                         }
                         replay.capture(&message, &reasoning, &refusal_reason);
+                        operation_idle.record_error(&error);
                         match self
-                            .wait_for_provider_route(&run_id, &cancel, &provider)
+                            .wait_for_provider_route(&run_id, &cancel, &provider, &operation_idle)
                             .await
                         {
                             Ok(()) => thinking_pending = false,
@@ -5382,6 +5403,7 @@ impl HarnessActor {
                                 ProviderRetryContext {
                                     run_id: &run_id,
                                     cancel: &cancel,
+                                    idle: &operation_idle,
                                 },
                                 &mut provider_attempt,
                                 &mut provider,
@@ -6135,6 +6157,9 @@ impl HarnessActor {
                         }
                     }
                     StreamEvent::Finish { reason } => {
+                        // Tool execution and the next logical request get their
+                        // own idle interval; transport retries above do not.
+                        operation_idle = haider_provider::ProviderIdleDeadline::default();
                         self.provider_finish_reason = Some(reason);
                         if let (Some(trace), Some(started)) =
                             (&self.config.turn_trace, provider_stream_started)
@@ -6997,6 +7022,7 @@ impl HarnessActor {
         run_id: &RunId,
         cancel: &CancelToken,
         provider: &Arc<dyn Provider>,
+        idle: &haider_provider::ProviderIdleDeadline,
     ) -> Result<(), DriveError> {
         self.flush_pending_item_delta()
             .await
@@ -7036,6 +7062,7 @@ impl HarnessActor {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                error = idle.wait() => return Err(DriveError::Provider(error)),
                 () = &mut deadline => {
                     return Err(DriveError::Provider(deadline_exhausted_error(
                         budget,
@@ -7147,6 +7174,10 @@ impl HarnessActor {
         thinking_pending: &mut bool,
         mut error: ProviderError,
     ) -> Result<(), DriveError> {
+        context.idle.record_error(&error);
+        if let Some(idle_error) = context.idle.expired() {
+            return Err(DriveError::Provider(idle_error));
+        }
         // A deadline that was already produced by an active request keeps its
         // in-flight classification. Every other pre-first-event failure enters
         // retry admission before resolver and backoff policy are consulted.
@@ -7165,6 +7196,7 @@ impl HarnessActor {
             let resolution = tokio::select! {
                 biased;
                 () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                error = context.idle.wait() => return Err(DriveError::Provider(error)),
                 resolution = resolver.resolve(&current_account, &error) => resolution,
             }
             .map_err(DriveError::Account)?;
@@ -7268,6 +7300,7 @@ impl HarnessActor {
                         let fallback = tokio::select! {
                             biased;
                             () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                            error = context.idle.wait() => return Err(DriveError::Provider(error)),
                             resolution = resolver.resolve_fallback(&current_account, &error) => resolution,
                         }
                         .map_err(DriveError::Account)?;
@@ -7304,6 +7337,7 @@ impl HarnessActor {
                 context.cancel,
                 *provider_attempt,
                 &error,
+                context.idle,
             )
             .await?;
             *thinking_pending = true;
@@ -7317,6 +7351,7 @@ impl HarnessActor {
             let fallback = tokio::select! {
                 biased;
                 () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                error = context.idle.wait() => return Err(DriveError::Provider(error)),
                 resolution = resolver.resolve_fallback(&current_account, &error) => resolution,
             }
             .map_err(DriveError::Account)?;
@@ -7893,6 +7928,7 @@ impl HarnessActor {
         cancel: &CancelToken,
         failed_attempt: usize,
         error: &ProviderError,
+        idle: &haider_provider::ProviderIdleDeadline,
     ) -> Result<(), DriveError> {
         if error
             .retry_after_ms
@@ -7910,6 +7946,7 @@ impl HarnessActor {
                 opened_within_ms: error.opened_within_ms,
                 budget_ms: error.budget_ms,
                 timeout_reason: error.timeout_reason,
+                idle_timeout: error.idle_timeout.clone(),
                 presentation: error.presentation.clone(),
             };
             return Err(DriveError::Provider(capped));
@@ -7970,6 +8007,7 @@ impl HarnessActor {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break Err(DriveError::Cancelled),
+                error = idle.wait() => break Err(DriveError::Provider(error)),
                 () = retry_wake.fired(&retrying_event_id) => break Ok(()),
                 // L1: a Stop (or a closed command channel) during a long
                 // Retry-After backoff must not block shutdown for the full
@@ -10570,6 +10608,22 @@ impl HarnessActor {
         let mut envelopes = Vec::new();
         // The hard checkpoint and the named terminal share the same append:
         // recovery never sees a hard-bound handle without its terminal state.
+        if error.code == ErrorCode::IdleTimeout
+            && let Some(data) = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("idle_timeout"))
+        {
+            // Preserve the typed cause and timing through replay and CLI
+            // observation, atomically with RunFailed/Errored. Older peers
+            // already carry unknown extensions without changing RPC methods.
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                "haider.provider.idle_timeout.v1",
+                data.clone(),
+                prompt_omit_render(),
+            )?);
+        }
         if error.code == ErrorCode::RequestBudgetExceeded {
             let data = error.details.clone().ok_or_else(|| {
                 HaiderError::new(
@@ -11790,6 +11844,7 @@ impl From<ContextCompactionError> for DriveError {
 struct ProviderRetryContext<'a> {
     run_id: &'a RunId,
     cancel: &'a CancelToken,
+    idle: &'a haider_provider::ProviderIdleDeadline,
 }
 
 /// One in-flight text or reasoning item (started, not yet completed).
@@ -12565,7 +12620,9 @@ fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
-    let code = if provider_error.presentation.subcode.as_str() == "provider-timeout" {
+    let code = if provider_error.timeout_reason == Some(ProviderTimeoutReason::IdleTimeout) {
+        ErrorCode::IdleTimeout
+    } else if provider_error.presentation.subcode.as_str() == "provider-timeout" {
         ErrorCode::ProviderTimeout
     } else {
         ErrorCode::ProviderError
@@ -12578,6 +12635,14 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
         "budget_ms": provider_error.budget_ms,
         "reason": provider_error.timeout_reason,
     }));
+    if let Some(idle) = provider_error.idle_timeout
+        && let Some(details) = error
+            .details
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        details.insert("idle_timeout".into(), serde_json::json!(idle));
+    }
     error.presentation = Some(provider_error.presentation);
     error
 }

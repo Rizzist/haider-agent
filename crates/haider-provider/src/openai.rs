@@ -881,6 +881,14 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn idle_timeout(&self) -> Option<Duration> {
+        Some(self.http.transport_config.chunk_idle_timeout)
+    }
+
+    fn reports_raw_progress(&self) -> bool {
+        true
+    }
+
     fn request_metadata_body_support(&self) -> crate::RequestMetadataBodySupport {
         crate::RequestMetadataBodySupport::Supported
     }
@@ -1851,6 +1859,14 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
+    fn idle_timeout(&self) -> Option<Duration> {
+        Some(self.http.transport_config.chunk_idle_timeout)
+    }
+
+    fn reports_raw_progress(&self) -> bool {
+        true
+    }
+
     fn trusts_default_route_absence(&self) -> bool {
         self.route_gating().enabled()
     }
@@ -2308,6 +2324,7 @@ async fn stream_sse_source<S: SseChunkSource>(
     let crate::SseRequestContext {
         route_gating,
         turn_trace,
+        idle_deadline,
     } = context;
     let mut decoder = match kind {
         DecoderKind::Responses(computer_kind) => {
@@ -2331,6 +2348,9 @@ async fn stream_sse_source<S: SseChunkSource>(
                     .as_ref()
                     .map(|(trace, _)| trace.now_us_from_accept());
                 let items = decoder.finish();
+                if let Some(idle) = &idle_deadline {
+                    idle.observe_items(&items);
+                }
                 if let (Some((trace, request_ordinal)), Some(started)) =
                     (&turn_trace, decode_started)
                 {
@@ -2369,11 +2389,19 @@ async fn stream_sse_source<S: SseChunkSource>(
         if let Some((trace, request_ordinal)) = &turn_trace {
             trace.emit_first_byte(*request_ordinal);
         }
+        if !chunk.as_ref().is_empty()
+            && let Some(idle) = &idle_deadline
+        {
+            idle.observe_progress();
+        }
         progress.observe_raw_chunk();
         let decode_started = turn_trace
             .as_ref()
             .map(|(trace, _)| trace.now_us_from_accept());
         let items = decoder.push(chunk.as_ref());
+        if let Some(idle) = &idle_deadline {
+            idle.observe_items(&items);
+        }
         if let (Some((trace, request_ordinal)), Some(started)) = (&turn_trace, decode_started) {
             trace.emit(
                 "sse_decode",

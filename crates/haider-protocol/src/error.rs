@@ -375,6 +375,8 @@ pub enum ErrorCode {
     Internal,
     /// A daemon-enforced headless run budget reached its durable limit.
     BudgetExhausted,
+    /// The logical provider request exhausted its last-progress idle budget.
+    IdleTimeout,
     /// Forward-compat catch-all: unknown codes from newer peers land here.
     #[serde(other)]
     Unknown,
@@ -409,6 +411,7 @@ impl ErrorCode {
             Self::WorkspaceUnavailable => "workspace_unavailable",
             Self::ProviderError => "provider_error",
             Self::ProviderTimeout => "provider_timeout",
+            Self::IdleTimeout => "idle_timeout",
             Self::VisionUnsupported => "vision_unsupported",
             Self::StoreCorrupt => "store_corrupt",
             Self::StoreLocked => "store_locked",
@@ -451,6 +454,7 @@ impl ErrorCode {
             Self::WorkspaceUnavailable => "workspace-unavailable",
             Self::ProviderError => "provider-error",
             Self::ProviderTimeout => "provider-timeout",
+            Self::IdleTimeout => "idle-timeout",
             Self::VisionUnsupported => "vision-unsupported",
             Self::StoreCorrupt => "store-corrupt",
             Self::StoreLocked => "store-locked",

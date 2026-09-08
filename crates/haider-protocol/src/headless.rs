@@ -262,6 +262,12 @@ pub fn durable_run_terminal_v1(
                 error_code: Some("budget_exhausted"),
             })
         }
+        RunState::Errored if matches!(failure_code, Some(ErrorCode::IdleTimeout)) => {
+            Some(DurableRunTerminalV1 {
+                terminal_kind: "timeout",
+                error_code: Some("idle_timeout"),
+            })
+        }
         RunState::Errored
             if matches!(
                 failure_code,

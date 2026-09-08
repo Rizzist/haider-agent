@@ -3121,6 +3121,26 @@ means “leave the stored value unchanged.” A client must not clear a stored
 override by omission, merge this budget with connect/chunk-idle timeouts, or
 assume the transport may outlive the enclosing run deadline.
 
+The configured chunk-idle budget also bounds one logical provider request
+across physical attempts, retry backoff, and route waits after dispatch.
+Nonempty received bytes or provider frames refresh its last-progress deadline;
+starting an attempt or receiving response headers does not. A progressing
+stream can therefore outlive the idle budget in total. A received terminal
+frame ends this transport watchdog, and a subsequent logical request starts
+its own interval. The separate semantic-progress and absolute run budgets
+still apply.
+
+Idle exhaustion stops automatic retries and emits `run_failed.code =
+"idle_timeout"`, `retryable = false`, and a durable `run_state` terminal with
+`terminal_kind = "timeout"` and `error_code = "idle_timeout"`. The CLI exits
+124. An additive `haider.provider.idle_timeout.v1` extension is committed in
+the same batch as the terminal and survives replay. Its data contains
+`elapsed_ms`, `idle_elapsed_ms`, `budget_ms`, `attempts`, and nullable `cause`:
+the original preceding provider error, including its retryability and typed
+timeout reason when present. A request that was silent from its first attempt
+has no preceding error. Genuine per-request response-open timeouts keep
+`provider_timeout` and their existing CLI exit 65. No RPC method is added.
+
 ### 15.7 Custom OpenAI-compatible providers (local or web)
 
 A custom provider is a durable provider profile whose caller-chosen alias is
