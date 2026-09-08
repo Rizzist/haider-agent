@@ -8,6 +8,7 @@ use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorSco
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
+use haider_protocol::task::{TaskEventPayload, TaskTerminalState};
 #[cfg(unix)]
 use std::fs::{OpenOptions, TryLockError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -522,21 +523,132 @@ const EXEC_WRITE_COMMAND: &str = "printf ok > exec-created.txt";
 #[cfg(windows)]
 const EXEC_WRITE_COMMAND: &str = "[IO.File]::WriteAllText('exec-created.txt','ok')";
 
-#[cfg(unix)]
-const REPLAY_BACKGROUND_COMMAND: &str = "while [ ! -f replay-release ]; do sleep 0.02; done";
+const REPLAY_RELEASE_POLL: Duration = Duration::from_millis(20);
 
-#[cfg(windows)]
-const REPLAY_BACKGROUND_COMMAND: &str =
-    "while (-not (Test-Path 'replay-release')) { Start-Sleep -Milliseconds 20 }";
+fn replay_background_command() -> String {
+    #[cfg(not(windows))]
+    {
+        format!(
+            "while [ ! -f replay-release ]; do sleep {}; done",
+            REPLAY_RELEASE_POLL.as_secs_f64()
+        )
+    }
+    #[cfg(windows)]
+    {
+        // Test-Path/Start-Sleep import modules on first use. This fixture
+        // needs only a file gate; pin the absence of that cold-start work.
+        format!(
+            "$PSModuleAutoLoadingPreference='None';\
+             while (-not [IO.File]::Exists('replay-release')) {{ [Threading.Thread]::Sleep({}) }}",
+            REPLAY_RELEASE_POLL.as_millis()
+        )
+    }
+}
 
-#[cfg(not(windows))]
-const REPLAY_TASK_COMPLETION_DEADLINE: Duration = Duration::from_secs(10);
+fn replay_task_completion_budget() -> Duration {
+    // BudgetSum: inbox PowerShell's existing 30s cold-start policy
+    // (daemond/tests/support/mod.rs), or the Unix shell's 5s startup policy
+    // (daemon/src/hooks_tests.rs), then the release poll, supervisor TERM
+    // grace + pipe drain (+ Windows fallback reap), one final workspace receipt
+    // (tools/workspace_receipt.rs),
+    // and this fixture's existing 10s journal/scheduling allowance.
+    // The observer also connects/handshakes and issues one session.attach RPC.
+    // A background process has NO foreground wall_timeout to add here.
+    let shell_start = Duration::from_secs(if cfg!(windows) { 30 } else { 5 });
+    let workspace_receipt = Duration::from_millis(500);
+    let journal_observation = Duration::from_secs(10);
+    let client = haider_client::ClientConfig::default();
+    shell_start
+        + REPLAY_RELEASE_POLL
+        + haider_tools::BACKGROUND_KILL_GRACE * if cfg!(windows) { 3 } else { 2 }
+        + workspace_receipt
+        + journal_observation
+        + client.handshake_timeout
+        + client.request_timeout
+}
 
-#[cfg(windows)]
-// Registry #94: 30s established cold inbox-PowerShell allowance + 15s for
-// detached-task scheduling, journal publication, and repeated CLI observation.
-// Background supervision has no foreground 60s wall limit, so it is not added.
-const REPLAY_TASK_COMPLETION_DEADLINE: Duration = Duration::from_secs(45);
+fn await_replay_task_completion(
+    profile: &Path,
+    session_id: &str,
+    run_id: &str,
+    task_id: &str,
+    terminal_seq: u64,
+) {
+    let mut environment = haider_client::ProfileEnv::capture();
+    environment.profile_dir = Some(profile.to_path_buf());
+    environment.home = Some(test_home(profile));
+    environment.user_profile = environment.home.clone();
+    environment.runtime_dir = None;
+    environment.xdg_runtime_dir = None;
+    let profile = haider_client::resolve_profile(&environment).expect("observer profile");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("task observation runtime");
+    runtime.block_on(async {
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        // The long-lived production observer services keepalives and replays
+        // every suffix fact. A 20-event session summary is not a completion
+        // barrier, and repeatedly spawning the CLI adds unbudgeted OS work.
+        let observation = haider_client::observe_stream_session_after(
+            &profile,
+            false,
+            SessionId::new(session_id),
+            true,
+            sender,
+            terminal_seq,
+        );
+        tokio::pin!(observation);
+        let budget = replay_task_completion_budget();
+        let started = Instant::now();
+        let mut last_seq = terminal_seq;
+        let mut progress = Vec::new();
+        let result = tokio::time::timeout(budget, async {
+            loop {
+                tokio::select! {
+                    result = &mut observation => {
+                        return Err(format!("event observer stopped: {result:?}"));
+                    }
+                    event = events.recv() => {
+                        let Some(event) = event else {
+                            return Err("event channel closed".to_owned());
+                        };
+                        last_seq = event.seq;
+                        progress.push(format!("seq {}: {}", event.seq, event.payload));
+                        if event.run_id.as_ref().map(RunId::as_str) != Some(run_id) {
+                            continue;
+                        }
+                        if let Some(TaskEventPayload::TaskCompleted(completed)) =
+                            TaskEventPayload::from_payload_value(&event.payload)
+                            && completed.task.as_str() == task_id
+                        {
+                            assert!(event.seq > terminal_seq, "task fact must follow run terminal");
+                            assert_eq!(
+                                completed.state,
+                                TaskTerminalState::Completed { exit_code: Some(0) },
+                                "late task reached an unsuccessful terminal: {completed:?}"
+                            );
+                            eprintln!(
+                                "replay task {task_id}: terminal_seq={terminal_seq}; \
+                                 completion_seq={}; elapsed={:?}; terminal={completed:?}",
+                                event.seq, started.elapsed()
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "late task {task_id} in run {run_id} did not complete: {result:?}; \
+             budget={budget:?}; elapsed={:?}; run_terminal_seq={terminal_seq}; \
+             last_seq={last_seq}; last observed task state=running (no matching terminal fact received); \
+             observed suffix:\n{}",
+            started.elapsed(), progress.join("\n")
+        );
+    });
+}
 
 #[test]
 fn version_prints_workspace_version() {
@@ -1571,7 +1683,7 @@ fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
             "call_id": "background-replay-1",
             "name": "exec",
             "args": {
-                "command": REPLAY_BACKGROUND_COMMAND,
+                "command": replay_background_command(),
                 "background": true,
                 "name": "replay-late-task"
             }
@@ -1636,28 +1748,15 @@ fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
         .expect("profile parent")
         .join("workspace");
     std::fs::write(workspace.join("replay-release"), b"release").expect("release background task");
-    let deadline = Instant::now() + REPLAY_TASK_COMPLETION_DEADLINE;
-    loop {
-        let mut session = Command::new(env!("CARGO_BIN_EXE_haider"));
-        configure_test_home(&mut session, &source.profile);
-        session
-            .args(["session", session_id, "--json"])
-            .env("HAIDER_PROFILE_DIR", &source.profile)
-            .env("HAIDER_DISCOVERY_DISABLED", "1");
-        let observed = session.output().expect("session observation executes");
-        assert!(observed.status.success());
-        let observation = String::from_utf8_lossy(&observed.stdout);
-        if observation.contains("task_completed") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "late task never completed within {:?}; last session observation: {}",
-            REPLAY_TASK_COMPLETION_DEADLINE,
-            observation
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    let before_json: serde_json::Value =
+        serde_json::from_slice(&before_completion.stdout).expect("initial replay JSON");
+    let terminal_seq = before_json["terminal_seq"]
+        .as_u64()
+        .expect("run terminal sequence");
+    let task_id = source_json["background_tasks_running"][0]["task_id"]
+        .as_str()
+        .expect("background task id");
+    await_replay_task_completion(&source.profile, session_id, run_id, task_id, terminal_seq);
 
     let after_completion = replay(&source.profile);
     assert!(

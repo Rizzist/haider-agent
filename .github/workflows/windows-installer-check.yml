@@ -1,60 +1,37 @@
-name: release
+# Permanent native Windows installer rehearsal. Advisory to the release
+# decision under registry #80 until its first green; publishes no release.
+# Build and Additional installers mirror release.yml; only matrix, source-run
+# plumbing and refs/tags checks differ. No manual release.yml dispatch needed.
+name: windows-installer-check
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch: {}   # manual build-only run (no release published)
+    branches: [ci-winonly-*]
+  workflow_dispatch:
+    inputs:
+      reuse_run_id:
+        description: Prior run with an unexpired Windows distribution for this exact SHA (empty builds it)
+        required: false
+        default: ''
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+  group: windows-installer-check-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
+  contents: read
   actions: read
-  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ship-gate-evidence:
-    runs-on: ubuntu-latest
-    outputs:
-      satisfied: ${{ steps.lookup.outputs.satisfied }}
-      run_id: ${{ steps.lookup.outputs.run_id }}
-      artifact_run_id: ${{ steps.lookup.outputs.artifact_run_id }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: find successful ship-gate on the exact candidate SHA (any ref)
-        id: lookup
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA"
-          --artifact "release-build-aarch64-apple-darwin-$GITHUB_SHA"
-
-  ship-gate-run:
-    needs: ship-gate-evidence
-    if: needs.ship-gate-evidence.outputs.satisfied != 'true'
-    permissions:
-      actions: write
-      contents: read
-    uses: ./.github/workflows/ship-gate.yml
-
   build:
-    needs: [ship-gate-evidence, ship-gate-run]
-    if: always() && needs.ship-gate-evidence.result == 'success' && (needs.ship-gate-run.result == 'success' || needs.ship-gate-run.result == 'skipped')
+    if: inputs.reuse_run_id == ''
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
@@ -71,7 +48,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libglib2.0-dev pkg-config
       - name: tag matches workspace version (tag builds only)
-        if: github.event_name == 'push'
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME#v}"
@@ -96,50 +73,8 @@ jobs:
           } catch {
             Write-Warning "Could not apply Defender exclusions: $_. Build continues, just slower."
           }
-      - uses: Swatinem/rust-cache@v2
-        if: matrix.target == 'aarch64-apple-darwin'
-        # Match the producer/render cache environment before key selection.
-        env:
-          CARGO_INCREMENTAL: 0
-          CARGO_PROFILE_DEV_DEBUG: 0
-        with:
-          shared-key: macos-release-aarch64
-      - name: locate shared macOS release artifact
-        if: matrix.target == 'aarch64-apple-darwin'
-        id: shared
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTIFACT_RUN_ID: ${{ needs.ship-gate-evidence.outputs.artifact_run_id }}
-          GATE_REUSED: ${{ needs.ship-gate-evidence.outputs.satisfied }}
-          CALL_ARTIFACT_RUN_ID: ${{ needs.ship-gate-run.outputs.artifact_run_id }}
-        run: |
-          # A reusable workflow uploads into this caller's run. A reused verdict
-          # may outlive its artifact; only that absence permits local compilation.
-          if [ "$GATE_REUSED" != true ]; then ARTIFACT_RUN_ID="$CALL_ARTIFACT_RUN_ID"; fi
-          if [ -n "$ARTIFACT_RUN_ID" ]; then
-            python3 scripts/release/find-evidence.py ship-gate.yml "$GITHUB_SHA" \
-              --artifact "release-build-aarch64-apple-darwin-$GITHUB_SHA" \
-              --artifact-run-id "$ARTIFACT_RUN_ID"
-          fi
-      - uses: actions/download-artifact@v4
-        if: matrix.target == 'aarch64-apple-darwin' && steps.shared.outputs.artifact_run_id != ''
-        with:
-          name: release-build-aarch64-apple-darwin-${{ github.sha }}
-          path: release-build
-          run-id: ${{ steps.shared.outputs.artifact_run_id }}
-          github-token: ${{ github.token }}
-      - name: verify and restore shared macOS release artifact
-        if: matrix.target == 'aarch64-apple-darwin' && steps.shared.outputs.artifact_run_id != ''
-        run: |
-          source scripts/release/macos-release-env.sh
-          python3 scripts/release/macos-build-artifact.py restore --sha "$GITHUB_SHA" --bundle release-build
-      - name: build (macOS, unless shared artifact is available)
-        if: runner.os == 'macOS' && steps.shared.outputs.artifact_run_id == ''
-        run: |
-          source scripts/release/macos-release-env.sh
-          cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target ${{ matrix.target }}
       - name: build
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         run: cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target ${{ matrix.target }}
       # WINDOWS ONLY: thin LTO across 16 codegen units instead of fat LTO in one.
       #
@@ -261,7 +196,7 @@ jobs:
           "$TBIN" --version
           "$BIN" self-test | grep '"ok":true'
           if [ "$RUNNER_OS" != "Windows" ]; then file "$BIN"; fi
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             TAG="${GITHUB_REF_NAME#v}"
             test "$("$BIN" --version)" = "haider $TAG"
             test "$("$TBIN" --version)" = "haider-tui $TAG"
@@ -499,20 +434,11 @@ jobs:
   installers:
     name: Additional installers (${{ matrix.target }})
     needs: build
-    # Reused gates leave a skipped ancestor; check the direct result explicitly.
-    if: always() && !cancelled() && needs.build.result == 'success'
+    if: always() && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.reuse_run_id != ''))
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
@@ -521,10 +447,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: require exact-SHA artifact provenance when reusing a run
+        if: inputs.reuse_run_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: |
+          python scripts/release/find-evidence.py release.yml "$GITHUB_SHA" \
+            --artifact distribution-x86_64-pc-windows-msvc --artifact-run-id "$REUSE_RUN_ID" > artifact-source.txt
+          grep -q '^artifact_run_id=[1-9][0-9]*$' artifact-source.txt
       - uses: actions/download-artifact@v4
         with:
           name: distribution-${{ matrix.target }}
           path: archives
+          run-id: ${{ inputs.reuse_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Freeze exact archive members and checksums
         shell: bash
         run: |
@@ -601,355 +539,3 @@ jobs:
             installers/*-uninstall-haider.sh
             installers/*.sha256
           if-no-files-found: error
-
-  publish:
-    needs: [build, installers]
-    if: always() && !cancelled() && needs.build.result == 'success' && needs.installers.result == 'success' && github.event_name == 'push'   # only tag pushes cut a release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: unsafe-count gate
-        shell: bash
-        run: bash scripts/check-unsafe-counts.sh
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: distribution-*
-          path: dist
-          merge-multiple: true
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: installers-*
-          path: dist
-          merge-multiple: true
-      - name: download Android APK artifact when available
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -u
-          RUN_ID=""
-          MISSING_ATTEMPTS=0
-          RUNNING_ATTEMPTS=0
-          while [ "$RUNNING_ATTEMPTS" -lt 120 ]; do
-            RUNS="$(gh api \
-              "/repos/$GITHUB_REPOSITORY/actions/workflows/android-apk.yml/runs?event=push&head_sha=$GITHUB_SHA&per_page=20" \
-              2>/dev/null || true)"
-            RUN_ID="$(jq -r --arg ref "$GITHUB_REF_NAME" '
-              [.workflow_runs[]?] as $all
-              | ([$all[] | select(.head_branch == $ref)] | if length > 0 then . else $all end)
-              | sort_by(.run_number) | last | .id // empty
-            ' <<< "$RUNS" 2>/dev/null || true)"
-            if [ -n "$RUN_ID" ]; then
-              MISSING_ATTEMPTS=0
-              RUNNING_ATTEMPTS=$((RUNNING_ATTEMPTS + 1))
-              STATUS="$(jq -r --argjson id "$RUN_ID" \
-                '.workflow_runs[] | select(.id == $id) | .status' <<< "$RUNS")"
-              CONCLUSION="$(jq -r --argjson id "$RUN_ID" \
-                '.workflow_runs[] | select(.id == $id) | .conclusion // empty' <<< "$RUNS")"
-              if [ "$STATUS" = "completed" ]; then
-                if [ "$CONCLUSION" = "success" ]; then
-                  APK_STAGE="$RUNNER_TEMP/haider-android-artifact"
-                  mkdir -p "$APK_STAGE"
-                  if gh run download "$RUN_ID" \
-                    --name haider-android-release \
-                    --dir "$APK_STAGE"; then
-                    VERSION="${GITHUB_REF_NAME#v}"
-                    APK_NAME="haider-v${VERSION}-android.apk"
-                    if [ -f "$APK_STAGE/$APK_NAME" ] && \
-                       [ -f "$APK_STAGE/$APK_NAME.sha256" ] && \
-                       (cd "$APK_STAGE" && sha256sum --check "$APK_NAME.sha256"); then
-                      if mv "$APK_STAGE/$APK_NAME" "$APK_STAGE/$APK_NAME.sha256" dist/; then
-                        echo "Downloaded Android release artifact from workflow run $RUN_ID"
-                      else
-                        rm -f "dist/$APK_NAME" "dist/$APK_NAME.sha256"
-                        echo "::warning::Android artifact could not be moved into the release directory"
-                      fi
-                    else
-                      echo "::warning::Android artifact was incomplete or failed checksum verification"
-                    fi
-                  else
-                    echo "::warning::Android workflow succeeded, but its APK artifact was unavailable"
-                  fi
-                else
-                  echo "::warning::Android APK workflow concluded '$CONCLUSION'; publishing native assets only"
-                fi
-                exit 0
-              fi
-            else
-              MISSING_ATTEMPTS=$((MISSING_ATTEMPTS + 1))
-              if [ "$MISSING_ATTEMPTS" -ge 8 ]; then
-                echo "::warning::Android APK workflow run was absent; publishing native assets only"
-                exit 0
-              fi
-            fi
-            sleep 15
-          done
-          echo "::warning::Android APK workflow was still running after 30 minutes; publishing native assets only"
-      - name: create or update release (prerelease until v0.1.0)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          NOTES="Cross-platform release (macOS aarch64/x86_64, Linux x86_64/arm64, Windows x86_64). Additional Windows EXE, macOS PKG/DMG, and Linux DEB/RPM installers are included. Signing and notarization depend on configured repository credentials; see installer job logs for SIGNED/SKIP status. Verify each SHA-256 sidecar."
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "haider $GITHUB_REF_NAME" \
-              --prerelease \
-              --notes "$NOTES"
-          fi
-
-  npm:
-    name: Publish npm
-    needs: publish
-    if: always() && !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: unsafe-count gate
-        shell: bash
-        run: bash scripts/check-unsafe-counts.sh
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
-      - name: Check npm token
-        id: token
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "${NPM_TOKEN:-}" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::NPM_TOKEN is not set; skipping npm publish"
-          fi
-
-      - name: Check published npm version
-        id: package
-        if: steps.token.outputs.skip != 'true'
-        working-directory: packaging/npm
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if npm view "haider-agent@$VERSION" version --json >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::haider-agent@$VERSION is already published; skipping npm publish"
-          fi
-
-      - name: Publish
-        if: steps.token.outputs.skip != 'true' && steps.package.outputs.skip != 'true'
-        working-directory: packaging/npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-          PACKAGE="$(npm pack --ignore-scripts --silent)"
-          python3 ../../scripts/release_packaging.py verify-npm \
-            --package "$PACKAGE" \
-            --version "$VERSION"
-          npm publish "$PACKAGE" --access public
-
-  repin-packages:
-    name: Re-pin Homebrew and Scoop manifests
-    needs: publish
-    if: always() && !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    concurrency:
-      group: haider-package-manifest-repin
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
-          token: ${{ github.token }}
-      - name: unsafe-count gate
-        shell: bash
-        run: bash scripts/check-unsafe-counts.sh
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: distribution-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: Re-pin manifests from release artifacts
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          export VERSION="${TAG#v}"
-          sha_file() {
-            shasum -a 256 "artifacts/$1" | awk '{print $1}'
-          }
-          export SHA_DARWIN_ARM
-          export SHA_DARWIN_X64
-          export SHA_LINUX_ARM64
-          export SHA_LINUX_X64
-          export SHA_WIN_X64
-          SHA_DARWIN_ARM=$(sha_file "haider-v${VERSION}-aarch64-apple-darwin-split.tar.xz")
-          SHA_DARWIN_X64=$(sha_file "haider-v${VERSION}-x86_64-apple-darwin-split.tar.xz")
-          SHA_LINUX_ARM64=$(sha_file "haider-v${VERSION}-aarch64-unknown-linux-gnu-split.tar.xz")
-          SHA_LINUX_X64=$(sha_file "haider-v${VERSION}-x86_64-unknown-linux-gnu-split.tar.xz")
-          SHA_WIN_X64=$(sha_file "haider-v${VERSION}-x86_64-pc-windows-msvc-split.zip")
-
-          python3 scripts/release_packaging.py repin-manifests \
-            --packaging-root packaging \
-            --version "$VERSION" \
-            --sha-darwin-arm64 "$SHA_DARWIN_ARM" \
-            --sha-darwin-x64 "$SHA_DARWIN_X64" \
-            --sha-linux-arm64 "$SHA_LINUX_ARM64" \
-            --sha-linux-x64 "$SHA_LINUX_X64" \
-            --sha-windows-x64 "$SHA_WIN_X64"
-
-      - name: Commit manifests to the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- packaging/homebrew/haider.rb packaging/scoop/haider.json
-          if git diff --cached --quiet; then
-            echo "::warning::Homebrew and Scoop manifests are already pinned to $GITHUB_REF_NAME; skipping commit"
-            exit 0
-          fi
-          git commit -m "packaging: re-pin manifests for $GITHUB_REF_NAME"
-          git pull --rebase origin "$DEFAULT_BRANCH"
-          git push origin "HEAD:$DEFAULT_BRANCH"
-
-      # The Homebrew tap (Rizzist/homebrew-tap, installed as
-      # `brew install Rizzist/tap/haidercode`) is a SEPARATE repository, so
-      # GITHUB_TOKEN cannot reach it. TAP_TOKEN must be a PAT carrying
-      # contents:write on that repo. Without it we warn and skip rather than
-      # fail the release: the tap simply stays on its previous version, which
-      # is a stale tap rather than a broken release.
-      - name: Re-pin the Homebrew tap
-        env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [ -z "${TAP_TOKEN:-}" ]; then
-            echo "::warning::TAP_TOKEN is not set; skipping the Homebrew tap re-pin. Rizzist/homebrew-tap stays on its previous version."
-            exit 0
-          fi
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/Rizzist/homebrew-tap.git" /tmp/tap
-          # The tap's formula is the in-repo formula with its class renamed to
-          # match the filename, which Homebrew requires. Deriving it here keeps
-          # a single source of truth: the pins were already written above.
-          sed -e 's/^class Haider < Formula/class Haidercode < Formula/' \
-            packaging/homebrew/haider.rb > /tmp/tap/Formula/haidercode.rb
-          cd /tmp/tap
-          if git diff --quiet; then
-            echo "::warning::Homebrew tap is already pinned to $TAG; skipping"
-            exit 0
-          fi
-          git add Formula/haidercode.rb
-          git commit -m "haidercode: re-pin to $TAG"
-          git push origin HEAD:main
-
-  chocolatey:
-    name: Publish Chocolatey
-    needs: publish
-    if: always() && !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: unsafe-count gate
-        shell: bash
-        run: bash scripts/check-unsafe-counts.sh
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: distribution-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: Check Chocolatey token
-        id: token
-        shell: pwsh
-        env:
-          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:CHOCO_API_KEY)) {
-            "skip=true" >> $env:GITHUB_OUTPUT
-            Write-Output "::warning::CHOCO_API_KEY is not set; skipping Chocolatey publish"
-          }
-
-      - name: Check published Chocolatey version
-        id: package
-        if: steps.token.outputs.skip != 'true'
-        shell: pwsh
-        run: |
-          $Version = $env:GITHUB_REF_NAME.TrimStart('v')
-          $Existing = choco search haider --exact --version $Version --source https://community.chocolatey.org/api/v2/ --limit-output
-          if ($LASTEXITCODE -ne 0) {
-            "skip=true" >> $env:GITHUB_OUTPUT
-            Write-Output '::warning::Could not query Chocolatey for the existing package version; skipping this publish attempt'
-            exit 0
-          }
-          if (@($Existing) -contains "haider|$Version") {
-            "skip=true" >> $env:GITHUB_OUTPUT
-            Write-Output "::warning::haider $Version is already published; skipping Chocolatey push"
-          }
-
-      # The first-ever Chocolatey version requires manual community moderation.
-      - name: Pack and push
-        if: steps.token.outputs.skip != 'true' && steps.package.outputs.skip != 'true'
-        shell: pwsh
-        env:
-          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $Version = $env:GITHUB_REF_NAME.TrimStart('v')
-          $Target = 'x86_64-pc-windows-msvc'
-          $Zip = "haider-v$Version-$Target-split.zip"
-          $ArtifactPath = "artifacts\$Zip"
-          python scripts\release_packaging.py render-chocolatey `
-            --source packaging\chocolatey `
-            --output dist-choco `
-            --version $Version `
-            --artifact $ArtifactPath
-          if ($LASTEXITCODE -ne 0) {
-            throw "Chocolatey template rendering failed with exit code $LASTEXITCODE"
-          }
-
-          $NuspecPath = 'dist-choco\haider.nuspec'
-          choco pack $NuspecPath --outputdirectory dist-choco
-          if ($LASTEXITCODE -ne 0) {
-            throw "choco pack failed with exit code $LASTEXITCODE"
-          }
-
-          $NupkgPath = "dist-choco\haider.$Version.nupkg"
-          python scripts\release_packaging.py verify-chocolatey `
-            --nupkg $NupkgPath `
-            --version $Version `
-            --artifact $ArtifactPath
-          if ($LASTEXITCODE -ne 0) {
-            throw "Chocolatey post-pack verification failed with exit code $LASTEXITCODE"
-          }
-
-          $PushOutput = choco push $NupkgPath --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY 2>&1
-          $PushExit = $LASTEXITCODE
-          $PushOutput | Write-Output
-          if ($PushExit -ne 0) {
-            $PushText = $PushOutput -join "`n"
-            if ($PushText -match '(?i)(already exists|conflict|status code 409)') {
-              Write-Output "::warning::haider $Version already exists on Chocolatey; treating the push as an idempotent no-op"
-              exit 0
-            }
-            if ($PushText -match '(?i)(403|Forbidden)') {
-              Write-Output "::warning::Chocolatey rejected the CHOCO_API_KEY (403 Forbidden). Regenerate the key at https://community.chocolatey.org/account and update the repository secret CHOCO_API_KEY; the release itself is unaffected."
-              exit 0
-            }
-            if ($PushText -match '(?i)(401|Unauthorized)') {
-              Write-Output "::warning::Chocolatey rejected the CHOCO_API_KEY (401 Unauthorized). Regenerate the key at https://community.chocolatey.org/account and update the repository secret CHOCO_API_KEY; the release itself is unaffected."
-              exit 0
-            }
-            exit $PushExit
-          }
