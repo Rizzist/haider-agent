@@ -6,6 +6,9 @@
 
 mod support;
 
+#[path = "support/tool_grants.rs"]
+mod tool_grants;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
