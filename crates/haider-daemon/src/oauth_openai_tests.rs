@@ -5,7 +5,7 @@ const FIXTURE_NONCE: &str = "fixture-nonce_971";
 const FIXTURE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const FIXTURE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
-fn canonical_query(url: &str) -> Vec<u8> {
+fn canonical_token_form_query(url: &str) -> Vec<u8> {
     let parsed = Url::parse(url).expect("fixture URL");
     let mut pairs = parsed.query_pairs().into_owned().collect::<Vec<_>>();
     pairs.sort();
@@ -15,11 +15,13 @@ fn canonical_query(url: &str) -> Vec<u8> {
         .into_bytes()
 }
 
-/// Reference: openai/codex 74d3a5bf1046f004ee33a200ee497dc7593a5687,
-/// codex-rs/login/src/server.rs, fetched 2026-09-08. Static fixture values
-/// replace only random state/PKCE. Pin the complete production URL as bytes,
-/// then compare the query set to upstream with just two explicit differences:
-/// Haider retains its verified nonce and does not request connector access.
+/// Reference: openai/codex 2cbbf0c9b542a36a1c3284b5e804917635b6f666,
+/// reconstructed by tests/fixtures/oauth/generate_codex_authorize_url.py.
+/// Both builders use the same synthetic state and PKCE challenge. The only
+/// Haider differences are the four OIDC scopes (without connector access),
+/// scope spaces encoded as `+`, state before code_challenge, and an OIDC nonce
+/// after code_challenge_method. Every transformation pins its original bytes;
+/// no URL parsing, sorting or re-encoding may hide other reference drift.
 #[test]
 fn openai_authorize_url_matches_codex_reference_and_oidc_scope_golden() {
     let registration = OAuthProviderCatalog::default()
@@ -48,28 +50,44 @@ fn openai_authorize_url_matches_codex_reference_and_oidc_scope_golden() {
     assert_eq!(
         actual.expose_authorization_url().as_bytes(),
         include_str!("../tests/fixtures/oauth/haider-openai-authorize-url.txt")
-            .trim_end()
+            .strip_suffix('\n')
+            .expect("fixture line ending")
             .as_bytes()
     );
 
-    let reference = include_str!("../tests/fixtures/oauth/codex-authorize-url.txt").trim_end();
-    let mut upstream = Url::parse(reference).expect("Codex reference");
-    assert_eq!(upstream.query_pairs().count(), 10);
-    let mut params = upstream.query_pairs().into_owned().collect::<Vec<_>>();
-    let scope = params
-        .iter_mut()
-        .find(|(key, _)| key == "scope")
-        .expect("scope");
+    let mut upstream = include_str!("../tests/fixtures/oauth/codex-authorize-url.txt")
+        .strip_suffix('\n')
+        .expect("fixture line ending")
+        .to_owned();
+    for (codex, haider) in [
+        // Scope subset and its exact form-urlencoding; no other value changes.
+        (
+            "&scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke&",
+            "&scope=openid+profile+email+offline_access&",
+        ),
+        // Move only this state value from its pinned upstream position ...
+        (
+            "&codex_cli_simplified_flow=true&state=fixture-state_971&originator=",
+            "&codex_cli_simplified_flow=true&originator=",
+        ),
+        // ... to its pinned Haider position immediately before the challenge.
+        (
+            "&scope=openid+profile+email+offline_access&code_challenge=",
+            "&scope=openid+profile+email+offline_access&state=fixture-state_971&code_challenge=",
+        ),
+        // Haider alone supplies the nonce that its ID-token verifier checks.
+        (
+            "&code_challenge_method=S256&id_token_add_organizations=",
+            "&code_challenge_method=S256&nonce=fixture-nonce_971&id_token_add_organizations=",
+        ),
+    ] {
+        assert_eq!(upstream.matches(codex).count(), 1, "Codex drift: {codex}");
+        upstream = upstream.replacen(codex, haider, 1);
+    }
     assert_eq!(
-        scope.1,
-        "openid profile email offline_access api.connectors.read api.connectors.invoke"
-    );
-    scope.1 = "openid profile email offline_access".to_owned();
-    params.push(("nonce".to_owned(), FIXTURE_NONCE.to_owned()));
-    upstream.query_pairs_mut().clear().extend_pairs(params);
-    assert_eq!(
-        canonical_query(actual.expose_authorization_url()),
-        canonical_query(upstream.as_str())
+        actual.expose_authorization_url().as_bytes(),
+        upstream.as_bytes(),
+        "full authorize URL must match the explicitly adapted Codex reference"
     );
 }
 
@@ -102,12 +120,12 @@ fn openai_token_exchange_has_exact_codex_form_fields_and_redirect() {
         "&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
     );
     assert_eq!(
-        canonical_query(&format!(
+        canonical_token_form_query(&format!(
             "{}?{}",
             registration.token_endpoint,
             std::str::from_utf8(actual.as_ref()).expect("form UTF-8")
         )),
-        canonical_query(upstream)
+        canonical_token_form_query(upstream)
     );
 }
 
