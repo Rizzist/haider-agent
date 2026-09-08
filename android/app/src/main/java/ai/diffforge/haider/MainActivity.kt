@@ -36,6 +36,7 @@ import androidx.core.content.ContextCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -119,6 +120,21 @@ class MainActivity : ComponentActivity() {
         // from here really does mean "will not ask again".
         markNotificationRequested()
         viewModel?.onNotificationPermissionResult(granted, !granted && !shouldShowNotificationRationale())
+    }
+
+    /**
+     * The system photo picker: no storage permission, no file paths, and the
+     * user chooses exactly what Haider sees.
+     */
+    private val imagePicker = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        val target = uri ?: return@registerForActivityResult
+        val bytes = runCatching {
+            contentResolver.openInputStream(target)?.use { it.readBytes() }
+        }.getOrNull() ?: return@registerForActivityResult
+        val mime = contentResolver.getType(target) ?: "image/*"
+        viewModel?.attach(bytes, mime, name = null)
     }
 
     private val smsPermissions = registerForActivityResult(
@@ -227,6 +243,7 @@ class MainActivity : ComponentActivity() {
 
             HaiderApp(
                 viewModel = viewModel,
+                service = service,
                 accounts = accounts,
                 oauth = oauth,
                 appVersion = BuildConfigVersion.name(this),
@@ -361,6 +378,11 @@ class MainActivity : ComponentActivity() {
             // it and starts the capture service on OK (addition H6).
             SystemAction.RequestScreenCapture ->
                 startActivity(Intent(this, ScreenConsentActivity::class.java))
+            // The picker returns bytes; staging them into the daemon's CAS is
+            // the view model's job (turn.submit carries the block, not a path).
+            SystemAction.PickImage -> imagePicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+            )
             SystemAction.Screenshot, SystemAction.PickFile -> Unit
             is SystemAction.CopyText -> {
                 val clipboard = getSystemService(ClipboardManager::class.java)

@@ -1,10 +1,26 @@
 package ai.diffforge.haider.ui.daemon
 
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.checkpoints.BranchOutcome
+import ai.diffforge.haider.ui.checkpoints.BranchView
+import ai.diffforge.haider.ui.checkpoints.CheckpointListResult
+import ai.diffforge.haider.ui.checkpoints.CheckpointOutcome
+import ai.diffforge.haider.ui.checkpoints.CheckpointUnavailable
+import ai.diffforge.haider.ui.checkpoints.Checkpoints
 import ai.diffforge.haider.ui.chat.Message
 import ai.diffforge.haider.ui.state.PermissionMode
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * The default [DaemonService.branchSelection]: one shared, permanently empty
+ * flow, so a facade that does not implement branch selection does not mint a
+ * new flow on every read.
+ */
+private val NO_BRANCH_SELECTION: StateFlow<Map<String, String>> =
+    MutableStateFlow<Map<String, String>>(emptyMap()).asStateFlow()
 
 /**
  * The only interface the UI lane consumes (UI-SPEC 5.3).
@@ -110,10 +126,38 @@ data class SessionRow(
     val parentSessionId: String? = null,
     val kind: String? = null,
     val needsInput: NeedsInput? = null,
+    /**
+     * `SessionSnapshot.workflow` (frame.rs:2299) — the session's own
+     * `GraphStatus`, under `session_workflow_state_v1`. Null means the roster
+     * carried none, which is why the chip's own state machine, and not this
+     * field, decides between "no workflow" and "not read".
+     */
+    val workflow: ai.diffforge.haider.ui.workflow.SessionWorkflow? = null,
     /** null ⇒ no active run ⇒ render no Stop button. */
     val runId: String? = null,
     val workerGeneration: Long = 0L,
     val headSeq: Long = 0L,
+    /**
+     * `ObserveSessionWire.branches` — the DURABLE named refs. Main is implicit
+     * and never appears here: the wire says so ("Main is implicit and is added
+     * by observation clients"), so a client that showed a `main` row would be
+     * showing a branch the daemon has no registry entry for.
+     */
+    val branches: List<BranchView> = emptyList(),
+    /**
+     * `ObserveSessionWire.active_branch_id`. `null` names the implicit main
+     * branch — it is not "unknown", and it is not a branch id this client may
+     * invent one for.
+     */
+    val activeBranchId: String? = null,
+    /**
+     * `ObserveSessionWire.main_head_node_id` / `main_head_seq` — the exact
+     * committed node `branch.create` forks from. Both are required together;
+     * a null node id means there is nothing to branch from yet, and the UI says
+     * that rather than sending half a coordinate.
+     */
+    val mainHeadNodeId: String? = null,
+    val mainHeadSeq: Long = 0L,
 ) {
     val unseen: Boolean
         get() = lastActivityMs != null && seenAtMs != null && lastActivityMs > seenAtMs
@@ -140,6 +184,13 @@ data class ProviderOption(
     val defaultModel: String?,
     val available: Boolean,
     val unavailableReason: String?,
+    /**
+     * `ModelInventoryAuthorityWire` (frame.rs:1227): whether this provider's
+     * published list is the last word or merely advisory. Unknown by default,
+     * which is what keeps a free-text field from appearing on a provider that
+     * never said its list was advisory.
+     */
+    val inventoryAuthority: String? = null,
 ) {
     val modelIds: List<String> get() = models.map { it.id }
 }
@@ -282,7 +333,13 @@ object TurnCancel {
 
 // ---------- the service the UI talks to ----------
 
-interface DaemonService {
+/**
+ * Lane 971-UI-workflows extends the facade by inheritance, not by editing the
+ * body: [WorkflowDaemon] and [LoomDaemon] carry their own honest defaults, so an
+ * implementation that has not wired those doors reports the daemon feature it
+ * would need instead of failing to compile or, worse, answering emptily.
+ */
+interface DaemonService : WorkflowDaemon, LoomDaemon {
     val status: StateFlow<DaemonStatus>
 
     /** Network / notification / battery signals, from the C2 snapshot. */
@@ -365,7 +422,42 @@ interface DaemonService {
     /** `provider.list`; also the door the provider picker refreshes through. */
     suspend fun refreshProviders()
     suspend fun selectProvider(provider: String)
-    suspend fun send(sessionId: String, text: String)
+    /**
+     * `turn.submit`. [attachments] and [mode] are defaulted, so every existing
+     * caller and every sibling implementation keeps compiling; the wire
+     * default for mode is Steer (`haider-protocol/lib.rs:174`).
+     *
+     * Refusals come back as [AttachmentRefused] carrying the daemon's own code
+     * — `too_many_attachments` or `attachments_too_large`.
+     */
+    suspend fun send(
+        sessionId: String,
+        text: String,
+        attachments: List<Attachment> = emptyList(),
+        mode: Delivery = Delivery.Steer,
+    )
+
+    /**
+     * Puts one local file into the daemon's CAS and returns the block that
+     * names it. Null means the daemon would not take it; the caller shows the
+     * reason it reported rather than guessing.
+     */
+    suspend fun stageAttachment(bytes: ByteArray, mime: String, name: String?): Attachment?
+
+    /** CAS bytes for a thumbnail. Null when the artifact is gone. */
+    suspend fun attachmentBytes(artifact: String): ByteArray?
+
+    /** `queue.list` plus its deltas; absence is not an empty list. */
+    val queue: StateFlow<QueueSnapshot>
+    suspend fun refreshQueue(sessionId: String)
+
+    /** Both fenced by the revision they were read at. */
+    suspend fun removeQueued(sessionId: String, id: String, revision: Long)
+    suspend fun promoteQueued(sessionId: String, id: String, revision: Long)
+
+    /** `usage.report`. Read-only, and an estimate is labelled as one. */
+    val usage: StateFlow<UsageSnapshot>
+    suspend fun refreshUsage()
 
     /**
      * `session.attach{after_seq:0, mode:"view"}` replay, paged through
@@ -387,7 +479,109 @@ interface DaemonService {
 
     /** Title/metadata plus indexed transcript content, honest about coverage. */
     suspend fun search(query: String): SearchOutcome
+
+    // ---------- subagents and the descendant fleet (lane 971-UI-fleet) ----------
+
+    /**
+     * `session.fleet` (frame.rs:3495): the bounded descendant tree and the
+     * daemon's own rollup, read-only and receipt-free.
+     *
+     * The default is [FleetLoad.Unavailable] rather than an empty snapshot: an
+     * implementation that has not wired the read has not learned that a session
+     * has no subagents, and the two must not render the same.
+     */
+    suspend fun fleet(sessionId: String): FleetLoad =
+        FleetLoad.Unavailable(FLEET_NOT_WIRED)
+
+    /**
+     * `session.observe`'s `subagents` (frame.rs:2271) for one session — the
+     * chip state on the session header.
+     *
+     * Same rule as [fleet]: not-wired is its own answer, never an empty roster.
+     */
+    suspend fun subagents(sessionId: String): SubagentLoad =
+        SubagentLoad.Unavailable(SUBAGENTS_NOT_WIRED)
+    // ---------- checkpoints and branches ----------
+
+    /**
+     * Which branch each session's NEXT `turn.submit` carries, by session id.
+     *
+     * An absent entry is the implicit main branch. This is a client choice, not
+     * a daemon one: the wire has `branch.create` and a `branch_id` on
+     * `turn.submit` (frame.rs:3697, transcript entry 82) but no `branch.switch`,
+     * so "switching" is choosing what the next turn is submitted on — it does
+     * not move anything the daemon already committed, and the sheet says so.
+     */
+    val branchSelection: StateFlow<Map<String, String>> get() = NO_BRANCH_SELECTION
+
+    /** Chooses the branch [sessionId]'s next turn is submitted on. Null = main. */
+    suspend fun selectBranch(sessionId: String, branchId: String?) = Unit
+
+    /**
+     * `checkpoint.list`, newest first.
+     *
+     * The default is the honest one for a facade that does not serve
+     * `checkpoint_v1`: unavailable, rather than an empty page that would read
+     * as "this session changed nothing".
+     */
+    suspend fun checkpoints(
+        sessionId: String,
+        branchId: String? = null,
+        cursor: Long? = null,
+        limit: Int = Checkpoints.PAGE_LIMIT,
+    ): CheckpointListResult = CheckpointListResult.Unavailable(CheckpointUnavailable.FEATURE_ABSENT)
+
+    /** `checkpoint.undo`. [target] is a checkpoint id or [Checkpoints.TARGET_LAST]. */
+    suspend fun undoCheckpoint(
+        sessionId: String,
+        target: String,
+        branchId: String? = null,
+    ): CheckpointOutcome = CheckpointOutcome.Unavailable(CheckpointUnavailable.FEATURE_ABSENT)
+
+    /** `checkpoint.redo`, same target vocabulary. */
+    suspend fun redoCheckpoint(
+        sessionId: String,
+        target: String,
+        branchId: String? = null,
+    ): CheckpointOutcome = CheckpointOutcome.Unavailable(CheckpointUnavailable.FEATURE_ABSENT)
+
+    /** `checkpoint.rollback_turn` — all of one run's durable edits, or none. */
+    suspend fun rollbackTurn(
+        sessionId: String,
+        runId: String,
+        branchId: String? = null,
+    ): CheckpointOutcome = CheckpointOutcome.Unavailable(CheckpointUnavailable.FEATURE_ABSENT)
+
+    /**
+     * `branch.create` at an EXACT committed node.
+     *
+     * Both coordinates are required and must come from the same published fact;
+     * the caller reads them from the row, and a row without a head node has
+     * nothing to fork from.
+     */
+    suspend fun createBranch(
+        sessionId: String,
+        forkNodeId: String,
+        forkSeq: Long,
+        name: String?,
+        sourceBranchId: String? = null,
+    ): BranchOutcome = BranchOutcome.Unavailable(CheckpointUnavailable.BRANCH_FEATURE_ABSENT)
 }
+
+/** What one `session.observe` said about a session's subagents. */
+sealed interface SubagentLoad {
+    /** Empty for every case but [Observed]: nothing invents a roster. */
+    val subagents: List<Subagent> get() = emptyList()
+
+    /** Nobody has asked yet. Distinct from a digest that listed none. */
+    data object Unread : SubagentLoad
+    data class Observed(override val subagents: List<Subagent>) : SubagentLoad
+    data class Unavailable(val reason: String) : SubagentLoad
+}
+
+/** The daemon-facing reason strings for an unwired fleet seam. */
+const val FLEET_NOT_WIRED = "session_fleet_not_wired"
+const val SUBAGENTS_NOT_WIRED = "session_observe_subagents_not_wired"
 
 // ---------- history ----------
 

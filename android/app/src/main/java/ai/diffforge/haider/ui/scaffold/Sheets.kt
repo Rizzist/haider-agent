@@ -40,6 +40,7 @@ fun AttachSheet(
     onDismiss: () -> Unit,
     onScreenshot: () -> Unit,
     onPickFile: () -> Unit,
+    onPickImage: () -> Unit = {},
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -51,6 +52,9 @@ fun AttachSheet(
     ) {
         Column(Modifier.padding(start = ForgeSpace.xl, end = ForgeSpace.xl, bottom = ForgeSpace.xxxl)) {
             Text(stringResource(R.string.attach_title), style = type.h4, color = colors.text)
+            // An image is the one attachment kind the daemon can actually take
+            // today: turn.submit carries AttachmentBlock::Image.
+            SheetRow(stringResource(R.string.attach_image), onPickImage)
             SheetRow(stringResource(R.string.attach_screenshot), onScreenshot)
             SheetRow(stringResource(R.string.attach_file), onPickFile)
         }

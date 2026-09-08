@@ -38,7 +38,6 @@ import androidx.compose.ui.unit.dp
 internal fun MarkdownText(
     text: String,
     showCaret: Boolean = false,
-    caretAlpha: Float = 1f,
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -53,7 +52,6 @@ internal fun MarkdownText(
                         block.text,
                         colors.accent,
                         showCaret && last,
-                        caretAlpha,
                     ),
                     // mono: a fenced code block.
                     style = type.toolRow.copy(fontFamily = FontFamily.Monospace),
@@ -71,7 +69,6 @@ internal fun MarkdownText(
                     style = type.thinking,
                     color = colors.textMuted,
                     showCaret = showCaret && last,
-                    caretAlpha = caretAlpha,
                     modifier = Modifier
                         .fillMaxWidth()
                         .drawBehind {
@@ -90,14 +87,12 @@ internal fun MarkdownText(
                     style = if (block.level <= 2) type.h1 else type.h4,
                     color = colors.text,
                     showCaret = showCaret && last,
-                    caretAlpha = caretAlpha,
                 )
                 is MarkdownBlock.ListItem -> InlineMarkdownLine(
                     text = "${block.marker} ${block.text}",
                     style = type.chatBody,
                     color = colors.chatText,
                     showCaret = showCaret && last,
-                    caretAlpha = caretAlpha,
                     modifier = Modifier.padding(start = ForgeSpace.md),
                 )
                 is MarkdownBlock.Table -> Text(
@@ -107,7 +102,6 @@ internal fun MarkdownText(
                         colors.accentSoft,
                         colors.accent,
                         showCaret && last,
-                        caretAlpha,
                     ),
                     // A table of prose is prose. Only a table whose cells are
                     // code needs the fixed-width face, and this renderer
@@ -128,7 +122,6 @@ internal fun MarkdownText(
                     style = type.chatBody,
                     color = colors.chatText,
                     showCaret = showCaret && last,
-                    caretAlpha = caretAlpha,
                 )
             }
         }
@@ -139,11 +132,10 @@ private fun literalCode(
     text: String,
     caret: Color,
     showCaret: Boolean,
-    caretAlpha: Float,
 ): AnnotatedString = buildAnnotatedString {
     append(text)
     if (showCaret) {
-        withStyle(SpanStyle(background = caret.copy(alpha = caretAlpha.coerceIn(0f, 1f)))) {
+        withStyle(SpanStyle(background = caret)) {
             append(" ")
         }
     }
@@ -155,19 +147,23 @@ private fun InlineMarkdownLine(
     style: TextStyle,
     color: Color,
     showCaret: Boolean,
-    caretAlpha: Float,
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
     val uriHandler = LocalUriHandler.current
-    val annotated = inlineMarkdown(
-        text,
-        color,
-        colors.accentSoft,
-        colors.accent,
-        showCaret,
-        caretAlpha,
-    )
+    // Memoised on the *text*, not on a per-frame alpha. The caret's alpha used
+    // to be an argument here, so every animation frame rebuilt the whole
+    // AnnotatedString and re-laid out the transcript — four cores' worth
+    // (verify-10 O5).
+    val annotated = remember(text, color, showCaret, colors.accentSoft, colors.accent) {
+        inlineMarkdown(
+            text,
+            color,
+            colors.accentSoft,
+            colors.accent,
+            showCaret,
+        )
+    }
     ClickableText(
         text = annotated,
         style = style.copy(color = color),
@@ -187,7 +183,6 @@ private fun inlineMarkdown(
     link: Color,
     caret: Color,
     showCaret: Boolean,
-    caretAlpha: Float,
 ): AnnotatedString = buildAnnotatedString {
     var cursor = 0
     while (cursor < text.length) {
@@ -250,7 +245,7 @@ private fun inlineMarkdown(
         }
     }
     if (showCaret) {
-        withStyle(SpanStyle(background = caret.copy(alpha = caretAlpha.coerceIn(0f, 1f)))) { append(" ") }
+        withStyle(SpanStyle(background = caret)) { append(" ") }
     }
 }
 

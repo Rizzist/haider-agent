@@ -1,13 +1,26 @@
 package ai.diffforge.haider.ui.chat
 
+import ai.diffforge.haider.ui.checkpoints.BranchOutcome
+import ai.diffforge.haider.ui.checkpoints.CheckpointCursorState
+import ai.diffforge.haider.ui.checkpoints.CheckpointGesture
+import ai.diffforge.haider.ui.checkpoints.CheckpointListResult
+import ai.diffforge.haider.ui.checkpoints.CheckpointOutcome
+import ai.diffforge.haider.ui.checkpoints.Checkpoints
+import ai.diffforge.haider.ui.checkpoints.CheckpointsUiState
 import ai.diffforge.haider.ui.daemon.DaemonService
+import ai.diffforge.haider.ui.daemon.AttachmentLimits
+import ai.diffforge.haider.ui.daemon.Delivery
+import ai.diffforge.haider.ui.daemon.TurnRefused
 import ai.diffforge.haider.ui.daemon.DaemonStatus
+import ai.diffforge.haider.ui.daemon.FleetLoad
+import ai.diffforge.haider.ui.daemon.SubagentLoad
 import ai.diffforge.haider.ui.daemon.MissingRunCoordinates
 import ai.diffforge.haider.ui.daemon.MenuAnswerInput
 import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.AppUiState
+import ai.diffforge.haider.ui.state.ChildTranscriptState
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.PermissionSnapshot
@@ -15,6 +28,7 @@ import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.state.SessionFilter
 import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.state.SessionListState
+import ai.diffforge.haider.ui.state.SessionTree
 import ai.diffforge.haider.ui.state.SetupPlan
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -52,6 +66,7 @@ class ChatViewModel(
     private val drafts = mutableMapOf<String, String>()
     private var batterySkipped = false
     private var searchJob: Job? = null
+    private var childTranscriptJob: Job? = null
     private var commandSeq = 0L
 
     /**
@@ -132,6 +147,37 @@ class ChatViewModel(
         viewModelScope.launch {
             service.permissionMode.collect { mode -> update { it.copy(permissionMode = mode) } }
         }
+        viewModelScope.launch {
+            service.queue.collect { snapshot -> update { it.copy(queue = snapshot) } }
+        }
+        viewModelScope.launch {
+            service.usage.collect { snapshot -> update { it.copy(usage = snapshot) } }
+        }
+        // Subagents are read on their own collector rather than inside the
+        // transcript one: that block collects a stream that never completes, so
+        // anything appended after it would never run (lane 971-UI-fleet).
+        viewModelScope.launch {
+            service.activeSessionId.collectLatest { id ->
+                if (id == null) {
+                    update {
+                        it.copy(
+                            fleet = it.fleet.copy(
+                                active = FleetLoad.Unread,
+                                subagents = SubagentLoad.Unread,
+                            ),
+                        )
+                    }
+                } else {
+                    refreshFleet(id).join()
+                }
+            }
+        }
+        // The branch each session's next submit carries (lane 971-UI-extras).
+        viewModelScope.launch {
+            service.branchSelection.collect { selection ->
+                update { it.copy(branchSelection = selection) }
+            }
+        }
     }
 
     // ---------- daemon lifecycle ----------
@@ -153,7 +199,11 @@ class ChatViewModel(
      * until the drawer closes.
      */
     fun onDrawerOpened() {
-        update { it.copy(orderSnapshot = SessionListState.OrderSnapshot.capture(it.sessions, it.activeSessionId)) }
+        // The family-aware capture: a parent and the sessions it spawned are
+        // frozen as one run, in the order the drawer actually draws them
+        // (SessionTree.captureOrder). A flat capture pinned the parent in the
+        // section its own tier named and the family then jumped on first render.
+        update { it.copy(orderSnapshot = SessionTree.captureOrder(it.sessions, it.activeSessionId)) }
         viewModelScope.launch { service.refreshRoster() }
     }
 
@@ -198,16 +248,30 @@ class ChatViewModel(
         update { it.copy(draft = text) }
     }
 
-    fun send() = viewModelScope.launch {
+    fun send(mode: Delivery = Delivery.Steer) = viewModelScope.launch {
         val current = _state.value
         val text = current.draft.trim()
-        if (text.isEmpty()) return@launch
+        val attachments = current.draftAttachments
+        if (text.isEmpty() && attachments.isEmpty()) return@launch
         if (current.daemon !is DaemonStatus.Running) service.start()
         val id = current.activeSessionId ?: service.createSession()
-        service.send(id, text)
+        // The daemon's refusal is the daemon's to word: too_many_attachments
+        // and attachments_too_large are its codes, shown verbatim.
+        val refusal = runCatching { service.send(id, text, attachments, mode) }
+            .exceptionOrNull()
+        if (refusal != null) {
+            update {
+                it.copy(
+                    attachmentNotice = (refusal as? TurnRefused)?.code ?: refusal.message,
+                    deliveryChooser = false,
+                )
+            }
+            return@launch
+        }
         drafts[id] = ""
-        update { it.copy(draft = "") }
-        loadTranscript(id)
+        update {
+            it.copy(draft = "", draftAttachments = emptyList(), deliveryChooser = false)
+        }
     }
 
     /**
@@ -360,6 +424,63 @@ class ChatViewModel(
 
     fun dismissSelectionRefusal() = update { it.copy(selectionRefusal = null) }
 
+    // ---------- attachments ----------
+
+    /**
+     * Stages one local file and adds the block it returns to the draft.
+     *
+     * A null return is the daemon refusing to take it; the reason is shown
+     * rather than guessed, and the draft is left alone.
+     */
+    fun attach(bytes: ByteArray, mime: String, name: String?) = viewModelScope.launch {
+        val staged = service.stageAttachment(bytes, mime, name)
+        if (staged == null) {
+            update { it.copy(attachmentNotice = AttachmentLimits.TOO_LARGE) }
+            return@launch
+        }
+        update { it.copy(draftAttachments = it.draftAttachments + staged) }
+    }
+
+    fun removeAttachment(artifact: String) = update {
+        it.copy(draftAttachments = it.draftAttachments.filterNot { block -> block.artifact == artifact })
+    }
+
+    fun dismissAttachmentNotice() = update { it.copy(attachmentNotice = null) }
+
+    // ---------- steering ----------
+
+    /** Opens the queue-or-steer chooser; only shown while a turn is running. */
+    fun askDelivery() = update { it.copy(deliveryChooser = true) }
+
+    fun dismissDelivery() = update { it.copy(deliveryChooser = false) }
+
+    // ---------- the queue ----------
+
+    fun refreshQueue() = viewModelScope.launch {
+        _state.value.activeSessionId?.let { service.refreshQueue(it) }
+    }
+
+    /**
+     * Both queue mutations carry the revision the row was read at, so a stale
+     * tap is refused by the daemon instead of hitting whatever moved into that
+     * position.
+     */
+    fun removeQueued(id: String) = viewModelScope.launch {
+        val sessionId = _state.value.activeSessionId ?: return@launch
+        val snapshot = _state.value.queue
+        runCatching { service.removeQueued(sessionId, id, snapshot.revision) }
+            .onFailure { error -> update { it.copy(queueNotice = error.message) } }
+    }
+
+    fun promoteQueued(id: String) = viewModelScope.launch {
+        val sessionId = _state.value.activeSessionId ?: return@launch
+        val snapshot = _state.value.queue
+        runCatching { service.promoteQueued(sessionId, id, snapshot.revision) }
+            .onFailure { error -> update { it.copy(queueNotice = error.message) } }
+    }
+
+    fun dismissQueueNotice() = update { it.copy(queueNotice = null) }
+
     /**
      * The daemon owns the policy, so this is a request, not a local toggle:
      * the mode the UI shows is whatever the facade reports back (addition H6).
@@ -378,11 +499,303 @@ class ChatViewModel(
         update { it.copy(selectionBusy = false) }
     }
 
+    // ---------- subagents and the fleet (lane 971-UI-fleet) ----------
+
+    /**
+     * Reads the visible session's descendant tree and its observe chips.
+     *
+     * Both are separate doors on purpose: `session.observe` is how a chip knows
+     * a subagent exists, and `session.fleet` is the only place a child's own
+     * session id is published (`ObserveSubagentWire` carries none, frame.rs:2219).
+     * A chip therefore cannot open a transcript until the snapshot has landed,
+     * and the UI offers the panel instead of guessing a session.
+     */
+    fun refreshFleet(sessionId: String? = _state.value.activeSessionId) =
+        viewModelScope.launch {
+            val id = sessionId ?: return@launch
+            update { it.copy(fleet = it.fleet.copy(active = FleetLoad.Loading)) }
+            val load = runCatching { service.fleet(id) }
+                .getOrElse { FleetLoad.Failed(it.message ?: "session_fleet_failed") }
+            val observed = runCatching { service.subagents(id) }
+                .getOrElse { SubagentLoad.Unavailable(it.message ?: "session_observe_failed") }
+            update { current ->
+                // A read that resolves after the user has moved on describes a
+                // session that is no longer on screen; it is dropped, not shown.
+                if (current.activeSessionId != id) current
+                else current.copy(
+                    fleet = current.fleet.copy(
+                        active = load,
+                        subagents = observed,
+                        panel = current.fleet.panel + (id to load),
+                    ),
+                )
+            }
+        }
+
+    /**
+     * Fills the cross-session panel.
+     *
+     * Only sessions the roster reports as roots are read: a descendant's own
+     * fleet is already inside its parent's snapshot, and re-reading it would
+     * double-count the same agent at two different heads — which the wire
+     * explicitly forbids (frame.rs:2318).
+     */
+    fun openFleet() = viewModelScope.launch {
+        update { it.copy(overlay = Overlay.Fleet, fleet = it.fleet.copy(panelLoading = true)) }
+        val roots = _state.value.sessions
+            .filter { it.parentSessionId == null }
+            .take(FLEET_PANEL_SESSION_LIMIT)
+        val reads = roots.associate { row ->
+            row.id to runCatching { service.fleet(row.id) }
+                .getOrElse { FleetLoad.Failed(it.message ?: "session_fleet_failed") }
+        }
+        update { it.copy(fleet = it.fleet.copy(panel = it.fleet.panel + reads, panelLoading = false)) }
+    }
+
+    /** Folds or unfolds one family in the drawer. */
+    fun toggleFamily(sessionId: String) = update { current ->
+        current.copy(
+            familyToggles = if (sessionId in current.familyToggles) {
+                current.familyToggles - sessionId
+            } else {
+                current.familyToggles + sessionId
+            },
+        )
+    }
+
+    /**
+     * Mounts one descendant's own replay, read-only.
+     *
+     * It is a separate subscription from the active session's, so opening a
+     * child never folds two transcripts into one screen, and the parent's feed
+     * keeps running underneath.
+     */
+    fun openChildTranscript(
+        sessionId: String,
+        agentId: String? = null,
+        parentSessionId: String? = null,
+    ) {
+        childTranscriptJob?.cancel()
+        update {
+            it.copy(
+                overlay = Overlay.ChildTranscript(sessionId, agentId, parentSessionId),
+                childTranscript = ChildTranscriptState(
+                    sessionId = sessionId,
+                    agentId = agentId,
+                    parentSessionId = parentSessionId,
+                ),
+            )
+        }
+        childTranscriptJob = viewModelScope.launch {
+            service.transcriptUpdates(sessionId).collect { load ->
+                update { current ->
+                    val open = current.childTranscript ?: return@update current
+                    if (open.sessionId != sessionId) return@update current
+                    current.copy(
+                        childTranscript = open.copy(
+                            messages = load.messages,
+                            loading = false,
+                            notice = when (load) {
+                                is TranscriptLoad.Complete -> null
+                                is TranscriptLoad.Partial ->
+                                    "History up to ${load.loadedThroughSeq} of " +
+                                        "${load.headSeq} — ${load.reason}"
+                                is TranscriptLoad.Unavailable -> load.reason
+                            },
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    // ---------- checkpoints and branches ----------
+
+    /**
+     * Opens the sheet and reads the timeline from authority.
+     *
+     * The state is replaced, not merged: a page read for the session that was
+     * open before must never be rendered under this one's title.
+     */
+    fun openCheckpoints(sessionId: String) {
+        update {
+            it.copy(
+                overlay = Overlay.Checkpoints(sessionId),
+                checkpoints = CheckpointsUiState(sessionId = sessionId, loading = true),
+            )
+        }
+        loadCheckpoints(sessionId)
+    }
+
+    fun openBranches(sessionId: String) = openOverlay(Overlay.Branches(sessionId))
+
+    /** Re-reads the first page. Every mutation ends here rather than editing rows. */
+    fun loadCheckpoints(sessionId: String, cursor: Long? = null) = viewModelScope.launch {
+        // Even the spinner belongs to the session it was asked for: a read for
+        // a session the sheet has left must not make this one look busy.
+        update {
+            if (it.checkpoints.sessionId != sessionId) {
+                it
+            } else {
+                it.copy(checkpoints = it.checkpoints.copy(loading = true))
+            }
+        }
+        // The facade owns the selection, so it is read from there rather than
+        // from the mirrored copy in state: the mirror is one collector hop
+        // behind a switch, and `checkpoint.list` is branch-scoped.
+        val branch = service.branchSelection.value[sessionId]
+        val result = service.checkpoints(sessionId, branch, cursor)
+        update { current ->
+            // A page that came back for a session the sheet has since left is
+            // dropped, not shown.
+            if (current.checkpoints.sessionId != sessionId) return@update current
+            current.copy(
+                checkpoints = when (result) {
+                    is CheckpointListResult.Page -> current.checkpoints.copy(
+                        rows = if (cursor == null) {
+                            result.page.checkpoints
+                        } else {
+                            Checkpoints.merge(current.checkpoints.rows.orEmpty(), result.page.checkpoints)
+                        },
+                        nextCursor = result.page.nextCursor,
+                        cursorState = result.page.cursorState,
+                        loading = false,
+                        unavailable = null,
+                        error = null,
+                        // A successful re-read is how a conflict is dismissed,
+                        // after the person has looked at the moved workspace.
+                        conflict = null,
+                        rollbackConflict = null,
+                        branchMismatch = null,
+                    )
+                    is CheckpointListResult.Unavailable -> current.checkpoints.copy(
+                        loading = false,
+                        unavailable = result.reason,
+                    )
+                    is CheckpointListResult.Failed -> current.checkpoints.copy(
+                        loading = false,
+                        error = result.code,
+                    )
+                },
+            )
+        }
+    }
+
+    fun loadMoreCheckpoints() {
+        val state = _state.value.checkpoints
+        val sessionId = state.sessionId ?: return
+        if (state.loading || state.busy) return
+        if (state.cursorState != CheckpointCursorState.More) return
+        loadCheckpoints(sessionId, state.nextCursor ?: return)
+    }
+
+    /** Nothing destructive happens on one tap: the gesture waits for a confirm. */
+    fun confirmCheckpointGesture(gesture: CheckpointGesture?) =
+        update { it.copy(checkpoints = it.checkpoints.copy(confirming = gesture)) }
+
+    /** Runs the confirmed gesture, then re-reads the timeline from authority. */
+    fun applyCheckpointGesture() = viewModelScope.launch {
+        val state = _state.value.checkpoints
+        val sessionId = state.sessionId ?: return@launch
+        val gesture = state.confirming ?: return@launch
+        val branch = service.branchSelection.value[sessionId]
+        update {
+            it.copy(
+                checkpoints = it.checkpoints.clearedOutcome().copy(
+                    pending = gesture,
+                    confirming = null,
+                ),
+            )
+        }
+        val outcome = when (gesture) {
+            is CheckpointGesture.Undo -> service.undoCheckpoint(sessionId, gesture.target, branch)
+            is CheckpointGesture.Redo -> service.redoCheckpoint(sessionId, gesture.target, branch)
+            is CheckpointGesture.Rollback -> service.rollbackTurn(sessionId, gesture.runId, branch)
+        }
+        var committed = false
+        update { current ->
+            if (current.checkpoints.sessionId != sessionId) return@update current
+            val next = when (outcome) {
+                is CheckpointOutcome.Committed -> {
+                    committed = true
+                    current.checkpoints.copy(receipt = outcome.receipt)
+                }
+                is CheckpointOutcome.Conflict -> current.checkpoints.copy(conflict = outcome.conflict)
+                is CheckpointOutcome.RollbackConflict ->
+                    current.checkpoints.copy(rollbackConflict = outcome.conflict)
+                is CheckpointOutcome.BranchMismatch ->
+                    current.checkpoints.copy(branchMismatch = outcome.mismatch)
+                is CheckpointOutcome.Unavailable ->
+                    current.checkpoints.copy(unavailable = outcome.reason)
+                is CheckpointOutcome.Failed -> current.checkpoints.copy(error = outcome.code)
+            }
+            current.copy(checkpoints = next.copy(pending = null))
+        }
+        // Only a committed receipt licenses a re-read. A conflict is terminal
+        // for the gesture, and re-reading here would clear the very notice the
+        // person has not seen yet.
+        if (committed) loadCheckpoints(sessionId)
+    }
+
+    /**
+     * Chooses the branch this session's next turn is submitted on.
+     *
+     * There is no `branch.switch` on the wire: nothing already committed moves.
+     * The timeline is re-read because `checkpoint.list` is branch-scoped.
+     */
+    fun selectBranch(sessionId: String, branchId: String?) = viewModelScope.launch {
+        service.selectBranch(sessionId, branchId)
+        if (_state.value.checkpoints.sessionId == sessionId) {
+            update { it.copy(checkpoints = it.checkpoints.copy(rows = null, loading = true)) }
+            loadCheckpoints(sessionId)
+        }
+    }
+
+    /**
+     * `branch.create` at the row's own published head node.
+     *
+     * A row with no head node has nothing to fork from, and half a coordinate
+     * is not sent: the sheet says so instead.
+     */
+    fun createBranch(sessionId: String, name: String) = viewModelScope.launch {
+        val row = session(sessionId) ?: return@launch
+        val node = row.mainHeadNodeId
+        if (node == null) {
+            update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = NO_FORK_POINT)) }
+            return@launch
+        }
+        val outcome = service.createBranch(
+            sessionId = sessionId,
+            forkNodeId = node,
+            forkSeq = row.mainHeadSeq,
+            name = name.trim().ifBlank { null },
+            sourceBranchId = service.branchSelection.value[sessionId],
+        )
+        when (outcome) {
+            is BranchOutcome.Created -> {
+                update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = null)) }
+                // Created is not selected: the next turn moves only because
+                // somebody chose it, which is the same rule the refusal path has.
+                service.refreshRoster()
+            }
+            is BranchOutcome.Unavailable ->
+                update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = outcome.reason)) }
+            is BranchOutcome.Failed ->
+                update { it.copy(checkpoints = it.checkpoints.copy(branchNotice = outcome.code)) }
+        }
+    }
+
     // ---------- surfaces ----------
 
     fun openOverlay(overlay: Overlay) = update { it.copy(overlay = overlay) }
 
-    fun closeOverlay() = update { it.copy(overlay = Overlay.None) }
+    fun closeOverlay() {
+        // A descendant's replay is its own subscription; leaving it collecting
+        // behind a closed screen would keep folding a session nobody is reading.
+        childTranscriptJob?.cancel()
+        childTranscriptJob = null
+        update { it.copy(overlay = Overlay.None, childTranscript = null) }
+    }
 
     fun setFilter(filter: SessionFilter) = update { it.copy(filter = filter) }
 
@@ -532,6 +945,22 @@ class ChatViewModel(
          * (lane 971-3 handoff).
          */
         const val ALREADY_RESOLVED = "already_resolved"
+
+        /**
+         * How many root sessions the fleet panel reads in one open.
+         *
+         * A roster of hundreds would otherwise fire hundreds of `session.fleet`
+         * calls the moment a sheet opens; the panel says how many it covered
+         * rather than implying it read them all.
+         */
+        const val FLEET_PANEL_SESSION_LIMIT = 24
+
+        /**
+         * Stated when a branch was asked for at a session with no published
+         * head node. `branch.create` needs an exact `(fork_node_id, fork_seq)`
+         * pair from one fact, so half of it is not sent.
+         */
+        const val NO_FORK_POINT = "branch_fork_point_unpublished"
 
         fun factory(
             service: DaemonService,

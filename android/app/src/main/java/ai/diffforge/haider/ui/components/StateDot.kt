@@ -3,11 +3,6 @@ package ai.diffforge.haider.ui.components
 import ai.diffforge.haider.ui.theme.ForgeMotion
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -40,20 +36,14 @@ fun StateDot(color: Color, modifier: Modifier = Modifier, size: Dp = ForgeSize.s
  */
 @Composable
 fun RunningDots(color: Color, animate: Boolean, modifier: Modifier = Modifier) {
-    val phase = if (animate) {
-        val transition = rememberInfiniteTransition(label = "row-marquee")
-        transition.animateFloat(
-            initialValue = 0f,
-            targetValue = 3f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(ForgeMotion.MARQUEE_MS, easing = ForgeMotion.easing),
-                repeatMode = RepeatMode.Restart,
-            ),
-            label = "row-marquee-phase",
-        ).value
-    } else {
-        null
+    // Three dots stepping on the shared ticker instead of a per-frame
+    // transition each (verify-10 O5).
+    val ticks = MotionTicker.phase.value
+    DisposableEffect(animate) {
+        if (animate) MotionTicker.subscribe()
+        onDispose { if (animate) MotionTicker.unsubscribe() }
     }
+    val phase = if (animate) (ticks % 3).toFloat() else null
     Row(
         modifier = modifier.clearAndSetSemantics { },
         horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xxs),

@@ -6,6 +6,7 @@ import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.Skeleton
 import ai.diffforge.haider.ui.daemon.ProviderInventory
 import ai.diffforge.haider.ui.state.ModelNames
+import ai.diffforge.haider.ui.accounts.ModelInventoryAuthority
 import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.SelectionRefusal
@@ -177,6 +178,18 @@ fun SessionPickerSheet(
                                 },
                             )
                         }
+                        // Free-text ids on the surface people actually pick
+                        // from, not only the full dialog. The component draws
+                        // nothing unless the daemon called the list advisory
+                        // (lane 971-UI-extras follow-up).
+                        CustomModelEntry(
+                            authority = ModelInventoryAuthority.of(option.inventoryAuthority),
+                            enabled = option.available && !busy,
+                            onSelect = { id ->
+                                submitted = true
+                                onSelectModel(option.id, id)
+                            },
+                        )
                     }
                 }
 

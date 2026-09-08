@@ -1,26 +1,46 @@
 package ai.diffforge.haider.ui.scaffold
 
+import ai.diffforge.haider.AppContainer
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.accounts.AccountsRepository
+import ai.diffforge.haider.ui.loom.LoomAuthoringController
+import ai.diffforge.haider.ui.loom.LoomAuthoringScreen
+import ai.diffforge.haider.ui.loom.LoomController
+import ai.diffforge.haider.ui.loom.LoomsScreen
+import ai.diffforge.haider.ui.workflow.WorkflowChipModel
+import ai.diffforge.haider.ui.workflow.WorkflowController
+import ai.diffforge.haider.ui.workflow.WorkflowGraphScreen
+import ai.diffforge.haider.ui.workflow.WorkflowStatusChip
 import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.chat.SessionPickerSheet
+import ai.diffforge.haider.ui.daemon.Delivery
 import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.InputRequiredCard
 import ai.diffforge.haider.ui.chat.ModelPicker
+import ai.diffforge.haider.ui.chat.QueuePanel
+import ai.diffforge.haider.ui.chat.DeliveryChooser
+import ai.diffforge.haider.ui.checkpoints.BranchSheet
+import ai.diffforge.haider.ui.checkpoints.CheckpointsSheet
 import ai.diffforge.haider.ui.chat.ShellView
 import ai.diffforge.haider.ui.chat.Transcript
 import ai.diffforge.haider.ui.drawer.RenameSheet
 import ai.diffforge.haider.ui.drawer.SessionActionsSheet
 import ai.diffforge.haider.ui.drawer.SessionDrawer
 import ai.diffforge.haider.ui.drawer.SessionRowAction
+import ai.diffforge.haider.ui.daemon.FleetModel
+import ai.diffforge.haider.ui.daemon.FleetLoad
+import ai.diffforge.haider.ui.fleet.ChildTranscriptScreen
+import ai.diffforge.haider.ui.fleet.FleetSheet
+import ai.diffforge.haider.ui.fleet.SubagentStrip
 import ai.diffforge.haider.ui.settings.AccountsScreen
 import ai.diffforge.haider.ui.settings.SettingsScreen
 import ai.diffforge.haider.ui.start.AutonomyGrant
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.PermissionStanding
+import ai.diffforge.haider.ui.components.MotionLifecycleGate
 import ai.diffforge.haider.ui.start.StartSurface
 import ai.diffforge.haider.ui.state.BannerAction
 import ai.diffforge.haider.ui.state.BannerInputs
@@ -45,7 +65,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.WindowInsets
@@ -57,6 +78,7 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -68,6 +90,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
@@ -84,6 +107,11 @@ import kotlinx.coroutines.launch
 @Composable
 fun HaiderApp(
     viewModel: ChatViewModel,
+    /**
+     * Only for fetching attachment bytes by CAS reference. Everything else
+     * goes through the view model; this is a read door, not a second channel.
+     */
+    service: ai.diffforge.haider.ui.daemon.DaemonService? = null,
     accounts: AccountsRepository,
     oauth: OAuthAttemptController,
     appVersion: String,
@@ -108,6 +136,9 @@ fun HaiderApp(
     ForgeTheme(dark = dark) {
         val colors = Forge.colors
         val drawerState = rememberDrawerState(DrawerValue.Closed)
+        // One gate for every looping animation: a paused app animates nothing
+        // (verify-10 O5).
+        MotionLifecycleGate()
         val scope = rememberCoroutineScope()
         var nowMs by remember { mutableLongStateOf(nowMsProvider()) }
         LaunchedEffect(Unit) {
@@ -172,7 +203,83 @@ fun HaiderApp(
             )
         }
 
-        when (state.overlay) {
+        // ---------- lane 971-UI-workflows: the three full screens ----------
+        // Controllers live here rather than inside a branch: a screen that is
+        // recomposed away and back must not restart its watch loop from zero.
+        val daemonService = AppContainer.daemon(LocalContext.current)
+        val workflowController = remember(daemonService) {
+            WorkflowController(daemonService, scope)
+        }
+        val loomController = remember(daemonService) { LoomController(daemonService, scope) }
+        val authoringController = remember(daemonService) {
+            LoomAuthoringController(daemonService, scope)
+        }
+
+        when (val overlay = state.overlay) {
+            is Overlay.WorkflowGraph -> {
+                LaunchedEffect(overlay.sessionId, overlay.graphId) {
+                    workflowController.open(
+                        sessionId = overlay.sessionId,
+                        sessionTitle = viewModel.session(overlay.sessionId)?.title
+                            ?: overlay.sessionId,
+                        graphId = overlay.graphId,
+                    )
+                }
+                DisposableEffect(Unit) { onDispose { workflowController.close() } }
+                val workflowState by workflowController.state.collectAsState()
+                WorkflowGraphScreen(
+                    state = workflowState,
+                    onBack = viewModel::closeOverlay,
+                    onToggleAst = workflowController::toggleAst,
+                    onSelectNode = { workflowController.selectNode(it) },
+                    // The drill-in is the daemon's own `parent_attempt` →
+                    // `child_session_id` mapping; nothing here matches a name.
+                    onOpenChild = { link ->
+                        viewModel.activate(link.childSessionId)
+                        viewModel.openOverlay(
+                            Overlay.WorkflowGraph(link.childSessionId, link.childGraphId),
+                        )
+                    },
+                    onRefresh = workflowController::refresh,
+                )
+                return@ForgeTheme
+            }
+            Overlay.Looms -> {
+                LaunchedEffect(Unit) { loomController.refresh() }
+                val loomState by loomController.state.collectAsState()
+                LoomsScreen(
+                    state = loomState,
+                    onBack = { viewModel.openOverlay(Overlay.Settings) },
+                    onRefresh = { loomController.refresh() },
+                    onIncludeArchived = loomController::setIncludeArchived,
+                    onSetArchived = { kind, id, archived, fence ->
+                        loomController.setArchived(kind, id, archived, fence)
+                    },
+                    onAuthor = { kind ->
+                        authoringController.setKind(kind)
+                        viewModel.openOverlay(Overlay.LoomAuthoring(kind))
+                    },
+                )
+                return@ForgeTheme
+            }
+            is Overlay.LoomAuthoring -> {
+                val authoringState by authoringController.state.collectAsState()
+                LoomAuthoringScreen(
+                    state = authoringState,
+                    onBack = { viewModel.openOverlay(Overlay.Looms) },
+                    onKind = authoringController::setKind,
+                    onProse = authoringController::setProse,
+                    onText = authoringController::setText,
+                    // The draft is generated with the active session's own
+                    // provider/model, which is why it needs one.
+                    onDraft = { state.activeSessionId?.let(authoringController::draft) },
+                    onRevise = authoringController::revise,
+                    onValidate = authoringController::validate,
+                    onConfirm = authoringController::confirm,
+                    onStartOver = authoringController::reset,
+                )
+                return@ForgeTheme
+            }
             Overlay.Settings -> {
                 SettingsScreen(
                     state = state,
@@ -183,6 +290,7 @@ fun HaiderApp(
                     onBack = viewModel::closeOverlay,
                     onThemeMode = onThemeMode,
                     onOpenAccounts = { viewModel.openOverlay(Overlay.Accounts) },
+                    onOpenLooms = { viewModel.openOverlay(Overlay.Looms) },
                     onStartDaemon = { viewModel.startDaemon() },
                     onStopDaemon = { viewModel.stopDaemon() },
                     onRestartDaemon = { viewModel.restartDaemon() },
@@ -203,6 +311,36 @@ fun HaiderApp(
                 )
                 return@ForgeTheme
             }
+            // A descendant's own transcript is a screen, not a sheet: it hosts
+            // a full replay and its own input-required card, and a sheet over
+            // the parent would put two transcripts on one surface.
+            is Overlay.ChildTranscript -> {
+                val open = state.childTranscript
+                if (open != null) {
+                    val roots = (state.fleet.active as? FleetLoad.Snapshot)
+                        ?.snapshot?.roots.orEmpty()
+                    ChildTranscriptScreen(
+                        state = open,
+                        node = FleetModel.find(roots, open.agentId),
+                        // The child's own roster row, when the daemon lists it:
+                        // that is where its needs-input card and coordinates
+                        // come from. Absent, the screen shows no card at all.
+                        row = viewModel.session(open.sessionId),
+                        parentTitle = viewModel.session(open.parentSessionId)?.title
+                            ?: open.parentSessionId,
+                        nowMs = nowMs,
+                        answeredElsewhere = state.answeredElsewhere,
+                        onBack = viewModel::closeOverlay,
+                        onAnswer = { rendered, key, index, text ->
+                            viewModel.answer(rendered, key, index, text)
+                        },
+                        onAnswerSecret = { rendered, key, index, secret ->
+                            viewModel.answerSecret(rendered, key, index, secret)
+                        },
+                    )
+                    return@ForgeTheme
+                }
+            }
             else -> Unit
         }
 
@@ -216,6 +354,9 @@ fun HaiderApp(
                     modifier = Modifier.widthIn(max = drawerWidth),
                 ) {
                     SessionDrawer(
+                        // The closed drawer stays composed, so it has to be
+                        // told when it is invisible (verify-10 O5).
+                        open = drawerState.isOpen,
                         state = state,
                         themeMode = themeMode,
                         appVersion = appVersion,
@@ -242,6 +383,11 @@ fun HaiderApp(
                         onOpenSettings = { viewModel.openOverlay(Overlay.Settings) },
                         onThemeMode = onThemeMode,
                         onLoadMore = { viewModel.loadMoreSessions() },
+                        onToggleFamily = { viewModel.toggleFamily(it) },
+                        onOpenFleet = {
+                            scope.launch { drawerState.close() }
+                            viewModel.openFleet()
+                        },
                         nowMsProvider = nowMsProvider,
                         elapsedRealtimeProvider = elapsedRealtimeProvider,
                         modifier = Modifier.windowInsetsPadding(WindowInsets.safeDrawing),
@@ -249,11 +395,28 @@ fun HaiderApp(
                 }
             },
         ) {
+            if (state.deliveryChooser) {
+                DeliveryChooser(
+                    onSteer = { viewModel.send(Delivery.Steer) },
+                    onQueue = { viewModel.send(Delivery.Queue) },
+                    onDismiss = viewModel::dismissDelivery,
+                )
+            }
             Column(
                 Modifier
                     .fillMaxSize()
                     .background(colors.bg)
-                    .windowInsetsPadding(WindowInsets.safeDrawing),
+                    // One owner for the IME: the shell takes the top and the
+                    // sides, the composer takes the bottom. Round 11 gave
+                    // `safeDrawing` — which *includes* the IME — to the whole
+                    // column and then padded the composer again, so the header
+                    // panned away and a keyboard-sized gap opened above the
+                    // keyboard (verify-10 O6).
+                    .windowInsetsPadding(
+                        WindowInsets.safeDrawing.only(
+                            WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
+                        ),
+                    ),
             ) {
                 HaiderTopBar(
                     state = state,
@@ -285,6 +448,22 @@ fun HaiderApp(
                     },
                     onDismiss = { rank -> dismissals.dismiss(rank, nowMs) },
                 )
+
+                // The session's own workflow, from the roster row that rendered
+                // it. A session with none draws nothing at all: most have none,
+                // and a permanent "No workflow" line above every chat is chrome.
+                state.activeSession?.let { row ->
+                    WorkflowStatusChip(
+                        state = WorkflowChipModel.resolve(
+                            workflow = row.workflow,
+                            // A subagent's workflow opens the same screen; the
+                            // chip only says which specialist is running it.
+                            agentType = row.agentType,
+                        ),
+                        onClick = { viewModel.openOverlay(Overlay.WorkflowGraph(row.id)) },
+                        modifier = Modifier.padding(start = ForgeSpace.md),
+                    )
+                }
 
                 Box(Modifier.fillMaxWidth().weight(1f)) {
                     // Never hidden. Auto means the *daemon* resolves device
@@ -372,6 +551,24 @@ fun HaiderApp(
                                 )
                                 }
                             }
+                            // The session's own delegated agents, from
+                            // `session.observe` (frame.rs:2271). Renders
+                            // nothing when the daemon published none.
+                            SubagentStrip(
+                                load = state.fleet.subagents,
+                                fleet = state.fleet.active,
+                                // A chip comes from *this* session's observe
+                                // digest, so this session is its parent by
+                                // construction — not an inferred one.
+                                onOpenChild = { childId, agentId ->
+                                    viewModel.openChildTranscript(
+                                        sessionId = childId,
+                                        agentId = agentId,
+                                        parentSessionId = state.activeSessionId,
+                                    )
+                                },
+                                onOpenFleet = { viewModel.openFleet() },
+                            )
                             state.transcriptNotice?.let { notice ->
                                 Text(
                                     notice,
@@ -385,6 +582,7 @@ fun HaiderApp(
                             }
                             // One Stop control, and it lives in the composer.
                             Transcript(
+                                service = service,
                                 messages = state.messages,
                                 onRetry = { viewModel.send() },
                                 modifier = Modifier.fillMaxSize(),
@@ -409,7 +607,17 @@ fun HaiderApp(
                     requestedAtMs = state.catalogRequestedAtMs,
                     nowMs = nowMs,
                 )
-                Box(Modifier.fillMaxWidth().imePadding(), contentAlignment = Alignment.Center) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        // The bottom inset is the union of the navigation bar
+                        // and the IME, so the composer sits against whichever
+                        // is there — and never against both.
+                        .windowInsetsPadding(
+                            WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom),
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
                     Composer(
                         // The picker row is meaningless before the daemon can
                         // answer; the input stays visible and disabled so the
@@ -421,7 +629,21 @@ fun HaiderApp(
                         chip = chip,
                         effort = state.models?.current?.effort,
                         permissionMode = state.permissionMode,
-                        onSend = { viewModel.send() },
+                        attachments = state.draftAttachments,
+                        attachmentNotice = state.attachmentNotice,
+                        service = service,
+                        queued = state.queue.rows.size,
+                        onRemoveAttachment = viewModel::removeAttachment,
+                        onOpenQueue = { viewModel.openOverlay(Overlay.Queue) },
+                        onSend = {
+                            // Send-while-running is a real choice, so it is
+                            // asked rather than assumed (DeliveryMode).
+                            if (composerState.showStop) {
+                                viewModel.askDelivery()
+                            } else {
+                                viewModel.send()
+                            }
+                        },
                         onStop = { viewModel.stopTurn() },
                         onStartDaemon = { viewModel.startDaemon() },
                         onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
@@ -504,6 +726,16 @@ private fun Overlays(
             onRefresh = { viewModel.refreshModels() },
             onDismiss = viewModel::closeOverlay,
         )
+        Overlay.Queue -> QueuePanel(
+            snapshot = state.queue,
+            notice = state.queueNotice,
+            onPromote = viewModel::promoteQueued,
+            onRemove = viewModel::removeQueued,
+            onDismiss = {
+                viewModel.dismissQueueNotice()
+                viewModel.closeOverlay()
+            },
+        )
         Overlay.Attach -> AttachSheet(
             onDismiss = viewModel::closeOverlay,
             onScreenshot = {
@@ -513,6 +745,10 @@ private fun Overlays(
             onPickFile = {
                 viewModel.closeOverlay()
                 onSystemAction(SystemAction.PickFile)
+            },
+            onPickImage = {
+                viewModel.closeOverlay()
+                onSystemAction(SystemAction.PickImage)
             },
         )
         Overlay.DaemonDetails -> DaemonDetailsSheet(
@@ -531,13 +767,74 @@ private fun Overlays(
                 onAction = { action -> viewModel.applyRowAction(row.id, action) },
             )
         }
+        Overlay.Fleet -> FleetSheet(
+            panel = state.fleet.panel,
+            sessions = state.sessions,
+            loading = state.fleet.panelLoading,
+            onDismiss = viewModel::closeOverlay,
+            onJump = { sessionId ->
+                viewModel.closeOverlay()
+                viewModel.activate(sessionId)
+            },
+            onOpenChild = { childId, agentId, parentId ->
+                viewModel.openChildTranscript(
+                    sessionId = childId,
+                    agentId = agentId,
+                    parentSessionId = parentId,
+                )
+            },
+            onRefresh = { viewModel.openFleet() },
+        )
         is Overlay.Rename -> RenameSheet(
             current = overlay.current,
             onDismiss = viewModel::closeOverlay,
             onRename = { title -> viewModel.rename(overlay.sessionId, title) },
         )
+        is Overlay.Checkpoints -> CheckpointsSheet(
+            state = state.checkpoints,
+            // The branch the timeline was read on, named as the sheet shows it
+            // elsewhere. `checkpoint.list` is branch-scoped, so this is part of
+            // what the list means, not decoration.
+            branchName = branchName(state, overlay.sessionId),
+            onDismiss = viewModel::closeOverlay,
+            onRefresh = { viewModel.loadCheckpoints(overlay.sessionId) },
+            onLoadMore = viewModel::loadMoreCheckpoints,
+            onConfirm = viewModel::confirmCheckpointGesture,
+            onApply = viewModel::applyCheckpointGesture,
+        )
+        is Overlay.Branches -> viewModel.session(overlay.sessionId)?.let { row ->
+            BranchSheet(
+                branches = row.branches,
+                selectedBranchId = state.branchSelection[overlay.sessionId],
+                // `branch.create` forks at an exact node; a row without one has
+                // no fork point, and the sheet offers no create rather than
+                // sending half a coordinate.
+                forkPointSeq = row.mainHeadNodeId?.let { row.mainHeadSeq },
+                notice = state.checkpoints.branchNotice,
+                onDismiss = viewModel::closeOverlay,
+                onSelect = { branchId -> viewModel.selectBranch(overlay.sessionId, branchId) },
+                onCreate = { name -> viewModel.createBranch(overlay.sessionId, name) },
+            )
+        }
         else -> Unit
     }
+}
+
+/**
+ * The branch a session's next turn goes on, by name.
+ *
+ * Null for the implicit main branch: main has no registry row and no id, so
+ * there is no name to show and the sheet says nothing rather than inventing one.
+ */
+private fun branchName(state: AppUiState, sessionId: String): String? {
+    val branchId = state.branchSelection[sessionId] ?: return null
+    return state.sessions.firstOrNull { it.id == sessionId }
+        ?.branches
+        ?.firstOrNull { it.branchId == branchId }
+        ?.name
+        // Selected but not in the published list: name the id rather than
+        // silently showing main.
+        ?: branchId
 }
 
 /** Everything the UI needs from the platform, kept out of the composables. */
@@ -558,6 +855,9 @@ sealed interface SystemAction {
     data object RequestScreenCapture : SystemAction
     data object Screenshot : SystemAction
     data object PickFile : SystemAction
+
+    /** The system photo picker, for turn.submit attachments. */
+    data object PickImage : SystemAction
     data class CopyText(val text: String) : SystemAction
 }
 
@@ -568,6 +868,8 @@ fun ChatViewModel.applyRowAction(sessionId: String, action: SessionRowAction) {
             Overlay.Rename(sessionId, session(sessionId)?.title.orEmpty()),
         )
         SessionRowAction.Fork -> fork(sessionId)
+        SessionRowAction.Checkpoints -> openCheckpoints(sessionId)
+        SessionRowAction.Branches -> openBranches(sessionId)
         SessionRowAction.CopyId -> closeOverlay()
     }
 }

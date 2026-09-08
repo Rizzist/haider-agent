@@ -4,11 +4,6 @@ import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
@@ -56,18 +51,10 @@ fun SessionGlyph(
         SessionVisualState.Errored -> colors.stateErrored
         else -> null
     }
-    // Errored never animates — nothing pulses for a corpse.
-    val pulse = if (animate && state == SessionVisualState.Running) {
-        val transition = rememberInfiniteTransition(label = "badge-pulse")
-        transition.animateFloat(
-            initialValue = 0.45f,
-            targetValue = 1f,
-            animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse),
-            label = "badge-pulse-alpha",
-        ).value
-    } else {
-        1f
-    }
+    // Errored never animates — nothing pulses for a corpse. Everything else
+    // shares one 3 Hz ticker and only subscribes while it can be seen
+    // (verify-10 O5).
+    val pulse = rememberPulse(active = animate && state == SessionVisualState.Running)
     Box(
         modifier = modifier.clearAndSetSemantics { }.size(ForgeSize.avatar),
         contentAlignment = Alignment.Center,

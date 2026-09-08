@@ -36,6 +36,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material.icons.rounded.Accessibility
+import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.Screenshot
 import androidx.compose.material.icons.rounded.Sms
 import androidx.compose.material.icons.rounded.Notifications
@@ -57,6 +58,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.testTag
 
 /**
  * The only full screen in the app: it hosts flows that leave it (Accessibility,
@@ -66,6 +68,9 @@ import androidx.compose.ui.text.style.TextOverflow
  * `ConnectCard` is gone, because in 971 there is nothing to connect to — the
  * daemon is in the app.
  */
+/** The read-only usage.report line in the daemon card. */
+const val USAGE_FOOTER_TAG = "usage_footer"
+
 @Composable
 fun SettingsScreen(
     state: AppUiState,
@@ -76,6 +81,8 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onThemeMode: (ThemeMode) -> Unit,
     onOpenAccounts: () -> Unit,
+    /** The Loom registry: agent types and workflows (lane 971-UI-workflows). */
+    onOpenLooms: () -> Unit = {},
     onStartDaemon: () -> Unit,
     onStopDaemon: () -> Unit,
     onRestartDaemon: () -> Unit,
@@ -156,6 +163,9 @@ fun SettingsScreen(
                     style = type.sessionMeta,
                     color = colors.textMuted,
                 )
+                // usage.report, read-only. The protocol calls est_cost_usd
+                // "never a bill — an estimate", and so does this line.
+                UsageFooter(state.usage)
                 Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
                     if (state.daemon is DaemonStatus.Running) {
                         ForgeButton(
@@ -182,6 +192,17 @@ fun SettingsScreen(
                 title = stringResource(R.string.accounts_title),
                 subtitle = accountsSummary,
                 onClick = onOpenAccounts,
+            )
+
+            // Lane 971-UI-workflows: the Loom registry lives behind one row
+            // rather than a fourth drawer destination — it is inventory a
+            // person visits, not a place they work.
+            SectionLabel(R.string.settings_section_looms)
+            NavigationRow(
+                title = stringResource(R.string.looms_title),
+                subtitle = stringResource(R.string.settings_looms_row),
+                onClick = onOpenLooms,
+                icon = Icons.Rounded.AccountTree,
             )
 
             SectionLabel(R.string.settings_section_permissions)
@@ -409,4 +430,58 @@ internal fun NavigationRow(
             )
         }
     }
+}
+
+/**
+ * `usage.report` totals (`usage.rs:296`).
+ *
+ * Absence is stated, not drawn as zeros: a daemon that does not advertise
+ * `usage_report_v1` says so.
+ */
+@Composable
+private fun UsageFooter(snapshot: ai.diffforge.haider.ui.daemon.UsageSnapshot) {
+    val colors = Forge.colors
+    val type = Forge.type
+    if (!snapshot.supported) {
+        Text(
+            stringResource(R.string.usage_footer_unavailable),
+            style = type.sessionMeta,
+            color = colors.textMuted,
+            modifier = Modifier.testTag(USAGE_FOOTER_TAG),
+        )
+        return
+    }
+    val totals = snapshot.totals
+    Column(modifier = Modifier.testTag(USAGE_FOOTER_TAG)) {
+        Text(
+            buildString {
+                append(stringResource(R.string.usage_footer_label))
+                append("  ")
+                append(tokens(totals.inputTokens))
+                append(" in · ")
+                append(tokens(totals.outputTokens))
+                append(" out")
+                if (totals.cachedTokens > 0) {
+                    append(" · ")
+                    append(tokens(totals.cachedTokens))
+                    append(" cached")
+                }
+            },
+            style = type.sessionMeta,
+            color = colors.textMuted,
+        )
+        totals.estCostUsd?.let { cost ->
+            Text(
+                "~$" + "%.2f".format(cost) + " " + stringResource(R.string.usage_footer_estimate),
+                style = type.selectLabel,
+                color = colors.textMuted,
+            )
+        }
+    }
+}
+
+private fun tokens(value: Long): String = when {
+    value >= 1_000_000 -> "%.1fM".format(value / 1_000_000.0)
+    value >= 1_000 -> "%.1fk".format(value / 1_000.0)
+    else -> value.toString()
 }

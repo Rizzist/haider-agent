@@ -77,6 +77,11 @@ fun SessionActionsSheet(
             )
             ActionRow(R.string.action_rename) { onAction(SessionRowAction.Rename) }
             ActionRow(R.string.action_fork) { onAction(SessionRowAction.Fork) }
+            // The drawer row's own surface is where a session's branch is
+            // chosen and its workspace timeline is opened: both are per-session
+            // facts, and neither belongs on the composer.
+            ActionRow(R.string.action_checkpoints) { onAction(SessionRowAction.Checkpoints) }
+            ActionRow(R.string.branches_title) { onAction(SessionRowAction.Branches) }
             // Stopping a turn is the composer's job and only the composer's
             // (E2, verify-6 O2).
             ActionRow(R.string.action_copy_session_id) { onAction(SessionRowAction.CopyId) }

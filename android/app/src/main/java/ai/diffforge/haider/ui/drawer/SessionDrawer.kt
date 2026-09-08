@@ -1,13 +1,13 @@
 package ai.diffforge.haider.ui.drawer
 
 import ai.diffforge.haider.R
-import ai.diffforge.haider.ui.components.ForgeChip
 import ai.diffforge.haider.ui.components.ForgeIconButton
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.ModelNames
 import ai.diffforge.haider.ui.state.SessionFilter
 import ai.diffforge.haider.ui.state.SessionGroupKind
 import ai.diffforge.haider.ui.state.SessionListState
+import ai.diffforge.haider.ui.state.SessionTree
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeMotion
 import ai.diffforge.haider.ui.theme.ForgeShapes
@@ -19,7 +19,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -38,10 +37,9 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.Hub
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Tune
-import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -71,6 +69,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 
 /**
  * The drawer: identity, daemon card and New session fixed at the top, the
@@ -82,11 +81,16 @@ import androidx.compose.ui.platform.LocalDensity
  * search change. A list that reorders under a thumb steals taps
  * (UI-SPEC 3.3, trap 6.6.4).
  */
+/** The merged daemon + New chat + collapse row. */
+const val DRAWER_HEAD_TAG = "drawer_head"
+
 @Composable
 fun SessionDrawer(
     state: AppUiState,
     themeMode: ThemeMode,
     appVersion: String,
+    /** False while the drawer is shut: its rows must not animate (O5). */
+    open: Boolean = true,
     onClose: () -> Unit,
     onNewSession: () -> Unit,
     onNewSessionWith: () -> Unit,
@@ -101,6 +105,9 @@ fun SessionDrawer(
     onOpenSettings: () -> Unit,
     onThemeMode: (ThemeMode) -> Unit,
     onLoadMore: () -> Unit,
+    /** Folds or unfolds the sessions one session delegated (lane 971-UI-fleet). */
+    onToggleFamily: (String) -> Unit = {},
+    onOpenFleet: () -> Unit = {},
     nowMsProvider: () -> Long = System::currentTimeMillis,
     elapsedRealtimeProvider: () -> Long = android.os.SystemClock::elapsedRealtime,
     modifier: Modifier = Modifier,
@@ -125,7 +132,11 @@ fun SessionDrawer(
     // deliberately rather than by accident of a `remember` key.
     val snapshot = state.orderSnapshot
     val searchIds = state.searchOutcome?.hits?.map { it.sessionId }?.toSet().orEmpty()
-    val groups = remember(
+    // Sections, not a flat list: a delegated session renders under the session
+    // that spawned it (`parent_session_id`, frame.rs:1949). With no delegation
+    // in the roster this is exactly SessionListState.groups — pinned in
+    // SessionTreeTest, which is what keeps the existing goldens honest.
+    val sections = remember(
         state.sessions,
         state.filter,
         state.query,
@@ -133,7 +144,7 @@ fun SessionDrawer(
         snapshot,
         searchIds,
     ) {
-        SessionListState.groups(
+        SessionTree.sections(
             rows = state.sessions,
             activeId = state.activeSessionId,
             filter = state.filter,
@@ -142,6 +153,9 @@ fun SessionDrawer(
             // Transcript-content hits the metadata filter would not find.
             extraIds = searchIds,
         )
+    }
+    val delegatedCount = remember(state.sessions) {
+        state.sessions.count { row -> row.parentSessionId != null }
     }
 
     val listState = rememberLazyListState()
@@ -173,7 +187,14 @@ fun SessionDrawer(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = ForgeSize.touch),
+                // R3 asks for a 44 dp head. Its three controls are targets, and
+                // a target may not be smaller than 48, so the row is 48 dp of
+                // layout with a 44 dp painted band — the same paint-versus-
+                // target split as every other row (verify-10 O7). The literal
+                // 44 dp *layout* row cannot coexist with legal targets inside
+                // it, which is recorded in the round report.
+                .height(ForgeSize.touch)
+                .testTag(DRAWER_HEAD_TAG),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             DaemonStatusRow(
@@ -233,7 +254,7 @@ fun SessionDrawer(
             }
         }
         Box(Modifier.weight(1f)) {
-            if (groups.isEmpty()) {
+            if (sections.isEmpty()) {
                 Text(
                     when {
                         state.query.isNotBlank() -> stringResource(R.string.drawer_search_empty, state.query)
@@ -251,10 +272,11 @@ fun SessionDrawer(
                     // frozen Recent one does exactly that. The header key has
                     // to be unique per *section*, not per kind, or LazyColumn
                     // throws on the duplicate.
-                    groups.forEach { group ->
-                        item(key = "section-${group.kind}-${group.rows.first().id}") {
+                    sections.forEach { section ->
+                        val lines = SessionTree.lines(section.roots, state.familyToggles)
+                        item(key = "section-${section.kind}-${lines.first().row.id}") {
                             Text(
-                                stringResource(groupLabel(group.kind)),
+                                stringResource(groupLabel(section.kind)),
                                 style = type.drawerSection,
                                 color = colors.textMuted,
                                 modifier = Modifier.padding(
@@ -264,14 +286,19 @@ fun SessionDrawer(
                                 ),
                             )
                         }
-                        items(group.rows, key = { it.id }) { row ->
-                            SessionRowItem(
-                                row = row,
-                                selected = row.id == state.activeSessionId,
+                        items(lines, key = { it.row.id }) { line ->
+                            SessionTreeLineItem(
+                                line = line,
+                                selected = line.row.id == state.activeSessionId,
                                 nowMs = nowMs,
-                                onClick = { onSelect(row.id) },
-                                onLongClick = { onRowAction(row.id, SessionRowAction.Rename) },
-                                onAction = { action -> onRowAction(row.id, action) },
+                                onClick = { onSelect(line.row.id) },
+                                onLongClick = {
+                                    onRowAction(line.row.id, SessionRowAction.Rename)
+                                },
+                                onAction = { action -> onRowAction(line.row.id, action) },
+                                onToggleFamily = { onToggleFamily(line.row.id) },
+                                // Round 12: a shut drawer animates nothing.
+                                visible = open,
                             )
                         }
                     }
@@ -290,11 +317,9 @@ fun SessionDrawer(
         }
 
         DrawerFooter(
-            state = state,
-            themeMode = themeMode,
-            onOpenModel = onOpenModel,
+            fleetCount = delegatedCount,
+            onOpenFleet = onOpenFleet,
             onOpenSettings = onOpenSettings,
-            onThemeMode = onThemeMode,
         )
     }
 }
@@ -427,14 +452,11 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
 
 @Composable
 private fun DrawerFooter(
-    state: AppUiState,
-    themeMode: ThemeMode,
-    onOpenModel: () -> Unit,
+    fleetCount: Int,
+    onOpenFleet: () -> Unit,
     onOpenSettings: () -> Unit,
-    onThemeMode: (ThemeMode) -> Unit,
 ) {
     val colors = Forge.colors
-    val type = Forge.type
     Column {
         Box(
             Modifier
@@ -442,6 +464,16 @@ private fun DrawerFooter(
                 .height(ForgeSize.hairline)
                 .background(colors.border),
         )
+        // Only when the roster actually carries delegated sessions: a door to
+        // an empty room is worse than no door (addition F, D5).
+        if (fleetCount > 0) {
+            FooterRow(
+                icon = Icons.Rounded.Hub,
+                primary = stringResource(R.string.fleet_footer_agents, fleetCount),
+                secondary = null,
+                onClick = onOpenFleet,
+            )
+        }
         // One row. The model is a composer picker and the theme is on the top
         // bar, so neither needs a second home down here (addition F, D5).
         FooterRow(
@@ -506,6 +538,4 @@ private fun groupLabel(kind: SessionGroupKind): Int = when (kind) {
     SessionGroupKind.Recent -> R.string.drawer_group_recent
 }
 
-private const val FILTER_THRESHOLD = 3
-private const val SEARCH_THRESHOLD = 20
 private const val PAGE_TRIGGER = 8

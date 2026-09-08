@@ -12,6 +12,10 @@ data class Message(
     /** `ChatReply.Error.retryable`; the 970 parser read it and threw it away. */
     val errorRetryable: Boolean = false,
     val provider: String? = null,
+    /** `AttachmentBlock`s the turn carried: images, files, pasted text. */
+    val attachments: List<ai.diffforge.haider.ui.daemon.Attachment> = emptyList(),
+    /** Per-turn tokens, when `usage.report` attributed any to this turn. */
+    val usage: ai.diffforge.haider.ui.daemon.TokenUsage? = null,
 )
 
 enum class Role { User, Agent }

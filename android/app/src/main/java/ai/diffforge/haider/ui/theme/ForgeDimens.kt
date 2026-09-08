@@ -65,6 +65,30 @@ object ForgeSize {
     val rowMin = 64.dp
     /** A drawer session row's painted band inside its 48 dp target (R3). */
     val rowVisual = 40.dp
+
+    /**
+     * One delegation level's indent in the drawer, and the elbow the connector
+     * draws into the child row. 12 dp keeps a depth-3 family readable inside a
+     * 322 dp drawer, where the desktop's 16 px would not.
+     */
+    val treeIndent = 12.dp
+    val treeElbow = 6.dp
+
+    /** The family count/aggregate control's ink, inside its 48 dp target. */
+    val familyPill = 26.dp
+
+    /** A subagent chip's ink on the session header strip. */
+    val subagentChip = 28.dp
+
+    /**
+     * How much of a subagent's task one chip may show. A chip is a glance, not
+     * a row: at the transcript's 220 dp two chips already fill a 412 dp phone
+     * and the third sits off-screen entirely.
+     */
+    val subagentTaskMax = 116.dp
+
+    /** The fleet panel's own scroll ceiling, so a sheet cannot eat the screen. */
+    val fleetListMax = 360.dp
     /** The merged daemon + New chat row's ink (R3). */
     val drawerRow = 44.dp
     /** The drawer search field's ink (R3). */
@@ -84,6 +108,10 @@ object ForgeSize {
     val activityDot = 5.dp
     /** The 24x24 viewport every ported vendor mark is drawn on. */
     val markViewport = 24.dp
+    /** An attachment thumbnail in the transcript or the composer strip. */
+    val thumbnail = 56.dp
+    /** The name column inside a file tile. */
+    val attachmentLabel = 92.dp
     /** Chip and composer-select ink: 30 dp inside a 48 dp target (R2). */
     val chip = 30.dp
     val segmented = 36.dp
@@ -92,6 +120,41 @@ object ForgeSize {
     val newSessionRow = 46.dp
     val actionButton = 44.dp
     val stopChip = 28.dp
+
+    // ---------- workflow DAG canvas (lane 971-UI-workflows) ----------
+
+    /**
+     * A node card. Wide enough for an uppercase graph node name plus its phase
+     * word at the app's own scale, and 62 dp tall so the card is its own target
+     * without a separate touch box: a DAG node is a thing you tap.
+     */
+    val graphNodeWidth = 148.dp
+    val graphNodeHeight = 62.dp
+
+    /** Between siblings in one layer, and between layers. */
+    val graphColumnGap = 20.dp
+    val graphLayerGap = 44.dp
+
+    /** Breathing room around the whole graph, and where an input stub is drawn. */
+    val graphCanvasPad = 28.dp
+
+    val graphEdge = 2.dp
+    val graphDash = 6.dp
+    val graphDashGap = 5.dp
+    val graphArrow = 7.dp
+
+    /** The phase dot on a node card, and the accent bar down its left edge. */
+    val graphPhaseDot = 8.dp
+    val graphNodeRail = 3.dp
+
+    /** One level of indent in the activation-AST tree. */
+    val astIndent = 14.dp
+
+    /** The agent-type colour/glyph tile in the Looms list. */
+    val loomGlyphTile = 34.dp
+
+    /** The authoring editor's minimum height, so a draft is readable at once. */
+    val authoringEditorMin = 200.dp
 
     /** Tablet affordance retained from the existing transcript. */
     val readableMax = 776.dp

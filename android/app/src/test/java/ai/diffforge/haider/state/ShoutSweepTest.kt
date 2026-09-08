@@ -35,6 +35,12 @@ class ShoutSweepTest {
         "API", "SMS", "MMS", "URL", "URI", "IDE", "SDK", "NDK", "APK", "ABI",
         "CPU", "RAM", "PID", "ADB", "JSON", "HTTP", "HTTPS", "TLS", "UUID",
         "GPS", "OTP", "RPC", "UI", "OS", "ID", "MB", "GB", "KB",
+        // Lane 971-UI-workflows: the workflow screen's second view is the
+        // activation AST, and the graph it draws is a DAG. Both are how the
+        // things are spelled — in the Rust, in the pipe spec and on the desktop
+        // — not this app raising its voice. This is the acronym list, not an
+        // exemption: `exemptStrings` is still the three drawer headers.
+        "AST", "DAG",
     )
     private val word = Regex("""[A-Za-z][A-Za-z0-9]*""")
 
@@ -100,6 +106,10 @@ class ShoutSweepTest {
         assertTrue(!shouts("Needs input"))
         assertTrue(!shouts("API key"))
         assertTrue(!shouts("Grant SMS access"))
+        assertTrue(!shouts("AST"))
+        assertTrue(!shouts("Draw the DAG"))
+        // The list is names, not a licence: an invented one still shouts.
+        assertTrue(shouts("XYZ"))
         assertTrue(!shouts("Haider 0.0.971"))
         assertTrue(!shouts("5 sessions · 3 active · 58 MB · up 4h12m"))
     }

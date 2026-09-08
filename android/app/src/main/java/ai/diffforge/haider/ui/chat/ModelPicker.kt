@@ -1,6 +1,7 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.accounts.ModelInventoryAuthority
 import ai.diffforge.haider.ui.components.BrandMarkOnly
 import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
@@ -47,6 +48,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+
+/** The catalog list, so a test can scroll it to a row below the fold. */
+const val MODEL_PICKER_LIST_TAG = "model_picker_list"
 
 @Composable
 fun ModelPicker(
@@ -208,7 +212,7 @@ private fun CatalogList(
         ?.firstOrNull { it.id == config.current.model }
 
     LazyColumn(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().testTag(MODEL_PICKER_LIST_TAG),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = ForgeSpace.xl),
     ) {
         item {
@@ -291,6 +295,17 @@ private fun CatalogList(
                     enabled = available && !busy &&
                         !(config.current.provider == provider.id && config.current.model == model.id),
                     onClick = { onSelectModel(provider.id, model.id) },
+                    modifier = Modifier.padding(horizontal = ForgeSpace.lg),
+                )
+            }
+            // Free-text ids, for a provider whose published list is advisory
+            // rather than the last word. The component decides for itself
+            // whether to draw anything, from the daemon's own authority field.
+            item(key = "custom-${provider.id}") {
+                CustomModelEntry(
+                    authority = ModelInventoryAuthority.of(provider.inventoryAuthority),
+                    enabled = provider.enabled && provider.availability == "available" && !busy,
+                    onSelect = { id -> onSelectModel(provider.id, id) },
                     modifier = Modifier.padding(horizontal = ForgeSpace.lg),
                 )
             }

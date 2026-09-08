@@ -50,6 +50,7 @@ fun ComposeContentTestRule.setHaiderApp(
     setContent {
         HaiderApp(
             viewModel = viewModel,
+            service = service,
             accounts = accounts,
             oauth = controller,
             appVersion = "0.0.971",

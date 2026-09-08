@@ -38,7 +38,17 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 
-enum class SessionRowAction { Rename, Fork, CopyId }
+enum class SessionRowAction {
+    Rename,
+    Fork,
+
+    /** The session's durable workspace timeline: undo, redo, roll back a turn. */
+    Checkpoints,
+
+    /** Which branch the session's next turn is submitted on, and creating one. */
+    Branches,
+    CopyId,
+}
 
 /** The painted band inside a session row's 48 dp target. */
 const val SESSION_ROW_INK_TAG = "session_row_ink"
@@ -67,6 +77,13 @@ fun SessionRowItem(
     onLongClick: () -> Unit,
     onAction: (SessionRowAction) -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * False while the drawer is shut. The drawer stays composed when closed —
+     * several sweeps depend on that — so without this every running row kept
+     * a live animation behind the chat, for pixels nobody could see
+     * (verify-10 O5).
+     */
+    visible: Boolean = true,
 ) {
     val colors = Forge.colors
     val type = Forge.type
@@ -85,6 +102,12 @@ fun SessionRowItem(
         })
         add(CustomAccessibilityAction(stringResource(R.string.action_fork)) {
             onAction(SessionRowAction.Fork); true
+        })
+        add(CustomAccessibilityAction(stringResource(R.string.action_checkpoints)) {
+            onAction(SessionRowAction.Checkpoints); true
+        })
+        add(CustomAccessibilityAction(stringResource(R.string.branches_title)) {
+            onAction(SessionRowAction.Branches); true
         })
         // No Stop custom action: TalkBack must not offer a second turn Stop
         // that the screen does not have (E2, verify-6 O2).
@@ -130,7 +153,7 @@ fun SessionRowItem(
                 model = row.model,
                 provider = row.provider,
                 state = row.state,
-                animate = SessionVisualStateFold.animates(row.state) && motionEnabled(),
+                animate = visible && SessionVisualStateFold.animates(row.state) && motionEnabled(),
                 ringAgainst = colors.surface,
             )
             Text(

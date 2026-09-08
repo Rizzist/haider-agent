@@ -11,6 +11,7 @@ import ai.diffforge.haider.ui.daemon.ShellAvailability
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.TurnCancel
 import ai.diffforge.haider.transport.SessionConfig
+import ai.diffforge.haider.ui.checkpoints.CheckpointsUiState
 import ai.diffforge.haider.ui.chat.Message
 
 /**
@@ -22,6 +23,8 @@ sealed interface Overlay {
     data object None : Overlay
     data object ModelPicker : Overlay
     data object Attach : Overlay
+    /** What is held behind the running turn (`queue.list`). */
+    data object Queue : Overlay
     data object DaemonDetails : Overlay
     data object NewSessionWith : Overlay
 
@@ -31,7 +34,69 @@ sealed interface Overlay {
     data object Accounts : Overlay
     data class SessionActions(val sessionId: String) : Overlay
     data class Rename(val sessionId: String, val current: String) : Overlay
+
+    /** The cross-session subagent panel (lane 971-UI-fleet). */
+    data object Fleet : Overlay
+
+    /**
+     * One descendant's own transcript, read-only.
+     *
+     * [agentId] is the fleet's selection coordinate and [parentSessionId] the
+     * lineage the daemon published; both are carried verbatim so the screen can
+     * say "unknown" rather than infer either from the session it came from.
+     */
+    data class ChildTranscript(
+        val sessionId: String,
+        val agentId: String?,
+        val parentSessionId: String?,
+    ) : Overlay
+
+    // ---------- lane 971-UI-workflows ----------
+
+    /**
+     * The live workflow graph for one session. Three full screens, because each
+     * hosts a flow with its own back stack: a graph drills into child sessions,
+     * and authoring is a multi-step exchange with the daemon that a sheet
+     * dismissed by a stray tap would lose.
+     */
+    data class WorkflowGraph(val sessionId: String, val graphId: String? = null) : Overlay
+    data object Looms : Overlay
+    data class LoomAuthoring(
+        val kind: ai.diffforge.haider.ui.loom.LoomAuthorKind,
+    ) : Overlay
+    /** The session's durable workspace timeline, with undo/redo/rollback. */
+    data class Checkpoints(val sessionId: String) : Overlay
+
+    /** Which branch the session's next turn is submitted on, and creating one. */
+    data class Branches(val sessionId: String) : Overlay
 }
+
+/**
+ * What this client has read about subagents (lane 971-UI-fleet).
+ *
+ * [active] and [subagents] describe the session on screen; [panel] is keyed by
+ * the parent session each snapshot was read for, because a fleet snapshot is
+ * only ever true of the session it was requested for.
+ */
+data class FleetState(
+    val active: ai.diffforge.haider.ui.daemon.FleetLoad =
+        ai.diffforge.haider.ui.daemon.FleetLoad.Unread,
+    val subagents: ai.diffforge.haider.ui.daemon.SubagentLoad =
+        ai.diffforge.haider.ui.daemon.SubagentLoad.Unread,
+    val panel: Map<String, ai.diffforge.haider.ui.daemon.FleetLoad> = emptyMap(),
+    val panelLoading: Boolean = false,
+)
+
+/** One descendant's replayed transcript, mounted read-only beside its parent. */
+data class ChildTranscriptState(
+    val sessionId: String,
+    val agentId: String?,
+    val parentSessionId: String?,
+    val messages: List<Message> = emptyList(),
+    val loading: Boolean = true,
+    /** Set when the replay came back partial or unavailable; never hidden. */
+    val notice: String? = null,
+)
 
 /** The four (or three, below SDK 33) first-run steps. */
 /**
@@ -100,6 +165,19 @@ data class AppUiState(
     val permissions: PermissionSnapshot = PermissionSnapshot(),
     /** What the daemon lets the model do unattended (addition H6). */
     val permissionMode: PermissionMode = PermissionMode.Auto,
+    /** Blocks staged for the next turn.submit. */
+    val draftAttachments: List<ai.diffforge.haider.ui.daemon.Attachment> = emptyList(),
+    /** The daemon's own refusal code for an attachment or a submit. */
+    val attachmentNotice: String? = null,
+    /** True while the queue-or-steer chooser is open. */
+    val deliveryChooser: Boolean = false,
+    /** `queue.list`; absence is not an empty list. */
+    val queue: ai.diffforge.haider.ui.daemon.QueueSnapshot =
+        ai.diffforge.haider.ui.daemon.QueueSnapshot(),
+    val queueNotice: String? = null,
+    /** `usage.report`, for the footer. */
+    val usage: ai.diffforge.haider.ui.daemon.UsageSnapshot =
+        ai.diffforge.haider.ui.daemon.UsageSnapshot(),
     val sessions: List<SessionRow> = emptyList(),
     val paging: RosterPaging = RosterPaging(),
     val activeSessionId: String? = null,
@@ -129,6 +207,23 @@ data class AppUiState(
     val viewTab: SessionViewTab = SessionViewTab.Chat,
     val shell: ShellAvailability = ShellAvailability(),
     val answeredElsewhere: Set<String> = emptySet(),
+    /** Subagent reads for the visible session and for the fleet panel. */
+    val fleet: FleetState = FleetState(),
+    /** The read-only descendant transcript, non-null only while it is open. */
+    val childTranscript: ChildTranscriptState? = null,
+    /**
+     * Families the user has folded *away from* their default, so the default
+     * can follow the child count without a stale boolean stranding a choice
+     * ([SessionTree.expanded]).
+     */
+    val familyToggles: Set<String> = emptySet(),
+    /** The checkpoints sheet's state, for the one session it is open on. */
+    val checkpoints: CheckpointsUiState = CheckpointsUiState(),
+    /**
+     * Which branch each session's next `turn.submit` carries. An absent entry
+     * is the implicit main branch — never a branch id this client made up.
+     */
+    val branchSelection: Map<String, String> = emptyMap(),
 ) {
     val activeSession: SessionRow?
         get() = sessions.firstOrNull { it.id == activeSessionId }

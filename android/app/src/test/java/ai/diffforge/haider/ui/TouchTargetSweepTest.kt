@@ -3,6 +3,8 @@ package ai.diffforge.haider.ui
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.daemon.FakeScenario
+import ai.diffforge.haider.ui.fleet.subagentChipTag
+import ai.diffforge.haider.ui.loom.LoomAuthorKind
 import ai.diffforge.haider.ui.state.Overlay
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsNode
@@ -14,8 +16,12 @@ import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
+
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -139,6 +145,31 @@ class TouchTargetSweepTest {
     }
 
     @Test
+    fun `the accounts custom-server form has no undersized targets`() {
+        open(overlay = Overlay.Accounts)
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Add a custom server").performClick()
+        rule.waitForIdle()
+        rule.waitForIdle()
+        sweep("accounts custom-server form")
+    }
+
+    @Test
+    fun `the checkpoints sheet has no undersized targets`() {
+        val viewModel = open()
+        viewModel.openCheckpoints("s-nav")
+        rule.waitForIdle()
+        sweep("checkpoints")
+    }
+
+    @Test
+    fun `the branches sheet has no undersized targets`() {
+        open(overlay = Overlay.Branches("s-nav"))
+        sweep("branches")
+    }
+
+    @Test
     fun `the model picker sheet has no undersized targets`() {
         open(overlay = Overlay.Picker(PickerKind.Model))
         sweep("model picker")
@@ -154,6 +185,83 @@ class TouchTargetSweepTest {
     fun `the daemon details sheet has no undersized targets`() {
         open(overlay = Overlay.DaemonDetails)
         sweep("daemon details")
+    }
+
+    // ---------- delegation surfaces (lane 971-UI-fleet) ----------
+
+    @Test
+    fun `the subagent strip has no undersized targets`() {
+        open(FakeScenario.Fleet)
+        sweep("subagent strip")
+    }
+
+    @Test
+    fun `a drawer with nested families has no undersized targets`() {
+        open(FakeScenario.Fleet)
+        rule.onAllNodes(hasContentDescription("Open sessions", substring = true))
+            .onFirst()
+            .performClick()
+        rule.waitForIdle()
+        sweep("fleet drawer")
+    }
+
+    @Test
+    fun `the child transcript has no undersized targets`() {
+        open(FakeScenario.Fleet)
+        rule.onNodeWithTag(subagentChipTag("agent-auditor")).performScrollTo().performClick()
+        rule.waitForIdle()
+        sweep("child transcript")
+    }
+
+    @Test
+    fun `the fleet panel has no undersized targets`() {
+        val viewModel = open(FakeScenario.Fleet)
+        viewModel.openFleet()
+        rule.waitForIdle()
+        sweep("fleet panel")
+    }
+    // ---------- lane 971-UI-workflows ----------
+    //
+    // A DAG node is not an exception to the 48 dp rule because it is drawn on a
+    // canvas: the card IS its own target, and the sweep measures it like any
+    // other row.
+
+    @Test
+    fun `the workflow graph has no undersized targets`() {
+        open(FakeScenario.WorkflowRunning, Overlay.WorkflowGraph("s-nav"))
+        sweep("workflow graph")
+    }
+
+    @Test
+    fun `a selected workflow node has no undersized targets`() {
+        open(FakeScenario.WorkflowRunning, Overlay.WorkflowGraph("s-nav"))
+        rule.onNodeWithTag("workflow_node_IMPLEMENT").performClick()
+        rule.waitForIdle()
+        sweep("workflow node panel")
+    }
+
+    @Test
+    fun `the workflow ast view has no undersized targets`() {
+        open(FakeScenario.WorkflowRunning, Overlay.WorkflowGraph("s-nav"))
+        rule.onNodeWithText("AST").performClick()
+        rule.waitForIdle()
+        sweep("workflow ast")
+    }
+
+    @Test
+    fun `the looms screen has no undersized targets`() {
+        open(FakeScenario.WorkflowRunning, Overlay.Looms)
+        sweep("looms")
+    }
+
+    @Test
+    fun `the loom authoring screen has no undersized targets`() {
+        open(FakeScenario.WorkflowRunning, Overlay.LoomAuthoring(LoomAuthorKind.AgentType))
+        rule.onNodeWithTag("loom_authoring_prose").performTextReplacement("a planner")
+        rule.waitForIdle()
+        rule.onNodeWithText("Draft it").performClick()
+        rule.waitForIdle()
+        sweep("loom authoring")
     }
 
     @Test

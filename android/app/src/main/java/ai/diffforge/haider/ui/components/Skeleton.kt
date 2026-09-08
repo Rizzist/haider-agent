@@ -3,11 +3,6 @@ package ai.diffforge.haider.ui.components
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSpace
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.height
@@ -25,17 +20,9 @@ fun Skeleton(
     height: Dp = ForgeSpace.md,
 ) {
     val colors = Forge.colors
-    val alpha = if (motionEnabled()) {
-        val transition = rememberInfiniteTransition(label = "skeleton")
-        transition.animateFloat(
-            initialValue = 0.25f,
-            targetValue = 0.6f,
-            animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
-            label = "skeleton-alpha",
-        ).value
-    } else {
-        0.4f
-    }
+    // A placeholder is by definition on screen, so it subscribes; it still
+    // shares the one ticker (verify-10 O5).
+    val alpha = rememberPulse(active = true, low = 0.25f, high = 0.6f)
     Box(
         modifier
             .width(width)
