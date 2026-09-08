@@ -246,6 +246,20 @@ class FakeDaemonService(
         applyAutoPolicy()
     }
 
+    /**
+     * The scripted workflow/Loom daemon.
+     *
+     * Declared **above** the `init` block on purpose: property initialisers run
+     * in declaration order, and [apply] reaches for this on the workflow
+     * scenarios. Below the init it would still be null when the constructor
+     * ran, and only the two new scenarios would have found out.
+     *
+     * Public so a test can walk its recorded activation steps: the screen is
+     * driven by daemon facts arriving in order, and a test that cannot advance
+     * them can only ever check one frame of a live surface.
+     */
+    val workflowLoom = FakeWorkflowLoom()
+
     init {
         apply(scenario)
     }
@@ -390,15 +404,6 @@ class FakeDaemonService(
     }
 
     // ---------- workflow + Loom (lane 971-UI-workflows) ----------
-
-    /**
-     * The scripted workflow/Loom daemon.
-     *
-     * Public so a test can walk its recorded activation steps: the screen is
-     * driven by daemon facts arriving in order, and a test that cannot advance
-     * them can only ever check one frame of a live surface.
-     */
-    val workflowLoom = FakeWorkflowLoom()
 
     override suspend fun workflowGraphState(sessionId: String, graphId: String?): WorkflowGraphRead {
         calls += "${WorkflowRpcAdapter.METHOD_GRAPH_STATE}:$sessionId"

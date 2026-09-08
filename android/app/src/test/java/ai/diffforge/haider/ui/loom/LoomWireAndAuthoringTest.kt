@@ -284,6 +284,20 @@ class LoomWireAndAuthoringTest {
     }
 
     @Test
+    fun `a transport failure keeps the text and the fence`() {
+        val editing = LoomAuthoringMachine.edited(
+            LoomAuthoringMachine.drafted(draft()),
+            "{\"id\":\"planner\"}",
+        )
+        val failed = LoomAuthoringMachine.failed(editing, "connection_lost")
+        // A failed call is the worst moment to lose what somebody typed.
+        assertEquals("{\"id\":\"planner\"}", LoomAuthoringMachine.textOf(failed))
+        assertEquals("authoring-1", LoomAuthoringMachine.draftOf(failed)!!.authoringId)
+        // And it stays editable, so the next revise has a fence to echo.
+        assertTrue(LoomAuthoringMachine.edited(failed, "{}") is LoomAuthoringState.Editing)
+    }
+
+    @Test
     fun `revise without a draft sends nothing at all`() {
         // There is no `authoring_id` to echo, and one cannot be made up.
         assertEquals(

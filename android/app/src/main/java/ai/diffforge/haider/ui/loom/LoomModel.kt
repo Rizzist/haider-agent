@@ -228,8 +228,17 @@ sealed interface LoomAuthoringState {
         val reason: String?,
     ) : LoomAuthoringState
 
-    /** A transport or daemon error, with the daemon's own code. */
-    data class Failed(val reason: String, val draft: LoomAuthorDraft? = null) : LoomAuthoringState
+    /**
+     * A transport or daemon error, with the daemon's own code.
+     *
+     * The user's exact text rides along. A failed call is the worst moment to
+     * lose what somebody typed, and the draft is still editable.
+     */
+    data class Failed(
+        val reason: String,
+        val draft: LoomAuthorDraft? = null,
+        val text: String = "",
+    ) : LoomAuthoringState
 
     /**
      * The daemon does not offer authoring, or has no provider/model to draft
@@ -258,6 +267,7 @@ object LoomAuthoringMachine {
         is LoomAuthoringState.Editing -> state.text
         is LoomAuthoringState.Confirming -> state.text
         is LoomAuthoringState.Refused -> state.text
+        is LoomAuthoringState.Failed -> state.text.ifEmpty { state.draft?.text.orEmpty() }
         is LoomAuthoringState.Confirmed -> state.receipt.canonicalText
         else -> ""
     }
@@ -273,6 +283,11 @@ object LoomAuthoringMachine {
         // A refusal is still editable: fixing the text is the whole point.
         is LoomAuthoringState.Refused ->
             LoomAuthoringState.Editing(draft = state.draft, text = text)
+        // So is a failure, as long as its fence survived. Without one there is
+        // nothing to revise against, and the state stands.
+        is LoomAuthoringState.Failed -> state.draft
+            ?.let { LoomAuthoringState.Editing(draft = it, text = text) }
+            ?: state
         else -> state
     }
 
@@ -287,6 +302,9 @@ object LoomAuthoringMachine {
         is LoomAuthoringState.Editing -> state.copy(busy = true)
         is LoomAuthoringState.Refused ->
             LoomAuthoringState.Editing(draft = state.draft, text = state.text, busy = true)
+        is LoomAuthoringState.Failed -> state.draft
+            ?.let { LoomAuthoringState.Editing(draft = it, text = textOf(state), busy = true) }
+            ?: state
         else -> state
     }
 
@@ -338,7 +356,7 @@ object LoomAuthoringMachine {
     }
 
     fun failed(state: LoomAuthoringState, reason: String): LoomAuthoringState =
-        LoomAuthoringState.Failed(reason, draftOf(state))
+        LoomAuthoringState.Failed(reason, draftOf(state), textOf(state))
 
     /** Every error the user should see: the draft's, plus a refusal's. */
     fun errorsOf(state: LoomAuthoringState): List<LoomAuthorError> = when (state) {
