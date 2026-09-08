@@ -7300,6 +7300,7 @@ impl HarnessActor {
                         let fallback = tokio::select! {
                             biased;
                             () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                            error = context.idle.wait() => return Err(DriveError::Provider(error)),
                             resolution = resolver.resolve_fallback(&current_account, &error) => resolution,
                         }
                         .map_err(DriveError::Account)?;

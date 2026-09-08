@@ -1,9 +1,12 @@
 #![allow(clippy::expect_used)]
 //! Paused-time bounds come directly from the idle budget and scripted waits.
 use async_trait::async_trait;
-use haider_core::{HarnessActor, HarnessConfig, MemoryStore, SubmitTurn};
-use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::{DeviceId, SessionId};
+use haider_core::{
+    HarnessActor, HarnessConfig, MemoryStore, ProviderAttemptDecision, ProviderAttemptResolver,
+    SubmitTurn,
+};
+use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::ids::{CredentialAlias, DeviceId, SessionId};
 use haider_protocol::provider::{CapabilityDoc, FinishReason};
 use haider_protocol::state::RunState;
 use haider_provider::{
@@ -54,6 +57,14 @@ impl Provider for IdleProvider {
 
 async fn run(provider: Arc<IdleProvider>) -> (haider_core::TurnOutcome, Duration) {
     let config = HarnessConfig::for_session(SessionId::new("idle"), DeviceId::new("idle"), 1, 1);
+    run_with_config(provider, config).await
+}
+
+async fn run_with_config(
+    provider: Arc<IdleProvider>,
+    config: HarnessConfig,
+) -> (haider_core::TurnOutcome, Duration) {
+    let session_id = config.session_id.clone();
     let store = Arc::new(MemoryStore::new());
     let handle = HarnessActor::spawn(config, provider, store.clone());
     let started = Instant::now();
@@ -82,7 +93,7 @@ async fn run(provider: Arc<IdleProvider>) -> (haider_core::TurnOutcome, Duration
         .expect("durable terminal");
         assert_eq!(terminal.terminal_kind, "timeout");
         assert_eq!(terminal.error_code, Some("idle_timeout"));
-        let events = store.events(&SessionId::new("idle")).await;
+        let events = store.events(&session_id).await;
         let evidence = events
             .iter()
             .filter_map(|event| {
@@ -122,6 +133,78 @@ fn failure(delay_ms: u64) -> FakeStep {
         kind: ProviderErrorKind::Transport,
         message: "connection reset by fake peer".into(),
         retry_after_ms: Some(delay_ms),
+    }
+}
+
+#[derive(Debug)]
+struct DelayedStopFallbackResolver {
+    delay: Duration,
+}
+
+#[async_trait]
+impl ProviderAttemptResolver for DelayedStopFallbackResolver {
+    async fn resolve(
+        &self,
+        _account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        Ok(ProviderAttemptDecision::Stop)
+    }
+
+    async fn resolve_fallback(
+        &self,
+        _account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(ProviderAttemptDecision::Stop)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_fallback_wait_shares_idle_budget_and_preserves_fast_resolution() {
+    for delay in [BUDGET / 4, BUDGET * 2] {
+        let mut config =
+            HarnessConfig::for_session(SessionId::new("idle"), DeviceId::new("idle"), 1, 1);
+        config.usage_account = Some(CredentialAlias::new("synthetic-account"));
+        config.provider_attempt_resolver = Some(Arc::new(DelayedStopFallbackResolver { delay }));
+        let provider = provider(vec![FakeStep::Error {
+            kind: ProviderErrorKind::Authentication,
+            message: "synthetic authentication rejection".into(),
+            retry_after_ms: None,
+        }]);
+        let (outcome, elapsed) = run_with_config(provider.clone(), config).await;
+        let error = outcome.error.expect("terminal error");
+        eprintln!(
+            "stop fallback measurement: delay_ms={} elapsed_ms={} code={:?} attempts={}",
+            delay.as_millis(),
+            elapsed.as_millis(),
+            error.code,
+            provider.fake.requests().len()
+        );
+        assert_eq!(outcome.state, RunState::Errored);
+        assert_eq!(provider.fake.requests().len(), 1);
+        assert!(!error.retryable);
+        assert_eq!(elapsed, delay.min(BUDGET));
+        if delay < BUDGET {
+            // A prompt Stop resolution surfaces the original provider failure.
+            assert_eq!(error.code, ErrorCode::ProviderError);
+        } else {
+            assert_eq!(error.code, ErrorCode::IdleTimeout);
+            let details = error.details.expect("typed details");
+            assert_eq!(details["reason"], "idle_timeout");
+            let idle = &details["idle_timeout"];
+            assert_eq!(idle["attempts"], 1);
+            assert_eq!(idle["elapsed_ms"], BUDGET.as_millis() as u64);
+            assert_eq!(idle["idle_elapsed_ms"], idle["elapsed_ms"]);
+            assert_eq!(idle["budget_ms"], idle["elapsed_ms"]);
+            assert_eq!(idle["cause"]["kind"], "authentication");
+            assert_eq!(
+                idle["cause"]["message"],
+                "synthetic authentication rejection"
+            );
+            assert_eq!(idle["cause"]["retryable"], false);
+        }
     }
 }
 
