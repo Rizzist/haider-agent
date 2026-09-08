@@ -373,7 +373,42 @@ interface DaemonService {
     /** `provider.list`; also the door the provider picker refreshes through. */
     suspend fun refreshProviders()
     suspend fun selectProvider(provider: String)
-    suspend fun send(sessionId: String, text: String)
+    /**
+     * `turn.submit`. [attachments] and [mode] are defaulted, so every existing
+     * caller and every sibling implementation keeps compiling; the wire
+     * default for mode is Steer (`haider-protocol/lib.rs:174`).
+     *
+     * Refusals come back as [AttachmentRefused] carrying the daemon's own code
+     * — `too_many_attachments` or `attachments_too_large`.
+     */
+    suspend fun send(
+        sessionId: String,
+        text: String,
+        attachments: List<Attachment> = emptyList(),
+        mode: Delivery = Delivery.Steer,
+    )
+
+    /**
+     * Puts one local file into the daemon's CAS and returns the block that
+     * names it. Null means the daemon would not take it; the caller shows the
+     * reason it reported rather than guessing.
+     */
+    suspend fun stageAttachment(bytes: ByteArray, mime: String, name: String?): Attachment?
+
+    /** CAS bytes for a thumbnail. Null when the artifact is gone. */
+    suspend fun attachmentBytes(artifact: String): ByteArray?
+
+    /** `queue.list` plus its deltas; absence is not an empty list. */
+    val queue: StateFlow<QueueSnapshot>
+    suspend fun refreshQueue(sessionId: String)
+
+    /** Both fenced by the revision they were read at. */
+    suspend fun removeQueued(sessionId: String, id: String, revision: Long)
+    suspend fun promoteQueued(sessionId: String, id: String, revision: Long)
+
+    /** `usage.report`. Read-only, and an estimate is labelled as one. */
+    val usage: StateFlow<UsageSnapshot>
+    suspend fun refreshUsage()
 
     /**
      * `session.attach{after_seq:0, mode:"view"}` replay, paged through

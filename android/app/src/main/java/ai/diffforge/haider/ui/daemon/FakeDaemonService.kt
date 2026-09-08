@@ -614,10 +614,42 @@ class FakeDaemonService(
         return "vaultref-menu-${secret.size}"
     }
 
-    override suspend fun send(sessionId: String, text: String) {
-        calls += "chat.send:$sessionId"
+    /** Set to make the next submit refuse, with the daemon's own code. */
+    var nextSendRefusal: String? = null
+
+    /** How many attachments the fake accepts, mirroring the daemon's ceiling. */
+    var attachmentCeiling = 4
+
+    override suspend fun send(
+        sessionId: String,
+        text: String,
+        attachments: List<Attachment>,
+        mode: Delivery,
+    ) {
+        calls += "turn.submit:$sessionId:${mode.wire}:${attachments.size}"
+        nextSendRefusal?.let { code -> nextSendRefusal = null; throw TurnRefused(code) }
+        if (attachments.size > attachmentCeiling) {
+            throw TurnRefused(AttachmentLimits.TOO_MANY)
+        }
+        val running = _sessions.value.firstOrNull { it.id == sessionId }?.runId != null
+        if (running && mode == Delivery.Queue) {
+            // Held behind the active turn, exactly as queue.list would report.
+            val next = _queue.value
+            _queue.value = next.copy(
+                revision = next.revision + 1,
+                rows = next.rows + QueuedMessage(
+                    id = "q-${next.rows.size + 1}",
+                    text = text,
+                    delivery = Delivery.Queue,
+                    ordinal = next.rows.size + 1,
+                    createdAtMs = nowMs,
+                ),
+                supported = true,
+            )
+            return
+        }
         val messages = transcripts.getOrPut(sessionId) { mutableListOf() }
-        messages += Message(nextMessageId++, Role.User, text)
+        messages += Message(nextMessageId++, Role.User, text, attachments = attachments)
         messages += Message(
             id = nextMessageId++,
             role = Role.Agent,
@@ -632,6 +664,93 @@ class FakeDaemonService(
                 it
             }
         }
+        publishTranscript(sessionId)
+    }
+
+    override suspend fun stageAttachment(
+        bytes: ByteArray,
+        mime: String,
+        name: String?,
+    ): Attachment? {
+        calls += "vault.stage_attachment:$mime:${bytes.size}"
+        if (bytes.size > MAX_ATTACHMENT_BYTES) return null
+        val artifact = "blake3:${"%064x".format(bytes.size.toBigInteger())}"
+        cas[artifact] = bytes
+        return when {
+            mime.startsWith("image/") -> Attachment.Image(artifact, mime, width = 1024, height = 768)
+            name != null -> Attachment.TextFile(artifact, name, lines = 42)
+            else -> Attachment.PastedText(artifact, lines = 12)
+        }
+    }
+
+    override suspend fun attachmentBytes(artifact: String): ByteArray? = cas[artifact]
+
+    private val cas = mutableMapOf<String, ByteArray>()
+
+    private val _queue = MutableStateFlow(QueueSnapshot(supported = true))
+    override val queue: StateFlow<QueueSnapshot> = _queue.asStateFlow()
+
+    override suspend fun refreshQueue(sessionId: String) {
+        calls += "queue.list:$sessionId"
+    }
+
+    override suspend fun removeQueued(sessionId: String, id: String, revision: Long) {
+        calls += "queue.remove:$sessionId:$id:$revision"
+        // Fenced: a stale revision is refused, never applied to whatever moved
+        // into that row.
+        if (revision != _queue.value.revision) throw StaleQueueRevision(revision)
+        _queue.value = _queue.value.let { snapshot ->
+            snapshot.copy(
+                revision = snapshot.revision + 1,
+                rows = snapshot.rows.filterNot { it.id == id },
+            )
+        }
+    }
+
+    override suspend fun promoteQueued(sessionId: String, id: String, revision: Long) {
+        calls += "queue.promote_steer:$sessionId:$id:$revision"
+        if (revision != _queue.value.revision) throw StaleQueueRevision(revision)
+        _queue.value = _queue.value.let { snapshot ->
+            snapshot.copy(
+                revision = snapshot.revision + 1,
+                rows = snapshot.rows.filterNot { it.id == id },
+            )
+        }
+    }
+
+    private val _usage = MutableStateFlow(
+        UsageSnapshot(
+            generatedAtMs = nowMs,
+            supported = true,
+            accounts = listOf(
+                AccountUsage(
+                    provider = "anthropic",
+                    alias = "work",
+                    identity = "you@anthropic",
+                    plan = "max",
+                    usage = TokenUsage(
+                        inputTokens = 184_200,
+                        outputTokens = 39_400,
+                        reasoningTokens = 12_100,
+                        cachedTokens = 96_800,
+                        estCostUsd = 2.41,
+                    ),
+                ),
+            ),
+        ),
+    )
+    override val usage: StateFlow<UsageSnapshot> = _usage.asStateFlow()
+
+    override suspend fun refreshUsage() {
+        calls += "usage.report"
+    }
+
+    fun setQueue(snapshot: QueueSnapshot) {
+        _queue.value = snapshot
+    }
+
+    fun setUsage(snapshot: UsageSnapshot) {
+        _usage.value = snapshot
     }
 
     /**
@@ -996,6 +1115,9 @@ class FakeDaemonService(
     )
 
     companion object {
+        /** The fake's own byte ceiling; the daemon's is its own business. */
+        const val MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+
         /** What the allowed call returned, rendered verbatim in the tool row. */
         const val AUTO_SMS_RESULT =
             "2 messages\n  Amir  \"4 pm still works\"\n  Bank  \"Payment received\""

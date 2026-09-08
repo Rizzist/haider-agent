@@ -22,6 +22,8 @@ sealed interface Overlay {
     data object None : Overlay
     data object ModelPicker : Overlay
     data object Attach : Overlay
+    /** What is held behind the running turn (`queue.list`). */
+    data object Queue : Overlay
     data object DaemonDetails : Overlay
     data object NewSessionWith : Overlay
 
@@ -100,6 +102,19 @@ data class AppUiState(
     val permissions: PermissionSnapshot = PermissionSnapshot(),
     /** What the daemon lets the model do unattended (addition H6). */
     val permissionMode: PermissionMode = PermissionMode.Auto,
+    /** Blocks staged for the next turn.submit. */
+    val draftAttachments: List<ai.diffforge.haider.ui.daemon.Attachment> = emptyList(),
+    /** The daemon's own refusal code for an attachment or a submit. */
+    val attachmentNotice: String? = null,
+    /** True while the queue-or-steer chooser is open. */
+    val deliveryChooser: Boolean = false,
+    /** `queue.list`; absence is not an empty list. */
+    val queue: ai.diffforge.haider.ui.daemon.QueueSnapshot =
+        ai.diffforge.haider.ui.daemon.QueueSnapshot(),
+    val queueNotice: String? = null,
+    /** `usage.report`, for the footer. */
+    val usage: ai.diffforge.haider.ui.daemon.UsageSnapshot =
+        ai.diffforge.haider.ui.daemon.UsageSnapshot(),
     val sessions: List<SessionRow> = emptyList(),
     val paging: RosterPaging = RosterPaging(),
     val activeSessionId: String? = null,

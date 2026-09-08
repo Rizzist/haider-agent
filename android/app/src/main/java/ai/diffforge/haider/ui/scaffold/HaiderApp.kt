@@ -5,11 +5,14 @@ import ai.diffforge.haider.ui.accounts.AccountsRepository
 import ai.diffforge.haider.ui.accounts.OAuthAttemptController
 import ai.diffforge.haider.ui.chat.PickerKind
 import ai.diffforge.haider.ui.chat.SessionPickerSheet
+import ai.diffforge.haider.ui.daemon.Delivery
 import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.InputRequiredCard
 import ai.diffforge.haider.ui.chat.ModelPicker
+import ai.diffforge.haider.ui.chat.QueuePanel
+import ai.diffforge.haider.ui.chat.DeliveryChooser
 import ai.diffforge.haider.ui.chat.ShellView
 import ai.diffforge.haider.ui.chat.Transcript
 import ai.diffforge.haider.ui.drawer.RenameSheet
@@ -86,6 +89,11 @@ import kotlinx.coroutines.launch
 @Composable
 fun HaiderApp(
     viewModel: ChatViewModel,
+    /**
+     * Only for fetching attachment bytes by CAS reference. Everything else
+     * goes through the view model; this is a read door, not a second channel.
+     */
+    service: ai.diffforge.haider.ui.daemon.DaemonService? = null,
     accounts: AccountsRepository,
     oauth: OAuthAttemptController,
     appVersion: String,
@@ -257,6 +265,13 @@ fun HaiderApp(
                 }
             },
         ) {
+            if (state.deliveryChooser) {
+                DeliveryChooser(
+                    onSteer = { viewModel.send(Delivery.Steer) },
+                    onQueue = { viewModel.send(Delivery.Queue) },
+                    onDismiss = viewModel::dismissDelivery,
+                )
+            }
             Column(
                 Modifier
                     .fillMaxSize()
@@ -403,6 +418,7 @@ fun HaiderApp(
                             }
                             // One Stop control, and it lives in the composer.
                             Transcript(
+                                service = service,
                                 messages = state.messages,
                                 onRetry = { viewModel.send() },
                                 modifier = Modifier.fillMaxSize(),
@@ -449,7 +465,21 @@ fun HaiderApp(
                         chip = chip,
                         effort = state.models?.current?.effort,
                         permissionMode = state.permissionMode,
-                        onSend = { viewModel.send() },
+                        attachments = state.draftAttachments,
+                        attachmentNotice = state.attachmentNotice,
+                        service = service,
+                        queued = state.queue.rows.size,
+                        onRemoveAttachment = viewModel::removeAttachment,
+                        onOpenQueue = { viewModel.openOverlay(Overlay.Queue) },
+                        onSend = {
+                            // Send-while-running is a real choice, so it is
+                            // asked rather than assumed (DeliveryMode).
+                            if (composerState.showStop) {
+                                viewModel.askDelivery()
+                            } else {
+                                viewModel.send()
+                            }
+                        },
                         onStop = { viewModel.stopTurn() },
                         onStartDaemon = { viewModel.startDaemon() },
                         onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
@@ -532,6 +562,16 @@ private fun Overlays(
             onRefresh = { viewModel.refreshModels() },
             onDismiss = viewModel::closeOverlay,
         )
+        Overlay.Queue -> QueuePanel(
+            snapshot = state.queue,
+            notice = state.queueNotice,
+            onPromote = viewModel::promoteQueued,
+            onRemove = viewModel::removeQueued,
+            onDismiss = {
+                viewModel.dismissQueueNotice()
+                viewModel.closeOverlay()
+            },
+        )
         Overlay.Attach -> AttachSheet(
             onDismiss = viewModel::closeOverlay,
             onScreenshot = {
@@ -541,6 +581,10 @@ private fun Overlays(
             onPickFile = {
                 viewModel.closeOverlay()
                 onSystemAction(SystemAction.PickFile)
+            },
+            onPickImage = {
+                viewModel.closeOverlay()
+                onSystemAction(SystemAction.PickImage)
             },
         )
         Overlay.DaemonDetails -> DaemonDetailsSheet(
@@ -586,6 +630,9 @@ sealed interface SystemAction {
     data object RequestScreenCapture : SystemAction
     data object Screenshot : SystemAction
     data object PickFile : SystemAction
+
+    /** The system photo picker, for turn.submit attachments. */
+    data object PickImage : SystemAction
     data class CopyText(val text: String) : SystemAction
 }
 

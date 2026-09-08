@@ -70,6 +70,8 @@ fun Transcript(
     messages: List<Message>,
     onRetry: () -> Unit = {},
     modifier: Modifier = Modifier,
+    /** Only for fetching attachment bytes by CAS ref; null renders tiles bare. */
+    service: ai.diffforge.haider.ui.daemon.DaemonService? = null,
 ) {
     val listState = rememberLazyListState()
     var stickToBottom by remember { mutableStateOf(true) }
@@ -113,8 +115,8 @@ fun Transcript(
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
                 Box(modifier = Modifier.widthIn(max = ForgeSize.readableMax).fillMaxWidth()) {
                     when (message.role) {
-                        Role.User -> UserBubble(message)
-                        Role.Agent -> AgentTurn(message, onRetry)
+                        Role.User -> UserBubble(message, service)
+                        Role.Agent -> AgentTurn(message, onRetry, service)
                     }
                 }
             }
@@ -123,7 +125,7 @@ fun Transcript(
 }
 
 @Composable
-private fun UserBubble(message: Message) {
+private fun UserBubble(message: Message, service: ai.diffforge.haider.ui.daemon.DaemonService?) {
     val colors = Forge.colors
     val type = Forge.type
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
@@ -141,14 +143,25 @@ private fun UserBubble(message: Message) {
                     )
                     .padding(horizontal = ForgeSpace.lg, vertical = ForgeSpace.md),
             ) {
-                Text(message.text, style = type.userBody, color = colors.chatText)
+                Column(verticalArrangement = Arrangement.spacedBy(ForgeSpace.sm)) {
+                    // Thumbnails above the text, the way the desktop mirrors
+                    // an attached image back at you.
+                    AttachmentStrip(message.attachments, service)
+                    if (message.text.isNotEmpty()) {
+                        Text(message.text, style = type.userBody, color = colors.chatText)
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun AgentTurn(message: Message, onRetry: () -> Unit) {
+private fun AgentTurn(
+    message: Message,
+    onRetry: () -> Unit,
+    service: ai.diffforge.haider.ui.daemon.DaemonService?,
+) {
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         BrandMarkOnly(
             model = null,
@@ -164,7 +177,10 @@ private fun AgentTurn(message: Message, onRetry: () -> Unit) {
                 if (message.thinking.isNotEmpty()) ThinkingFold(message)
                 if (message.tools.isNotEmpty()) ToolCluster(message.id, message.tools, message.streaming)
                 if (message.text.isNotEmpty() || message.streaming) AssistantProse(message)
+                AttachmentStrip(message.attachments, service)
                 message.error?.let { ErrorCard(it, message.errorRetryable, onRetry) }
+                // The turn's own tokens, when usage.report attributed any.
+                message.usage?.let { UsageLine(it) }
             }
         }
     }

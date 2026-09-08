@@ -94,6 +94,14 @@ fun Composer(
     chip: ModelChipState,
     effort: String?,
     permissionMode: PermissionMode,
+    /** Blocks staged for this turn, mirrored back above the field. */
+    attachments: List<ai.diffforge.haider.ui.daemon.Attachment> = emptyList(),
+    /** The daemon's own refusal code, when it refused one. */
+    attachmentNotice: String? = null,
+    service: ai.diffforge.haider.ui.daemon.DaemonService? = null,
+    queued: Int = 0,
+    onRemoveAttachment: (String) -> Unit = {},
+    onOpenQueue: () -> Unit = {},
     onSend: () -> Unit,
     onStop: () -> Unit,
     onStartDaemon: () -> Unit,
@@ -159,6 +167,43 @@ fun Composer(
             }
         }
 
+        // The input mirror: what is going with this turn, above the field.
+        if (attachments.isNotEmpty()) {
+            AttachmentStrip(
+                attachments = attachments,
+                service = service,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        attachmentNotice?.let { code ->
+            Text(
+                // The daemon's word, not ours.
+                code,
+                style = type.sessionMeta,
+                color = colors.amber,
+                maxLines = 2,
+                modifier = Modifier.padding(start = ForgeSpace.xl),
+            )
+        }
+        if (queued > 0) {
+            Row(
+                modifier = Modifier
+                    .heightIn(min = ForgeSize.touch)
+                    .clickable(onClick = onOpenQueue)
+                    .semantics {
+                        contentDescription = "$queued waiting to send"
+                        role = Role.Button
+                    }
+                    .padding(horizontal = ForgeSpace.xl),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "$queued waiting to send",
+                    style = type.sessionMeta,
+                    color = colors.accentSoft,
+                )
+            }
+        }
         Box(modifier = Modifier.fillMaxWidth()) {
             BasicTextField(
                 value = text,

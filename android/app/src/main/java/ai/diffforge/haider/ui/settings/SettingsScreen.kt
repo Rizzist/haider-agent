@@ -57,6 +57,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.testTag
 
 /**
  * The only full screen in the app: it hosts flows that leave it (Accessibility,
@@ -66,6 +67,9 @@ import androidx.compose.ui.text.style.TextOverflow
  * `ConnectCard` is gone, because in 971 there is nothing to connect to — the
  * daemon is in the app.
  */
+/** The read-only usage.report line in the daemon card. */
+const val USAGE_FOOTER_TAG = "usage_footer"
+
 @Composable
 fun SettingsScreen(
     state: AppUiState,
@@ -156,6 +160,9 @@ fun SettingsScreen(
                     style = type.sessionMeta,
                     color = colors.textMuted,
                 )
+                // usage.report, read-only. The protocol calls est_cost_usd
+                // "never a bill — an estimate", and so does this line.
+                UsageFooter(state.usage)
                 Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
                     if (state.daemon is DaemonStatus.Running) {
                         ForgeButton(
@@ -409,4 +416,58 @@ internal fun NavigationRow(
             )
         }
     }
+}
+
+/**
+ * `usage.report` totals (`usage.rs:296`).
+ *
+ * Absence is stated, not drawn as zeros: a daemon that does not advertise
+ * `usage_report_v1` says so.
+ */
+@Composable
+private fun UsageFooter(snapshot: ai.diffforge.haider.ui.daemon.UsageSnapshot) {
+    val colors = Forge.colors
+    val type = Forge.type
+    if (!snapshot.supported) {
+        Text(
+            stringResource(R.string.usage_footer_unavailable),
+            style = type.sessionMeta,
+            color = colors.textMuted,
+            modifier = Modifier.testTag(USAGE_FOOTER_TAG),
+        )
+        return
+    }
+    val totals = snapshot.totals
+    Column(modifier = Modifier.testTag(USAGE_FOOTER_TAG)) {
+        Text(
+            buildString {
+                append(stringResource(R.string.usage_footer_label))
+                append("  ")
+                append(tokens(totals.inputTokens))
+                append(" in · ")
+                append(tokens(totals.outputTokens))
+                append(" out")
+                if (totals.cachedTokens > 0) {
+                    append(" · ")
+                    append(tokens(totals.cachedTokens))
+                    append(" cached")
+                }
+            },
+            style = type.sessionMeta,
+            color = colors.textMuted,
+        )
+        totals.estCostUsd?.let { cost ->
+            Text(
+                "~$" + "%.2f".format(cost) + " " + stringResource(R.string.usage_footer_estimate),
+                style = type.selectLabel,
+                color = colors.textMuted,
+            )
+        }
+    }
+}
+
+private fun tokens(value: Long): String = when {
+    value >= 1_000_000 -> "%.1fM".format(value / 1_000_000.0)
+    value >= 1_000 -> "%.1fk".format(value / 1_000.0)
+    else -> value.toString()
 }

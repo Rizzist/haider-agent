@@ -84,6 +84,10 @@ object ForgeSize {
     val activityDot = 5.dp
     /** The 24x24 viewport every ported vendor mark is drawn on. */
     val markViewport = 24.dp
+    /** An attachment thumbnail in the transcript or the composer strip. */
+    val thumbnail = 56.dp
+    /** The name column inside a file tile. */
+    val attachmentLabel = 92.dp
     /** Chip and composer-select ink: 30 dp inside a 48 dp target (R2). */
     val chip = 30.dp
     val segmented = 36.dp

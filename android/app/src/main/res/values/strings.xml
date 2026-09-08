@@ -10,6 +10,10 @@
     <string name="app_subtitle_setup">Setting up · step %1$d of %2$d</string>
     <string name="header_new_session">New session</string>
     <string name="cd_refresh_session">Refresh</string>
+    <string name="attach_image">Image</string>
+    <string name="usage_footer_label">Tokens</string>
+    <string name="usage_footer_estimate">estimate, not a bill</string>
+    <string name="usage_footer_unavailable">This daemon does not report usage.</string>
     <string name="empty_session_title">No session yet.</string>
     <string name="empty_session_body">Send a message below to start.</string>
     <string name="select_label_model">Model</string>

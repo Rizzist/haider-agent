@@ -1,6 +1,9 @@
 package ai.diffforge.haider.ui.chat
 
 import ai.diffforge.haider.ui.daemon.DaemonService
+import ai.diffforge.haider.ui.daemon.AttachmentLimits
+import ai.diffforge.haider.ui.daemon.Delivery
+import ai.diffforge.haider.ui.daemon.TurnRefused
 import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.daemon.MissingRunCoordinates
 import ai.diffforge.haider.ui.daemon.MenuAnswerInput
@@ -132,6 +135,12 @@ class ChatViewModel(
         viewModelScope.launch {
             service.permissionMode.collect { mode -> update { it.copy(permissionMode = mode) } }
         }
+        viewModelScope.launch {
+            service.queue.collect { snapshot -> update { it.copy(queue = snapshot) } }
+        }
+        viewModelScope.launch {
+            service.usage.collect { snapshot -> update { it.copy(usage = snapshot) } }
+        }
     }
 
     // ---------- daemon lifecycle ----------
@@ -198,16 +207,30 @@ class ChatViewModel(
         update { it.copy(draft = text) }
     }
 
-    fun send() = viewModelScope.launch {
+    fun send(mode: Delivery = Delivery.Steer) = viewModelScope.launch {
         val current = _state.value
         val text = current.draft.trim()
-        if (text.isEmpty()) return@launch
+        val attachments = current.draftAttachments
+        if (text.isEmpty() && attachments.isEmpty()) return@launch
         if (current.daemon !is DaemonStatus.Running) service.start()
         val id = current.activeSessionId ?: service.createSession()
-        service.send(id, text)
+        // The daemon's refusal is the daemon's to word: too_many_attachments
+        // and attachments_too_large are its codes, shown verbatim.
+        val refusal = runCatching { service.send(id, text, attachments, mode) }
+            .exceptionOrNull()
+        if (refusal != null) {
+            update {
+                it.copy(
+                    attachmentNotice = (refusal as? TurnRefused)?.code ?: refusal.message,
+                    deliveryChooser = false,
+                )
+            }
+            return@launch
+        }
         drafts[id] = ""
-        update { it.copy(draft = "") }
-        loadTranscript(id)
+        update {
+            it.copy(draft = "", draftAttachments = emptyList(), deliveryChooser = false)
+        }
     }
 
     /**
@@ -359,6 +382,63 @@ class ChatViewModel(
     }
 
     fun dismissSelectionRefusal() = update { it.copy(selectionRefusal = null) }
+
+    // ---------- attachments ----------
+
+    /**
+     * Stages one local file and adds the block it returns to the draft.
+     *
+     * A null return is the daemon refusing to take it; the reason is shown
+     * rather than guessed, and the draft is left alone.
+     */
+    fun attach(bytes: ByteArray, mime: String, name: String?) = viewModelScope.launch {
+        val staged = service.stageAttachment(bytes, mime, name)
+        if (staged == null) {
+            update { it.copy(attachmentNotice = AttachmentLimits.TOO_LARGE) }
+            return@launch
+        }
+        update { it.copy(draftAttachments = it.draftAttachments + staged) }
+    }
+
+    fun removeAttachment(artifact: String) = update {
+        it.copy(draftAttachments = it.draftAttachments.filterNot { block -> block.artifact == artifact })
+    }
+
+    fun dismissAttachmentNotice() = update { it.copy(attachmentNotice = null) }
+
+    // ---------- steering ----------
+
+    /** Opens the queue-or-steer chooser; only shown while a turn is running. */
+    fun askDelivery() = update { it.copy(deliveryChooser = true) }
+
+    fun dismissDelivery() = update { it.copy(deliveryChooser = false) }
+
+    // ---------- the queue ----------
+
+    fun refreshQueue() = viewModelScope.launch {
+        _state.value.activeSessionId?.let { service.refreshQueue(it) }
+    }
+
+    /**
+     * Both queue mutations carry the revision the row was read at, so a stale
+     * tap is refused by the daemon instead of hitting whatever moved into that
+     * position.
+     */
+    fun removeQueued(id: String) = viewModelScope.launch {
+        val sessionId = _state.value.activeSessionId ?: return@launch
+        val snapshot = _state.value.queue
+        runCatching { service.removeQueued(sessionId, id, snapshot.revision) }
+            .onFailure { error -> update { it.copy(queueNotice = error.message) } }
+    }
+
+    fun promoteQueued(id: String) = viewModelScope.launch {
+        val sessionId = _state.value.activeSessionId ?: return@launch
+        val snapshot = _state.value.queue
+        runCatching { service.promoteQueued(sessionId, id, snapshot.revision) }
+            .onFailure { error -> update { it.copy(queueNotice = error.message) } }
+    }
+
+    fun dismissQueueNotice() = update { it.copy(queueNotice = null) }
 
     /**
      * The daemon owns the policy, so this is a request, not a local toggle:
