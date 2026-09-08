@@ -416,14 +416,22 @@ fn session_screen_has_header_and_composer_gap() {
     );
     // Agent blocks carry the ■ haider name header.
     assert!(text.contains("■ haider"));
-    // Gap row: the line directly above the status bar is empty — the
-    // composer must never sit ON the bottom bar (owner ask).
+    // The composer must never sit ON the bottom bar (owner ask). The row
+    // that keeps them apart is the band's CLOSING RULE since 971 F2: the
+    // session screen used to park a blank spacer there INSTEAD, below its
+    // rule, which floated its whole band one row higher than the main
+    // menu's (owner report 2026-09-08). The rule is the separator — the
+    // same ruling 970 bug 1 made for the SubTree seam.
     let lines: Vec<&str> = text.lines().collect();
-    let above_status = lines[lines.len() - 2];
-    assert_eq!(
-        above_status.trim(),
-        "",
-        "spacer row between composer and status bar"
+    let above_status = lines[lines.len() - 2].trim_end();
+    assert!(
+        !above_status.is_empty() && above_status.chars().all(|c| c == '\u{2500}' || c == ' '),
+        "the band's closing rule separates the composer from the status bar, got \
+         {above_status:?}"
+    );
+    assert!(
+        !lines[lines.len() - 3].trim().is_empty(),
+        "and the composer row itself sits directly above that rule"
     );
     assert!(lines[lines.len() - 1].contains("IDLE"));
 }

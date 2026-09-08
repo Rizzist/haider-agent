@@ -77,25 +77,25 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
 38|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
-39|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
-   ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×160
-40| ? Which migration strategy should the agent take?                                                                                                              |
-   ~ Rgb(255, 183, 87)/Rgb(39, 35, 21)/NONE×50; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×110
-41| The event store has two candidate schemas.                                                                                                                     |
-   ~ Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×1; Rgb(139, 148, 158)/Rgb(39, 35, 21)/NONE×42; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×117
-42| Pick one — the agent is blocked until you answer.                                                                                                              |
-   ~ Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×1; Rgb(139, 148, 158)/Rgb(39, 35, 21)/NONE×49; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×110
-43| ❯ 1. Rewrite in place (fast, riskier)                                                                                                                          |
-   ~ Rgb(58, 58, 58)/Rgb(39, 39, 39)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 39, 39)/NONE×2; Rgb(242, 242, 242)/Rgb(39, 39, 39)/NONE×157
-44|   2. Shadow table + backfill                                                                                                                                   |
-   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 35, 21)/NONE×2; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×157
-45|   3. Option 2                                                                                                                                                  |
-   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 35, 21)/NONE×2; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×157
-46| ↑↓ select · ⏎ confirm · 1-3 quick · menu tuivirt-question-1 · menu.answer("tuivirt-question-1", n) over RPC                                                    |
-   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×108; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×52
-47|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
-   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
-48|                                                                                                                                                                |
+39|                                                                                                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+40|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×160
+41| ? Which migration strategy should the agent take?                                                                                                              |
+   ~ Rgb(255, 183, 87)/Rgb(39, 35, 21)/NONE×50; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×110
+42| The event store has two candidate schemas.                                                                                                                     |
+   ~ Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×1; Rgb(139, 148, 158)/Rgb(39, 35, 21)/NONE×42; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×117
+43| Pick one — the agent is blocked until you answer.                                                                                                              |
+   ~ Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×1; Rgb(139, 148, 158)/Rgb(39, 35, 21)/NONE×49; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×110
+44| ❯ 1. Rewrite in place (fast, riskier)                                                                                                                          |
+   ~ Rgb(58, 58, 58)/Rgb(39, 39, 39)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 39, 39)/NONE×2; Rgb(242, 242, 242)/Rgb(39, 39, 39)/NONE×157
+45|   2. Shadow table + backfill                                                                                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 35, 21)/NONE×2; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×157
+46|   3. Option 2                                                                                                                                                  |
+   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 35, 21)/NONE×2; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×157
+47| ↑↓ select · ⏎ confirm · 1-3 quick · menu tuivirt-question-1 · menu.answer("tuivirt-question-1", n) over RPC                                                    |
+   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×108; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×52
+48|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
 49| [ ? INPUT_REQUIRED ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                                                    |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×20; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106

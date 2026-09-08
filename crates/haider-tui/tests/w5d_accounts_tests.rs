@@ -207,8 +207,12 @@ fn accounts_screen_renders_the_sim_hierarchy() {
     let add = frame.find("[+ OpenAI (OAuth)]").expect("add row");
     assert!(add > last_row, "the add row renders AFTER all groups");
     assert!(frame.contains("[+ Add custom server]"));
-    // Hints line.
-    assert!(frame.contains("click an account to make it active"));
+    // Hints line. 971 F1(c) pinned it to the last row and made its key map
+    // degrade by width, so the assertion holds the parts BOTH cuts carry —
+    // including `esc back`, which the wide cut used to push off a narrow
+    // frame.
+    assert!(frame.contains("click an account"));
+    assert!(frame.contains("esc back"));
 }
 
 /// 970 source projection: a linked account exposes its stable source badge,

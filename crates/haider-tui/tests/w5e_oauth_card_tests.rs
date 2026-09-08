@@ -68,15 +68,20 @@ fn add_row_is_bottom_anchored_even_when_empty() {
         .expect("add row rendered");
     let hint_row = rows
         .iter()
-        .position(|row| row.contains("click an account to make it active"))
+        // 971 F1(c): the hint's key map degrades by width, so match the
+        // stem both cuts share.
+        .position(|row| row.contains("click an account"))
         .expect("hints rendered");
     // Bottom block: buttons(8, since U1 added the OpenCode Zen/Go row,
     // G4a the Ollama/LM Studio row, G4b the Azure/Bedrock/Vertex row, 940
     // split the six-button API row 4+3 to seat Haider Code, and 970 gave
     // Google Antigravity a row of its own — eight buttons do not fit one
-    // 100-col line) + blank + hints, then status.
+    // 100-col line) + the shared bottom band, then status. 971 F2 (verify
+    // round 1) put the key map INSIDE that band, so the three rows under
+    // the grid are rule/hints/rule where they used to be blank/hints — one
+    // row more, and the grid sits one row higher.
     assert!(
-        button_row >= rows.len() - 11,
+        button_row >= rows.len() - 12,
         "add row must sit at the bottom (row {button_row} of {})",
         rows.len()
     );

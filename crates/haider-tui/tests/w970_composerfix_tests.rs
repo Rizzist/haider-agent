@@ -138,9 +138,16 @@ fn model_with_subagents() -> AppModel {
 
 #[test]
 fn the_session_band_reaches_subagents_through_the_rule_alone() {
-    // MUTATION CHECK (970 bug 1): restore `Constraint::Length(lead_subtree)`
-    // in `render_session` and this fails at every roomy height — a blank
-    // row reappears between the band and `▾ subagents`. Verified by revert.
+    // 970 bug 1 said the SEPARATOR between the band and the SubTree ledger is
+    // a rule and nothing else — no blank breathing row. 971 F2 (verify round
+    // 1) moved the ledger from BELOW the band to ABOVE it, because a ledger
+    // under the band lifted the composer three rows off the row every other
+    // view puts it on. The separator law is unchanged and still pinned here;
+    // only which of the band's two rules does the separating changed.
+    //
+    // MUTATION CHECK: put a blank row back between the ledger and the band's
+    // opening rule (or restore the `lead_subtree` row of 970) and this fails
+    // at every roomy height.
     let model = model_with_subagents();
     for height in 16..34 {
         let frame = rows(&model, 90, height);
@@ -151,19 +158,24 @@ fn the_session_band_reaches_subagents_through_the_rule_alone() {
             continue;
         };
         assert!(
-            subtree > band,
-            "height {height}: the panel sits below the band"
+            subtree < band,
+            "height {height}: the ledger sits above the band"
         );
-        let between = &frame[band + 1..subtree];
+        let between = &frame[subtree + 1..band];
         assert!(
-            between.len() <= 1,
-            "height {height}: {} rows between the band and ▾ subagents — only the \
-             closing rule belongs there: {between:?}",
-            between.len()
+            !between.is_empty(),
+            "height {height}: the band's opening rule separates them"
+        );
+        // The ledger's own rows come first; the LAST row before the composer
+        // is the band's opening rule, and nothing blank may sit against it.
+        let seam = between.last().unwrap_or_else(|| unreachable!());
+        assert!(
+            opens_with_rule(seam) || is_rule(seam),
+            "height {height}: a NON-rule row opens the band under ▾ subagents: {seam:?}"
         );
         assert!(
-            between.iter().all(|row| is_rule(row)),
-            "height {height}: a NON-rule row separates the band from ▾ subagents: {between:?}"
+            !blank_row(&between[between.len().saturating_sub(2)]),
+            "height {height}: a blank row separates the ledger from the band: {between:?}"
         );
     }
 }
@@ -171,7 +183,10 @@ fn the_session_band_reaches_subagents_through_the_rule_alone() {
 #[test]
 fn removing_the_breathing_row_gave_it_to_the_transcript() {
     // The freed row is not lost — `Constraint::Min` on the transcript
-    // absorbs it, so the history shows one row MORE than it used to.
+    // absorbs it, so the history shows one row MORE than it used to. Since
+    // 971 F2 the reading runs the other way round the band: the ledger's
+    // last row, the band's opening rule, then the composer — three
+    // consecutive rows with no blank among them.
     let model = model_with_subagents();
     let frame = rows(&model, 90, 24);
     let band = frame
@@ -182,12 +197,17 @@ fn removing_the_breathing_row_gave_it_to_the_transcript() {
         .iter()
         .position(|row| row.contains("subagents —"))
         .expect("panel");
-    assert_eq!(
-        subtree - band,
-        2,
-        "band row, closing rule, panel — three consecutive rows: {:?}",
-        &frame[band..=subtree]
+    assert!(subtree < band, "the ledger is above the band");
+    assert!(
+        frame[subtree..band].iter().all(|row| !blank_row(row)),
+        "no blank row between the ledger and the composer: {:?}",
+        &frame[subtree..=band]
     );
+}
+
+/// A row with nothing on it.
+fn blank_row(row: &str) -> bool {
+    row.trim().is_empty()
 }
 
 // ---------------------------------------------------------------------------
