@@ -73,6 +73,8 @@ impl std::error::Error for ProviderViewInvariantError {}
 /// Header, serialization, auth/reasoning, and compaction changes are already
 /// content-addressed in the two epochs, so they are explicit cold boundaries
 /// rather than accidental middle mutations.
+/// The ledger's cache epoch also includes declared request-local snapshot
+/// changes; reusable routing uses the separate metadata cache epoch.
 pub fn validate_provider_view_prefix(
     previous: &ProviderViewLedgerV1,
     current: &PreparedProviderView,
@@ -232,7 +234,11 @@ pub(crate) fn prepared_serialized_provider_view(
             dialect: dialect.to_owned(),
             serialization_version: PROVIDER_VIEW_SERIALIZATION_VERSION.into(),
             header_epoch,
-            cache_epoch: metadata.cache_epoch.clone(),
+            cache_epoch: metadata
+                .request_view_epoch
+                .as_ref()
+                .unwrap_or(&metadata.cache_epoch)
+                .clone(),
             compaction_epoch: metadata.compaction_epoch.clone(),
             reasoning_retention: format!(
                 "append_only_provider_opaque_v1:{}",
@@ -330,6 +336,7 @@ mod tests {
                     ..PrefixDigests::default()
                 },
                 cache_epoch: "epoch".into(),
+                request_view_epoch: None,
                 header_epoch: String::new(),
                 compaction_epoch: "root".into(),
                 provider: "openai".into(),

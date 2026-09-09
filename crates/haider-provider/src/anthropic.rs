@@ -590,7 +590,10 @@ impl AnthropicProvider {
             .flatten()
             .filter(|metadata| {
                 metadata.boundaries_valid(request.messages.len())
-                    && metadata.account_scope.is_some()
+                    && metadata
+                        .account_scope
+                        .as_ref()
+                        .is_some_and(|scope| !scope.is_empty())
                     && match self.auth_mode {
                         AnthropicAuthMode::ApiKey => metadata.provider == ANTHROPIC_PROVIDER_NAME,
                         AnthropicAuthMode::None => true,
@@ -781,7 +784,11 @@ impl AnthropicProvider {
         }
         if !self.prompt_caching_enabled(&request.model) {
             return CacheControlObservationV1::NotEmitted {
-                reason: CacheControlOmissionReasonV1::Unverified,
+                reason: if known_anthropic_cache_model(&request.model) {
+                    CacheControlOmissionReasonV1::Unverified
+                } else {
+                    CacheControlOmissionReasonV1::UnsupportedModel
+                },
             };
         }
         let Some(metadata) = request.cache_metadata.as_ref() else {
@@ -791,7 +798,7 @@ impl AnthropicProvider {
         };
         let reason = if !metadata.boundaries_valid(request.messages.len()) {
             CacheControlOmissionReasonV1::InvalidBoundaries
-        } else if metadata.account_scope.is_none() {
+        } else if metadata.account_scope.as_ref().is_none_or(String::is_empty) {
             CacheControlOmissionReasonV1::MissingAccountScope
         } else if !matches!(
             (self.auth_mode, metadata.provider.as_str()),
@@ -804,8 +811,12 @@ impl AnthropicProvider {
             CacheControlOmissionReasonV1::ProviderMismatch
         } else if !known_anthropic_cache_model(&request.model) {
             CacheControlOmissionReasonV1::UnsupportedModel
+        } else if crate::cacheable_prompt_minimum(&metadata.provider, &request.model)
+            .is_some_and(|minimum| metadata.stable_prefix_tokens < minimum)
+        {
+            CacheControlOmissionReasonV1::BelowMinimum
         } else {
-            CacheControlOmissionReasonV1::AdapterUnavailable
+            CacheControlOmissionReasonV1::NoEligibleBoundary
         };
         CacheControlObservationV1::NotEmitted { reason }
     }
@@ -1124,60 +1135,6 @@ fn anthropic_cache_controls_would_emit(
     })
 }
 
-/// Preserves the prior diagnostic comparer exactly without retaining a
-/// second neutral DOM. The legacy recursive comparison could see inserted
-/// keys only when the surrounding JSON shape stayed the same; notably, an
-/// API-key system marker changes `system` from a string to an array and was
-/// therefore intentionally invisible to that observation path.
-fn anthropic_cache_controls_legacy_observable(
-    request: &TurnRequest,
-    payload: &serde_json::Value,
-    plan: &crate::InlineBreakpointPlan,
-) -> bool {
-    if plan.mark_system
-        && request.system_prompt.is_some()
-        && payload
-            .get("system")
-            .is_some_and(serde_json::Value::is_array)
-    {
-        return true;
-    }
-    if plan.mark_final_tool
-        && payload
-            .get("tools")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|tools| tools.last())
-            .is_some_and(serde_json::Value::is_object)
-    {
-        return true;
-    }
-    let Some(messages) = payload
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return false;
-    };
-    plan.history_ends.iter().any(|boundary| {
-        *boundary > 0
-            && *boundary <= messages.len()
-            && *boundary <= request.messages.len()
-            && request.messages[*boundary - 1]
-                .blocks
-                .last()
-                .is_some_and(|block| {
-                    !matches!(
-                        block,
-                        haider_protocol::provider::Block::ProviderOpaque { .. }
-                    )
-                })
-            && messages[*boundary - 1]
-                .get("content")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|content| content.last())
-                .is_some_and(serde_json::Value::is_object)
-    })
-}
-
 /// Adds Anthropic's cache markers as a thin overlay on the one cache-neutral
 /// render. Every target is Haider-shaped; a provider-opaque block at a
 /// boundary remains untouched exactly as in the original renderer.
@@ -1280,14 +1237,16 @@ fn apply_anthropic_cache_controls(
 }
 
 fn verified_anthropic_cache_model(model: &str) -> bool {
-    let model = crate::effort::base_model(model);
-    model.starts_with("claude-opus-5")
-        || model.starts_with("claude-sonnet-5")
-        || model == "claude-fable-5"
-        || model.starts_with("claude-opus-4")
-        || model.starts_with("claude-sonnet-4")
-        || model.starts_with("claude-haiku-4")
-        || model.starts_with("claude-3-")
+    crate::cacheable_prompt_minimum(ANTHROPIC_PROVIDER_NAME, model).is_some()
+        || [
+            "claude-3-opus",
+            "claude-3-sonnet",
+            "claude-3-haiku",
+            "claude-3-5-sonnet",
+            "claude-3-7-sonnet",
+        ]
+        .iter()
+        .any(|family| crate::cache::model_family_matches(model, family))
 }
 
 fn known_anthropic_cache_model(model: &str) -> bool {
@@ -1356,9 +1315,7 @@ impl AnthropicProvider {
         let cache_ttl = self.request_cache_ttl(request);
         let will_emit = cache_ttl.is_some()
             && anthropic_cache_controls_would_emit(request, &full_payload, &wire_plan);
-        let legacy_observable = cache_ttl.is_some()
-            && anthropic_cache_controls_legacy_observable(request, &full_payload, &wire_plan);
-        let boundaries = if legacy_observable {
+        let boundaries = if will_emit {
             ledger_plan.ledger_boundaries()
         } else {
             Vec::new()
@@ -1417,7 +1374,7 @@ impl AnthropicProvider {
         debug_assert_eq!(emitted, will_emit);
         self.validate_pdf_request_size(request, &full_payload)
             .ok()?;
-        let cache_control = self.cache_control_observation(request, legacy_observable);
+        let cache_control = self.cache_control_observation(request, emitted);
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
@@ -2125,5 +2082,98 @@ mod oauth_cache_tests {
                 .contains_key(ANTHROPIC_OAUTH_BETA_HEADER),
             "the API-key cache path gains no OAuth-only beta header"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_reuse_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::prompt_cache_fake::{PrefixCache, RecordingCacheHttp, neutral};
+    use crate::{Message, PromptCacheMetadata, Provider};
+    use haider_accounts::{MemoryVault, Vault};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn oauth_cache_fake_checks_wire_headers_prefixes_and_invalidation() {
+        let fake = RecordingCacheHttp::start(3, false).await;
+        let vault = MemoryVault::new();
+        let account = CredentialAlias::new("synthetic-oauth-cache");
+        vault
+            .put(&account, b"synthetic-oauth-only")
+            .expect("test token");
+        let provider = AnthropicProvider::new_with_auth(
+            vault.resolve(&account).expect("handle"),
+            "claude-fable-5-1",
+            AnthropicAuthMode::OAuthBearer,
+            None,
+        )
+        .expect("test route")
+        .with_api_url(&fake.url);
+        let mut request = TurnRequest {
+            model: "claude-fable-5-1".into(),
+            max_tokens: 128,
+            system_prompt: Some("Stable synthetic system. ".repeat(160)),
+            tools: Vec::new(),
+            attachments: Vec::new(),
+            messages: vec![Message::user_text("first")],
+            cache_metadata: Some(PromptCacheMetadata {
+                provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+                account_scope: Some(account.to_string()),
+                session_scope: "synthetic-session".into(),
+                stable_prefix_tokens: 2048,
+                ..Default::default()
+            }),
+        };
+        for turn in 0..3 {
+            request.messages[0] = Message::user_text(format!("accepted turn {turn}"));
+            let mut stream = provider
+                .stream_turn(request.clone())
+                .await
+                .expect("HTTP stream");
+            while let Some(event) = stream.recv().await {
+                event.expect("SSE event");
+            }
+        }
+        fake.task.await.expect("fake exits");
+        let records = fake.records.lock().expect("records").clone();
+        assert_eq!(records[0]["usage"]["read"], 0);
+        assert!(records[1]["usage"]["read"].as_u64().expect("read") > 0);
+        assert_eq!(
+            records[1]["usage"]["prefix_hashes"],
+            records[2]["usage"]["prefix_hashes"]
+        );
+        let body = &records[0]["body"];
+        let mut oracle = PrefixCache::default();
+        assert_eq!(oracle.observe(body, "account-a", true)["read"], 0);
+        assert!(
+            oracle.observe(body, "account-a", true)["read"]
+                .as_u64()
+                .expect("hit")
+                > 0
+        );
+        assert_eq!(oracle.observe(body, "account-b", true)["read"], 0);
+        assert_eq!(
+            oracle.observe(body, "account-a", false)["read"],
+            0,
+            "missing OAuth betas"
+        );
+        assert_eq!(
+            oracle.observe(&neutral(body), "account-a", true)["read"],
+            0,
+            "no breakpoints"
+        );
+        let mut changed = body.clone();
+        changed["system"][1]["text"] = json!("Mutated stable policy. ".repeat(160));
+        assert_eq!(oracle.observe(&changed, "account-a", true)["read"], 0);
+        if let Some(directory) = std::env::var_os("HAIDER_CACHE_EVIDENCE_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).expect("evidence dir");
+            std::fs::write(
+                directory.join("synthetic-oauth-requests.json"),
+                serde_json::to_vec_pretty(&records).expect("JSON"),
+            )
+            .expect("record wire");
+        }
     }
 }

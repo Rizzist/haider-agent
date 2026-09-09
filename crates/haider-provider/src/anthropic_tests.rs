@@ -462,6 +462,7 @@ fn cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetad
             reasoning_settings: "reasoning-digest".into(),
         },
         cache_epoch: "epoch-a".into(),
+        request_view_epoch: None,
         header_epoch: String::new(),
         compaction_epoch: "compaction-a".into(),
         provider: provider.into(),
@@ -643,7 +644,7 @@ fn prepared_anthropic_wire_bytes_match_legacy_final_render() {
 }
 
 #[test]
-fn api_key_system_only_marker_preserves_legacy_diagnostic_shape_semantics() {
+fn api_key_system_only_marker_reports_actual_emission() {
     let provider = payload_provider(false).with_prompt_caching_verified(true);
     let mut request = cache_control_request();
     request.tools.clear();
@@ -661,20 +662,20 @@ fn api_key_system_only_marker_preserves_legacy_diagnostic_shape_semantics() {
         "fixture must exercise the legacy string-to-array system marker case"
     );
     assert!(
-        !matches!(
+        matches!(
             prepared.cache_control(),
             haider_protocol::provider::CacheControlObservationV1::Emitted { .. }
         ),
-        "legacy structural comparison did not observe a key through the string-to-array system shape change"
+        "the final wire marker must be observable even when the system shape changes"
     );
     assert!(
-        prepared
+        !prepared
             .provider_view()
             .expect("provider view")
             .ledger()
             .boundaries
             .is_empty(),
-        "system-only API-key observation historically recorded no ledger breakpoint"
+        "system-only API-key observation records its actual ledger breakpoint"
     );
 }
 
@@ -2178,4 +2179,102 @@ async fn completed_anthropic_5xx_with_reset_body_keeps_http_status_not_network_c
 fn native_computer_replay_never_silently_drops_region() {
     let input = serde_json::json!({"action": "screenshot", "region": {"x": 1, "y": 2, "width": 3, "height": 4, "reference_width": 100, "reference_height": 100}});
     assert!(crate::wire::anthropic_computer_input_from_neutral(&input).is_err());
+}
+
+#[test]
+fn fable_mythos_cache_emission_matches_prepared_and_fallback_wire() {
+    use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
+    for model in ["claude-fable-5-1", "claude-mythos-5-1", "claude-fable-5-12"] {
+        for oauth in [false, true] {
+            let provider = model_payload_provider(oauth, model);
+            let mut request = cache_control_request();
+            request.model = model.into();
+            request.cache_metadata.as_mut().expect("metadata").provider = if oauth {
+                crate::ANTHROPIC_OAUTH_PROVIDER_NAME
+            } else {
+                crate::ANTHROPIC_PROVIDER_NAME
+            }
+            .into();
+            let mut prepared = provider.prepare_turn(&request).expect("prepared");
+            assert!(matches!(
+                prepared.cache_control(),
+                CacheControlObservationV1::Emitted { .. }
+            ));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &crate::serialize_prepared_json_body(prepared.wire.take().expect("wire"))
+                        .expect("final prepared bytes")
+                )
+                .expect("wire JSON"),
+                provider.request_payload(&request).expect("fallback")
+            );
+            request
+                .cache_metadata
+                .as_mut()
+                .expect("metadata")
+                .stable_prefix_tokens = 511;
+            let below = provider.prepare_turn(&request).expect("below minimum");
+            assert_eq!(
+                *below.cache_control(),
+                CacheControlObservationV1::NotEmitted {
+                    reason: CacheControlOmissionReasonV1::BelowMinimum
+                }
+            );
+            assert!(
+                !below
+                    .wire
+                    .as_ref()
+                    .expect("wire")
+                    .payload
+                    .to_string()
+                    .contains("cache_control")
+            );
+        }
+    }
+    for model in [
+        "claude-fable-5-1-fake",
+        "claude-opus-5-nonsense",
+        "claude-mythos-6",
+    ] {
+        let provider = model_payload_provider(true, model).with_prompt_caching_verified(true);
+        let mut request = cache_control_request();
+        request.model = model.into();
+        assert!(
+            !provider
+                .request_payload(&request)
+                .expect("wire")
+                .to_string()
+                .contains("cache_control")
+        );
+    }
+}
+
+#[tokio::test]
+async fn fable_51_oauth_body_and_non_authorization_headers_golden() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("synthetic-fable-golden");
+    vault.put(&alias, b"synthetic-only").expect("test token");
+    let provider = AnthropicProvider::new_subscription_with_dns_resolver(
+        vault.resolve(&alias).expect("handle"),
+        "claude-fable-5-1",
+        ANTHROPIC_OAUTH_BASE_URL,
+        Arc::new(StubFixedResolver {
+            address: SocketAddr::from(([93, 184, 216, 34], 443)),
+        }),
+    )
+    .expect("provider with deterministic public DNS");
+    let mut request = cache_control_request();
+    request.model = "claude-fable-5-1".into();
+    let payload = provider.request_payload(&request).expect("payload");
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/anthropic/cache_control_fable_5_1.json"
+    ))
+    .expect("synthetic golden");
+    assert_eq!(payload, golden);
+    let request = provider.request_body(payload).await.expect("request");
+    assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+    assert_eq!(
+        request.headers()["anthropic-beta"],
+        "oauth-2025-04-20,prompt-caching-scope-2026-01-05,extended-cache-ttl-2025-04-11"
+    );
 }

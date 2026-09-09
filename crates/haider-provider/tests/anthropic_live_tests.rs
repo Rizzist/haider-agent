@@ -178,6 +178,7 @@ fn cache_assertion_request(
                 reasoning_settings: "live-default-reasoning".into(),
             },
             cache_epoch: "live-cache-assertion-v1".into(),
+            request_view_epoch: None,
             header_epoch: String::new(),
             compaction_epoch: "live-root-compaction".into(),
             provider: "anthropic".into(),

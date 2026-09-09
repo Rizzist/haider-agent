@@ -13314,6 +13314,9 @@ fn prompt_cache_metadata(
         || digest_json(&"root-compaction-epoch"),
         |boundary| digest_json(&messages[boundary - 1]),
     );
+    // Request correlation already carries run/turn/attempt identity. Cache
+    // resources must survive a new accepted turn and its volatile user tail;
+    // exact immutable-history matching remains the adapter/provider's job.
     let cache_epoch = digest_json(&serde_json::json!({
         "provider": config.usage_scope.provider,
         "model": config.model,
@@ -13324,7 +13327,6 @@ fn prompt_cache_metadata(
         "auth_digest": prefix_digests.auth_mode,
         "reasoning_digest": prefix_digests.reasoning_settings,
         "compaction_epoch": compaction_epoch,
-        "volatile_context_epoch": volatile_context_epoch,
     }));
     let cache_epoch = config.provider_route_epoch.as_ref().map_or_else(
         || cache_epoch.clone(),
@@ -13332,6 +13334,9 @@ fn prompt_cache_metadata(
             digest_json(&serde_json::json!({"request_epoch": cache_epoch, "provider_route": route}))
         },
     );
+    let request_view_epoch = volatile_context_epoch.map(|snapshot| {
+        digest_json(&serde_json::json!({"cache_epoch": cache_epoch, "snapshot": snapshot}))
+    });
     let stable_prefix_tokens =
         estimated_request_input_tokens(config, &messages[..cacheable_history_end]);
     PromptCacheMetadata {
@@ -13343,6 +13348,7 @@ fn prompt_cache_metadata(
         latest_compaction_summary_end,
         prefix_digests,
         cache_epoch,
+        request_view_epoch,
         header_epoch: String::new(),
         compaction_epoch,
         provider: config.usage_scope.provider.clone(),
@@ -15117,5 +15123,76 @@ mod cu1_actor_tests {
             epoch(&config),
             "ordinary request cache bytes stay unchanged"
         );
+    }
+    #[test]
+    fn reusable_cache_epoch_ignores_turn_tail_but_isolates_prefix_and_compaction() {
+        let mut config = HarnessConfig::for_session(
+            SessionId::new("cache-identity"),
+            DeviceId::new("test"),
+            0,
+            0,
+        );
+        config.model = "gpt-6-astra".into();
+        config.usage_scope.provider = "openai".into();
+        config.usage_account = Some(CredentialAlias::new("account-a"));
+        config.system_prompt = Some("stable policy".into());
+        let messages = vec![
+            Message::user_text("immutable summary"),
+            Message::user_text("current tail"),
+        ];
+        let epoch = |config: &HarnessConfig, compacted: bool| {
+            prompt_cache_metadata(
+                config,
+                &messages,
+                PromptCacheBoundaries {
+                    stable_history_end: 1,
+                    cacheable_history_end: 1,
+                    current_user_start: 1,
+                    previous_stable_history_end: None,
+                    latest_compaction_summary_end: compacted.then_some(1),
+                },
+                usage_prefix_digests(config, &messages[..1]),
+                config.usage_account.as_ref(),
+                config.volatile_user_tail.as_deref(),
+            )
+            .cache_epoch
+        };
+        let first = epoch(&config, false);
+        config.volatile_user_tail = Some("run-a workflow progress".into());
+        assert_eq!(first, epoch(&config, false));
+        config.volatile_user_tail = Some("monitor wake in run-b".into());
+        assert_eq!(first, epoch(&config, false));
+        assert_ne!(
+            first,
+            epoch(&config, true),
+            "compaction is a deliberate cold boundary"
+        );
+        for mutation in [
+            "system",
+            "discovery",
+            "denial",
+            "auth",
+            "account",
+            "model",
+            "provider",
+            "route",
+        ] {
+            let mut changed = config.clone();
+            match mutation {
+                "system" => changed.system_prompt = Some("changed policy".into()),
+                "discovery" | "denial" => changed.tools.push(ToolDefinition {
+                    name: mutation.into(),
+                    description: mutation.into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                }),
+                "auth" => changed.usage_scope.auth_scope = "oauth".into(),
+                "account" => changed.usage_account = Some(CredentialAlias::new("account-b")),
+                "model" => changed.model = "gpt-5.6-sol".into(),
+                "provider" => changed.usage_scope.provider = "openai-oauth".into(),
+                "route" => changed.provider_route_epoch = Some("new-route".into()),
+                _ => unreachable!(),
+            }
+            assert_ne!(first, epoch(&changed, false), "{mutation}");
+        }
     }
 }

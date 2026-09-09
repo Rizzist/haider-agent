@@ -4933,7 +4933,8 @@ fn openai_lite_cache_breakpoint_enabled() -> bool {
 
 fn openai_automatic_cache_key_supported(model: &str) -> bool {
     let model_or_variant = |base: &str| model == base || model.starts_with(&format!("{base}-"));
-    model_or_variant("gpt-4o")
+    crate::cache::model_family_matches(model, "gpt-6-astra")
+        || model_or_variant("gpt-4o")
         || model_or_variant("gpt-4.1")
         || model_or_variant("gpt-5")
         || [

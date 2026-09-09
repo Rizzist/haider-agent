@@ -31,6 +31,10 @@ mod oauth_identity;
 mod openai;
 mod origin;
 mod pricing;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "../tests/support/prompt_cache_fake.rs"]
+pub mod prompt_cache_fake;
 mod usage;
 mod webfetch;
 #[cfg(test)]
@@ -1789,6 +1793,11 @@ pub struct PromptCacheMetadata {
     pub prefix_digests: PrefixDigests,
     /// Stable until system/tools/reasoning/provider/account/compaction change.
     pub cache_epoch: String,
+    /// Exact provider-view continuity domain when a request-local snapshot
+    /// changes inside otherwise reusable history. Never used for cache routing
+    /// or Gemini resource identity; absent inherits `cache_epoch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_view_epoch: Option<String>,
     /// Content address of provider/model/exact stable system/exact tool schema/
     /// dialect/serialization version. Finalized by adapter preparation and
     /// reused for routing plus resume validation.

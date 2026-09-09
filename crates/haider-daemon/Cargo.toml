@@ -39,6 +39,7 @@ zeroize.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+haider-provider = { path = "../haider-provider", features = ["test-support"] }
 futures-util = "0.3"
 http = "1"
 image.workspace = true

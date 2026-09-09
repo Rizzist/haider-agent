@@ -114,6 +114,7 @@ fn cache_metadata(
             reasoning_settings: "stable-reasoning".into(),
         },
         cache_epoch: "cache-epoch-a".into(),
+        request_view_epoch: None,
         header_epoch: String::new(),
         compaction_epoch: "compaction-epoch-a".into(),
         provider: provider.into(),

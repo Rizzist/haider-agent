@@ -195,7 +195,7 @@ pub struct GeminiCacheRegistry {
 
 #[derive(Debug)]
 struct GeminiCachedResource {
-    epoch: String,
+    domain: String,
     name: String,
     content_blocks: Vec<haider_protocol::cache::ProviderViewBlockRefV1>,
     stable_prefix_tokens: u64,
@@ -449,6 +449,7 @@ impl GeminiProvider {
                     Arc::clone(&self.cache_backend),
                     self.web_builtins
                         && crate::effort::gemini_web_builtins_supported(&request.model),
+                    &prepared.reply_bindings,
                 )
                 .await
         } else {
@@ -875,6 +876,7 @@ impl GeminiCacheRegistry {
             history_boundary,
             backend,
             web_builtins,
+            &[],
         )
         .await
     }
@@ -886,25 +888,50 @@ impl GeminiCacheRegistry {
         history_boundary: Option<crate::PreparedHistoryBoundary>,
         backend: Arc<dyn GeminiCacheBackend>,
         web_builtins: bool,
+        reply_bindings: &[crate::PreparedReplyBinding],
     ) -> serde_json::Value {
         let Some(metadata) = request.cache_metadata.as_ref().filter(|metadata| {
             metadata.boundaries_valid(request.messages.len())
                 && metadata.provider == GEMINI_PROVIDER_NAME
-                && metadata.account_scope.is_some()
+                && metadata
+                    .account_scope
+                    .as_ref()
+                    .is_some_and(|scope| !scope.is_empty())
+                && !metadata.session_scope.is_empty()
+                && !metadata.cache_epoch.is_empty()
         }) else {
+            return full_payload;
+        };
+        // The actor epoch isolates grants/auth/compaction; exact rendered
+        // headers and history also guard standalone and fallback callers.
+        let domain = crate::exact_json_digest_with_replies(
+            &serde_json::json!({
+                "epoch": metadata.cache_epoch,
+                "account": metadata.account_scope,
+                "model": request.model,
+                "system": full_payload.get("system_instruction"),
+                "tools": full_payload.get("tools"),
+                "generation": full_payload.get("generationConfig"),
+            }),
+            reply_bindings,
+        );
+        let Some(domain) = domain else {
             return full_payload;
         };
         let scope = metadata.session_scope.clone();
         let existing = { self.resources.lock().await.remove(&scope) };
         if let Some(existing) = existing {
             let expired = existing.expires_at <= tokio::time::Instant::now();
-            if existing.epoch == metadata.cache_epoch
+            if existing.domain == domain
+                && !web_builtins
                 && !expired
                 && payload_contents(&full_payload)
                     .and_then(|contents| {
                         contents
                             .get(..existing.content_blocks.len())
-                            .and_then(gemini_content_block_refs)
+                            .and_then(|contents| {
+                                gemini_content_block_refs(contents, reply_bindings)
+                            })
                     })
                     .is_some_and(|blocks| blocks == existing.content_blocks)
                 && !gemini_cached_coverage_needs_refresh(
@@ -964,11 +991,27 @@ impl GeminiCacheRegistry {
             // boundary is not byte-stable and stays on implicit caching.
             return full_payload;
         }
-        let Some(content_blocks) = gemini_content_block_refs(stable_contents) else {
+        let Some(content_blocks) = gemini_content_block_refs(stable_contents, reply_bindings)
+        else {
             return full_payload;
         };
-        let create_payload =
+        let mut create_payload =
             gemini_cached_content_create_payload(request, &full_payload, stable_contents);
+        if !reply_bindings.is_empty() {
+            // Resource creation is a separate HTTP request. Resolve arena
+            // references only for this cold prefix; generate-call suffixes
+            // retain their existing bindings and streaming serialization.
+            let mut bytes = Vec::new();
+            if crate::write_json_value_with_replies(&mut bytes, &create_payload, reply_bindings)
+                .is_err()
+            {
+                return full_payload;
+            }
+            let Ok(materialized) = serde_json::from_slice(&bytes) else {
+                return full_payload;
+            };
+            create_payload = materialized;
+        }
         let Ok(name) = backend.create_cached_content(&create_payload).await else {
             return full_payload;
         };
@@ -977,7 +1020,7 @@ impl GeminiCacheRegistry {
         self.resources.lock().await.insert(
             scope,
             GeminiCachedResource {
-                epoch: metadata.cache_epoch.clone(),
+                domain,
                 name,
                 content_blocks,
                 stable_prefix_tokens: metadata.stable_prefix_tokens,
@@ -1663,8 +1706,17 @@ fn gemini_cacheable_contents(
 
 fn gemini_content_block_refs(
     contents: &[serde_json::Value],
+    reply_bindings: &[crate::PreparedReplyBinding],
 ) -> Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>> {
-    contents.iter().map(crate::exact_wire_block_ref).collect()
+    if reply_bindings.is_empty() {
+        return contents.iter().map(crate::exact_wire_block_ref).collect();
+    }
+    contents
+        .iter()
+        .map(|content| {
+            crate::provider_view_json_blob(content, reply_bindings).map(|blob| blob.block)
+        })
+        .collect()
 }
 
 fn append_content(
