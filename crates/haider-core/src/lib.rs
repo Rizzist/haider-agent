@@ -39,7 +39,7 @@ pub use actor::{
     RouteWaitCheckpoint, RouteWaitCompletedToolCheckpoint, RouteWaitTextCheckpoint,
     RouteWaitToolCheckpoint, STREAM_DELTA_COALESCE_WINDOW, SharedToolPacks, SubmitCheckpointTurn,
     SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, SubmitRouteWaitTurn,
-    SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome,
+    SubmitTurn, ToolCapabilityProfile, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome,
     VISION_IMAGE_ESTIMATE_TOKENS, append_peer_message_to_provider_tail,
     build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
     compaction_guard_tripped, context_soft_threshold_tokens, context_tier_threshold_tokens,
