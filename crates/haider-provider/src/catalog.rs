@@ -354,8 +354,7 @@ pub async fn discover_models_with_resolver(
     let client = if let Some(client) = custom_client {
         client
     } else {
-        let mut client = reqwest::Client::builder()
-            .no_proxy()
+        let mut client = haider_platform::native_http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(crate::OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout)
             .timeout(CATALOG_TIMEOUT);

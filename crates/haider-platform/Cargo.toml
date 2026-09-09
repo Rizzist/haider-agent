@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+reqwest.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
@@ -41,6 +42,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1"
 jni = "0.21.1"
 ndk-context = "0.1.1"
 

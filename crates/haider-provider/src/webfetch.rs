@@ -709,7 +709,7 @@ fn client_for_target(
     if let Some(client) = with_client_cache(|cache| cache.get(policy_key)) {
         return Ok(client);
     }
-    let mut builder = reqwest::Client::builder()
+    let mut builder = haider_platform::http_client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())

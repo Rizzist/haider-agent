@@ -137,6 +137,51 @@ pub fn open_workspace_directory(
     )
 }
 
+/// Opens every component without following symlinks and retains a readable final
+/// directory. Linux/Android ancestors need only traversal access: app UIDs cannot
+/// read global directories such as `/` or `/data`, even when they can reach their
+/// own private descendants. O_PATH must not escape as the final I/O/sync handle.
+#[cfg(unix)]
+pub fn open_absolute_directory(path: &Path) -> Result<WorkspaceDirectory, WorkspaceDirectoryError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::path::Component;
+
+    let mut components = path.components().peekable();
+    if components.next() != Some(Component::RootDir) {
+        return Err(rustix::io::Errno::INVAL);
+    }
+    let readable = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let traversal = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let traversal = readable;
+    let mut directory = rustix::fs::open(
+        "/",
+        if components.peek().is_none() {
+            readable
+        } else {
+            traversal
+        },
+        Mode::empty(),
+    )?;
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(rustix::io::Errno::INVAL);
+        };
+        directory = rustix::fs::openat(
+            &directory,
+            name,
+            if components.peek().is_none() {
+                readable
+            } else {
+                traversal
+            },
+            Mode::empty(),
+        )?;
+    }
+    Ok(directory)
+}
+
 #[cfg(windows)]
 pub fn open_workspace_directory(
     path: &Path,
@@ -449,3 +494,7 @@ mod windows_process_directory_tests {
         assert!(error.to_string().contains("changes identity"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "directory_unix_tests.rs"]
+mod unix_tests;

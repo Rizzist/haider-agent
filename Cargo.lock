@@ -1908,9 +1908,12 @@ dependencies = [
  "libc",
  "ndk-context",
  "nix 0.31.3",
+ "reqwest",
  "rustix 1.1.4",
+ "rustls",
  "tempfile",
  "tokio",
+ "webpki-roots 1.0.9",
  "windows 0.54.0",
  "windows-sys 0.61.2",
 ]

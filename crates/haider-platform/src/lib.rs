@@ -5,6 +5,15 @@
 //! daemon detachment, descriptor hygiene, process signalling, and shutdown
 //! delivery preserve the pre-abstraction implementations exactly.
 
+mod native_temp;
+pub use native_temp::native_temp_directory;
+#[cfg(target_os = "android")]
+pub use native_temp::set_native_temp_directory;
+mod http;
+#[cfg(target_os = "android")]
+pub use http::set_android_http_proxy;
+pub use http::{http_client_builder, native_http_client_builder};
+
 mod bounded_wait;
 #[cfg(windows)]
 mod console;
@@ -22,6 +31,8 @@ mod user;
 pub use bounded_wait::{BoundedWait, WaitTimeout, bounded_wait};
 #[cfg(windows)]
 pub use console::{ConsoleHoldError, SoleProcessConsole, sole_process_console};
+#[cfg(unix)]
+pub use directory::open_absolute_directory;
 #[cfg(windows)]
 pub use directory::{
     WindowsFileIdentity, open_workspace_subdirectory, windows_file_identity,

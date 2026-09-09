@@ -700,7 +700,7 @@ pub(crate) const PROVIDER_KEEP_ALIVE: ProviderKeepAliveConfig = ProviderKeepAliv
 };
 
 fn provider_http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    haider_platform::native_http_client_builder()
         .http2_keep_alive_interval(PROVIDER_KEEP_ALIVE.http2_interval)
         .http2_keep_alive_while_idle(PROVIDER_KEEP_ALIVE.http2_while_idle)
         .tcp_keepalive(PROVIDER_KEEP_ALIVE.tcp_interval)

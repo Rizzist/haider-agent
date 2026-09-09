@@ -161,7 +161,6 @@ fn build_anthropic_client(
 ) -> Result<reqwest::Client, ProviderError> {
     ANTHROPIC_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut client = crate::provider_http_client_builder()
-        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(match transport_config.retry_policy {
             AnthropicRetryPolicy::Never => reqwest::retry::never(),
