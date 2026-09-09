@@ -1,3 +1,9 @@
+#![allow(clippy::expect_used)]
+
+use super::tests::{
+    FakeIdentityVerifier, FakeMode, FakeOAuthServer, coordinator_for_registration, started_flow,
+    wait_ready,
+};
 use super::*;
 
 const FIXTURE_STATE: &str = "fixture-state_971";
