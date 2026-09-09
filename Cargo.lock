@@ -1718,10 +1718,13 @@ dependencies = [
 name = "haider-accounts"
 version = "0.0.970"
 dependencies = [
+ "aes-gcm",
  "blake3",
+ "getrandom 0.3.4",
  "haider-platform",
  "haider-protocol",
  "hex",
+ "rustix 1.1.4",
  "security-framework",
  "serde",
  "serde_json",

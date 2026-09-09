@@ -18,6 +18,11 @@ zeroize.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 
+[target.'cfg(unix)'.dependencies]
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
+getrandom.workspace = true
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
