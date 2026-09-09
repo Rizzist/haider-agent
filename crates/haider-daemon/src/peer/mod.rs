@@ -170,6 +170,8 @@ pub(crate) struct PeerService {
     background: Mutex<Option<JoinHandle<()>>>,
     outbox: tokio::sync::Mutex<delivery::Outbox>,
     sends: Arc<tokio::sync::Semaphore>,
+    send_admission: tokio::sync::Mutex<()>,
+    recipient_guards: tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     reconcile_count: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -210,6 +212,8 @@ impl PeerService {
             background: Mutex::new(None),
             outbox: tokio::sync::Mutex::new(outbox),
             sends: Arc::new(tokio::sync::Semaphore::new(SEND_CAPACITY)),
+            send_admission: tokio::sync::Mutex::new(()),
+            recipient_guards: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             reconcile_count: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -1744,4 +1748,4 @@ async fn write_frame_limited<W: AsyncWrite + Unpin>(
 
 #[cfg(all(test, unix))]
 #[path = "../peer_delivery_tests.rs"]
-mod delivery_tests;
+mod peer_delivery_tests;

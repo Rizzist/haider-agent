@@ -2,6 +2,7 @@
 //! this bounded map is rebuilt on boot and never imports retired .q files.
 
 use super::*;
+use futures_util::{StreamExt, stream};
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::EventId;
@@ -287,19 +288,25 @@ impl PeerService {
                 message: "cancellation requires msg_id".into(),
             });
         }
-        let mut outbox = self.outbox.lock().await;
+        // Serialize idempotency lookup and durable acceptance, never transport.
+        // This also reserves each FIFO ordinal until its entry reaches the map.
+        let admission = self.send_admission.lock().await;
         self.ensure_running()?;
         if let Some(id) = &options.msg_id {
             if let Some(prior) = self.prior_send(&from, id).await? {
                 let key = (from.to_string(), id.clone());
                 if options.cancel {
-                    if is_pending(&prior.receipt) {
-                        let failed = status_receipt(&prior.entry, PeerDeliveryState::Failed, Some("cancelled by sender; this does not recall an admission whose reply was lost".into()));
+                    drop(admission);
+                    let _recipient = self.recipient_guard(&prior.entry.target.address()).await;
+                    // A delivery may have committed while cancellation waited.
+                    let current = self.outbox.lock().await.get(&key).cloned();
+                    if let Some(current) = current {
+                        let failed = status_receipt(&current.entry, PeerDeliveryState::Failed, Some("cancelled by sender; this does not recall an admission whose reply was lost".into()));
                         self.record_status(&from, &failed).await?;
-                        outbox.remove(&key);
+                        self.outbox.lock().await.remove(&key);
                         return Ok(failed);
                     }
-                    return Ok(prior.receipt);
+                    return self.completed_receipt(&key).await;
                 }
                 let same_target =
                     resolve_address(&to, std::slice::from_ref(&prior.entry.target)).is_ok();
@@ -358,7 +365,10 @@ impl PeerService {
             None => random_id("msg")?,
         };
         let queued_at = now_ms();
-        let enqueue_order = outbox
+        let enqueue_order = self
+            .outbox
+            .lock()
+            .await
             .values()
             .filter_map(|pending| pending.entry.enqueue_order)
             .max()
@@ -392,12 +402,15 @@ impl PeerService {
             },
             target,
         };
-        let full = outbox.len() >= MAX_PENDING
-            || outbox
-                .values()
-                .filter(|pending| pending.entry.target.address() == entry.target.address())
-                .count()
-                >= MAX_PER_RECIPIENT;
+        let full = {
+            let outbox = self.outbox.lock().await;
+            outbox.len() >= MAX_PENDING
+                || outbox
+                    .values()
+                    .filter(|pending| pending.entry.target.address() == entry.target.address())
+                    .count()
+                    >= MAX_PER_RECIPIENT
+        };
         let receipt = status_receipt(
             &entry,
             if full {
@@ -427,7 +440,8 @@ impl PeerService {
             return Ok(receipt);
         }
         let key = (from.to_string(), msg_id);
-        outbox.insert(
+        let recipient = entry.target.address();
+        self.outbox.lock().await.insert(
             key.clone(),
             Pending {
                 entry,
@@ -435,7 +449,9 @@ impl PeerService {
                 journal_seq,
             },
         );
-        self.attempt(&key, &mut outbox).await
+        drop(admission);
+        let guard = self.recipient_guard(&recipient).await;
+        self.attempt(&key, &guard).await
     }
 
     pub(crate) async fn has_pending_sends(&self) -> bool {
@@ -463,21 +479,62 @@ impl PeerService {
         Ok(())
     }
 
+    /// Lock order: acceptance -> outbox, or recipient -> outbox. Acceptance
+    /// is released before waiting for a recipient. The guard registry is only
+    /// held to upgrade/create a mutex, never while waiting for that mutex.
+    /// Outbox guards never span I/O or acquisition of another lock. Every
+    /// caller holds a `sends` permit until after its recipient guard drops,
+    /// including maintenance, so terminal removal cannot enable retirement
+    /// while transport/status commit is still active.
+    async fn recipient_guard(&self, address: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut guards = self.recipient_guards.lock().await;
+            guards.retain(|_, guard| guard.strong_count() != 0);
+            match guards.get(address).and_then(std::sync::Weak::upgrade) {
+                Some(guard) => guard,
+                None => {
+                    let guard = Arc::new(tokio::sync::Mutex::new(()));
+                    guards.insert(address.to_owned(), Arc::downgrade(&guard));
+                    guard
+                }
+            }
+        };
+        mutex.lock_owned().await
+    }
+
+    async fn completed_receipt(&self, key: &Key) -> Result<PeerReceipt, PeerError> {
+        self.prior_send(&SessionId::new(key.0.clone()), &key.1)
+            .await?
+            .map(|prior| prior.receipt)
+            .ok_or_else(|| PeerError::Invalid {
+                message: "peer outbox entry disappeared".into(),
+            })
+    }
+
     async fn attempt(
         self: &Arc<Self>,
         key: &Key,
-        outbox: &mut Outbox,
+        _recipient: &tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<PeerReceipt, PeerError> {
-        let pending = outbox.get(key).cloned().ok_or_else(|| PeerError::Invalid {
-            message: "peer outbox entry disappeared".into(),
-        })?;
+        let snapshot = {
+            let outbox = self.outbox.lock().await;
+            outbox.get(key).map(|pending| {
+                let older_pending = outbox.iter().any(|(other_key, other)| {
+                    other.entry.target.address() == pending.entry.target.address()
+                        && order_key(other_key, other) < order_key(key, pending)
+                });
+                (pending.clone(), older_pending)
+            })
+        };
+        let Some((pending, older_pending)) = snapshot else {
+            // Another send/drain/cancel may have settled this key before the
+            // recipient guard became available. Never retransmit a terminal key.
+            return self.completed_receipt(key).await;
+        };
         let entry = &pending.entry;
         let receipt = if now_ms() >= entry.message.expires_at {
             status_receipt(entry, PeerDeliveryState::Failed, Some("expired before confirmed receiver admission; a lost reply can hide an admission".into()))
-        } else if outbox.iter().any(|(other_key, other)| {
-            other.entry.target.address() == entry.target.address()
-                && order_key(other_key, other) < order_key(key, &pending)
-        }) {
+        } else if older_pending {
             status_receipt(
                 entry,
                 PeerDeliveryState::Held,
@@ -550,6 +607,7 @@ impl PeerService {
         }
         self.record_status(&SessionId::new(key.0.clone()), &receipt)
             .await?;
+        let mut outbox = self.outbox.lock().await;
         if is_pending(&receipt) {
             if let Some(pending) = outbox.get_mut(key) {
                 pending.receipt = receipt.clone();
@@ -561,18 +619,60 @@ impl PeerService {
     }
 
     pub(super) async fn drain_outbox(self: &Arc<Self>) -> Result<(), PeerError> {
-        let mut outbox = self.outbox.lock().await;
-        let mut keys = outbox.keys().cloned().collect::<Vec<_>>();
-        keys.sort_by(|left, right| {
-            order_key(left, &outbox[left]).cmp(&order_key(right, &outbox[right]))
-        });
-        for key in keys {
-            if self.draining.load(Ordering::Acquire) {
-                break;
+        let recipients = {
+            let outbox = self.outbox.lock().await;
+            let mut keys = outbox.keys().cloned().collect::<Vec<_>>();
+            keys.sort_by(|left, right| {
+                order_key(left, &outbox[left]).cmp(&order_key(right, &outbox[right]))
+            });
+            let mut recipients = BTreeMap::<String, Vec<Key>>::new();
+            for key in keys {
+                recipients
+                    .entry(outbox[&key].entry.target.address())
+                    .or_default()
+                    .push(key);
             }
-            self.attempt(&key, &mut outbox).await?;
-        }
-        Ok(())
+            recipients
+        };
+        // Poll recipients concurrently, but keep each recipient's FIFO under
+        // one guard through transport and status commits. Collect all results:
+        // an error must not cancel another recipient mid-journal commit.
+        let results = stream::iter(recipients)
+            .map(|(address, keys)| async move {
+                let Ok(permit) = self.sends.clone().try_acquire_owned() else {
+                    return Ok(()); // The next maintenance pass retries it.
+                };
+                let guard = self.recipient_guard(&address).await;
+                let mut result = Ok(());
+                let mut settled = std::collections::BTreeSet::new();
+                for key in &keys {
+                    if self.draining.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match self.attempt(key, &guard).await {
+                        Ok(receipt) if !is_pending(&receipt) => {
+                            settled.insert(key.0.clone());
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                }
+                drop(guard);
+                drop(permit);
+                if let Ok(hub) = self.hub() {
+                    for from in settled {
+                        hub.notify_peer_delivery_settled(SessionId::new(from));
+                    }
+                }
+                result
+            })
+            .buffer_unordered(SEND_CAPACITY)
+            .collect::<Vec<Result<(), PeerError>>>()
+            .await;
+        results.into_iter().collect()
     }
 
     async fn deliver_registered(
@@ -667,6 +767,113 @@ mod tests {
     use haider_core::StoreHandle;
 
     #[tokio::test]
+    async fn stalled_recipient_serializes_its_sends_without_blocking_other_recipients() {
+        let root = tempfile::tempdir_in("/tmp").expect("short root");
+        let runtime = root.path().join("r");
+        let (sh, ss, sender) = live_peer_fixture(&root.path().join("s"), &runtime, "sender").await;
+        let (th, ts, target) = live_peer_fixture(&root.path().join("t"), &runtime, "target").await;
+        let (hh, hs, healthy) =
+            live_peer_fixture(&root.path().join("h"), &runtime, "healthy").await;
+        target.shutdown().await;
+        let paths =
+            peer_endpoint_paths(&runtime, "target", PeerEndpointKind::Haider).expect("paths");
+        let listener = tokio::net::UnixListener::bind(&paths.socket).expect("stalled endpoint");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))
+            .expect("private socket");
+        let from = SessionId::new("sender");
+        let send = |to: &str, id: &str| {
+            let sender = sender.clone();
+            let from = from.clone();
+            let to = to.to_owned();
+            let id = id.to_owned();
+            tokio::spawn(async move {
+                sender
+                    .send_with_options(
+                        &from,
+                        to,
+                        id.clone(),
+                        None,
+                        PeerSendOptions {
+                            msg_id: Some(id),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        let manager = crate::peer_tests::start_held_peer_turn(
+            &hh,
+            &hs,
+            &SessionId::new("healthy"),
+            &haider_protocol::ids::RunId::new("healthy-busy"),
+        )
+        .await;
+        let head = send("target", "head");
+        let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("head reached transport")
+            .expect("connection");
+        let tail = send("target", "tail");
+        let duplicate = send("target", "head");
+        let delivered =
+            tokio::time::timeout(Duration::from_secs(2), send("healthy", "independent"))
+                .await
+                .expect("healthy send must finish while target is stalled")
+                .expect("send task")
+                .expect("healthy receipt");
+        assert_eq!(
+            delivered.status.expect("status").state,
+            PeerDeliveryState::Delivered
+        );
+        assert!(!head.is_finished());
+        assert!(!tail.is_finished());
+        let duplicate = duplicate
+            .await
+            .expect("duplicate task")
+            .expect("duplicate receipt");
+        assert_eq!(duplicate.msg_id, "head");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a second same-recipient transport must not enter while the head is held"
+        );
+        assert!(
+            !sh.daemon_is_durably_quiescent()
+                .await
+                .expect("inflight check")
+        );
+        drop(connection);
+        head.await.expect("head task").expect("held receipt");
+        let tail = tail.await.expect("tail task").expect("tail receipt");
+        assert_eq!(
+            tail.status.expect("tail status").state,
+            PeerDeliveryState::Held
+        );
+        let entries = ss.read(&from, 0, 256).await.expect("journal");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|event| matches!(event.payload.decode_event(),
+            Ok(EventPayload::PeerOutbox(entry)) if entry.message.msg_id == "head"))
+                .count(),
+            1,
+            "concurrent duplicate must have only one durable acceptance"
+        );
+        drop(listener);
+        sender.shutdown().await;
+        healthy.shutdown().await;
+        manager.shutdown().await.expect("worker stop");
+        sh.shutdown().await.expect("sender stop");
+        th.shutdown().await.expect("target stop");
+        hh.shutdown().await.expect("healthy stop");
+        ss.close().await.expect("sender close");
+        ts.close().await.expect("target close");
+        hs.close().await.expect("healthy close");
+    }
+
+    #[tokio::test]
     async fn durable_fifo_order_survives_timestamp_ties_restart_and_new_sends() {
         let root = tempfile::tempdir_in("/tmp").expect("short root");
         let runtime = root.path().join("r");
@@ -741,7 +948,23 @@ mod tests {
             .await
             .expect("new send after restart");
         assert_eq!(third.status.expect("status").state, PeerDeliveryState::Held);
-        let pending = sender.outbox.lock().await;
+        let permit = sender
+            .sends
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("send permit");
+        let address = sender
+            .outbox
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("pending")
+            .entry
+            .target
+            .address();
+        let guard = sender.recipient_guard(&address).await;
         let (th, ts, target) = live_peer_fixture(&target_root, &runtime, "target").await;
         // A live held turn supplies the real receiver's durable admission path.
         let manager = crate::peer_tests::start_held_peer_turn(
@@ -751,7 +974,18 @@ mod tests {
             &haider_protocol::ids::RunId::new("fifo-busy"),
         )
         .await;
-        drop(pending);
+        let tail = (from.to_string(), "a-second".to_owned());
+        let held = sender
+            .attempt(&tail, &guard)
+            .await
+            .expect("ready tail attempt");
+        assert_eq!(
+            held.status.expect("tail status").state,
+            PeerDeliveryState::Held,
+            "a ready tail must wait until its older pending head terminates"
+        );
+        drop(guard);
+        drop(permit);
         sender.drain_outbox().await.expect("reconnect drain");
         let events = ts
             .read(&SessionId::new("target"), 0, 256)

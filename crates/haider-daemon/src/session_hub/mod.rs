@@ -5937,9 +5937,10 @@ impl SessionHub {
     /// The journal remains the authority: resident-worker count and volatile
     /// actor state are deliberately insufficient for a shutdown decision.
     pub(crate) async fn daemon_is_durably_quiescent(&self) -> Result<bool, SessionHubError> {
-        // The service is recovered before the listener starts. Taking its
-        // outbox lock observes journal commits and terminal removals together;
-        // admitted send tasks also guard retirement until their permit drops.
+        // The service is recovered before the listener starts; its outbox
+        // tracks durable pending sends. Admission and recipient tasks
+        // hold permits across journal commits, transport and terminal removal,
+        // guarding retirement even while no entry is visible in the map.
         let peer = lock(&self.inner.peer_service)?.clone();
         if let Some(peer) = peer
             && peer.has_pending_sends().await
