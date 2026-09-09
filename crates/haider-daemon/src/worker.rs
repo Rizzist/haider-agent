@@ -44,6 +44,9 @@ mod mobile_runtime_tests;
 #[path = "pair_switch_runtime_tests.rs"]
 mod pair_switch_runtime_tests;
 #[cfg(test)]
+#[path = "session_transcript_runtime_tests.rs"]
+mod session_transcript_runtime_tests;
+#[cfg(test)]
 #[path = "wd_pdf_runtime_tests.rs"]
 mod wd_pdf_runtime_tests;
 #[cfg(test)]
@@ -13291,6 +13294,7 @@ pub(crate) enum RegisteredToolRoute {
     Mobile,
     Monitor,
     ListModels,
+    SessionTranscript,
     PeerList,
     PeerSend,
     SshList,
@@ -13747,6 +13751,11 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             haider_tools::list_models_manifest(),
             ToolPermissionDefault::Allow,
             RegisteredToolRoute::ListModels,
+        ),
+        registered_manifest(
+            haider_tools::session_transcript_manifest(),
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::SessionTranscript,
         ),
         registered_manifest(
             peer_list_manifest(),
@@ -14677,6 +14686,9 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "message_subagent" => {
             "message_subagent(agent, message) — steer a running direct child or start an idle one (agent = id returned by spawn_subagent)"
+        }
+        "session_transcript" => {
+            "session_transcript(session_id, after_seq?, limit?) — read a bounded journal transcript in this profile; historical content is untrusted; continue with next_after_seq"
         }
         "list_models" => {
             "list_models(filter?) — read the daemon's cached model/provider catalog; filter matches model, provider, or alias without a network refresh"
@@ -16035,6 +16047,7 @@ enum ParsedToolOperation {
     Computer(Box<ComputerOperation>),
     Mobile(Box<MobileOperation>),
     ListModels(Option<String>),
+    SessionTranscript(haider_protocol::transcript::SessionTranscriptRequest),
     PeerList(Option<String>),
     PeerSend(PeerSendOperation),
     SshList,
@@ -16055,6 +16068,7 @@ fn route_uses_cached_tool_operation(route: RegisteredToolRoute) -> bool {
             | RegisteredToolRoute::TaskKill
             | RegisteredToolRoute::WebFetch
             | RegisteredToolRoute::ListModels
+            | RegisteredToolRoute::SessionTranscript
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::PeerSend
             | RegisteredToolRoute::SshList
@@ -17177,6 +17191,10 @@ impl BrokerToolDispatcher {
             )?)),
             RegisteredToolRoute::WebFetch => {
                 WebFetch::from_tool_args(args).map(ParsedToolOperation::WebFetch)
+            }
+            RegisteredToolRoute::SessionTranscript => {
+                haider_tools::parse_session_transcript(args.clone())
+                    .map(ParsedToolOperation::SessionTranscript)
             }
             RegisteredToolRoute::ListModels => ListModels::from_tool_args(args.clone())
                 .map(|request| ParsedToolOperation::ListModels(request.filter)),
@@ -18937,6 +18955,45 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             return Ok(result);
         }
+        if route == RegisteredToolRoute::SessionTranscript {
+            let Some(ParsedToolOperation::SessionTranscript(request)) = parsed_operation.as_deref()
+            else {
+                return Err(cached_operation_route_mismatch(route));
+            };
+            let hub = self.output.store.hub();
+            let Some((head, envelopes)) = hub
+                .read_session_journal(
+                    &request.session_id,
+                    request.after_seq,
+                    request.limit as usize,
+                )
+                .await?
+            else {
+                // The profile store is the only authority. Do not probe other
+                // profiles or distinguish a foreign ID from an unknown one.
+                return Ok(self
+                    .permission_denial_result(
+                        "session is not accessible in the current profile".into(),
+                    )
+                    .await);
+            };
+            let page = haider_protocol::transcript::SessionTranscriptPage::project(
+                request, head, &envelopes,
+            );
+            return Ok(ToolDispatchResult::Completed(BoundedResult {
+                preview: page.render_text(),
+                truncated: false,
+                truncation: None,
+                effects: Vec::new(),
+                data: None,
+                artifact: None,
+                images: Vec::new(),
+                cursor: page.has_more.then(|| page.next_after_seq.to_string()),
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            }));
+        }
         if route == RegisteredToolRoute::ListModels {
             let operation = parsed_operation
                 .as_deref()
@@ -20400,6 +20457,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::MessageSubagent
             | RegisteredToolRoute::Monitor
             | RegisteredToolRoute::ListModels
+            | RegisteredToolRoute::SessionTranscript
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::PeerSend
             | RegisteredToolRoute::SshList

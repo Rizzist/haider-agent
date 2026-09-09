@@ -4311,6 +4311,30 @@ impl SessionHub {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    /// Shared `session.read` journal path. This hub owns exactly one profile
+    /// store; IDs never resolve through the filesystem or another daemon.
+    pub(crate) async fn read_session_journal(
+        &self,
+        session_id: &SessionId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Option<(u64, Vec<RawEnvelope>)>, HaiderError> {
+        let head = self.inner.store.latest_seq(session_id).await?;
+        if head == 0 {
+            return Ok(None);
+        }
+        let end_seq = head.min(after_seq.saturating_add(limit as u64));
+        let envelopes = self
+            .inner
+            .store
+            .read(session_id, after_seq, limit)
+            .await?
+            .into_iter()
+            .take_while(|envelope| envelope.seq <= end_seq)
+            .collect();
+        Ok(Some((head, envelopes)))
+    }
+
     pub(crate) async fn read_internal_session(
         &self,
         session_id: &SessionId,

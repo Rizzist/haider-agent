@@ -1007,3 +1007,21 @@ async fn ssh_shell_ask_default_is_enforced_by_the_effect_broker() {
         0
     );
 }
+
+#[test]
+fn session_transcript_surface_is_manifest_route_and_digest_pinned() {
+    let tool = registered_tool_by_name("session_transcript").expect("transcript manifest");
+    assert_eq!(tool.route, RegisteredToolRoute::SessionTranscript);
+    assert_eq!(tool.default, ToolPermissionDefault::Allow);
+    assert!(tool.manifest.effects.is_empty());
+    assert_eq!(tool.manifest.dispatch, DispatchMode::Await);
+    assert_tool_surface_fixture(
+        "session_transcript_provider_schema.json",
+        &[provider_definition(&tool.manifest)],
+    );
+    assert!(
+        tool_manual_line("session_transcript")
+            .expect("manual")
+            .contains("next_after_seq")
+    );
+}
