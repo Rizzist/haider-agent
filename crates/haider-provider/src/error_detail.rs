@@ -78,12 +78,21 @@ fn is_secret_label(value: &str) -> bool {
         .any(|label| value.eq_ignore_ascii_case(label))
 }
 
+#[derive(Clone, Copy)]
 struct CredentialStart {
     introducer: usize,
     value: usize,
     redact: usize,
     authorization: bool,
     assignment: bool,
+}
+
+// Discovery passes raw input and offsets. Only the consumer classifies words,
+// selects quoted contents, or determines a credential's redaction boundaries.
+enum CredentialCandidate {
+    Introduced(CredentialStart),
+    Word(usize),
+    Quote(usize),
 }
 
 fn credential_starts(detail: &str) -> Vec<CredentialStart> {
@@ -103,11 +112,7 @@ fn credential_starts(detail: &str) -> Vec<CredentialStart> {
                 Some(CredentialStart {
                     introducer: start,
                     value,
-                    redact: if detail[value..].starts_with(char::is_whitespace) {
-                        value
-                    } else {
-                        start
-                    },
+                    redact: start,
                     authorization: label.ends_with("authorization") || *label == "bearer",
                     assignment: true,
                 })
@@ -134,46 +139,19 @@ fn credential_starts(detail: &str) -> Vec<CredentialStart> {
                 assignment: false,
             });
         }
-        if let Some(prefix) = provider_secret_start(&word.to_ascii_lowercase()) {
-            starts.push(CredentialStart {
-                introducer: offset + prefix,
-                value: offset + prefix,
-                redact: offset,
-                authorization: false,
-                assignment: false,
-            });
+        let (start, _) = consume_credential_value(detail, CredentialCandidate::Word(offset), None);
+        if let Some(start) = start {
+            starts.push(start);
         }
         offset += piece.len();
     }
     // Known prefixes can occur anywhere in a quoted value, including unknown
     // assignments such as echoed="opaque head sk-... opaque tail".
     let mut quotes = detail.match_indices(['\'', '"']).peekable();
-    while let Some((value, quote)) = quotes.next() {
-        // Apostrophes in diagnostic words do not open quoted values.
-        if quote == "'"
-            && detail[..value]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric)
-            && detail[value + 1..]
-                .chars()
-                .next()
-                .is_some_and(char::is_alphanumeric)
-        {
-            continue;
-        }
-        let start = CredentialStart {
-            introducer: value,
-            value,
-            redact: value,
-            authorization: false,
-            assignment: false,
-        };
-        let end = consume_credential_value(detail, &start, None);
-        if detail[value..end]
-            .split_whitespace()
-            .any(|word| provider_secret_start(&word.to_ascii_lowercase()).is_some())
-        {
+    while let Some((value, _)) = quotes.next() {
+        let (start, end) =
+            consume_credential_value(detail, CredentialCandidate::Quote(value), None);
+        if let Some(start) = start {
             starts.push(start);
         }
         while quotes.peek().is_some_and(|(quote, _)| *quote < end) {
@@ -200,31 +178,115 @@ fn credential_spans(detail: &str) -> Vec<std::ops::Range<usize>> {
             headers.next();
         }
         let next_header = headers.peek().map(|header| header.introducer);
-        let end = consume_credential_value(detail, start, next_header);
-        spans.push(start.redact..end);
+        let (consumed, end) =
+            consume_credential_value(detail, CredentialCandidate::Introduced(*start), next_header);
+        if let Some(consumed) = consumed {
+            spans.push(consumed.redact..end);
+        }
         consumed_until = end;
     }
     spans
 }
 
-// The only credential-value consumer. Discovery supplies introductions, never
-// alternative value boundaries. An opening quote owns its contents through its
-// matching unescaped close, or conservatively through end-of-input. The public
-// presentation applies the 512-byte UTF-8 bound after redaction.
+// The only credential-value consumer. Discovery supplies raw input and candidate
+// offsets, never pre-trimmed words or selected quote contents. Prefix thresholds,
+// value starts, quote classification and value ends all belong to this function.
+// The public presentation applies the 512-byte UTF-8 bound after redaction.
 fn consume_credential_value(
     detail: &str,
-    start: &CredentialStart,
+    candidate: CredentialCandidate,
     next_header: Option<usize>,
-) -> usize {
+) -> (Option<CredentialStart>, usize) {
+    // This classifier is private to the consumer and shared by its raw-word and
+    // quoted-value paths. Keep the established prefix length/dot thresholds.
+    let known_prefix = |value: &str| {
+        let lowercase = value.to_ascii_lowercase();
+        let value = lowercase
+            .trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+        let jwt_separator = value.rmatch_indices('.').nth(1).map(|(offset, _)| offset);
+        value.char_indices().find_map(|(start, _)| {
+            let token = &value[start..];
+            ((token.starts_with("sk-") && token.len() >= 12)
+                || (token.starts_with("sess-") && token.len() >= 16)
+                || (token.starts_with("akia")
+                    && token[4..]
+                        .bytes()
+                        .take_while(u8::is_ascii_alphanumeric)
+                        .take(16)
+                        .count()
+                        >= 16)
+                || (token.starts_with("ghp_")
+                    && token[4..]
+                        .bytes()
+                        .take_while(u8::is_ascii_alphanumeric)
+                        .take(20)
+                        .count()
+                        >= 20)
+                || (token.starts_with("xoxb-")
+                    && token[5..]
+                        .bytes()
+                        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+                        .take(10)
+                        .count()
+                        >= 10)
+                || (token.starts_with("eyj")
+                    && token.len() >= 24
+                    && jwt_separator.is_some_and(|separator| start < separator)))
+            .then_some(start)
+        })
+    };
+    let quoted_candidate = matches!(candidate, CredentialCandidate::Quote(_));
+    let mut start = match candidate {
+        CredentialCandidate::Introduced(start) => start,
+        CredentialCandidate::Word(offset) => {
+            let value = &detail[offset..];
+            let word_end = value.find(char::is_whitespace).unwrap_or(value.len());
+            let Some(prefix) = known_prefix(&value[..word_end]) else {
+                return (None, offset);
+            };
+            CredentialStart {
+                introducer: offset + prefix,
+                value: offset + prefix,
+                redact: offset,
+                authorization: false,
+                assignment: false,
+            }
+        }
+        CredentialCandidate::Quote(value) => {
+            // Apostrophes in diagnostic words do not open quoted values.
+            if detail.as_bytes()[value] == b'\''
+                && detail[..value]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric)
+                && detail[value + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+            {
+                return (None, value + 1);
+            }
+            CredentialStart {
+                introducer: value,
+                value,
+                redact: value,
+                authorization: false,
+                assignment: false,
+            }
+        }
+    };
+    if start.assignment && detail[start.value..].starts_with(char::is_whitespace) {
+        start.redact = start.value;
+    }
     let schemes = ["bearer", "basic", "token"];
     let mut cursor = start.value;
-    loop {
+    let end = loop {
         // Normalize label and scheme separators before any grammar selection.
         let value = detail[cursor..]
             .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '='));
         cursor = detail.len() - value.len();
         let Some(&first) = value.as_bytes().first() else {
-            return cursor;
+            break cursor;
         };
         if matches!(first, b'"' | b'\'') {
             let mut escaped = false;
@@ -240,7 +302,7 @@ fn consume_credential_value(
                 }
             }
             let Some(close) = close else {
-                return detail.len();
+                break detail.len();
             };
             cursor += close + 1;
             if start.authorization
@@ -251,7 +313,7 @@ fn consume_credential_value(
                 // Separately quoted schemes still introduce the same value.
                 continue;
             }
-            return cursor;
+            break cursor;
         }
         if start.authorization
             && let Some(scheme) = schemes.iter().find(|scheme| {
@@ -281,49 +343,14 @@ fn consume_credential_value(
                 .find(char::is_whitespace)
                 .unwrap_or(credential.len())
         });
-        return cursor + end;
+        break cursor + end;
+    };
+    if quoted_candidate
+        && !detail[start.value..end]
+            .split_whitespace()
+            .any(|word| known_prefix(word).is_some())
+    {
+        return (None, end);
     }
-}
-
-// Classify a known prefix; this does not determine a credential value end.
-fn provider_secret_start(value: &str) -> Option<usize> {
-    // Match inside punctuation/assignments too. Keep the established sk-/sess-
-    // thresholds and include the known token prefixes in haider-tools/redact.rs.
-    // A JWT prefix must precede at least two dots in the same word. Locate that
-    // boundary once instead of rescanning the suffix at every possible prefix.
-    // Trailing punctuation is not part of the prefix length threshold. This
-    // lexical classification supplies a start only; the consumer owns the end.
-    let value =
-        value.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
-    let jwt_separator = value.rmatch_indices('.').nth(1).map(|(offset, _)| offset);
-    value.char_indices().find_map(|(start, _)| {
-        let token = &value[start..];
-        ((token.starts_with("sk-") && token.len() >= 12)
-            || (token.starts_with("sess-") && token.len() >= 16)
-            || (token.starts_with("akia")
-                && token[4..]
-                    .bytes()
-                    .take_while(u8::is_ascii_alphanumeric)
-                    .take(16)
-                    .count()
-                    >= 16)
-            || (token.starts_with("ghp_")
-                && token[4..]
-                    .bytes()
-                    .take_while(u8::is_ascii_alphanumeric)
-                    .take(20)
-                    .count()
-                    >= 20)
-            || (token.starts_with("xoxb-")
-                && token[5..]
-                    .bytes()
-                    .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-                    .take(10)
-                    .count()
-                    >= 10)
-            || (token.starts_with("eyj")
-                && token.len() >= 24
-                && jwt_separator.is_some_and(|separator| start < separator)))
-        .then_some(start)
-    })
+    (Some(start), end)
 }
