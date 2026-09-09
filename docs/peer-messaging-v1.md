@@ -38,7 +38,7 @@ wire sender claiming a session it owns. All peer text is untrusted.
 
 Sender admission journals `peer.outbox` and `peer.delivery` in one ordinary
 session-store batch before attempting delivery. The additive receipt `status`
-contains `state`, a bounded diagnostic `reason`, destination address,
+contains `state`, stable sender address `from`, a bounded diagnostic `reason`, destination address,
 `accepted_at_ms`, and `updated_at_ms`. States are `accepted`, `held` (offline
 or transient transport failure), `held_for_approval` (an external bridge is
 waiting for its own owner), `delivered`, and `failed`. No approval is inferred
@@ -60,7 +60,21 @@ daemon, with a one-hour default expiry and configurable 1 ms–24 hour TTL.
 Full queues return a journaled failed receipt without retaining pending work.
 Retry uses the existing five-second maintenance wake and event reconciliation;
 repeated unchanged holding reasons do not add journal events. Pending work is
-recovered from sender journals on restart. Receiver admission deduplicates by
+recovered from sender journals on restart. Each new entry commits an additive
+`enqueue_order`, allocated under the daemon's outbox lock. Only the oldest
+pending entry for a recipient may attempt transport, including new sends;
+held and approval-held heads block later sends until delivery, failure,
+cancellation or expiry. This order survives timestamp ties, clock changes,
+and restarts across sender sessions. Legacy entries without the order field
+precede new entries and use timestamp, journal sequence and sender/message ID
+as a deterministic migration order (historical cross-session timestamp ties
+cannot reconstruct an order that was never recorded).
+Pending and in-flight sends prevent autospawn idle retirement. Terminal
+journal changes and completion of send tasks wake retirement reevaluation.
+Transcript deduplication and receipt correlation use stable sender address
+plus message ID. Legacy receipts lacking a sender address leave peer rows
+unchanged because message IDs alone cannot identify their sender.
+Receiver admission deduplicates by
 sender address and message ID; presentation changes such as rename/state do
 not change that identity. A reused ID with different content is refused. Legacy receiver receipts are
 checked before creating an admission under the new sender-scoped key; a
@@ -175,3 +189,18 @@ without a mailbox fallback. Old clients can still negotiate the retained
 `peer_messaging_v1` list/send surface with a new daemon, whose additive status describes durable transport admission. `wait-idle` requires the new feature bit. Upgrade any
 reader of newly written `kind: agent` transcript nodes before relying on its
 rendering; additive wire decoding alone does not provide that rendering.
+
+
+The real CLI regressions for forwarding-proxy reconnect ordering and default
+30-second autospawn retirement run with freshly built `haider` and `haiderd`:
+
+```sh
+python3 scripts/qa-gate/peer_delivery_regression.py --evidence /absolute/fresh/evidence
+```
+
+The script uses isolated synthetic profiles and a real receiver behind a
+fault proxy. It also captures two sender-scoped ID collisions for replay by
+`real_receiver_collision_capture_renders_both_senders` in the TUI suite, with
+`PEER_REPAIR_JOURNAL` and `PEER_REPAIR_RENDER` pointing at the fresh journal and
+renderer output. The normal suite uses the round-1 verifier's checked-in
+synthetic receiver events.

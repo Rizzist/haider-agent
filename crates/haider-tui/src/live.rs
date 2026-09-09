@@ -3405,6 +3405,7 @@ impl LiveDriver {
                 let kind = peer_kind_label(message.from.kind);
                 model.projection.push_peer_message(
                     message.msg_id,
+                    message.from.address(),
                     message.from.display_identity(),
                     kind.to_owned(),
                     message.message.to_owned_string(),
@@ -3419,9 +3420,7 @@ impl LiveDriver {
                 Vec::new()
             }
             LiveReply::PeerDeliveryChanged { receipt } => {
-                model
-                    .projection
-                    .set_peer_receipt(&receipt.msg_id, receipt.delivery);
+                model.projection.apply_peer_receipt(&receipt);
                 model.flash = Some(format!(
                     "· peer message {} — {}",
                     receipt.msg_id,

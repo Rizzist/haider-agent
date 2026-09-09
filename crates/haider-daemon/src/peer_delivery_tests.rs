@@ -57,16 +57,31 @@ async fn peer_offline_queue_survives_sender_and_receiver_restart_and_replays_onc
             .expect("connect reason")
             .contains("endpoint")
     );
+    assert!(
+        !sh.daemon_is_durably_quiescent()
+            .await
+            .expect("pending quiescence")
+    );
     sender.shutdown().await;
     sh.shutdown().await.expect("sender stop");
     ss.close().await.expect("sender store close");
     let (sh, ss, sender) = live_peer_fixture(&sender_root, &runtime, "sender").await;
     assert_eq!(sender.outbox.lock().await.len(), 1);
+    assert!(
+        !sh.daemon_is_durably_quiescent()
+            .await
+            .expect("recovered quiescence")
+    );
     let (th, ts, target) = live_peer_fixture(&target_root, &runtime, "target").await;
     let target_id = SessionId::new("target");
     let manager = start_held_peer_turn(&th, &ts, &target_id, &RunId::new("busy-target")).await;
     sender.drain_outbox().await.expect("reconnect drain");
     assert!(sender.outbox.lock().await.is_empty());
+    assert!(
+        sh.daemon_is_durably_quiescent()
+            .await
+            .expect("delivered quiescence")
+    );
     let receipt = sender
         .send_with_options(
             &from,
@@ -271,6 +286,101 @@ async fn peer_outbox_bounds_expiry_cancel_conflict_and_removed_registration() {
         .await
         .expect_err("unknown fails");
     assert!(error.to_string().contains("candidates:"));
+    sender.shutdown().await;
+    sh.shutdown().await.expect("sender stop");
+    th.shutdown().await.expect("target stop");
+    ss.close().await.expect("sender close");
+    ts.close().await.expect("target close");
+}
+
+#[tokio::test]
+async fn peer_terminal_states_wake_and_release_durable_quiescence() {
+    let root = tempfile::tempdir_in("/tmp").expect("short root");
+    let runtime = root.path().join("r");
+    let (sh, ss, sender) = live_peer_fixture(&root.path().join("s"), &runtime, "sender").await;
+    let (th, ts, target) = live_peer_fixture(&root.path().join("t"), &runtime, "target").await;
+    target.shutdown().await;
+    let from = SessionId::new("sender");
+    for terminal in ["cancel", "expire", "revoke"] {
+        // Subscribe before admission: a one-millisecond TTL may legitimately
+        // expire in the initial attempt on a loaded machine.
+        let mut wake = sh.subscribe_peer_reconcile();
+        let accepted = sender
+            .send_with_options(
+                &from,
+                "target".into(),
+                "pending".into(),
+                None,
+                PeerSendOptions {
+                    ttl_ms: (terminal == "expire").then_some(1),
+                    ..options(terminal)
+                },
+            )
+            .await
+            .expect("queue send");
+        if terminal != "expire" {
+            assert!(
+                !sh.daemon_is_durably_quiescent()
+                    .await
+                    .expect("pending check")
+            );
+            while wake.try_recv().is_ok() {}
+        }
+        match terminal {
+            "cancel" => {
+                sender
+                    .send_with_options(
+                        &from,
+                        String::new(),
+                        String::new(),
+                        None,
+                        PeerSendOptions {
+                            cancel: true,
+                            ..options(terminal)
+                        },
+                    )
+                    .await
+                    .expect("cancel send");
+            }
+            "expire" => {
+                let expiry = accepted
+                    .status
+                    .expect("accepted status")
+                    .accepted_at_ms
+                    .saturating_add(1);
+                tokio::time::sleep(Duration::from_millis(
+                    expiry.saturating_sub(now_ms()).saturating_add(1),
+                ))
+                .await;
+                sender.drain_outbox().await.expect("expiry drain");
+            }
+            _ => {
+                let paths = peer_endpoint_paths(&runtime, "target", PeerEndpointKind::Haider)
+                    .expect("target paths");
+                std::fs::remove_file(paths.manifest).expect("revoke target");
+                sender.drain_outbox().await.expect("revocation drain");
+            }
+        }
+        assert!(
+            wake.try_recv().is_ok(),
+            "{terminal} must wake idle retirement"
+        );
+        assert_eq!(
+            sender
+                .prior_receipt_for_test(&from, terminal)
+                .await
+                .status
+                .expect("terminal status")
+                .state,
+            PeerDeliveryState::Failed
+        );
+        assert!(
+            sh.daemon_is_durably_quiescent()
+                .await
+                .expect("terminal check"),
+            "{terminal}"
+        );
+    }
     sender.shutdown().await;
     sh.shutdown().await.expect("sender stop");
     th.shutdown().await.expect("target stop");

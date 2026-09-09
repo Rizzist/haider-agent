@@ -156,6 +156,8 @@ struct LocalPublication {
     paths: haider_platform::PeerEndpointPaths,
 }
 
+const SEND_CAPACITY: usize = 32;
+
 /// One profile daemon's live roster and per-session injection endpoints.
 pub(crate) struct PeerService {
     runtime_dir: PathBuf,
@@ -207,7 +209,7 @@ impl PeerService {
             publications: Mutex::new(HashMap::new()),
             background: Mutex::new(None),
             outbox: tokio::sync::Mutex::new(outbox),
-            sends: Arc::new(tokio::sync::Semaphore::new(32)),
+            sends: Arc::new(tokio::sync::Semaphore::new(SEND_CAPACITY)),
             #[cfg(test)]
             reconcile_count: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -713,6 +715,7 @@ impl PeerService {
         );
         receipt.status = Some(haider_protocol::peer::PeerReceiptStatus {
             state: haider_protocol::peer::PeerDeliveryState::Delivered,
+            from: Some(message.from.address()),
             reason: None,
             to: message.to.clone(),
             accepted_at_ms: message.queued_at,

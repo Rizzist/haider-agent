@@ -6191,5 +6191,13 @@ fn peer_delivery_extensions_roundtrip_without_new_methods() {
             serde_json::to_value(decoded).expect("encode receipt"),
             receipt
         );
+        let mut scoped = receipt;
+        scoped["status"]["from"] = serde_json::json!("session:sender@device");
+        let decoded: haider_protocol::peer::PeerReceipt =
+            serde_json::from_value(scoped.clone()).expect("sender-scoped receipt");
+        assert_eq!(
+            serde_json::to_value(decoded).expect("encode scoped receipt"),
+            scoped
+        );
     }
 }

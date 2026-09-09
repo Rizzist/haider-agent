@@ -66,6 +66,7 @@ pub enum TranscriptEntry {
     /// by construction; callers cannot turn the marker off.
     Peer {
         msg_id: String,
+        sender_address: String,
         sender: String,
         sender_kind: String,
         text: String,
@@ -785,6 +786,7 @@ impl SessionProjection {
             }
             EventPayload::PeerMessage(message) => self.push_peer_message(
                 message.msg_id.clone(),
+                message.from.address(),
                 message.from.display_identity(),
                 peer_kind_label(message.from.kind).to_owned(),
                 message.message.to_owned_string(),
@@ -1074,7 +1076,8 @@ impl SessionProjection {
             EventPayload::CheckpointRecorded(_) => {}
             // Sender delivery bookkeeping is exposed by peer status; replay
             // must not turn it into another transcript message.
-            EventPayload::PeerOutbox(_) | EventPayload::PeerDelivery(_) => {}
+            EventPayload::PeerOutbox(_) => {}
+            EventPayload::PeerDelivery(receipt) => self.apply_peer_receipt(receipt),
         }
     }
 
@@ -1779,16 +1782,18 @@ impl SessionProjection {
     pub fn push_peer_message(
         &mut self,
         msg_id: String,
+        sender_address: String,
         sender: String,
         sender_kind: String,
         text: String,
     ) {
-        if self.has_peer_message(&msg_id) {
+        if self.has_peer_message(&sender_address, &msg_id) {
             return;
         }
         self.render_revision = self.render_revision.wrapping_add(1);
         self.entries.push(TranscriptEntry::Peer {
             msg_id,
+            sender_address,
             sender,
             sender_kind,
             text,
@@ -1797,9 +1802,19 @@ impl SessionProjection {
     }
 
     /// Attach an optional delivery receipt to an existing peer block.
-    pub fn set_peer_receipt(&mut self, msg_id: &str, receipt: PeerDelivery) {
+    pub fn apply_peer_receipt(&mut self, receipt: &haider_protocol::peer::PeerReceipt) {
+        if let Some(from) = receipt
+            .status
+            .as_ref()
+            .and_then(|status| status.from.as_deref())
+        {
+            self.set_peer_receipt(from, &receipt.msg_id, receipt.delivery);
+        }
+    }
+
+    pub fn set_peer_receipt(&mut self, sender_address: &str, msg_id: &str, receipt: PeerDelivery) {
         let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
-            matches!(entry, TranscriptEntry::Peer { msg_id: existing, .. } if existing == msg_id)
+            matches!(entry, TranscriptEntry::Peer { msg_id: existing, sender_address: address, .. } if existing == msg_id && address == sender_address)
         }) else {
             return;
         };
@@ -1814,9 +1829,9 @@ impl SessionProjection {
         }
     }
 
-    fn has_peer_message(&self, msg_id: &str) -> bool {
+    fn has_peer_message(&self, sender_address: &str, msg_id: &str) -> bool {
         self.entries.iter().rev().any(|entry| {
-            matches!(entry, TranscriptEntry::Peer { msg_id: existing, .. } if existing == msg_id)
+            matches!(entry, TranscriptEntry::Peer { msg_id: existing, sender_address: address, .. } if existing == msg_id && address == sender_address)
         })
     }
 

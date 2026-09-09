@@ -3597,6 +3597,10 @@ impl SessionHub {
         self.inner.roster_publications.subscribe()
     }
 
+    pub(crate) fn notify_peer_delivery_settled(&self, session: SessionId) {
+        let _ = self.inner.roster_publications.send(session);
+    }
+
     pub(crate) fn peer_control_sessions(
         &self,
         connection_id: &str,
@@ -5927,12 +5931,21 @@ impl SessionHub {
         self.inner.store.session_ids().await.map_err(Into::into)
     }
 
-    /// Return true only when every durable run in the profile is terminal.
+    /// Return true only when every durable run and peer send is terminal.
     ///
     /// Auto-spawn retirement calls this after the last client disconnects.
     /// The journal remains the authority: resident-worker count and volatile
     /// actor state are deliberately insufficient for a shutdown decision.
     pub(crate) async fn daemon_is_durably_quiescent(&self) -> Result<bool, SessionHubError> {
+        // The service is recovered before the listener starts. Taking its
+        // outbox lock observes journal commits and terminal removals together;
+        // admitted send tasks also guard retirement until their permit drops.
+        let peer = lock(&self.inner.peer_service)?.clone();
+        if let Some(peer) = peer
+            && peer.has_pending_sends().await
+        {
+            return Ok(false);
+        }
         for session_id in self.session_ids().await? {
             if self.session_has_nonterminal_runs(&session_id).await? {
                 return Ok(false);

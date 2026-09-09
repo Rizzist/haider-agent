@@ -153,6 +153,10 @@ pub enum PeerDeliveryState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReceiptStatus {
     pub state: PeerDeliveryState,
+    /// Stable sender address for sender-scoped message IDs. Legacy receipts
+    /// without this field cannot be correlated to a transcript peer row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
     /// Bounded diagnostic, including the connect/refusal reason when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -197,6 +201,11 @@ pub struct PeerStatusPage {
 pub struct PeerOutboxEntry {
     pub message: PeerMessage,
     pub target: PeerDescriptor,
+    /// Daemon outbox order, allocated under the send lock and committed with
+    /// the entry. Pending entries retain this order across timestamp ties,
+    /// clock changes, sender sessions and daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueue_order: Option<u64>,
 }
 
 /// Transcript message. The old timing fields are retained for decoding

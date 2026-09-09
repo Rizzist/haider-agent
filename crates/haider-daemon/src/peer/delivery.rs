@@ -22,8 +22,21 @@ type Key = (String, String);
 pub(super) struct Pending {
     entry: PeerOutboxEntry,
     receipt: PeerReceipt,
+    journal_seq: u64,
 }
 pub(super) type Outbox = BTreeMap<Key, Pending>;
+
+fn order_key<'a>(key: &'a Key, pending: &Pending) -> (Option<u64>, u64, u64, &'a Key) {
+    // Pre-ordering journals sort first, using their original timestamp and
+    // session sequence with a stable final tie-break. New entries never use
+    // wall-clock time to decide their relative order.
+    (
+        pending.entry.enqueue_order,
+        pending.entry.message.queued_at,
+        pending.journal_seq,
+        key,
+    )
+}
 
 fn is_pending(receipt: &PeerReceipt) -> bool {
     receipt.status.as_ref().is_some_and(|status| {
@@ -56,7 +69,11 @@ pub(super) async fn recover(hub: &SessionHub) -> Result<Outbox, PeerError> {
                         let receipt = status_receipt(&entry, PeerDeliveryState::Accepted, None);
                         pending.insert(
                             (session.to_string(), entry.message.msg_id.clone()),
-                            Pending { entry, receipt },
+                            Pending {
+                                entry,
+                                receipt,
+                                journal_seq: event.seq,
+                            },
                         );
                     }
                     Ok(EventPayload::PeerDelivery(receipt)) => {
@@ -95,6 +112,7 @@ fn status_receipt(
         reason: (state == PeerDeliveryState::Failed).then_some(PeerDeliveryReason::TargetRefused),
         status: Some(PeerReceiptStatus {
             state,
+            from: Some(entry.message.from.address()),
             reason: reason.map(|reason| sanitize_peer_scalar(&reason, 2048)),
             to: entry.target.address(),
             accepted_at_ms: entry.message.queued_at,
@@ -107,7 +125,7 @@ async fn journal(
     hub: &SessionHub,
     session: &SessionId,
     payloads: Vec<EventPayload>,
-) -> Result<(), PeerError> {
+) -> Result<u64, PeerError> {
     let mut envelopes = Vec::with_capacity(payloads.len());
     for payload in payloads {
         envelopes.push(EventEnvelope {
@@ -139,7 +157,7 @@ async fn journal(
     hub.append(&mut envelopes)
         .await
         .map_err(SessionHubError::from)?;
-    Ok(())
+    Ok(envelopes.first().map_or(0, |event| event.seq))
 }
 
 impl PeerService {
@@ -194,7 +212,11 @@ impl PeerService {
                 match event.payload.decode_event() {
                     Ok(EventPayload::PeerOutbox(entry)) if entry.message.msg_id == msg_id => {
                         let receipt = status_receipt(&entry, PeerDeliveryState::Accepted, None);
-                        found = Some(Pending { entry, receipt });
+                        found = Some(Pending {
+                            entry,
+                            receipt,
+                            journal_seq: event.seq,
+                        });
                     }
                     Ok(EventPayload::PeerDelivery(receipt)) if receipt.msg_id == msg_id => {
                         if let Some(record) = found.as_mut() {
@@ -231,10 +253,16 @@ impl PeerService {
         let service = self.clone();
         let from = from.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            service
-                .send_owned(from, to, message, summary, options)
-                .await
+            let result = service
+                .send_owned(from.clone(), to, message, summary, options)
+                .await;
+            drop(permit);
+            // Validation failures may produce no journal publication. Release
+            // the in-flight retirement guard before waking the idle loop.
+            if let Ok(hub) = service.hub() {
+                hub.notify_peer_delivery_settled(from);
+            }
+            result
         })
         .await
         .map_err(|error| PeerError::Unavailable {
@@ -330,7 +358,17 @@ impl PeerService {
             None => random_id("msg")?,
         };
         let queued_at = now_ms();
+        let enqueue_order = outbox
+            .values()
+            .filter_map(|pending| pending.entry.enqueue_order)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| PeerError::Unavailable {
+                message: "peer outbox ordering space exhausted".into(),
+            })?;
         let entry = PeerOutboxEntry {
+            enqueue_order: Some(enqueue_order),
             message: PeerMessage {
                 msg_id: msg_id.clone(),
                 from: PeerSender {
@@ -370,7 +408,7 @@ impl PeerService {
             full.then(|| "sender outbox is full for this recipient or daemon".into()),
         );
         // Both facts commit atomically under the ordinary actor/store policy.
-        journal(
+        let journal_seq = journal(
             &self.hub()?,
             &from,
             vec![
@@ -389,8 +427,19 @@ impl PeerService {
             return Ok(receipt);
         }
         let key = (from.to_string(), msg_id);
-        outbox.insert(key.clone(), Pending { entry, receipt });
+        outbox.insert(
+            key.clone(),
+            Pending {
+                entry,
+                receipt,
+                journal_seq,
+            },
+        );
         self.attempt(&key, &mut outbox).await
+    }
+
+    pub(crate) async fn has_pending_sends(&self) -> bool {
+        !self.outbox.lock().await.is_empty() || self.sends.available_permits() < SEND_CAPACITY
     }
 
     async fn record_status(
@@ -425,6 +474,15 @@ impl PeerService {
         let entry = &pending.entry;
         let receipt = if now_ms() >= entry.message.expires_at {
             status_receipt(entry, PeerDeliveryState::Failed, Some("expired before confirmed receiver admission; a lost reply can hide an admission".into()))
+        } else if outbox.iter().any(|(other_key, other)| {
+            other.entry.target.address() == entry.target.address()
+                && order_key(other_key, other) < order_key(key, &pending)
+        }) {
+            status_receipt(
+                entry,
+                PeerDeliveryState::Held,
+                Some("waiting for older pending send to this recipient".into()),
+            )
         } else {
             let result = self.deliver_registered(entry).await;
             match result {
@@ -505,7 +563,9 @@ impl PeerService {
     pub(super) async fn drain_outbox(self: &Arc<Self>) -> Result<(), PeerError> {
         let mut outbox = self.outbox.lock().await;
         let mut keys = outbox.keys().cloned().collect::<Vec<_>>();
-        keys.sort_by_key(|key| outbox[key].entry.message.queued_at);
+        keys.sort_by(|left, right| {
+            order_key(left, &outbox[left]).cmp(&order_key(right, &outbox[right]))
+        });
         for key in keys {
             if self.draining.load(Ordering::Acquire) {
                 break;
@@ -596,5 +656,126 @@ impl PeerService {
         }
         #[cfg(windows)]
         self.discover().await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::peer_tests::live_peer_fixture;
+    use haider_core::StoreHandle;
+
+    #[tokio::test]
+    async fn durable_fifo_order_survives_timestamp_ties_restart_and_new_sends() {
+        let root = tempfile::tempdir_in("/tmp").expect("short root");
+        let runtime = root.path().join("r");
+        let sender_root = root.path().join("s");
+        let target_root = root.path().join("t");
+        let (sh, ss, sender) = live_peer_fixture(&sender_root, &runtime, "sender").await;
+        let (th, ts, target) = live_peer_fixture(&target_root, &runtime, "target").await;
+        target.shutdown().await;
+        let from = SessionId::new("sender");
+        sender
+            .send_with_options(
+                &from,
+                "target".into(),
+                "first".into(),
+                None,
+                PeerSendOptions {
+                    msg_id: Some("z-first".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("offline send");
+        let mut first = sender
+            .outbox
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("first entry")
+            .entry
+            .clone();
+        sender.shutdown().await;
+        // Journal two accepted entries at exactly the same timestamp, with
+        // message IDs deliberately in reverse lexical order. This represents
+        // the clock tie that a timestamp-sort cannot resolve after restart.
+        first.message.queued_at = now_ms();
+        first.message.expires_at = first.message.queued_at + 60_000;
+        let mut second = first.clone();
+        second.message.msg_id = "a-second".into();
+        second.message.message = "second".into();
+        second.enqueue_order = Some(first.enqueue_order.expect("durable order") + 1);
+        for entry in [first, second] {
+            let receipt = status_receipt(&entry, PeerDeliveryState::Accepted, None);
+            journal(
+                &sh,
+                &from,
+                vec![
+                    EventPayload::PeerOutbox(entry),
+                    EventPayload::PeerDelivery(receipt),
+                ],
+            )
+            .await
+            .expect("timestamp tie journal");
+        }
+        sh.shutdown().await.expect("sender stop");
+        ss.close().await.expect("sender close");
+        th.shutdown().await.expect("target stop");
+        ts.close().await.expect("target close");
+        let (sh, ss, sender) = live_peer_fixture(&sender_root, &runtime, "sender").await;
+        assert_eq!(sender.outbox.lock().await.len(), 2);
+        let third = sender
+            .send_with_options(
+                &from,
+                "target".into(),
+                "third".into(),
+                None,
+                PeerSendOptions {
+                    msg_id: Some("0-third".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("new send after restart");
+        assert_eq!(third.status.expect("status").state, PeerDeliveryState::Held);
+        let pending = sender.outbox.lock().await;
+        let (th, ts, target) = live_peer_fixture(&target_root, &runtime, "target").await;
+        // A live held turn supplies the real receiver's durable admission path.
+        let manager = crate::peer_tests::start_held_peer_turn(
+            &th,
+            &ts,
+            &SessionId::new("target"),
+            &haider_protocol::ids::RunId::new("fifo-busy"),
+        )
+        .await;
+        drop(pending);
+        sender.drain_outbox().await.expect("reconnect drain");
+        let events = ts
+            .read(&SessionId::new("target"), 0, 256)
+            .await
+            .expect("receiver journal");
+        let ids = events
+            .iter()
+            .filter_map(|event| match event.payload.decode_event() {
+                Ok(EventPayload::PeerMessage(message)) => Some(message.msg_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["z-first", "a-second", "0-third"]);
+        assert!(
+            sh.daemon_is_durably_quiescent()
+                .await
+                .expect("settled quiescence")
+        );
+        sender.shutdown().await;
+        target.shutdown().await;
+        manager.shutdown().await.expect("worker stop");
+        sh.shutdown().await.expect("sender stop");
+        th.shutdown().await.expect("target stop");
+        ss.close().await.expect("sender close");
+        ts.close().await.expect("target close");
     }
 }

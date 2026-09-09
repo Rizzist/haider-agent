@@ -51,6 +51,7 @@ fn delivered_peer_message_is_its_own_untrusted_transcript_block() {
             sender_kind,
             text,
             receipt: None,
+            ..
         }] if sender == "reviewer [session:peer-1@device-1]"
             && msg_id == "msg-1"
             && sender_kind == "external"
@@ -72,7 +73,14 @@ fn delivered_peer_message_is_its_own_untrusted_transcript_block() {
 
     let mut receipt_replies = map_frame(haider_rpc::WireFrame::PeerDeliveryChanged {
         receipt: PeerReceipt {
-            status: None,
+            status: Some(haider_protocol::peer::PeerReceiptStatus {
+                state: haider_protocol::peer::PeerDeliveryState::Delivered,
+                from: Some("session:peer-1@device-1".into()),
+                reason: None,
+                to: "session:session-1@local".into(),
+                accepted_at_ms: 10,
+                updated_at_ms: 11,
+            }),
             msg_id: "msg-1".into(),
             delivery: PeerDelivery::Delivered,
             reason: None,
@@ -128,4 +136,128 @@ fn peer_slash_lists_and_sends_with_an_inline_affordance() {
         [AppRequest::PeerSend { to, message }]
             if to == "reviewer" && message == "please inspect the permission gate"
     ));
+}
+
+// Captured from the independent verifier's two real sender sessions (round 1).
+#[test]
+fn captured_sender_scoped_ids_survive_replay_live_rename_and_receipts() {
+    let events: Vec<EventPayload> =
+        serde_json::from_str(include_str!("fixtures/peer_sender_collision.json"))
+            .expect("captured receiver events");
+    assert_eq!(events.len(), 2);
+    let mut model = launcher_model();
+    let mut driver = LiveDriver::new("collision-test");
+    let mut addresses = Vec::new();
+    for event in &events {
+        model.projection.apply(event);
+        let EventPayload::PeerMessage(mut message) = event.clone() else {
+            panic!("captured peer message");
+        };
+        addresses.push(message.from.address());
+        // A renamed live notification duplicates the durable event; the
+        // display identity changes but the sender address does not.
+        message.from.name = "same renamed display name".into();
+        let reply = map_frame(haider_rpc::WireFrame::PeerMessageReceived { message }).remove(0);
+        driver.apply(&mut model, reply);
+    }
+    assert_ne!(addresses[0], addresses[1]);
+    let rows = || {
+        model
+            .projection
+            .entries()
+            .iter()
+            .filter(|row| matches!(row, TranscriptEntry::Peer { .. }))
+            .count()
+    };
+    assert_eq!(rows(), 2);
+    let mut receipt = PeerReceipt {
+        msg_id: "per-sender-id".into(),
+        delivery: PeerDelivery::Delivered,
+        reason: None,
+        status: None,
+    };
+    // No identity on a legacy receipt: it must not guess either sender.
+    model
+        .projection
+        .apply(&EventPayload::PeerDelivery(receipt.clone()));
+    assert!(
+        model
+            .projection
+            .entries()
+            .iter()
+            .all(|row| matches!(row, TranscriptEntry::Peer { receipt: None, .. }))
+    );
+    receipt.status = Some(haider_protocol::peer::PeerReceiptStatus {
+        state: haider_protocol::peer::PeerDeliveryState::Delivered,
+        from: Some(addresses[0].clone()),
+        reason: None,
+        to: "receiver".into(),
+        accepted_at_ms: 1,
+        updated_at_ms: 2,
+    });
+    model
+        .projection
+        .apply(&EventPayload::PeerDelivery(receipt.clone()));
+    let reply = map_frame(haider_rpc::WireFrame::PeerDeliveryChanged { receipt }).remove(0);
+    driver.apply(&mut model, reply);
+    for row in model.projection.entries() {
+        let TranscriptEntry::Peer {
+            sender_address,
+            receipt,
+            ..
+        } = row
+        else {
+            panic!("peer row");
+        };
+        assert_eq!(
+            *receipt,
+            (sender_address == &addresses[0]).then_some(PeerDelivery::Delivered)
+        );
+    }
+    let rendered = render_plain(&model.projection, 100_000, None);
+    assert!(rendered.contains("synthetic sender one visible message"));
+    assert!(rendered.contains("synthetic sender two visible message"));
+}
+
+/// Replays fresh real-daemon captures when running the CLI regression script.
+/// The checked-in verifier capture is the hermetic default for the full suite.
+#[test]
+fn real_receiver_collision_capture_renders_both_senders() {
+    let events: Vec<EventPayload> = if let Ok(path) = std::env::var("PEER_REPAIR_JOURNAL") {
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(path).expect("fresh journal"))
+                .expect("journal JSON");
+        rows.into_iter()
+            .filter(|row| {
+                row["payload_kind"] == "peer.message"
+                    && row["envelope"]["payload"]["msg_id"] == "per-sender-id"
+            })
+            .map(|row| {
+                serde_json::from_value(row["envelope"]["payload"].clone()).expect("typed event")
+            })
+            .collect()
+    } else {
+        serde_json::from_str(include_str!("fixtures/peer_sender_collision.json"))
+            .expect("captured events")
+    };
+    assert_eq!(events.len(), 2, "both real receiver admissions required");
+    let mut model = launcher_model();
+    for event in events {
+        model.projection.apply(&event);
+    }
+    assert_eq!(
+        model
+            .projection
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Peer { .. }))
+            .count(),
+        2
+    );
+    let rendered = render_plain(&model.projection, 100_000, None);
+    assert!(rendered.contains("synthetic sender one visible message"));
+    assert!(rendered.contains("synthetic sender two visible message"));
+    if let Ok(path) = std::env::var("PEER_REPAIR_RENDER") {
+        std::fs::write(path, rendered).expect("render evidence");
+    }
 }
