@@ -135,3 +135,91 @@ fn close_wins_a_race_with_the_running_transition() {
         .expect_err("closed row cannot transition back to running");
     assert!(matches!(error, ShellRegistryError::ControlClosed(_)));
 }
+
+#[test]
+fn activity_inventory_counts_active_shells_and_ignores_output_and_duplicate_exit() {
+    let registry = ShellRegistry::default();
+    let mut changes = registry.subscribe_inventory();
+    assert_eq!(
+        registry.inventory(),
+        haider_rpc::ShellInventoryWire::default()
+    );
+    let local = registry
+        .open(ShellKindWire::Local, "local", ".")
+        .expect("open");
+    let ssh = registry
+        .open(
+            ShellKindWire::Ssh {
+                profile: "fixture".into(),
+            },
+            "remote",
+            "fixture.invalid",
+        )
+        .expect("ssh");
+    assert_eq!(
+        registry.inventory(),
+        haider_rpc::ShellInventoryWire {
+            count: 2,
+            revision: 2
+        }
+    );
+    changes.borrow_and_update();
+    local.running().expect("running");
+    local.add_output(100_000).expect("output");
+    assert!(!changes.has_changed().expect("watch"));
+    local.exited(Some(0)).expect("exit");
+    local.exited(Some(0)).expect("duplicate exit");
+    registry.close(local.id()).expect("close exited");
+    assert_eq!(
+        registry.inventory(),
+        haider_rpc::ShellInventoryWire {
+            count: 1,
+            revision: 3
+        }
+    );
+    registry.close(ssh.id()).expect("close active");
+    registry.close(ssh.id()).expect("duplicate close");
+    assert_eq!(
+        registry.inventory(),
+        haider_rpc::ShellInventoryWire {
+            count: 0,
+            revision: 4
+        }
+    );
+    assert_eq!(*changes.borrow_and_update(), registry.inventory());
+    assert_eq!(registry.list().expect("retained history").len(), 2);
+}
+
+#[test]
+fn activity_inventory_revision_remains_monotonic_under_concurrent_lifecycle_changes() {
+    let registry = ShellRegistry::default();
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            let registry = registry.clone();
+            scope.spawn(move || {
+                let mut previous = 0;
+                for sequence in 0..25 {
+                    let shell = registry
+                        .open(ShellKindWire::Local, format!("{worker}-{sequence}"), ".")
+                        .expect("open");
+                    shell.running().expect("running");
+                    shell.add_output(17).expect("output");
+                    let inventory = registry.inventory();
+                    assert!(inventory.revision >= previous);
+                    assert!(inventory.count <= 4);
+                    previous = inventory.revision;
+                    shell.exited(Some(0)).expect("exit");
+                    registry.close(shell.id()).expect("close");
+                }
+            });
+        }
+    });
+    assert_eq!(
+        registry.inventory(),
+        haider_rpc::ShellInventoryWire {
+            count: 0,
+            revision: 200
+        }
+    );
+    assert_eq!(registry.active_count(), 0);
+}

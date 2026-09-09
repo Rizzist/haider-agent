@@ -281,7 +281,7 @@ fn detect_output_adapter(tool: &str, output: &str) -> OutputAdapter {
     }
 }
 
-fn strip_ansi(input: &str) -> String {
+pub(crate) fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0usize;

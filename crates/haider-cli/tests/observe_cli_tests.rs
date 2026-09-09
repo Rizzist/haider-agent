@@ -135,6 +135,8 @@ fn digest(
             accounting: None,
         }),
         pending_menus: menu.into_iter().collect(),
+        tasks: None,
+        shells: None,
         subagents: vec![
             ObserveSubagentWire {
                 agent_id: AgentId::new("agent-daemon-name"),
@@ -146,6 +148,7 @@ fn digest(
                     .expect("chip string")
                     .to_owned(),
                 provider: None,
+                agent_type: None,
                 lockdown_bound: None,
                 lockdown_auto_hermetic_bound: None,
                 lockdown: None,
@@ -160,6 +163,7 @@ fn digest(
                     .expect("chip string")
                     .to_owned(),
                 provider: None,
+                agent_type: None,
                 lockdown_bound: None,
                 lockdown_auto_hermetic_bound: None,
                 lockdown: None,

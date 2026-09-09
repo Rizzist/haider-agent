@@ -1387,6 +1387,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     main_head_seq: 0,
                     latest_context_footprint: None,
                     pending_menus: Vec::new(),
+                    tasks: None,
+                    shells: None,
                     subagents: Vec::new(),
                     lockdown: None,
                     updated_at_ms: 1_753_500_000_009,

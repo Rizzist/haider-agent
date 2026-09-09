@@ -241,6 +241,17 @@ pub const COMMANDS: &[CommandSpec] = &[
     session_client_cmd("update", "Check for and install a production update", ""),
     session_operation_cmd("rename", "Rename this session", "<name>"),
     client_cmd("reset", "Reset the demo — restore the seed sessions", ""),
+    session_client_cmd(
+        "collapse",
+        "Fold or expand activity rows",
+        "[all|expand|next|prev]",
+    ),
+    client_cmd(
+        "verbosity",
+        "Set transcript detail",
+        "[quiet|normal|verbose]",
+    ),
+    session_client_cmd("tasks", "Show background tasks", ""),
 ];
 
 /// One palette row: a built-in, an argument candidate, or a custom command.
