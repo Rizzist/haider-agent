@@ -374,7 +374,7 @@ impl FixedDnsResolver for StubFixedResolver {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FakeMode {
+pub(super) enum FakeMode {
     Success,
     Denied,
     TokenRedirect,
@@ -404,11 +404,11 @@ struct AuthSeen {
     audience: String,
 }
 
-struct FakeState {
+pub(super) struct FakeState {
     mode: FakeMode,
     issuer: String,
     auth: Mutex<Option<AuthSeen>>,
-    token_calls: AtomicUsize,
+    pub(super) token_calls: AtomicUsize,
     redirect_target_calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     saw_client_secret: AtomicBool,
@@ -417,7 +417,7 @@ struct FakeState {
     msh_headers: Mutex<Vec<HashMap<String, String>>>,
     expect_refresh_binding: AtomicBool,
     expect_code_state: AtomicBool,
-    jwt_id_tokens: AtomicBool,
+    pub(super) jwt_id_tokens: AtomicBool,
     verifiers: Mutex<Vec<String>>,
     refresh_gate: Option<Arc<Semaphore>>,
     refresh_started: Notify,
@@ -425,9 +425,9 @@ struct FakeState {
     resource_before_durable: AtomicUsize,
 }
 
-struct FakeOAuthServer {
+pub(super) struct FakeOAuthServer {
     address: SocketAddr,
-    state: Arc<FakeState>,
+    pub(super) state: Arc<FakeState>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -438,7 +438,7 @@ impl Drop for FakeOAuthServer {
 }
 
 impl FakeOAuthServer {
-    async fn start(mode: FakeMode, gated_refresh: bool) -> Self {
+    pub(super) async fn start(mode: FakeMode, gated_refresh: bool) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("fake bind");
@@ -483,7 +483,10 @@ impl FakeOAuthServer {
         }
     }
 
-    fn registration(&self, verifier: Arc<dyn OAuthIdentityVerifier>) -> OAuthProviderRegistration {
+    pub(super) fn registration(
+        &self,
+        verifier: Arc<dyn OAuthIdentityVerifier>,
+    ) -> OAuthProviderRegistration {
         OAuthProviderRegistration::new(
             "fake-oauth",
             self.state.issuer.clone(),
@@ -1065,7 +1068,7 @@ async fn openai_jwks_chunked_body_stops_at_limit() {
     assert_eq!(error.code, "identity_keys_malformed");
 }
 
-struct FakeIdentityVerifier;
+pub(super) struct FakeIdentityVerifier;
 
 #[async_trait::async_trait]
 impl OAuthIdentityVerifier for FakeIdentityVerifier {
@@ -1187,7 +1190,7 @@ async fn coordinator_for(
     coordinator_for_registration(registration, ttl).await
 }
 
-async fn coordinator_for_registration(
+pub(super) async fn coordinator_for_registration(
     registration: OAuthProviderRegistration,
     ttl: Duration,
 ) -> (OAuthCoordinator, mpsc::UnboundedReceiver<WireFrame>) {
@@ -1222,7 +1225,7 @@ async fn coordinator_for_registration(
     (coordinator, receiver)
 }
 
-async fn started_flow(
+pub(super) async fn started_flow(
     receiver: &mut mpsc::UnboundedReceiver<WireFrame>,
 ) -> (OAuthFlowId, String, u16) {
     let frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
@@ -1283,7 +1286,10 @@ async fn started_device_flow(
     (flow_id, url.expose_authorization_url().to_owned())
 }
 
-async fn wait_ready(coordinator: &OAuthCoordinator, flow_id: &OAuthFlowId) -> OAuthFlowStatusWire {
+pub(super) async fn wait_ready(
+    coordinator: &OAuthCoordinator,
+    flow_id: &OAuthFlowId,
+) -> OAuthFlowStatusWire {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let status = coordinator
@@ -6350,6 +6356,3 @@ fn registered_redirects_match_provider_clients_and_others_stay_hardened() {
 fn default_flow_ttl_is_at_least_ten_minutes() {
     assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
 }
-
-#[path = "oauth_openai_tests.rs"]
-mod openai_tests;

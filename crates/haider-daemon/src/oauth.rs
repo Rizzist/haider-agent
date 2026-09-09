@@ -6911,5 +6911,9 @@ pub(crate) fn oauth_error(error: OAuthPublicError) -> HaiderError {
 }
 
 #[cfg(test)]
+#[path = "oauth_openai_tests.rs"]
+mod openai_tests;
+
+#[cfg(test)]
 #[path = "oauth_tests.rs"]
 mod tests;
