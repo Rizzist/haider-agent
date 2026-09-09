@@ -224,22 +224,103 @@ impl From<ToolError> for CheckpointRestoreError {
     }
 }
 
+// Every phase uses this same authority, including freshness reads and error
+// rollback. The anchored variant never reopens a recovered cwd by pathname.
+struct CheckpointWorkspace {
+    root: PathBuf,
+    #[cfg(unix)]
+    directory: Option<std::sync::Arc<haider_platform::WorkspaceDirectory>>,
+}
+
+impl CheckpointWorkspace {
+    fn open(root: &Path) -> ToolResult<Self> {
+        Ok(Self {
+            root: fs::canonicalize(root)
+                .map_err(|error| ToolError::io("canonicalize checkpoint workspace", root, error))?,
+            #[cfg(unix)]
+            directory: None,
+        })
+    }
+
+    fn target(&self, relative: &str) -> ToolResult<PathBuf> {
+        #[cfg(unix)]
+        if self.directory.is_some() {
+            validate_relative_target(&self.root, relative)?;
+            return Ok(self.root.join(relative));
+        }
+        checked_target(&self.root, relative)
+    }
+
+    fn read(&self, relative: &str) -> ToolResult<Option<Vec<u8>>> {
+        let path = self.target(relative)?;
+        #[cfg(unix)]
+        if let Some(directory) = &self.directory {
+            return crate::filesystem::read_checkpoint_state_anchored(
+                directory,
+                &self.root,
+                Path::new(relative),
+            );
+        }
+        locked_current(&path).map(|current| current.map(|current| current.bytes))
+    }
+
+    fn digest(&self, relative: &str) -> ToolResult<Option<String>> {
+        self.read(relative)
+            .map(|bytes| bytes.as_deref().map(digest))
+    }
+
+    fn install(
+        &self,
+        relative: &str,
+        expected: Option<&str>,
+        bytes: Option<&[u8]>,
+    ) -> Result<(), InstallStateError> {
+        self.target(relative)?;
+        #[cfg(unix)]
+        if let Some(directory) = &self.directory {
+            return crate::filesystem::install_checkpoint_state_anchored(
+                directory,
+                &self.root,
+                Path::new(relative),
+                expected,
+                bytes,
+            );
+        }
+        install_state(&self.root, relative, expected, bytes)
+    }
+}
+
+/// Restore using an authority already opened beneath the caller's immutable
+/// workspace ceiling. `plan.workspace_root` is only a diagnostic spelling.
+#[cfg(unix)]
+pub fn restore_checkpoint_plan_anchored(
+    plan: &CheckpointRestorePlan,
+    directory: std::sync::Arc<haider_platform::WorkspaceDirectory>,
+) -> Result<Vec<CheckpointCapturePath>, CheckpointRestoreError> {
+    restore_checkpoint_plan_in(
+        plan,
+        &CheckpointWorkspace {
+            root: plan.workspace_root.clone(),
+            directory: Some(directory),
+        },
+    )
+}
+
 /// Verifies every target and returns all conflicts without changing disk.
 pub fn verify_checkpoint_restore_plan(
     plan: &CheckpointRestorePlan,
 ) -> Result<(), CheckpointRestoreError> {
-    let root = fs::canonicalize(&plan.workspace_root).map_err(|error| {
-        ToolError::io(
-            "canonicalize checkpoint workspace",
-            &plan.workspace_root,
-            error,
-        )
-    })?;
+    verify_checkpoint_restore_plan_in(plan, &CheckpointWorkspace::open(&plan.workspace_root)?)
+}
+
+fn verify_checkpoint_restore_plan_in(
+    plan: &CheckpointRestorePlan,
+    workspace: &CheckpointWorkspace,
+) -> Result<(), CheckpointRestoreError> {
     let mut verified = Vec::new();
     let mut conflicts = Vec::new();
     for target in &plan.targets {
-        let path = checked_target(&root, &target.path)?;
-        match digest_if_file(&path) {
+        match workspace.digest(&target.path) {
             Ok(current_digest) if current_digest == target.expected_digest => {
                 verified.push(target.path.clone());
             }
@@ -273,19 +354,18 @@ pub fn verify_checkpoint_restore_plan(
 pub fn restore_checkpoint_plan(
     plan: &CheckpointRestorePlan,
 ) -> Result<Vec<CheckpointCapturePath>, CheckpointRestoreError> {
-    verify_checkpoint_restore_plan(plan)?;
-    let root = fs::canonicalize(&plan.workspace_root).map_err(|error| {
-        ToolError::io(
-            "canonicalize checkpoint workspace",
-            &plan.workspace_root,
-            error,
-        )
-    })?;
+    restore_checkpoint_plan_in(plan, &CheckpointWorkspace::open(&plan.workspace_root)?)
+}
+
+fn restore_checkpoint_plan_in(
+    plan: &CheckpointRestorePlan,
+    workspace: &CheckpointWorkspace,
+) -> Result<Vec<CheckpointCapturePath>, CheckpointRestoreError> {
+    verify_checkpoint_restore_plan_in(plan, workspace)?;
     let mut captures = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
-        let path = checked_target(&root, &target.path)?;
-        let current = match locked_current(&path) {
-            Ok(current) => current.map(|current| current.bytes),
+        let current = match workspace.read(&target.path) {
+            Ok(current) => current,
             Err(ToolError::PathChanged { .. }) => {
                 return Err(CheckpointRestoreError::Conflict(
                     CheckpointRollbackConflict {
@@ -330,13 +410,11 @@ pub fn restore_checkpoint_plan(
 
     let mut applied = 0usize;
     for target in &plan.targets {
-        let path = checked_target(&root, &target.path)?;
         // Count the current target before publication: `install_state` can
         // fail during the post-replace directory sync, after bytes changed.
         // Recovery must therefore include it even on an error return.
         applied += 1;
-        match install_state(
-            &root,
+        match workspace.install(
             &target.path,
             target.expected_digest.as_deref(),
             target.restore_bytes.as_deref(),
@@ -344,7 +422,7 @@ pub fn restore_checkpoint_plan(
             Ok(()) => {}
             Err(InstallStateError::Conflict { current_digest }) => {
                 applied -= 1;
-                rollback_applied(&root, &plan.targets, &captures, applied)?;
+                rollback_applied(workspace, &plan.targets, &captures, applied)?;
                 return Err(CheckpointRestoreError::Conflict(
                     CheckpointRollbackConflict {
                         verified: plan.targets[..applied]
@@ -361,16 +439,16 @@ pub fn restore_checkpoint_plan(
             }
             Err(InstallStateError::Tool(error)) => {
                 let installed_digest = target.restore_bytes.as_deref().map(digest);
-                match digest_if_file(&path) {
+                match workspace.digest(&target.path) {
                     Ok(current_digest) if current_digest == installed_digest => {}
                     Ok(_) => applied -= 1,
                     Err(recheck_error) => {
                         applied -= 1;
-                        rollback_applied(&root, &plan.targets, &captures, applied)?;
+                        rollback_applied(workspace, &plan.targets, &captures, applied)?;
                         return Err(recheck_error.into());
                     }
                 }
-                rollback_applied(&root, &plan.targets, &captures, applied)?;
+                rollback_applied(workspace, &plan.targets, &captures, applied)?;
                 return Err(error.into());
             }
         }
@@ -379,7 +457,7 @@ pub fn restore_checkpoint_plan(
 }
 
 fn rollback_applied(
-    root: &Path,
+    workspace: &CheckpointWorkspace,
     targets: &[CheckpointRestoreTarget],
     captures: &[CheckpointCapturePath],
     applied: usize,
@@ -387,17 +465,16 @@ fn rollback_applied(
     let mut failures = Vec::new();
     for (target, capture) in targets[..applied].iter().zip(&captures[..applied]).rev() {
         let attempt = (|| -> Result<(), CheckpointRestoreError> {
-            let path = checked_target(root, &target.path)?;
+            let path = workspace.target(&target.path)?;
             let applied_digest = target.restore_bytes.as_deref().map(digest);
-            if digest_if_file(&path)? != applied_digest {
+            if workspace.digest(&target.path)? != applied_digest {
                 return Err(ToolError::PathChanged {
                     path,
                     message: "checkpoint rollback refused a concurrent foreign edit".into(),
                 }
                 .into());
             }
-            match install_state(
-                root,
+            match workspace.install(
                 &target.path,
                 applied_digest.as_deref(),
                 capture.pre_bytes.as_deref(),
@@ -429,13 +506,15 @@ fn rollback_applied(
     }
 }
 
-fn checked_target(root: &Path, relative: &str) -> ToolResult<PathBuf> {
+fn validate_relative_target(root: &Path, relative: &str) -> ToolResult<()> {
     let relative = Path::new(relative);
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
+        || relative.components().any(|component| {
+            !matches!(component, Component::Normal(_))
+                || (cfg!(feature = "android-standalone")
+                    && component.as_os_str() == ".haider-lockdown")
+        })
     {
         return Err(ToolError::WorkspaceBoundary {
             workspace_root: root.to_path_buf(),
@@ -443,6 +522,12 @@ fn checked_target(root: &Path, relative: &str) -> ToolResult<PathBuf> {
             resolved_path: None,
         });
     }
+    Ok(())
+}
+
+fn checked_target(root: &Path, relative: &str) -> ToolResult<PathBuf> {
+    validate_relative_target(root, relative)?;
+    let relative = Path::new(relative);
     let path = root.join(relative);
     let parent = path.parent().ok_or_else(|| {
         ToolError::invalid_argument("checkpoint restore path has no parent directory")
@@ -461,10 +546,6 @@ fn checked_target(root: &Path, relative: &str) -> ToolResult<PathBuf> {
             ToolError::invalid_argument("checkpoint restore path has no file name")
         })?,
     ))
-}
-
-fn digest_if_file(path: &Path) -> ToolResult<Option<String>> {
-    locked_current(path).map(|current| current.map(|current| digest(&current.bytes)))
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -514,7 +595,7 @@ fn locked_current(path: &Path) -> ToolResult<Option<LockedCurrent>> {
                 ToolError::io("open checkpoint freshness", path, error)
             }
         })?;
-    file.lock()
+    haider_platform::lock_file_exclusive(&file)
         .map_err(|error| ToolError::io("lock checkpoint freshness", path, error))?;
     require_locked_path_identity(path, &file)?;
     file.seek(SeekFrom::Start(0))

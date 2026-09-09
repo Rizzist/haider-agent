@@ -19,7 +19,6 @@ fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-env-changed=HAIDER_ANDROID_BUILD_ID");
     println!("cargo:rerun-if-changed=private-symbols.map");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);

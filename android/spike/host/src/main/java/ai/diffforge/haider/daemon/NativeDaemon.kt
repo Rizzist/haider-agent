@@ -2,7 +2,7 @@ package ai.diffforge.haider.daemon
 
 import android.content.Context
 
-/** Spike only: no credentials and no production standalone policy. */
+/** Frozen JNI v1 surface exercised by the disposable diagnostic host. */
 class NativeDaemon private constructor() {
     companion object {
         init { System.loadLibrary("haider") }

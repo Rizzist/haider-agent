@@ -4,6 +4,17 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use std::io::Write;
 use std::path::Path;
 
+fn validate_file(stat: &rustix::fs::Stat) -> std::io::Result<()> {
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o777 != 0o600
+        || stat.st_nlink != 1
+    {
+        return Err(std::io::Error::other("invalid native log"));
+    }
+    Ok(())
+}
+
 pub fn record(directory: &Path, observation: &Observation) -> std::io::Result<()> {
     let root = rustix::fs::open(
         directory,
@@ -16,34 +27,44 @@ pub fn record(directory: &Path, observation: &Observation) -> std::io::Result<()
         "daemon_version":env!("CARGO_PKG_VERSION")
     }))?;
     const CURRENT: &str = "native.log";
-    if let Ok(stat) = rustix::fs::statat(&root, CURRENT, AtFlags::SYMLINK_NOFOLLOW) {
-        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
-            || stat.st_uid != rustix::process::geteuid().as_raw()
-        {
-            return Err(std::io::Error::other("invalid native log"));
-        }
-        if stat.st_size as u64 + bytes.len() as u64 + 1 > 1_048_576 {
-            let _ = rustix::fs::unlinkat(&root, "native.log.4", AtFlags::empty());
-            for index in (1..4).rev() {
-                match rustix::fs::renameat(
-                    &root,
-                    format!("native.log.{index}"),
-                    &root,
-                    format!("native.log.{}", index + 1),
-                ) {
-                    Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-                    Err(error) => return Err(error.into()),
+    match rustix::fs::statat(&root, CURRENT, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            validate_file(&stat)?;
+            if (stat.st_size as u64).saturating_add(bytes.len() as u64 + 1) > 1_048_576 {
+                let _ = rustix::fs::unlinkat(&root, "native.log.4", AtFlags::empty());
+                for index in (1..4).rev() {
+                    match rustix::fs::renameat(
+                        &root,
+                        format!("native.log.{index}"),
+                        &root,
+                        format!("native.log.{}", index + 1),
+                    ) {
+                        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
+                rustix::fs::renameat(&root, CURRENT, &root, "native.log.1")?;
             }
-            rustix::fs::renameat(&root, CURRENT, &root, "native.log.1")?;
         }
+        Err(rustix::io::Errno::NOENT) => (),
+        Err(error) => return Err(error.into()),
     }
     let mut file = std::fs::File::from(rustix::fs::openat(
         &root,
         CURRENT,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::APPEND
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC
+            | OFlags::NONBLOCK,
         Mode::from_raw_mode(0o600),
     )?);
+    validate_file(&rustix::fs::fstat(&file)?)?;
     file.write_all(&bytes)?;
     file.write_all(b"\n")
 }
+
+#[cfg(test)]
+#[path = "logging_tests.rs"]
+mod tests;

@@ -33,7 +33,7 @@ fn canned_sms() -> MobileOutput {
     ])
 }
 
-fn memory_envelope(
+pub(super) fn memory_envelope(
     session_id: &SessionId,
     event: &str,
     text: &str,

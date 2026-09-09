@@ -42,8 +42,10 @@ impl EncryptedFileVault {
         }
         let parent = root.parent().ok_or_else(corrupt)?;
         let name = root.file_name().ok_or_else(corrupt)?;
+        // The private parent stays readable for the mkdir durability barrier;
+        // global ancestors are traversed through no-follow search handles.
         let parent =
-            haider_platform::open_absolute_directory_no_follow(parent).map_err(io_error)?;
+            File::from(haider_platform::open_absolute_directory(parent).map_err(io_error)?);
         match rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o700)) {
             Ok(()) => rustix::fs::fsync(&parent).map_err(io_error)?,
             Err(rustix::io::Errno::EXIST) => {}

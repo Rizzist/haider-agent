@@ -87,6 +87,55 @@ fn paths_require_exact_private_layout_and_both_socket_budgets() {
 
 #[cfg(unix)]
 #[test]
+fn exact_c3_layout_rejects_first_over_budget_staging_path() {
+    use std::os::unix::fs::PermissionsExt;
+    // Endpoint staging uses a 20-byte basename and a slash. Construct otherwise
+    // valid C3 layouts at the platform limit and one byte beyond it; the final
+    // h.sock/mobile.sock addresses themselves fit in both cases.
+    let budget = if cfg!(any(target_os = "linux", target_os = "android")) {
+        107
+    } else {
+        103
+    };
+    let base = tempfile::Builder::new()
+        .prefix("b")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let base_path = base.path().canonicalize().unwrap();
+    let suffix = "/haider/runtime/android-default";
+    for extra in [0, 1] {
+        let root_length = budget - 21 - suffix.len() + extra;
+        let root = base_path.join("x".repeat(root_length - base_path.as_os_str().len() - 1));
+        let paths = Paths {
+            profile_id: "android-default".into(),
+            store_dir: root.join("haider/profiles/default"),
+            runtime_dir: root.join("haider/runtime/android-default"),
+            logs_dir: root.join("haider/logs"),
+            workspace_dir: root.join("haider/profiles/default/workspace"),
+            tmp_dir: root.join("haider/runtime/android-default/tmp"),
+        };
+        for path in [
+            &paths.store_dir,
+            &paths.runtime_dir,
+            &paths.logs_dir,
+            &paths.workspace_dir,
+            &paths.tmp_dir,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(paths.runtime_dir.as_os_str().len() + 21, budget + extra);
+        assert!(paths.runtime_dir.join("mobile.sock").as_os_str().len() < budget);
+        if extra == 0 {
+            paths.validate(&root).unwrap();
+        } else {
+            assert_eq!(paths.validate(&root), Err(NativeStatus::BadPaths));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn fake_provider_requires_debuggable_and_private_disposable_marker() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let root = tempfile::tempdir().expect("fixture root");

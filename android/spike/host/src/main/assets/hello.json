@@ -1,1 +1,1 @@
-{"v":1,"kind":"hello","protocol_min":1,"protocol_max":1,"client_name":"android-spike","client_version":"971-1","client_instance_id":"spike-fixture","client_kind":"gui","capabilities_requested":["view"],"max_receive_frame":8388608}
+{"v":1,"kind":"hello","protocol_min":1,"protocol_max":1,"client_name":"android-spike","client_version":"971-1","client_instance_id":"spike-fixture","client_kind":"gui","capabilities_requested":["view","control"],"max_receive_frame":8388608}

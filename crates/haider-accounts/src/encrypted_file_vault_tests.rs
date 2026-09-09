@@ -1,5 +1,4 @@
 #![allow(clippy::unwrap_used)]
-
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::sync::Arc;
 

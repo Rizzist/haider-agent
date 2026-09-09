@@ -18,6 +18,8 @@ serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
+haider-daemon = { path = "../haider-daemon", default-features = false }
+tokio.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 async-trait.workspace = true

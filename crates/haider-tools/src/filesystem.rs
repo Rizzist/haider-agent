@@ -70,8 +70,12 @@ use crate::checkpoint::{
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
 use crate::{FsEditAnchorMismatch, ToolError, ToolResult};
 use async_trait::async_trait;
+#[cfg(all(unix, test))]
+use checkpoint_sync_tests::sync_parent as sync_checkpoint_parent;
 use globset::{GlobBuilder, GlobMatcher};
 use haider_platform::WorkspaceDirectory as OwnedFd;
+#[cfg(all(unix, not(test)))]
+use haider_platform::sync_file as sync_checkpoint_parent;
 use haider_protocol::checkpoint::{CheckpointKind, CheckpointOrigin};
 use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, BranchId, RunId, SessionId};
@@ -4345,12 +4349,73 @@ pub(crate) fn install_checkpoint_state(
     expected_digest: Option<&str>,
     bytes: Option<&[u8]>,
 ) -> Result<(), crate::checkpoint::InstallStateError> {
-    use crate::checkpoint::InstallStateError;
-
-    let display_path = workspace_root.join(relative);
     let workspace_dir = haider_platform::open_workspace_directory(workspace_root)
         .map_err(|error| ToolError::io("open checkpoint workspace", workspace_root, error))?;
-    let traversal_root = rustix::io::dup(&workspace_dir)
+    install_checkpoint_state_in(
+        &workspace_dir,
+        workspace_root,
+        relative,
+        expected_digest,
+        bytes,
+        false,
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn read_checkpoint_state_anchored(
+    workspace_dir: &haider_platform::WorkspaceDirectory,
+    workspace_root: &Path,
+    relative: &Path,
+) -> ToolResult<Option<Vec<u8>>> {
+    let display_path = workspace_root.join(relative);
+    let traversal_root = rustix::io::dup(workspace_dir)
+        .map_err(|error| ToolError::io("duplicate checkpoint workspace", workspace_root, error))?;
+    let (parent, leaf) = open_parent_at(traversal_root, relative, &display_path)?;
+    match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(anchored_io_error(
+            "inspect checkpoint target",
+            &display_path,
+            error,
+        )),
+        Ok(_) => {
+            let (mut file, _) = open_locked_current_at(&parent, &leaf, &display_path)?;
+            let (bytes, _) = file_snapshot(&parent, &mut file, &display_path)?.parts();
+            Ok(Some(bytes))
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn install_checkpoint_state_anchored(
+    workspace_dir: &haider_platform::WorkspaceDirectory,
+    workspace_root: &Path,
+    relative: &Path,
+    expected_digest: Option<&str>,
+    bytes: Option<&[u8]>,
+) -> Result<(), crate::checkpoint::InstallStateError> {
+    install_checkpoint_state_in(
+        workspace_dir,
+        workspace_root,
+        relative,
+        expected_digest,
+        bytes,
+        true,
+    )
+}
+
+#[cfg(unix)]
+fn install_checkpoint_state_in(
+    workspace_dir: &haider_platform::WorkspaceDirectory,
+    workspace_root: &Path,
+    relative: &Path,
+    expected_digest: Option<&str>,
+    bytes: Option<&[u8]>,
+    retained_authority: bool,
+) -> Result<(), crate::checkpoint::InstallStateError> {
+    use crate::checkpoint::InstallStateError;
+    let display_path = workspace_root.join(relative);
+    let traversal_root = rustix::io::dup(workspace_dir)
         .map_err(|error| ToolError::io("duplicate checkpoint workspace", workspace_root, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &display_path)?;
     let mut current = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
@@ -4400,16 +4465,20 @@ pub(crate) fn install_checkpoint_state(
         }
         None => None,
     };
-    let commit_parent =
-        match revalidate_commit_parent(&workspace_dir, relative, &parent, &display_path) {
-            Ok(parent) => parent,
-            Err(error) => {
-                if let Some(name) = staged.as_deref() {
-                    remove_temporary(&parent, name);
-                }
-                return Err(checkpoint_install_error(error));
+    let revalidated = if retained_authority {
+        revalidate_anchored_commit_parent(workspace_dir, relative, &parent, &display_path)
+    } else {
+        revalidate_commit_parent(workspace_dir, relative, &parent, &display_path)
+    };
+    let commit_parent = match revalidated {
+        Ok(parent) => parent,
+        Err(error) => {
+            if let Some(name) = staged.as_deref() {
+                remove_temporary(&parent, name);
             }
-        };
+            return Err(checkpoint_install_error(error));
+        }
+    };
     if let Some((file, _, source_hash)) = current.as_mut()
         && let Err(error) = require_unchanged_content(&parent, file, *source_hash, &display_path)
     {
@@ -4432,13 +4501,20 @@ pub(crate) fn install_checkpoint_state(
 
     match (staged.as_deref(), current.is_some()) {
         (Some(name), true) => {
-            if let Err(error) = replace_temporary_at_commit(
-                &commit_parent,
-                name,
-                &leaf,
-                &display_path,
-                "publish checkpoint restore",
-            ) {
+            let published = if retained_authority {
+                rustix::fs::renameat(&commit_parent, name, &commit_parent, &leaf).map_err(|error| {
+                    anchored_io_error("publish anchored checkpoint restore", &display_path, error)
+                })
+            } else {
+                replace_temporary_at_commit(
+                    &commit_parent,
+                    name,
+                    &leaf,
+                    &display_path,
+                    "publish checkpoint restore",
+                )
+            };
+            if let Err(error) = published {
                 remove_temporary(&parent, name);
                 return Err(checkpoint_install_error(error));
             }
@@ -4476,7 +4552,14 @@ pub(crate) fn install_checkpoint_state(
         }
         (None, false) => {}
     }
-    sync_mutation_parents(&[display_path]).map_err(InstallStateError::Tool)
+    // Keep the desktop Full durability barrier, including delete-only restores,
+    // while syncing the retained parent handle rather than reopening its path.
+    sync_checkpoint_parent(
+        &fs::File::from(commit_parent),
+        haider_platform::SyncPolicy::Full,
+    )
+    .map_err(|error| ToolError::io("sync checkpoint parent", &display_path, error))
+    .map_err(InstallStateError::Tool)
 }
 
 #[cfg(unix)]
@@ -7775,6 +7858,33 @@ fn require_unchanged_target(
 }
 
 #[cfg(unix)]
+fn revalidate_anchored_commit_parent(
+    workspace_dir: &OwnedFd,
+    relative: &Path,
+    held_parent: &OwnedFd,
+    display_path: &Path,
+) -> ToolResult<OwnedFd> {
+    let current_root = rustix::io::dup(workspace_dir).map_err(|error| {
+        ToolError::io("duplicate retained checkpoint root", display_path, error)
+    })?;
+    let mut components = normal_components(relative);
+    components.pop();
+    let current_parent = walk_directories(
+        current_root,
+        &components,
+        "reopen checkpoint parent beneath retained root",
+        display_path,
+    )?;
+    require_same_directory(
+        held_parent,
+        &current_parent,
+        display_path,
+        "checkpoint parent left its retained workspace location",
+    )?;
+    Ok(current_parent)
+}
+
+#[cfg(unix)]
 fn revalidate_commit_parent(
     workspace_dir: &OwnedFd,
     relative: &Path,
@@ -8812,6 +8922,10 @@ where
             message: format!("blocking filesystem worker failed: {error}"),
         })?
 }
+
+#[cfg(all(test, unix))]
+#[path = "filesystem/tests/checkpoint_sync.rs"]
+mod checkpoint_sync_tests;
 
 #[cfg(all(test, unix))]
 #[allow(clippy::expect_used)]

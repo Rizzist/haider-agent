@@ -28268,5 +28268,5 @@ mod store_synchronous_tests {
 mod group_commit_tests;
 
 #[cfg(test)]
-#[path = "store_synchronous_tests.rs"]
+#[path = "embedded_store_synchronous_tests.rs"]
 mod embedded_store_synchronous_tests;

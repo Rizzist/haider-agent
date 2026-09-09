@@ -32,7 +32,7 @@ pub use bounded_wait::{BoundedWait, WaitTimeout, bounded_wait};
 #[cfg(windows)]
 pub use console::{ConsoleHoldError, SoleProcessConsole, sole_process_console};
 #[cfg(unix)]
-pub use directory::open_absolute_directory_no_follow;
+pub use directory::open_absolute_directory;
 #[cfg(windows)]
 pub use directory::{
     WindowsFileIdentity, open_workspace_subdirectory, windows_file_identity,

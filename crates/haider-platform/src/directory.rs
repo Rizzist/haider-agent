@@ -122,39 +122,6 @@ pub type WorkspaceDirectoryError = rustix::io::Errno;
 #[cfg(windows)]
 pub type WorkspaceDirectoryError = std::io::Error;
 
-/// Anchors every absolute component without following symlinks. Linux/Android
-/// ancestors need traversal only: SELinux forbids apps from reading `/` and
-/// `/data`, even when their own descendant directory is accessible.
-#[cfg(unix)]
-pub fn open_absolute_directory_no_follow(
-    path: &Path,
-) -> Result<WorkspaceDirectory, WorkspaceDirectoryError> {
-    use rustix::fs::{Mode, OFlags};
-    use std::path::Component;
-
-    if !path.is_absolute() {
-        return Err(rustix::io::Errno::INVAL);
-    }
-    let directory = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let traverse = directory | OFlags::PATH;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let traverse = directory | OFlags::RDONLY;
-    let mut anchor = rustix::fs::open("/", traverse, Mode::empty())?;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                anchor = rustix::fs::openat(&anchor, name, traverse, Mode::empty())?;
-            }
-            _ => return Err(rustix::io::Errno::INVAL),
-        }
-    }
-    // Consumers may enumerate or fsync only this final directory. Reopen it
-    // relative to the retained handle, never through an ambient pathname.
-    rustix::fs::openat(&anchor, ".", directory | OFlags::RDONLY, Mode::empty())
-}
-
 #[cfg(all(test, unix))]
 mod absolute_directory_tests {
     #![allow(clippy::expect_used)]
@@ -168,15 +135,15 @@ mod absolute_directory_tests {
         let parent = root.join("parent");
         let leaf = parent.join("leaf");
         std::fs::create_dir_all(&leaf).expect("private child");
-        let anchored = open_absolute_directory_no_follow(&leaf).expect("anchor");
-        assert!(open_absolute_directory_no_follow(Path::new("relative")).is_err());
-        assert!(open_absolute_directory_no_follow(&parent.join("../parent/leaf")).is_err());
+        let anchored = open_absolute_directory(&leaf).expect("anchor");
+        assert!(open_absolute_directory(Path::new("relative")).is_err());
+        assert!(open_absolute_directory(&parent.join("../parent/leaf")).is_err());
         let original = root.join("original");
         std::fs::rename(&parent, &original).expect("move original ancestor");
         let replacement = root.join("replacement");
         std::fs::create_dir_all(replacement.join("leaf")).expect("replacement");
         symlink(&replacement, &parent).expect("replace ancestor with symlink");
-        assert!(open_absolute_directory_no_follow(&leaf).is_err());
+        assert!(open_absolute_directory(&leaf).is_err());
         let actual = rustix::fs::fstat(&anchored).expect("retained anchor");
         let wanted = rustix::fs::stat(original.join("leaf")).expect("original identity");
         assert_eq!(
@@ -199,6 +166,51 @@ pub fn open_workspace_directory(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
+}
+
+/// Opens every component without following symlinks and retains a readable final
+/// directory. Linux/Android ancestors need only traversal access: app UIDs cannot
+/// read global directories such as `/` or `/data`, even when they can reach their
+/// own private descendants. O_PATH must not escape as the final I/O/sync handle.
+#[cfg(unix)]
+pub fn open_absolute_directory(path: &Path) -> Result<WorkspaceDirectory, WorkspaceDirectoryError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::path::Component;
+
+    let mut components = path.components().peekable();
+    if components.next() != Some(Component::RootDir) {
+        return Err(rustix::io::Errno::INVAL);
+    }
+    let readable = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let traversal = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let traversal = readable;
+    let mut directory = rustix::fs::open(
+        "/",
+        if components.peek().is_none() {
+            readable
+        } else {
+            traversal
+        },
+        Mode::empty(),
+    )?;
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(rustix::io::Errno::INVAL);
+        };
+        directory = rustix::fs::openat(
+            &directory,
+            name,
+            if components.peek().is_none() {
+                readable
+            } else {
+                traversal
+            },
+            Mode::empty(),
+        )?;
+    }
+    Ok(directory)
 }
 
 #[cfg(windows)]
@@ -513,3 +525,7 @@ mod windows_process_directory_tests {
         assert!(error.to_string().contains("changes identity"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "directory_unix_tests.rs"]
+mod unix_tests;

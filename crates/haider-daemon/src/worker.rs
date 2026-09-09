@@ -15251,6 +15251,10 @@ struct WorkspaceUnavailableToolDispatcher {
 
 #[async_trait]
 impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
+    fn platform_tool_supported(&self, name: &str) -> bool {
+        !crate::android_policy::enabled() || registered_tool_route(name).is_some()
+    }
+
     async fn execute(
         &self,
         _run_id: &RunId,
@@ -15260,6 +15264,11 @@ impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
         _args: serde_json::Value,
         _cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
+        if !self.platform_tool_supported(name) {
+            return model_tool_argument_failure(ToolError::invalid_argument(format!(
+                "unsupported tool `{name}`"
+            )));
+        }
         let reason = bounded_failure_reason(&format!(
             "workspace unavailable: {}: {}; re-root the session before using `{name}`",
             self.unavailable.path,

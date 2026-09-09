@@ -70,7 +70,7 @@ pub(crate) fn initialize(path: Option<&Path>) -> Result<(), HaiderError> {
 
 #[cfg(unix)]
 fn open_absolute(path: &Path) -> Result<haider_platform::WorkspaceDirectory, HaiderError> {
-    haider_platform::open_absolute_directory_no_follow(path).map_err(|_| denied())
+    haider_platform::open_absolute_directory(path).map_err(|_| denied())
 }
 
 #[cfg(unix)]

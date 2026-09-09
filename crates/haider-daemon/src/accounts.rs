@@ -2289,7 +2289,10 @@ async fn run_account_actor(
                 let linked_source = source_registry.lock().ok().and_then(|registry| {
                     registry.find_by_alias(descriptor.alias.as_str()).cloned()
                 });
-                let result = if let Some(linked_source) = linked_source.filter(|source| {
+                let result = if crate::android_policy::enabled() && linked_source.is_some() {
+                    crate::oauth::require_credential_import_available()
+                        .map(|()| OAuthImportHealResult::NotImported)
+                } else if let Some(linked_source) = linked_source.filter(|source| {
                     crate::device_discovery::linked_kind_yields_access(source.kind)
                 }) {
                     let source_id = linked_source.id;
@@ -6909,6 +6912,9 @@ async fn handle_oauth_import_heal(
     if identity.alias != descriptor.alias.as_str() || identity.provider != descriptor.provider {
         return Ok(OAuthImportHealResult::NotImported);
     }
+    // Preserve import provenance: an error must stop healing/refresh rather
+    // than returning NotImported and authorizing refresh of a source-owned token.
+    crate::oauth::require_credential_import_available()?;
     let spec = oauth_import_source_spec(&identity.source)?;
     if spec.provider != descriptor.provider {
         return Ok(OAuthImportHealResult::NotImported);
