@@ -1021,6 +1021,7 @@ impl DaemonContextCompactor {
             latest_compaction_summary_end,
             prefix_digests,
             cache_epoch,
+            request_view_epoch: None,
             header_epoch: String::new(),
             compaction_epoch,
             provider: self.usage_scope.provider.clone(),

@@ -190,3 +190,6 @@ pub use worker::{
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-daemon";
+
+#[cfg(test)]
+mod prompt_cache_tests;

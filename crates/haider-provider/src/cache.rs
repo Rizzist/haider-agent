@@ -9,8 +9,8 @@
 use haider_protocol::provider::{CacheStatAvailability, NormalizedUsage};
 
 use crate::{
-    ANTHROPIC_PROVIDER_NAME, BEDROCK_PROVIDER_NAME, GEMINI_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    VERTEX_PROVIDER_NAME,
+    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, BEDROCK_PROVIDER_NAME,
+    GEMINI_PROVIDER_NAME, OPENAI_PROVIDER_NAME, VERTEX_PROVIDER_NAME,
 };
 
 const ANTHROPIC_CACHE_DOCUMENTATION: &str =
@@ -27,7 +27,7 @@ const GEMINI_CACHE_DOCUMENTATION: &str =
 pub struct CacheablePromptMinimumPolicy {
     /// Exact provider names for which the source documents this threshold.
     pub providers: &'static [&'static str],
-    /// Canonical model family; recognized dated snapshots share the row.
+    /// Canonical cache family; recognized minors and dated snapshots share the row.
     pub model_family: &'static str,
     pub minimum_tokens: u64,
     pub documentation_url: &'static str,
@@ -39,7 +39,7 @@ pub struct CacheablePromptMinimumPolicy {
 /// Cloud. Bedrock publishes platform-specific values, so its rows remain
 /// separate even when the model name is the same.
 pub const CACHEABLE_PROMPT_MINIMUM_POLICIES: &[CacheablePromptMinimumPolicy] = &[
-    // Claude API and Claude on Vertex.
+    // Claude API, its verified first-party OAuth route, and Claude on Vertex.
     anthropic_minimum("claude-opus-5", 512),
     anthropic_minimum("claude-fable-5", 512),
     anthropic_minimum("claude-mythos-5", 512),
@@ -74,11 +74,13 @@ pub const CACHEABLE_PROMPT_MINIMUM_POLICIES: &[CacheablePromptMinimumPolicy] = &
     bedrock_minimum("anthropic.claude-3-7-sonnet", 1_024),
     bedrock_minimum("anthropic.claude-3-5-sonnet", 1_024),
     // OpenAI documents a strict 1,024-token minimum for GPT-5.6 and later.
+    openai_minimum("gpt-6-astra", 1_024),
     openai_minimum("gpt-5.6", 1_024),
     openai_minimum("gpt-5.6-sol", 1_024),
     openai_minimum("gpt-5.6-terra", 1_024),
     openai_minimum("gpt-5.6-luna", 1_024),
     // Gemini explicit-context-cache table.
+    gemini_minimum("gemini-3.8-flash", 4_096),
     gemini_minimum("gemini-3.7-flash", 4_096),
     gemini_minimum("gemini-3.6-flash", 4_096),
     gemini_minimum("gemini-3.5-flash", 4_096),
@@ -92,7 +94,11 @@ const fn anthropic_minimum(
     minimum_tokens: u64,
 ) -> CacheablePromptMinimumPolicy {
     CacheablePromptMinimumPolicy {
-        providers: &[ANTHROPIC_PROVIDER_NAME, VERTEX_PROVIDER_NAME],
+        providers: &[
+            ANTHROPIC_PROVIDER_NAME,
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            VERTEX_PROVIDER_NAME,
+        ],
         model_family,
         minimum_tokens,
         documentation_url: ANTHROPIC_CACHE_DOCUMENTATION,
@@ -151,7 +157,7 @@ pub enum CacheUsageAssessment {
 
 /// Finds the documented cacheability policy for an exact provider/model pair.
 ///
-/// Provider names are exact on purpose: a generic endpoint, OAuth proxy, or
+/// Provider names are exact on purpose: a generic endpoint, third-party OAuth proxy, or
 /// gateway does not inherit an upstream guarantee merely because its model
 /// string resembles one of these families.
 #[must_use]
@@ -203,17 +209,33 @@ pub fn assess_cache_usage(
     }
 }
 
-fn model_family_matches(model: &str, family: &str) -> bool {
+/// Minor releases of the documented Fable/Mythos 5 families inherit their
+/// cache placement contract. This is deliberately narrower than starts_with:
+/// arbitrary labels, major releases and other providers do not inherit it.
+/// Snapshot decorations still use the same strict parser as every other row.
+pub(crate) fn model_family_matches(model: &str, family: &str) -> bool {
     if model == family {
         return true;
     }
     let Some(suffix) = model.strip_prefix(family) else {
         return false;
     };
-    snapshot_suffix(suffix)
+    if snapshot_suffix(suffix, family.starts_with("anthropic.")) {
+        return true;
+    }
+    if matches!(family, "claude-fable-5" | "claude-mythos-5") {
+        let Some(version) = suffix.strip_prefix('-') else {
+            return false;
+        };
+        let digits = version.bytes().take_while(u8::is_ascii_digit).count();
+        return digits > 0
+            && !version.starts_with('0')
+            && (digits == version.len() || snapshot_suffix(&version[digits..], false));
+    }
+    false
 }
 
-fn snapshot_suffix(suffix: &str) -> bool {
+fn snapshot_suffix(suffix: &str, bedrock: bool) -> bool {
     if let Some(date) = suffix.strip_prefix('@') {
         return eight_digits(date);
     }
@@ -225,7 +247,7 @@ fn snapshot_suffix(suffix: &str) -> bool {
         .get(..8)
         .is_some_and(|date| date.iter().all(u8::is_ascii_digit))
     {
-        return version.len() == 8 || bedrock_version_suffix(&version[8..]);
+        return version.len() == 8 || bedrock && bedrock_version_suffix(&version[8..]);
     }
     if bytes.len() >= 10
         && bytes[4] == b'-'
@@ -234,9 +256,9 @@ fn snapshot_suffix(suffix: &str) -> bool {
         && bytes[5..7].iter().all(u8::is_ascii_digit)
         && bytes[8..10].iter().all(u8::is_ascii_digit)
     {
-        return version.len() == 10 || bedrock_version_suffix(&version[10..]);
+        return version.len() == 10 || bedrock && bedrock_version_suffix(&version[10..]);
     }
-    bedrock_version_suffix(suffix)
+    bedrock && bedrock_version_suffix(suffix)
 }
 
 fn eight_digits(value: &str) -> bool {
@@ -293,6 +315,36 @@ mod tests {
             cacheable_prompt_minimum(OPENAI_PROVIDER_NAME, "gpt-5.6-terra"),
             Some(1_024)
         );
+    }
+
+    #[test]
+    fn fable_and_mythos_minor_cache_policy_is_strict_and_shared_by_verified_routes() {
+        for family in ["claude-fable-5", "claude-mythos-5"] {
+            for suffix in ["", "-1", "-2", "-19", "-1234", "-1-20260901", "-2@20260901"] {
+                for provider in [
+                    ANTHROPIC_PROVIDER_NAME,
+                    ANTHROPIC_OAUTH_PROVIDER_NAME,
+                    VERTEX_PROVIDER_NAME,
+                ] {
+                    assert_eq!(
+                        cacheable_prompt_minimum(provider, &format!("{family}{suffix}")),
+                        Some(512)
+                    );
+                }
+            }
+            for suffix in [
+                "-fake", "1", "-1-fake", "-01", "-1-2", "-é", "--1", "-v1", "-1-v1",
+            ] {
+                assert_eq!(
+                    cacheable_prompt_minimum(ANTHROPIC_PROVIDER_NAME, &format!("{family}{suffix}")),
+                    None
+                );
+            }
+            assert_eq!(
+                cacheable_prompt_minimum("custom-proxy", &format!("{family}-1")),
+                None
+            );
+        }
     }
 
     /// MUTATION CHECK: broaden family matching to arbitrary suffixes. Expected
