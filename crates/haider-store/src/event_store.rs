@@ -12841,6 +12841,72 @@ impl Store {
         Ok(revision)
     }
 
+    /// The committed receipt is the durable provider-trust authority. Every
+    /// affected session event and its management revision commit together;
+    /// callers publish the in-memory provider value only after this succeeds.
+    pub fn finalize_provider_trust_receipt<T: serde::Serialize>(
+        &self,
+        command_id: &str,
+        response: &T,
+        expected_revision: u64,
+        request: (&str, &str),
+        mut envelopes: Vec<RawEnvelope>,
+    ) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let ManagementClaim::Committed { revision, .. } =
+            claim_management_receipt_in_transaction::<serde_json::Value>(
+                &transaction,
+                command_id,
+                PROVIDER_SET_TRUST_METHOD,
+                request.0,
+                request.1,
+                None,
+                Some(expected_revision),
+            )?
+        {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(revision);
+        }
+        let mut outcomes = Vec::with_capacity(envelopes.len());
+        for envelope in &mut envelopes {
+            outcomes.push(append_envelopes_in_transaction(
+                &transaction,
+                std::slice::from_mut(envelope),
+                false,
+            )?);
+        }
+        let revision = finalize_management_command_receipt(
+            &transaction,
+            command_id,
+            PROVIDER_SET_TRUST_METHOD,
+            "",
+            None,
+            None,
+            response,
+            now_ms()?,
+            "provider-trust",
+            true,
+        )?;
+        if expected_revision.checked_add(1) != Some(revision) {
+            return Err(corrupt("provider trust revision changed before commit"));
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        for (envelope, outcome) in envelopes.iter().zip(outcomes) {
+            update_append_caches(
+                self,
+                &connection,
+                &outcome.range.session_id,
+                std::slice::from_ref(envelope),
+                outcome.changes_graph_reduction,
+                outcome.changes_graph_telemetry,
+            );
+        }
+        Ok(revision)
+    }
+
     /// Finalizes remove and releases its alias reservation atomically with the
     /// receipt and management-revision commit.
     pub fn finalize_account_remove_receipt<T: serde::Serialize>(

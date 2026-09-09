@@ -66,7 +66,7 @@ fn activity_fields_are_absent_on_legacy_digests_and_optional_for_legacy_readers(
 fn activity_commands_are_unique_client_views_with_typed_argument_hints() {
     let specs = [
         ("collapse", "[all|expand|next|prev]", true),
-        ("verbosity", "[quiet|normal|verbose]", false),
+        ("verbosity", "[quiet|default|verbose]", false),
         ("tasks", "", true),
     ];
     for (name, hint, session_only) in specs {

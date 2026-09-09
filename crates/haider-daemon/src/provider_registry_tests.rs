@@ -652,9 +652,9 @@ fn legacy_provider_record_without_trust_migrates_to_full() {
 }
 
 /// MUTATION CHECK: default a new custom provider to Lockdown, or fail to save
-/// a later explicit setter. Expected failure: the first and/or reopened assertion.
+/// the staged preview. Expected failure: the preview or unchanged registry assertion.
 #[test]
-fn new_custom_provider_defaults_full_and_typed_setter_persists() {
+fn new_custom_provider_defaults_full_and_trust_preview_is_unpublished() {
     let dir = tempfile::tempdir().expect("provider registry profile");
     let source = model_source([("research", vec![discovered("search-1", true, None)])]);
     let mut registry = ProviderRegistry::new(
@@ -679,11 +679,21 @@ fn new_custom_provider_defaults_full_and_typed_setter_persists() {
         })
         .expect("create custom provider");
     assert_eq!(profile.trust, ProviderTrustWire::Full);
-    registry
-        .set_trust("research", ProviderTrustWire::Lockdown)
-        .expect("set trust");
-    drop(registry);
-
+    let preview = registry
+        .preview_trust("research", ProviderTrustWire::Lockdown, &|_| false)
+        .expect("preview trust");
+    assert_eq!(preview.trust, ProviderTrustWire::Lockdown);
+    assert_eq!(
+        registry.get("research").map(|profile| profile.trust),
+        Some(ProviderTrustWire::Full)
+    );
+    registry.publish_trust("research", preview.trust);
+    assert_eq!(
+        registry.get("research").map(|profile| profile.trust),
+        Some(ProviderTrustWire::Lockdown)
+    );
+    // The caller's committed SQLite receipt, not an independent JSON write,
+    // supplies the durable override when the actor restarts.
     let reopened = ProviderRegistry::new(
         JsonProviderRegistryStore::new(dir.path()),
         Vec::new(),
@@ -692,7 +702,7 @@ fn new_custom_provider_defaults_full_and_typed_setter_persists() {
     .expect("reopen provider registry");
     assert_eq!(
         reopened.get("research").map(|profile| profile.trust),
-        Some(ProviderTrustWire::Lockdown)
+        Some(ProviderTrustWire::Full)
     );
 }
 

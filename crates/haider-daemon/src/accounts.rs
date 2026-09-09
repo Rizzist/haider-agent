@@ -5547,7 +5547,6 @@ async fn handle_provider_set_trust(
     providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     job: ProviderSetTrustJob,
 ) {
-    let journal_command_id = job.command_id.clone();
     let identity = ProviderSetTrustIdentity {
         provider: job.provider.clone(),
         trust: job.trust,
@@ -5574,7 +5573,7 @@ async fn handle_provider_set_trust(
         respond_management_error(&job.route, &error);
         return;
     }
-    match preflight {
+    let recovered_previous = match preflight {
         Ok(Some(ManagementClaim::Committed { response, revision })) => {
             respond(
                 &job.route,
@@ -5585,12 +5584,28 @@ async fn handle_provider_set_trust(
             );
             return;
         }
-        Ok(_) => {}
+        Ok(Some(ManagementClaim::ResumePending { recovery_json })) => {
+            let Some(ProviderSetTrustRecovery { previous }) =
+                recovery_json.and_then(|json| serde_json::from_str(&json).ok())
+            else {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "pending provider-trust receipt has no recovery coordinates",
+                        false,
+                    ),
+                );
+                return;
+            };
+            Some(previous)
+        }
+        Ok(_) => None,
         Err(error) => {
             respond_management_error(&job.route, &error);
             return;
         }
-    }
+    };
     if matches!(job.trust, ProviderTrustWire::Unknown) {
         respond_management_error(
             &job.route,
@@ -5614,140 +5629,23 @@ async fn handle_provider_set_trust(
         );
         return;
     };
-    let recovery_json = match serde_json::to_string(&ProviderSetTrustRecovery {
-        previous: previous_before_claim,
-    }) {
-        Ok(recovery_json) => recovery_json,
-        Err(error) => {
-            respond_management_error(
-                &job.route,
-                &HaiderError::new(
-                    ErrorCode::Internal,
-                    format!("cannot encode provider trust recovery: {error}"),
-                    false,
-                ),
-            );
-            return;
-        }
-    };
-    let previous_trust = match store
-        .management_claim_receipt::<ProviderReceipt>(
-            job.command_id.clone(),
-            PROVIDER_SET_TRUST_METHOD.to_owned(),
-            request_digest,
-            request_json,
-            Some(recovery_json),
-            Some(job.expected_revision),
-        )
-        .await
-    {
-        Ok(ManagementClaim::Committed { response, revision }) => {
-            respond(
-                &job.route,
-                ResponseBody::ProviderSetTrust {
-                    provider: response.provider,
-                    revision,
-                },
-            );
-            return;
-        }
-        Ok(ManagementClaim::Fresh) => previous_before_claim,
-        Ok(ManagementClaim::ResumePending { recovery_json }) => {
-            match recovery_json.and_then(|json| serde_json::from_str(&json).ok()) {
-                Some(ProviderSetTrustRecovery { previous }) => previous,
-                None => {
-                    respond_management_error(
-                        &job.route,
-                        &HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            "pending provider-trust receipt has no recovery coordinates",
-                            false,
-                        ),
-                    );
-                    return;
-                }
-            }
-        }
-        Err(error) => {
-            respond_management_error(&job.route, &error);
-            return;
-        }
-    };
-    let profile = match providers.set_trust(&job.provider, job.trust) {
-        Ok(profile) => profile,
-        Err(error) => {
-            respond_management_error(&job.route, &error);
-            return;
-        }
-    };
-    let Some(provider) =
-        providers.summary(&profile.provider_id, &provider_has_credential(accounts))
-    else {
-        respond_management_error(
-            &job.route,
-            &HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                "trusted provider disappeared before receipt finalization",
-                false,
-            ),
-        );
-        return;
-    };
-    let receipt = ProviderReceipt {
-        provider,
-        revision_unchanged: false,
-    };
-    let Some(anticipated_revision) = job.expected_revision.checked_add(1) else {
-        respond_management_error(
-            &job.route,
-            &HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                "provider management revision space is exhausted",
-                false,
-            ),
-        );
-        return;
-    };
-    if let Err(error) = journal_provider_trust_changed(
+    let previous_trust = recovered_previous.unwrap_or(previous_before_claim);
+    let (receipt, revision) = match commit_provider_trust(
         store,
-        &journal_command_id,
-        &job.provider,
+        accounts,
+        providers,
+        &job.command_id,
+        &identity,
         previous_trust,
-        job.trust,
-        anticipated_revision,
     )
     .await
     {
-        respond_management_error(&job.route, &error);
-        return;
-    }
-    let revision = match store
-        .finalize_management_receipt(
-            job.command_id,
-            PROVIDER_SET_TRUST_METHOD.to_owned(),
-            receipt.clone(),
-        )
-        .await
-    {
-        Ok(revision) => revision,
+        Ok(committed) => committed,
         Err(error) => {
             respond_management_error(&job.route, &error);
             return;
         }
     };
-    if revision != anticipated_revision {
-        respond_management_error(
-            &job.route,
-            &HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                format!(
-                    "provider trust event revision {anticipated_revision} differs from committed revision {revision}"
-                ),
-                false,
-            ),
-        );
-        return;
-    }
     if let Some(management) = management {
         management.publish(
             revision,
@@ -5764,18 +5662,33 @@ async fn handle_provider_set_trust(
     );
 }
 
-async fn journal_provider_trust_changed(
+async fn commit_provider_trust(
     store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     command_id: &str,
-    provider: &str,
+    identity: &ProviderSetTrustIdentity,
     previous: ProviderTrustWire,
-    trust: ProviderTrustWire,
-    revision: u64,
-) -> Result<(), HaiderError> {
+) -> Result<(ProviderReceipt, u64), HaiderError> {
+    let receipt = ProviderReceipt {
+        provider: providers.preview_trust(
+            &identity.provider,
+            identity.trust,
+            &provider_has_credential(accounts),
+        )?,
+        revision_unchanged: false,
+    };
+    let revision = identity.expected_revision.checked_add(1).ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "provider trust revision space is exhausted",
+            false,
+        )
+    })?;
     let payload = serde_json::to_value(EventPayload::ProviderTrustChanged(ProviderTrustChanged {
-        provider: provider.to_owned(),
+        provider: identity.provider.clone(),
         previous: provider_trust_label(previous).to_owned(),
-        trust: provider_trust_label(trust).to_owned(),
+        trust: provider_trust_label(identity.trust).to_owned(),
         revision,
     }))
     .map_err(|error| {
@@ -5785,13 +5698,25 @@ async fn journal_provider_trust_changed(
             false,
         )
     })?;
-    journal_provider_management_event(
+    let envelopes = provider_management_events(
         store,
         EventId::new(format!("provider-trust-{command_id}")),
-        provider,
+        &identity.provider,
         payload,
     )
-    .await
+    .await?;
+    let (request_json, request_digest) = command_json(identity)?;
+    let revision = store
+        .finalize_provider_trust_receipt(
+            command_id.to_owned(),
+            receipt.clone(),
+            identity.expected_revision,
+            (request_digest, request_json),
+            envelopes,
+        )
+        .await?;
+    providers.publish_trust(&identity.provider, identity.trust);
+    Ok((receipt, revision))
 }
 
 async fn journal_provider_auth_changed(
@@ -5830,7 +5755,20 @@ async fn journal_provider_management_event(
     provider: &str,
     payload: impl Into<RawPayload>,
 ) -> Result<(), HaiderError> {
+    for mut envelope in provider_management_events(store, event_id, provider, payload).await? {
+        StoreHandle::append(store, std::slice::from_mut(&mut envelope)).await?;
+    }
+    Ok(())
+}
+
+async fn provider_management_events(
+    store: &SqliteStoreHandle,
+    event_id: EventId,
+    provider: &str,
+    payload: impl Into<RawPayload>,
+) -> Result<Vec<haider_protocol::envelope::RawEnvelope>, HaiderError> {
     let payload = payload.into();
+    let mut envelopes = Vec::new();
     let profile_id = store.profile_installation_id().await?;
     for session_id in store.session_ids().await? {
         let Some(metadata) = store.session_metadata(&session_id).await? else {
@@ -5845,6 +5783,13 @@ async fn journal_provider_management_event(
         if metadata.provider != provider && bound_provider.as_deref() != Some(provider) {
             continue;
         }
+        // Length-prefix the command coordinate so arbitrary ids cannot alias.
+        let session_event_id = EventId::new(format!(
+            "{}:{}:{}",
+            event_id.as_str().len(),
+            event_id,
+            session_id,
+        ));
         let mut cursor = 0_u64;
         let mut already_journaled = false;
         loop {
@@ -5852,9 +5797,10 @@ async fn journal_provider_management_event(
             if page.is_empty() {
                 break;
             }
-            already_journaled = page
-                .iter()
-                .any(|envelope| envelope.event_id == event_id && envelope.payload == payload);
+            already_journaled = page.iter().any(|envelope| {
+                (envelope.event_id == session_event_id || envelope.event_id == event_id)
+                    && envelope.payload == payload
+            });
             if already_journaled {
                 break;
             }
@@ -5873,9 +5819,9 @@ async fn journal_provider_management_event(
         if already_journaled {
             continue;
         }
-        let mut envelope = EventEnvelope {
+        let envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION,
-            event_id: event_id.clone(),
+            event_id: session_event_id,
             seq: 0,
             session_id,
             branch_id: None,
@@ -5894,9 +5840,9 @@ async fn journal_provider_management_event(
             },
             payload: payload.clone(),
         };
-        StoreHandle::append(store, std::slice::from_mut(&mut envelope)).await?;
+        envelopes.push(envelope);
     }
-    Ok(())
+    Ok(envelopes)
 }
 
 const fn provider_trust_label(trust: ProviderTrustWire) -> &'static str {
@@ -11045,6 +10991,7 @@ async fn reconcile_provider_receipts(
 ) -> Result<(), HaiderError> {
     let rows = store.provider_management_receipts().await?;
     let mut latest_existence_mutation = HashMap::new();
+    let mut latest_removal = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
         let provider = match row.method.as_str() {
             PROVIDER_CONFIGURE_METHOD => {
@@ -11067,6 +11014,7 @@ async fn reconcile_provider_receipts(
                             false,
                         )
                     })?;
+                latest_removal.insert(identity.provider.clone(), index);
                 Some(identity.provider)
             }
             ACCOUNT_SET_DEFAULT_MODEL_METHOD | PROVIDER_SET_TRUST_METHOD => None,
@@ -11092,6 +11040,22 @@ async fn reconcile_provider_receipts(
                         row.method.clone(),
                     )
                     .await?;
+            }
+            if row.method == PROVIDER_SET_TRUST_METHOD {
+                let identity: ProviderSetTrustIdentity = serde_json::from_str(&row.request_json)
+                    .map_err(|error| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("committed provider-trust identity is invalid: {error}"),
+                            false,
+                        )
+                    })?;
+                if latest_removal
+                    .get(&identity.provider)
+                    .is_none_or(|removed| *removed <= index)
+                {
+                    providers.publish_trust(&identity.provider, identity.trust);
+                }
             }
             if row.method == PROVIDER_REMOVE_METHOD {
                 let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
@@ -11148,25 +11112,16 @@ async fn reconcile_provider_receipts(
                             false,
                         )
                     })?;
-                let anticipated_revision =
-                    identity.expected_revision.checked_add(1).ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            "provider trust revision space is exhausted during reconciliation",
-                            false,
-                        )
-                    })?;
-                let profile = providers.set_trust(&identity.provider, identity.trust)?;
-                journal_provider_trust_changed(
+                commit_provider_trust(
                     store,
+                    accounts,
+                    providers,
                     &row.command_id,
-                    &identity.provider,
+                    &identity,
                     recovery.previous,
-                    identity.trust,
-                    anticipated_revision,
                 )
                 .await?;
-                (profile, false, None, None)
+                continue;
             }
             PROVIDER_CONFIGURE_METHOD => {
                 let identity: ProviderConfigureIdentity = serde_json::from_str(&row.request_json)
