@@ -266,4 +266,61 @@ class ComposerPickersTest {
         assertEquals(1, service.calls.count { it == "createSession" })
         assertEquals(1, service.calls.count { it.startsWith("turn.submit:") })
     }
+    @Test
+    fun `a send queued behind cold navigation keeps attachments with their original session`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        rule.waitForIdle()
+        val original = viewModel.state.value.activeSessionId!!
+        val other = service.sessions.value.first { it.id != original }.id
+        viewModel.attach(byteArrayOf(1), "image/png", null)
+        rule.waitForIdle()
+        rule.runOnIdle {
+            service.setStatus(ai.diffforge.haider.ui.daemon.DaemonStatus.Stopped)
+            service.rosterReady.value = false
+        }
+        rule.runOnIdle {
+            viewModel.activate(other)
+            viewModel.setDraft("Attachment stays here")
+            viewModel.send()
+        }
+        assertTrue(service.calls.none { it.startsWith("turn.submit:") })
+        rule.runOnIdle { service.rosterReady.value = true }
+        rule.waitForIdle()
+        assertEquals(1, service.calls.count { it == "turn.submit:$original:steer:1" })
+        assertTrue(service.calls.none { it.startsWith("turn.submit:$other:") })
+        assertEquals(other, viewModel.state.value.activeSessionId)
+        assertTrue(viewModel.state.value.draftAttachments.isEmpty())
+        viewModel.activate(original)
+        rule.waitForIdle()
+        assertTrue(viewModel.state.value.draftAttachments.isEmpty())
+        assertEquals("", viewModel.state.value.draft)
+    }
+
+    @Test
+    fun `edits made during a roster wait survive a successful attachment send`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        rule.waitForIdle()
+        val original = viewModel.state.value.activeSessionId!!
+        viewModel.attach(byteArrayOf(1), "image/png", null)
+        rule.waitForIdle()
+        rule.runOnIdle {
+            service.rosterReady.value = false
+            viewModel.setDraft("First draft")
+            viewModel.send()
+        }
+        assertTrue(service.calls.none { it.startsWith("turn.submit:") })
+        rule.runOnIdle {
+            viewModel.setDraft("Edited during wait")
+            viewModel.attach(byteArrayOf(2), "image/png", null)
+        }
+        rule.waitForIdle()
+        rule.runOnIdle { service.rosterReady.value = true }
+        rule.waitForIdle()
+        assertEquals(1, service.calls.count { it == "turn.submit:$original:steer:1" })
+        assertEquals("Edited during wait", viewModel.state.value.draft)
+        assertEquals(2, viewModel.state.value.draftAttachments.size)
+    }
+
 }

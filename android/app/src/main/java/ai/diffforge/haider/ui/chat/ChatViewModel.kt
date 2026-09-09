@@ -304,17 +304,19 @@ class ChatViewModel(
                 return@withReadyRoster
             }
             // Preserve text or attachments edited while startup or RPC was pending.
-            if (_state.value.activeSessionId == id && _state.value.draft == current.draft &&
-                draftAttachments[id].orEmpty() == attachments
-            ) {
+            val visible = _state.value.activeSessionId == id
+            val latestDraft = if (visible) _state.value.draft else drafts[id].orEmpty()
+            if (latestDraft == current.draft && draftAttachments[id].orEmpty() == attachments) {
                 drafts[id] = ""
                 draftAttachments.remove(id)
                 attachmentNotices.remove(id)
-                update {
-                    it.copy(draft = "", draftAttachments = emptyList(), attachmentNotice = null, deliveryChooser = false)
+                if (visible) {
+                    update {
+                        it.copy(draft = "", draftAttachments = emptyList(), attachmentNotice = null, deliveryChooser = false)
+                    }
                 }
             }
-            if (_state.value.activeSessionId == id) loadTranscript(id)
+            if (visible) loadTranscript(id)
         }
     }
 

@@ -24,7 +24,7 @@ class LocalRpcInstrumentedTest {
         assertEquals(BuildConfig.VERSION_NAME, metadata.string("daemon_version"))
         assertEquals(1L, metadata.number("jni_version"))
         assertEquals(1L, metadata.number("wire_protocol"))
-        assertTrue(metadata.string("build_id").matches(Regex("[0-9a-f]{64}")))
+        assertTrue(metadata.string("build_id").matches(Regex("sha256:[0-9a-f]{64}")))
         InstrumentationRegistry.getArguments().getString("expectedBuildId")?.let {
             assertEquals(it, metadata.string("build_id"))
         }

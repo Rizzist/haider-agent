@@ -43,7 +43,7 @@ sign-in still require their own acceptance checks.
 
 ## UI parity merge
 
-The UI round 12/parity tree (`18b2269c`) is integrated. Sending retains the
+The UI round 13 tree (`81335a59`) and final embedding (`eca81200`) are integrated. Sending retains the
 Ready/authoritative-roster wait and preserves edits made while startup or RPC is
 pending. The chosen Steer/Queue delivery mode is forwarded to `turn.submit`.
 Production CAS attachment staging and previews are not wired; a supplied
@@ -100,7 +100,9 @@ acceptance. The device instrumentation verifies the actual reply in replay data.
 The explicit fixture model `fake-needs-input` first asks a synthetic Continue
 question through the real worker/menu pipeline, then returns the same reply.
 Pass `expectedBuildId` to the instrumentation runner to compare loaded JNI
-metadata with the packaged native source ID. An `adb am instrument` exit of zero
+metadata with `sha256:<digest>` from `crates/haider-android/build.rs`. This native
+source ID differs from the packaging recipe digest in `.haider.build`; record
+and verify both independently. An `adb am instrument` exit of zero
 alone is not a passing test result; inspect its JUnit result.
 The embedded-turn test holds the replay control attachment through submission,
 matching the production facade. A separate attach followed by submit can race
@@ -118,8 +120,9 @@ During death, Android can briefly report the old service PID with an empty
 retains the caller's deadline. It proves neither Ready nor service absence;
 unrecognized diagnostics still fail the probe.
 
-`mobile.sock` and standalone SMS/screen/accessibility transport remain a forward
-integration item. The legacy token/loopback bootstrap is suppressed in standalone
-mode. Passing chat over `h.sock` does not establish mobile capability transport,
+The standalone daemon now binds `mobile.sock` with same-UID admission. Android
+capability-client wiring and end-to-end SMS/screen/accessibility behavior remain
+forward integration items. The legacy token/loopback bootstrap is suppressed in
+standalone mode. Passing chat over `h.sock` does not establish mobile capability transport,
 real OAuth, physical OEM battery behavior, or publication readiness. Those remain
 explicit verification scope for 971-V and the later embed/UI forward merges.

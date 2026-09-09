@@ -139,13 +139,20 @@ fn init(env: &mut JNIEnv<'_>, context: JObject<'_>, paths: JString<'_>) -> Resul
         crate::logging::record(&logs, &crate::contract::Observation::phase("Stopped", 0))
             .map_err(|_| Status::Internal)?;
         let info = env
-            .call_method(&app, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", &[])
+            .call_method(
+                &app,
+                "getApplicationInfo",
+                "()Landroid/content/pm/ApplicationInfo;",
+                &[],
+            )
             .and_then(|value| value.l())
             .map_err(|_| Status::Internal)?;
         let debuggable = env
             .get_field(info, "flags", "I")
             .and_then(|value| value.i())
-            .map_err(|_| Status::Internal)? & 2 != 0;
+            .map_err(|_| Status::Internal)?
+            & 2
+            != 0;
         let vm = env.get_java_vm().map_err(|_| Status::Internal)?;
         let context = env.new_global_ref(app).map_err(|_| Status::Internal)?;
         // SAFETY: Host serializes initialization/release. ContextOwner outlives
@@ -156,7 +163,10 @@ fn init(env: &mut JNIEnv<'_>, context: JObject<'_>, paths: JString<'_>) -> Resul
                 context.as_obj().as_raw().cast(),
             )
         };
-        Ok(Some(ContextOwner { reference: context, debuggable }))
+        Ok(Some(ContextOwner {
+            reference: context,
+            debuggable,
+        }))
     })
 }
 
