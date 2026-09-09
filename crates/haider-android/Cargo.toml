@@ -10,15 +10,31 @@ rust-version.workspace = true
 name = "haider"
 crate-type = ["cdylib"]
 
-[target.'cfg(target_os = "android")'.dependencies]
-haider-daemon = { path = "../haider-daemon" }
+[dependencies]
 haider-platform = { path = "../haider-platform" }
+haider-protocol = { path = "../haider-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+haider-daemon = { path = "../haider-daemon", default-features = false }
+tokio.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+haider-daemon = { path = "../haider-daemon", default-features = false, features = ["android-standalone"] }
+haider-accounts = { path = "../haider-accounts" }
+zeroize.workspace = true
 haider-rpc = { path = "../haider-rpc" }
 jni = "0.21.1"
 ndk-context = "0.1.1"
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
 
 [lints]
 workspace = true

@@ -7,7 +7,8 @@
     },
     "haider-android": {
       "production": 2,
-      "test": 0
+      "test": 0,
+      "review": "C1 v1, 2026-09-07: two ndk-context calls; singleton initialization and release only after runtime/blocking-reader completion. JNI exports use unwind containment."
     },
     "haider-cli": {
       "production": 0,

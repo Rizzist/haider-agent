@@ -1736,14 +1736,20 @@ dependencies = [
 name = "haider-android"
 version = "0.0.970"
 dependencies = [
+ "haider-accounts",
  "haider-daemon",
  "haider-platform",
+ "haider-protocol",
  "haider-rpc",
  "jni 0.21.1",
  "ndk-context",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
