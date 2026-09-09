@@ -15,6 +15,7 @@ pub mod branch;
 pub mod cache;
 pub mod ceiling;
 pub mod checkpoint;
+pub mod completion;
 pub mod computer;
 pub mod context;
 pub mod context_compaction;

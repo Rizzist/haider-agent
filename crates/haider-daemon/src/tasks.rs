@@ -406,6 +406,7 @@ impl TaskFacade {
             };
             let state = TaskTerminalState::Failed { reason };
             let completed = TaskCompleted {
+                completion_consumer: None,
                 task: task.clone(),
                 name: started.fact.name.clone(),
                 state: state.clone(),
@@ -707,6 +708,7 @@ impl TaskFacade {
             }
         };
         let mut completed = TaskCompleted {
+            completion_consumer: None,
             task: task.clone(),
             name: entry.name.clone(),
             state: state.clone(),
@@ -732,8 +734,13 @@ impl TaskFacade {
         }
         let notice =
             haider_core::task_event_notice(&TaskEventPayload::TaskCompleted(completed.clone()));
+        let mut completion_consumer = None;
         let delivery = match self.active_run(session_id).await {
             Ok(Some((active_run, active_branch))) => {
+                completion_consumer = Some(haider_protocol::task::TaskCompletionConsumer {
+                    run_id: active_run.clone(),
+                    branch_id: active_branch.clone(),
+                });
                 match self
                     .steer_completion(session_id, &active_run, active_branch, &entry, &notice)
                     .await
@@ -753,6 +760,11 @@ impl TaskFacade {
             }
         };
         completed.delivery = delivery;
+        completed.completion_consumer = if delivery == TaskCompletionDelivery::DeliveredSteer {
+            completion_consumer
+        } else {
+            None
+        };
         // Exactly ONE prompt copy: the durable steer user message owns it on
         // the steer path, the fact owns it on the queued path.
         let prompt = match delivery {

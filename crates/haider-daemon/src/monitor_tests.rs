@@ -21,7 +21,7 @@ fn monitor_event_payload_rejects_unknown_variant_fields() {
     assert!(error.to_string().contains("unexpected"));
 }
 
-fn registration(filter: Option<MonitorFilter>) -> MonitorRegistration {
+pub(super) fn registration(filter: Option<MonitorFilter>) -> MonitorRegistration {
     MonitorRegistration {
         monitor_id: "monitor-test".into(),
         owner_session_id: SessionId::new("session-monitor-test"),
@@ -59,7 +59,11 @@ fn sms(address: &str, body: &str) -> MonitorEvent {
     }
 }
 
-fn test_report(report_id: &str, body: &str, status: MonitorReportStatus) -> MonitorReport {
+pub(super) fn test_report(
+    report_id: &str,
+    body: &str,
+    status: MonitorReportStatus,
+) -> MonitorReport {
     MonitorReport {
         report_id: report_id.into(),
         monitor_id: "monitor-test".into(),
@@ -396,17 +400,17 @@ fn client_delivery_projects_durable_report_with_cursor_and_dedupe() {
     assert!(monitor_delivery_report(&envelope).is_none());
 }
 
-struct MonitorWorld {
-    store: SqliteStoreHandle,
-    hub: SessionHub,
-    session: SessionId,
-    run: RunId,
-    lease: HubStoreHandle,
-    _root: tempfile::TempDir,
+pub(super) struct MonitorWorld {
+    pub(super) store: SqliteStoreHandle,
+    pub(super) hub: SessionHub,
+    pub(super) session: SessionId,
+    pub(super) run: RunId,
+    pub(super) lease: HubStoreHandle,
+    pub(super) _root: tempfile::TempDir,
 }
 
 impl MonitorWorld {
-    async fn new(label: &str) -> Self {
+    pub(super) async fn new(label: &str) -> Self {
         let root = tempfile::tempdir().expect("temporary monitor profile");
         let store = SqliteStoreHandle::open(root.path())
             .await
@@ -478,7 +482,7 @@ impl MonitorWorld {
         }
     }
 
-    fn coordinates(&self, call: &str) -> MonitorToolCoordinates {
+    pub(super) fn coordinates(&self, call: &str) -> MonitorToolCoordinates {
         MonitorToolCoordinates {
             run_id: self.run.clone(),
             branch_id: None,
@@ -491,7 +495,7 @@ impl MonitorWorld {
         }
     }
 
-    async fn execute(&self, call: &str, request: MonitorRequest) -> BoundedResult {
+    pub(super) async fn execute(&self, call: &str, request: MonitorRequest) -> BoundedResult {
         self.hub
             .execute_monitor_tool(&self.lease, self.coordinates(call), request)
             .await

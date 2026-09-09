@@ -92,11 +92,11 @@ pub use mobile::{
     MobileResult, UnavailableMobileBackend, mobile_manifest, platform_mobile_backend,
 };
 pub use monitor::{
-    MAX_MONITOR_FILTER_CHARS, MAX_MONITOR_FOLLOW_UP_CHARS, MAX_MONITOR_ID_CHARS, MonitorAction,
-    MonitorApproval, MonitorCliPreset, MonitorCommandApproval, MonitorFilter, MonitorFilterField,
-    MonitorFilterOperator, MonitorLifetime, MonitorOccurrence, MonitorPollUntil,
-    MonitorProcessRestart, MonitorRequest, MonitorSource, MonitorSourceKind, cli_preset_argv,
-    monitor_manifest,
+    CompletionControl, MAX_MONITOR_FILTER_CHARS, MAX_MONITOR_FOLLOW_UP_CHARS, MAX_MONITOR_ID_CHARS,
+    MonitorAction, MonitorApproval, MonitorCliPreset, MonitorCommandApproval, MonitorFilter,
+    MonitorFilterField, MonitorFilterOperator, MonitorLifetime, MonitorOccurrence,
+    MonitorPollUntil, MonitorProcessRestart, MonitorRequest, MonitorSource, MonitorSourceKind,
+    cli_preset_argv, monitor_manifest,
 };
 pub use plan::{
     PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan, PlanResult,

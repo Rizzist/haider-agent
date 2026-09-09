@@ -148,6 +148,7 @@ fn durable_staging_keeps_running_tasks_killable() {
     entry.kill = Some(kill);
     registry.insert(&session, entry);
     let fact = TaskCompleted {
+        completion_consumer: None,
         task: task.clone(),
         name: "buffer-test".into(),
         state: TaskTerminalState::Completed { exit_code: Some(0) },

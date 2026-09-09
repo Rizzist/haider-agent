@@ -66,9 +66,21 @@ pub struct TaskStarted {
     pub started_at_ms: u64,
 }
 
+/// The actual branch/run reached by a completion steer, independent of the
+/// task's source branch. Absence means queued work with no automatic turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCompletionConsumer {
+    pub run_id: crate::ids::RunId,
+    pub branch_id: Option<crate::ids::BranchId>,
+}
+
 /// Durable end-of-life fact for one background task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskCompleted {
+    /// Consuming run for a durably steered completion; absence preserves the
+    /// non-autostart queued policy. Independent of the task's source run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_consumer: Option<TaskCompletionConsumer>,
     pub task: TaskId,
     pub name: String,
     pub state: TaskTerminalState,

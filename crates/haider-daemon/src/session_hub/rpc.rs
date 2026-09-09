@@ -1299,6 +1299,7 @@ struct ObservedRun {
 
 #[derive(serde::Serialize)]
 struct ObserveProjection {
+    completions: haider_protocol::completion::CompletionProjection,
     event_limit: usize,
     event_kinds: VecDeque<String>,
     title: Option<String>,
@@ -1368,6 +1369,7 @@ struct ObserveFold {
 
 #[derive(Clone)]
 struct ObserveFoldSnapshot {
+    pending_follow_ups: Vec<haider_protocol::completion::CompletionObligation>,
     head_seq: u64,
     title: Option<String>,
     run_state: haider_rpc::ObserveRunStateWire,
@@ -1465,6 +1467,13 @@ impl ObserveFold {
             .collect::<Vec<_>>();
         branches.sort_by_key(|branch| branch.created_seq);
         ObserveFoldSnapshot {
+            pending_follow_ups: self
+                .projection
+                .completions
+                .pending
+                .values()
+                .cloned()
+                .collect(),
             head_seq: self.head_seq,
             title: self.projection.title.clone(),
             run_state,
@@ -1708,6 +1717,7 @@ impl ObserveFoldSnapshot {
         });
         let event_start = self.event_kinds.len().saturating_sub(event_limit);
         haider_rpc::SessionObserveDigest {
+            pending_follow_ups: self.pending_follow_ups.clone(),
             session_id,
             head_seq: self.head_seq,
             worker_generation,
@@ -2822,6 +2832,7 @@ fn observed_lockdown_manager_status(
 impl ObserveProjection {
     fn new(event_limit: usize) -> Self {
         Self {
+            completions: haider_protocol::completion::CompletionProjection::default(),
             event_limit,
             event_kinds: VecDeque::with_capacity(event_limit),
             title: None,
@@ -2838,6 +2849,7 @@ impl ObserveProjection {
     }
 
     fn apply(&mut self, envelope: haider_protocol::envelope::RawEnvelope) {
+        self.completions.apply(&envelope);
         self.graphs.apply_envelope(&envelope);
         self.updated_at_ms = self.updated_at_ms.max(envelope.committed_at_ms);
         if let Some(kind) = envelope
@@ -3079,6 +3091,7 @@ impl ObserveProjection {
         let pending_menus: Vec<haider_rpc::ObserveMenuWire> = self.menus.into_values().collect();
         let needs_input = needs_input(run_state, &pending_menus);
         haider_rpc::SessionObserveDigest {
+            pending_follow_ups: self.completions.pending.into_values().collect(),
             session_id,
             head_seq,
             worker_generation,
