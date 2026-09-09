@@ -4927,6 +4927,154 @@ async fn zero_is_only_reported_for_truly_empty_sessions() {
     store.close().await.expect("store closes");
 }
 
+async fn task_outcome_observe(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    metadata_only: bool,
+) -> haider_rpc::SessionObserveDigest {
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("observe connection");
+    connection
+        .request(
+            RequestId::new("task-outcome-observe"),
+            RequestBody::SessionObserve {
+                session_id: session_id.clone(),
+                last_event_limit: 0,
+                metadata_only,
+            },
+        )
+        .await
+        .expect("observe request");
+    let WireFrame::Response {
+        body: ResponseBody::SessionObserve { digest },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected observe digest");
+    };
+    connection.close().await.expect("observe connection closes");
+    digest
+}
+
+#[tokio::test]
+async fn task_outcome_observe_survives_live_cache_restart_and_new_runs() {
+    use haider_protocol::task_outcome::TaskOutcomeV1;
+
+    let (root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let session = SessionId::new("task-outcome-live");
+    let cold_session = SessionId::new("task-outcome-unobserved-before-restart");
+    let legacy_session = SessionId::new("task-outcome-legacy");
+    let outcome = TaskOutcomeV1::Failure {
+        reason: "Required input is unavailable".into(),
+    };
+    let state = |session: &SessionId, event: &str, run: &str, generation, state| {
+        let mut envelope = envelope(session, event, generation);
+        envelope.run_id = Some(RunId::new(run));
+        envelope.branch_id = Some(BranchId::new("task-branch"));
+        envelope.payload = serde_json::to_value(EventPayload::RunState(state))
+            .expect("run state")
+            .into();
+        envelope
+    };
+    let terminal = |session: &SessionId, event: &str| {
+        let mut terminal = state(session, event, "failed-run", generation, RunState::Errored);
+        terminal
+            .payload
+            .insert_metadata("task_outcome_version", serde_json::json!(1));
+        terminal
+            .payload
+            .insert_metadata("task_outcome", serde_json::json!(outcome));
+        terminal
+    };
+    hub.append(&mut [state(
+        &session,
+        "live",
+        "failed-run",
+        generation,
+        RunState::Streaming,
+    )])
+    .await
+    .expect("live run commits");
+    let live = task_outcome_observe(&hub, &session, false).await;
+    assert!(live.task_outcome.is_none()); // Installs the live cache before settlement.
+    hub.append(&mut [terminal(&session, "live-terminal")])
+        .await
+        .expect("terminal commits");
+    let settled = task_outcome_observe(&hub, &session, false).await;
+    assert_eq!(settled.task_outcome, Some(outcome.clone()));
+    assert_eq!(settled.task_outcome_version, Some(1));
+    assert_eq!(settled.run_id, Some(RunId::new("failed-run")));
+    assert_eq!(settled.active_branch_id, Some(BranchId::new("task-branch")));
+    assert_eq!(settled.run_state, haider_rpc::ObserveRunStateWire::Errored);
+    let metadata = task_outcome_observe(&hub, &session, true).await;
+    assert!(metadata.task_outcome.is_none());
+    assert!(metadata.task_outcome_version.is_none());
+    hub.append(&mut [terminal(&cold_session, "unobserved-terminal")])
+        .await
+        .expect("cold terminal commits");
+    hub.append(&mut [state(
+        &legacy_session,
+        "legacy-terminal",
+        "legacy-run",
+        generation,
+        RunState::Errored,
+    )])
+    .await
+    .expect("legacy terminal commits");
+    hub.shutdown().await.expect("first hub stops");
+    store.close().await.expect("first store closes");
+
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store reopens");
+    assert_ne!(store.worker_generation(), generation);
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub reopens");
+    for session in [&session, &cold_session] {
+        // Both previously observed and never-observed terminals rebuild from
+        // committed metadata despite their older worker generation.
+        for _ in 0..2 {
+            let digest = task_outcome_observe(&hub, session, false).await;
+            assert_eq!(digest.task_outcome, Some(outcome.clone()));
+            assert_eq!(digest.task_outcome_version, Some(1));
+            assert_eq!(digest.run_id, Some(RunId::new("failed-run")));
+            assert_eq!(digest.active_branch_id, Some(BranchId::new("task-branch")));
+            assert_eq!(digest.run_state, haider_rpc::ObserveRunStateWire::Errored);
+        }
+    }
+    let legacy = task_outcome_observe(&hub, &legacy_session, false).await;
+    assert_eq!(legacy.run_state, haider_rpc::ObserveRunStateWire::Errored);
+    let legacy_json = serde_json::to_value(legacy).expect("legacy digest serializes");
+    assert!(legacy_json.get("task_outcome").is_none());
+    assert!(legacy_json.get("task_outcome_version").is_none());
+    for (event, run_state) in [
+        ("new-live", RunState::Streaming),
+        ("new-done", RunState::Done),
+    ] {
+        hub.append(&mut [state(
+            &session,
+            event,
+            "new-run",
+            store.worker_generation(),
+            run_state,
+        )])
+        .await
+        .expect("new run commits");
+        let digest = task_outcome_observe(&hub, &session, false).await;
+        assert_eq!(digest.run_id, Some(RunId::new("new-run")));
+        assert!(digest.task_outcome.is_none());
+        assert!(digest.task_outcome_version.is_none());
+    }
+    hub.shutdown().await.expect("second hub stops");
+    store.close().await.expect("second store closes");
+}
+
 /// MUTATION CHECK: collapse both parked run states to one generic blocked
 /// value, or serialize whole menu/event payloads into the digest. Expected
 /// RUNTIME failure: the simultaneous fixtures cease to report distinct

@@ -819,6 +819,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "plan",
             "loom_register",
             "todo_write",
+            "task_outcome",
             "graph_evidence",
             "fs_read",
             "fs_glob",
@@ -1607,17 +1608,13 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Keep wave's stricter pre-diet comparator (before docsync's +304 bytes).
     // Provider-dialect JSON framing is measured separately by AHRB.
     const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
-    // Confbench's task/prompt default delegation stub: POSIX
-    // 5_670 + 574 = 6_244 (name 14 + usage 256 + schema 304).
-    // Optional controls retain their full declaration via durable discovery;
-    // the required property constraints/prose are unchanged in the stub.
-    // Preserve wave's platform-derived pin: process_exec.command.description
-    // names /bin/zsh and /bin/sh on POSIX (78 bytes), and absolute System32
-    // PowerShell on Windows (75 bytes). Its actual serialized contribution
-    // is measured below; the invariant pin is 5_592 + 574 = 6_166.
-    // Keep the reduction floor independent of this exact-value pin: adding
-    // delegation cannot waive the existing release budget.
-    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_166;
+    // Default delegation adds 574 bytes and task_outcome adds 515 bytes.
+    // Optional controls retain their full declaration via durable discovery.
+    // process_exec.command.description names /bin/zsh and /bin/sh on POSIX
+    // (78 bytes), and absolute System32 PowerShell on Windows (75 bytes).
+    // Measure that platform contribution separately below; the invariant is
+    // 5_592 + 574 + 515 = 6_681. Keep the existing release reduction floors.
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_681;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1628,7 +1625,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         0,
     );
     let registry = registered_tools();
-    assert_eq!(authorized.len(), 27, "26 former tools plus list_tools");
+    assert_eq!(authorized.len(), 28, "27 former tools plus task_outcome");
     let full_prefix: usize = authorized
         .iter()
         .map(|tool| {
@@ -1643,21 +1640,18 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
                     .len()
         })
         .sum();
-    // Computer parity adds 771 full-schema bytes for triple_click, region crops,
-    // and key-chord descriptions: macOS 20_770 -> 21_541.
-    // Other hosts retain platform deltas: Linux +49, Windows -1, Unix -6.
-    // Computer remains a stub in the default pipe: invariant 6_166 -> 6_166;
-    // manual bytes remain zero. Full schema growth cannot waive the pipe gate.
-    // Shipgate clarifies interactive/autonomous request_input prose (+96
-    // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
+    // Prior macOS full pack: 21_637 bytes, including computer parity (+771)
+    // and request_input clarification (+96). Task outcome adds 515 bytes:
+    // name 12 + description 307 + compact schema 196. Preserve the other
+    // platform deltas: Linux +49, Windows -1, other Unix -6.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_686;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_201;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_637;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_152;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_636;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_151;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_631;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_146;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1676,11 +1670,11 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         - 2;
     let expected_pipe_bytes =
         EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
-    assert_eq!(registered_tools().len(), 30);
+    assert_eq!(registered_tools().len(), 31);
     assert_eq!(
         tools.len(),
-        9,
-        "seven coding tools, discovery, and delegation"
+        10,
+        "seven coding tools, discovery, delegation, and task outcome"
     );
     let spawn = tools
         .iter()

@@ -195,6 +195,8 @@ pub(crate) struct SessionSummaryView {
     /// uncancellable from anything reading this JSON. Read them off the SAME
     /// summary as `run_state` — the pair is one observation.
     pub run_id: Option<String>,
+    pub task_outcome: Option<haider_protocol::task_outcome::TaskOutcomeV1>,
+    pub task_outcome_version: Option<u32>,
     pub worker_generation: Option<u64>,
     /// Prompt-cache health, projected from the promoted roster scalars with
     /// `agent_metrics.usage` retained only as a pre-promotion-daemon fallback.
@@ -340,6 +342,10 @@ impl ObserveJson for SessionSummaryView {
         });
         if let Some(run_id) = &self.run_id {
             object["run_id"] = json!(run_id);
+        }
+        if let Some(outcome) = &self.task_outcome {
+            object["task_outcome"] = json!(outcome);
+            object["task_outcome_version"] = json!(self.task_outcome_version);
         }
         if let Some(generation) = self.worker_generation {
             object["worker_generation"] = json!(generation);
@@ -978,6 +984,8 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         title: digest.title,
         run_state: run_state_name(digest.run_state),
         run_id: digest.run_id.as_ref().map(|run| run.as_str().to_owned()),
+        task_outcome: digest.task_outcome,
+        task_outcome_version: digest.task_outcome_version,
         worker_generation: Some(digest.worker_generation),
         cache: digest
             .agent_metrics
@@ -1058,6 +1066,12 @@ pub(crate) fn merge_roster_summary(
                 reread_basis_points: usage.cache_reread_hit_basis_points,
             })
     };
+    // A newer roster read may select another run. Never attach the digest's
+    // terminal outcome to that run's cancel coordinates.
+    if view.run_id.as_deref() != summary.run_id.as_ref().map(|run| run.as_str()) {
+        view.task_outcome = None;
+        view.task_outcome_version = None;
+    }
     // The cancel coordinates are another pair from the same live summary.
     view.run_id = summary.run_id.as_ref().map(|run| run.as_str().to_owned());
     view.worker_generation = Some(summary.worker_generation);
@@ -1530,6 +1544,8 @@ mod roster_scalar_tests {
             title: "t".into(),
             run_state: "idle",
             run_id: None,
+            task_outcome: None,
+            task_outcome_version: None,
             worker_generation: None,
             cache: None,
             active_branch: "main".into(),

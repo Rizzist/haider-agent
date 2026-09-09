@@ -803,6 +803,8 @@ mod tests {
             title: "parked".into(),
             run_state: ObserveRunStateWire::EffectUnknown,
             run_id: None,
+            task_outcome: None,
+            task_outcome_version: None,
             active_branch_id: None,
             branches: Vec::new(),
             main_head_node_id: None,

@@ -143,6 +143,7 @@ fn production_coding_surface_and_explicit_names_remain_authorized() {
         [
             "list_tools",
             "todo_write",
+            "task_outcome",
             "fs_read",
             "fs_glob",
             "fs_search",

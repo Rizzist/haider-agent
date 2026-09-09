@@ -47,6 +47,15 @@ retain their existing exit mappings. Rejected calls do not create a task
 terminal. If the terminal append fails, no accepted signal is persisted and
 normal storage-error cleanup applies.
 
+`session.observe` and `haider session <id> --json` expose the same optional
+`task_outcome` and `task_outcome_version` fields for the selected run. They
+come from its committed errored terminal, correlated with `run_id` and the
+active branch. Live observation and journal reconstruction after restart use
+the same reduction, including terminals committed in older worker generations.
+Selecting a new run clears the previous outcome. Ordinary completion, legacy
+terminals without the metadata, and metadata-only reads omit both fields;
+unknown versions are not interpreted as V1 outcomes.
+
 Compatibility: this uses existing ToolCall/ToolResult, Item, RunFailed and
 RunState carriers. `TaskOutcomeV1` and `task_failed` are additive, and the
 terminal metadata is versioned. Older readers ignore the metadata and decode

@@ -1381,6 +1381,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     title: "Observe the durable session".into(),
                     run_state: ObserveRunStateWire::ParkedInput,
                     run_id: None,
+                    task_outcome: None,
+                    task_outcome_version: None,
                     active_branch_id: None,
                     branches: Vec::new(),
                     main_head_node_id: None,
