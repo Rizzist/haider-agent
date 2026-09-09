@@ -32,6 +32,14 @@ impl DescendantProbe {
     pub fn release(&self) {
         fs::write(&self.0, b"probe").expect("probe cancelled descendant");
     }
+
+    pub fn assert_released(&self) {
+        assert_eq!(
+            fs::read(&self.0).expect("descendant probe must be released before checking survival"),
+            b"probe",
+            "descendant probe release must remain observable",
+        );
+    }
 }
 
 impl Drop for DescendantProbe {

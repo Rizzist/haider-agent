@@ -587,49 +587,143 @@ async fn submit_turn_observing(
     generation: u64,
     text: &str,
 ) -> (RunId, Vec<EventPayload>) {
-    send_request(
-        client,
-        config,
-        command_id,
-        RequestBody::TurnSubmit {
-            command_id: CommandId::new(command_id),
-            session_id,
-            worker_generation: generation,
-            text: text.into(),
-            attachments: Vec::new(),
-            mode: DeliveryMode::Queue,
-        },
-    )
-    .await;
-    let mut events: Vec<(Option<RunId>, EventPayload)> = Vec::new();
-    loop {
-        match client.next().await {
-            WireFrame::Response {
-                body: ResponseBody::TurnSubmit { run_id, .. },
-                ..
-            } => {
-                let events = events
-                    .into_iter()
-                    .filter(|(seen, _)| seen.as_ref() == Some(&run_id))
-                    .map(|(_, payload)| payload)
-                    .collect();
-                return (run_id, events);
-            }
-            WireFrame::Event { envelope, .. } => {
-                if let Ok(payload) = serde_json::from_value(envelope.payload.into()) {
-                    events.push((envelope.run_id, payload));
+    // Registry #94: reuse the complete-operation budget (Windows cold spawn +
+    // foreground wall limit + kill grace), including the request write. Frames
+    // and keepalive replies must never restart this deadline.
+    let started = tokio::time::Instant::now();
+    let mut frames = 0usize;
+    let result = tokio::time::timeout_at(started + support::DEADLINE, async {
+        send_request(
+            client,
+            config,
+            command_id,
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new(command_id),
+                session_id,
+                worker_generation: generation,
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await;
+        let mut events: Vec<(Option<RunId>, EventPayload)> = Vec::new();
+        loop {
+            let frame = client
+                .try_next()
+                .await
+                .expect("connection closed before turn.submit reply");
+            frames += 1;
+            match frame {
+                WireFrame::Response {
+                    body: ResponseBody::TurnSubmit { run_id, .. },
+                    ..
+                } => {
+                    let events = events
+                        .into_iter()
+                        .filter(|(seen, _)| seen.as_ref() == Some(&run_id))
+                        .map(|(_, payload)| payload)
+                        .collect();
+                    return (run_id, events);
                 }
+                WireFrame::Event { envelope, .. } => {
+                    if let Ok(payload) = serde_json::from_value(envelope.payload.into()) {
+                        events.push((envelope.run_id, payload));
+                    }
+                }
+                WireFrame::Response {
+                    body: ResponseBody::Error { code, message, .. },
+                    ..
+                } => panic!("turn.submit `{command_id}` failed ({code}): {message}"),
+                WireFrame::ProtocolError(error) => {
+                    panic!("turn.submit `{command_id}` failed: {error}")
+                }
+                _ => {}
             }
-            WireFrame::Response {
-                body: ResponseBody::Error { code, message, .. },
-                ..
-            } => panic!("turn.submit `{command_id}` failed ({code}): {message}"),
-            WireFrame::ProtocolError(error) => {
-                panic!("turn.submit `{command_id}` failed: {error}")
-            }
-            _ => {}
         }
-    }
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        let reason = format!(
+            "turn.submit `{command_id}` operation deadline elapsed; elapsed={:?}; budget={:?}; frames={frames}",
+            started.elapsed(), support::DEADLINE,
+        );
+        client.report_connection_failure(&reason);
+        panic!("{reason}")
+    })
+}
+
+/// Real socket traffic must not extend the reply deadline. A non-reserved
+/// Pong is exposed on Unix too, reproducing Windows' keepalive-frame path.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn turn_submit_deadline_survives_continuous_control_frames() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let root = test_root("submit-deadline-");
+    let endpoint = root.path().join("peer.sock");
+    let listener = tokio::net::UnixListener::bind(&endpoint).expect("bind peer");
+    let config = DaemonConfig::new(
+        "submit-deadline",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let limit = config.frame_limit;
+    let mut client = UdsClient::connect(&endpoint, limit)
+        .await
+        .expect("connect peer");
+    let (mut peer, _) = listener.accept().await.expect("accept peer");
+    let control = haider_rpc::uds_codec::encode(&WireFrame::Pong { nonce: 77 }, limit)
+        .expect("encode control frame");
+    let sent = Arc::new(AtomicUsize::new(0));
+    let peer_sent = sent.clone();
+    let sender = tokio::spawn(async move {
+        loop {
+            if peer.write_all(&control).await.is_err() {
+                break;
+            }
+            peer_sent.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(support::KEEPALIVE_INTERVAL / 10).await;
+        }
+    });
+    let mut request = tokio::spawn(async move {
+        submit_turn_observing(
+            &mut client,
+            &config,
+            "withheld-submit",
+            SessionId::new("deadline-session"),
+            1,
+            "withheld reply",
+        )
+        .await
+    });
+    let started = tokio::time::Instant::now();
+    let observed = tokio::time::timeout(support::DEADLINE * 2, &mut request).await;
+    let elapsed = started.elapsed();
+    let frames_sent = sent.load(Ordering::Relaxed);
+    request.abort();
+    sender.abort();
+    let _ = sender.await;
+    eprintln!("submit deadline: elapsed={elapsed:?}; control_frames_sent={frames_sent}");
+    let failure = observed
+        .expect("TurnSubmit outlived two operation budgets despite continuous control frames")
+        .expect_err("a withheld reply must fail")
+        .into_panic();
+    let reason = failure
+        .downcast_ref::<String>()
+        .expect("submit timeout diagnostic");
+    assert!(reason.contains("turn.submit `withheld-submit` operation deadline elapsed"));
+    let frames: usize = reason
+        .rsplit_once("frames=")
+        .expect("deadline diagnostic includes frame count")
+        .1
+        .parse()
+        .expect("numeric frame count");
+    assert!(
+        frames > 1 && frames <= frames_sent,
+        "received frames={frames}"
+    );
+    assert!(elapsed >= support::DEADLINE && elapsed < support::DEADLINE * 2);
 }
 
 async fn register_workflow_chain(
@@ -1545,12 +1639,58 @@ fn shell_round_trip_command() -> String {
 #[cfg(unix)]
 fn cancellable_process_command() -> String {
     format!(
-        "(printf started > descendant-started.log; \
+        "({}) & while :; do printf x >> heartbeat.log; sleep {}; done",
+        cancellable_descendant_command(),
+        process_fixture::HEARTBEAT_PERIOD.as_secs_f64(),
+    )
+}
+
+#[cfg(unix)]
+fn cancellable_descendant_command() -> String {
+    format!(
+        "printf started > descendant-started.log; \
          while [ ! -f descendant-probe ] && [ -f descendant-started.log ]; do sleep {period}; done; \
-         printf survived > descendant-survived.log) & \
-         while :; do printf x >> heartbeat.log; sleep {period}; done",
+         printf survived > descendant-survived.log",
         period = process_fixture::HEARTBEAT_PERIOD.as_secs_f64(),
     )
+}
+
+/// Positive control for the cancellation test's absent-survivor assertion:
+/// this exact Unix descendant stays alive until release, then writes a marker.
+#[cfg(unix)]
+#[tokio::test]
+async fn live_descendant_observes_released_probe() {
+    let root = test_root("live-descendant-probe-");
+    let probe = process_fixture::DescendantProbe::new(root.path());
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cancellable_descendant_command())
+        .current_dir(root.path())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real fixture descendant");
+    tokio::time::timeout(support::DEADLINE, async {
+        while !root.path().join("descendant-started.log").exists() {
+            tokio::time::sleep(process_fixture::HEARTBEAT_PERIOD).await;
+        }
+    })
+    .await
+    .expect("descendant started");
+    tokio::time::sleep(process_fixture::STOP_OBSERVATION).await;
+    assert!(child.try_wait().expect("inspect live descendant").is_none());
+    let survived = root.path().join("descendant-survived.log");
+    assert!(!survived.exists(), "unreleased descendant wrote early");
+    probe.release();
+    probe.assert_released();
+    let status = tokio::time::timeout(process_fixture::STOP_OBSERVATION, child.wait())
+        .await
+        .expect("released descendant must observe probe and exit")
+        .expect("wait for descendant");
+    assert!(status.success());
+    assert_eq!(
+        fs::read(survived).expect("live descendant observed probe"),
+        b"survived"
+    );
 }
 
 #[cfg(windows)]
@@ -2815,6 +2955,9 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
         stopped_size,
         "cancelled leader kept running"
     );
+    // Absence is meaningful only after an observable release. Drop also
+    // releases on unwind, but that happens too late to validate this check.
+    descendant_probe.assert_released();
     assert!(
         !workspace.join("descendant-survived.log").exists(),
         "outliving descendant escaped the process group"
