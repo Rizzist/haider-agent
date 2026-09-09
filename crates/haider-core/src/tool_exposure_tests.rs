@@ -503,3 +503,17 @@ async fn discovery_is_committed_before_the_next_request_advertises_it() {
     let events = store.events(&SessionId::new("discovery-session")).await;
     assert!(events.iter().any(|event| matches!(event.payload.decode_event(), Ok(EventPayload::ToolResult { result: BoundedResult { data: Some(haider_protocol::tool::ToolResultData::ToolsDiscovered { promoted }), .. }, .. }) if promoted == ["monitor"])));
 }
+
+#[test]
+fn task_outcome_is_initially_visible_only_when_granted() {
+    let mut allowed = HarnessConfig::for_session(
+        SessionId::new("outcome-discovery"),
+        DeviceId::new("discovery-device"),
+        1,
+        1,
+    );
+    allowed.tools.push(definition("task_outcome"));
+    allowed.enable_tool_discovery(Vec::new());
+    assert!(names(&allowed).contains(&"task_outcome"));
+    assert!(!names(&config()).contains(&"task_outcome"));
+}

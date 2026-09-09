@@ -2851,6 +2851,64 @@ fn run_jsonl_exits_65_when_fake_provider_errors() {
 }
 
 #[test]
+fn task_outcome_real_cli_distinguishes_typed_failure_from_failure_text() {
+    let cases = [
+        (
+            r#"[{"step":"emit_text","text":"{\"status\":\"FAILURE\",\"category\":\"scripted\"}"},{"step":"finish","reason":"end_turn"}]"#,
+            0,
+        ),
+        (
+            r#"[{"step":"emit_tool_call","call_id":"outcome-1","name":"task_outcome","args":{"status":"failure","reason":"Required input is unavailable"}},{"step":"finish","reason":"tool_use"}]"#,
+            1,
+        ),
+    ];
+    for (script, exit) in cases {
+        let out = haider_with_boot_retry(
+            &["run", "--provider", "fake", "--jsonl", "report result"],
+            &[("HAIDER_TEST_FAKE_PROVIDER", script)],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(exit),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let envelopes = parse_jsonl(&out.stdout);
+        let terminal = envelopes.last().expect("durable terminal");
+        eprintln!(
+            "task outcome CLI exit {exit}; terminal: {}",
+            terminal.payload
+        );
+        assert_eq!(envelopes.iter().filter(|event| matches!(typed(event), Some(EventPayload::RunState(state)) if state.is_terminal())).count(), 1);
+        if exit == 1 {
+            assert_eq!(
+                typed(terminal),
+                Some(EventPayload::RunState(RunState::Errored))
+            );
+            assert!(matches!(
+                typed(&envelopes[envelopes.len() - 2]),
+                Some(EventPayload::RunFailed {
+                    code: ErrorCode::TaskFailed,
+                    retryable: false,
+                    ..
+                })
+            ));
+            assert_eq!(
+                terminal.payload["task_outcome"],
+                serde_json::json!({"status":"failure", "reason":"Required input is unavailable"})
+            );
+            assert_eq!(terminal.payload["task_outcome_version"], 1);
+        } else {
+            assert_eq!(
+                typed(terminal),
+                Some(EventPayload::RunState(RunState::Done))
+            );
+            assert!(terminal.payload.get("task_outcome").is_none());
+        }
+    }
+}
+
+#[test]
 fn run_jsonl_bounded_rate_limit_exhaustion_is_one_provider_terminal() {
     const RUN_BUDGET_MS: u64 = 10_000;
     const RETRY_AFTER_MS: u64 = 15_000;

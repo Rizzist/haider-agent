@@ -14,6 +14,7 @@ const CORE_TOOLS: &[&str] = &[
     // headless clients. This remains an intersection with the granted pack.
     "spawn_subagent",
     "todo_write",
+    "task_outcome",
     "list_tools",
 ];
 const DISCOVERY_ROW_CAP: usize = 8;

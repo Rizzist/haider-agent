@@ -2218,6 +2218,7 @@ pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
         HeadlessOutcome::Timeout => EX_TIMEOUT,
         HeadlessOutcome::InputRequired => EX_BLOCKED,
         HeadlessOutcome::Errored => match result.failure.as_ref().map(|failure| &failure.code) {
+            Some(HeadlessFailureCode::Run(ErrorCode::TaskFailed)) => 1,
             Some(HeadlessFailureCode::Run(ErrorCode::RequestBudgetExceeded)) => {
                 INTERNAL_CEILING_EXIT_CODE
             }
