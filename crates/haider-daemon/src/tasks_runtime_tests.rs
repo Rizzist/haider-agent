@@ -1527,6 +1527,7 @@ async fn background_capture_redacts_before_paging_and_completion_journaling() {
             .map(|i| format!("line {i}: orchestration evidence\n"))
             .collect::<String>()
     );
+    let original = format!("{}{original}", redaction_repair_fixture());
     std::fs::write(std::path::Path::new(&cwd).join("capture.txt"), &original).expect("fixture");
     let safe = haider_tools::redact_output_text(&original);
     let store = SqliteStoreHandle::open(profile.path())
@@ -1573,10 +1574,13 @@ async fn background_capture_redacts_before_paging_and_completion_journaling() {
     }
     assert!(pages >= 3);
     assert_eq!(full, safe);
+    assert_repair_secrets_absent(&full);
+    assert_repair_carriers_present(&full);
     for envelope in read_all(&store, &session).await {
         let text = serde_json::to_string(&envelope).expect("journal JSON");
         assert!(!text.contains("sk-abcdefghijklmnopQRSTUV"));
         assert!(!text.contains("AA=="));
+        assert_repair_secrets_absent(&text);
     }
     eprintln!(
         "background capture: safe_bytes={} pages={pages}; completion journal and pages contain no synthetic secrets",
@@ -1599,6 +1603,7 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
             .map(|i| format!("line {i}: orchestration evidence\n"))
             .collect::<String>()
     );
+    let original = format!("{}{original}", redaction_repair_fixture());
     std::fs::write(std::path::Path::new(&cwd).join("capture.txt"), &original).expect("fixture");
     let store = SqliteStoreHandle::open(profile.path())
         .await
@@ -1639,6 +1644,8 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     )];
     hub.append(&mut facts).await.expect("persist result");
     assert_eq!(result["exit_code"], 0);
+    assert_repair_secrets_absent(&result.to_string());
+    assert_repair_carriers_present(result["output"].as_str().expect("preview"));
     let handle = format!("capture:{}", result["effect_id"].as_str().expect("effect"));
     assert!(
         result["output"]
@@ -1677,6 +1684,8 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     assert_eq!(full, haider_tools::redact_output_text(&original));
     assert!(!full.contains("sk-"));
     assert!(!full.contains("AA=="));
+    assert_repair_secrets_absent(&full);
+    assert_repair_carriers_present(&full);
     let facade = TaskFacade::new(hub.clone());
     let restored = facade
         .restore_foreground_capture(&session, &handle)
@@ -1696,6 +1705,7 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
             .is_err()
     );
     for envelope in read_all(&store, &session).await {
+        assert_repair_secrets_absent(&serde_json::to_string(&envelope).expect("journal"));
         if let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Delta {
             delta: haider_protocol::item::ItemDelta::CommandOutput { chunk_b64, .. },
             ..
@@ -1707,9 +1717,48 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
             let text = String::from_utf8(bytes).expect("UTF8");
             assert!(!text.contains("sk-abcdefghijklmnopQRSTUV"));
             assert!(!text.contains("AA=="));
+            assert_repair_secrets_absent(&text);
         }
     }
     dispatcher.close().await.expect("close dispatcher");
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close store");
+}
+
+fn redaction_repair_fixture() -> &'static str {
+    concat!(
+        "https://owner:fixturepass@example.test/repo\n",
+        "postgres://owner:p%40ssw0rd@db.test/app\n",
+        "password=\"abc\\\"SYNTHETICTAIL987\"\n",
+        "password='abc\\'SYNTHETICTAIL987'\n",
+        "password=\"abc\\\\SYNTHETICTAIL987\"\n",
+        "password='abc\\\\SYNTHETICTAIL987'\n",
+        "HEAD:752dfaa79475887978ffeb8eaa73134d7a933c7d\n",
+        "urn:uuid:01a0e893-52bc-7def-89ab-0123456789cd\n",
+        "thread-01a0e893-52bc-7def-89ab-0123456789cd\n",
+        "01a0e893-52bc-7def-89ab-0123456789cd.result.md\n",
+        "QmYwAPJzv5CZsnAzt8auVZRnGi2CQCqK4HCb2jdPrFAgDq\n",
+        "run_id=aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY\n",
+    )
+}
+
+fn assert_repair_secrets_absent(text: &str) {
+    for secret in ["fixturepass", "p%40ssw0rd", "SYNTHETICTAIL987"] {
+        assert!(!text.contains(secret), "secret {secret} leaked");
+    }
+}
+
+fn assert_repair_carriers_present(text: &str) {
+    for carrier in redaction_repair_fixture().lines().skip(6) {
+        assert!(text.contains(carrier), "carrier {carrier} lost");
+    }
+    for authority in [
+        "https://owner:[REDACTED:secret_value]@",
+        "postgres://owner:[REDACTED:secret_value]@",
+    ] {
+        assert!(
+            text.contains(authority),
+            "username/authority lost: {authority}"
+        );
+    }
 }

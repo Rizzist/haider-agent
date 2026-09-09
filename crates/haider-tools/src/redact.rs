@@ -276,28 +276,31 @@ fn redaction_spans(input: &str, policy: RedactionPolicy) -> Vec<Span> {
     }
     // Explicit secret context wins even if the value resembles a digest or
     // a path. Lockdown retains its historical classifier byte-for-byte.
-    if policy != RedactionPolicy::Lockdown
-        && let Some(regex) = secret_assignment_regex()
-    {
-        for captures in regex.captures_iter(input) {
-            if let Some(found) = captures.get(1) {
-                if spans
-                    .iter()
-                    .any(|span| span.start == found.start() && span.end == found.end())
-                {
-                    continue;
-                }
-                if !spans.iter().any(|span| {
-                    span.kind == "private_key"
-                        && found.start() < span.end
-                        && span.start < found.end()
-                }) {
-                    spans.retain(|span| found.start() >= span.end || span.start >= found.end());
-                    spans.push(Span {
-                        start: found.start(),
-                        end: found.end(),
-                        kind: "secret_value",
-                    });
+    if policy != RedactionPolicy::Lockdown {
+        for regex in [url_userinfo_regex(), secret_assignment_regex()]
+            .into_iter()
+            .flatten()
+        {
+            for captures in regex.captures_iter(input) {
+                if let Some(found) = captures.get(1) {
+                    if spans
+                        .iter()
+                        .any(|span| span.start == found.start() && span.end == found.end())
+                    {
+                        continue;
+                    }
+                    if !spans.iter().any(|span| {
+                        span.kind == "private_key"
+                            && found.start() < span.end
+                            && span.start < found.end()
+                    }) {
+                        spans.retain(|span| found.start() >= span.end || span.start >= found.end());
+                        spans.push(Span {
+                            start: found.start(),
+                            end: found.end(),
+                            kind: "secret_value",
+                        });
+                    }
                 }
             }
         }
@@ -314,7 +317,8 @@ fn redaction_spans(input: &str, policy: RedactionPolicy) -> Vec<Span> {
                 .any(|span| found.start() < span.end && span.start < found.end())
                 || !looks_high_entropy(found.as_str())
                 || (policy != RedactionPolicy::Lockdown
-                    && is_non_secret_carrier(found.as_str(), policy))
+                    && (is_non_secret_carrier(found.as_str(), policy)
+                        || is_public_run_id(&input[..found.start()], found.as_str())))
             {
                 continue;
             }
@@ -424,8 +428,19 @@ fn extended_secret_regex() -> Option<&'static Regex> {
 fn secret_assignment_regex() -> Option<&'static Regex> {
     static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(
-        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)("[^"\r\n]*"|'[^'\r\n]*'|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
+        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)("(?:\\[^\r\n]|[^"\\\r\n])*"|'(?:\\[^\r\n]|[^'\\\r\n])*'|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
     ).ok()).as_ref()
+}
+
+/// Match the authority before path/query delimiters. Percent escapes remain
+/// encoded; only the password capture is removed, preserving the username.
+fn url_userinfo_regex() -> Option<&'static Regex> {
+    static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    REGEX
+        .get_or_init(|| {
+            Regex::new(r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s:/?#@"<>]+:([^\s/?#@"<>]*)@"#).ok()
+        })
+        .as_ref()
 }
 
 fn identifier_candidate_regex() -> Option<&'static Regex> {
@@ -475,6 +490,15 @@ fn is_non_secret_carrier(value: &str, policy: RedactionPolicy) -> bool {
 }
 
 fn is_identifier(value: &str) -> bool {
+    if let Some(digest) = value.strip_prefix("HEAD:") {
+        return digest.len() == 40 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    if let Some(uuid) = value
+        .strip_prefix("urn:uuid:")
+        .or_else(|| value.strip_prefix("thread-"))
+    {
+        return is_uuid(uuid);
+    }
     let value = value
         .strip_prefix("sha256:")
         .or_else(|| value.strip_prefix("blake3:"))
@@ -482,15 +506,7 @@ fn is_identifier(value: &str) -> bool {
     if matches!(value.len(), 32 | 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return true;
     }
-    if value.len() == 36
-        && value.bytes().enumerate().all(|(i, byte)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-    {
+    if is_uuid(value) || is_cid_v0(value) {
         return true;
     }
     value.len() == 26
@@ -498,6 +514,53 @@ fn is_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte.to_ascii_uppercase()))
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// CIDv0 is base58btc of a 34-byte SHA-256 multihash (0x12, 0x20, digest).
+/// An arbitrary base58/random token is not an identifier exemption.
+fn is_cid_v0(value: &str) -> bool {
+    if value.len() != 46 || !value.starts_with("Qm") {
+        return false;
+    }
+    let mut decoded = [0u8; 34];
+    for byte in value.bytes() {
+        let Some(digit) = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+            .iter()
+            .position(|candidate| *candidate == byte)
+        else {
+            return false;
+        };
+        let mut carry = digit as u16;
+        for place in decoded.iter_mut().rev() {
+            carry += u16::from(*place) * 58;
+            *place = carry as u8;
+            carry >>= 8;
+        }
+        if carry != 0 {
+            return false;
+        }
+    }
+    decoded[..2] == [0x12, 0x20]
+}
+
+/// The public run_id field supplies context that a bare random value lacks.
+/// Run IDs may use mixed-case alphanumerics, including non-base58 letters.
+fn is_public_run_id(prefix: &str, value: &str) -> bool {
+    prefix.strip_suffix("run_id=").is_some_and(|before| {
+        !before.ends_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    }) && (26..=64).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn is_file_path(value: &str) -> bool {
@@ -519,6 +582,17 @@ fn is_file_path(value: &str) -> bool {
             && value.as_bytes()[1] == b':'
             && value.as_bytes()[2] == b'/');
     if qualified {
+        return true;
+    }
+    // A directory-free UUID filename needs a conventional extension, not just
+    // a dot appended to random bytes. Credential-shaped suffixes still win.
+    if let Some((stem, extensions)) = value.split_once('.')
+        && is_uuid(stem)
+        && extensions.split('.').all(|extension| {
+            (1..=10).contains(&extension.len())
+                && extension.bytes().all(|byte| byte.is_ascii_lowercase())
+        })
+    {
         return true;
     }
     let mut components = value.trim_start_matches('/').split('/');

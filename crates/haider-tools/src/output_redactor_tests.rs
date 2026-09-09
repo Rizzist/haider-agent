@@ -117,3 +117,30 @@ fn hidden_pem_delimiters_still_protect_the_visible_body() {
         );
     }
 }
+
+#[test]
+fn url_passwords_and_escaped_values_are_safe_at_every_stream_boundary() {
+    let input = concat!(
+        "https://owner:fixturepass@example.test/repo\n",
+        "postgres://owner:p%40ssw0rd@db.test/app\n",
+        "password=\"abc\\\"SYNTHETICTAIL987\"\n",
+        "password='abc\\'SYNTHETICTAIL987'\n",
+        "password=\"abc\\\\SYNTHETICTAIL987\"\n",
+        "password='abc\\\\SYNTHETICTAIL987'\n",
+    );
+    let expected = concat!(
+        "https://owner:[REDACTED:secret_value]@example.test/repo\n",
+        "postgres://owner:[REDACTED:secret_value]@db.test/app\n",
+        "password=[REDACTED:secret_value]\n",
+        "password=[REDACTED:secret_value]\n",
+        "password=[REDACTED:secret_value]\n",
+        "password=[REDACTED:secret_value]\n",
+    );
+    for boundary in 0..=input.len() {
+        let mut redactor = OutputRedactor::default();
+        let mut safe = redactor.push_bytes(&input.as_bytes()[..boundary]);
+        safe.extend(redactor.push_bytes(&input.as_bytes()[boundary..]));
+        safe.extend(redactor.finish_bytes());
+        assert_eq!(safe, expected.as_bytes(), "boundary {boundary}");
+    }
+}

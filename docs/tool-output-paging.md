@@ -12,9 +12,17 @@ inventories retain their separate bounds.
 Ordinary previews preserve UUIDs, ULIDs, 32/40/64-digit hexadecimal identifiers
 and digests, paths, and base64 encoding of those validated carriers. An exact,
 call-local path allow-list also preserves conventionally tagged thread, run,
-and session identifiers in explicitly requested files. This grants no file
-access and does not exempt unknown random values. Known credential prefixes,
-secret assignments, bearer credentials and PEM material remain redacted.
+and session identifiers in explicitly requested files. Standard shell output
+also preserves `HEAD:<40-hex>`, `urn:uuid:<UUID>`, `thread-<UUID>`, UUID filenames
+with conventional lowercase extensions, and CIDv0 identifiers whose base58btc
+decoding is a SHA-256 multihash. Mixed-case alphanumeric run IDs (26–64
+characters) require the exact `run_id=` field; their alphabet alone grants no
+exemption. This grants no file access and does not exempt unknown random values.
+Known credential prefixes, secret assignments, bearer credentials and PEM
+material remain redacted. URL userinfo passwords, including percent escapes,
+are removed while the username stays visible. Quoted secret values consume
+escaped quotes and backslashes through the actual closing quote. Secret
+context always takes precedence over these identifier shapes.
 Redaction runs before range selection. Lockdown keeps its historical strict
 classifier and read path.
 

@@ -133,7 +133,8 @@ fn orchestration_identifiers_survive_but_secrets_win_over_shapes() {
 #[test]
 fn explicit_pointer_allow_list_is_exact_and_keeps_secret_checks() {
     let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));
-    let id = "thread-01a0e893-52bc-7def-89ab-0123456789cd";
+    // thread-UUID is now a standard carrier; session-UUID remains call-local.
+    let id = "session-01a0e893-52bc-7def-89ab-0123456789cd";
     assert_eq!(paths.redact(Path::new("handoff.md"), id).text, id);
     assert_ne!(paths.redact(Path::new("other.md"), id).text, id);
     for value in [
@@ -255,4 +256,105 @@ fn slash_bearing_random_tokens_require_more_than_a_path_separator() {
     ] {
         assert_eq!(redact_text(path).text, path);
     }
+}
+
+#[test]
+fn url_userinfo_redacts_only_passwords_before_carrier_exemptions() {
+    let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));
+    for (input, expected) in [
+        (
+            "https://owner:fixturepass@example.test/repo",
+            "https://owner:[REDACTED:secret_value]@example.test/repo",
+        ),
+        (
+            "postgres://owner:p%40ssw0rd@db.test/app",
+            "postgres://owner:[REDACTED:secret_value]@db.test/app",
+        ),
+        (
+            "https://owner:01a0e893-52bc-7def-89ab-0123456789cd@example.test/repo",
+            "https://owner:[REDACTED:secret_value]@example.test/repo",
+        ),
+        (
+            "https://own%65r:p%3Ass%2Fword@example.test/repo",
+            "https://own%65r:[REDACTED:secret_value]@example.test/repo",
+        ),
+        (
+            "https://owner:pa'ss:word@example.test/repo",
+            "https://owner:[REDACTED:secret_value]@example.test/repo",
+        ),
+        (
+            "https://owner:sk-abcdefghijklmnopQRSTUV@example.test/repo",
+            "https://owner:[REDACTED:api_key]@example.test/repo",
+        ),
+        (
+            "https://owner@example.test/repo",
+            "https://owner@example.test/repo",
+        ),
+        ("https://a.test/u:p@repo", "https://a.test/u:p@repo"),
+    ] {
+        assert_eq!(redact_text(input).text, expected, "{input}");
+        assert_eq!(paths.redact(Path::new("handoff.md"), input).text, expected);
+    }
+}
+
+#[test]
+fn escaped_credential_quotes_consume_through_the_real_closing_quote() {
+    let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));
+    for input in [
+        r#"password="abc\"SYNTHETICTAIL987" after"#,
+        r#"password='abc\'SYNTHETICTAIL987' after"#,
+        r#"password="abc\\SYNTHETICTAIL987" after"#,
+        r#"password='abc\\SYNTHETICTAIL987' after"#,
+        r#"password="abc\\\"SYNTHETICTAIL987" after"#,
+        r#"password="abc\\" after"#,
+        r#"password='abc\\' after"#,
+    ] {
+        for output in [
+            redact_text(input),
+            paths.redact(Path::new("handoff.md"), input),
+        ] {
+            assert_eq!(
+                output.text, "password=[REDACTED:secret_value] after",
+                "{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn named_public_carriers_survive_standard_output_but_secret_context_wins() {
+    for value in [
+        "HEAD:752dfaa79475887978ffeb8eaa73134d7a933c7d",
+        "urn:uuid:01a0e893-52bc-7def-89ab-0123456789cd",
+        "thread-01a0e893-52bc-7def-89ab-0123456789cd",
+        "01a0e893-52bc-7def-89ab-0123456789cd.result.md",
+        "QmYwAPJzv5CZsnAzt8auVZRnGi2CQCqK4HCb2jdPrFAgDq",
+        "run_id=aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+    ] {
+        assert_eq!(super::redact_output_text(value), value);
+        for label in ["password=", "Bearer ", "secret="] {
+            assert_eq!(
+                redact_text(&format!("{label}{value}")).text,
+                format!("{label}[REDACTED:secret_value]")
+            );
+        }
+    }
+    for value in [
+        "HEAD:aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+        "urn:uuid:aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+        "thread-aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+        "aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY.result.md",
+        "QmYwAPJzv5CZsnAzt8auVZRnGi2CQCqK4HCb2jdPrFAgD0",
+        "QmYwAPJzv5CZsnAzt8auVZRnGi2CQCqK4HCb2jdPrFAgDqx",
+        "aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+        "other_run_id=aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
+        "run_id=sk-abcdefghijklmnopQRSTUV",
+    ] {
+        assert!(!super::is_cid_v0(value), "{value}");
+        assert_ne!(redact_text(value).text, value, "{value}");
+    }
+    // A base58 value with the wrong multihash header is not a public CID.
+    assert!(!super::is_cid_v0(
+        "Qm11111111111111111111111111111111111111111111"
+    ));
 }

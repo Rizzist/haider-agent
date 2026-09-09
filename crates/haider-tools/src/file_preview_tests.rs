@@ -162,3 +162,49 @@ async fn redaction_outside_the_requested_range_does_not_mark_it_incomplete() {
     assert!(result.truncation.is_none());
     assert!(result.artifact.is_none());
 }
+
+#[tokio::test]
+async fn password_redaction_precedes_file_line_and_column_paging() {
+    let mut cas = Capture::default();
+    let text = concat!(
+        "https://owner:fixturepass@example.test/repo\n",
+        "postgres://owner:p%40ssw0rd@db.test/app\n",
+        "password=\"abc\\\"SYNTHETICTAIL987\"\n",
+        "password='abc\\'SYNTHETICTAIL987'\n",
+        "password=\"abc\\\\SYNTHETICTAIL987\"\n",
+        "password='abc\\\\SYNTHETICTAIL987'\n",
+        "thread-01a0e893-52bc-7def-89ab-0123456789cd\n",
+    );
+    let expected = concat!(
+        "https://owner:[REDACTED:secret_value]@example.test/repo\n",
+        "postgres://owner:[REDACTED:secret_value]@db.test/app\n",
+        "password=[REDACTED:secret_value]\n",
+        "password=[REDACTED:secret_value]\n",
+        "password=[REDACTED:secret_value]\n",
+        "password=[REDACTED:secret_value]\n",
+        "thread-01a0e893-52bc-7def-89ab-0123456789cd\n",
+    );
+    for (line, expected_line) in expected.split_inclusive('\n').enumerate() {
+        for column in [1, 14, 20] {
+            let page = bounded_file_read(
+                text.into(),
+                &FsRead::new("mixed.txt")
+                    .with_line_range(Some(line + 1), Some(1))
+                    .with_column(Some(column)),
+                ResultBounds::file_read(),
+                &mut cas,
+            )
+            .await
+            .expect("page");
+            let expected_content = format!("{}: {}", line + 1, &expected_line[column - 1..]);
+            assert!(
+                page.preview.starts_with(&expected_content),
+                "{}",
+                page.preview
+            );
+            for secret in ["fixturepass", "p%40ssw0rd", "SYNTHETICTAIL987"] {
+                assert!(!page.preview.contains(secret));
+            }
+        }
+    }
+}
