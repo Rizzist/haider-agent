@@ -1420,5 +1420,123 @@
       "r5prefixtail"
     ],
     "expected": "Request can't parse; [REDACTED] [REDACTED] field didn't match; retained detail"
+  },
+  {
+    "name": "v5-label-newline-quote",
+    "detail": "Invalid request; api_key\n\t\"n5linehead, n5linetail\"; retained detail",
+    "secrets": [
+      "n5linehead",
+      "n5linetail"
+    ]
+  },
+  {
+    "name": "v5-scheme-quote-header",
+    "detail": "Invalid request; Bearer \"n5schemehead, X-Api-Key:n5inner n5schemetail\"; api_key=\"n5afterhead n5aftertail\"; retained detail",
+    "secrets": [
+      "n5schemehead",
+      "n5inner",
+      "n5schemetail",
+      "n5afterhead",
+      "n5aftertail"
+    ]
+  },
+  {
+    "name": "v5-nested-bound",
+    "detail": "Invalid request; Authorization:Bearer \"n5boundhead 界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀 n5boundtail\"; retained detail",
+    "secrets": [
+      "n5boundhead",
+      "n5nested",
+      "n5boundtail"
+    ]
+  },
+  {
+    "name": "v5-odd-backslash-storm",
+    "detail": "Invalid request; apikey \"n5stormhead\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\" api_key:n5storminner, n5stormtail\"; retained detail",
+    "secrets": [
+      "n5stormhead",
+      "n5storminner",
+      "n5stormtail"
+    ]
+  },
+  {
+    "name": "v5-even-backslash-storm",
+    "detail": "Invalid request; Bearer 'n5evenhead\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\'; Authorization:'n5evennext, n5eventail'; retained detail",
+    "secrets": [
+      "n5evenhead",
+      "n5evennext",
+      "n5eventail"
+    ]
+  },
+  {
+    "name": "v5-mixed-single-double",
+    "detail": "Invalid request; refresh-token\n'n5mixhead \"Bearer n5mixinner\" n5mixtail'; retained detail",
+    "secrets": [
+      "n5mixhead",
+      "n5mixinner",
+      "n5mixtail"
+    ]
+  },
+  {
+    "name": "v5-separately-quoted-schemes",
+    "detail": "Invalid request; Authorization:\"Bearer\" 'Basic' \"Token\" 'n5stackhead, n5stacktail'; retained detail",
+    "secrets": [
+      "n5stackhead",
+      "n5stacktail"
+    ]
+  },
+  {
+    "name": "v5-prefix-newline",
+    "detail": "Invalid request; echoed=\"n5prehead\n sk-fixture-n5prefix n5pretail\"; retained detail",
+    "secrets": [
+      "n5prehead",
+      "sk-fixture-n5prefix",
+      "n5pretail"
+    ]
+  },
+  {
+    "name": "v5-bearer-colon-newline",
+    "detail": "Invalid request; Bearer:\n\"n5colonhead, n5colontail\"; retained detail",
+    "secrets": [
+      "n5colonhead",
+      "n5colontail"
+    ]
+  },
+  {
+    "name": "v5-bearer-separated-equal",
+    "detail": "Invalid request; Bearer = 'n5eqhead, n5eqtail'; retained detail",
+    "secrets": [
+      "n5eqhead",
+      "n5eqtail"
+    ]
+  },
+  {
+    "name": "v5-unclosed-label",
+    "detail": "Invalid request; apikey \"n5openhead, n5opentail",
+    "secrets": [
+      "n5openhead",
+      "n5opentail"
+    ]
+  },
+  {
+    "name": "v5-unclosed-assignment",
+    "detail": "Invalid request; api_key=\"n5assignhead, n5assigntail",
+    "secrets": [
+      "n5assignhead",
+      "n5assigntail"
+    ]
+  },
+  {
+    "name": "v5-unclosed-scheme",
+    "detail": "Invalid request; Bearer \"n5bearopenhead, n5bearopentail",
+    "secrets": [
+      "n5bearopenhead",
+      "n5bearopentail"
+    ]
+  },
+  {
+    "name": "r6-short-prefix-punctuation-is-public",
+    "detail": "Invalid request; sk-short!!!!!!!! sess-short!!!!!!!! retained detail",
+    "secrets": [],
+    "expected": "Invalid request; sk-short!!!!!!!! sess-short!!!!!!!! retained detail"
   }
 ]

@@ -117,10 +117,21 @@ fn inline_authorization_schemes_redact_the_following_credential() {
                         .to_string();
                         let detail = classify(400, None, body.as_bytes()).presentation.detail;
                         let public_whitespace = whitespace.replace('\t', " ");
+                        // A malformed quoted scheme with no matching close
+                        // owns the remaining diagnostic, including this prose.
+                        let unterminated = ['"', '\''].into_iter().any(|quote| {
+                            header.ends_with(&format!("{quote}{scheme}"))
+                                && !credential.contains(quote)
+                        });
+                        let suffix = if unterminated {
+                            "[REDACTED] [REDACTED]"
+                        } else {
+                            "retained detail"
+                        };
                         assert_eq!(
                             detail,
                             format!(
-                                "Invalid request; [REDACTED]{public_whitespace}[REDACTED] retained detail"
+                                "Invalid request; [REDACTED]{public_whitespace}[REDACTED] {suffix}"
                             ),
                             "input: {message}"
                         );
@@ -201,6 +212,108 @@ fn quoted_value_paths_preserve_the_exact_utf8_bound() {
                 assert_eq!(detail, expected[..end], "input: {message}");
                 assert!(!detail.contains(head));
                 assert!(!detail.contains("boundtail"));
+            }
+        }
+    }
+}
+
+#[test]
+fn credential_introductions_keep_unterminated_quote_ownership() {
+    for classify in [
+        replay_anthropic_http_error,
+        replay_gemini_http_error,
+        replay_openai_http_error,
+    ] {
+        for introducer in [
+            "proxy-authorization",
+            "authorization",
+            "x-api-key",
+            "x_api_key",
+            "api-key",
+            "api_key",
+            "apikey",
+            "access_token",
+            "access-token",
+            "refresh_token",
+            "refresh-token",
+            "Bearer",
+            "Authorization:Bearer",
+            "Authorization:\"Bearer\" 'Basic'",
+            "echoed=",
+        ] {
+            for separator in [" ", "\n\t", ":", ":\n", "=", " = ", " : = \n"] {
+                for quote in ['"', '\''] {
+                    let head = if introducer == "echoed=" {
+                        "sk-fixture-openhead"
+                    } else {
+                        "opaque-openhead"
+                    };
+                    // A mismatched quote, escaped matching quote, apparent
+                    // header and delimiters must all stay inside the value.
+                    let other_quote = if quote == '"' { '\'' } else { '"' };
+                    let message = format!(
+                        "Invalid request; {introducer}{separator}{quote}{head}, {other_quote}opposite; \\{quote}escaped\n api_key=inner, opentail"
+                    );
+                    let structured = serde_json::json!({"error": {"message": message}}).to_string();
+                    for body in [structured.as_bytes(), message.as_bytes()] {
+                        let detail = classify(400, None, body).presentation.detail;
+                        for secret in [head, "opposite", "escaped", "inner", "opentail"] {
+                            assert!(
+                                !detail.contains(secret),
+                                "input: {message:?}; output: {detail:?}"
+                            );
+                        }
+                        assert!(detail.starts_with("Invalid request;"));
+                        assert!(detail.ends_with("[REDACTED]"));
+                        assert!(detail.len() <= 512);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bearer_separators_share_closed_and_unquoted_value_boundaries() {
+    for classify in [
+        replay_anthropic_http_error,
+        replay_gemini_http_error,
+        replay_openai_http_error,
+    ] {
+        for introducer in [
+            "Bearer",
+            "bEaReR",
+            "Authorization:Bearer",
+            "Authorization:'Bearer'",
+        ] {
+            for separator in [" ", "\n\t", ":", ":\n", "=", " = ", " : = \n"] {
+                for value in [
+                    "\"separatorhead, separatortail\";",
+                    "'separatorhead, separatortail';",
+                    "\"Token\":\n'separatorhead, separatortail';",
+                    "Basic = \"separatorhead, separatortail\";",
+                    "separatorhead;",
+                ] {
+                    let message =
+                        format!("Invalid request; {introducer}{separator}{value} retained detail");
+                    let structured = serde_json::json!({"error": {"message": message}}).to_string();
+                    for body in [structured.as_bytes(), message.as_bytes()] {
+                        let detail = classify(400, None, body).presentation.detail;
+                        assert!(
+                            !detail.contains("separatorhead"),
+                            "input: {message:?}; output: {detail:?}"
+                        );
+                        assert!(
+                            !detail.contains("separatortail"),
+                            "input: {message:?}; output: {detail:?}"
+                        );
+                        assert!(detail.starts_with("Invalid request;"));
+                        assert!(
+                            detail.ends_with("retained detail"),
+                            "input: {message:?}; output: {detail:?}"
+                        );
+                    }
+                }
             }
         }
     }
