@@ -10,6 +10,7 @@ pub(crate) mod hooks;
 pub(crate) mod lockdown;
 pub(crate) mod models;
 pub(crate) mod observe;
+pub(crate) mod peer;
 pub(crate) mod provider;
 pub(crate) mod run;
 pub(crate) mod session_config;
@@ -160,6 +161,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
         Command::Models(rest) => models::models_command(rest).await,
         Command::Fleet(rest) => observe::fleet_command(rest).await,
         Command::Events(rest) => observe::events_command(rest).await,
+        Command::Peer(rest) => peer::peer_command(rest).await,
         Command::Graph(rest) => graph::graph_command(rest).await,
         Command::Export(rest) => export::export_command(rest).await,
         Command::Hooks(rest) => hooks::hooks_command(rest).await,
@@ -198,6 +200,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--read-only] [--allow-writes] [--allow-exec] [--auto-allow] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], daemon stop [--json] [--timeout <duration>], \
+                 peer list|send|status|watch|name|wait-idle ..., \
                  sessions [--recovery] [--json] [--no-spawn], \
                  sessions wait-ready --count <n> [--session <id>]... [--timeout <dur>] --json [--no-spawn], \
                  resume [<session-id>], resume <session-id> --json [--timeout <dur>] [--no-spawn], \

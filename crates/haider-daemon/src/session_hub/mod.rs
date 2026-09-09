@@ -3673,6 +3673,28 @@ impl SessionHub {
             ))
         })?;
         let manager = self.worker_manager()?;
+        // Honor an admission committed by the legacy global-msg-id scheme.
+        // A conflicting legacy receipt must refuse, never become a second
+        // admission under the new sender-scoped coordinates after upgrade.
+        let legacy_json = serde_json::to_string(message)
+            .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        if let Some(accepted) = self
+            .inner
+            .store
+            .turn_accept_receipt(
+                format!("peer:{}", message.msg_id),
+                blake3::hash(legacy_json.as_bytes()).to_hex().to_string(),
+                legacy_json,
+            )
+            .await?
+        {
+            drop(_selection);
+            manager
+                .submit(accepted.clone())
+                .await
+                .map_err(SessionHubError::from)?;
+            return Ok(accepted);
+        }
         let (command_id, request_digest, request_json) = peer_turn_coordinates(message)?;
         let command = TurnAcceptCommand {
             command_id,
@@ -4214,6 +4236,15 @@ impl SessionHub {
 
     pub(crate) fn device_id(&self) -> DeviceId {
         self.inner.device_id.clone()
+    }
+
+    /// Peer addresses use the existing durable profile installation identity,
+    /// independently of journal worker/device generation fencing.
+    pub(crate) fn peer_device_id(&self) -> String {
+        format!(
+            "profile-{}",
+            self.inner.store.cached_profile_installation_id()
+        )
     }
 
     pub(crate) fn cache_diagnostic_key(&self) -> CacheDiagnosticKey {
@@ -8088,12 +8119,21 @@ fn random_id(prefix: &str) -> Result<String, SessionHubError> {
 fn peer_turn_coordinates(
     message: &haider_protocol::peer::PeerMessage,
 ) -> Result<(String, String, String), SessionHubError> {
-    let request_json = serde_json::to_string(message).map_err(|error| {
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "msg_id": message.msg_id, "from": message.from.address(), "to": message.to,
+        "message": message.message, "summary": message.summary,
+        "queued_at": message.queued_at, "expires_at": message.expires_at,
+    }))
+    .map_err(|error| {
         SessionHubError::Task(format!("cannot encode peer delivery coordinates: {error}"))
     })?;
     let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
     Ok((
-        format!("peer:{}", message.msg_id),
+        format!(
+            "peer:{}:{}",
+            blake3::hash(message.from.address().as_bytes()).to_hex(),
+            message.msg_id
+        ),
         request_digest,
         request_json,
     ))

@@ -12701,7 +12701,8 @@ fn peer_error(error: crate::peer::PeerError) -> HaiderError {
             ),
             false,
         ),
-        crate::peer::PeerError::Invalid { message } => {
+        crate::peer::PeerError::Invalid { message }
+        | crate::peer::PeerError::Refused { message } => {
             HaiderError::new(ErrorCode::InvalidArgument, message, false)
         }
         crate::peer::PeerError::Unavailable { message } => {

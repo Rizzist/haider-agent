@@ -125,7 +125,11 @@ impl PeerMessaging<'_> {
     }
 
     pub async fn list(&self) -> Result<Vec<PeerDescriptor>, PeerClientError> {
-        peer_list_response(self.client.request(RequestBody::PeerList {}).await?)
+        peer_list_response(
+            self.client
+                .request(RequestBody::PeerList { status: None })
+                .await?,
+        )
     }
 
     pub async fn send(
@@ -137,9 +141,65 @@ impl PeerMessaging<'_> {
         peer_send_response(
             self.client
                 .request(RequestBody::PeerSend {
+                    options: None,
                     to: to.into(),
                     message: message.into(),
                     summary,
+                })
+                .await?,
+        )
+    }
+
+    /// Replay durable sender receipts through the additive peer.list surface.
+    pub async fn status(
+        &self,
+        query: haider_rpc::haider_protocol::peer::PeerStatusQuery,
+    ) -> Result<haider_rpc::haider_protocol::peer::PeerStatusPage, PeerClientError> {
+        match self
+            .client
+            .request(RequestBody::PeerList {
+                status: Some(query),
+            })
+            .await?
+        {
+            ResponseBody::PeerList {
+                status: Some(status),
+                ..
+            } => Ok(status),
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                data,
+            } => Err(PeerClientError::Refused {
+                code,
+                message,
+                retryable,
+                data,
+            }),
+            _ => Err(PeerClientError::UnexpectedBody),
+        }
+    }
+
+    pub async fn send_with_options(
+        &self,
+        to: String,
+        message: String,
+        summary: Option<String>,
+        options: haider_rpc::haider_protocol::peer::PeerSendOptions,
+    ) -> Result<PeerReceipt, PeerClientError> {
+        require_delivery_support(
+            self.client
+                .request(RequestBody::PeerList { status: None })
+                .await?,
+        )?;
+        peer_send_response(
+            self.client
+                .request(RequestBody::PeerSend {
+                    to,
+                    message,
+                    summary,
+                    options: Some(options),
                 })
                 .await?,
         )
@@ -168,9 +228,22 @@ impl PeerMessaging<'_> {
     }
 }
 
+pub(super) fn require_delivery_support(body: ResponseBody) -> Result<(), PeerClientError> {
+    match body {
+        ResponseBody::PeerList { delivery_status_supported: true, .. } => Ok(()),
+        ResponseBody::PeerList { .. } => Err(PeerClientError::Refused {
+            code: "peer_delivery_unsupported".into(),
+            message: "daemon does not support durable peer delivery; upgrade it before sending with delivery options".into(),
+            retryable: false,
+            data: None,
+        }),
+        other => peer_list_response(other).map(|_| ()),
+    }
+}
+
 pub fn peer_list_response(body: ResponseBody) -> Result<Vec<PeerDescriptor>, PeerClientError> {
     match body {
-        ResponseBody::PeerList { agents } => Ok(agents),
+        ResponseBody::PeerList { agents, .. } => Ok(agents),
         ResponseBody::Error {
             code,
             message,

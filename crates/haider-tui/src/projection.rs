@@ -1072,6 +1072,9 @@ impl SessionProjection {
             // Checkpoint facts power the explicit /checkpoints surface; raw
             // replay must not fabricate an extra transcript row for them.
             EventPayload::CheckpointRecorded(_) => {}
+            // Sender delivery bookkeeping is exposed by peer status; replay
+            // must not turn it into another transcript message.
+            EventPayload::PeerOutbox(_) | EventPayload::PeerDelivery(_) => {}
         }
     }
 

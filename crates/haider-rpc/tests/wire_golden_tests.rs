@@ -1501,13 +1501,13 @@ fn peer_messaging_methods_and_events_are_tail_appended() {
     assert!(matches!(
         &frames[133],
         WireFrame::Request {
-            body: RequestBody::PeerList {},
+            body: RequestBody::PeerList { status: None },
             ..
         }
     ));
     assert!(matches!(
         &frames[134],
-        WireFrame::Response { body: ResponseBody::PeerList { agents }, .. }
+        WireFrame::Response { body: ResponseBody::PeerList { agents, .. }, .. }
             if agents.len() == 1 && agents[0].kind == haider_protocol::peer::PeerKind::HaiderSession
     ));
     assert!(matches!(
@@ -6167,4 +6167,29 @@ fn turn_retract_request_receipt_and_too_late_are_golden() {
         body.additive_shape_feature(),
         Some(haider_rpc::FEATURE_TURN_RETRACT_V1)
     );
+}
+
+#[test]
+fn peer_delivery_extensions_roundtrip_without_new_methods() {
+    let send = serde_json::json!({"method":"peer.send","to":"session:receiver@device","message":"hello","options":{"msg_id":"m-1","ttl_ms":1000}});
+    let decoded: RequestBody = serde_json::from_value(send.clone()).expect("additive send");
+    assert_eq!(serde_json::to_value(decoded).expect("encode send"), send);
+    let status = serde_json::json!({"method":"peer.list","status":{"session_id":"sender","msg_id":"m-1","after_seq":7}});
+    let decoded: RequestBody = serde_json::from_value(status.clone()).expect("status query");
+    assert_eq!(serde_json::to_value(decoded).expect("encode query"), status);
+    for state in [
+        "accepted",
+        "held",
+        "held_for_approval",
+        "delivered",
+        "failed",
+    ] {
+        let receipt = serde_json::json!({"msg_id":"m-1","delivery":"queued","status":{"state":state,"reason":"synthetic diagnostic","to":"session:receiver@device","accepted_at_ms":100,"updated_at_ms":200}});
+        let decoded: haider_protocol::peer::PeerReceipt =
+            serde_json::from_value(receipt.clone()).expect("receipt");
+        assert_eq!(
+            serde_json::to_value(decoded).expect("encode receipt"),
+            receipt
+        );
+    }
 }

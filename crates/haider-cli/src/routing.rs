@@ -35,6 +35,7 @@ pub enum Command<'a> {
     Models(&'a [String]),
     Fleet(&'a [String]),
     Events(&'a [String]),
+    Peer(&'a [String]),
     Graph(&'a [String]),
     Export(&'a [String]),
     Hooks(&'a [String]),
@@ -86,6 +87,7 @@ pub fn parse_command(args: &[String]) -> Result<Command<'_>, String> {
         [c, r @ ..] if c == "models" => Command::Models(r),
         [c, r @ ..] if c == "fleet" => Command::Fleet(r),
         [c, r @ ..] if c == "events" => Command::Events(r),
+        [c, r @ ..] if c == "peer" => Command::Peer(r),
         [c, r @ ..] if c == "graph" => Command::Graph(r),
         [c, r @ ..] if c == "export" => Command::Export(r),
         [c, r @ ..] if c == "hooks" => Command::Hooks(r),
@@ -155,6 +157,7 @@ mod tests {
             | Command::Models(_)
             | Command::Fleet(_)
             | Command::Events(_)
+            | Command::Peer(_)
             | Command::Graph(_)
             | Command::Export(_)
             | Command::Hooks(_)
@@ -218,6 +221,7 @@ mod tests {
             vec!["models"],
             vec!["fleet"],
             vec!["events"],
+            vec!["peer", "status"],
             vec!["graph"],
             vec!["export"],
             vec!["hooks"],
@@ -236,10 +240,10 @@ mod tests {
         }
     }
     #[test]
-    fn removed_peer_verbs_are_unknown() {
-        for verb in ["list", "send", "name", "watch", "wait-idle"] {
+    fn peer_verbs_reach_the_control_dispatcher() {
+        for verb in ["list", "send", "status", "name", "watch", "wait-idle"] {
             let argv = args(&["peer", verb]);
-            assert!(matches!(parse_command(&argv), Ok(Command::Unknown("peer"))));
+            assert!(matches!(parse_command(&argv), Ok(Command::Peer(rest)) if rest == &argv[1..]));
         }
     }
     #[test]

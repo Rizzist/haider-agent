@@ -72,6 +72,7 @@ fn delivered_peer_message_is_its_own_untrusted_transcript_block() {
 
     let mut receipt_replies = map_frame(haider_rpc::WireFrame::PeerDeliveryChanged {
         receipt: PeerReceipt {
+            status: None,
             msg_id: "msg-1".into(),
             delivery: PeerDelivery::Delivered,
             reason: None,

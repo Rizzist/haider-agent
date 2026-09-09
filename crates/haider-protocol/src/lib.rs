@@ -106,6 +106,10 @@ pub enum EventPayload {
     /// input even though the prompt compiler transports it with a user role.
     #[serde(rename = "peer.message")]
     PeerMessage(peer::PeerMessage),
+    #[serde(rename = "peer.outbox")]
+    PeerOutbox(peer::PeerOutboxEntry),
+    #[serde(rename = "peer.delivery")]
+    PeerDelivery(peer::PeerReceipt),
     /// Volatile-looking queue control is journaled because its revision fence
     /// and watch delta must share the same serialized session truth.
     QueueChanged(queue::QueueDelta),

@@ -1267,12 +1267,13 @@ pub fn request_body_for_features(
         LiveCommand::ToolsInventory { session } => RequestBody::ToolsInventory {
             session_id: session,
         },
-        LiveCommand::PeerList => RequestBody::PeerList {},
+        LiveCommand::PeerList => RequestBody::PeerList { status: None },
         LiveCommand::PeerSend {
             to,
             message,
             summary,
         } => RequestBody::PeerSend {
+            options: None,
             to,
             message,
             summary,
@@ -2035,7 +2036,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             session: session_id,
             snapshot: Box::new(inventory),
         }],
-        ResponseBody::PeerList { agents } => vec![LiveReply::PeerListed { agents }],
+        ResponseBody::PeerList { agents, .. } => vec![LiveReply::PeerListed { agents }],
         ResponseBody::PeerSend { receipt } => vec![LiveReply::PeerSent { receipt }],
         ResponseBody::SshList { profiles } => vec![LiveReply::SshListed { profiles }],
         ResponseBody::SessionSetSshScope { scope, .. } => {

@@ -21,6 +21,21 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.971 — sender delivery receipts and offline outbox
+
+New journal kinds `payload:peer.outbox` and `payload:peer.delivery` record the
+sender's bounded outbox entry and receipt transitions. Both omit prompt and
+transcript rendering. Receipts add optional `status` with state, reason,
+recipient address, and acceptance/update timestamps. `delivered` records
+durable receiver admission, including its busy queue, not completed effects.
+
+Existing `peer.send` adds optional idempotency/expiry/cancellation options;
+`peer.list` adds an optional status query/page and an additive
+`delivery_status_supported` response marker. The 136 wire methods and feature
+bits remain unchanged. No retired `.q` mailbox is read or written. Known peer
+manifests survive socket downtime; stable peer device identity uses the
+existing durable profile installation ID. See [the peer contract](peer-messaging-v1.md).
+
 ### v0.0.970 — peer input is a transcript agent speaker
 
 `NodeKind` adds `kind: "agent"` carrying `message`. New peer admissions commit
