@@ -4,6 +4,8 @@
 
 #![allow(clippy::expect_used)]
 
+#[path = "support/process_fixture.rs"]
+mod process_fixture;
 mod support;
 
 #[path = "support/tool_grants.rs"]
@@ -21,7 +23,7 @@ use haider_daemon::{
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::cache::CacheRequestAttemptV1;
-use haider_protocol::effect::{EffectClass, FileFreshness};
+use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase, FileFreshness};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::headless::{
@@ -48,6 +50,8 @@ use haider_rpc::{
     SshScopeWire, WireFrame,
 };
 use haider_tools::SessionGrant;
+#[cfg(windows)]
+use process_fixture::windows_real_process_test_guard;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
@@ -55,27 +59,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use support::{UdsClient, ready_with_dependencies, test_root};
 use tokio::sync::Semaphore;
-
-// This binary has five tests that launch the production Windows PowerShell,
-// and two also launch real descendants. Running them concurrently on the
-// hosted Windows runner starves process creation and pushes the whole binary
-// against its 900-second crate cap. Keep protocol-only tests parallel and
-// serialize only these real-process tests, matching live_turn_rpc_tests.
-#[cfg(windows)]
-static WINDOWS_REAL_PROCESS_TEST_GATE: Semaphore = Semaphore::const_new(1);
-
-#[cfg(windows)]
-async fn windows_real_process_test_guard(
-    test_name: &'static str,
-) -> tokio::sync::SemaphorePermit<'static> {
-    eprintln!("haider-daemond windows-process test={test_name} phase=waiting-for-gate");
-    let permit = WINDOWS_REAL_PROCESS_TEST_GATE
-        .acquire()
-        .await
-        .expect("Windows real-process test gate remains open");
-    eprintln!("haider-daemond windows-process test={test_name} phase=running");
-    permit
-}
 
 #[derive(Clone)]
 struct RoutingFactory {
@@ -594,36 +577,156 @@ async fn submit_turn(
     generation: u64,
     text: &str,
 ) -> RunId {
-    send_request(
-        client,
-        config,
-        command_id,
-        RequestBody::TurnSubmit {
-            command_id: CommandId::new(command_id),
-            session_id,
-            worker_generation: generation,
-            text: text.into(),
-            attachments: Vec::new(),
-            mode: DeliveryMode::Queue,
-        },
-    )
-    .await;
-    loop {
-        match client.next().await {
-            WireFrame::Response {
-                body: ResponseBody::TurnSubmit { run_id, .. },
-                ..
-            } => return run_id,
-            WireFrame::Response {
-                body: ResponseBody::Error { code, message, .. },
-                ..
-            } => panic!("turn.submit `{command_id}` failed ({code}): {message}"),
-            WireFrame::ProtocolError(error) => {
-                panic!("turn.submit `{command_id}` failed: {error}")
+    submit_turn_observing(client, config, command_id, session_id, generation, text)
+        .await
+        .0
+}
+
+async fn submit_turn_observing(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    command_id: &str,
+    session_id: SessionId,
+    generation: u64,
+    text: &str,
+) -> (RunId, Vec<EventPayload>) {
+    // Registry #94: reuse the complete-operation budget (Windows cold spawn +
+    // foreground wall limit + kill grace), including the request write. Frames
+    // and keepalive replies must never restart this deadline.
+    let started = tokio::time::Instant::now();
+    let mut frames = 0usize;
+    let result = tokio::time::timeout_at(started + support::DEADLINE, async {
+        send_request(
+            client,
+            config,
+            command_id,
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new(command_id),
+                session_id,
+                worker_generation: generation,
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await;
+        let mut events: Vec<(Option<RunId>, EventPayload)> = Vec::new();
+        loop {
+            let frame = client
+                .try_next()
+                .await
+                .expect("connection closed before turn.submit reply");
+            frames += 1;
+            match frame {
+                WireFrame::Response {
+                    body: ResponseBody::TurnSubmit { run_id, .. },
+                    ..
+                } => {
+                    let events = events
+                        .into_iter()
+                        .filter(|(seen, _)| seen.as_ref() == Some(&run_id))
+                        .map(|(_, payload)| payload)
+                        .collect();
+                    return (run_id, events);
+                }
+                WireFrame::Event { envelope, .. } => {
+                    if let Ok(payload) = serde_json::from_value(envelope.payload.into()) {
+                        events.push((envelope.run_id, payload));
+                    }
+                }
+                WireFrame::Response {
+                    body: ResponseBody::Error { code, message, .. },
+                    ..
+                } => panic!("turn.submit `{command_id}` failed ({code}): {message}"),
+                WireFrame::ProtocolError(error) => {
+                    panic!("turn.submit `{command_id}` failed: {error}")
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        let reason = format!(
+            "turn.submit `{command_id}` operation deadline elapsed; elapsed={:?}; budget={:?}; frames={frames}",
+            started.elapsed(), support::DEADLINE,
+        );
+        client.report_connection_failure(&reason);
+        panic!("{reason}")
+    })
+}
+
+/// Real socket traffic must not extend the reply deadline. A non-reserved
+/// Pong is exposed on Unix too, reproducing Windows' keepalive-frame path.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn turn_submit_deadline_survives_continuous_control_frames() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let root = test_root("submit-deadline-");
+    let endpoint = root.path().join("peer.sock");
+    let listener = tokio::net::UnixListener::bind(&endpoint).expect("bind peer");
+    let config = DaemonConfig::new(
+        "submit-deadline",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let limit = config.frame_limit;
+    let mut client = UdsClient::connect(&endpoint, limit)
+        .await
+        .expect("connect peer");
+    let (mut peer, _) = listener.accept().await.expect("accept peer");
+    let control = haider_rpc::uds_codec::encode(&WireFrame::Pong { nonce: 77 }, limit)
+        .expect("encode control frame");
+    let sent = Arc::new(AtomicUsize::new(0));
+    let peer_sent = sent.clone();
+    let sender = tokio::spawn(async move {
+        loop {
+            if peer.write_all(&control).await.is_err() {
+                break;
+            }
+            peer_sent.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(support::KEEPALIVE_INTERVAL / 10).await;
+        }
+    });
+    let mut request = tokio::spawn(async move {
+        submit_turn_observing(
+            &mut client,
+            &config,
+            "withheld-submit",
+            SessionId::new("deadline-session"),
+            1,
+            "withheld reply",
+        )
+        .await
+    });
+    let started = tokio::time::Instant::now();
+    let observed = tokio::time::timeout(support::DEADLINE * 2, &mut request).await;
+    let elapsed = started.elapsed();
+    let frames_sent = sent.load(Ordering::Relaxed);
+    request.abort();
+    sender.abort();
+    let _ = sender.await;
+    eprintln!("submit deadline: elapsed={elapsed:?}; control_frames_sent={frames_sent}");
+    let failure = observed
+        .expect("TurnSubmit outlived two operation budgets despite continuous control frames")
+        .expect_err("a withheld reply must fail")
+        .into_panic();
+    let reason = failure
+        .downcast_ref::<String>()
+        .expect("submit timeout diagnostic");
+    assert!(reason.contains("turn.submit `withheld-submit` operation deadline elapsed"));
+    let frames: usize = reason
+        .rsplit_once("frames=")
+        .expect("deadline diagnostic includes frame count")
+        .1
+        .parse()
+        .expect("numeric frame count");
+    assert!(
+        frames > 1 && frames <= frames_sent,
+        "received frames={frames}"
+    );
+    assert!(elapsed >= support::DEADLINE && elapsed < support::DEADLINE * 2);
 }
 
 async fn register_workflow_chain(
@@ -1440,8 +1543,20 @@ fn background_child_command() -> String {
 #[cfg(windows)]
 fn background_child_command() -> String {
     concat!(
-        "$job=Start-Job { Start-Sleep -Milliseconds 50; [Console]::Out.Write('child') };",
-        "[Console]::Out.Write('leader');Wait-Job $job|Out-Null;Receive-Job $job"
+        // Start-Job imports job infrastructure and starts another PowerShell
+        // before the leader can print anything. A real cmd.exe descendant
+        // suffices for inherited-pipe capture, without that cold-start work.
+        "$PSModuleAutoLoadingPreference='None';",
+        "$start=[Diagnostics.ProcessStartInfo]::new();",
+        "$start.FileName=[IO.Path]::Combine([Environment]::SystemDirectory,'cmd.exe');",
+        "$start.Arguments='/D /S /C \"<nul set /p =child&exit /b 0\"';",
+        "$start.WorkingDirectory=[Environment]::SystemDirectory;",
+        "$start.UseShellExecute=$false;",
+        "[Console]::Out.Write('leader');[Console]::Out.Flush();",
+        "$child=[Diagnostics.Process]::Start($start);",
+        "if($null -eq $child){throw 'descendant did not start'};",
+        "$child.WaitForExit();$code=$child.ExitCode;$child.Dispose();",
+        "if($code -ne 0){throw 'descendant failed'}"
     )
     .into()
 }
@@ -1526,36 +1641,105 @@ fn shell_round_trip_command() -> String {
 
 #[cfg(unix)]
 fn cancellable_process_command() -> String {
-    concat!(
-        "(printf started > descendant-started.log; sleep 0.5; ",
-        "printf survived > descendant-survived.log) & ",
-        "while :; do printf x >> heartbeat.log; sleep 0.01; done"
+    format!(
+        "({}) & while :; do printf x >> heartbeat.log; sleep {}; done",
+        cancellable_descendant_command(),
+        process_fixture::HEARTBEAT_PERIOD.as_secs_f64(),
     )
-    .into()
+}
+
+#[cfg(unix)]
+fn cancellable_descendant_command() -> String {
+    format!(
+        "printf started > descendant-started.log; \
+         while [ ! -f descendant-probe ] && [ -f descendant-started.log ]; do sleep {period}; done; \
+         printf survived > descendant-survived.log",
+        period = process_fixture::HEARTBEAT_PERIOD.as_secs_f64(),
+    )
+}
+
+/// Positive control for the cancellation test's absent-survivor assertion:
+/// this exact Unix descendant stays alive until release, then writes a marker.
+#[cfg(unix)]
+#[tokio::test]
+async fn live_descendant_observes_released_probe() {
+    let root = test_root("live-descendant-probe-");
+    let probe = process_fixture::DescendantProbe::new(root.path());
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cancellable_descendant_command())
+        .current_dir(root.path())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real fixture descendant");
+    tokio::time::timeout(support::DEADLINE, async {
+        while !root.path().join("descendant-started.log").exists() {
+            tokio::time::sleep(process_fixture::HEARTBEAT_PERIOD).await;
+        }
+    })
+    .await
+    .expect("descendant started");
+    tokio::time::sleep(process_fixture::STOP_OBSERVATION).await;
+    assert!(child.try_wait().expect("inspect live descendant").is_none());
+    let survived = root.path().join("descendant-survived.log");
+    assert!(!survived.exists(), "unreleased descendant wrote early");
+    probe.release();
+    probe.assert_released();
+    let status = tokio::time::timeout(process_fixture::STOP_OBSERVATION, child.wait())
+        .await
+        .expect("released descendant must observe probe and exit")
+        .expect("wait for descendant");
+    assert!(status.success());
+    assert_eq!(
+        fs::read(survived).expect("live descendant observed probe"),
+        b"survived"
+    );
 }
 
 #[cfg(windows)]
 fn cancellable_process_command() -> String {
-    concat!(
-        "$workspace=(Get-Location).Path;[Environment]::CurrentDirectory=$workspace;",
-        "$start=[Diagnostics.ProcessStartInfo]::new();",
-        "$start.FileName=(Join-Path ([Environment]::SystemDirectory) 'cmd.exe');",
-        "$start.Arguments='/D /S /C \"echo started>descendant-started.log & ",
-        "ping -n 3 127.0.0.1 >nul & echo survived>descendant-survived.log\"';",
-        "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
-        "$child=[Diagnostics.Process]::Start($start);",
-        "if($null -eq $child){throw 'descendant did not start'};$child.Dispose();",
-        "$heartbeat=Join-Path $workspace 'heartbeat.log';",
-        "while($true){[IO.File]::AppendAllText($heartbeat,'x',[Text.Encoding]::ASCII);",
-        "Start-Sleep -Milliseconds 10}"
+    // Pin the fixture to .NET primitives. Get-Location/Join-Path/Start-Sleep
+    // can import PowerShell modules before the first heartbeat on cold CI.
+    format!(
+        "$PSModuleAutoLoadingPreference='None';\
+         $workspace=$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.Path;\
+         [Environment]::CurrentDirectory=$workspace;\
+         $start=[Diagnostics.ProcessStartInfo]::new();\
+         $start.FileName=[IO.Path]::Combine([Environment]::SystemDirectory,'cmd.exe');\
+         $start.Arguments='/D /S /C cancellable-descendant.cmd';\
+         $start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;\
+         $child=[Diagnostics.Process]::Start($start);\
+         if($null -eq $child){{throw 'descendant did not start'}};$child.Dispose();\
+         $heartbeat=[IO.Path]::Combine($workspace,'heartbeat.log');\
+         while($true){{[IO.File]::AppendAllText($heartbeat,'x',[Text.Encoding]::ASCII);\
+         [Threading.Thread]::Sleep({})}}",
+        process_fixture::HEARTBEAT_PERIOD.as_millis(),
     )
-    .into()
+}
+
+#[cfg(windows)]
+fn install_cancellable_descendant(workspace: &Path) {
+    // The test releases this probe only AFTER cancellation. A slow observer
+    // must not race a descendant's fixed sleep before it can send TurnCancel.
+    fs::write(
+        workspace.join("cancellable-descendant.cmd"),
+        format!(
+            "@echo off\r\necho started>descendant-started.log\r\n\
+             :wait\r\nif exist descendant-probe goto survived\r\n\
+             if not exist descendant-started.log exit /b 0\r\n\
+             ping -n {} 127.0.0.1 >nul\r\ngoto wait\r\n\
+             :survived\r\necho survived>descendant-survived.log\r\n",
+            process_fixture::DESCENDANT_POLL.as_secs() + 1,
+        ),
+    )
+    .expect("write cancellable descendant");
 }
 
 #[cfg(windows)]
 fn large_output_command(bytes: usize) -> String {
     format!(
-        "$b=New-Object byte[] {bytes};$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)"
+        "$PSModuleAutoLoadingPreference='None';$b=[byte[]]::new({bytes});\
+         $s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)"
     )
 }
 
@@ -2368,6 +2552,22 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
         )
         .await;
         let events = events_until_terminal(&mut client, &run).await;
+        if *call_id != "exec-cap" {
+            let result = events
+                .iter()
+                .find_map(|event| match event {
+                    EventPayload::ToolResult {
+                        call_id: seen,
+                        result,
+                    } if seen.as_str() == *call_id => Some(result),
+                    _ => None,
+                })
+                .expect("tool result before continuation");
+            assert!(
+                result.status.is_completed(),
+                "tool {call_id} failed before continuation: {result:?}"
+            );
+        }
         assert!(
             continuation_seen(&events, marker),
             "turn did not continue after {call_id}"
@@ -2390,7 +2590,7 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
     assert_eq!(descendant_output, b"leaderchild");
     // Tokio services Windows child-pipe reads on its blocking pool. That read
     // result can still be pending when the stop watch becomes ready, so the
-    // leader bytes are guaranteed but Receive-Job's boundary bytes are not.
+    // leader bytes are guaranteed but the descendant's boundary bytes are not.
     #[cfg(windows)]
     assert!(
         descendant_output == b"leader" || descendant_output == b"leaderchild",
@@ -2660,6 +2860,9 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
     let root = test_root("core-loop-process-cancel-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
+    #[cfg(windows)]
+    install_cancellable_descendant(&workspace);
+    let descendant_probe = process_fixture::DescendantProbe::new(&workspace);
     let (dependencies, _) = fake_dependencies(vec![
         FakeStep::EmitToolCall {
             call_id: "cancel-process".into(),
@@ -2698,7 +2901,7 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
         None,
     )
     .await;
-    let run = submit_turn(
+    let (run, initial_events) = submit_turn_observing(
         &mut client,
         &config,
         "cancel-process-turn",
@@ -2708,80 +2911,20 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
     )
     .await;
     let heartbeat = workspace.join("heartbeat.log");
-    let descendant_started = workspace.join("descendant-started.log");
-    const STARTUP_KEEPALIVE_NONCE: u64 = u64::MAX - 2;
-    let mut startup_last_state = None;
-    let mut startup_failure = None;
-    let startup = tokio::time::timeout(support::DEADLINE, async {
-        let mut next_keepalive = tokio::time::Instant::now() + support::KEEPALIVE_INTERVAL;
-        loop {
-            if fs::metadata(&heartbeat).is_ok_and(|metadata| metadata.len() >= 2)
-                && descendant_started.exists()
-            {
-                break;
-            }
-            if tokio::time::Instant::now() >= next_keepalive {
-                // This wait observes external files rather than wire frames,
-                // but it still owns a negotiated client. Keep that live peer
-                // inside the daemon's 45-second read-idle contract even when
-                // a contended Windows PowerShell start consumes most of the
-                // outer operation budget. The later TurnCancel remains a
-                // strict write; a genuinely closed connection must still fail.
-                client
-                    .send(
-                        &WireFrame::Ping {
-                            nonce: STARTUP_KEEPALIVE_NONCE,
-                        },
-                        config.frame_limit,
-                    )
-                    .await;
-                loop {
-                    let Some(frame) = client.try_next().await else {
-                        let reason = format!(
-                            "connection closed while waiting for process tree in run {run}; last_state={startup_last_state:?}; failure={startup_failure:?}"
-                        );
-                        client.report_connection_failure(&reason);
-                        panic!("{reason}");
-                    };
-                    match frame {
-                        WireFrame::Pong { nonce } if nonce == STARTUP_KEEPALIVE_NONCE => break,
-                        WireFrame::Event { envelope, .. }
-                            if envelope.run_id.as_ref() == Some(&run) =>
-                        {
-                            match serde_json::from_value::<EventPayload>(envelope.payload.into()) {
-                                Ok(EventPayload::RunFailed { code, message, .. }) => {
-                                    startup_failure = Some((code, message));
-                                }
-                                Ok(EventPayload::RunState(state)) => {
-                                    startup_last_state = Some(state.clone());
-                                    if state.is_terminal() {
-                                        panic!(
-                                            "run {run} reached terminal state {state:?} before its process tree started; failure={startup_failure:?}"
-                                        );
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                next_keepalive = tokio::time::Instant::now() + support::KEEPALIVE_INTERVAL;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+    if let Err(reason) = process_fixture::wait_for_process_tree(
+        &mut client,
+        config.frame_limit,
+        &run,
+        &workspace,
+        initial_events,
+    )
     .await
-    .is_ok();
-    if !startup {
-        let heartbeat_bytes = fs::metadata(&heartbeat).map(|metadata| metadata.len()).ok();
-        let reason = format!(
-            "process tree for run {run} did not start within {:?}; heartbeat_bytes={heartbeat_bytes:?}; descendant_started={}; last_state={startup_last_state:?}; failure={startup_failure:?}",
-            support::DEADLINE,
-            descendant_started.exists()
-        );
-        client.report_connection_failure(&reason);
-        panic!("{reason}");
+    {
+        // Readiness can fail before the foreground wall limit. Close the real
+        // dispatcher/process registry before dropping this test's runtime.
+        task.shutdown_handle().request("process startup failed");
+        let cleanup = tokio::time::timeout(support::DEADLINE, task.join()).await;
+        panic!("{reason}; daemon_cleanup={cleanup:?}");
     }
 
     let cancel_events = cancel_and_collect_terminal(
@@ -2794,8 +2937,20 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
     )
     .await;
     assert!(cancel_events.contains(&EventPayload::RunState(RunState::Cancelled)));
+    // A wall timeout could kill the tree just before TurnCancel reaches the
+    // hanging provider. Require the supervisor's cancellation outcome too;
+    // an already-dead process or unproven group death must not pass.
+    let process_outcomes = cancel_events
+        .iter()
+        .filter_map(|event| match event {
+            EventPayload::Effect(EffectPhase::Outcome { outcome, .. }) => Some(outcome),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(process_outcomes, [&EffectOutcome::Cancelled]);
     let stopped_size = fs::metadata(&heartbeat).expect("heartbeat exists").len();
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    descendant_probe.release();
+    tokio::time::sleep(process_fixture::STOP_OBSERVATION).await;
     assert_eq!(
         fs::metadata(&heartbeat)
             .expect("heartbeat remains inspectable")
@@ -2803,6 +2958,9 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
         stopped_size,
         "cancelled leader kept running"
     );
+    // Absence is meaningful only after an observable release. Drop also
+    // releases on unwind, but that happens too late to validate this check.
+    descendant_probe.assert_released();
     assert!(
         !workspace.join("descendant-survived.log").exists(),
         "outliving descendant escaped the process group"
