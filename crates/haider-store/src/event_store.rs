@@ -206,20 +206,7 @@ const STORE_SYNCHRONOUS_ENV: &str = "HAIDER_STORE_SYNCHRONOUS";
 /// `HAIDER_STORE_SYNCHRONOUS=full`; both modes are applied on every open.
 const DEFAULT_STORE_SYNCHRONOUS: StoreSynchronous = StoreSynchronous::Normal;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StoreSynchronous {
-    Normal,
-    Full,
-}
-
-impl StoreSynchronous {
-    const fn pragma_value(self) -> &'static str {
-        match self {
-            Self::Normal => "NORMAL",
-            Self::Full => "FULL",
-        }
-    }
-}
+use haider_protocol::runtime::StoreSynchronous;
 
 /// Device-profile-wide hard admission bound for durable live delegations.
 ///
@@ -2128,12 +2115,20 @@ impl Store {
 
     /// Opens or creates a durable profile after its lifetime lock is held.
     pub fn open_locked(lease: ProfileLease) -> StoreResult<Self> {
+        Self::open_locked_with_synchronous(lease, configured_store_synchronous()?)
+    }
+
+    /// Opens the journal with a typed policy, without consulting the environment.
+    pub fn open_locked_with_synchronous(
+        lease: ProfileLease,
+        synchronous: StoreSynchronous,
+    ) -> StoreResult<Self> {
         let ProfileLease {
             root,
             lock: profile_lock,
         } = lease;
         let database_path = root.join("store.sqlite");
-        let mut connection = open_connection(&database_path)?;
+        let mut connection = open_connection_with(&database_path, synchronous)?;
         let migration = migrations::migrate(&mut connection)?;
         backfill_payload_kinds(&mut connection)?;
         backfill_run_head_projections(&mut connection)?;
@@ -24657,6 +24652,7 @@ fn same_session_batch(envelopes: &[RawEnvelope]) -> StoreResult<(SessionId, u64)
 
 /// Opens the profile's long-lived journal connection with the required pragmas
 /// (WAL, configured synchronous policy, foreign keys, busy timeout).
+#[cfg(test)]
 fn open_connection(path: &Path) -> StoreResult<Connection> {
     open_connection_with(path, configured_store_synchronous()?)
 }
@@ -28270,3 +28266,7 @@ mod store_synchronous_tests {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod group_commit_tests;
+
+#[cfg(test)]
+#[path = "embedded_store_synchronous_tests.rs"]
+mod embedded_store_synchronous_tests;
