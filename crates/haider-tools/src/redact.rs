@@ -27,16 +27,12 @@ pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
 }
 
 fn redact_lines(input: &str, policy: RedactionPolicy) -> RedactedText {
-    let mut private_key = false;
+    let mut state = RedactionState::default();
     let mut output = String::with_capacity(input.len());
     let mut replacements = 0usize;
     for line in input.split_inclusive('\n') {
-        let (content, newline) = line
-            .strip_suffix('\n')
-            .map_or((line, ""), |content| (content, "\n"));
-        let redacted = redact_line(content, &mut private_key, policy);
+        let redacted = redact_line(line, &mut state, policy);
         output.push_str(&redacted.text);
-        output.push_str(newline);
         replacements = replacements.saturating_add(redacted.replacements);
     }
     RedactedText {
@@ -84,24 +80,96 @@ pub fn redact_output_text(input: &str) -> String {
     redact_private_key_lines(input).text
 }
 
-pub(crate) fn redact_line_with_private_key_state(
-    line: &str,
-    private_key: &mut bool,
-) -> RedactedText {
-    redact_line(line, private_key, RedactionPolicy::Standard)
+/// The quote window shares the process-output ceiling. Once exhausted without
+/// a closing quote, fail closed for the rest of this input/stream; do not scan
+/// for a later delimiter or retain the discarded bytes.
+const QUOTED_SECRET_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RedactionState {
+    private_key: bool,
+    quoted: QuotedValue,
 }
 
-fn redact_line(line: &str, private_key: &mut bool, policy: RedactionPolicy) -> RedactedText {
+impl RedactionState {
+    pub(crate) fn discard_oversized_line(&mut self) {
+        if self.quoted.active() {
+            self.quoted.exhausted = true;
+            self.private_key = false;
+        } else {
+            // Preserve the existing conservative PEM recovery policy.
+            self.private_key = true;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct QuotedValue {
+    quote: Option<u8>,
+    escaped: bool,
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl QuotedValue {
+    fn start(&mut self, quote: u8) {
+        self.quote = Some(quote);
+        self.escaped = false;
+        self.remaining = QUOTED_SECRET_MAX_BYTES - 1;
+    }
+
+    fn active(&self) -> bool {
+        self.quote.is_some() || self.exhausted
+    }
+
+    /// Consume bytes after the opening quote, including CR/LF and escapes.
+    /// The same consumer handles complete text and streaming continuations.
+    fn consume(&mut self, input: &str) -> usize {
+        if self.exhausted {
+            return input.len();
+        }
+        let Some(quote) = self.quote else {
+            return 0;
+        };
+        for (index, byte) in input.bytes().take(self.remaining).enumerate() {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+            } else if byte == quote {
+                self.quote = None;
+                return index + 1;
+            }
+        }
+        self.remaining = self.remaining.saturating_sub(input.len());
+        self.exhausted = self.remaining == 0;
+        input.len()
+    }
+}
+
+pub(crate) fn redact_line_with_state(line: &str, state: &mut RedactionState) -> RedactedText {
+    redact_line(line, state, RedactionPolicy::Standard)
+}
+
+fn redact_line(line: &str, state: &mut RedactionState, policy: RedactionPolicy) -> RedactedText {
     let begins = line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----");
     let ends = line.contains("-----END") && line.contains("PRIVATE KEY-----");
-    if *private_key || begins {
-        *private_key = !ends;
+    let was_quoted = state.quoted.active();
+    // Even a line replaced by a PEM marker must advance quote/escape state:
+    // a same-line BEGIN/END pair cannot expose the password's next line.
+    let redacted = redact_with_state(line, policy, &mut state.quoted);
+    if state.private_key || (begins && !(was_quoted && state.quoted.active())) {
+        state.private_key = !ends;
         return RedactedText {
-            text: "[REDACTED:private_key]".into(),
+            text: if line.ends_with('\n') {
+                "[REDACTED:private_key]\n".into()
+            } else {
+                "[REDACTED:private_key]".into()
+            },
             replacements: 1,
         };
     }
-    redact_with_policy(line, policy)
+    redacted
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,11 +233,19 @@ pub(crate) fn token_config_contains_secret(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 pub(crate) fn redact_text(input: &str) -> RedactedText {
-    redact_with_policy(input, RedactionPolicy::Standard)
+    redact_with_state(
+        input,
+        RedactionPolicy::Standard,
+        &mut QuotedValue::default(),
+    )
 }
 
-fn redact_with_policy(input: &str, policy: RedactionPolicy) -> RedactedText {
-    let spans = redaction_spans(input, policy);
+fn redact_with_state(
+    input: &str,
+    policy: RedactionPolicy,
+    quoted: &mut QuotedValue,
+) -> RedactedText {
+    let spans = redaction_spans(input, policy, quoted);
     if spans.is_empty() {
         return RedactedText {
             text: input.to_owned(),
@@ -201,7 +277,11 @@ fn redact_with_policy(input: &str, policy: RedactionPolicy) -> RedactedText {
 /// the complete redacted value. `full_len` is the byte length that complete
 /// value would have had, so callers retain the existing truncation decision.
 pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedactedText {
-    let spans = redaction_spans(input, RedactionPolicy::Standard);
+    let spans = redaction_spans(
+        input,
+        RedactionPolicy::Standard,
+        &mut QuotedValue::default(),
+    );
     if spans.is_empty() {
         return BoundedRedactedText {
             text: utf8_prefix(input, max_bytes).to_owned(),
@@ -244,7 +324,7 @@ pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedac
     }
 }
 
-fn redaction_spans(input: &str, policy: RedactionPolicy) -> Vec<Span> {
+fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValue) -> Vec<Span> {
     let mut spans = Vec::new();
     if let Some(regex) = private_key_regex() {
         for found in regex.find_iter(input) {
@@ -276,33 +356,50 @@ fn redaction_spans(input: &str, policy: RedactionPolicy) -> Vec<Span> {
     }
     // Explicit secret context wins even if the value resembles a digest or
     // a path. Lockdown retains its historical classifier byte-for-byte.
-    if policy != RedactionPolicy::Lockdown {
-        for regex in [url_userinfo_regex(), secret_assignment_regex()]
-            .into_iter()
-            .flatten()
-        {
-            for captures in regex.captures_iter(input) {
-                if let Some(found) = captures.get(1) {
-                    if spans
-                        .iter()
-                        .any(|span| span.start == found.start() && span.end == found.end())
-                    {
-                        continue;
-                    }
-                    if !spans.iter().any(|span| {
-                        span.kind == "private_key"
-                            && found.start() < span.end
-                            && span.start < found.end()
-                    }) {
-                        spans.retain(|span| found.start() >= span.end || span.start >= found.end());
-                        spans.push(Span {
-                            start: found.start(),
-                            end: found.end(),
-                            kind: "secret_value",
-                        });
-                    }
+    if policy != RedactionPolicy::Lockdown
+        && let Some(regex) = url_userinfo_regex()
+    {
+        for captures in regex.captures_iter(input) {
+            if let Some(found) = captures.get(1) {
+                if spans
+                    .iter()
+                    .any(|span| span.start == found.start() && span.end == found.end())
+                {
+                    continue;
+                }
+                if !spans.iter().any(|span| {
+                    span.kind == "private_key"
+                        && found.start() < span.end
+                        && span.start < found.end()
+                }) {
+                    spans.retain(|span| found.start() >= span.end || span.start >= found.end());
+                    spans.push(Span {
+                        start: found.start(),
+                        end: found.end(),
+                        kind: "secret_value",
+                    });
                 }
             }
+        }
+    }
+    if policy != RedactionPolicy::Lockdown {
+        for span in secret_assignment_spans(input, quoted) {
+            // Keep a known key's marker, but a PEM-looking continuation is
+            // still inside the quoted value and must preserve its line ending.
+            if spans.iter().any(|other| {
+                other.kind != "private_key" && other.start == span.start && other.end == span.end
+            }) {
+                continue;
+            }
+            // An enclosing PEM block retains priority over assignments in its
+            // body. A PEM-looking delimiter inside a quote is secret text.
+            if spans.iter().any(|other| {
+                other.kind == "private_key" && other.start < span.start && span.start < other.end
+            }) {
+                continue;
+            }
+            spans.retain(|other| span.start >= other.end || other.start >= span.end);
+            spans.push(span);
         }
     }
     let candidates = if policy == RedactionPolicy::Lockdown {
@@ -348,7 +445,15 @@ fn redaction_spans(input: &str, policy: RedactionPolicy) -> Vec<Span> {
         }
     }
     spans.sort_by_key(|span| (span.start, span.end));
-    spans
+    let mut output = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.kind == "secret_value" {
+            push_secret_lines(&mut output, input, span.start, span.end);
+        } else {
+            output.push(span);
+        }
+    }
+    output
 }
 
 fn push_bounded(output: &mut String, value: &str, max_bytes: usize) -> bool {
@@ -428,8 +533,66 @@ fn extended_secret_regex() -> Option<&'static Regex> {
 fn secret_assignment_regex() -> Option<&'static Regex> {
     static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(
-        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)("(?:\\[^\r\n]|[^"\\\r\n])*"|'(?:\\[^\r\n]|[^'\\\r\n])*'|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
+        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)(["']|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
     ).ok()).as_ref()
+}
+
+fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut cursor = quoted.consume(input);
+    if cursor > 0 {
+        spans.push(Span {
+            start: 0,
+            end: cursor,
+            kind: "secret_value",
+        });
+    }
+    if quoted.active() {
+        return spans;
+    }
+    if let Some(regex) = secret_assignment_regex() {
+        for captures in regex.captures_iter(input) {
+            let Some(value) = captures.get(1) else {
+                continue;
+            };
+            if value.start() < cursor {
+                continue;
+            }
+            let end = if matches!(value.as_str(), "\"" | "'") {
+                quoted.start(input.as_bytes()[value.start()]);
+                value.end() + quoted.consume(&input[value.end()..])
+            } else {
+                value.end()
+            };
+            spans.push(Span {
+                start: value.start(),
+                end,
+                kind: "secret_value",
+            });
+            cursor = end;
+            if quoted.active() {
+                break;
+            }
+        }
+    }
+    spans
+}
+
+fn push_secret_lines(spans: &mut Vec<Span>, input: &str, start: usize, end: usize) {
+    // Preserve physical line numbering for fs_read, including empty lines.
+    // Newlines count toward the quote window even though they remain visible.
+    let mut cursor = start;
+    for line in input[start..end].split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if !content.is_empty() {
+            spans.push(Span {
+                start: cursor,
+                end: cursor + content.len(),
+                kind: "secret_value",
+            });
+        }
+        cursor += line.len();
+    }
 }
 
 /// Match the authority before path/query delimiters. Percent escapes remain

@@ -21,7 +21,16 @@ exemption. This grants no file access and does not exempt unknown random values.
 Known credential prefixes, secret assignments, bearer credentials and PEM
 material remain redacted. URL userinfo passwords, including percent escapes,
 are removed while the username stays visible. Quoted secret values consume
-escaped quotes and backslashes through the actual closing quote. Secret
+escaped quotes and backslashes, including LF/CRLF, through the actual closing
+quote. One consumer carries this state across file lines and per-stream journal
+chunks. Physical LF boundaries stay visible, with each nonempty secret line
+replaced, so file line/column paging cannot reveal a continuation alone.
+The quote scan window is 2 MiB of bytes, counting both quotes, escapes and line
+endings. A closing quote at the last byte is accepted. If the window ends first,
+the rest of that input/stream is suppressed (including later apparent closing
+quotes), preserving only line boundaries. EOF also suppresses an unfinished
+value. The consumer keeps constant-size state and never buffers the quoted
+value; existing per-line stream buffering remains capped at 2 MiB. Secret
 context always takes precedence over these identifier shapes.
 Redaction runs before range selection. Lockdown keeps its historical strict
 classifier and read path.
@@ -57,3 +66,8 @@ sequences are removed at this boundary; ordinary non-secret binary bytes remain
 byte-exact in the journal. A partial
 line is delayed until its newline or process completion. Unreasonably long
 unterminated lines are suppressed conservatively at the process capture cap.
+
+The real terminal regression uses throwaway profiles and synthetic secrets:
+`python3 scripts/qa-gate/redaction_tui_regression.py --bin-dir <built-binaries> --evidence-dir <fresh-directory>`.
+It types a real shell command, requires the complete output in a fresh PTY
+frame, checks decoded journal bytes, and records ANSI frames and cleanup.

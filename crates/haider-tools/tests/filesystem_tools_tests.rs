@@ -821,6 +821,12 @@ async fn anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction() {
             Some("sk-abcdefghijklmnopqrstuv"),
         ),
         (
+            "multiline.txt",
+            "password=\"abc\\\nSYNTHETICTAIL987\" after\n".into(),
+            "REDACTED:secret_value",
+            Some("SYNTHETICTAIL987"),
+        ),
+        (
             ".env",
             "CUSTOM_SECRET=private-value\n".into(),
             "sensitive path",

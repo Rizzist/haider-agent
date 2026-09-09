@@ -1733,6 +1733,10 @@ fn redaction_repair_fixture() -> &'static str {
         "password='abc\\'SYNTHETICTAIL987'\n",
         "password=\"abc\\\\SYNTHETICTAIL987\"\n",
         "password='abc\\\\SYNTHETICTAIL987'\n",
+        "password=\"abc\nSYNTHETICTAIL987\" after\n",
+        "password='abc\nSYNTHETICTAIL987' after\n",
+        "password=\"abc\\\nSYNTHETICTAIL987\" after\n",
+        "password='abc\\\r\nSYNTHETICTAIL987' after\n",
         "HEAD:752dfaa79475887978ffeb8eaa73134d7a933c7d\n",
         "urn:uuid:01a0e893-52bc-7def-89ab-0123456789cd\n",
         "thread-01a0e893-52bc-7def-89ab-0123456789cd\n",
@@ -1749,7 +1753,10 @@ fn assert_repair_secrets_absent(text: &str) {
 }
 
 fn assert_repair_carriers_present(text: &str) {
-    for carrier in redaction_repair_fixture().lines().skip(6) {
+    for carrier in redaction_repair_fixture()
+        .lines()
+        .skip_while(|line| !line.starts_with("HEAD:"))
+    {
         assert!(text.contains(carrier), "carrier {carrier} lost");
     }
     for authority in [

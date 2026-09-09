@@ -1,10 +1,10 @@
 //! Streaming journal boundary. Delay incomplete lines so credentials split
-//! across OS reads are classified together, with PEM state across lines.
+//! across OS reads are classified together, with PEM and bounded quoted-secret state across lines.
 
 #[derive(Clone, Debug, Default)]
 pub struct OutputRedactor {
     pending: Vec<u8>,
-    private_key: bool,
+    state: crate::redact::RedactionState,
     discarding_line: bool,
 }
 
@@ -22,11 +22,13 @@ impl OutputRedactor {
                 if self.pending.len().saturating_add(segment.len())
                     > crate::PROCESS_MAX_OUTPUT_BYTES
                 {
-                    self.pending.clear();
+                    // Classify the bounded prefix before discarding it so an
+                    // open quote cannot recover on a later line or PEM marker.
+                    let remaining = crate::PROCESS_MAX_OUTPUT_BYTES - self.pending.len();
+                    self.pending.extend_from_slice(&segment[..remaining]);
+                    let _ = self.finish_bytes();
+                    self.state.discard_oversized_line();
                     self.discarding_line = true;
-                    // Conservatively retain PEM protection after an oversized
-                    // line, even if its opening delimiter could not be held.
-                    self.private_key = true;
                     output.extend_from_slice(b"[REDACTED:oversized_output_line]\n");
                 } else {
                     self.pending.extend_from_slice(segment);
@@ -48,13 +50,13 @@ impl OutputRedactor {
 
     pub fn finish_bytes(&mut self) -> Vec<u8> {
         let bytes = std::mem::take(&mut self.pending);
+        if bytes.is_empty() {
+            return bytes;
+        }
         let line = String::from_utf8_lossy(&bytes);
         let (text, newline) = line
             .strip_suffix('\n')
             .map_or((line.as_ref(), ""), |text| (text, "\n"));
-        if text.is_empty() {
-            return bytes;
-        }
         // Classify the same visible text the process adapter will see. ANSI
         // styling inside a token must not hide its prefix until after this
         // security boundary. Control sequences can themselves contain secrets,
@@ -68,12 +70,14 @@ impl OutputRedactor {
         } else {
             &plain
         };
-        let redacted =
-            crate::redact::redact_line_with_private_key_state(classified, &mut self.private_key);
+        let redacted = crate::redact::redact_line_with_state(
+            &format!("{classified}{newline}"),
+            &mut self.state,
+        );
         if redacted.replacements == 0 && plain == text {
             bytes
         } else {
-            format!("{}{newline}", crate::shell::strip_ansi(&redacted.text)).into_bytes()
+            crate::shell::strip_ansi(&redacted.text).into_bytes()
         }
     }
 }

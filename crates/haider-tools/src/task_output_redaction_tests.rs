@@ -34,3 +34,27 @@ fn live_ready_prompt_remains_immediate_without_newline() {
         "unfinished output is not committed"
     );
 }
+
+#[test]
+fn multiline_secret_snapshots_never_publish_or_page_the_tail() {
+    let input = b"password=\"abc\\\nSYNTHETICTAIL987\" after\npublic";
+    let expected = b"password=[REDACTED:secret_value]\n[REDACTED:secret_value] after\npublic";
+    for boundary in 0..=input.len() {
+        let mut buffer = TaskOutputBuffer::new(4096, 4096);
+        buffer.append_stream(OutputStream::Stdout, &input[..boundary]);
+        assert!(
+            !buffer
+                .live_snapshot()
+                .tail_lossy()
+                .contains("SYNTHETICTAIL987")
+        );
+        buffer.append_stream(OutputStream::Stdout, &input[boundary..]);
+        assert_eq!(buffer.live_snapshot().retained(), expected);
+        buffer.finish_streams();
+        assert_eq!(buffer.retained(), expected);
+        for cursor in 0..expected.len() {
+            let (page, next) = buffer.read_from(cursor as u64, 7);
+            assert_eq!(page, expected[cursor..next as usize]);
+        }
+    }
+}

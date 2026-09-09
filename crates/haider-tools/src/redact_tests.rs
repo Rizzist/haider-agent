@@ -358,3 +358,81 @@ fn named_public_carriers_survive_standard_output_but_secret_context_wins() {
         "Qm11111111111111111111111111111111111111111111"
     ));
 }
+
+#[test]
+fn multiline_quoted_values_preserve_lines_and_hide_every_secret_fragment() {
+    let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));
+    for quote in ['\'', '"'] {
+        for newline in ["\n", "\r\n", "\\\n", "\\\r\n"] {
+            for escaped in ["", "\\", "\\\\\\"] {
+                let input = format!(
+                    "password={quote}abc{newline}SYNTHETICTAIL987{escaped}{quote}last{quote} after"
+                );
+                // Odd backslashes escape the first quote; the final quote closes it.
+                let suffix = if escaped.is_empty() {
+                    format!("last{quote} after")
+                } else {
+                    " after".into()
+                };
+                let expected =
+                    format!("password=[REDACTED:secret_value]\n[REDACTED:secret_value]{suffix}");
+                for output in [
+                    redact_text(&input),
+                    paths.redact(Path::new("handoff.md"), &input),
+                    redact_private_key_lines(&input),
+                ] {
+                    assert_eq!(output.text, expected, "{input:?}");
+                }
+                for limit in [0, 1, 28, 29, 30, 54, 128] {
+                    let bounded = redact_text_bounded(&input, limit);
+                    assert_eq!(bounded.text, super::utf8_prefix(&expected, limit));
+                    assert_eq!(bounded.full_len, expected.len());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn multiline_quote_window_is_byte_bounded_and_fails_closed_on_overflow() {
+    let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));
+    for quote in ['\'', '"'] {
+        for length in [
+            super::QUOTED_SECRET_MAX_BYTES - 3,
+            super::QUOTED_SECRET_MAX_BYTES - 2,
+        ] {
+            // Opening + payload + LF + closing: exactly at the limit, then one over.
+            let input = format!(
+                "password={quote}{}\n{quote} after\nPUBLIC",
+                "a".repeat(length)
+            );
+            let expected = if length == super::QUOTED_SECRET_MAX_BYTES - 3 {
+                "password=[REDACTED:secret_value]\n[REDACTED:secret_value] after\nPUBLIC"
+            } else {
+                "password=[REDACTED:secret_value]\n[REDACTED:secret_value]\n[REDACTED:secret_value]"
+            };
+            for output in [
+                redact_text(&input),
+                paths.redact(Path::new("handoff.md"), &input),
+                redact_private_key_lines(&input),
+            ] {
+                assert_eq!(output.text, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn unterminated_multiline_quotes_and_nested_contexts_fail_closed() {
+    for input in [
+        "password=\"abc\n\nSYNTHETICTAIL987",
+        "password='abc\\\n\nSYNTHETICTAIL987",
+        "password=\"abc\n-----BEGIN\x20PRIVATE KEY-----\nSYNTHETICTAIL987",
+        "password=\"abc\npassword=inner SYNTHETICTAIL987",
+    ] {
+        let expected = redact_text(input).text;
+        assert!(!expected.contains("SYNTHETICTAIL987"));
+        assert_eq!(expected.matches('\n').count(), input.matches('\n').count());
+        assert_eq!(redact_private_key_lines(input).text, expected);
+    }
+}

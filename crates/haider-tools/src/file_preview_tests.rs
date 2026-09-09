@@ -208,3 +208,44 @@ async fn password_redaction_precedes_file_line_and_column_paging() {
         }
     }
 }
+
+#[tokio::test]
+async fn multiline_password_redaction_precedes_tail_only_line_and_column_pages() {
+    let mut cas = Capture::default();
+    for quote in ['\'', '"'] {
+        for newline in ["\n", "\r\n", "\\\n", "\\\r\n"] {
+            let input = format!(
+                "public\npassword={quote}abc{newline}SYNTHETICTAIL987{quote} after\nlast\n"
+            );
+            for column in [1, 3, 20, 28] {
+                let page = bounded_file_read(
+                    input.clone(),
+                    &FsRead::new("multiline.txt")
+                        .with_line_range(Some(3), Some(1))
+                        .with_column(Some(column)),
+                    ResultBounds::file_read(),
+                    &mut cas,
+                )
+                .await
+                .expect("tail page");
+                let line = "[REDACTED:secret_value] after\n";
+                assert!(
+                    page.preview
+                        .starts_with(&format!("3: {}", &line[column - 1..]))
+                );
+                assert!(!page.preview.contains("SYNTHETICTAIL987"));
+                assert!(page.truncated);
+            }
+            let page = bounded_file_read(
+                input,
+                &FsRead::new("multiline.txt").with_line_range(Some(4), Some(1)),
+                ResultBounds::file_read(),
+                &mut cas,
+            )
+            .await
+            .expect("public page");
+            assert_eq!(page.preview, "4: last\n");
+            assert!(!page.truncated);
+        }
+    }
+}

@@ -144,3 +144,98 @@ fn url_passwords_and_escaped_values_are_safe_at_every_stream_boundary() {
         assert_eq!(safe, expected.as_bytes(), "boundary {boundary}");
     }
 }
+
+#[test]
+fn multiline_quotes_remain_safe_at_every_byte_boundary_and_finish() {
+    for quote in ['\'', '"'] {
+        for newline in ["\n", "\r\n", "\\\n", "\\\r\n"] {
+            let input = format!(
+                "password={quote}abc{newline}é\\{quote}SYNTHETICTAIL987{quote} after\npublic\n"
+            );
+            let expected =
+                b"password=[REDACTED:secret_value]\n[REDACTED:secret_value] after\npublic\n";
+            for boundary in 0..=input.len() {
+                let mut redactor = OutputRedactor::default();
+                let mut safe = redactor.push_bytes(&input.as_bytes()[..boundary]);
+                safe.extend(redactor.push_bytes(&input.as_bytes()[boundary..]));
+                safe.extend(redactor.finish_bytes());
+                assert_eq!(safe, expected, "boundary {boundary}, {input:?}");
+            }
+            let mut redactor = OutputRedactor::default();
+            let mut safe = Vec::new();
+            for byte in input.bytes() {
+                safe.extend(redactor.push_bytes(&[byte]));
+            }
+            safe.extend(redactor.finish_bytes());
+            assert_eq!(safe, expected);
+        }
+    }
+}
+
+#[test]
+fn multiline_quote_state_is_per_stream_and_survives_empty_lines() {
+    use base64::Engine as _;
+    use haider_protocol::item::OutputStream;
+    let chunks = [
+        (OutputStream::Stdout, "password=\"abc\\\n"),
+        (OutputStream::Stderr, "notice \"\n"),
+        (OutputStream::Stdout, "\nSYNTHETICTAIL987\" after\n"),
+    ]
+    .map(|(stream, bytes)| crate::ProcessOutputChunk {
+        stream,
+        chunk_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    });
+    assert_eq!(
+        super::redact_process_output(&chunks).expect("chunks"),
+        "password=[REDACTED:secret_value]\nnotice \"\n\n[REDACTED:secret_value] after\n"
+    );
+}
+
+#[test]
+fn multiline_quote_overflow_never_reopens_on_a_late_closing_quote() {
+    let mut redactor = OutputRedactor::default();
+    assert_eq!(
+        redactor.push(b"password=\"abc\n"),
+        "password=[REDACTED:secret_value]\n"
+    );
+    let line = vec![b'x'; 1024];
+    for _ in 0..2048 {
+        let _ = redactor.push(&line);
+        let _ = redactor.push(b"\n");
+    }
+    let output = redactor.push(b"SYNTHETICTAIL987\" after\nPUBLIC\n");
+    assert_eq!(output, "[REDACTED:secret_value]\n[REDACTED:secret_value]\n");
+    assert!(redactor.pending.len() <= crate::PROCESS_MAX_OUTPUT_BYTES);
+}
+
+#[test]
+fn oversized_quoted_lines_do_not_recover_at_pem_or_quote_delimiters() {
+    for prefix in ["password=\"", "password=\"abc\n"] {
+        let mut redactor = OutputRedactor::default();
+        let _ = redactor.push(prefix.as_bytes());
+        let _ = redactor.push(&vec![b'a'; crate::PROCESS_MAX_OUTPUT_BYTES + 1]);
+        let rest = redactor.push(b"\n-----END PRIVATE KEY-----\nSYNTHETICTAIL987\" after\n");
+        assert!(!rest.contains("SYNTHETICTAIL987"));
+        assert!(!rest.contains(" after"));
+        assert!(redactor.pending.len() <= crate::PROCESS_MAX_OUTPUT_BYTES);
+    }
+}
+
+#[test]
+fn quoted_passwords_and_pem_delimiters_cannot_reset_each_others_protection() {
+    for input in [
+        "password=\"abc -----BEGIN\x20PRIVATE KEY----- -----END PRIVATE KEY-----\nSYNTHETICTAIL987\" after\n",
+        "password=\"abc\nSYNTHETICTAIL987\" -----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\npublic\n",
+    ] {
+        let expected = crate::redact_output_text(input);
+        assert!(!expected.contains("SYNTHETICTAIL987"));
+        assert!(!expected.contains("AA=="));
+        for boundary in 0..=input.len() {
+            let mut redactor = OutputRedactor::default();
+            let mut output = redactor.push_bytes(&input.as_bytes()[..boundary]);
+            output.extend(redactor.push_bytes(&input.as_bytes()[boundary..]));
+            output.extend(redactor.finish_bytes());
+            assert_eq!(output, expected.as_bytes(), "boundary {boundary}");
+        }
+    }
+}

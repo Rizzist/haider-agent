@@ -3324,7 +3324,7 @@ fn collect_streamed_file_matches(
     let mut pending = Vec::<PendingContext>::new();
     let mut buffer = Vec::new();
     let mut line_number = 0usize;
-    let mut private_key = false;
+    let mut redaction = crate::redact::RedactionState::default();
     loop {
         if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
             matches.truncate(ToolTruncationReason::TimeBudget);
@@ -3359,18 +3359,18 @@ fn collect_streamed_file_matches(
             matches.truncate(ToolTruncationReason::LineTooLong);
             break;
         }
-        if buffer.last() == Some(&b'\n') {
-            buffer.pop();
-        }
-        if buffer.last() == Some(&b'\r') {
-            buffer.pop();
-        }
-        let Ok(line) = std::str::from_utf8(&buffer) else {
+        let Ok(full_line) = std::str::from_utf8(&buffer) else {
             matches.skip_binary();
             break;
         };
-        let redacted = crate::redact::redact_line_with_private_key_state(line, &mut private_key);
-        let structured_line = utf8_prefix(&redacted.text, SEARCH_STRUCTURED_LINE_BYTES).to_owned();
+        // Feed physical line endings to the quote consumer before removing
+        // them from search's single-line presentation and match coordinates.
+        let redacted = crate::redact::redact_line_with_state(full_line, &mut redaction);
+        let line = full_line.strip_suffix('\n').unwrap_or(full_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let safe_line = redacted.text.strip_suffix('\n').unwrap_or(&redacted.text);
+        let safe_line = safe_line.strip_suffix('\r').unwrap_or(safe_line);
+        let structured_line = utf8_prefix(safe_line, SEARCH_STRUCTURED_LINE_BYTES).to_owned();
         for context in &mut pending {
             matches.append_context_after(context.match_index, &structured_line)?;
             context.remaining = context.remaining.saturating_sub(1);
@@ -3400,7 +3400,7 @@ fn collect_streamed_file_matches(
         if !columns.is_empty() {
             let display = portable_relative_path(display_path)?;
             let raw_legacy = format!("{display}:{line_number}:{line}");
-            let preview_legacy = format!("{display}:{line_number}:{}", redacted.text);
+            let preview_legacy = format!("{display}:{line_number}:{safe_line}");
             let structured = columns
                 .into_iter()
                 .map(|column| FsSearchMatch {

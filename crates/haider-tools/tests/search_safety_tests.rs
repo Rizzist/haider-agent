@@ -487,3 +487,38 @@ fn typed_reason_names_remain_wire_stable() {
         "\"time_budget\""
     );
 }
+
+#[tokio::test]
+async fn search_tail_matches_keep_multiline_quote_state_before_context_selection() {
+    let root = tempfile::tempdir().expect("root");
+    fs::create_dir(root.path().join(".git")).expect("git marker");
+    let mut broker = broker(root.path(), 2);
+    let mut cas = RecordingCas::default();
+    for quote in ['\'', '"'] {
+        for newline in ["\n", "\r\n", "\\\n", "\\\r\n"] {
+            fs::write(
+                root.path().join("multiline.txt"),
+                format!("password={quote}abc{newline}SYNTHETICTAIL987{quote} after\npublic\n"),
+            )
+            .expect("fixture");
+            let result = broker
+                .fs_search(
+                    &FsSearch::new(".", "SYNTHETICTAIL987"),
+                    &allow_read(),
+                    &mut cas,
+                    ResultBounds::default(),
+                )
+                .await
+                .expect("search tail");
+            assert!(!result.preview.contains("SYNTHETICTAIL987"));
+            let Some(ToolResultData::FsSearch { matches, .. }) = result.data else {
+                panic!("typed search data");
+            };
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].line, 2);
+            assert_eq!(matches[0].text, "[REDACTED:secret_value] after");
+            assert!(result.artifact.is_none());
+            assert!(cas.0.is_empty());
+        }
+    }
+}
