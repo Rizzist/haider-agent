@@ -1678,6 +1678,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
             detach_request,
             ResponseBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                closed_session_id: None,
             },
         )
         .await;
@@ -1811,6 +1812,7 @@ async fn lagged_pressure_recovers_every_durable_sequence() {
             detach_request,
             ResponseBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                closed_session_id: None,
             },
         )
         .await;
@@ -1910,7 +1912,10 @@ async fn withheld_recovery_barrier_cannot_defeat_run_and_grace_deadlines() {
         assert!(matches!(detach, RequestBody::SessionDetach { .. }));
         peer.respond(
             detach_request,
-            ResponseBody::SessionDetach { attachment_id },
+            ResponseBody::SessionDetach {
+                attachment_id,
+                closed_session_id: None,
+            },
         )
         .await;
         let (attach_request, attach) = peer.request().await;

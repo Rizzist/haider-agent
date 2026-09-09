@@ -4429,7 +4429,10 @@ async fn detach_existing(
     };
     match connection
         .client
-        .request(RequestBody::SessionDetach { attachment_id })
+        .request(RequestBody::SessionDetach {
+            attachment_id,
+            close_session: false,
+        })
         .await
     {
         Ok(ResponseBody::SessionDetach { .. }) | Ok(ResponseBody::Error { .. }) => Ok(()),

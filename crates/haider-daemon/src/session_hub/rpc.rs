@@ -4231,8 +4231,16 @@ impl HubConnection {
                 self.session_attach(request_id, session_id, after_seq, mode, sealed_replay)
                     .await
             }
-            RequestBody::SessionDetach { attachment_id } => {
-                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+            RequestBody::SessionDetach {
+                attachment_id,
+                close_session,
+            } => {
+                let operation = if close_session {
+                    Operation::Control
+                } else {
+                    Operation::View
+                };
+                if let Err(message) = authorize(&self.capabilities, operation) {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_CAPABILITY_DENIED,
@@ -4241,7 +4249,56 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_detach(request_id, attachment_id).await
+                if close_session {
+                    match self
+                        .hub
+                        .close_attachment_session(
+                            attachment_id.clone(),
+                            self.connection_id.clone(),
+                            Arc::clone(&self.sink),
+                        )
+                        .await
+                    {
+                        Ok(session_id) => {
+                            let watch_task = {
+                                let mut watch = lock(&self.surface_watch)?;
+                                if let Some(state) = watch.as_ref() {
+                                    lock(&state.registrations)?.remove(&session_id);
+                                }
+                                if watch.as_ref().is_some_and(|state| {
+                                    state
+                                        .registrations
+                                        .lock()
+                                        .is_ok_and(|registrations| registrations.is_empty())
+                                }) {
+                                    watch.take().map(|state| state.task)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(task) = watch_task {
+                                task.abort();
+                                let _ = task.await;
+                            }
+                            self.send(WireFrame::Response {
+                                request_id,
+                                body: ResponseBody::SessionDetach {
+                                    attachment_id,
+                                    closed_session_id: Some(session_id),
+                                },
+                            })
+                        }
+                        Err(error) => self.respond_error(
+                            request_id,
+                            error.code.as_str(),
+                            &error.message,
+                            error.retryable,
+                            None,
+                        ),
+                    }
+                } else {
+                    self.session_detach(request_id, attachment_id).await
+                }
             }
             RequestBody::BranchCreate {
                 command_id,
@@ -17865,7 +17922,10 @@ impl HubConnection {
             let _ = self.sink.purge_attachment(&attachment_id);
             return self.send(WireFrame::Response {
                 request_id,
-                body: ResponseBody::SessionDetach { attachment_id },
+                body: ResponseBody::SessionDetach {
+                    attachment_id,
+                    closed_session_id: None,
+                },
             });
         }
         let Some(owner) = owner else {
@@ -17885,7 +17945,10 @@ impl HubConnection {
         SessionHub::finish_detach(&attachment_id, owner).await;
         self.send(WireFrame::Response {
             request_id,
-            body: ResponseBody::SessionDetach { attachment_id },
+            body: ResponseBody::SessionDetach {
+                attachment_id,
+                closed_session_id: None,
+            },
         })
     }
 

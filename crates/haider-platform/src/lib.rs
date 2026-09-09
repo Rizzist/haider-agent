@@ -50,6 +50,8 @@ pub use ipc::{
     shutdown_handle, split, sweep_stale_endpoints, validate_runtime_artifact_basename,
     validate_unix_socket_path, write_immediate,
 };
+#[cfg(target_os = "macos")]
+pub use process::process_group_contains_only_leader;
 pub use process::program_on_path;
 pub use process::{
     ProcessExitMonitor, ProcessGroup, ProcessId, ProcessSignal, abandon_process_group,

@@ -111,6 +111,24 @@ impl PipeSidecarTask {
             }
         }
     }
+
+    async fn finish_close(&mut self) -> Result<(), HaiderError> {
+        self.durable_head.take();
+        if let Some(task) = self.task.as_mut() {
+            // Keep ownership across await. Unlike forced daemon shutdown,
+            // native close must wait for any already-started blocking I/O.
+            task.await.map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("session sidecar task failed during close: {error}"),
+                    true,
+                )
+            })?;
+        }
+        self.task.take();
+        self.writer.release_clean(&self.session_id);
+        Ok(())
+    }
 }
 
 impl Drop for PipeSidecarTask {
@@ -316,6 +334,7 @@ pub(super) async fn run_session_actor(
     metrics: Arc<HubMetrics>,
     hooks: Arc<CommitProjection>,
     force_stop: Arc<AtomicBool>,
+    closing: Arc<AtomicBool>,
     mut commands: mpsc::Receiver<ActorCommand>,
 ) {
     let mut attachments = HashMap::<AttachmentId, ActorAttachment>::new();
@@ -335,6 +354,21 @@ pub(super) async fn run_session_actor(
     while let Some(command) = commands.recv().await {
         if force_stop.load(Ordering::Acquire) {
             break;
+        }
+        if closing.load(Ordering::Acquire)
+            && !matches!(
+                &command,
+                ActorCommand::Detach { .. }
+                    | ActorCommand::UnregisterHarness { .. }
+                    | ActorCommand::FenceIfQuiescent { .. }
+                    | ActorCommand::FenceForClose { .. }
+                    | ActorCommand::StopForClose { .. }
+                    | ActorCommand::Stop
+            )
+        {
+            // A sender obtained before the admission fence cannot start new
+            // work behind the close barrier. Dropping its reply reports closure.
+            continue;
         }
         match command {
             ActorCommand::Append {
@@ -1812,6 +1846,17 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(());
             }
+            ActorCommand::FenceForClose { completed } => {
+                let result = if attachments.is_empty() {
+                    session_is_quiescent(&store, &session_id).await
+                } else {
+                    Ok(false)
+                };
+                if result.as_ref().is_ok_and(|quiescent| *quiescent) {
+                    closing.store(true, Ordering::Release);
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::FenceIfQuiescent { completed } => {
                 let result = if attachments.is_empty() {
                     session_is_quiescent(&store, &session_id).await
@@ -1833,6 +1878,11 @@ pub(super) async fn run_session_actor(
                     return;
                 }
                 let _ = completed.send(result);
+            }
+            ActorCommand::StopForClose { completed } => {
+                let result = pipe_sidecar.finish_close().await;
+                let _ = completed.send(result);
+                return;
             }
             ActorCommand::Stop => break,
         }

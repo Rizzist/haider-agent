@@ -3850,6 +3850,7 @@ async fn detach_mid_replay_purges_and_leaks_no_later_event() {
             RequestId::new("detach"),
             RequestBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                close_session: false,
             },
         )
         .await
@@ -3864,7 +3865,7 @@ async fn detach_mid_replay_purges_and_leaks_no_later_event() {
             matches!(
                 frame,
                 WireFrame::Response {
-                    body: ResponseBody::SessionDetach { attachment_id: found },
+                    body: ResponseBody::SessionDetach { attachment_id: found, .. },
                     ..
                 } if found == &attachment_id
             )
@@ -5599,6 +5600,7 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
             RequestId::new("descendant-first-detach"),
             RequestBody::SessionDetach {
                 attachment_id: first_attachment,
+                close_session: false,
             },
         )
         .await
@@ -5924,7 +5926,10 @@ async fn descendant_reconnect_preserves_cursor_seeded_ancestry() {
     connection
         .request(
             RequestId::new("cohort-detach"),
-            RequestBody::SessionDetach { attachment_id },
+            RequestBody::SessionDetach {
+                attachment_id,
+                close_session: false,
+            },
         )
         .await
         .expect("detach first cohort");
@@ -7758,6 +7763,7 @@ async fn per_connection_attachment_cap_rejects_overloaded_and_readmits_after_det
             RequestId::new("detach-1"),
             RequestBody::SessionDetach {
                 attachment_id: first,
+                close_session: false,
             },
         )
         .await
@@ -7837,6 +7843,7 @@ async fn global_attachment_cap_binds_independently_of_per_connection_headroom() 
             RequestId::new("first-detach"),
             RequestBody::SessionDetach {
                 attachment_id: held,
+                close_session: false,
             },
         )
         .await
@@ -8051,6 +8058,7 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
             RequestId::new("detach-after"),
             RequestBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                close_session: false,
             },
         )
         .await

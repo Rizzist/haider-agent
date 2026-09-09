@@ -15,6 +15,8 @@
 
 use crate::session_hub::{HubStoreHandle, SessionHub, WeakSessionHub};
 use async_trait::async_trait;
+use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, Shared};
 use haider_core::{StoreHandle as _, TurnAcceptCommand, TurnAdmissionDisposition};
 use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{
@@ -31,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1050,29 +1053,43 @@ struct RateWindow {
     matches: u32,
 }
 
+type MonitorTaskResult = Result<(), Arc<tokio::task::JoinError>>;
+
+#[derive(Clone)]
+struct MonitorTask {
+    completed: Shared<BoxFuture<'static, MonitorTaskResult>>,
+    lifetime: tokio::task::AbortHandle,
+}
+
+impl MonitorTask {
+    async fn join(self) -> MonitorTaskResult {
+        self.completed.await
+    }
+}
+
 struct TimeoutTask {
     token: u64,
     cancel: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    task: MonitorTask,
 }
 
 struct DeliveryTask {
     token: u64,
     cancel: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    task: MonitorTask,
 }
 
 struct EnqueueTask {
     token: u64,
     pending: Arc<StdMutex<EnqueueRetryQueue>>,
     cancel: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    task: MonitorTask,
 }
 
 struct RunnerTask {
     token: u64,
     cancel: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    task: MonitorTask,
 }
 
 #[derive(Clone)]
@@ -1166,6 +1183,7 @@ struct MonitorServiceInner {
     enqueue_sequence: AtomicU64,
     runner_tasks: StdMutex<HashMap<(SessionId, String), RunnerTask>>,
     runner_sequence: AtomicU64,
+    session_tasks: StdMutex<HashMap<SessionId, Vec<MonitorTask>>>,
     runtime_status: StdMutex<HashMap<(SessionId, String), MonitorRuntimeStatus>>,
     sms_enqueued_sequence: StdRwLock<Option<Arc<AtomicU64>>>,
     sms_classified: watch::Sender<u64>,
@@ -1204,6 +1222,7 @@ impl Default for MonitorService {
                 enqueue_sequence: AtomicU64::new(0),
                 runner_tasks: StdMutex::new(HashMap::new()),
                 runner_sequence: AtomicU64::new(0),
+                session_tasks: StdMutex::new(HashMap::new()),
                 runtime_status: StdMutex::new(HashMap::new()),
                 sms_enqueued_sequence: StdRwLock::new(None),
                 sms_classified,
@@ -1475,7 +1494,7 @@ impl MonitorService {
         let mut first_join_error = None::<String>;
         for TimeoutTask { cancel, task, .. } in timeout_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor timeout task failed: {error}"));
@@ -1483,7 +1502,7 @@ impl MonitorService {
         }
         for DeliveryTask { cancel, task, .. } in delivery_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor delivery task failed: {error}"));
@@ -1491,7 +1510,7 @@ impl MonitorService {
         }
         for EnqueueTask { cancel, task, .. } in enqueue_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor enqueue task failed: {error}"));
@@ -1499,10 +1518,24 @@ impl MonitorService {
         }
         for RunnerTask { cancel, task, .. } in runner_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor runner task failed: {error}"));
+            }
+        }
+        let session_tasks = std::mem::take(
+            &mut *self
+                .inner
+                .session_tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for task in session_tasks.into_values().flatten() {
+            if let Err(error) = task.join().await
+                && first_join_error.is_none()
+            {
+                first_join_error = Some(format!("retired monitor task failed: {error}"));
             }
         }
         for task in runtime_tasks {
@@ -1604,7 +1637,7 @@ impl MonitorService {
         let mut first_join_error = None::<String>;
         for TimeoutTask { cancel, task, .. } in timeout_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor timeout task failed: {error}"));
@@ -1612,7 +1645,7 @@ impl MonitorService {
         }
         for DeliveryTask { cancel, task, .. } in delivery_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor delivery task failed: {error}"));
@@ -1620,7 +1653,7 @@ impl MonitorService {
         }
         for EnqueueTask { cancel, task, .. } in enqueue_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor enqueue task failed: {error}"));
@@ -1628,11 +1661,16 @@ impl MonitorService {
         }
         for RunnerTask { cancel, task, .. } in runner_tasks {
             let _ = cancel.send(());
-            if let Err(error) = task.await
+            if let Err(error) = task.join().await
                 && first_join_error.is_none()
             {
                 first_join_error = Some(format!("monitor runner task failed: {error}"));
             }
+        }
+        if let Err(error) = self.join_session_tasks(session).await
+            && first_join_error.is_none()
+        {
+            first_join_error = Some(error.to_string());
         }
         if let Some(error) = first_join_error {
             return match self.restore_session(hub, session).await {
@@ -1643,6 +1681,64 @@ impl MonitorService {
             };
         }
         Ok(())
+    }
+
+    fn spawn_session_task(
+        &self,
+        hub: &WeakSessionHub,
+        session: &SessionId,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> Option<MonitorTask> {
+        let hub = hub.upgrade()?;
+        let activity = hub.try_session_activity(session).ok()?;
+        let owner = crate::native_process::NativeOwner::new(&hub, session, activity);
+        let task = tokio::spawn(crate::native_process::NativeOwner::scope(Some(owner), work));
+        let task = MonitorTask {
+            lifetime: task.abort_handle(),
+            completed: task.map(|result| result.map_err(Arc::new)).boxed().shared(),
+        };
+        let mut owners = self
+            .inner
+            .session_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let owners = owners.entry(session.clone()).or_default();
+        owners.retain(|owner| !owner.lifetime.is_finished());
+        owners.push(task.clone());
+        Some(task)
+    }
+
+    /// Close holds the exclusive session activity fence. Every submitted
+    /// runner/timeout/enqueue/delivery owner has finished, including cancelled
+    /// or replaced revisions whose public registry entry was already removed.
+    pub(crate) async fn join_session_tasks(&self, session: &SessionId) -> Result<(), MonitorError> {
+        let tasks = self
+            .inner
+            .session_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(session)
+            .unwrap_or_default();
+        let mut failure = None;
+        for task in tasks {
+            if let Err(error) = task.join().await {
+                failure = Some(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(MonitorError::Delivery(format!(
+                "monitor session task failed: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_session_resources(&self, session: &SessionId) -> bool {
+        self.inner
+            .registry
+            .lock()
+            .get(session)
+            .is_some_and(|state| !state.monitors.is_empty() || !state.pending_reports.is_empty())
     }
 
     pub(crate) async fn restore_session(
@@ -1695,6 +1791,9 @@ impl MonitorService {
         hub: &SessionHub,
         session: &SessionId,
     ) -> Result<(), MonitorError> {
+        let _activity = hub
+            .try_session_activity(session)
+            .map_err(|error| MonitorError::Store(error.to_string()))?;
         let _mutation = self.inner.mutations.lock().await;
         self.adopt_session_locked(hub, session).await
     }
@@ -2045,6 +2144,12 @@ impl MonitorService {
         hub: &SessionHub,
         session: SessionId,
     ) -> haider_rpc::MonitorListReceiptWire {
+        let Ok(_activity) = hub.try_session_activity(&session) else {
+            return monitor_list_rejected(
+                session,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        };
         if *self.inner.shutdown.borrow() || self.is_retired(&session) {
             return monitor_list_rejected(
                 session,
@@ -2113,6 +2218,14 @@ impl MonitorService {
             occurrence,
             lifetime,
         } = request;
+        let Ok(_activity) = hub.try_session_activity(&session_id) else {
+            return monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        };
         let parsed = match monitor_register_request_from_wire(
             source, filter, action, occurrence, lifetime,
         ) {
@@ -2705,6 +2818,14 @@ impl MonitorService {
         monitor_id: String,
     ) -> haider_rpc::MonitorRemoveReceiptWire {
         let current_generation = hub.worker_generation();
+        let Ok(_activity) = hub.try_session_activity(&session_id) else {
+            return monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        };
         let parsed = match MonitorRequest::from_tool_args(json!({
             "operation": "remove",
             "monitor_id": monitor_id,
@@ -3114,6 +3235,12 @@ impl MonitorService {
         self.clear_rate(&session_id, &monitor_id);
         self.cancel_timeout(&session_id, &monitor_id);
         self.cancel_enqueue(&session_id, &monitor_id);
+        self.cancel_runner(&session_id, &monitor_id);
+        self.inner
+            .runtime_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(session_id.clone(), monitor_id.clone()));
         match self
             .finalize_client_receipt(
                 hub,
@@ -3143,6 +3270,14 @@ impl MonitorService {
         mutation: haider_rpc::MonitorMutationWire,
     ) -> haider_rpc::MonitorMutateReceiptWire {
         let current_generation = hub.worker_generation();
+        let Ok(_activity) = hub.try_session_activity(&session_id) else {
+            return monitor_mutate_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        };
         let operation = monitor_mutation_name(&mutation);
         if command_id.as_str().trim().is_empty() {
             return monitor_mutate_rejected(
@@ -3852,6 +3987,11 @@ impl MonitorService {
         coordinates: MonitorToolCoordinates,
         request: MonitorRequest,
     ) -> ToolResult<BoundedResult> {
+        let _activity = hub
+            .try_session_activity(store.session_id())
+            .map_err(|error| ToolError::Runtime {
+                message: error.to_string(),
+            })?;
         if *self.inner.shutdown.borrow() || self.is_retired(store.session_id()) {
             return Err(ToolError::Runtime {
                 message: "monitor service is stopped for this session".into(),
@@ -4542,6 +4682,9 @@ impl MonitorService {
         registration: &MonitorRegistration,
         matching: Vec<MonitorEvent>,
     ) {
+        let Ok(_activity) = hub.session_activity(session).await else {
+            return;
+        };
         let _mutation = self.inner.mutations.lock().await;
         if *self.inner.shutdown.borrow()
             || self.is_retired(session)
@@ -4791,7 +4934,9 @@ impl MonitorService {
         let (cancel, mut cancelled) = oneshot::channel();
         let (start, started) = oneshot::channel();
         let mut shutdown = self.inner.shutdown.subscribe();
-        let task = tokio::spawn(async move {
+        let owner_hub = hub.clone();
+        let owner_session = session.clone();
+        let Some(task) = self.spawn_session_task(&owner_hub, &owner_session, async move {
             if started.await.is_err() {
                 return;
             }
@@ -4911,7 +5056,7 @@ impl MonitorService {
                 }
                 backoff = std::cmp::min(backoff.saturating_mul(2), MONITOR_DELIVERY_RETRY_MAX);
             }
-        });
+        }) else { return; };
         tasks.insert(
             key,
             EnqueueTask {
@@ -4958,7 +5103,9 @@ impl MonitorService {
         let (cancel, mut cancelled) = oneshot::channel();
         let (start, started) = oneshot::channel();
         let mut shutdown = self.inner.shutdown.subscribe();
-        let task = tokio::spawn(async move {
+        let owner_hub = hub.clone();
+        let owner_session = session.clone();
+        let Some(task) = self.spawn_session_task(&owner_hub, &owner_session, async move {
             if started.await.is_err() {
                 return;
             }
@@ -5007,7 +5154,7 @@ impl MonitorService {
                     tasks.remove(&completion_key);
                 }
             }
-        });
+        }) else { return; };
         let mut tasks = self
             .inner
             .delivery_tasks
@@ -5169,7 +5316,9 @@ impl MonitorService {
         let (cancel, cancelled) = oneshot::channel();
         let (start, started) = oneshot::channel();
         let task_session = session.clone();
-        let task = tokio::spawn(async move {
+        let owner_hub = hub.clone();
+        let owner_session = session.clone();
+        let Some(task) = self.spawn_session_task(&owner_hub, &owner_session, async move {
             if started.await.is_err() {
                 return;
             }
@@ -5197,7 +5346,9 @@ impl MonitorService {
                     tasks.remove(&completion_key);
                 }
             }
-        });
+        }) else {
+            return;
+        };
         let mut tasks = self
             .inner
             .timeout_tasks
@@ -5413,7 +5564,9 @@ impl MonitorService {
         let completion_key = key.clone();
         let (cancel, cancelled) = oneshot::channel();
         let (start, started) = oneshot::channel();
-        let task = tokio::spawn(async move {
+        let owner_hub = hub.clone();
+        let owner_session = session.clone();
+        let Some(task) = self.spawn_session_task(&owner_hub, &owner_session, async move {
             if started.await.is_err() {
                 return;
             }
@@ -5443,7 +5596,9 @@ impl MonitorService {
                         .await;
                 }
             }
-        });
+        }) else {
+            return;
+        };
         let mut tasks = self
             .inner
             .runner_tasks
@@ -6063,67 +6218,13 @@ struct CapturedCommand {
     stderr: String,
 }
 
-struct MonitorChild {
-    child: tokio::process::Child,
-    group: Option<haider_platform::ProcessGroup>,
-}
-
-impl MonitorChild {
-    fn spawn(command: haider_tools::PreparedMonitorProcess) -> Result<Self, String> {
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("cannot spawn monitor command: {error}"))?;
-        let pid = child
-            .id()
-            .ok_or_else(|| "spawned monitor command did not expose a process id".to_owned())?;
-        let group = match haider_platform::register_process_group(pid) {
-            Ok(group) => group,
-            Err(error) => {
-                let _ = child.start_kill();
-                return Err(format!(
-                    "cannot attach monitor command {pid} to its process group: {error}"
-                ));
-            }
-        };
-        Ok(Self {
-            child,
-            group: Some(group),
-        })
-    }
-
-    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
-    }
-
-    fn finish_normal(&mut self) -> std::io::Result<()> {
-        if let Some(group) = self.group.take() {
-            if let Err(error) = haider_platform::detach_process_group(group) {
-                let _ = haider_platform::signal_process_group(
-                    group,
-                    haider_platform::ProcessSignal::Kill,
-                );
-                haider_platform::release_process_group(group);
-                return Err(error);
-            }
-            haider_platform::release_process_group(group);
-        }
-        Ok(())
-    }
-
-    fn kill_group(&mut self) {
-        if let Some(group) = self.group.take() {
-            let _ =
-                haider_platform::signal_process_group(group, haider_platform::ProcessSignal::Kill);
-            haider_platform::release_process_group(group);
-        }
-        let _ = self.child.start_kill();
-    }
-}
-
-impl Drop for MonitorChild {
-    fn drop(&mut self) {
-        self.kill_group();
-    }
+async fn spawn_monitor_child(
+    command: haider_tools::PreparedMonitorProcess,
+) -> Result<crate::native_process::NativeProcess, String> {
+    command
+        .spawn()
+        .and_then(crate::native_process::NativeProcess::register)
+        .map_err(|error| format!("cannot spawn monitor command: {error}"))
 }
 
 async fn run_poll_monitor(
@@ -6143,16 +6244,16 @@ async fn run_poll_monitor(
             () = tokio::time::sleep(interval) => {}
             _ = &mut *cancelled => return,
         }
-        let result = tokio::select! {
-            result = run_command_capped(
-                command,
-                registration.workspace_root.as_deref(),
-                Duration::from_millis(interval_ms).min(Duration::from_secs(60)),
-            ) => result,
-            _ = &mut *cancelled => return,
-        };
+        let result = run_command_capped(
+            command,
+            registration.workspace_root.as_deref(),
+            Duration::from_millis(interval_ms).min(Duration::from_secs(60)),
+            cancelled,
+        )
+        .await;
         let result = match result {
-            Ok(result) => result,
+            Ok(Some(result)) => result,
+            Ok(None) => return,
             Err(error) => CapturedCommand {
                 exit_code: -1,
                 stdout: String::new(),
@@ -6230,45 +6331,47 @@ async fn run_command_capped(
     command: &ApprovedMonitorCommand,
     workspace: Option<&str>,
     timeout: Duration,
-) -> Result<CapturedCommand, String> {
+    cancelled: &mut oneshot::Receiver<()>,
+) -> Result<Option<CapturedCommand>, String> {
     let workspace = workspace.ok_or_else(|| "monitor workspace is unavailable".to_owned())?;
-    let mut child = MonitorChild::spawn(monitor_command(command, Path::new(workspace))?)?;
-    let stdout = child
-        .child
-        .stdout
-        .take()
-        .ok_or_else(|| "monitor stdout was not piped".to_owned())?;
-    let stderr = child
-        .child
-        .stderr
-        .take()
-        .ok_or_else(|| "monitor stderr was not piped".to_owned())?;
+    let mut child = spawn_monitor_child(monitor_command(command, Path::new(workspace))?).await?;
+    let (Some(stdout), Some(stderr)) = (child.take_stdout(), child.take_stderr()) else {
+        let _ = child.finish().await;
+        return Err("monitor output was not piped".into());
+    };
     let half_cap = MONITOR_OUTPUT_CAP_BYTES / 2;
     let execution = async {
         let (status, stdout, stderr) = tokio::join!(
-            child.wait(),
+            child.observe_exit(),
             drain_capped(stdout, half_cap),
             drain_capped(stderr, half_cap),
         );
-        let status = status.map_err(|error| format!("cannot wait for monitor command: {error}"))?;
-        child
-            .finish_normal()
-            .map_err(|error| format!("cannot release monitor command group: {error}"))?;
-        Ok(CapturedCommand {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-        })
+        status.map_err(|error| format!("cannot wait for monitor command: {error}"))?;
+        Ok::<_, String>((stdout, stderr))
     };
-    match tokio::time::timeout(timeout, execution).await {
-        Ok(result) => result,
-        Err(_) => {
-            child.kill_group();
-            Err(format!(
-                "monitor command exceeded {}ms, including output drain",
-                timeout.as_millis()
-            ))
-        }
+    let result = tokio::select! {
+        result = tokio::time::timeout(timeout, execution) => Some(result),
+        _ = &mut *cancelled => None,
+    };
+    // Cancellation drops only the bounded output/read phase. Process-tree
+    // cleanup remains inside the owning runner and must finish before return.
+    let status = child
+        .finish()
+        .await
+        .map_err(|error| format!("monitor cleanup failed: {error}"))?;
+    match result {
+        Some(Ok(result)) => result.map(|(stdout, stderr)| {
+            Some(CapturedCommand {
+                exit_code: status.code().unwrap_or(-1),
+                stdout,
+                stderr,
+            })
+        }),
+        None => Ok(None),
+        Some(Err(_)) => Err(format!(
+            "monitor command exceeded {}ms, including output drain",
+            timeout.as_millis()
+        )),
     }
 }
 
@@ -6383,7 +6486,9 @@ async fn run_process_monitor_once(
         return Some(-1);
     };
     let mut child =
-        match monitor_command(command, Path::new(workspace)).and_then(MonitorChild::spawn) {
+        match async { spawn_monitor_child(monitor_command(command, Path::new(workspace))?).await }
+            .await
+        {
             Ok(child) => child,
             Err(error) => {
                 let payload = process_payload(cli, error, None, true, Some(-1));
@@ -6391,52 +6496,57 @@ async fn run_process_monitor_once(
                 return Some(-1);
             }
         };
-    let stdout = child.child.stdout.take()?;
-    let stderr = child.child.stderr.take()?;
+    let (Some(stdout), Some(stderr)) = (child.take_stdout(), child.take_stderr()) else {
+        let _ = child.finish().await;
+        return Some(-1);
+    };
     let stdout_service = service.clone();
     let stdout_registration = registration.clone();
-    let mut stdout_task = tokio::spawn(async move {
+    let mut stdout_task = crate::native_process::NativeTask::spawn(async move {
         stream_process_stdout(&stdout_service, &stdout_registration, stdout, cli).await
     });
-    let mut stderr_task = tokio::spawn(drain_capped(stderr, MONITOR_OUTPUT_CAP_BYTES / 2));
+    let mut stderr_task = crate::native_process::NativeTask::spawn(drain_capped(
+        stderr,
+        MONITOR_OUTPUT_CAP_BYTES / 2,
+    ));
     let status = tokio::select! {
-        status = child.wait() => status,
+        status = child.observe_exit() => status,
         _ = &mut *cancelled => {
-            child.kill_group();
+            let _ = child.finish().await;
             stdout_task.abort();
             stderr_task.abort();
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            let _ = stdout_task.wait().await;
+            let _ = stderr_task.wait().await;
             return None;
         }
     };
     if status.is_err() {
-        child.kill_group();
+        let _ = child.finish().await;
     }
     let drain = async {
-        let final_text = (&mut stdout_task).await.unwrap_or_default();
-        let stderr = (&mut stderr_task).await.unwrap_or_default();
+        let final_text = stdout_task.wait().await.unwrap_or_default();
+        let stderr = stderr_task.wait().await.unwrap_or_default();
         (final_text, stderr)
     };
     let drained = tokio::select! {
         result = tokio::time::timeout(MONITOR_PIPE_DRAIN_TIMEOUT, drain) => result.ok(),
         _ = &mut *cancelled => {
-            child.kill_group();
+            let _ = child.finish().await;
             stdout_task.abort();
             stderr_task.abort();
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            let _ = stdout_task.wait().await;
+            let _ = stderr_task.wait().await;
             return None;
         }
     };
     let (final_text, mut stderr) = match drained {
         Some(output) => output,
         None => {
-            child.kill_group();
+            let _ = child.finish().await;
             stdout_task.abort();
             stderr_task.abort();
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            let _ = stdout_task.wait().await;
+            let _ = stderr_task.wait().await;
             (
                 String::new(),
                 format!(
@@ -6446,22 +6556,14 @@ async fn run_process_monitor_once(
             )
         }
     };
-    if status.is_ok()
-        && child.group.is_some()
-        && let Err(error) = child.finish_normal()
-    {
-        if !stderr.is_empty() {
-            stderr.push_str("; ");
-        }
-        stderr.push_str(&format!("cannot release monitor process group: {error}"));
-    }
+    let reaped = child.finish().await;
     if let Err(error) = &status {
         if !stderr.is_empty() {
             stderr.push_str("; ");
         }
         stderr.push_str(&format!("cannot wait for monitor process: {error}"));
     }
-    let code = status.ok().and_then(|status| status.code()).unwrap_or(-1);
+    let code = reaped.ok().and_then(|status| status.code()).unwrap_or(-1);
     let terminal = json!({
         "event": "exit",
         "exit_code": code,

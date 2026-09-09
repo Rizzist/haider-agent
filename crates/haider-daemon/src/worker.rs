@@ -4740,15 +4740,19 @@ async fn run_supervisor(
     let mut delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
     // W-A: rebuild this session's background-task projection and reap
     // prior-generation orphans as soon as the session becomes live again.
-    {
+    let mut adoption = {
         let tasks = crate::tasks::TaskFacade::new(lease.hub().clone());
         let session_id = lease.session_id().clone();
-        tokio::spawn(async move {
-            if let Err(error) = tasks.adopt_session(&session_id).await {
-                tracing::warn!(%session_id, ?error, "background-task adoption failed at supervisor start");
+        Box::pin(async move {
+            if let Err(error) = tasks
+                .start_session_adoption_when_available(&session_id)
+                .await
+            {
+                tracing::warn!(%session_id, ?error, "background-task adoption admission failed");
             }
-        });
-    }
+        })
+    };
+    let mut adoption_pending = true;
 
     loop {
         if retire_requested && active.is_none() {
@@ -5127,6 +5131,9 @@ async fn run_supervisor(
                             return false;
                         }
                     }
+                }
+                () = &mut adoption, if adoption_pending => {
+                    adoption_pending = false;
                 }
                 command = commands.recv() => {
                     match command {
@@ -5574,6 +5581,9 @@ async fn run_supervisor(
             }
         } else {
             tokio::select! {
+                () = &mut adoption, if adoption_pending => {
+                    adoption_pending = false;
+                }
                 command = commands.recv() => match command {
                     Some(SupervisorCommand::Submit(pending)) => {
                         idle_deadline = None;
