@@ -38,12 +38,15 @@ pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
     for piece in detail.split_inclusive(char::is_whitespace) {
         let word = piece.trim_end_matches(char::is_whitespace);
         let whitespace = &piece[word.len()..];
-        while spans.peek().is_some_and(|span| span.end <= offset) {
+        while spans.peek().is_some_and(|span| span.range.end <= offset) {
             spans.next();
         }
         let header_secret = spans
             .peek()
-            .is_some_and(|span| span.start < offset + word.len());
+            .is_some_and(|span| span.range.start < offset + word.len());
+        let quoted_secret_ended = spans
+            .peek()
+            .is_some_and(|span| span.quoted && span.range.end <= offset + word.len());
         offset += piece.len();
         if word.is_empty() {
             output.push_str(whitespace);
@@ -54,7 +57,9 @@ pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
             .to_ascii_lowercase();
         if header_secret || redact_next || contains_provider_secret(&normalized) {
             output.push_str("[REDACTED]");
-            redact_next = (header_secret || redact_next) && is_authorization_scheme(&normalized);
+            redact_next = (header_secret || redact_next)
+                && !quoted_secret_ended
+                && is_authorization_scheme(&normalized);
         } else {
             output.push_str(word);
             redact_next = normalized == "bearer" || is_secret_label(&normalized);
@@ -84,7 +89,12 @@ fn is_secret_label(value: &str) -> bool {
         .any(|label| value.eq_ignore_ascii_case(label))
 }
 
-fn header_secret_spans(detail: &str) -> Vec<std::ops::Range<usize>> {
+struct SecretSpan {
+    range: std::ops::Range<usize>,
+    quoted: bool,
+}
+
+fn header_secret_spans(detail: &str) -> Vec<SecretSpan> {
     // Locate every header independently of whitespace: the preceding credential
     // may be adjacent to another header, including inside compact JSON.
     let mut headers = detail
@@ -104,27 +114,33 @@ fn header_secret_spans(detail: &str) -> Vec<std::ops::Range<usize>> {
         .peekable();
     let mut spans = Vec::new();
     while let Some((header_start, value_start, authorization)) = headers.next() {
-        let next_header = headers.peek().map(|header| header.0);
-        let limit = next_header.unwrap_or(detail.len());
-        let value = &detail[value_start..limit];
+        let value = &detail[value_start..];
         let value_text = value.trim_start_matches(char::is_whitespace);
+        let text_start = detail.len() - value_text.len();
         let start = if value.len() == value_text.len() {
             header_start
         } else {
-            limit - value_text.len()
+            text_start
         };
+        if let Some(end) = quoted_credential_end(value_text, authorization) {
+            let end = text_start + end;
+            spans.push(SecretSpan {
+                range: start..end,
+                quoted: true,
+            });
+            // Apparent headers inside a quoted credential belong to that
+            // credential; only resume header matching after its closing quote.
+            while headers.peek().is_some_and(|header| header.0 < end) {
+                headers.next();
+            }
+            continue;
+        }
+        let next_header = headers.peek().map(|header| header.0);
+        let limit = next_header.unwrap_or(detail.len());
+        let value_text = &detail[text_start..limit];
         let mut credential = value_text.trim_start_matches(['"', '\'']);
         if authorization {
-            for scheme in ["bearer", "basic", "token"] {
-                if credential
-                    .get(..scheme.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
-                {
-                    // A scheme may touch its credential (Bearer<token>).
-                    credential = &credential[scheme.len()..];
-                    break;
-                }
-            }
+            credential = strip_authorization_scheme(credential).unwrap_or(credential);
         }
         credential =
             credential.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'));
@@ -140,9 +156,58 @@ fn header_secret_spans(detail: &str) -> Vec<std::ops::Range<usize>> {
                     .find(char::is_whitespace)
                     .unwrap_or(credential.len())
             });
-        spans.push(start..credential_start + end);
+        spans.push(SecretSpan {
+            range: start..credential_start + end,
+            quoted: false,
+        });
     }
     spans
+}
+
+fn quoted_credential_end(value: &str, authorization: bool) -> Option<usize> {
+    let mut credential = value;
+    loop {
+        if let Some(end) = closing_quote_end(credential) {
+            if !authorization || !is_authorization_scheme(&credential[..end]) {
+                return Some(value.len() - credential.len() + end);
+            }
+            // A separately quoted scheme still introduces a credential.
+            credential = &credential[end..];
+        } else if authorization {
+            credential = strip_authorization_scheme(credential.trim_start_matches(['"', '\'']))?;
+        } else {
+            return None;
+        }
+        credential = credential.trim_start_matches(char::is_whitespace);
+    }
+}
+
+fn strip_authorization_scheme(value: &str) -> Option<&str> {
+    ["bearer", "basic", "token"].iter().find_map(|scheme| {
+        // A scheme may touch its credential (Bearer<token>).
+        value
+            .get(..scheme.len())?
+            .eq_ignore_ascii_case(scheme)
+            .then_some(&value[scheme.len()..])
+    })
+}
+
+fn closing_quote_end(value: &str) -> Option<usize> {
+    let quote = *value.as_bytes().first()?;
+    if !matches!(quote, b'"' | b'\'') {
+        return None;
+    }
+    let mut escaped = false;
+    for (offset, byte) in value.bytes().enumerate().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == quote {
+            return Some(offset + 1);
+        }
+    }
+    None
 }
 
 fn is_authorization_scheme(value: &str) -> bool {

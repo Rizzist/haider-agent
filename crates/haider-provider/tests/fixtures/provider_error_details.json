@@ -458,5 +458,256 @@
       "fixture-stacked-secret"
     ],
     "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "quoted-inner-boundary-0",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head, v3tail0\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail0"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-1",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head; v3tail1\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail1"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-2",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head{ v3tail2\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail2"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-3",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head} v3tail3\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail3"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-4",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head[ v3tail4\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail4"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-5",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head] v3tail5\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail5"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-6",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head' v3tail6\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail6"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-7",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head\\\" v3tail7\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail7"
+    ],
+    "expected": null
+  },
+  {
+    "name": "single-quoted-comma",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:'v3head, v3single'; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3single"
+    ],
+    "expected": null
+  },
+  {
+    "name": "header-inside-quoted-secret",
+    "detail": "Invalid request; X-Api-Key:\"v3first Authorization:Bearer v3middle, v3end\"; retained detail",
+    "secrets": [
+      "v3first",
+      "v3middle",
+      "v3end"
+    ],
+    "expected": null
+  },
+  {
+    "name": "isolated-alias-proxy-authorization",
+    "detail": "Invalid request; proxy-authorization v4opaque0 retained detail",
+    "secrets": [
+      "v4opaque0"
+    ],
+    "expected": "Invalid request; proxy-authorization [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-authorization",
+    "detail": "Invalid request; authorization v4opaque1 retained detail",
+    "secrets": [
+      "v4opaque1"
+    ],
+    "expected": "Invalid request; authorization [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-x-api-key",
+    "detail": "Invalid request; x-api-key v4opaque2 retained detail",
+    "secrets": [
+      "v4opaque2"
+    ],
+    "expected": "Invalid request; x-api-key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-x_api_key",
+    "detail": "Invalid request; x_api_key v4opaque3 retained detail",
+    "secrets": [
+      "v4opaque3"
+    ],
+    "expected": "Invalid request; x_api_key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-api-key",
+    "detail": "Invalid request; api-key v4opaque4 retained detail",
+    "secrets": [
+      "v4opaque4"
+    ],
+    "expected": "Invalid request; api-key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-api_key",
+    "detail": "Invalid request; api_key v4opaque5 retained detail",
+    "secrets": [
+      "v4opaque5"
+    ],
+    "expected": "Invalid request; api_key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-apikey",
+    "detail": "Invalid request; apikey v4opaque6 retained detail",
+    "secrets": [
+      "v4opaque6"
+    ],
+    "expected": "Invalid request; apikey [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-access_token",
+    "detail": "Invalid request; access_token v4opaque7 retained detail",
+    "secrets": [
+      "v4opaque7"
+    ],
+    "expected": "Invalid request; access_token [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-access-token",
+    "detail": "Invalid request; access-token v4opaque8 retained detail",
+    "secrets": [
+      "v4opaque8"
+    ],
+    "expected": "Invalid request; access-token [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-refresh_token",
+    "detail": "Invalid request; refresh_token v4opaque9 retained detail",
+    "secrets": [
+      "v4opaque9"
+    ],
+    "expected": "Invalid request; refresh_token [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-refresh-token",
+    "detail": "Invalid request; refresh-token v4opaque10 retained detail",
+    "secrets": [
+      "v4opaque10"
+    ],
+    "expected": "Invalid request; refresh-token [REDACTED] retained detail"
+  },
+  {
+    "name": "single-quoted-escaped-quote",
+    "detail": "Invalid request; X-Api-Key:'v4head\\' v4tail'; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-even-backslashes",
+    "detail": "Invalid request; X-Api-Key:\"v4even\\\\\"; retained detail",
+    "secrets": [
+      "v4even"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-odd-backslashes",
+    "detail": "Invalid request; X-Api-Key:\"v4head\\\\\\\" v4tail\"; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-headers-then-independent-header",
+    "detail": "Invalid request; X-Api-Key:\"v4head Authorization:Bearer v4middle, v4tail\"; access_token: v4outside; retained detail",
+    "secrets": [
+      "v4head",
+      "v4middle",
+      "v4tail",
+      "v4outside"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-stacked-schemes",
+    "detail": "Invalid request; Authorization:Bearer Basic \"v4head, v4tail\"; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-separate-schemes",
+    "detail": "Invalid request; Authorization:\"Bearer\" 'Basic' \"v4head, v4tail\"; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-ending-scheme",
+    "detail": "Invalid request; X-Api-Key: \"v4head Bearer\" retained detail",
+    "secrets": [
+      "v4head"
+    ],
+    "expected": "Invalid request; X-Api-Key: [REDACTED] [REDACTED] retained detail"
   }
 ]
