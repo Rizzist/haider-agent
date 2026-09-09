@@ -373,7 +373,7 @@ impl EffectBroker {
 /// reads and the completion artifact, a rolling tail preview, and a total
 /// byte counter. Output beyond the cap is dropped — never buffered — so
 /// memory stays bounded while the task keeps running.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskOutputBuffer {
     original_hasher: sha2::Sha256,
     retained: Vec<u8>,
@@ -381,6 +381,7 @@ pub struct TaskOutputBuffer {
     tail: VecDeque<u8>,
     tail_cap: usize,
     total: u64,
+    pending_lines: [crate::OutputRedactor; 2],
 }
 
 impl TaskOutputBuffer {
@@ -393,6 +394,31 @@ impl TaskOutputBuffer {
             tail: VecDeque::new(),
             tail_cap,
             total: 0,
+            pending_lines: Default::default(),
+        }
+    }
+
+    /// Live reads include a redacted snapshot of unfinished lines. Keep those
+    /// views separate from committed bytes so a later token suffix cannot
+    /// freeze an unclassified fragment into the completion journal or CAS.
+    #[must_use]
+    pub fn live_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.finish_streams();
+        snapshot
+    }
+
+    fn append_stream(&mut self, stream: OutputStream, bytes: &[u8]) {
+        // Classify before the retained-head or completion-tail bounds can
+        // split a credential. Unfinished lines remain replaceable live views.
+        let index = usize::from(stream == OutputStream::Stderr);
+        let safe = self.pending_lines[index].push_bytes(bytes);
+        self.append(&safe);
+    }
+
+    fn finish_streams(&mut self) {
+        for mut redactor in std::mem::take(&mut self.pending_lines) {
+            self.append(&redactor.finish_bytes());
         }
     }
 
@@ -454,6 +480,10 @@ impl TaskOutputBuffer {
         (self.retained[start..end].to_vec(), end as u64)
     }
 }
+
+#[cfg(test)]
+#[path = "task_output_redaction_tests.rs"]
+mod output_redaction_tests;
 
 /// Shared handle to one task's live output.
 pub type SharedTaskOutput = Arc<Mutex<TaskOutputBuffer>>;
@@ -631,8 +661,8 @@ async fn supervise_background_with_exit_observation(
             }
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
-                    Some(Captured::Chunk(_, bytes)) => {
-                        lock_task_output(&output).append(&bytes);
+                    Some(Captured::Chunk(stream, bytes)) => {
+                        lock_task_output(&output).append_stream(stream, &bytes);
                     }
                     Some(Captured::ReadError(stream, error)) => {
                         fatal.get_or_insert_with(|| ToolError::Runtime {
@@ -800,6 +830,7 @@ async fn supervise_background_with_exit_observation(
         }
     }
 
+    lock_task_output(&output).finish_streams();
     if exit_status.is_none() && !killed {
         fatal.get_or_insert_with(|| ToolError::Runtime {
             message: format!("background task `{call_id}` ended without an exit status"),
@@ -1045,7 +1076,7 @@ where
 pub fn task_output_manifest() -> haider_protocol::tool::ToolManifest {
     haider_protocol::tool::ToolManifest {
         name: "task_output".into(),
-        description: "Read bounded output from a background task started with \
+        description: "Read a foreground capture handle or bounded output from a background task started with \
                       process_exec background=true. Without a cursor it returns the \
                       rolling tail preview; with a cursor it pages the retained output."
             .into(),
@@ -1057,7 +1088,7 @@ pub fn task_output_manifest() -> haider_protocol::tool::ToolManifest {
                 "task_id": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Task id returned by the background process_exec call"
+                    "description": "Task id or capture handle returned by process_exec"
                 },
                 "cursor": {
                     "type": "integer",

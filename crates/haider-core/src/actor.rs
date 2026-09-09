@@ -327,6 +327,37 @@ fn model_tool_payload_projection(
             savings,
         };
     }
+    // Numbered file reads and cursor-based task output own their pages. A
+    // second head/tail reducer loses content while advancing past that page.
+    let producer_owns_page = (tool_name == "fs_read"
+        && result.data.is_none()
+        && result.reason.as_deref() != Some("lockdown secret redaction forced on"))
+        || (tool_name == "task_output" && result.cursor.is_some());
+    if producer_owns_page {
+        let savings = result.truncated.then(|| {
+            let (omitted, exact) = inline_text_elision_disclosure(result.payload_text())
+                .unwrap_or_else(|| {
+                    result.truncation.as_ref().map_or((1, false), |marker| {
+                        (
+                            marker.original_bytes.saturating_sub(marker.payload_bytes) as usize,
+                            false,
+                        )
+                    })
+                });
+            OutputSavings::from_provider_request_bytes(
+                "bounded_tool_result",
+                haider_tools::provider_request_text_projection_bytes(result.payload_text()),
+                haider_tools::provider_request_text_projection_bytes(&result.preview),
+                omitted,
+                exact,
+            )
+        });
+        return ModelToolResultProjection {
+            preview: result.preview.clone(),
+            truncated: result.truncated,
+            savings,
+        };
+    }
     let disclosed_omission = inline_text_elision_disclosure(&result.preview);
     if tool_name == "process_exec"
         && result.truncated

@@ -78,6 +78,7 @@ mod endpoint;
 #[path = "endpoint_tests.rs"]
 mod endpoint_tests;
 mod error;
+mod foreground_capture;
 mod gcloud;
 mod haider_code_plan;
 #[cfg(test)]

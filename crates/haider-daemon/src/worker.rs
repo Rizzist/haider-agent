@@ -14620,7 +14620,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable sms/process/file/poll/timer/cli watches; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy"
         }
         "fs_read" => {
-            "fs_read(path, offset?, limit?) — read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle"
+            "fs_read(path, offset?, limit?, column?) — read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted"
         }
         "fs_glob" => {
             "fs_glob(pattern, path?, respect_gitignore?, include_hidden?) — stable, redacted repository-aware file listing; .git is always excluded"
@@ -14647,7 +14647,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "process_exec(command, cwd?, background?, name?, profile?) — run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable"
         }
         "task_output" => {
-            "task_output(task_id, cursor?) — read a background task's output; no cursor = rolling tail, cursor = page from that byte offset"
+            "task_output(task_id, cursor?) — page background output or a foreground capture handle; foreground cursors count secret-redacted UTF-8 bytes; follow next_cursor until exhausted"
         }
         "task_kill" => "task_kill(task_id) — terminate a background task's whole process group",
         "web_fetch" => {
@@ -16952,8 +16952,16 @@ impl BrokerToolDispatcher {
                     .map_err(|_| {
                         ToolError::invalid_argument("tool argument `limit` is too large")
                     })?;
+                let column = optional_u64(args, "column")?
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        ToolError::invalid_argument("tool argument `column` is too large")
+                    })?;
                 Ok(ParsedToolOperation::FsRead(
-                    FsRead::new(path).with_line_range(offset, limit),
+                    FsRead::new(path)
+                        .with_line_range(offset, limit)
+                        .with_column(column),
                 ))
             }
             RegisteredToolRoute::FsSearch => {
@@ -19075,7 +19083,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 };
                 let mut cas = self.cas.lock().await;
                 broker
-                    .fs_read(operation, &policy, &mut *cas, ResultBounds::default())
+                    .fs_read(operation, &policy, &mut *cas, ResultBounds::file_read())
                     .await
             }
             RegisteredToolRoute::FsSearch => {
@@ -19230,10 +19238,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         run_id.clone(),
                         item_id.clone(),
                         call_id.to_owned(),
-                        // Raw live chunks remain UI-visible/durable and are
-                        // frozen in CAS, but prompt omission leaves the
-                        // deterministic bounded result as the model's sole
-                        // view. No model-visible prefix is rewritten.
+                        // CAS retains the owner-authorized raw capture. The
+                        // sink redacts complete lines before UI/journal send;
+                        // only the bounded result enters the model view.
                         PromptRender::Omit,
                         None,
                     );
@@ -19294,7 +19301,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 }
                             };
                             match waited {
-                                Ok(result) => {
+                                Ok(mut result) => {
+                                    let safe_output = self.tasks.retain_foreground_capture(&self.session_id, &mut result).await.map_err(tool_error)?;
                                     let _ = shell.add_output(result.output_bytes);
                                     let _ = shell.exited(result.exit_code);
                                     match self.output.record_process_signal(run_id, &result).await {
@@ -19319,7 +19327,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                                     return Err(tool_error(error));
                                                 }
                                             }
-                                            Ok(process_result_with_signal(result, Some(&signal)))
+                                            Ok(process_result_with_signal(result, Some(&signal), Some(safe_output)))
                                         }
                                         Err(error) => Err(ToolError::Runtime {
                                             message: error.message,
@@ -21998,7 +22006,7 @@ fn parse_fs_file_glob(value: Option<&serde_json::Value>) -> ToolResult<FsFileGlo
 
 #[cfg(test)]
 pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
-    process_result_with_signal(result, None)
+    process_result_with_signal(result, None, None)
 }
 
 fn command_cwd(workspace: &str, requested: Option<&str>) -> PathBuf {
@@ -22047,34 +22055,43 @@ fn process_output_preview(result: &ProcessResult) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn process_combined_output(result: &ProcessResult) -> String {
-    let mut bytes = Vec::with_capacity(result.output_bytes);
-    for chunk in &result.inline_output {
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&chunk.chunk_b64) {
-            bytes.extend_from_slice(&decoded);
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 fn process_result_with_signal(
     result: ProcessResult,
     signal: Option<&ProcessSignalRecorded>,
+    complete_safe_output: Option<String>,
 ) -> BoundedResult {
-    const PROCESS_RESULT_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+    const PROCESS_RESULT_MODEL_PREVIEW_MAX_BYTES: usize =
+        haider_tools::ORCHESTRATION_PREVIEW_MAX_BYTES + 4096;
     let artifact = result.artifact.clone();
-    let raw_output = process_combined_output(&result);
+    // The production dispatcher reads and redacts the full retained capture
+    // before head/tail reduction. Clipped raw fragments cannot be classified
+    // safely (the missing prefix may be a PEM delimiter or token prefix).
+    let output_elided_bytes_at_least = if complete_safe_output.is_some() {
+        result.source_output_elided_bytes_at_least
+    } else {
+        result.output_elided_bytes_at_least
+    };
+    let raw_output = complete_safe_output.unwrap_or_else(|| {
+        if result.output_elided_bytes_at_least > result.source_output_elided_bytes_at_least {
+            "[REDACTED:incomplete_process_capture]".into()
+        } else {
+            haider_tools::redact_process_output(&result.inline_output)
+                .unwrap_or_else(|_| "[REDACTED:invalid_process_capture]".into())
+        }
+    });
     let failed = result.status != haider_protocol::item::ToolStatus::Completed;
     let reduced = haider_tools::reduce_tool_output("process_exec", &raw_output, failed);
-    let mut truncated = result.limit_reached.is_some() || reduced.text != raw_output;
+    let mut truncated = result.limit_reached.is_some()
+        || output_elided_bytes_at_least > 0
+        || reduced.text != raw_output;
     let reason = process_failure_reason(&result);
-    let hard_limit_elision =
-        (result.limit_reached.is_some() || result.output_elided_bytes_at_least > 0).then(|| {
+    let hard_limit_elision = (result.limit_reached.is_some() || output_elided_bytes_at_least > 0)
+        .then(|| {
             haider_tools::mark_text_elision(
                 &reduced.text,
                 haider_tools::REDUCED_TOOL_OUTPUT_MAX_BYTES,
                 "process_output_execution_limit",
-                result.output_elided_bytes_at_least,
+                output_elided_bytes_at_least,
                 false,
             )
         });
@@ -22085,11 +22102,11 @@ fn process_result_with_signal(
         process_result_preview_json(&result, signal, reduced.adapter, &raw_output, None);
     let baseline_source_bytes = baseline_preview
         .len()
-        .saturating_add(result.output_elided_bytes_at_least);
+        .saturating_add(output_elided_bytes_at_least);
     let baseline_input_bytes =
         haider_tools::provider_request_text_projection_bytes(&baseline_preview)
-            .saturating_add(result.output_elided_bytes_at_least);
-    let omitted_bytes_exact = result.output_elided_bytes_at_least == 0
+            .saturating_add(output_elided_bytes_at_least);
+    let omitted_bytes_exact = output_elided_bytes_at_least == 0
         && result.limit_reached.is_none()
         && reduced
             .savings
@@ -22110,7 +22127,7 @@ fn process_result_with_signal(
     } else {
         baseline_preview
     };
-    for max_output_bytes in [4_096usize, 2_048, 1_024, 512] {
+    for max_output_bytes in [32_768usize, 16_384, 8_192, 4_096, 2_048, 1_024, 512] {
         if preview.len() <= PROCESS_RESULT_MODEL_PREVIEW_MAX_BYTES {
             break;
         }
@@ -22206,6 +22223,18 @@ fn process_result_with_signal(
     bounded
 }
 
+fn process_capture_preview(result: &ProcessResult, output: &str) -> String {
+    if result.artifact.is_none() {
+        return output.to_owned();
+    }
+    let handle = format!("capture:{}", result.effect);
+    let args = serde_json::json!({ "task_id": handle, "cursor": 0 });
+    format!(
+        "{output}\n[Capture: {} bytes retained; at least {} source bytes unavailable. Page the full secret-redacted capture with task_output({args}); follow next_cursor until exhausted.]",
+        result.output_bytes, result.source_output_elided_bytes_at_least
+    )
+}
+
 fn process_result_minimal_preview_json(
     result: &ProcessResult,
     output_adapter: haider_tools::OutputAdapter,
@@ -22221,7 +22250,7 @@ fn process_result_minimal_preview_json(
         "transcript_digest": result.transcript_digest,
         "artifact": result.artifact,
         "output_adapter": output_adapter,
-        "output": output,
+        "output": process_capture_preview(result, output),
         "context_savings_detail": context_savings_detail,
     })
     .to_string()
@@ -22249,7 +22278,7 @@ fn process_result_preview_json(
             call_id: signal.call_id.clone(),
             effect_id: signal.effect_id.clone(),
         }),
-        "output": output,
+        "output": process_capture_preview(result, output),
         "output_adapter": output_adapter,
         "artifact": result.artifact,
         "limit_reached": result.limit_reached,
@@ -22424,6 +22453,10 @@ impl HubCommandOutputContext {
             device_id: self.device_id.clone(),
             event_ids: Arc::clone(&self.event_ids),
             user_command_output,
+            redactors: StdMutex::new([
+                haider_tools::OutputRedactor::default(),
+                haider_tools::OutputRedactor::default(),
+            ]),
         }
     }
 
@@ -22587,6 +22620,7 @@ struct HubCommandOutputSink {
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
     user_command_output: Option<Arc<StdMutex<UserCommandOutput>>>,
+    redactors: StdMutex<[haider_tools::OutputRedactor; 2]>,
 }
 
 #[async_trait]
@@ -22600,6 +22634,60 @@ impl CommandOutputSink for HubCommandOutputSink {
                 ),
             });
         }
+        let delta = if let ItemDelta::CommandOutput { stream, chunk_b64 } = delta {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(chunk_b64)
+                .map_err(|error| ToolError::Runtime {
+                    message: format!("decode process output: {error}"),
+                })?;
+            let index = usize::from(stream == haider_protocol::item::OutputStream::Stderr);
+            let safe_bytes = self
+                .redactors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[index]
+                .push_bytes(&bytes);
+            if safe_bytes.is_empty() {
+                return Ok(());
+            }
+            ItemDelta::CommandOutput {
+                stream,
+                chunk_b64: base64::engine::general_purpose::STANDARD.encode(safe_bytes),
+            }
+        } else {
+            delta
+        };
+        self.append_safe_delta(delta).await?;
+        #[cfg(windows)]
+        trace_windows_process_publish("CommandOutputDelta", &self.run_id);
+        Ok(())
+    }
+    async fn finish(&self, _call_id: &str) -> ToolResult<()> {
+        for (index, stream) in [
+            haider_protocol::item::OutputStream::Stdout,
+            haider_protocol::item::OutputStream::Stderr,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let safe_bytes = self
+                .redactors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[index]
+                .finish_bytes();
+            if !safe_bytes.is_empty() {
+                self.append_safe_delta(ItemDelta::CommandOutput {
+                    stream,
+                    chunk_b64: base64::engine::general_purpose::STANDARD.encode(safe_bytes),
+                })
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HubCommandOutputSink {
+    async fn append_safe_delta(&self, delta: ItemDelta) -> ToolResult<()> {
         let captured = match (&self.user_command_output, &delta) {
             (Some(_), ItemDelta::CommandOutput { stream, chunk_b64 }) => Some((
                 *stream,
@@ -22647,14 +22735,14 @@ impl CommandOutputSink for HubCommandOutputSink {
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,
             })?;
+        // Live accounting consumes the exact secret-safe journal stream,
+        // including delayed final lines, so replay uses identical inputs.
         if let (Some(output), Some((stream, bytes))) = (&self.user_command_output, captured) {
             output
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(stream, &bytes);
         }
-        #[cfg(windows)]
-        trace_windows_process_publish("CommandOutputDelta", &self.run_id);
         Ok(())
     }
 }

@@ -691,7 +691,7 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
 
     let diagnostic = format!(
         "COMMAND cargo test --locked\n{}\nFAILURE: final linker diagnostic\n",
-        (0..2_000)
+        (0..haider_tools::ORCHESTRATION_PREVIEW_MAX_BYTES / 8)
             .map(|index| format!("unique progress line {index}"))
             .collect::<Vec<_>>()
             .join("\n")
@@ -714,6 +714,19 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
         raw_chunk,
         process_accounting_fixture("head-tail", &diagnostic, true).inline_output[0].chunk_b64,
         "model projection must not mutate the captured output"
+    );
+}
+
+#[test]
+fn toolshape_legacy_one_mib_process_golden_replays_unchanged() {
+    use haider_protocol::envelope::RawPayload;
+    let fixture = include_str!("../tests/fixtures/toolshape/process_one_mib.json");
+    let raw: RawPayload = serde_json::from_str(fixture).expect("historical golden");
+    let replay = raw.decode_event().expect("historical replay");
+    let restored = RawPayload::from_event(replay).expect("re-encode historical event");
+    assert_eq!(
+        serde_json::to_string_pretty(&restored).expect("historical JSON") + "\n",
+        fixture
     );
 }
 
@@ -741,6 +754,11 @@ fn toolshape_one_mib_process_result_golden_preserves_payload_and_replays() {
     let selected = payload["output"].as_str().expect("stdout");
     assert!(selected.contains("ORIGINAL-STDOUT!"));
     assert!(selected.contains("ORIGINAL-TAIL!!"));
+    assert!(
+        selected.len() > 8 * 1024,
+        "uses the larger orchestration preview"
+    );
+    assert!(selected.len() <= haider_tools::ORCHESTRATION_PREVIEW_MAX_BYTES);
     let event = EventPayload::ToolResult {
         call_id: "fixture-one-mib".into(),
         result,
@@ -749,7 +767,7 @@ fn toolshape_one_mib_process_result_golden_preserves_payload_and_replays() {
     assert_eq!(raw.decode_event().expect("replay"), event);
     let actual = serde_json::to_string_pretty(&raw).expect("golden JSON") + "\n";
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/toolshape/process_one_mib.json");
+        .join("tests/fixtures/toolshape/process_one_mib_orchestration.json");
     if std::env::var_os("UPDATE_FIXTURES").is_some() {
         std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("mkdir");
         std::fs::write(&path, &actual).expect("bless");

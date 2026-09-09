@@ -157,6 +157,16 @@ impl Default for ResultBounds {
     }
 }
 
+impl ResultBounds {
+    /// Default for the fs_read tool; other filesystem inventories retain their
+    /// smaller preview. Explicitly supplied byte bounds are always respected.
+    pub fn file_read() -> Self {
+        Self {
+            max_preview_bytes: crate::ORCHESTRATION_PREVIEW_MAX_BYTES,
+        }
+    }
+}
+
 /// Process-local storage is partitioned by the broker identity embedded in an
 /// effect id, making entries session/worker scoped even though the cache lives
 /// outside [`EffectBroker`] to keep the broker's durable state schema unchanged.
@@ -389,7 +399,7 @@ fn invalidate_read_memo(workspace: &Path) {
 pub fn fs_read_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_read".into(),
-        description: "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes".into(),
+        description: "Read up to 64 KiB / 2,000 numbered lines; offset/limit are one-based line paging, column continues a long line. Explicit paths preserve identifiers; secret patterns remain redacted".into(),
         effects: vec![EffectClass::FsRead],
         dispatch: DispatchMode::Await,
         input_schema: json!({
@@ -397,7 +407,8 @@ pub fn fs_read_manifest() -> ToolManifest {
             "properties": {
                 "path": {"type": "string", "minLength": 1},
                 "offset": {"type": "integer", "minimum": 1},
-                "limit": {"type": "integer", "minimum": 1}
+                "limit": {"type": "integer", "minimum": 1},
+                "column": {"type": "integer", "minimum": 1}
             },
             "required": ["path"],
             "additionalProperties": false
@@ -580,6 +591,8 @@ pub struct FsRead {
     pub path: PathBuf,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+    /// One-based character column in the first selected line (long-line paging).
+    pub column: Option<usize>,
 }
 
 impl FsRead {
@@ -588,15 +601,35 @@ impl FsRead {
             path: path.into(),
             offset: None,
             limit: None,
+            column: None,
         }
     }
 
-    /// Selects a one-based line range. Ranged reads are line-numbered; the
-    /// default remains the byte-exact whole-file read used by freshness.
+    /// Selects a one-based line range. Every preview is line-numbered;
+    /// freshness always covers the byte-exact whole file.
     pub fn with_line_range(mut self, offset: Option<usize>, limit: Option<usize>) -> Self {
         self.offset = offset;
         self.limit = limit;
         self
+    }
+
+    pub fn with_column(mut self, column: Option<usize>) -> Self {
+        self.column = column;
+        self
+    }
+
+    fn read_arguments(&self, path: &Path) -> ToolResult<Value> {
+        let mut arguments = json!({
+            "limit": self.limit,
+            "offset": self.offset,
+            "path": path_argument(path)?,
+        });
+        // Preserve existing canonical argument digests when the additive
+        // long-line cursor is absent.
+        if let Some(column) = self.column {
+            arguments["column"] = json!(column);
+        }
+        Ok(arguments)
     }
 }
 
@@ -610,20 +643,12 @@ impl EffectOperation for FsRead {
     }
 
     fn arguments(&self) -> ToolResult<Value> {
-        Ok(json!({
-            "limit": self.limit,
-            "offset": self.offset,
-            "path": path_argument(&self.path)?,
-        }))
+        self.read_arguments(&self.path)
     }
 
     fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
         let path = resolve_workspace_path(workspace_root, &self.path, PathResolution::Existing)?;
-        Ok(json!({
-            "limit": self.limit,
-            "offset": self.offset,
-            "path": path_argument(&path)?,
-        }))
+        self.read_arguments(&path)
     }
 }
 
@@ -1116,7 +1141,13 @@ impl EffectBroker {
             &operation.path,
             PathResolution::Existing,
         )?)
-        .with_line_range(operation.offset, operation.limit);
+        .with_line_range(operation.offset, operation.limit)
+        .with_column(operation.column);
+        if operation.column == Some(0) {
+            return Err(ToolError::invalid_argument(
+                "fs_read column must be one or greater",
+            ));
+        }
         let relative = anchored_relative_path(self.workspace_root(), &operation.path)?;
         let display_path = operation.path.clone();
         let workspace_dir = self.duplicate_workspace_dir()?;
@@ -1144,7 +1175,7 @@ impl EffectBroker {
                         && crate::redact::token_config_contains_secret(read.contents.as_bytes()));
                 let result = bounded_read(
                     read.contents,
-                    read.preview_contents,
+                    &operation,
                     read.data,
                     sensitive_path,
                     bounds,
@@ -2183,7 +2214,6 @@ fn read_footprint_is_current(workspace_dir: OwnedFd, footprint: &ReadFootprint) 
 
 struct ReadPathOutput {
     contents: String,
-    preview_contents: Option<String>,
     digest: Option<String>,
     footprint: ReadFootprint,
     data: Option<ToolResultData>,
@@ -2226,23 +2256,8 @@ fn read_path_at(
         FileType::RegularFile => {
             let contents = read_utf8_file(fs::File::from(target), display_path)?;
             let digest = mutation_digest(contents.as_bytes());
-            let preview_contents = if offset.is_some() || limit.is_some() {
-                Some(select_numbered_lines(
-                    &crate::redact::redact_private_key_lines(&contents).text,
-                    offset.unwrap_or(1),
-                    limit,
-                ))
-            } else {
-                None
-            };
-            let contents = if offset.is_some() || limit.is_some() {
-                select_numbered_lines(&contents, offset.unwrap_or(1), limit)
-            } else {
-                contents
-            };
             Ok(ReadPathOutput {
                 contents,
-                preview_contents,
                 digest: Some(digest),
                 footprint: footprint(),
                 data: None,
@@ -2252,7 +2267,6 @@ fn read_path_at(
             let listing = list_directory_fd(target, display_path)?;
             Ok(ReadPathOutput {
                 contents: listing.contents,
-                preview_contents: None,
                 digest: None,
                 footprint: footprint(),
                 data: Some(listing.data),
@@ -2284,17 +2298,6 @@ fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String>
     String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", display_path.display()),
     })
-}
-
-fn select_numbered_lines(contents: &str, offset: usize, limit: Option<usize>) -> String {
-    let limit = limit.unwrap_or(usize::MAX);
-    contents
-        .split_inclusive('\n')
-        .enumerate()
-        .skip(offset - 1)
-        .take(limit)
-        .map(|(index, line)| format!("{}: {line}", index + 1))
-        .collect()
 }
 
 /// Shallow directory listings share the glob entry cap before first send.
@@ -4068,23 +4071,8 @@ fn read_path_at(
     if metadata.is_file() {
         let contents = read_utf8_file(entry.handle, display_path)?;
         let digest = format!("blake3:{}", blake3::hash(contents.as_bytes()).to_hex());
-        let preview_contents = if offset.is_some() || limit.is_some() {
-            Some(select_numbered_lines(
-                &crate::redact::redact_private_key_lines(&contents).text,
-                offset.unwrap_or(1),
-                limit,
-            ))
-        } else {
-            None
-        };
-        let contents = if offset.is_some() || limit.is_some() {
-            select_numbered_lines(&contents, offset.unwrap_or(1), limit)
-        } else {
-            contents
-        };
         Ok(ReadPathOutput {
             contents,
-            preview_contents,
             digest: Some(digest),
             footprint,
             data: None,
@@ -4106,7 +4094,6 @@ fn read_path_at(
         let listing = collector.finish();
         Ok(ReadPathOutput {
             contents: listing.contents,
-            preview_contents: None,
             digest: None,
             footprint,
             data: Some(listing.data),
@@ -8159,7 +8146,7 @@ fn is_dot_entry(name: &CStr) -> bool {
 /// CAS; presentation-only redaction does not spill an otherwise-inline result.
 async fn bounded_read<C>(
     contents: String,
-    preview_contents: Option<String>,
+    operation: &FsRead,
     data: Option<ToolResultData>,
     sensitive_path: bool,
     bounds: ResultBounds,
@@ -8168,6 +8155,14 @@ async fn bounded_read<C>(
 where
     C: CasSink,
 {
+    if data.is_none() && !sensitive_path {
+        return super::file_preview::bounded_file_read(contents, operation, bounds, cas).await;
+    }
+    let bounds = ResultBounds {
+        max_preview_bytes: bounds
+            .max_preview_bytes
+            .min(crate::TOOL_RESULT_INLINE_MAX_BYTES),
+    };
     let semantic_truncated = matches!(
         &data,
         Some(ToolResultData::FsRead {
@@ -8184,7 +8179,7 @@ where
             .collect::<Vec<_>>();
         Cow::Owned(directory_preview(&entries).0)
     } else {
-        preview_contents.map_or_else(|| Cow::Borrowed(contents.as_str()), Cow::Owned)
+        Cow::Borrowed(contents.as_str())
     };
     let redacted = crate::redact::redact_text_bounded(&presented, bounds.max_preview_bytes);
     let presentation_reduced = presented.as_ref() != contents || redacted.replacements > 0;

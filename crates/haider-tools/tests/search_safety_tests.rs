@@ -279,7 +279,7 @@ async fn search_and_read_redact_without_spilling_inline_results() {
     fs::write(root.path().join("three-kib.txt"), &three_kib).expect("3 KiB fixture");
     fs::write(
         root.path().join("embedded-key.txt"),
-        "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+        "-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
     )
     .expect("embedded key");
     let mut broker = broker(root.path(), 2);
@@ -349,7 +349,12 @@ async fn search_and_read_redact_without_spilling_inline_results() {
         )
         .await
         .expect("3 KiB read");
-    assert_eq!(plain.preview, three_kib);
+    let numbered: String = three_kib
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(index, line)| format!("{}: {line}", index + 1))
+        .collect();
+    assert_eq!(plain.preview, numbered);
     assert!(plain.artifact.is_none());
 
     let ranged = broker

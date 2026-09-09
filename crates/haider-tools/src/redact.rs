@@ -4,6 +4,7 @@
 //! bytes only through owner-authorized CAS artifacts; this module produces the
 //! first-send preview and never rewrites durable history.
 
+use base64::Engine as _;
 use regex::Regex;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -22,6 +23,10 @@ pub(crate) struct BoundedRedactedText {
 }
 
 pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
+    redact_lines(input, RedactionPolicy::Standard)
+}
+
+fn redact_lines(input: &str, policy: RedactionPolicy) -> RedactedText {
     let mut private_key = false;
     let mut output = String::with_capacity(input.len());
     let mut replacements = 0usize;
@@ -29,7 +34,7 @@ pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
         let (content, newline) = line
             .strip_suffix('\n')
             .map_or((line, ""), |content| (content, "\n"));
-        let redacted = redact_line_with_private_key_state(content, &mut private_key);
+        let redacted = redact_line(content, &mut private_key, policy);
         output.push_str(&redacted.text);
         output.push_str(newline);
         replacements = replacements.saturating_add(redacted.replacements);
@@ -43,6 +48,39 @@ pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
 /// Forced secret redaction for the provider-lockdown sandbox. The returned
 /// text is the only form the restricted provider receives.
 pub fn redact_lockdown_text(input: &str) -> String {
+    redact_lines(input, RedactionPolicy::Lockdown).text
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedactionPolicy {
+    Standard,
+    ExplicitPath,
+    Lockdown,
+}
+
+/// A call-local allow-list: only the exact named path receives identifier
+/// exemptions. It grants no filesystem authority and cannot disable secret
+/// patterns, PEM state, or the entropy check for unrecognized random values.
+pub(crate) struct ExplicitReadPaths<'a>(&'a Path);
+
+impl<'a> ExplicitReadPaths<'a> {
+    pub(crate) fn new(path: &'a Path) -> Self {
+        Self(path)
+    }
+
+    pub(crate) fn redact(&self, path: &Path, input: &str) -> RedactedText {
+        let policy = if self.0 == path {
+            RedactionPolicy::ExplicitPath
+        } else {
+            RedactionPolicy::Standard
+        };
+        redact_lines(input, policy)
+    }
+}
+
+/// Secret-safe process/capture text. Redact the complete text before slicing;
+/// page and chunk boundaries must never split a secret before classification.
+pub fn redact_output_text(input: &str) -> String {
     redact_private_key_lines(input).text
 }
 
@@ -50,6 +88,10 @@ pub(crate) fn redact_line_with_private_key_state(
     line: &str,
     private_key: &mut bool,
 ) -> RedactedText {
+    redact_line(line, private_key, RedactionPolicy::Standard)
+}
+
+fn redact_line(line: &str, private_key: &mut bool, policy: RedactionPolicy) -> RedactedText {
     let begins = line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----");
     let ends = line.contains("-----END") && line.contains("PRIVATE KEY-----");
     if *private_key || begins {
@@ -59,7 +101,7 @@ pub(crate) fn redact_line_with_private_key_state(
             replacements: 1,
         };
     }
-    redact_text(line)
+    redact_with_policy(line, policy)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,8 +163,13 @@ pub(crate) fn token_config_contains_secret(bytes: &[u8]) -> bool {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn redact_text(input: &str) -> RedactedText {
-    let spans = redaction_spans(input);
+    redact_with_policy(input, RedactionPolicy::Standard)
+}
+
+fn redact_with_policy(input: &str, policy: RedactionPolicy) -> RedactedText {
+    let spans = redaction_spans(input, policy);
     if spans.is_empty() {
         return RedactedText {
             text: input.to_owned(),
@@ -150,11 +197,11 @@ pub(crate) fn redact_text(input: &str) -> RedactedText {
     }
 }
 
-/// Produces the exact UTF-8 byte prefix of [`redact_text`] without allocating
+/// Produces the exact UTF-8 byte prefix of standard redaction without allocating
 /// the complete redacted value. `full_len` is the byte length that complete
 /// value would have had, so callers retain the existing truncation decision.
 pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedactedText {
-    let spans = redaction_spans(input);
+    let spans = redaction_spans(input, RedactionPolicy::Standard);
     if spans.is_empty() {
         return BoundedRedactedText {
             text: utf8_prefix(input, max_bytes).to_owned(),
@@ -197,7 +244,7 @@ pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedac
     }
 }
 
-fn redaction_spans(input: &str) -> Vec<Span> {
+fn redaction_spans(input: &str, policy: RedactionPolicy) -> Vec<Span> {
     let mut spans = Vec::new();
     if let Some(regex) = private_key_regex() {
         for found in regex.find_iter(input) {
@@ -208,7 +255,11 @@ fn redaction_spans(input: &str) -> Vec<Span> {
             });
         }
     }
-    if let Some(regex) = known_secret_regex() {
+    if let Some(regex) = if policy == RedactionPolicy::Lockdown {
+        known_secret_regex()
+    } else {
+        extended_secret_regex()
+    } {
         for found in regex.find_iter(input) {
             if spans
                 .iter()
@@ -223,12 +274,47 @@ fn redaction_spans(input: &str) -> Vec<Span> {
             });
         }
     }
-    if let Some(regex) = entropy_candidate_regex() {
+    // Explicit secret context wins even if the value resembles a digest or
+    // a path. Lockdown retains its historical classifier byte-for-byte.
+    if policy != RedactionPolicy::Lockdown
+        && let Some(regex) = secret_assignment_regex()
+    {
+        for captures in regex.captures_iter(input) {
+            if let Some(found) = captures.get(1) {
+                if spans
+                    .iter()
+                    .any(|span| span.start == found.start() && span.end == found.end())
+                {
+                    continue;
+                }
+                if !spans.iter().any(|span| {
+                    span.kind == "private_key"
+                        && found.start() < span.end
+                        && span.start < found.end()
+                }) {
+                    spans.retain(|span| found.start() >= span.end || span.start >= found.end());
+                    spans.push(Span {
+                        start: found.start(),
+                        end: found.end(),
+                        kind: "secret_value",
+                    });
+                }
+            }
+        }
+    }
+    let candidates = if policy == RedactionPolicy::Lockdown {
+        entropy_candidate_regex()
+    } else {
+        identifier_candidate_regex()
+    };
+    if let Some(regex) = candidates {
         for found in regex.find_iter(input) {
             if spans
                 .iter()
                 .any(|span| found.start() < span.end && span.start < found.end())
                 || !looks_high_entropy(found.as_str())
+                || (policy != RedactionPolicy::Lockdown
+                    && is_non_secret_carrier(found.as_str(), policy))
             {
                 continue;
             }
@@ -245,6 +331,8 @@ fn redaction_spans(input: &str) -> Vec<Span> {
                 .iter()
                 .any(|span| found.start() < span.end && span.start < found.end())
                 || !looks_high_entropy(found.as_str().trim())
+                || (policy != RedactionPolicy::Lockdown
+                    && is_non_secret_carrier(found.as_str().trim(), policy))
             {
                 continue;
             }
@@ -313,17 +401,140 @@ fn private_key_material_regex() -> Option<&'static Regex> {
 }
 
 fn known_kind(value: &str) -> &'static str {
-    if value.starts_with("AKIA") {
+    if value.starts_with("AKIA") || value.starts_with("ASIA") {
         "aws_access_key"
     } else if value.starts_with("sk-") {
         "api_key"
-    } else if value.starts_with("ghp_") {
+    } else if value.starts_with("ghp_") || value.starts_with("github_pat_") {
         "github_token"
-    } else if value.starts_with("xoxb-") {
+    } else if value.starts_with("xox") {
         "slack_token"
     } else {
         "jwt"
     }
+}
+
+fn extended_secret_regex() -> Option<&'static Regex> {
+    static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(
+        r"(?:AKIA|ASIA)[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,}|(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}|xox[a-z]+-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    ).ok()).as_ref()
+}
+
+fn secret_assignment_regex() -> Option<&'static Regex> {
+    static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(
+        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)("[^"\r\n]*"|'[^'\r\n]*'|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
+    ).ok()).as_ref()
+}
+
+fn identifier_candidate_regex() -> Option<&'static Regex> {
+    static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    REGEX
+        .get_or_init(|| Regex::new(r"[A-Za-z0-9_+/.\\:~-]{26,}={0,2}").ok())
+        .as_ref()
+}
+
+fn is_non_secret_carrier(value: &str, policy: RedactionPolicy) -> bool {
+    let value = value.trim_end_matches(['.', ':']);
+    if is_identifier(value) || is_file_path(value) {
+        return true;
+    }
+    // The exact explicit pointer additionally permits conventional tagged
+    // identifiers. Never exempt an arbitrary labelled random token.
+    if policy == RedactionPolicy::ExplicitPath
+        && ["thread-", "run-", "session-", "thread_", "run_", "session_"]
+            .iter()
+            .any(|prefix| value.strip_prefix(prefix).is_some_and(is_identifier))
+    {
+        return true;
+    }
+    // One decoding layer, bounded to a small carrier. This is deliberately
+    // not a general "printable base64" exemption (credentials are printable).
+    if value.len() > 4096 {
+        return false;
+    }
+    [
+        base64::engine::general_purpose::STANDARD,
+        base64::engine::general_purpose::STANDARD_NO_PAD,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ]
+    .iter()
+    .any(|engine| {
+        engine
+            .decode(value)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|decoded| {
+                (is_identifier(&decoded) || is_file_path(&decoded))
+                    && !extended_secret_regex().is_some_and(|regex| regex.is_match(&decoded))
+                    && !secret_assignment_regex().is_some_and(|regex| regex.is_match(&decoded))
+                    && !is_sensitive_path(Path::new(&decoded))
+            })
+    })
+}
+
+fn is_identifier(value: &str) -> bool {
+    let value = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("blake3:"))
+        .unwrap_or(value);
+    if matches!(value.len(), 32 | 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return true;
+    }
+    if value.len() == 36
+        && value.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return true;
+    }
+    value.len() == 26
+        && value.as_bytes()[0] <= b'7'
+        && value
+            .bytes()
+            .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte.to_ascii_uppercase()))
+}
+
+fn is_file_path(value: &str) -> bool {
+    let value = value.trim_end_matches(['.', ':']);
+    if value.contains('=')
+        || value.contains("://")
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/\\._-~:".contains(c))
+    {
+        return false;
+    }
+    let qualified = value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with("~/")
+        || value.contains('\\')
+        || (value.len() > 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':'
+            && value.as_bytes()[2] == b'/');
+    if qualified {
+        return true;
+    }
+    let mut components = value.trim_start_matches('/').split('/');
+    let first = components.next().unwrap_or_default();
+    let has_directory = components.next().is_some();
+    let has_extension = Path::new(value).extension().is_some();
+    // A slash alone is also legal in random base64. Require a filename
+    // extension or a conventional directory root (workspace, Users, etc.).
+    // Digest/UUID directory roots are already recognized non-secret carriers.
+    let named_directory = first.len() >= 3
+        && first.as_bytes()[0].is_ascii_alphabetic()
+        && first.as_bytes()[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(*byte, b'_' | b'-'));
+    (has_extension && (has_directory || value.starts_with('/')))
+        || (has_directory && (named_directory || is_identifier(first)))
 }
 
 fn looks_high_entropy(value: &str) -> bool {
