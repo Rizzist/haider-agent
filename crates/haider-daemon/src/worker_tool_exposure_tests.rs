@@ -270,6 +270,79 @@ async fn discovery_survives_cold_journal_and_turn_setup_reduction() {
     assert_eq!(reduction.durable_tool_state().promoted_tools, ["monitor"]);
 }
 
+#[tokio::test]
+async fn sqlite_discovery_survives_turn_setup_suffix_and_restart() {
+    let root = tempfile::tempdir().expect("discovery profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("SQLite store");
+    let session = SessionId::new("exposure-session");
+    let cache = TurnSetupReductionCache::default();
+    let selector = |run: &str| TurnSetupReductionSelector {
+        run_id: RunId::new(run),
+        branch_id: None,
+        agent_id: None,
+        provider: "fake".into(),
+        model: "fake".into(),
+        account_scope: None,
+        auth_scope: "none".into(),
+    };
+    // Cache a prefix ending at Started. The receipt arrives in a later
+    // page/turn; SQLite indexes this item as item_tool_call, not item.
+    let mut start = [envelope(1, discovery_start("discover"))];
+    start[0].worker_generation = store.worker_generation();
+    StoreHandle::append(&store, &mut start)
+        .await
+        .expect("commit discovery start");
+    let initial = reduce_turn_setup_journal_cached(&store, &session, &cache, selector("turn-1"))
+        .await
+        .expect("initial setup");
+    assert!(initial.durable_tool_state().promoted_tools.is_empty());
+    let mut settlement = [
+        envelope(2, discovery_result("discover", ToolResultStatus::Completed)),
+        envelope(
+            3,
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("item-discover"),
+                item: TurnItem::ToolCall {
+                    call_id: "discover".into(),
+                    name: "list_tools".into(),
+                    args: serde_json::json!({"filter": "monitor"}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+        ),
+    ];
+    for event in &mut settlement {
+        event.worker_generation = store.worker_generation();
+    }
+    StoreHandle::append(&store, &mut settlement)
+        .await
+        .expect("commit discovery settlement");
+    for run in ["turn-2", "turn-3"] {
+        let state = reduce_turn_setup_journal_cached(&store, &session, &cache, selector(run))
+            .await
+            .expect("warm setup");
+        assert_eq!(state.durable_tool_state().promoted_tools, ["monitor"]);
+        assert!(state.durable_tools.discovery_calls.is_empty());
+    }
+    store.close().await.expect("close first daemon store");
+    let restarted = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("restart store");
+    let state = reduce_turn_setup_journal_cached(
+        &restarted,
+        &session,
+        &TurnSetupReductionCache::default(),
+        selector("turn-4"),
+    )
+    .await
+    .expect("cold setup");
+    assert_eq!(state.durable_tool_state().promoted_tools, ["monitor"]);
+    assert!(state.durable_tools.discovery_calls.is_empty());
+    restarted.close().await.expect("close restarted store");
+}
+
 #[test]
 fn workspace_selection_preserves_discovery_and_clears_permission_state() {
     let mut reduction = DurableToolStateReduction::default();

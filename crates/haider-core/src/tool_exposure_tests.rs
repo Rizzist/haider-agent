@@ -308,6 +308,30 @@ fn discovery_cannot_promote_outside_catalog_or_from_rejected_results() {
 }
 
 #[test]
+fn durable_promotions_cannot_restore_a_disabled_tool_or_widen_a_new_pack() {
+    let mut config = config();
+    let receipt = config.discovered_tool_result(serde_json::json!({"filter": "monitor"}));
+    config.promote_committed_tools(&receipt);
+    assert!(tool_call_within_advertised_ceiling(&config, "monitor"));
+
+    // A later turn's authorization/standalone pack is the ceiling even
+    // when replay restores the name of a tool discovered on an older pack.
+    config.tools = vec![definition("list_tools"), definition("fs_read")];
+    config.shared_tools = None;
+    config.refresh_tool_exposure();
+    assert!(!tool_call_within_advertised_ceiling(&config, "monitor"));
+    let denied = config.discovered_tool_result(serde_json::json!({"filter": "monitor"}));
+    assert!(matches!(&denied.data,
+        Some(haider_protocol::tool::ToolResultData::ToolsDiscovered { promoted })
+            if promoted.is_empty()
+    ));
+    config.promote_committed_tools(&denied);
+    config.promote_committed_tools(&receipt);
+    assert_eq!(names(&config), ["list_tools", "fs_read"]);
+    assert!(!tool_call_within_advertised_ceiling(&config, "monitor"));
+}
+
+#[test]
 fn broad_discovery_promotes_only_described_rows_with_honest_truncation() {
     let mut config = config();
     let result = config.discovered_tool_result(serde_json::json!({"filter": "use"}));

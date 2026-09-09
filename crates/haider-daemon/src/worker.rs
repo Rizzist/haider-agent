@@ -9538,6 +9538,9 @@ const TURN_SETUP_REDUCTION_PAYLOAD_KINDS: &[&str] = &[
     "usage",
     "node_committed",
     "item",
+    // SQLite indexes ToolCall Started/Completed separately. Discovery replay
+    // needs the matching list_tools start as well as its durable receipt.
+    "item_tool_call",
     "tool_result",
     "session_forked",
 ];
