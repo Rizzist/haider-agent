@@ -277,11 +277,24 @@ pub enum OAuthInferenceHeaderSet {
     GrokOpenAiChatCompletions,
 }
 
-/// The only callback policy supported by the generic engine.
+/// Release-owned loopback listener policy for each public-native client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthRedirectPolicy {
-    /// Bind a fresh numeric `127.0.0.1:0` listener and use a random path.
+    /// Bind a fresh numeric `127.0.0.1:0` listener with the provider's path.
     EphemeralIpv4Loopback,
+    /// Codex's registered localhost callback: prefer 1455, then 1457.
+    OpenAiCodexLoopback,
+}
+
+impl OAuthRedirectPolicy {
+    fn ports(self) -> &'static [u16] {
+        match self {
+            Self::EphemeralIpv4Loopback => &[0],
+            // Keep in sync with openai/codex login/src/server.rs's
+            // DEFAULT_PORT/FALLBACK_PORT and Hydra redirect allowlist.
+            Self::OpenAiCodexLoopback => &[1455, 1457],
+        }
+    }
 }
 
 const OPENAI_AUTHORIZE_PARAMETERS: &[OAuthAuthorizeParameter] = &[
@@ -292,6 +305,10 @@ const OPENAI_AUTHORIZE_PARAMETERS: &[OAuthAuthorizeParameter] = &[
     OAuthAuthorizeParameter {
         name: "codex_cli_simplified_flow",
         value: "true",
+    },
+    OAuthAuthorizeParameter {
+        name: "originator",
+        value: "codex_cli_rs",
     },
 ];
 
@@ -307,7 +324,7 @@ pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
         scopes: &["openid", "profile", "email", "offline_access"],
         audience: "app_EMoamEEZ73f0CkXaXp7hrann",
         resource: None,
-        redirect_policy: OAuthRedirectPolicy::EphemeralIpv4Loopback,
+        redirect_policy: OAuthRedirectPolicy::OpenAiCodexLoopback,
         authorize_parameters: OPENAI_AUTHORIZE_PARAMETERS,
         send_nonce_in_authorize: true,
         send_audience_in_authorize: false,
@@ -894,9 +911,6 @@ impl Default for OAuthProviderCatalog {
         let registrations = SANCTIONED_PROVIDER_REGISTRATIONS
             .iter()
             .filter_map(|metadata| {
-                if metadata.redirect_policy != OAuthRedirectPolicy::EphemeralIpv4Loopback {
-                    return None;
-                }
                 let identity_mode = match metadata.identity_mode {
                     OAuthIdentityMode::VerifiedIdToken(factory) => {
                         RuntimeIdentityMode::VerifiedIdToken(factory())
@@ -920,6 +934,7 @@ impl Default for OAuthProviderCatalog {
                     identity_mode,
                 )
                 .ok()?;
+                registration.redirect_policy = metadata.redirect_policy;
                 registration.authorize_parameters = metadata
                     .authorize_parameters
                     .iter()
@@ -3048,13 +3063,20 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
         begin_device_flow(inner, job, registration).await;
         return;
     }
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await {
+    let listener = match bind_callback_listener(registration.redirect_policy.ports()).await {
         Ok(listener) => listener,
         Err(_) => {
             respond_error(
                 &job.route,
                 "oauth_listener_unavailable",
-                "cannot allocate a numeric loopback callback listener",
+                match registration.redirect_policy {
+                    OAuthRedirectPolicy::OpenAiCodexLoopback => {
+                        "cannot bind OpenAI's registered loopback ports 1455 or 1457; finish the other sign-in and retry"
+                    }
+                    OAuthRedirectPolicy::EphemeralIpv4Loopback => {
+                        "cannot allocate a numeric loopback callback listener"
+                    }
+                },
                 true,
             );
             return;
@@ -3118,34 +3140,13 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
     let callback_path = Zeroizing::new(path);
     let redirect_uri = Zeroizing::new(uri);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier_b64.as_bytes()));
-    let authorization_url = {
-        let mut authorization = url::form_urlencoded::Serializer::new(SecretFormBody::new(
-            format!("{}?", registration.authorization_endpoint),
-        ));
-        authorization
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &registration.client_id)
-            .append_pair("redirect_uri", redirect_uri.as_str())
-            .append_pair("scope", &registration.scopes.join(" "))
-            .append_pair("state", state_b64.as_str())
-            .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256");
-        if registration.send_nonce_in_authorize {
-            authorization.append_pair("nonce", nonce_b64.as_str());
-        }
-        if registration.send_audience_in_authorize {
-            authorization.append_pair("audience", &registration.audience);
-        }
-        if let Some(resource) = &registration.resource {
-            authorization.append_pair("resource", resource);
-        }
-        for (name, value) in &registration.authorize_parameters {
-            authorization.append_pair(name, value);
-        }
-        // `finish` moves the one state-bearing allocation directly into the
-        // zeroizing wire wrapper. No second ordinary URL retains the query.
-        OAuthAuthorizationWire::from_zeroizing(authorization.finish().into_zeroizing())
-    };
+    let authorization_url = build_authorization_url(
+        &registration,
+        redirect_uri.as_str(),
+        state_b64.as_str(),
+        &challenge,
+        nonce_b64.as_str(),
+    );
     let flow_id = match random_id(
         "oauth-flow",
         inner.next_flow.fetch_add(1, Ordering::Relaxed),
@@ -3241,6 +3242,59 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
     {
         flow.cancel.send_replace(true);
     }
+}
+
+/// Try only registered ports. Never cancel an incumbent listener (it may
+/// belong to Codex or another Haider profile), and never fall back to an
+/// unregistered ephemeral port when a fixed-port registration is exhausted.
+async fn bind_callback_listener(ports: &[u16]) -> std::io::Result<TcpListener> {
+    let mut last_error = std::io::Error::from(std::io::ErrorKind::AddrNotAvailable);
+    for &port in ports {
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => last_error = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
+
+fn build_authorization_url(
+    registration: &OAuthProviderRegistration,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+    nonce: &str,
+) -> OAuthAuthorizationWire {
+    let prefix = format!("{}?", registration.authorization_endpoint);
+    let query_start = prefix.len();
+    // Only the suffix is form data; treating the URL prefix as an existing
+    // form field would insert an empty leading query entry (`?&`).
+    let mut authorization =
+        url::form_urlencoded::Serializer::for_suffix(SecretFormBody::new(prefix), query_start);
+    authorization
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &registration.client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", &registration.scopes.join(" "))
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256");
+    if registration.send_nonce_in_authorize {
+        authorization.append_pair("nonce", nonce);
+    }
+    if registration.send_audience_in_authorize {
+        authorization.append_pair("audience", &registration.audience);
+    }
+    if let Some(resource) = &registration.resource {
+        authorization.append_pair("resource", resource);
+    }
+    for (name, value) in &registration.authorize_parameters {
+        authorization.append_pair(name, value);
+    }
+    // `finish` moves the one state-bearing allocation directly into the
+    // zeroizing wire wrapper. No second ordinary URL retains the query.
+    OAuthAuthorizationWire::from_zeroizing(authorization.finish().into_zeroizing())
 }
 
 #[derive(Deserialize)]
@@ -4171,7 +4225,7 @@ fn parse_callback(
     // The one authority law: the browser sends the exact `host:port` it
     // navigated to, which is the redirect authority THIS flow registered
     // with the provider (`compose_redirect` — `localhost:<port>` for
-    // Anthropic parity, numeric `127.0.0.1:<port>` for everyone else).
+    // OpenAI/Anthropic parity, numeric `127.0.0.1:<port>` otherwise).
     // Validating a recomputed shape instead of the flow's own composed
     // authority is the v0.0.65 owner bug.
     if host != Some(expected_authority) {
@@ -4475,7 +4529,9 @@ async fn scrub_source_chunks(mut pending: Vec<bytes::Bytes>) -> usize {
 /// `http://localhost:<port>/callback` — the hardened random path segment
 /// is rejected with "Redirect URI … not supported by client". CSRF stays
 /// covered by `state` + PKCE, and the per-flow PORT still discriminates
-/// flows; every other provider keeps the hardened random-path shape.
+/// flows. OpenAI's Codex registration likewise requires localhost and
+/// `/auth/callback`, with the fixed ports selected by its redirect policy.
+/// Other providers keep the hardened random-path shape.
 ///
 /// The returned `authority` is the exact `host:port` a browser navigating
 /// to `uri` sends as its `Host` header, and it is the ONLY authority the
@@ -4489,7 +4545,13 @@ pub(crate) fn compose_redirect(
     port: u16,
     hardened_segment: &str,
 ) -> (String, String, String) {
-    if provider == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
+    if provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME {
+        (
+            "/auth/callback".to_owned(),
+            format!("http://localhost:{port}/auth/callback"),
+            format!("localhost:{port}"),
+        )
+    } else if provider == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
         (
             "/callback".to_owned(),
             format!("http://localhost:{port}/callback"),

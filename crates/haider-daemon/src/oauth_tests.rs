@@ -417,6 +417,7 @@ struct FakeState {
     msh_headers: Mutex<Vec<HashMap<String, String>>>,
     expect_refresh_binding: AtomicBool,
     expect_code_state: AtomicBool,
+    jwt_id_tokens: AtomicBool,
     verifiers: Mutex<Vec<String>>,
     refresh_gate: Option<Arc<Semaphore>>,
     refresh_started: Notify,
@@ -455,6 +456,7 @@ impl FakeOAuthServer {
             msh_headers: Mutex::new(Vec::new()),
             expect_refresh_binding: AtomicBool::new(true),
             expect_code_state: AtomicBool::new(false),
+            jwt_id_tokens: AtomicBool::new(false),
             verifiers: Mutex::new(Vec::new()),
             refresh_gate: (gated_refresh || mode == FakeMode::SlowExchange)
                 .then(|| Arc::new(Semaphore::new(0))),
@@ -798,6 +800,11 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
             "display": "person@example.invalid"
         })
         .to_string();
+        let claims = if state.jwt_id_tokens.load(Ordering::SeqCst) {
+            format!("fixture.{}.fixture", URL_SAFE_NO_PAD.encode(claims))
+        } else {
+            claims
+        };
         let scope = if state.mode == FakeMode::ScopeMismatch {
             "openid profile"
         } else {
@@ -1328,6 +1335,10 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
             OAuthAuthorizeParameter {
                 name: "codex_cli_simplified_flow",
                 value: "true",
+            },
+            OAuthAuthorizeParameter {
+                name: "originator",
+                value: "codex_cli_rs",
             },
         ]
     );
@@ -6312,7 +6323,7 @@ async fn late_refresh_failure_cannot_expire_a_newer_same_alias_generation() {
 /// failure: one of the exact shapes below, or an authority that is not the
 /// exact `host:port` of its own `uri`.
 #[test]
-fn anthropic_redirect_is_claude_code_parity_and_others_stay_hardened() {
+fn registered_redirects_match_provider_clients_and_others_stay_hardened() {
     let (path, uri, authority) = compose_redirect(
         haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
         58820,
@@ -6321,7 +6332,11 @@ fn anthropic_redirect_is_claude_code_parity_and_others_stay_hardened() {
     assert_eq!(path, "/callback");
     assert_eq!(uri, "http://localhost:58820/callback");
     assert_eq!(authority, "localhost:58820");
-    let (path, uri, authority) = compose_redirect("openai-oauth", 58820, "SEGMENT");
+    let (path, uri, authority) = compose_redirect("openai-oauth", 1455, "SEGMENT");
+    assert_eq!(path, "/auth/callback");
+    assert_eq!(uri, "http://localhost:1455/auth/callback");
+    assert_eq!(authority, "localhost:1455");
+    let (path, uri, authority) = compose_redirect("fake-oauth", 58820, "SEGMENT");
     assert_eq!(path, "/oauth/callback/SEGMENT");
     assert_eq!(uri, "http://127.0.0.1:58820/oauth/callback/SEGMENT");
     assert_eq!(authority, "127.0.0.1:58820");
@@ -6335,3 +6350,6 @@ fn anthropic_redirect_is_claude_code_parity_and_others_stay_hardened() {
 fn default_flow_ttl_is_at_least_ten_minutes() {
     assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
 }
+
+#[path = "oauth_openai_tests.rs"]
+mod openai_tests;
