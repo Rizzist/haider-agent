@@ -1886,6 +1886,7 @@ impl DemoDriver {
             // `/update` as a stub and never emits either request.
             | AppRequest::CheckForUpdate
             | AppRequest::RunUpdate
+            | AppRequest::Reconnect
             | AppRequest::Reattach { .. }
             | AppRequest::CreateSession { .. }
             // W8b live-only vocabulary: the reducer's demo gates flash
@@ -3678,6 +3679,14 @@ pub async fn run_live(
     // so a stale daemon shows an honest note instead of a failed request.
     model.daemon_features = link.daemon_features.clone();
     model.daemon_version = Some(link.daemon_version.clone());
+    model.client_version = link.client_version.clone();
+    model.daemon_protocol = Some(link.daemon_protocol);
+    model.compatibility_diagnostic = crate::stream_recovery::compatibility(
+        &model.client_version,
+        model.daemon_version.as_deref(),
+        model.daemon_protocol,
+        "payload types/gaps: none observed on this connection",
+    );
     // T2: load the profile's transcription section ONCE at boot (shell-
     // owned IO — the reducer only ever sees the data). A present-but-
     // corrupt section is a typed error `/talk` surfaces honestly.

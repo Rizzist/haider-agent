@@ -12864,6 +12864,7 @@ fn error_action_key(action: ErrorAction) -> &'static str {
         ErrorAction::ContactAdmin => "contact_admin",
         ErrorAction::ContinuePartial => "continue_partial",
         ErrorAction::RetryFresh => "retry_fresh",
+        ErrorAction::Reconnect => "reconnect",
         ErrorAction::None => "none",
     }
 }
@@ -12881,6 +12882,7 @@ fn error_action_label(action: ErrorAction) -> &'static str {
         ErrorAction::ContactAdmin => "Contact admin",
         ErrorAction::ContinuePartial => "Continue from partial",
         ErrorAction::RetryFresh => "Retry from scratch",
+        ErrorAction::Reconnect => "Reconnect",
         ErrorAction::None => "Dismiss",
     }
 }
@@ -12895,6 +12897,9 @@ fn error_action_detail(action: ErrorAction) -> Option<&'static str> {
         ErrorAction::Wait => Some("Wait until the displayed reset time before retrying."),
         ErrorAction::ContinuePartial => Some("Continue without repeating the partial response."),
         ErrorAction::RetryFresh => Some("Start over; keep the partial response only as history."),
+        ErrorAction::Reconnect => {
+            Some("Reconnect the client to resume from its last applied cursor.")
+        }
         ErrorAction::Retry
         | ErrorAction::ChooseModel
         | ErrorAction::ContactAdmin

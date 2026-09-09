@@ -753,25 +753,20 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     frame.render_widget(Block::default().style(theme.text_style()), area);
 
     let mut hits: Vec<(Rect, Hit)> = Vec::new();
-    let persistent_diagnostic = persistent_diagnostic(model);
-    let (area, diagnostic) = if persistent_diagnostic.is_some() && area.height > 1 {
+    let area = if let Some((presentation, tone)) =
+        persistent_diagnostic(model).filter(|_| area.height > 1)
+    {
+        let lines = diagnostic_banner_lines(presentation, tone, theme, area.width);
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .min(area.height - 1);
         let [diagnostic, body] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-        (body, Some(diagnostic))
+            Layout::vertical([Constraint::Length(height), Constraint::Min(1)]).areas(area);
+        frame.render_widget(Paragraph::new(lines), diagnostic);
+        body
     } else {
-        (area, None)
+        area
     };
-    if let (Some(rect), Some((presentation, tone))) = (diagnostic, persistent_diagnostic) {
-        frame.render_widget(
-            Paragraph::new(diagnostic_banner_line(
-                presentation,
-                tone,
-                theme,
-                rect.width,
-            )),
-            rect,
-        );
-    }
     // The status row is the FIRST chrome to yield when a session's sacred
     // input — a blocking menu's options OR the composer's cursor row
     // (review r5 P2-1 + r6 P2-1) — cannot otherwise fit. Minimal need
@@ -11065,6 +11060,13 @@ fn persistent_diagnostic(
     if let Some(presentation) = &model.compatibility_diagnostic {
         return Some((presentation, DiagnosticTone::Failure));
     }
+    if let Some(presentation) = model
+        .active_session
+        .as_ref()
+        .and_then(|session| model.stream_diagnostics.get(session))
+    {
+        return Some((presentation, DiagnosticTone::Failure));
+    }
     if let Some(presentation) = &model.voice_diagnostic {
         return Some((presentation, DiagnosticTone::ActionNeeded));
     }
@@ -11084,21 +11086,24 @@ fn persistent_diagnostic(
     None
 }
 
-/// The persistent diagnostic banner's single row (E5 visual pass), in the
+/// The persistent diagnostic banner (E5 visual pass), in the
 /// error-card grammar: severity rail `▏` + glyph + BOLD tone-ink title,
 /// dim detail, then the dim fact segments (subcode + actions — the one
 /// error-fact vocabulary). Severity travels in TEXT via the glyph (✗
-/// failure / ⚠ action-needed), never in ink alone. Under width pressure
+/// failure / ⚠ action-needed), never in ink alone. Stream compatibility
+/// and resync failures wrap: identities, observed evidence and recovery
+/// commands must remain readable. Other banners retain their single row.
+/// Under width pressure
 /// the facts shed whole segments first (the subcode never sheds), then
 /// the detail ellipsizes; the title never yields. A detail that opens by
 /// echoing its own title ("Store unwritable — …") drops the echo — the
 /// bold title already said it.
-fn diagnostic_banner_line(
+fn diagnostic_banner_lines(
     presentation: &haider_protocol::error::ErrorPresentation,
     tone: DiagnosticTone,
     theme: &Theme,
     width: u16,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthStr;
     let (ink, glyph) = match tone {
         DiagnosticTone::Failure => (theme.err, "✗"),
@@ -11111,8 +11116,37 @@ fn diagnostic_banner_line(
         .and_then(|rest| rest.strip_prefix(" — "))
         .unwrap_or(presentation.detail.as_str());
     let head = format!("{glyph} {title}");
-    let after_head = (width as usize).saturating_sub(1 + head.width());
     let facts = crate::projection::error_fact_segments_with_actions(presentation, None);
+    if matches!(
+        presentation.subcode.as_str(),
+        "client-daemon-incompatible" | "session-resync-failed"
+    ) {
+        let rail_style = ratatui::style::Style::default().fg(ink.into());
+        let mut lines: Vec<_> = wrap_body(&head, (width as usize).saturating_sub(1))
+            .into_iter()
+            .map(|row| {
+                Line::from(vec![
+                    Span::styled("▏", rail_style),
+                    Span::styled(row, rail_style.add_modifier(Modifier::BOLD)),
+                ])
+            })
+            .collect();
+        let fact_line = facts
+            .iter()
+            .map(|(segment, _)| segment.as_str())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        for text in [detail, fact_line.as_str()] {
+            for row in wrap_body(text, (width as usize).saturating_sub(3)) {
+                lines.push(Line::from(vec![
+                    Span::styled("▏", rail_style),
+                    Span::styled(format!("  {row}"), theme.dim_style()),
+                ]));
+            }
+        }
+        return lines;
+    }
+    let after_head = (width as usize).saturating_sub(1 + head.width());
     let subcode_width = facts
         .first()
         .map_or(0, |(segment, _)| segment.as_str().width());
@@ -11143,7 +11177,7 @@ fn diagnostic_banner_line(
     if !fact_line.is_empty() {
         spans.push(Span::styled(format!(" · {fact_line}"), theme.dim_style()));
     }
-    Line::from(spans)
+    vec![Line::from(spans)]
 }
 
 /// The menu's body lines pre-wrapped by display cells into the menu's
@@ -13952,7 +13986,12 @@ fn render_status_bar(
         && update_hint.is_none()
         && model.screen == Screen::Launcher
         && !model.help_open;
-    let right = if let Some(flash) = &model.flash {
+    let resync_notice = model
+        .active_session
+        .as_ref()
+        .filter(|session| model.resyncing.contains(*session))
+        .map(|_| "· resyncing…".to_owned());
+    let right = if let Some(flash) = resync_notice.as_ref().or(model.flash.as_ref()) {
         flash.clone()
     } else if let Some(update_hint) = update_hint {
         update_hint

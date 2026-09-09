@@ -37,6 +37,7 @@ pub mod select;
 pub mod session;
 pub mod settings;
 pub mod ssh_terminal;
+pub mod stream_recovery;
 pub mod stt_runtime;
 pub mod style;
 pub mod talk;

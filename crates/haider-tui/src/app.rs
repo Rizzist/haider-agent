@@ -3737,6 +3737,8 @@ pub enum AppRequest {
     CreateSession {
         text: String,
     },
+    /// Explicitly renegotiate the daemon connection and resume applied cursors.
+    Reconnect,
     /// The strict gap law fired (W3c3, report R11 cut 2): reduction STOPPED
     /// for `session` with its cursor still at `after_seq`, and NOTHING later
     /// may be applied until the driver reattaches from there. The demo
@@ -5424,8 +5426,12 @@ pub struct AppModel {
     /// Persistent profile-level diagnostic, cleared only by an explicit
     /// healthy edge from the daemon after a real write probe succeeds.
     pub profile_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
-    /// Latched after sustained unknown-payload/sequence mismatch.
+    /// Connection-local fault grounded in the current Hello/Welcome pair.
     pub compatibility_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
+    pub stream_diagnostics:
+        std::collections::HashMap<SessionId, haider_protocol::error::ErrorPresentation>,
+    pub resyncing: std::collections::HashSet<SessionId>,
+    pub stream_observations: std::collections::HashMap<SessionId, String>,
     /// Post-start microphone failure, persistent until a later Start succeeds.
     pub voice_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
     pub supervisor_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
@@ -5588,6 +5594,8 @@ pub struct AppModel {
     /// (observed live: a daemon two days and five releases old).
     pub daemon_features: std::collections::BTreeSet<String>,
     pub daemon_version: Option<String>,
+    pub client_version: String,
+    pub daemon_protocol: Option<u32>,
     /// The open OAuth add card, if any (accounts screen overlay).
     pub oauth_add: Option<OAuthAddCard>,
     /// Monotonic attempt counter for OAuth add cards.
@@ -5797,6 +5805,9 @@ impl Default for AppModel {
             update_available: None,
             profile_diagnostic: None,
             compatibility_diagnostic: None,
+            stream_diagnostics: Default::default(),
+            resyncing: Default::default(),
+            stream_observations: Default::default(),
             voice_diagnostic: None,
             supervisor_diagnostic: None,
             command_diagnostic: None,
@@ -5836,6 +5847,8 @@ impl Default for AppModel {
             providers: ProvidersState::default(),
             daemon_features: std::collections::BTreeSet::new(),
             daemon_version: None,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            daemon_protocol: None,
             oauth_add: None,
             oauth_attempt_seq: 0,
             custom_add: None,
@@ -14710,6 +14723,10 @@ impl AppModel {
                     self.flash = Some("· checking for updates…".to_owned());
                 }
             }
+            "reconnect" if !self.mode.fabricates_locally() => {
+                self.requests.push(AppRequest::Reconnect);
+                self.flash = Some("· reconnecting…".into());
+            }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
             "aura" => self.enter_aura(),
             "tokens" => self.toggle_token_panel(),
@@ -16022,19 +16039,8 @@ impl AppModel {
         match outcome {
             RawOutcome::Applied => {
                 self.dirty = true;
-                if let Ok(EventPayload::ClientDiagnostic { code, message, .. }) =
-                    envelope.payload.decode_event()
-                    && code == "client-daemon-incompatible"
-                {
-                    self.compatibility_diagnostic =
-                        Some(haider_protocol::error::ErrorPresentation::new(
-                            code,
-                            "Client/daemon incompatible — update",
-                            message,
-                            haider_protocol::error::ErrorScope::Session,
-                            [haider_protocol::error::ErrorAction::None],
-                        ));
-                }
+                // A journal diagnostic describes a former connection. It
+                // cannot establish compatibility of this Hello/Welcome pair.
                 // S4: applied journal truth advances the render clock —
                 // the first paint after a spawn reads a clock already
                 // inside the journal's own time base, tick or no tick.
@@ -16198,6 +16204,7 @@ impl AppModel {
                                     &mut self.projection,
                                     envelope,
                                 )
+                                && !envelope.payload.is_structurally_valid()
                             {
                                 self.projection.count_unknown_payload();
                             }
@@ -16770,6 +16777,7 @@ impl AppModel {
             ErrorAction::ContactAdmin => self
                 .projection
                 .push_note("· contact the account administrator for access".into()),
+            ErrorAction::Reconnect => self.requests.push(AppRequest::Reconnect),
             ErrorAction::ContinuePartial | ErrorAction::RetryFresh | ErrorAction::None => {}
         }
         self.dirty = true;

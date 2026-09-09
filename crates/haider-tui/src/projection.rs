@@ -7,7 +7,7 @@
 //! Laws honored here:
 //! - Item lifecycle (`started`/`delta`/`completed`): `Completed` carries the
 //!   final item and REPLACES the block (deltas are advisory, replay-safe).
-//! - Forward compatibility: unknown payloads are counted, never fatal.
+//! - Forward compatibility: opaque tagged payloads are skipped, never fatal.
 //! - Honesty: seq gaps and orphan deltas are surfaced as counters, not hidden.
 //!
 //! Badge strings are sim goldens (`BADGE_LABEL` in the `/tui` sim). Protocol
@@ -544,7 +544,7 @@ impl SessionProjection {
     /// papering over a gap is never the client's job.
     ///
     /// Duplicate seqs are skipped (delivery is at-least-once). Unknown
-    /// payloads are counted and ignored (forward-compat law). Envelopes
+    /// tagged payloads are ignored (forward-compat law). Envelopes
     /// marked `render.ui == false` advance the cursor but never mutate
     /// display state (§6.1: three surfaces, never conflated).
     pub fn apply_raw(&mut self, envelope: &RawEnvelope) -> RawOutcome {
@@ -594,7 +594,15 @@ impl SessionProjection {
         }
         match serde_json::from_value::<EventPayload>(payload.clone()) {
             Ok(payload) => self.apply(&payload),
-            Err(_) => self.unknown_payloads += 1,
+            Err(_)
+                if payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|tag| tag.trim().is_empty()) =>
+            {
+                self.unknown_payloads += 1
+            }
+            Err(_) => {}
         }
     }
 
@@ -634,8 +642,8 @@ impl SessionProjection {
         true
     }
 
-    /// Count one payload this build cannot decode (forward-compat law) —
-    /// the router's hook when IT owns the decode.
+    /// Count malformed raw structure. Opaque tagged payloads, including
+    /// additive families and new nested variants, never increment this.
     pub fn count_unknown_payload(&mut self) {
         self.unknown_payloads += 1;
     }
@@ -813,17 +821,12 @@ impl SessionProjection {
                     presentation: presentation.clone(),
                 });
             }
-            EventPayload::ClientDiagnostic { code, message, .. } => {
-                self.entries.push(TranscriptEntry::Error {
-                    text: format!("{code} — {message}"),
-                    presentation: Some(haider_protocol::error::ErrorPresentation::new(
-                        code,
-                        "Client/daemon incompatible — update",
-                        message,
-                        haider_protocol::error::ErrorScope::Session,
-                        [haider_protocol::error::ErrorAction::None],
-                    )),
-                });
+            EventPayload::ClientDiagnostic { code, .. } => {
+                // Connection diagnoses cannot be restored from durable
+                // session history (including false reports from old clients).
+                self.push_note(format!(
+                    "· historical client diagnostic: {code} (previous connection)"
+                ));
             }
             // B2b-m3: a committed node ANCHORS its display entry — never a
             // transcript row of its own (the sim's tree reads entries; the
@@ -2341,6 +2344,7 @@ pub const fn error_action_word(action: ErrorAction) -> &'static str {
         ErrorAction::ContactAdmin => "contact admin",
         ErrorAction::ContinuePartial => "continue partial",
         ErrorAction::RetryFresh => "retry fresh",
+        ErrorAction::Reconnect => "reconnect /reconnect",
         ErrorAction::None => "none",
     }
 }

@@ -127,24 +127,6 @@ fn checkpoint_page_summary(page: &haider_protocol::checkpoint::CheckpointListPag
     format!("· checkpoints — {}", rows.join(" | "))
 }
 
-fn recognized_payload(payload: &serde_json::Value) -> bool {
-    serde_json::from_value::<haider_protocol::EventPayload>(payload.clone()).is_ok()
-        || serde_json::from_value::<haider_protocol::agent::AgentEventPayload>(payload.clone())
-            .is_ok()
-        || serde_json::from_value::<haider_protocol::task::TaskEventPayload>(payload.clone())
-            .is_ok()
-        || serde_json::from_value::<haider_protocol::session::SessionConfigEventPayload>(
-            payload.clone(),
-        )
-        .is_ok()
-        || serde_json::from_value::<haider_protocol::hook::HookEventPayload>(payload.clone())
-            .is_ok()
-        || haider_protocol::permission::PermissionEventPayload::from_payload_value(payload.clone())
-            .is_ok()
-        || haider_protocol::workspace::WorkspaceEventPayload::from_payload_value(payload).is_some()
-        || crate::session::is_workflow_graph_event(payload)
-}
-
 /// The daemon's per-connection attachment ceiling
 /// (`haider-daemon/src/session_hub/mod.rs`: `max_attachments_per_connection`).
 ///
@@ -181,6 +163,8 @@ fn workflow_graph_view_open(model: &AppModel) -> bool {
 /// cancel, or login").
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveCommand {
+    /// Retire this socket and negotiate a fresh Hello/Welcome.
+    Reconnect,
     List {
         cursor: Option<String>,
     },
@@ -1180,7 +1164,8 @@ impl LiveCommand {
             Self::SelectAgentType { command_id, .. } => Some(command_id),
             Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
-            Self::List { .. }
+            Self::Reconnect
+            | Self::List { .. }
             | Self::CheckpointList { .. }
             | Self::Attach { .. }
             | Self::Detach { .. }
@@ -1949,6 +1934,8 @@ pub enum LiveReply {
     Handshake {
         features: std::collections::BTreeSet<String>,
         version: String,
+        client_version: String,
+        protocol: u32,
     },
     /// A fresh connection is negotiated. Every attachment is gone with the
     /// old socket, so the working set is rebuilt from the reducer's cursors
@@ -2307,10 +2294,9 @@ pub struct LiveDriver {
     /// deadlines are a pure function of the value it was handed — a test
     /// moves time by calling [`Self::set_now`], never by sleeping.
     now: std::time::Instant,
-    /// Consecutive forward-compat mismatches. One unknown additive event or
-    /// one recoverable gap remains tolerated; sustained mismatch escalates.
-    mismatch_streaks: HashMap<SessionId, u8>,
-    incompatible_sessions: std::collections::HashSet<SessionId>,
+    /// Cursor-scoped recovery attempts. Retiring the route fences queued
+    /// frames, so only another failed replay can spend the retry budget.
+    resyncs: HashMap<SessionId, crate::stream_recovery::Resync>,
     /// One `session.fleet` read outstanding at most (single-flight): the
     /// fleet screen's event-cadence refresh folds bursts into `chase` and
     /// re-reads once when the outstanding reply lands. No timer anywhere.
@@ -2468,8 +2454,7 @@ impl LiveDriver {
             creating: HashMap::new(),
             models_requested: std::collections::HashSet::new(),
             now: std::time::Instant::now(),
-            mismatch_streaks: HashMap::new(),
-            incompatible_sessions: std::collections::HashSet::new(),
+            resyncs: HashMap::new(),
             fleet_inflight: false,
             fleet_chase: false,
             graph_inflight: false,
@@ -2727,6 +2712,13 @@ impl LiveDriver {
     /// call sites have to remember — which is exactly how the double
     /// attach survived M3.2's fix (review W3c3 P1-3 / D1-1).
     pub fn ensure_attached(&mut self, model: &AppModel, session: &SessionId) -> Vec<LiveCommand> {
+        if self
+            .resyncs
+            .get(session)
+            .is_some_and(|resync| resync.blocked)
+        {
+            return Vec::new();
+        }
         if self.attachments.contains_key(session) {
             self.touch(session);
             return Vec::new();
@@ -4664,8 +4656,7 @@ impl LiveDriver {
                 let Some(session) = self.routes.get(&attachment).cloned() else {
                     return Vec::new();
                 };
-                self.drop_attachment(&attachment);
-                self.ensure_attached(model, &session)
+                self.resync(model, &session, "lagged observe stream".into(), true)
             }
             LiveReply::CaughtUp {
                 attachment,
@@ -4678,13 +4669,20 @@ impl LiveDriver {
                 // that far, envelopes were lost between the daemon's sink
                 // and our reducer, and the LAST ones leave no trace of
                 // their own absence. Reattach from what we really applied.
-                if cursor_of(model, &session).unwrap_or(0) >= high_water_seq {
+                let after_seq = cursor_of(model, &session).unwrap_or(0);
+                if after_seq >= high_water_seq {
+                    self.resyncs.remove(&session);
+                    model.resyncing.remove(&session);
+                    model.stream_diagnostics.remove(&session);
+                    model.dirty = true;
                     return Vec::new();
                 }
-                self.drop_attachment(&attachment);
-                let mut commands = vec![LiveCommand::Detach { attachment }];
-                commands.extend(self.ensure_attached(model, &session));
-                commands
+                self.resync(
+                    model,
+                    &session,
+                    format!("catch-up gap after {after_seq}, advertised {high_water_seq}"),
+                    false,
+                )
             }
             LiveReply::EventsLost { count } => {
                 model.flash = Some(format!("· resynchronizing — {count} frames dropped"));
@@ -4701,10 +4699,13 @@ impl LiveDriver {
                     })
                     .collect();
                 let mut commands = Vec::new();
-                for (session, attachment) in held {
-                    self.drop_attachment(&attachment);
-                    commands.push(LiveCommand::Detach { attachment });
-                    commands.extend(self.ensure_attached(model, &session));
+                for (session, _) in held {
+                    commands.extend(self.resync(
+                        model,
+                        &session,
+                        format!("client inbound queue dropped {count} frames"),
+                        false,
+                    ));
                 }
                 commands
             }
@@ -4733,6 +4734,14 @@ impl LiveDriver {
                         head_seq: cursor_of(model, &session).unwrap_or(0),
                     },
                 );
+                if self.resyncs.contains_key(&session) {
+                    return self.resync(
+                        model,
+                        &session,
+                        format!("replay attach failed: {code} — {message}"),
+                        true,
+                    );
+                }
                 // Retryable classes (overloaded, a transient cap) are worth
                 // one more try on the next loop pass; a permanent one is
                 // reported and the row stays cold rather than pretending.
@@ -5444,9 +5453,26 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
-            LiveReply::Handshake { features, version } => {
+            LiveReply::Handshake {
+                features,
+                version,
+                client_version,
+                protocol,
+            } => {
+                self.resyncs.clear();
+                model.resyncing.clear();
+                model.stream_diagnostics.clear();
+                model.stream_observations.clear();
                 model.daemon_features = features;
                 model.daemon_version = Some(version);
+                model.client_version = client_version;
+                model.daemon_protocol = Some(protocol);
+                model.compatibility_diagnostic = crate::stream_recovery::compatibility(
+                    &model.client_version,
+                    model.daemon_version.as_deref(),
+                    model.daemon_protocol,
+                    "payload types/gaps: none observed on this connection",
+                );
                 if !model
                     .daemon_features
                     .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
@@ -5892,6 +5918,82 @@ impl LiveDriver {
         self.graph_refresh(model)
     }
 
+    /// All loss paths retire the old route before issuing one cursor replay.
+    /// Frames already queued for that route cannot consume another attempt.
+    fn resync(
+        &mut self,
+        model: &mut AppModel,
+        session: &SessionId,
+        reason: String,
+        daemon_detached: bool,
+    ) -> Vec<LiveCommand> {
+        if self.attaching.contains_key(session) {
+            return Vec::new();
+        }
+        let after_seq = cursor_of(model, session).unwrap_or(0);
+        let recovery =
+            self.resyncs
+                .entry(session.clone())
+                .or_insert(crate::stream_recovery::Resync {
+                    after_seq,
+                    attempts: 0,
+                    blocked: false,
+                    cause: reason.clone(),
+                });
+        if recovery.blocked {
+            return Vec::new();
+        }
+        if after_seq > recovery.after_seq {
+            recovery.after_seq = after_seq;
+            recovery.attempts = 0;
+            recovery.cause = reason.clone();
+        }
+        // Retain the payload/gap that started this cursor's recovery even
+        // when its final failure is an RPC refusal or a missing replay tail.
+        // Only the initial cause and latest failure are kept, not a growing
+        // event history.
+        let reason = if recovery.cause == reason {
+            reason
+        } else {
+            format!("{}; latest replay failure: {reason}", recovery.cause)
+        };
+        recovery.blocked = recovery.attempts == crate::stream_recovery::RESYNC_ATTEMPTS;
+        let blocked = recovery.blocked;
+        if !blocked {
+            recovery.attempts += 1;
+        }
+        let mut commands = Vec::new();
+        if let Some(attachment) = self.attachments.get(session).cloned() {
+            self.drop_attachment(&attachment);
+            if !daemon_detached {
+                commands.push(LiveCommand::Detach { attachment });
+            }
+        }
+        model
+            .stream_observations
+            .insert(session.clone(), reason.clone());
+        // Observations explain an already-proven handshake mismatch; loss
+        // itself never creates an incompatibility diagnosis.
+        model.compatibility_diagnostic = crate::stream_recovery::compatibility(
+            &model.client_version,
+            model.daemon_version.as_deref(),
+            model.daemon_protocol,
+            &reason,
+        );
+        if blocked {
+            model.resyncing.remove(session);
+            model.stream_diagnostics.insert(
+                session.clone(),
+                crate::stream_recovery::failed(after_seq, &reason),
+            );
+        } else {
+            model.resyncing.insert(session.clone());
+            commands.extend(self.ensure_attached(model, session));
+        }
+        model.dirty = true;
+        commands
+    }
+
     fn on_event(
         &mut self,
         model: &mut AppModel,
@@ -5922,46 +6024,58 @@ impl LiveDriver {
         // hears a detach for — a permanent slot against its 16-per-
         // connection ceiling, plus duplicate delivery of every later
         // envelope for that session (review P1-3).
-        let recognized = recognized_payload(&envelope.payload);
+        // Malformed raw structure is recoverable from the journal. Never
+        // advance the applied cursor past it, and never count an applied
+        // opaque/additive fact as a mismatch.
+        if !envelope.payload.is_structurally_valid()
+            && envelope.seq > cursor_of(model, session).unwrap_or(0)
+        {
+            if model.active_session.as_ref() == Some(session) {
+                model.projection.count_unknown_payload();
+            } else if let Some(entry) = model.sessions.iter_mut().find(|entry| &entry.id == session)
+            {
+                entry.projection.count_unknown_payload();
+            }
+            let reason = format!(
+                "malformed payload type {} at seq {}",
+                crate::stream_recovery::payload_type(&envelope.payload),
+                envelope.seq
+            );
+            return self.resync(model, session, reason, false);
+        }
         let outcome = model.route_raw(envelope);
         let applied = matches!(outcome, RawOutcome::Applied);
-        match outcome {
-            RawOutcome::Applied if recognized => {
-                self.mismatch_streaks.remove(session);
-                self.record_menu(session, envelope);
-                self.apply_tuning_fact(model, session, envelope);
-            }
-            RawOutcome::Applied | RawOutcome::Gap { .. } => {
-                let streak = self.mismatch_streaks.entry(session.clone()).or_default();
-                *streak = streak.saturating_add(1);
-                let should_report =
-                    *streak >= 3 && self.incompatible_sessions.insert(session.clone());
-                if should_report {
-                    let presentation = ErrorPresentation::new(
-                        "client-daemon-incompatible",
-                        "Client/daemon incompatible — update",
-                        "This client repeatedly received unknown events or unrecoverable sequence gaps. Update Haider before continuing this session.",
-                        haider_protocol::error::ErrorScope::Session,
-                        [haider_protocol::error::ErrorAction::None],
-                    );
-                    model.compatibility_diagnostic = Some(presentation);
-                    model.record_session_error(
-                        session,
-                        "client/daemon incompatible — update".into(),
-                    );
-                    model.dirty = true;
-                    let command = LiveCommand::SessionDiagnostic {
-                        command_id: self.mint(),
-                        session: session.clone(),
-                        code: "client-daemon-incompatible".into(),
-                        message:
-                            "sustained unknown-payload or sequence-gap mismatch — update Haider"
-                                .into(),
-                    };
-                    return vec![self.enqueue(command)];
+        if applied {
+            self.record_menu(session, envelope);
+            self.apply_tuning_fact(model, session, envelope);
+            if model.compatibility_diagnostic.is_some() {
+                let mut observed = format!(
+                    "observed payload type {} at seq {}",
+                    crate::stream_recovery::payload_type(&envelope.payload),
+                    envelope.seq
+                );
+                if let Some(issue) = model.stream_observations.get(session) {
+                    observed.push_str("; ");
+                    observed.push_str(issue);
                 }
+                model.compatibility_diagnostic = crate::stream_recovery::compatibility(
+                    &model.client_version,
+                    model.daemon_version.as_deref(),
+                    model.daemon_protocol,
+                    &observed,
+                );
             }
-            RawOutcome::Duplicate | RawOutcome::WrongSession => {}
+        } else if let RawOutcome::Gap { after_seq } = outcome {
+            // route_raw owns the Reattach request; retain the observed gap
+            // for its single recovery authority below.
+            model.stream_observations.insert(
+                session.clone(),
+                format!(
+                    "gap after {after_seq}, received {} ({})",
+                    envelope.seq,
+                    crate::stream_recovery::payload_type(&envelope.payload)
+                ),
+            );
         }
         // The fleet screen's event-cadence chase (see `fleet_event_chase`):
         // only an APPLIED envelope can have moved the tree.
@@ -6707,19 +6821,26 @@ impl LiveDriver {
                     confirm_new_epoch,
                 })]
             }
+            AppRequest::Reconnect => {
+                self.resyncs.clear();
+                model.resyncing.clear();
+                model.stream_diagnostics.clear();
+                model.stream_observations.clear();
+                self.connected = false;
+                vec![LiveCommand::Reconnect]
+            }
             // The request's `after_seq` is the reducer's own last fully
             // applied sequence — the same value [`cursor_of`] reads, from
             // the same authority. `ensure_attached` re-reads it rather
             // than carrying a copy, because a second cursor is how a
             // reattach asks for history the reducer already applied.
             AppRequest::Reattach { session, .. } => {
-                let mut commands = Vec::new();
-                if let Some(attachment) = self.attachments.get(&session).cloned() {
-                    self.drop_attachment(&attachment);
-                    commands.push(LiveCommand::Detach { attachment });
-                }
-                commands.extend(self.ensure_attached(model, &session));
-                commands
+                let reason = model
+                    .stream_observations
+                    .get(&session)
+                    .cloned()
+                    .unwrap_or_else(|| "sequence gap".into());
+                self.resync(model, &session, reason, false)
             }
             AppRequest::Interrupt { branch } => {
                 // Esc cancels the run the COMMITTED stream says is running.

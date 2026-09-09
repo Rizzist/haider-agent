@@ -352,6 +352,8 @@ fn feature_downgrade_never_renders_a_retained_projection_as_live() {
     driver.apply(
         &mut model,
         LiveReply::Handshake {
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
             features: [
                 haider_rpc::FEATURE_LOOM_V1.to_owned(),
                 haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),

@@ -197,6 +197,8 @@ fn stale_watch_epoch_cannot_release_adoption_or_install_an_old_owner() {
     driver.apply(
         &mut model,
         LiveReply::Handshake {
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
             features: BTreeSet::from([haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned()]),
             version: "test".into(),
         },
@@ -576,6 +578,8 @@ fn watch_is_issued_on_entry_switch_and_connection_epoch() {
     driver.apply(
         &mut model,
         LiveReply::Handshake {
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
             features: BTreeSet::from([haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned()]),
             version: "test".to_owned(),
         },
