@@ -30,11 +30,21 @@ pub(crate) fn provider_error_message(value: &serde_json::Value) -> Option<&str> 
 }
 
 pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
+    let spans = header_secret_spans(detail);
+    let mut spans = spans.into_iter().peekable();
     let mut output = String::new();
     let mut redact_next = false;
+    let mut offset = 0;
     for piece in detail.split_inclusive(char::is_whitespace) {
         let word = piece.trim_end_matches(char::is_whitespace);
         let whitespace = &piece[word.len()..];
+        while spans.peek().is_some_and(|span| span.end <= offset) {
+            spans.next();
+        }
+        let header_secret = spans
+            .peek()
+            .is_some_and(|span| span.start < offset + word.len());
+        offset += piece.len();
         if word.is_empty() {
             output.push_str(whitespace);
             continue;
@@ -42,37 +52,97 @@ pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
         let normalized = word
             .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
             .to_ascii_lowercase();
-        if redact_next {
+        if header_secret || redact_next || contains_provider_secret(&normalized) {
             output.push_str("[REDACTED]");
-            redact_next = is_authorization_scheme(&normalized);
-        } else if let Some((label, secret)) = inline_provider_secret(word) {
-            output.push_str("[REDACTED]");
-            // A compact header can end at its scheme; the credential is
-            // still in the following word, including any surrounding quotes.
-            redact_next =
-                label.eq_ignore_ascii_case("authorization") && is_authorization_scheme(secret);
-        } else if looks_like_provider_secret(&normalized) {
-            output.push_str("[REDACTED]");
+            redact_next = (header_secret || redact_next) && is_authorization_scheme(&normalized);
         } else {
             output.push_str(word);
-            redact_next = matches!(
-                normalized.as_str(),
-                "bearer" | "authorization" | "api_key" | "access_token" | "refresh_token"
-            );
+            redact_next = normalized == "bearer" || is_secret_label(&normalized);
         }
         output.push_str(whitespace);
     }
     (!output.trim().is_empty()).then_some(output)
 }
 
-fn inline_provider_secret(value: &str) -> Option<(&str, &str)> {
-    let value = value.trim_start_matches(['"', '\'', '{', '[']);
-    let (label, secret) = value.split_once(['=', ':'])?;
-    let label = label.trim_end_matches(['"', '\'']);
-    let is_secret_label = ["authorization", "api_key", "access_token", "refresh_token"]
+const SECRET_LABELS: &[&str] = &[
+    "proxy-authorization",
+    "authorization",
+    "x-api-key",
+    "x_api_key",
+    "api-key",
+    "api_key",
+    "apikey",
+    "access_token",
+    "access-token",
+    "refresh_token",
+    "refresh-token",
+];
+
+fn is_secret_label(value: &str) -> bool {
+    SECRET_LABELS
         .iter()
-        .any(|expected| label.eq_ignore_ascii_case(expected));
-    (is_secret_label && !secret.is_empty()).then_some((label, secret))
+        .any(|label| value.eq_ignore_ascii_case(label))
+}
+
+fn header_secret_spans(detail: &str) -> Vec<std::ops::Range<usize>> {
+    // Locate every header independently of whitespace: the preceding credential
+    // may be adjacent to another header, including inside compact JSON.
+    let mut headers = detail
+        .match_indices([':', '='])
+        .filter_map(|(separator, _)| {
+            let prefix = detail[..separator]
+                .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'));
+            SECRET_LABELS.iter().find_map(|label| {
+                let start = prefix.len().checked_sub(label.len())?;
+                prefix.get(start..)?.eq_ignore_ascii_case(label).then_some((
+                    start,
+                    separator + 1,
+                    label.ends_with("authorization"),
+                ))
+            })
+        })
+        .peekable();
+    let mut spans = Vec::new();
+    while let Some((header_start, value_start, authorization)) = headers.next() {
+        let next_header = headers.peek().map(|header| header.0);
+        let limit = next_header.unwrap_or(detail.len());
+        let value = &detail[value_start..limit];
+        let value_text = value.trim_start_matches(char::is_whitespace);
+        let start = if value.len() == value_text.len() {
+            header_start
+        } else {
+            limit - value_text.len()
+        };
+        let mut credential = value_text.trim_start_matches(['"', '\'']);
+        if authorization {
+            for scheme in ["bearer", "basic", "token"] {
+                if credential
+                    .get(..scheme.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                {
+                    // A scheme may touch its credential (Bearer<token>).
+                    credential = &credential[scheme.len()..];
+                    break;
+                }
+            }
+        }
+        credential =
+            credential.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'));
+        let credential_start = limit - credential.len();
+        // Explicit separators bound the whole value, including whitespace in
+        // an echoed credential. Without a delimiter, retain diagnostic prose
+        // after the credential's first word, as for a standalone Bearer token.
+        let end = credential
+            .find([';', ',', '\n', '\r', '"', '\'', '{', '}', '[', ']'])
+            .or_else(|| next_header.map(|_| credential.len()))
+            .unwrap_or_else(|| {
+                credential
+                    .find(char::is_whitespace)
+                    .unwrap_or(credential.len())
+            });
+        spans.push(start..credential_start + end);
+    }
+    spans
 }
 
 fn is_authorization_scheme(value: &str) -> bool {
@@ -82,10 +152,39 @@ fn is_authorization_scheme(value: &str) -> bool {
         .any(|scheme| value.eq_ignore_ascii_case(scheme))
 }
 
-fn looks_like_provider_secret(value: &str) -> bool {
-    (value.starts_with("sk-") && value.len() >= 12)
-        || (value.starts_with("sess-") && value.len() >= 16)
-        || (value.starts_with("eyj")
-            && value.len() >= 24
-            && value.bytes().filter(|byte| *byte == b'.').count() >= 2)
+fn contains_provider_secret(value: &str) -> bool {
+    // Match inside punctuation/assignments too. Keep the established sk-/sess-
+    // thresholds and include the known token prefixes in haider-tools/redact.rs.
+    // A JWT prefix must precede at least two dots in the same word. Locate that
+    // boundary once instead of rescanning the suffix at every possible prefix.
+    let jwt_separator = value.rmatch_indices('.').nth(1).map(|(offset, _)| offset);
+    value.char_indices().any(|(start, _)| {
+        let token = &value[start..];
+        (token.starts_with("sk-") && token.len() >= 12)
+            || (token.starts_with("sess-") && token.len() >= 16)
+            || (token.starts_with("akia")
+                && token[4..]
+                    .bytes()
+                    .take_while(u8::is_ascii_alphanumeric)
+                    .take(16)
+                    .count()
+                    >= 16)
+            || (token.starts_with("ghp_")
+                && token[4..]
+                    .bytes()
+                    .take_while(u8::is_ascii_alphanumeric)
+                    .take(20)
+                    .count()
+                    >= 20)
+            || (token.starts_with("xoxb-")
+                && token[5..]
+                    .bytes()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+                    .take(10)
+                    .count()
+                    >= 10)
+            || (token.starts_with("eyj")
+                && token.len() >= 24
+                && jwt_separator.is_some_and(|separator| start < separator))
+    })
 }

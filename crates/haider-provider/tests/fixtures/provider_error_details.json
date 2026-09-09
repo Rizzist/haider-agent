@@ -1,0 +1,462 @@
+[
+  {
+    "name": "original-r1",
+    "detail": "Invalid request; Authorization:Bearer fixture-opaque-secret",
+    "secrets": [
+      "fixture-opaque-secret"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED]"
+  },
+  {
+    "name": "scheme-0-Bearer-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:Bearer fixture-value-bearer retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-0-Bearer-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"Bearer fixture-value-bearer\" retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-0-Bearer-single-quoted",
+    "detail": "Invalid request; 'authorization'='Bearer fixture-value-bearer' retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-1-Basic-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:Basic fixture-value-basic retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-1-Basic-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"Basic fixture-value-basic\" retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-1-Basic-single-quoted",
+    "detail": "Invalid request; 'authorization'='Basic fixture-value-basic' retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-2-Token-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:Token fixture-value-token retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-2-Token-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"Token fixture-value-token\" retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-2-Token-single-quoted",
+    "detail": "Invalid request; 'authorization'='Token fixture-value-token' retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-3-bEaReR-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:bEaReR fixture-value-bearer retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-3-bEaReR-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"bEaReR fixture-value-bearer\" retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-3-bEaReR-single-quoted",
+    "detail": "Invalid request; 'authorization'='bEaReR fixture-value-bearer' retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-4-bAsIc-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:bAsIc fixture-value-basic retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-4-bAsIc-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"bAsIc fixture-value-basic\" retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-4-bAsIc-single-quoted",
+    "detail": "Invalid request; 'authorization'='bAsIc fixture-value-basic' retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-5-tOkEn-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:tOkEn fixture-value-token retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-5-tOkEn-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"tOkEn fixture-value-token\" retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-5-tOkEn-single-quoted",
+    "detail": "Invalid request; 'authorization'='tOkEn fixture-value-token' retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "multiple-spaced",
+    "detail": "Invalid request; Authorization:Bearer fixture-first \"Authorization\":\"Basic fixture-second\" Authorization:Token fixture-third retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "fixture-third"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "multiple-newlines",
+    "detail": "Invalid request; Authorization: Bearer fixture-first\nAuthorization: Basic fixture-second\nAuthorization: Token fixture-third retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "fixture-third"
+    ],
+    "expected": "Invalid request; Authorization: [REDACTED] [REDACTED]\nAuthorization: [REDACTED] [REDACTED]\nAuthorization: [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "multiple-compact-json",
+    "detail": "Invalid request; [{\"Authorization\":\"Bearer fixture-first\"},{\"Authorization\":\"Basic fixture-second\"},{\"Authorization\":\"Token fixture-third\"}] retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "fixture-third"
+    ],
+    "expected": null
+  },
+  {
+    "name": "multiple-compact-semicolon",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;Authorization:Basic fixture-second retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "spacing",
+    "detail": "messages.2:\n  invalid  tool pairing",
+    "secrets": [],
+    "expected": "messages.2:\n  invalid  tool pairing"
+  },
+  {
+    "name": "tabs-controls",
+    "detail": "Invalid\u001b[31m\trequest; Authorization:Token\n\tfixture-control-secret retained detail",
+    "secrets": [
+      "fixture-control-secret"
+    ],
+    "expected": "Invalid [31m request; [REDACTED]\n [REDACTED] retained detail"
+  },
+  {
+    "name": "utf8-bound",
+    "detail": "Invalid request; Authorization:Bearer\n  \"fixture-utf8-secret\"\u001b[31m 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+    "secrets": [
+      "fixture-utf8-secret"
+    ],
+    "expected": "Invalid request; [REDACTED]\n  [REDACTED] 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+  },
+  {
+    "name": "utf8-only",
+    "detail": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+    "secrets": [],
+    "expected": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+  },
+  {
+    "name": "mixed-comma",
+    "detail": "Invalid request; Authorization:Bearer fixture-first,X-Api-Key: fixture-second,Proxy-Authorization: Basic Zml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "joined-schemes-comma",
+    "detail": "Invalid request; Authorization:Bearerfixture-first,X-Api-Key:fixture-second,Proxy-Authorization:BasicZml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-semicolon",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;X-Api-Key: fixture-second;Proxy-Authorization: Basic Zml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "joined-schemes-semicolon",
+    "detail": "Invalid request; Authorization:Bearerfixture-first;X-Api-Key:fixture-second;Proxy-Authorization:BasicZml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-adjacent",
+    "detail": "Invalid request; Authorization:Bearer fixture-firstX-Api-Key: fixture-secondProxy-Authorization: Basic Zml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "joined-schemes-adjacent",
+    "detail": "Invalid request; Authorization:Bearerfixture-firstX-Api-Key:fixture-secondProxy-Authorization:BasicZml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-quoted-json",
+    "detail": "Invalid request; [{\"Authorization\":\"Bearer fixture-first\"},{\"X-Api-Key\":\"fixture-second\"},{\"Proxy-Authorization\":\"Basic Zml4dHVyZS10aGlyZA==\"}] retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-single-quoted",
+    "detail": "Invalid request; 'Authorization'='Bearerfixture-first','x-api-key'='fixture-second';'Proxy-Authorization'='BasicZml4dHVyZS10aGlyZA==' retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "delimited-multiword",
+    "detail": "Invalid request; Authorization:Bearer fixture first part;X-Api-Key:fixture second part,Proxy-Authorization:Basic Zml4dHVyZS10aGlyZA==; retained detail",
+    "secrets": [
+      "fixture",
+      "first",
+      "second",
+      "part",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-multiword",
+    "detail": "Invalid request; \"Authorization\":\"Bearer fixture first part\",\"X-Api-Key\":\"fixture second part\"; retained detail",
+    "secrets": [
+      "fixture",
+      "first",
+      "second",
+      "part"
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-controls",
+    "detail": "Invalid request; Authorization:Bearer\tfixture-first;X-Api-Key: fixture-second;Proxy-Authorization:Basic\n\tZml4dHVyZS10aGlyZA==\u001b[31m retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-api-key",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;api-key=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-api_key",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;api_key=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-apikey",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;apikey=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-x_api_key",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;x_api_key=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-access_token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;access_token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-access-token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;access-token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-refresh_token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;refresh_token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-refresh-token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;refresh-token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-aws",
+    "detail": "Invalid request; echoed=[AKIAFIXTURE0123456789], retained detail",
+    "secrets": [
+      "AKIAFIXTURE0123456789"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-github",
+    "detail": "Invalid request; echoed=[ghp_fixture0123456789abcdefgh], retained detail",
+    "secrets": [
+      "ghp_fixture0123456789abcdefgh"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-slack",
+    "detail": "Invalid request; echoed=[xoxb-fixture-0123456789], retained detail",
+    "secrets": [
+      "xoxb-fixture-0123456789"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-openai",
+    "detail": "Invalid request; echoed=[sk-fixture-secret-value], retained detail",
+    "secrets": [
+      "sk-fixture-secret-value"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-session",
+    "detail": "Invalid request; echoed=[sess-fixture-secret-value], retained detail",
+    "secrets": [
+      "sess-fixture-secret-value"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-jwt",
+    "detail": "Invalid request; echoed=[eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY], retained detail",
+    "secrets": [
+      "eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY"
+    ],
+    "expected": null
+  },
+  {
+    "name": "scheme-continuation",
+    "detail": "Invalid request; Authorization:Bearer Basic fixture-stacked-secret retained detail",
+    "secrets": [
+      "fixture-stacked-secret"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  }
+]

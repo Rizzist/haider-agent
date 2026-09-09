@@ -167,3 +167,65 @@ fn redacted_diagnostics_preserve_whitespace_control_sanitization_and_utf8_bound(
         assert!(!detail.contains("fixture-opaque-secret"));
     }
 }
+
+#[test]
+fn every_credential_in_compact_diagnostics_is_redacted() -> Result<(), serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Fixture {
+        name: String,
+        detail: String,
+        secrets: Vec<String>,
+        expected: Option<String>,
+    }
+
+    let fixtures: Vec<Fixture> =
+        serde_json::from_str(include_str!("fixtures/provider_error_details.json"))?;
+    assert!(!fixtures.is_empty(), "the credential corpus must run");
+    for classify in [
+        replay_anthropic_http_error,
+        replay_gemini_http_error,
+        replay_openai_http_error,
+    ] {
+        for fixture in &fixtures {
+            assert!(!fixture.secrets.is_empty() || fixture.expected.is_some());
+            let message = &fixture.detail;
+            let body = serde_json::json!({"error": {
+                "type": "invalid_request_error", "message": message
+            }})
+            .to_string();
+            // The same sanitizer serves structured and plain HTTP error bodies.
+            for input in [body.as_bytes(), message.as_bytes()] {
+                let error = classify(400, None, input)
+                    .with_http_metadata(400, Some("req-multi-header-fixture"));
+                let detail = error.presentation.detail;
+                for secret in &fixture.secrets {
+                    assert!(
+                        !detail.contains(secret),
+                        "{}: credential survived in {detail:?}",
+                        fixture.name
+                    );
+                }
+                if let Some(expected) = &fixture.expected {
+                    assert_eq!(&detail, expected, "{}", fixture.name);
+                }
+                if message.ends_with("retained detail") {
+                    assert!(
+                        detail.ends_with("retained detail"),
+                        "{}: {detail:?}",
+                        fixture.name
+                    );
+                }
+                assert!(detail.len() <= 512);
+                assert!(!detail.chars().any(|c| c.is_control() && c != '\n'));
+                assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+                assert_eq!(error.presentation.provider_http_status, Some(400));
+                assert_eq!(
+                    error.presentation.provider_request_id.as_deref(),
+                    Some("req-multi-header-fixture")
+                );
+            }
+        }
+    }
+    Ok(())
+}
