@@ -14,7 +14,6 @@ import ai.diffforge.haider.ui.theme.ForgeSpace
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -125,13 +124,18 @@ fun StatusBanner(
                 tint = tint,
                 modifier = Modifier.size(ForgeSize.iconSm),
             )
+            // One weight, not two. A `Box(weight(1f))` spacer beside a
+            // `weight(1f, fill = false)` title split the row in half, so on a
+            // 360 dp screen the battery banner's title lost most of its width
+            // to empty space and ellipsised mid-word (971-V F8). The title
+            // takes what is left after the icon, suffix and controls.
             Text(
                 resolve(model.title),
                 style = type.sessionTitle,
                 color = colors.text,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
+                modifier = Modifier.weight(1f),
             )
             model.suffix?.let {
                 Text(
@@ -141,7 +145,6 @@ fun StatusBanner(
                     maxLines = 1,
                 )
             }
-            Box(Modifier.weight(1f))
             if (actionable) {
                 Icon(
                     Icons.Rounded.ChevronRight,

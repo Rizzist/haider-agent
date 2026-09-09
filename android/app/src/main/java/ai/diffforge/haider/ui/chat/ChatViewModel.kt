@@ -10,6 +10,7 @@ import ai.diffforge.haider.ui.checkpoints.CheckpointsUiState
 import ai.diffforge.haider.ui.daemon.DaemonService
 import ai.diffforge.haider.ui.daemon.Attachment
 import ai.diffforge.haider.ui.daemon.AttachmentLimits
+import ai.diffforge.haider.ui.daemon.AttachmentRefused
 import ai.diffforge.haider.ui.daemon.Delivery
 import ai.diffforge.haider.ui.daemon.TurnRefused
 import ai.diffforge.haider.ui.daemon.DaemonStatus
@@ -23,6 +24,7 @@ import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.ChildTranscriptState
 import ai.diffforge.haider.ui.state.Overlay
+import ai.diffforge.haider.ui.state.OverlayNavigation
 import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.PermissionSnapshot
 import ai.diffforge.haider.ui.state.PermissionStanding
@@ -485,7 +487,16 @@ class ChatViewModel(
         // and the user can switch sessions during it; without this the block
         // lands wherever they ended up (verify-11 O10).
         val target = _state.value.activeSessionId ?: return@launch
-        val staged = service.stageAttachment(bytes, mime, name)
+        // The refusal's own code, not a guess: a null return means the facade
+        // has no staging adapter, and an AttachmentRefused carries the reason
+        // the daemon or the block kind gave (971-V F2).
+        val staged = try { service.stageAttachment(bytes, mime, name) }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (refused: AttachmentRefused) { noteAttachment(target, refused.code); return@launch }
+        catch (error: Exception) {
+            noteAttachment(target, error.message?.takeIf { it.isNotBlank() } ?: AttachmentLimits.TOO_LARGE)
+            return@launch
+        }
         if (staged == null) {
             noteAttachment(target, AttachmentLimits.TOO_LARGE)
             return@launch
@@ -494,6 +505,18 @@ class ChatViewModel(
         if (_state.value.activeSessionId == target) {
             update { it.copy(draftAttachments = draftAttachments.getValue(target)) }
         }
+    }
+
+    /**
+     * A platform affordance the composer offered and this device does not have.
+     *
+     * The Activity reports it rather than crashing on the launch (971-V F10);
+     * it rides the same notice line as a daemon refusal because to the person
+     * holding the phone it is the same fact: this attachment did not happen.
+     */
+    fun noteAttachmentUnavailable(code: String) {
+        _state.value.activeSessionId?.let { noteAttachment(it, code) }
+            ?: update { it.copy(attachmentNotice = code) }
     }
 
     /** Records a refusal against the session it belongs to. */
@@ -564,13 +587,39 @@ class ChatViewModel(
 
     private fun selectionFailed(error: Throwable) {
         if (error is kotlinx.coroutines.CancellationException) throw error
-        val code = (error as? ai.diffforge.haider.transport.rpc.RpcRemoteException)?.code ?: "selection_unavailable"
+        // An IOException from the transport already carries its own stable code
+        // as the message ("connection_lost"); reducing every failure to
+        // "selection_unavailable" hid which one happened.
+        val code = (error as? ai.diffforge.haider.transport.rpc.RpcRemoteException)?.code
+            ?: error.message?.takeIf { it.isNotBlank() }
+            ?: "selection_unavailable"
         update { it.copy(catalogError = code) }
     }
 
-    fun refreshModels() = viewModelScope.launch { service.refreshModels() }
+    /**
+     * Refresh is the button a person presses *because* something looks wrong,
+     * so it is exactly the call that must not raise: a daemon restart made it
+     * throw `connection_lost` out of an unguarded coroutine and killed the UI
+     * process while the daemon was fine (971-V F4, `api35-refresh-crash.log`).
+     *
+     * The failure becomes the chip's error state and the facade re-reads what
+     * it can, which is what "Retry" means from here.
+     */
+    fun refreshModels() = viewModelScope.launch {
+        update { it.copy(catalogRequestedAtMs = clock()) }
+        try { service.refreshModels() }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (error: Exception) {
+            selectionFailed(error)
+            refreshProviders()
+        }
+    }
 
-    fun refreshProviders() = viewModelScope.launch { service.refreshProviders() }
+    fun refreshProviders() = viewModelScope.launch {
+        try { service.refreshProviders() }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (error: Exception) { selectionFailed(error) }
+    }
 
     fun selectProvider(provider: String) = viewModelScope.launch {
         update { it.copy(selectionBusy = true, catalogRequestedAtMs = clock()) }
@@ -891,6 +940,19 @@ class ChatViewModel(
         childTranscriptJob?.cancel()
         childTranscriptJob = null
         update { it.copy(overlay = Overlay.None, childTranscript = null) }
+    }
+
+    /**
+     * System Back on a full screen, which must land where its own back control
+     * lands.
+     *
+     * Looms and Accounts are reached *through* Settings, and Back dropped
+     * straight to the session surface instead of returning to it, so neither
+     * the tapped control nor hardware Back went "back" (971-V F8).
+     */
+    fun back() {
+        val parent = OverlayNavigation.parent(_state.value.overlay)
+        if (parent == Overlay.None) closeOverlay() else openOverlay(parent)
     }
 
     fun setFilter(filter: SessionFilter) = update { it.copy(filter = filter) }

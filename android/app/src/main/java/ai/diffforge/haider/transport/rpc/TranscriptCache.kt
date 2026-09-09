@@ -70,9 +70,10 @@ class TranscriptCache(private val directory: File) {
     }
     private fun file(session: String): File {
         val hash = MessageDigest.getInstance("SHA-256").digest(session.toByteArray()).joinToString("") { "%02x".format(it) }
-        // Projection changes replay from zero: v1 lost unknown items, and v2
-        // classified ordinary lifecycle/metric records as missing chat content.
-        return File(directory, "$hash.replay-v3.jsonl")
+        // Projection changes replay from zero: v1 lost unknown items, v2
+        // classified ordinary lifecycle/metric records as missing chat content,
+        // and v3 threw away the canonical run_failed cause.
+        return File(directory, "$hash.replay-v4.jsonl")
     }
     private fun atomic(file: File, contents: String) {
         val temp = File.createTempFile("cache-", ".tmp", directory)
@@ -92,12 +93,30 @@ class TranscriptCache(private val directory: File) {
                 // These describe roster/lifecycle state, not transcript content.
                 // Do not persist their arbitrary additive fields in the display cache.
                 "session_state", "run_state", "session_seen", "session_renamed" -> obj("type" to "metadata")
+                // The canonical terminal cause (`EventPayload::RunFailed`,
+                // haider-protocol/lib.rs:75). It was projected as `unrendered`,
+                // so an errored session showed an error icon, no explanation at
+                // all and "unsupported_display_events" (971-V F7).
+                //
+                // `presentation` is the protocol's own explicitly SAFE
+                // structured presentation (error.rs:109) and `code` is the
+                // stable machine reason. The free-text `message` stays
+                // un-allowlisted and is still never cached.
+                "run_failed" -> {
+                    val presentation = payload["presentation"] as? JsonObject
+                    obj("type" to "run_failed", "code" to payload.optionalString("code"),
+                        "title" to presentation?.optionalString("title"),
+                        "detail" to presentation?.optionalString("detail"),
+                        "retryable" to (payload["retryable"] == JsonPrimitive(true)))
+                }
                 "node_committed" -> {
                     val node = payload["kind"] as? JsonObject
                     val kind = node?.optionalString("kind")
                     if (kind in setOf("user_turn", "assistant_commit") && node?.optionalString("text") != null)
                         obj("type" to "history_node", "kind" to kind, "text" to node.optionalString("text"))
-                    else obj("type" to "unrendered")
+                    // The family is kept so the coverage notice can name what it
+                    // could not draw instead of only that something existed.
+                    else obj("type" to "unrendered", "family" to (kind ?: "node_committed"))
                 }
                 "item" -> {
                     val item = payload["item"] as? JsonObject
@@ -123,11 +142,11 @@ class TranscriptCache(private val directory: File) {
                     val safeDelta = delta?.takeIf { it.optionalString("delta") in setOf("text", "reasoning") }
                         ?.let { obj("delta" to it.string("delta"), "text" to it.optionalString("text")) }
                     if ((item != null && value == null) || (delta != null && safeDelta == null) || (value == null && safeDelta == null))
-                        obj("type" to "unrendered")
+                        obj("type" to "unrendered", "family" to (kind ?: delta?.optionalString("delta") ?: "item"))
                     else obj("type" to "item", "event" to payload.optionalString("event"), "item_id" to payload.optionalString("item_id"),
                         "item" to value, "delta" to safeDelta)
                 }
-                else -> obj("type" to "unrendered")
+                else -> obj("type" to "unrendered", "family" to (payload.optionalString("type") ?: "unknown"))
             }
         }
     }

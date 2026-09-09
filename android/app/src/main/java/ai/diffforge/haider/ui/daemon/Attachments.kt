@@ -47,7 +47,27 @@ sealed interface Attachment {
 object AttachmentLimits {
     const val TOO_MANY = "too_many_attachments"
     const val TOO_LARGE = "attachments_too_large"
+
+    /** `ARTIFACT_PUT_MAX_BYTES` (frame.rs:85), refused before the bytes are sent. */
+    const val ARTIFACT_TOO_LARGE = "artifact_too_large"
+
+    /**
+     * A kind this client cannot state truthfully on `turn.submit`.
+     *
+     * A PDF block carries a daemon-verified `pages` count, so a PDF picked on
+     * the phone is refused here rather than submitted with an invented one.
+     */
+    const val KIND_UNSUPPORTED = "attachment_kind_unsupported"
 }
+
+/**
+ * One staging attempt the daemon or this client refused, with its own code.
+ *
+ * Distinct from a null return, which means the facade has no staging adapter at
+ * all. Round 11 collapsed both into "attachments_too_large", so a 780-byte PNG
+ * reported that it was too large (971-V F2).
+ */
+class AttachmentRefused(val code: String) : Exception(code)
 
 /**
  * Mid-turn delivery (`haider-protocol/lib.rs:172`).

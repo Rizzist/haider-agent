@@ -72,6 +72,23 @@ sealed interface Overlay {
 }
 
 /**
+ * Where Back goes from a full screen.
+ *
+ * There is no navigation library here, so the parent relation is stated once
+ * and both the on-screen back control and the system gesture read it. Round 11
+ * wired the control to Settings and left the gesture on "close everything", so
+ * Back from Looms dropped to the session surface (971-V F8). [Overlay.None]
+ * means the session surface, which is the root.
+ */
+object OverlayNavigation {
+    fun parent(overlay: Overlay): Overlay = when (overlay) {
+        Overlay.Looms, Overlay.Accounts -> Overlay.Settings
+        is Overlay.LoomAuthoring -> Overlay.Looms
+        else -> Overlay.None
+    }
+}
+
+/**
  * What this client has read about subagents (lane 971-UI-fleet).
  *
  * [active] and [subagents] describe the session on screen; [panel] is keyed by

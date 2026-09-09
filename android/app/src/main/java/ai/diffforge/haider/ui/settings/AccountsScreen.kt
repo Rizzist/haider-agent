@@ -257,6 +257,7 @@ fun AccountsScreen(
 
                 AddAccountForm.ApiKey -> Card {
                     ProviderPicker(
+                        form = AddAccountForm.ApiKey,
                         providers = providers.filter { it.supportsApiKey },
                         selected = provider,
                         onSelect = { provider = it },
@@ -381,6 +382,7 @@ fun AccountsScreen(
                 // make a running sign-in disappear (verify-6 O4).
                 AddAccountForm.SignIn -> if (attempt == null) Card {
                         ProviderPicker(
+                            form = AddAccountForm.SignIn,
                             providers = providers.filter { it.supportsOAuth },
                             selected = provider,
                             onSelect = { provider = it },
@@ -667,6 +669,7 @@ private fun AccountDetailSheet(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ProviderPicker(
+    form: AddAccountForm,
     providers: List<ProviderDescriptor>,
     selected: String?,
     onSelect: (String) -> Unit,
@@ -682,17 +685,25 @@ private fun ProviderPicker(
             verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
         ) {
             providers.forEach { descriptor ->
+                // Not `descriptor.available`: on a fresh profile a built-in
+                // provider is unavailable *for want of this very credential*,
+                // and gating the form on it made setup circular (971-V F5).
+                val selectable = AddAccountFormPolicy.selectable(
+                    form = form,
+                    supportsApiKey = descriptor.supportsApiKey,
+                    supportsOAuth = descriptor.supportsOAuth,
+                )
                 ForgeChip(
                     onClick = { onSelect(descriptor.id) },
                     selected = selected == descriptor.id,
-                    enabled = descriptor.available,
+                    enabled = selectable,
                     contentDescription = descriptor.label,
                 ) {
                     Text(
                         descriptor.label,
                         style = type.chip,
                         color = when {
-                            !descriptor.available -> colors.textMuted
+                            !selectable -> colors.textMuted
                             selected == descriptor.id -> colors.accent
                             else -> colors.textSoft
                         },

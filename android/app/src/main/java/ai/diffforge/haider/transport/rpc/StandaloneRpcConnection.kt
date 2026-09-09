@@ -52,4 +52,10 @@ interface AccountsDataSource {
     suspend fun pollOAuth(flow: OAuthFlow): OAuthStatus
     suspend fun completeOAuth(flow: OAuthFlow, oauthReference: String, commandId: String): Account
     suspend fun cancelOAuth(flow: OAuthFlow)
+    /** `provider.models_probe`: read-only discovery before the provider exists. */
+    suspend fun probeCustomModels(provider: String, origin: String, apiFamily: String,
+        keyless: Boolean, reference: String? = null): RpcResponses.ProbedModels
+    /** `provider.configure`: the durable create, under the revision the form was read at. */
+    suspend fun configureCustomProvider(command: String, provider: String, origin: String,
+        apiFamily: String, authRequirement: String, models: List<String>, defaultModel: String?, revision: Long)
 }

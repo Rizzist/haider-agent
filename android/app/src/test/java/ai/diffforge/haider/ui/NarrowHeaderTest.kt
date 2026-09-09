@@ -78,4 +78,28 @@ class NarrowHeaderTest {
         assertEquals("select centres: $ys", ys[0], ys[1], 1f)
         assertEquals("select centres: $ys", ys[0], ys[2], 1f)
     }
+
+    /**
+     * The values have to be readable, not just present (971-V F8).
+     *
+     * At 360 dp a third of the row held a label and an ellipsis, so the current
+     * permission mode could not be read without opening its own picker. Below
+     * the breakpoint the labels drop and the value gets the chip.
+     */
+    @Test
+    fun `at 360 dp the selects show their value and drop their label`() {
+        rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
+        rule.waitForIdle()
+        // The values are on screen, whole.
+        assertTrue(rule.onAllNodesWithTextSafe("Auto") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("high") > 0)
+        assertTrue(rule.onAllNodesWithTextSafe("Sonnet 4.5") > 0)
+        // The labels are not; they live in the content description instead.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Permissions"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Effort"))
+        assertTrue(
+            rule.onAllNodes(hasContentDescription("Change what Haider may do on its own, Auto"))
+                .fetchSemanticsNodes().isNotEmpty(),
+        )
+    }
 }

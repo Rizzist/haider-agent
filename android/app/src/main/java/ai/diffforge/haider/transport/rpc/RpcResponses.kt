@@ -13,6 +13,10 @@ object RpcResponses {
     data class Stage(val reference: String, val expiresAtMs: Long) {
         override fun toString() = "Stage(redacted)"
     }
+    /** `artifact.put` (frame.rs:4584): the verified address and the decoded byte count. */
+    data class Artifact(val reference: String, val bytes: Long)
+    /** `provider.models_probe` (frame.rs:5253). Discovery, never a durable write. */
+    data class ProbedModels(val models: List<String>, val defaultModel: String?)
 
     fun watch(body: JsonObject): Boolean = (body["accepted"] == JsonPrimitive(true)).also {
         if (!it) throw RpcProtocolException("watch_rejected")
@@ -36,6 +40,12 @@ object RpcResponses {
         return Attachment(body.string("attachment_id"), state.string("session_id"), state.number("replay_through_seq"), state.number("worker_generation"))
     }
     fun detached(body: JsonObject): String = body.string("attachment_id")
+    fun artifact(body: JsonObject) = Artifact(body.string("artifact"), body.number("bytes"))
+    fun probedModels(body: JsonObject) = ProbedModels(
+        // Discovery order is the daemon's; a Set would silently reorder the list
+        // a person then picks a default from.
+        (body["models"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content },
+        body.optionalString("default_model"))
     fun read(body: JsonObject): ReadPage {
         val result = body.objectAt("result")
         return ReadPage(result.string("session_id"), result.number("head_seq"), result.objects("envelopes"))

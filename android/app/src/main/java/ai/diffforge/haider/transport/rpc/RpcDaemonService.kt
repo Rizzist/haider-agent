@@ -2,7 +2,10 @@ package ai.diffforge.haider.transport.rpc
 
 import ai.diffforge.haider.transport.*
 import ai.diffforge.haider.ui.daemon.*
+import ai.diffforge.haider.ui.loom.LoomRegistry
+import ai.diffforge.haider.ui.loom.LoomRpcAdapter
 import ai.diffforge.haider.ui.state.PermissionMode
+import ai.diffforge.haider.ui.state.StandingConsent
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.*
@@ -53,17 +56,53 @@ class RpcDaemonService(
     private data class SecretCoordinates(val epoch: Long, val session: String, val menu: String, val seq: Long, val generation: Long)
     private class SecretOwner(val coordinates: SecretCoordinates, val expiresAtMs: Long)
     private val secrets = mutableMapOf<String, SecretOwner>()
+    /** Locally retained preview bytes for the blocks this connection staged. */
+    private val staged = linkedMapOf<String, ByteArray>()
+    /**
+     * Menus this client has already spent its standing consent on, this epoch.
+     *
+     * Keyed by session as well as menu and request sequence: a menu id is only
+     * unique within the session that raised it.
+     */
+    private val consented = java.util.Collections.synchronizedSet(mutableSetOf<Triple<String, String, Long>>())
     override val sessions = roster.sessions.map { it.map(RpcUiMapping::row) }.stateIn(owner, SharingStarted.Eagerly, roster.sessions.value.map(RpcUiMapping::row))
     override val rosterReady = combine(roster.ready, client.state) { _, _ -> roster.isReady() }
         .stateIn(owner, SharingStarted.Eagerly, false)
     override val paging = roster.loading.map { RosterPaging(loading = it) }.stateIn(owner, SharingStarted.Eagerly, RosterPaging())
     override val activeSessionId: StateFlow<String?> = selected.asStateFlow()
-    // Existing interactive sessions preserve daemon approval gates. The frozen
-    // RPC contract has no mutation for the UI's new standing-consent mode.
-    override val permissionMode: StateFlow<PermissionMode> = MutableStateFlow(PermissionMode.Ask).asStateFlow()
-    override val supportedPermissionModes = setOf(PermissionMode.Ask)
+    // The frozen RPC contract has no permission-mode mutation, so Auto is what
+    // it always claimed to be: standing consent held by THIS client and spent
+    // by answering the exact device-capability approvals StandingConsent
+    // covers. Nothing pretends the daemon stopped asking; the answer is real,
+    // it is the same menu answer a person would send, and `sms.send` and every
+    // unrecognised card still stop for a human (971-V F3).
+    private val mode = MutableStateFlow(PermissionMode.Ask)
+    override val permissionMode: StateFlow<PermissionMode> = mode.asStateFlow()
+    override val supportedPermissionModes = PermissionMode.entries.toSet()
     override suspend fun setPermissionMode(mode: PermissionMode) {
         if (mode !in supportedPermissionModes) throw IOException("permission_mode_unavailable")
+        this.mode.value = mode
+        applyStandingConsent()
+    }
+
+    /**
+     * Answers every card standing consent covers, once each.
+     *
+     * The coordinates come from the same roster snapshot that carried the card,
+     * and [answer] is the ordinary compare-and-set door: a card answered
+     * elsewhere loses the race and is dropped rather than retried.
+     */
+    private suspend fun applyStandingConsent() {
+        if (mode.value != PermissionMode.Auto) return
+        roster.sessions.value.map(RpcUiMapping::row).forEach { row ->
+            val choice = StandingConsent.choice(mode.value, row.needsInput) ?: return@forEach
+            val coordinates = MenuCoordinates.of(row.id, row.needsInput, "auto-${row.id}-${row.needsInput?.menuId}")
+                ?: return@forEach
+            if (!consented.add(Triple(row.id, coordinates.menuId, coordinates.requestSeq))) return@forEach
+            try { answer(coordinates, choice.key, choice.index, null) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { /* A refused or already-resolved menu is the daemon's answer, not a retry. */ }
+        }
     }
     // C4 is an immutable platform ceiling, independent of provider/session grants.
     override val shell: StateFlow<ShellAvailability> =
@@ -99,8 +138,40 @@ class RpcDaemonService(
         owner.launch {
             combine(client.state, client.connectionEpochs) { state, epoch -> state to epoch }.collect { (state, epoch) ->
                 synchronized(secrets) { secrets.entries.removeAll { state != RpcConnectionState.CONNECTED || it.value.coordinates.epoch != epoch } }
+                // A menu id belongs to one worker generation on one connection;
+                // spent consent is not carried into a new epoch, and neither
+                // are preview bytes for a CAS address from the old one.
+                consented.clear()
+                synchronized(staged) { staged.clear() }
+                // A restarted daemon reconnects on the same socket path, so the
+                // Binder target never changes and nothing re-read the session
+                // the UI is showing: the roster repository re-hydrates itself,
+                // but the control attachment, catalog and transcript stream did
+                // not, which is what left Starting/Running on screen until the
+                // app was killed (971-V F4). Re-observe here instead.
+                if (state == RpcConnectionState.CONNECTED) reobserve()
             }
         }
+        owner.launch { roster.sessions.collect { applyStandingConsent() } }
+    }
+
+    /**
+     * Re-establishes everything that belongs to a connection, in the order the
+     * UI reads it: roster, then the active session's control attachment, then
+     * the catalog. Every step is allowed to fail without taking the others
+     * down — a reconnect is not the place to raise.
+     */
+    private suspend fun reobserve() {
+        step { refreshRoster() }
+        selected.value?.let { id -> step { replay.attach(id, control = true) } }
+        step { refreshProviders() }
+    }
+
+    /** Runs one recovery step; cancellation still propagates, a refusal does not. */
+    private suspend inline fun step(action: suspend () -> Unit) {
+        try { action() }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { /* Each step reports through its own state flow. */ }
     }
     override suspend fun start() = control.start()
     override suspend fun stop() = control.stop()
@@ -235,32 +306,69 @@ class RpcDaemonService(
             provider.models.map { name ->
                 val detail = provider.modelDetails.firstOrNull { it.id == name }
                 ModelOption(name, detail?.supportedEfforts.orEmpty(), detail?.defaultEffort, detail?.contextWindow)
-            }, provider.defaultModel, provider.available, provider.unavailableReason) }, revision, accountSource.loadError.value)
+            }, provider.defaultModel, provider.available, provider.unavailableReason,
+            // An advisory catalog is what licenses the picker's free-text model
+            // id. Constructing the option without it silently removed custom
+            // model entry from every provider (971-V F6).
+            provider.inventoryAuthority) }, revision, accountSource.loadError.value)
         catalog.value = if (revision == null || current?.provider == null || current.model == null) null else SessionConfig(
             revision, accountSource.loadError.value == null, accountSource.loadError.value,
             SessionSelection(current.sessionId, current.provider, current.model, current.canonical.optionalString("effort")),
             rows.map { provider -> SessionProvider(provider.id, provider.available, if (provider.available) "available" else "unavailable",
                 provider.unavailableReason, provider.defaultModel, provider.models.map { name ->
                     provider.modelDetails.firstOrNull { it.id == name } ?: SessionModel(name, null, emptyList(), null)
-                }) })
+                }, provider.inventoryAuthority) })
     }
     override suspend fun send(sessionId: String, text: String, attachments: List<Attachment>, mode: Delivery) {
-        // UI parity added CAS attachments after this integration's frozen chat
-        // seam. Refuse unsupported blocks before submitting any part of a turn.
-        if (attachments.isNotEmpty()) throw TurnRefused("attachment_transport_unavailable")
         try {
-            mutation(operationKey("send", sessionId, text, mode.wire)) {
-                RpcMethods.submit(it, at(sessionId), text, mode = mode.wire)
+            mutation(operationKey("send", sessionId, text, mode.wire,
+                attachments.joinToString(",") { it.artifact })) {
+                RpcMethods.submit(it, at(sessionId), text, mode = mode.wire, attachments = attachments)
             }
         } catch (error: RpcRemoteException) {
             throw TurnRefused(error.code)
         }
     }
 
-    // Explicit unavailable snapshots for the UI parity doors that have no
-    // production adapter yet, matching the facade's fleet/workflow defaults.
-    override suspend fun stageAttachment(bytes: ByteArray, mime: String, name: String?): Attachment? = null
-    override suspend fun attachmentBytes(artifact: String): ByteArray? = null
+    /**
+     * `artifact.put` puts the bytes in the daemon's own CAS and answers with
+     * the address the turn then names; nothing but the address rides on
+     * `turn.submit` (`AttachmentBlock` carries a ref, never bytes).
+     *
+     * Only the kinds this client can state truthfully are built. A PDF's
+     * `pages` is a daemon-verified page-tree count, so a PDF is refused here
+     * rather than submitted with a page count the phone invented.
+     */
+    override suspend fun stageAttachment(bytes: ByteArray, mime: String, name: String?): Attachment {
+        if (bytes.size > ARTIFACT_MAX_BYTES) throw AttachmentRefused(AttachmentLimits.ARTIFACT_TOO_LARGE)
+        if (!mime.startsWith("image/") && !mime.startsWith("text/"))
+            throw AttachmentRefused(AttachmentLimits.KIND_UNSUPPORTED)
+        val reference = try {
+            RpcResponses.artifact(client.request(
+                RpcMethods.putArtifact(java.util.Base64.getEncoder().encodeToString(bytes)))).reference
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: RpcRemoteException) { throw AttachmentRefused(error.code) }
+        catch (_: Exception) { throw AttachmentRefused("connection_lost") }
+        val block = if (mime.startsWith("image/")) Attachment.Image(reference, mime)
+            else Attachment.TextFile(reference, basename(name) ?: "attachment.txt", lines(bytes))
+        // The composer's own thumbnail: there is no artifact GET door on this
+        // wire, so the bytes it just handed over are kept for the preview of
+        // the draft they belong to and dropped with the connection.
+        synchronized(staged) {
+            if (staged.size >= STAGED_PREVIEW_LIMIT) staged.remove(staged.keys.first())
+            staged[block.artifact] = bytes
+        }
+        return block
+    }
+
+    override suspend fun attachmentBytes(artifact: String): ByteArray? = synchronized(staged) { staged[artifact] }
+
+    /** Sanitised BASENAME only, never a path (`AttachmentBlock::File`, tool.rs:399). */
+    private fun basename(name: String?): String? = name?.substringAfterLast('/')
+        ?.filterNot { it < ' ' }?.take(120)?.takeIf(String::isNotBlank)
+
+    private fun lines(bytes: ByteArray): Int =
+        String(bytes, Charsets.UTF_8).count { it == '\n' }.let { if (bytes.isEmpty()) 0 else it + 1 }
     override val queue: StateFlow<QueueSnapshot> =
         MutableStateFlow(QueueSnapshot(error = "queue_transport_unavailable")).asStateFlow()
     override suspend fun refreshQueue(sessionId: String) = Unit
@@ -276,10 +384,18 @@ class RpcDaemonService(
             ?: return TranscriptLoad.Unavailable("session_unavailable")
         val messages = RpcUiMapping.messages(entries)
         val loaded = cache.lastApplied(sessionId)
+        // Naming the families it could not draw is the graceful summary the bare
+        // code was not: "unsupported_display_events" alone told a person nothing
+        // about what was missing from the transcript in front of them (971-V F7).
+        val unrendered = entries.mapNotNull { entry ->
+            entry.display.optionalString("family")?.takeIf { entry.display.optionalString("type") == "unrendered" }
+        }.distinct().sorted()
         val reason = error ?: when {
             client.state.value != RpcConnectionState.CONNECTED -> "connection_lost"
             !roster.isReady() -> "roster_unavailable"
-            entries.any { it.display.optionalString("type") == "unrendered" } -> "unsupported_display_events"
+            entries.any { it.display.optionalString("type") == "unrendered" } ->
+                if (unrendered.isEmpty()) "unsupported_display_events"
+                else "unsupported_display_events(${unrendered.joinToString(", ")})"
             loaded < row.headSeq -> "history_incomplete"
             else -> null
         }
@@ -305,8 +421,38 @@ class RpcDaemonService(
         val index = SearchIndexState(coverage.indexedSessions, coverage.totalSessions, coverage.complete && roster.isReady() && roster.loadError.value == null && !roster.loading.value && client.state.value == RpcConnectionState.CONNECTED && rows == roster.sessions.value)
         return SearchOutcome(replay.search(query, rows).map { SearchHit(it.sessionId, it.text, it.seq) }, index, index.complete)
     }
+    // ---------- Looms ----------
+
+    /**
+     * Null when the daemon's own Hello advertises `loom_v1`.
+     *
+     * The screen printed "the daemon does not offer loom_v1" while the actual
+     * Hello advertised it, because this facade never overrode the interface's
+     * unavailable default (971-V F8). The feature set the daemon sent is the
+     * authority; an unread Welcome is honestly unavailable, not honestly empty.
+     */
+    override suspend fun loomUnavailable(): String? {
+        val features = client.welcome.value?.features ?: return LoomRpcAdapter.FEATURE_LOOM_V1
+        return if (LoomRpcAdapter.FEATURE_LOOM_V1 in features) null else LoomRpcAdapter.FEATURE_LOOM_V1
+    }
+
+    override suspend fun loomList(includeArchived: Boolean): LoomRegistry? =
+        LoomRpcAdapter.parseList(bridge(client.request(RpcMethods.loomList(includeArchived))), includeArchived)
+
+    /** kotlinx on the socket, `org.json` in the wire adapters the UI lane owns. */
+    private fun bridge(body: JsonObject) = org.json.JSONObject(body.toString())
+
     override fun close() {
         (accounts as? Closeable)?.close(); accountSource.close(); roster.close(); replay.close(); connection.close()
-        synchronized(secrets) { secrets.clear() }; ownerJob.cancel()
+        synchronized(secrets) { secrets.clear() }; synchronized(staged) { staged.clear() }; consented.clear()
+        ownerJob.cancel()
+    }
+
+    private companion object {
+        /** `ARTIFACT_PUT_MAX_BYTES` (frame.rs:85), applied before base64 expansion. */
+        const val ARTIFACT_MAX_BYTES = 33 * 1024 * 1024
+
+        /** How many draft previews are retained; a composer holds a handful, not a gallery. */
+        const val STAGED_PREVIEW_LIMIT = 16
     }
 }

@@ -40,16 +40,46 @@ class EmbeddedTranscriptTest {
 
     @Test fun unknownAndAttentionRecordsRemainPartialAndDoNotPersistArbitraryContent() {
         val payloads = listOf(
-            obj("type" to "future_event", "text" to "must-not-cache"),
-            obj("type" to "run_failed", "message" to "must-not-cache"),
-            obj("type" to "node_committed", "kind" to obj("kind" to "future_node", "text" to "must-not-cache")),
-            obj("type" to "item", "event" to "completed", "item" to obj("item" to "extension", "kind" to "future_extension", "data" to obj("text" to "must-not-cache"))),
-            obj("type" to "item", "event" to "completed", "item" to obj("item" to "extension", "kind" to "provider_request_budget_v1", "data" to obj("phase" to "exhausted", "text" to "must-not-cache"))),
+            obj("type" to "future_event", "text" to "must-not-cache") to "future_event",
+            obj("type" to "node_committed", "kind" to obj("kind" to "future_node", "text" to "must-not-cache")) to "future_node",
+            obj("type" to "item", "event" to "completed", "item" to obj("item" to "extension", "kind" to "future_extension", "data" to obj("text" to "must-not-cache"))) to "extension",
+            obj("type" to "item", "event" to "completed", "item" to obj("item" to "extension", "kind" to "provider_request_budget_v1", "data" to obj("phase" to "exhausted", "text" to "must-not-cache"))) to "extension",
         )
-        payloads.forEach { payload ->
+        payloads.forEach { (payload, family) ->
             val display = TranscriptCache.displayProjection(obj("render" to obj("ui" to true), "payload" to payload))
-            assertEquals(obj("type" to "unrendered"), display)
+            // The family is named so the coverage notice can summarise what it
+            // could not draw; no arbitrary content comes with it (971-V F7).
+            assertEquals(obj("type" to "unrendered", "family" to family), display)
+            assertFalse(display.toString().contains("must-not-cache"))
         }
+    }
+
+    /**
+     * The canonical terminal cause is rendered, and only its safe fields are
+     * kept (971-V F7: the errored session showed an icon and no explanation).
+     */
+    @Test fun runFailedProjectsItsSafePresentationAndNeverTheFreeTextMessage() {
+        val payload = obj("type" to "run_failed", "code" to "store_read_only", "retryable" to false,
+            "message" to "must-not-cache",
+            "presentation" to obj("subcode" to "cas_publish_denied", "title" to "Haider could not save the reply",
+                "detail" to "The provider view store is read-only.", "scope" to "run",
+                "allowed_actions" to JsonArray(emptyList())))
+        val display = TranscriptCache.displayProjection(obj("render" to obj("ui" to true), "payload" to payload))
+        assertEquals("run_failed", display.optionalString("type"))
+        assertFalse(display.toString().contains("must-not-cache"))
+        val message = RpcUiMapping.messages(listOf(TranscriptCache.Entry(1, display))).single()
+        assertEquals(
+            "Haider could not save the reply · The provider view store is read-only. · store_read_only",
+            message.error,
+        )
+        assertFalse(message.errorRetryable)
+        // A pre-E2 journal that stated no presentation still explains itself
+        // with the code, rather than reading as an empty agent turn.
+        val bare = TranscriptCache.displayProjection(obj("render" to obj("ui" to true),
+            "payload" to obj("type" to "run_failed", "code" to "provider_error", "retryable" to true)))
+        val fallback = RpcUiMapping.messages(listOf(TranscriptCache.Entry(1, bare))).single()
+        assertEquals("provider_error", fallback.error)
+        assertTrue(fallback.errorRetryable)
     }
 
     @Test fun aHistoryNodeWithoutItsOriginalItemStillSuppliesText() {

@@ -1,5 +1,6 @@
 package ai.diffforge.haider.transport.rpc
 
+import ai.diffforge.haider.ui.daemon.Attachment
 import kotlinx.serialization.json.*
 
 /** Wire coordinates are copied together from one authoritative snapshot. */
@@ -27,9 +28,26 @@ object RpcMethods {
     fun create(command: String, cwd: String, provider: String, model: String, maxTokens: Long) = obj(
         "method" to "session.create", "command_id" to command, "cwd" to cwd, "provider" to provider,
         "model" to model, "max_tokens" to maxTokens)
-    fun submit(command: String, at: SessionCoordinate, text: String, mode: String = "queue", branch: String? = null) =
+    fun submit(command: String, at: SessionCoordinate, text: String, mode: String = "queue", branch: String? = null,
+        attachments: List<Attachment> = emptyList()) =
         command("turn.submit", command, at, "text" to text, "mode" to mode,
-            "attachments" to JsonArray(emptyList()), "branch_id" to branch)
+            "attachments" to JsonArray(attachments.map(::attachment)), "branch_id" to branch)
+    /** `artifact.put` (frame.rs:3348): receipt-free byte ingress, base64 on the wire. */
+    fun putArtifact(base64: String) = obj("method" to "artifact.put", "data_base64" to base64)
+    /**
+     * One `AttachmentBlock` (haider-protocol `tool.rs:386`), internally tagged
+     * on `kind`. Only the kinds this client can state truthfully are encoded:
+     * an [Attachment.Unsupported] block was never staged here and carries no
+     * shape the daemon would accept.
+     */
+    fun attachment(block: Attachment): JsonObject = when (block) {
+        is Attachment.Image -> obj("kind" to "image", "artifact" to block.artifact, "mime" to block.mime,
+            "width" to block.width, "height" to block.height)
+        is Attachment.PastedText -> obj("kind" to "pasted_text", "artifact" to block.artifact, "lines" to block.lines)
+        is Attachment.TextFile -> obj("kind" to "file", "artifact" to block.artifact, "name" to block.name, "lines" to block.lines)
+        is Attachment.Pdf -> obj("kind" to "pdf", "artifact" to block.artifact, "name" to block.name, "pages" to block.pages)
+        is Attachment.Unsupported -> throw RpcProtocolException("unsupported_attachment_kind")
+    }
     fun cancel(command: String, at: SessionCoordinate, run: String) =
         command("turn.cancel", command, at, "run_id" to run)
     fun rename(command: String, at: SessionCoordinate, title: String?) = command("session.rename", command, at, "title" to title)
@@ -51,6 +69,27 @@ object RpcMethods {
     fun watchAccounts() = obj("method" to "account.list_watch")
     fun refreshAccount(alias: String) = obj("method" to "account.refresh", "alias" to alias)
     fun refreshModels(provider: String) = obj("method" to "provider.models_refresh", "provider" to provider)
+    /**
+     * `provider.models_probe` (frame.rs:4117): read-only discovery for a server
+     * that does not exist yet, so it deliberately carries no `command_id`. A
+     * staged reference is BORROWED — the later `account.login_api` spends it.
+     */
+    fun probeModels(provider: String, origin: String, apiFamily: String, keyless: Boolean, reference: String? = null) =
+        obj("method" to "provider.models_probe", "provider" to provider, "origin" to origin,
+            "api_family" to apiFamily, "keyless" to keyless, "probe_vault_reference" to reference)
+    /**
+     * `provider.configure` (frame.rs:4133): the durable create. `expected_revision`
+     * is required; `probe_vault_reference` is omitted once a probe borrowed the
+     * stage, because `account.login_api` is what consumes it.
+     */
+    fun configureProvider(command: String, provider: String, origin: String, apiFamily: String,
+        authRequirement: String, models: List<String>, defaultModel: String?, revision: Long) =
+        obj("method" to "provider.configure", "command_id" to command, "provider" to provider,
+            "api_family" to apiFamily, "origin" to origin, "auth_requirement" to authRequirement,
+            "enabled" to true, "models" to JsonArray(models.map(::JsonPrimitive)),
+            "default_model" to defaultModel, "expected_revision" to revision)
+    fun loomList(includeArchived: Boolean) = obj("method" to "loom.list",
+        "include_archived" to if (includeArchived) true else null)
     fun stage(stage: String, purpose: String, secret: String): JsonObject {
         require(purpose in setOf("api_key", "menu_secret"))
         return obj("method" to "vault.stage", "stage_id" to stage, "purpose" to purpose, "secret" to secret)

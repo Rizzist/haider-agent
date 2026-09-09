@@ -58,6 +58,21 @@ internal object RpcUiMapping {
                     if (previous == null || previous.role != role || previous.text != text)
                         messages["node:${entry.seq}"] = Message(entry.seq, role, text)
                 }
+                // The canonical cause, as its own card. The safe presentation
+                // supplies the sentence a person needs and `code` the stable
+                // reason a person reporting it needs; a journal that carried
+                // neither still says the run failed rather than nothing at all
+                // (971-V F7).
+                "run_failed" -> {
+                    val lines = listOfNotNull(
+                        display.optionalString("title"),
+                        display.optionalString("detail"),
+                        display.optionalString("code"),
+                    ).map(String::trim).filter(String::isNotEmpty).distinct()
+                    messages["failed:${entry.seq}"] = Message(entry.seq, Role.Agent, "",
+                        error = lines.joinToString(" · ").ifEmpty { "run_failed" },
+                        errorRetryable = display.optionalBoolean("retryable") == true)
+                }
                 "item" -> {
                     val key = display.optionalString("item_id") ?: continue
                     val previous = messages[key] ?: Message(entry.seq, Role.Agent, "")

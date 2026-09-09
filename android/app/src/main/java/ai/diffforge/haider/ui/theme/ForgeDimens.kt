@@ -186,6 +186,26 @@ object ForgeMotion {
     const val RESOURCE_TICK_MS = 5_000L
 }
 
+/**
+ * Width thresholds, declared here for the same reason every other dimension is:
+ * a breakpoint spelled inline is a dimension nothing can sweep.
+ */
+object ForgeBreakpoint {
+    /**
+     * Below this the composer's three selects drop their labels.
+     *
+     * The row is the screen minus its gutter, so a 360 dp phone measures 336
+     * here and a 412 dp one measures 388: this threshold takes the labels off
+     * the narrow phone and leaves them on the wide one. At 336 a third of the
+     * row is about 108 dp, which holds a label OR a value but not both, so the
+     * *value* ellipsised and the current permission mode was unreadable
+     * without opening its own picker (971-V F8). Label-less chips are also
+     * what the declutter pass asked for (addition F, S5); the label stays in
+     * `contentDescription`, so nothing is lost to a screen reader.
+     */
+    val compactSelects = 360.dp
+}
+
 object ForgeElevation {
     /**
      * Elevation is a surface step, not a shadow, except for the drawer which

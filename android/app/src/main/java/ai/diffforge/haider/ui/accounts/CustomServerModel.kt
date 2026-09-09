@@ -256,4 +256,24 @@ object AddAccountFormPolicy {
     /** True when the person has typed something a silent replacement would lose. */
     fun hasUnsavedInput(form: AddAccountForm, alias: String, keyLength: Int): Boolean =
         form != AddAccountForm.None && (alias.isNotBlank() || keyLength > 0)
+
+    /**
+     * Which providers an add form may pick from.
+     *
+     * The gate is the auth method the provider declares, **not**
+     * `ProviderDescriptor.available`. Availability answers "can this provider
+     * serve a turn right now", and on a fresh profile the honest answer is no
+     * *because there is no credential yet* — so gating the credential form on
+     * it greyed out every built-in provider and left Save permanently disabled
+     * with nothing a person could do about it (971-V F5, `api35-key-form.png`).
+     *
+     * An unavailable provider is still shown with its reason; what changes is
+     * that it can be chosen, which is the only way the reason ever goes away.
+     */
+    fun selectable(form: AddAccountForm, supportsApiKey: Boolean, supportsOAuth: Boolean): Boolean =
+        when (form) {
+            AddAccountForm.ApiKey -> supportsApiKey
+            AddAccountForm.SignIn -> supportsOAuth
+            AddAccountForm.CustomServer, AddAccountForm.None -> false
+        }
 }
