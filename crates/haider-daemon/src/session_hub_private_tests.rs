@@ -1058,6 +1058,312 @@ async fn create_fork_ready_source(
     (source, node_id, seq)
 }
 
+async fn observe_fork_outcome(
+    hub: &SessionHub,
+    session: &SessionId,
+) -> haider_rpc::SessionObserveDigest {
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("outcome observer");
+    connection
+        .request(
+            RequestId::new("fork-outcome"),
+            RequestBody::SessionObserve {
+                session_id: session.clone(),
+                last_event_limit: 100,
+                metadata_only: false,
+            },
+        )
+        .await
+        .expect("observe fork outcome");
+    let digest = sink
+        .0
+        .lock()
+        .expect("observe frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                body: ResponseBody::SessionObserve { digest },
+                ..
+            } => Some(digest.clone()),
+            _ => None,
+        })
+        .expect("outcome digest");
+    connection.close().await.expect("observer closes");
+    digest
+}
+
+fn fork_failure() -> haider_protocol::task_outcome::TaskOutcomeV1 {
+    haider_protocol::task_outcome::TaskOutcomeV1::Failure {
+        reason: "Required input is unavailable".into(),
+    }
+}
+
+async fn settle_fork_outcome(
+    hub: &SessionHub,
+    store: &SqliteStoreHandle,
+    session: &SessionId,
+    run: &RunId,
+    failed: bool,
+) {
+    let mut terminal = run_state_envelope(
+        session,
+        run,
+        store.worker_generation(),
+        &format!("{run}-terminal"),
+        if failed {
+            RunState::Errored
+        } else {
+            RunState::Done
+        },
+    );
+    if failed {
+        terminal
+            .payload
+            .insert_metadata("task_outcome_version", serde_json::json!(1));
+        terminal
+            .payload
+            .insert_metadata("task_outcome", serde_json::json!(fork_failure()));
+    }
+    hub.append(&mut [terminal]).await.expect("outcome commits");
+}
+
+async fn create_failed_fork_source(
+    hub: &SessionHub,
+    store: &SqliteStoreHandle,
+) -> (SessionId, RunId) {
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let source = SessionId::new("fork-outcome-parent");
+    let run = RunId::new("fork-outcome-parent-run");
+    hub.create_internal_session(create_command(&source, "fork-outcome"))
+        .await
+        .expect("create source");
+    hub.accept_internal_turn(accept_command(
+        &source,
+        &run,
+        store.worker_generation(),
+        "fork-outcome",
+    ))
+    .await
+    .expect("accept failed turn");
+    settle_fork_outcome(hub, store, &source, &run, true).await;
+    let parent = observe_fork_outcome(hub, &source).await;
+    assert_eq!(parent.run_id, Some(run.clone()));
+    assert_eq!(parent.task_outcome, Some(fork_failure()));
+    (source, run)
+}
+
+/// Reproduces the exclusive cut before a newer prompt, which copies the
+/// earlier terminal failure intact. Neither warm nor cold child observation
+/// may adjudicate it; the inherited journal remains byte-identical on reopen.
+#[tokio::test]
+async fn prompt_fork_before_newer_turn_excludes_inherited_failure_live_and_after_restart() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let generation = store.worker_generation();
+    let (source, failed_run) = create_failed_fork_source(&hub, &store).await;
+    let newer = RunId::new("newer-ordinary-run");
+    hub.accept_internal_turn(accept_command(
+        &source,
+        &newer,
+        generation,
+        "newer-ordinary",
+    ))
+    .await
+    .expect("newer prompt");
+    settle_fork_outcome(&hub, &store, &source, &newer, false).await;
+    let parent_before = store.read(&source, 0, 128).await.expect("parent history");
+    let prompt_seq = parent_before
+        .iter()
+        .find(|event| {
+            event.run_id.as_ref() == Some(&newer)
+                && matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::UserMessage { .. })
+                )
+        })
+        .expect("newer user prompt")
+        .seq;
+    let children = [
+        SessionId::new("warm-fork-child"),
+        SessionId::new("cold-fork-child"),
+    ];
+    let mut histories = Vec::new();
+    for child in &children {
+        hub.fork_session_from_prompt(SessionPromptForkCommand {
+            command_id: format!("fork-{child}"),
+            request_digest: format!("digest-{child}"),
+            request_json: format!(r#"{{"child":"{child}"}}"#),
+            source_session_id: source.clone(),
+            session_id: child.clone(),
+            worker_generation: generation,
+            source_branch_id: None,
+            prompt_seq,
+            name: None,
+            audit_event_id: EventId::new(format!("audit-{child}")),
+            device_id: DeviceId::new("fork-outcome"),
+        })
+        .await
+        .expect("exclusive prompt fork");
+        let history = store.read(child, 0, 128).await.expect("child journal");
+        assert!(
+            history
+                .iter()
+                .any(|event| event.run_id.as_ref() == Some(&failed_run)
+                    && event.payload.get("task_outcome")
+                        == Some(&serde_json::json!(fork_failure())))
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|event| event.run_id.as_ref() == Some(&newer))
+        );
+        assert_eq!(
+            history.last().expect("fork marker").payload["type"],
+            "session_forked"
+        );
+        histories.push(history);
+    }
+    let assert_unadjudicated = |digest: haider_rpc::SessionObserveDigest| {
+        assert_eq!(digest.run_id, None, "inherited run is not the child's run");
+        assert_eq!(digest.run_state, haider_rpc::ObserveRunStateWire::Idle);
+        assert!(digest.task_outcome.is_none());
+        assert!(digest.task_outcome_version.is_none());
+    };
+    assert_unadjudicated(observe_fork_outcome(&hub, &children[0]).await);
+    assert_eq!(
+        store.read(&source, 0, 128).await.expect("parent unchanged"),
+        parent_before
+    );
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store reopens");
+    assert_ne!(store.worker_generation(), generation);
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub reopens");
+    for (child, history) in children.iter().zip(histories) {
+        for _ in 0..2 {
+            assert_unadjudicated(observe_fork_outcome(&hub, child).await);
+        }
+        assert_eq!(
+            store.read(child, 0, 128).await.expect("reopened history"),
+            history
+        );
+    }
+    // The first child-owned failure must still adjudicate after the boundary.
+    let own_run = RunId::new("child-owned-failure");
+    hub.accept_internal_turn(accept_command(
+        &children[0],
+        &own_run,
+        store.worker_generation(),
+        "child-failure",
+    ))
+    .await
+    .expect("child turn");
+    settle_fork_outcome(&hub, &store, &children[0], &own_run, true).await;
+    let own = observe_fork_outcome(&hub, &children[0]).await;
+    assert_eq!(own.run_id, Some(own_run));
+    assert_eq!(own.task_outcome, Some(fork_failure()));
+    assert_eq!(own.task_outcome_version, Some(1));
+    let parent = observe_fork_outcome(&hub, &source).await;
+    assert_eq!(parent.run_id, Some(newer));
+    assert!(parent.task_outcome.is_none());
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+#[tokio::test]
+async fn fork_after_failure_child_success_preserves_parent_failure_across_restart() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let generation = store.worker_generation();
+    let (source, failed_run) = create_failed_fork_source(&hub, &store).await;
+    let parent_history = store.read(&source, 0, 128).await.expect("parent journal");
+    let (node, seq) = parent_history
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
+                return None;
+            };
+            Some((node.node, event.seq))
+        })
+        .expect("fork coordinate");
+    let child = SessionId::new("successful-fork-child");
+    hub.fork_session(private_fork_command(
+        &store,
+        "success-fork",
+        source.clone(),
+        child.clone(),
+        node,
+        seq,
+    ))
+    .await
+    .expect("fork after failure");
+    let untouched = observe_fork_outcome(&hub, &child).await;
+    assert!(untouched.run_id.is_none());
+    assert!(untouched.task_outcome.is_none());
+    let child_run = RunId::new("child-owned-success");
+    hub.accept_internal_turn(accept_command(
+        &child,
+        &child_run,
+        generation,
+        "child-success",
+    ))
+    .await
+    .expect("child turn");
+    settle_fork_outcome(&hub, &store, &child, &child_run, false).await;
+    let success = observe_fork_outcome(&hub, &child).await;
+    assert_eq!(success.run_id, Some(child_run.clone()));
+    assert_eq!(success.run_state, haider_rpc::ObserveRunStateWire::Idle);
+    assert!(success.task_outcome.is_none());
+    assert!(success.task_outcome_version.is_none());
+    assert_eq!(
+        observe_fork_outcome(&hub, &source).await.task_outcome,
+        Some(fork_failure())
+    );
+    assert_eq!(
+        store.read(&source, 0, 128).await.expect("parent unchanged"),
+        parent_history
+    );
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store reopens");
+    assert_ne!(store.worker_generation(), generation);
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub reopens");
+    let success = observe_fork_outcome(&hub, &child).await;
+    assert_eq!(success.run_id, Some(child_run));
+    assert_eq!(success.run_state, haider_rpc::ObserveRunStateWire::Idle);
+    assert!(success.task_outcome.is_none());
+    assert!(success.task_outcome_version.is_none());
+    let parent = observe_fork_outcome(&hub, &source).await;
+    assert_eq!(parent.run_id, Some(failed_run));
+    assert_eq!(parent.run_state, haider_rpc::ObserveRunStateWire::Errored);
+    assert_eq!(parent.task_outcome, Some(fork_failure()));
+    assert_eq!(parent.task_outcome_version, Some(1));
+    assert_eq!(
+        store
+            .read(&source, 0, 128)
+            .await
+            .expect("parent history retained"),
+        parent_history
+    );
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 fn private_fork_command(
     store: &SqliteStoreHandle,
     label: &str,

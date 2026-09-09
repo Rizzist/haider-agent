@@ -2847,6 +2847,21 @@ impl ObserveProjection {
         let seq = envelope.seq;
         let branch_id = envelope.branch_id;
         let run_id = envelope.run_id;
+        if envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("session_forked")
+            && haider_protocol::session_fork::SessionForked::from_payload_value(&envelope.payload)
+                .is_some()
+        {
+            // Forks retain the parent's journal prefix for context, including
+            // terminal run facts. Only runs after this durable boundary belong
+            // to the child for adjudication. Apply the same reset during live
+            // folding and restart reconstruction without changing history.
+            self.runs.clear();
+            return;
+        }
         if let Some(created) =
             haider_protocol::branch::BranchCreated::from_payload_value(&envelope.payload)
         {
