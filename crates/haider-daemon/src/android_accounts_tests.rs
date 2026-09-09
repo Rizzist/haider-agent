@@ -1,5 +1,10 @@
+#![allow(clippy::expect_used)]
 //! Recovery must not reopen credentials owned by a desktop client.
+use super::accounts_tests::{
+    StubAccountClaudeNative, memory_accounts, open_store, openai_import_test_bundle, test_store_dir,
+};
 use super::*;
+use crate::oauth::{oauth_import_read_count, reset_oauth_import_read_count};
 
 #[tokio::test]
 async fn android_recovered_import_healing_never_reads_or_rotates_source_credentials() {

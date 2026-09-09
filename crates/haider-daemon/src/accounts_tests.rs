@@ -20,7 +20,7 @@ use crate::oauth::{
     oauth_import_read_count, reset_oauth_import_read_count,
 };
 
-fn test_store_dir() -> tempfile::TempDir {
+pub(super) fn test_store_dir() -> tempfile::TempDir {
     #[cfg(unix)]
     {
         tempfile::Builder::new()
@@ -89,7 +89,7 @@ fn linked_source_failure_health_states_remain_distinct() {
     }
 }
 
-fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
+pub(super) fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
     struct Ephemeral(StdMutex<Vec<CredentialDescriptor>>);
     impl StoreLike for Ephemeral {
         fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
@@ -2765,7 +2765,7 @@ async fn staged_secret_storage_is_released_at_ttl_without_a_followup_rpc() {
     );
 }
 
-async fn open_store(dir: &std::path::Path) -> SqliteStoreHandle {
+pub(super) async fn open_store(dir: &std::path::Path) -> SqliteStoreHandle {
     SqliteStoreHandle::open(dir)
         .await
         .unwrap_or_else(|error| panic!("open store: {}", error.message))
@@ -3179,7 +3179,7 @@ const CLAUDE_READ_THROUGH_FIXTURE: &[u8] = br#"{
   }
 }"#;
 
-struct StubAccountClaudeNative {
+pub(super) struct StubAccountClaudeNative {
     state: StdMutex<Result<Vec<u8>, ClaudeNativeCredentialFailure>>,
     reads: std::sync::atomic::AtomicUsize,
     events: StdMutex<Vec<ClaudeNativeReadEvent>>,
@@ -3194,7 +3194,7 @@ impl StubAccountClaudeNative {
         }
     }
 
-    fn unavailable() -> Self {
+    pub(super) fn unavailable() -> Self {
         Self {
             state: StdMutex::new(Err(ClaudeNativeCredentialFailure::Missing)),
             reads: std::sync::atomic::AtomicUsize::new(0),
@@ -3214,7 +3214,7 @@ impl StubAccountClaudeNative {
         }
     }
 
-    fn reads(&self) -> usize {
+    pub(super) fn reads(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -8474,7 +8474,7 @@ async fn mark_import_expired(
     );
 }
 
-fn openai_import_test_bundle(
+pub(super) fn openai_import_test_bundle(
     access_token: &[u8],
     refresh_token: &[u8],
     generation: u64,
@@ -14350,7 +14350,3 @@ fn customprov_manual_key_acceptance_requires_nonempty_utf8_without_controls() {
         assert!(!error.message.contains("key\nheader"));
     }
 }
-
-#[cfg(feature = "android-standalone")]
-#[path = "android_accounts_tests.rs"]
-mod android_accounts_tests;

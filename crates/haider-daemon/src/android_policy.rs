@@ -28,6 +28,7 @@ pub(crate) const fn route_allowed(route: RegisteredToolRoute) -> bool {
                 | RegisteredToolRoute::Mobile
                 | RegisteredToolRoute::Monitor
                 | RegisteredToolRoute::ListModels
+                | RegisteredToolRoute::SessionTranscript
                 | RegisteredToolRoute::SpawnSubagent
                 | RegisteredToolRoute::MessageSubagent
         )

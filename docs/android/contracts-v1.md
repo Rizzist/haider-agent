@@ -180,6 +180,7 @@ The policy is a hard platform ceiling; ordinary permissions, provider trust, too
 | WebFetch, WebSearch | `web_fetch`, `web_search` | Preserve network policy and conditional web-search availability; rustls dependencies exist (`worker.rs:13677`, `Cargo.toml:56`). |
 | Mobile | `mobile` | C4 mobile.sock, OS permissions, separate observation/control, user ControlGate, existing activation/grant rules (`worker.rs:13712`, `worker.rs:20874`). |
 | Monitor, ListModels | `monitor`, `list_models` | Monitors use canonical report RPC and safe native/in-process sources; no shell-backed source (`worker.rs:13722`, `frame.rs:5997`). |
+| SessionTranscript | `session_transcript` | Bounded read of the current profile's journal only; foreign/unknown sessions return typed denial. Discovery, child grants and durable receipts use the same policy-aware catalog. Historical content remains untrusted. |
 | SpawnSubagent, MessageSubagent | `spawn_subagent`, `message_subagent` | In-process descendants only; inherited hard ceiling; no typed-agent executable or CLI installation (`worker.rs:13640`, `worker.rs:13848`). |
 
 | Excluded route | Public/legacy names that must not dispatch | Source |

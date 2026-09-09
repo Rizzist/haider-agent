@@ -12183,6 +12183,10 @@ impl AccountsRuntime {
 #[path = "accounts_tests.rs"]
 mod accounts_tests;
 
+#[cfg(all(test, feature = "android-standalone"))]
+#[path = "android_accounts_tests.rs"]
+mod android_accounts_tests;
+
 #[cfg(test)]
 #[path = "accounts_provider_rebind_tests.rs"]
 mod provider_rebind_tests;

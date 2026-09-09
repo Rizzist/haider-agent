@@ -61,9 +61,72 @@ async fn android_standalone_inventory_golden_and_route_ceiling() {
         "mobile",
         "monitor",
         "loom_register",
+        "session_transcript",
     ] {
         assert!(registered_tool_route(name).is_some(), "retained {name}");
     }
+}
+
+#[test]
+fn android_session_transcript_catalog_preserves_read_only_and_child_grants() {
+    let entry = registered_tool_by_name("session_transcript").expect("retained transcript");
+    assert_eq!(entry.route, RegisteredToolRoute::SessionTranscript);
+    assert_eq!(entry.default, ToolPermissionDefault::Allow);
+    assert!(entry.manifest.effects.is_empty());
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(AndroidToolFactory);
+    let mut child = default_child_grant();
+    assert!(child.tools.iter().any(|name| name == "session_transcript"));
+    for mobile_active in [false, true] {
+        let definitions = authorized_tool_definitions(&factory, Some(&child), mobile_active);
+        assert!(
+            definitions
+                .iter()
+                .any(|tool| tool.name == "session_transcript")
+        );
+    }
+    child.tools.retain(|name| name != "session_transcript");
+    assert!(
+        !authorized_tool_definitions(&factory, Some(&child), false)
+            .iter()
+            .any(|tool| tool.name == "session_transcript")
+    );
+}
+
+#[tokio::test]
+async fn android_session_transcript_dispatch_obeys_restricted_child_grant() {
+    let mut child = default_child_grant();
+    child.tools.retain(|name| name != "session_transcript");
+    let fixture = super::mobile_runtime_tests::mobile_dispatcher_fixture_with_grant(
+        "android-transcript-child",
+        "read a transcript",
+        Arc::new(haider_tools::UnavailableMobileBackend),
+        Some(child),
+    )
+    .await;
+    assert!(
+        fixture
+            .dispatcher
+            .platform_tool_supported("session_transcript")
+    );
+    let result = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new("transcript-child-denied"),
+            "transcript-child-denied",
+            "session_transcript",
+            serde_json::json!({"session_id":fixture.session_id.as_str()}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("typed denial");
+    let ToolDispatchResult::Completed(result) = result else {
+        panic!("restricted child must complete immediately");
+    };
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    assert!(result.effects.is_empty());
+    assert!(!result.preview.contains("user: read a transcript"));
+    super::mobile_runtime_tests::close_fixture(fixture).await;
 }
 
 #[tokio::test]

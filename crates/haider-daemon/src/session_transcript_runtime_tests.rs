@@ -72,7 +72,11 @@ impl World {
             .expect("install manager");
         let session_id = SessionId::new(format!("{prefix}-session"));
         let device_id = DeviceId::new(format!("{prefix}-device"));
-        let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        #[cfg(not(feature = "android-standalone"))]
+        let workspace = std::env::current_dir().expect("cwd");
+        #[cfg(feature = "android-standalone")]
+        let workspace = crate::android_workspace::test_root();
+        let cwd = std::fs::canonicalize(workspace)
             .expect("canonical cwd")
             .to_string_lossy()
             .into_owned();
