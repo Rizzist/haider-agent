@@ -440,6 +440,56 @@ pub fn sync_model_persistence(
     }
 }
 
+/// 971-tui-collapse: persist a tool-output VERBOSITY commit (mirrors the
+/// theme/notification syncs, keyed on the model's commit counter so a
+/// commit re-affirming the boot default still writes the file).
+pub fn sync_verbosity_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.verbosity_commits == *seen_commits {
+        return;
+    }
+    *seen_commits = model.verbosity_commits;
+    if let Some(store) = settings.as_mut() {
+        store.save_verbosity_if_changed(model.theme_choice, model.toolfold.verbosity());
+    }
+}
+
+/// 971-tui-collapse verify 1 (F3): persist the ATTACHED session's tool-row
+/// disclosure so it survives a process restart.
+///
+/// The trigger is `ToolFold`'s own REVISION — the counter the layout cache
+/// already keys on — rather than a separate commit field, so no mutation
+/// path can forget to bump it. It also ticks on focus and scroll, which are
+/// not persisted; `save_tool_rows_if_changed` compares the record and
+/// writes nothing when it did not change. With no session attached there is
+/// nothing to key a record to and nothing is written.
+pub fn sync_tool_rows_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.toolfold.revision() == *seen_commits {
+        return;
+    }
+    *seen_commits = model.toolfold.revision();
+    let Some(session) = model.active_session.as_ref() else {
+        return;
+    };
+    if let Some(store) = settings.as_mut() {
+        store.save_tool_rows_if_changed(
+            model.theme_choice,
+            session.as_str(),
+            &crate::settings::ToolRowsRecord {
+                blanket: model.toolfold.blanket(),
+                rows: model.toolfold.rows_snapshot(),
+            },
+        );
+    }
+}
+
 /// 970 — persist a terms ACKNOWLEDGEMENT (mirrors the theme/notification
 /// syncs, keyed on the model's commit counter so a re-affirmation is never
 /// silently dropped). The journal itself is idempotent per subject, so a user
@@ -632,6 +682,30 @@ pub async fn run_demo(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 971-tui-collapse: seed the tool-output verbosity from the persisted
+    // setting (default `normal`) so a prior ⌥V survives a restart, and
+    // mirror it into the store so a later theme save never drops it. The
+    // SEED is not a commit — nothing is written until the reader cycles.
+    let verbosity = settings
+        .as_ref()
+        .map_or_else(crate::toolfold::Verbosity::default, |store| {
+            store.load_verbosity()
+        });
+    model.toolfold.seed_verbosity(verbosity);
+    if let Some(store) = settings.as_mut() {
+        store.set_verbosity(verbosity);
+    }
+    // F3: the disclosure state every session left behind, read ONCE at
+    // boot. `open_session` consults it the first time a session is opened
+    // in this process; the slot is authoritative after that.
+    let tool_rows = settings
+        .as_ref()
+        .map(crate::settings::SettingsStore::load_tool_rows)
+        .unwrap_or_default();
+    model.persisted_tool_rows = tool_rows.clone();
+    if let Some(store) = settings.as_mut() {
+        store.set_tool_rows(tool_rows);
+    }
     // 970: the terms acknowledgements this profile already carries — read
     // ONCE at boot so the first-login disclosure never reappears for a user
     // who has already answered it.
@@ -642,6 +716,8 @@ pub async fn run_demo(
         .unwrap_or_default();
     let mut seen_terms_commits = model.terms_ack_commits;
     let mut seen_theme_commits = model.theme_commits;
+    let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
     // Query the terminal for a graphics protocol and build the wordmark image
@@ -817,6 +893,12 @@ pub async fn run_demo(
         // Theme cycled: re-sync the emulator background.
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
         sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
+        sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
+        // 971-tui-collapse: observe tool start/finish against the shared
+        // clock, so a collapsed row can carry an honest duration (the
+        // protocol carries none).
+        model.note_tool_timings();
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
@@ -3711,6 +3793,30 @@ pub async fn run_live(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 971-tui-collapse: seed the tool-output verbosity from the persisted
+    // setting (default `normal`) so a prior ⌥V survives a restart, and
+    // mirror it into the store so a later theme save never drops it. The
+    // SEED is not a commit — nothing is written until the reader cycles.
+    let verbosity = settings
+        .as_ref()
+        .map_or_else(crate::toolfold::Verbosity::default, |store| {
+            store.load_verbosity()
+        });
+    model.toolfold.seed_verbosity(verbosity);
+    if let Some(store) = settings.as_mut() {
+        store.set_verbosity(verbosity);
+    }
+    // F3: the disclosure state every session left behind, read ONCE at
+    // boot. `open_session` consults it the first time a session is opened
+    // in this process; the slot is authoritative after that.
+    let tool_rows = settings
+        .as_ref()
+        .map(crate::settings::SettingsStore::load_tool_rows)
+        .unwrap_or_default();
+    model.persisted_tool_rows = tool_rows.clone();
+    if let Some(store) = settings.as_mut() {
+        store.set_tool_rows(tool_rows);
+    }
     // W-C M2: seed the desktop-notification toggle from the persisted setting
     // (default on) so a prior `/notifications off` survives a restart, and
     // mirror it into the store so a later theme save never drops it.
@@ -3747,6 +3853,8 @@ pub async fn run_live(
     let mut seen_theme_commits = model.theme_commits;
     let mut seen_notification_commits = model.notification_commits;
     let mut seen_model_commits = model.model_commits;
+    let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
     // Graphics wordmark query — after raw mode, before the input pump (see the
@@ -4040,6 +4148,10 @@ pub async fn run_live(
         // notifications as OSC 9 to the terminal (tty-gated inside).
         sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
+        sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
+        // 971-tui-collapse: see the demo loop.
+        model.note_tool_timings();
         emit_notifications(&mut model);
         if model.theme != active_theme {
             active_theme = model.theme;

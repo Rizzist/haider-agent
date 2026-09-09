@@ -53,20 +53,20 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
 26|                                                                                                                      |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
-27|                                                                                                                      |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
-28| ✳ Waiting for 1 background agent to finish                                                                           |
+27| ✳ Waiting for 1 background agent to finish                                                                           |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×75
-29|▾ subagents — ◐ 1 working                                                                                             |
+28|▾ subagents — ◐ 1 working                                                                                             |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×93
-30| ⌂ session — back to the main transcript                                                                              |
+29| ⌂ session — back to the main transcript                                                                              |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×3; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×37; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×78
-31| └─ ◐ Husayn (r) · docs · fable-5 · macbook — starting…                                                   ↓ 100 tokens|
+30| └─ ◐ Husayn (r) · docs · fable-5 · macbook — starting…                                                   ↓ 100 tokens|
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×10; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×51; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12
-32|─────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
+31|─────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×107; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2
-33|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                               [ ◉ talk ]  |
+32|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                               [ ◉ talk ]  |
    ~ Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/BOLD×2; Rgb(15, 15, 15)/Rgb(217, 181, 68)/NONE×1; Rgb(139, 148, 158)/Rgb(26, 26, 26)/NONE×70; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×31; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/NONE×6; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2
+33| ▸▸ 1 agent                                                                                                           |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×107
 34|──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×118
 35| [ ◔ WAITING · 1 subagent ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                    |

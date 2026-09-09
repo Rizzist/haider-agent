@@ -22,6 +22,23 @@
 //! off the frame. The body scrolls now, at most one add-form is ever pending,
 //! and the hint line is pinned to the last row.
 //!
+//! F2 AMENDMENT (971-tui-collapse, owner 2026-09-08). The band grew a fourth
+//! part: a live background-task line between the slot and the closing rule
+//! (`▸▸ bypass permissions on · 6 shells, 14 monitors`). `bottom_band` draws
+//! it itself, precisely so no surface can place it differently or omit it —
+//! the F2 law's own logic, extended.
+//!
+//! It is STATE-DEPENDENT, so the cross-view equality here is now stated over
+//! the band's ANATOMY rather than over one absolute row: every view puts the
+//! slot the same distance above the bottom GIVEN the same background-task
+//! state. That is the property the owner's complaint was about — switching
+//! views must not move the composer — and it is checked directly by
+//! `one_model_places_the_band_identically_on_every_screen`, which walks one
+//! model (one background-task state, as a running session actually has)
+//! across every screen. The fixtures below deliberately differ in that state
+//! (`session with ledger` runs a child), which is why the absolute row
+//! differs by exactly the line each model carries.
+//!
 //! MUTATION CHECKS. Revert `bottom_band` to the per-surface layouts and the
 //! cross-view equality test fails on the session, loom and workflows rows.
 //! Drop the closing-rule row from the loom band and its composer moves down
@@ -220,12 +237,55 @@ fn every_banded_view_places_the_band_on_the_same_rows() {
                 rect.y + rect.height <= status.y,
                 "{name} at {width}x{height}: composer {rect:?} reaches the status line {status:?}"
             );
+            // The slot's distance from the bottom, with the band's own
+            // background-task line discounted (see the F2 AMENDMENT): every
+            // view places the slot identically GIVEN the same task state.
+            let line = model.tasks_line_rect.get().map_or(0, |line| line.height);
+            let anatomy = Rect {
+                y: rect.y + line,
+                ..rect
+            };
             match reference {
-                None => reference = Some((name, rect)),
+                None => reference = Some((name, anatomy)),
+                Some((first, expected)) => assert_eq!(
+                    anatomy, expected,
+                    "{name} at {width}x{height}: band slot {rect:?} (+{line} task rows) \
+                     differs from {first}'s {expected:?} — the bottom band is one \
+                     layout for every view"
+                ),
+            }
+        }
+    }
+}
+
+/// The property the owner's F2 complaint was actually about, stated on ONE
+/// model — one background-task state, as a running session actually has —
+/// walked across every screen: switching views must not move the composer.
+#[test]
+fn one_model_places_the_band_identically_on_every_screen() {
+    for (width, height) in SIZES {
+        let mut reference: Option<(Screen, Rect)> = None;
+        for screen in [
+            Screen::Launcher,
+            Screen::Session,
+            Screen::Loom,
+            Screen::Aura,
+            Screen::Accounts,
+        ] {
+            let mut model = session_with_ledger();
+            model.screen = screen;
+            let _ = draw(&model, width, height);
+            let rect = model
+                .band_rect
+                .get()
+                .unwrap_or_else(|| panic!("{screen:?} at {width}x{height}: drew no band"));
+            match reference {
+                None => reference = Some((screen, rect)),
                 Some((first, expected)) => assert_eq!(
                     rect, expected,
-                    "{name} at {width}x{height}: band slot {rect:?} differs from {first}'s \
-                     {expected:?} — the bottom band is one layout for every view"
+                    "{screen:?} at {width}x{height}: band slot {rect:?} differs from \
+                     {first:?}'s {expected:?} — one model must place the band on the \
+                     same rows on every screen"
                 ),
             }
         }
@@ -290,7 +350,10 @@ fn the_band_closes_with_a_rule_on_the_last_body_row_everywhere() {
         for (name, model) in banded_views() {
             let (rows, _) = draw(&model, width, height);
             let rect = model.band_rect.get().expect("band");
-            let close = usize::from(rect.y + rect.height);
+            // The band's live background-task line, when it drew one, sits
+            // between the slot and the closing rule (F2 AMENDMENT).
+            let line = model.tasks_line_rect.get().map_or(0, |line| line.height);
+            let close = usize::from(rect.y + rect.height + line);
             assert_eq!(
                 close,
                 usize::from(height) - 2,

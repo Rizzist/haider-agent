@@ -16,6 +16,18 @@ pub const HELP_INTRO_TEXT: &[&str] = &[
     "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
     "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
     "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
+    // 971-tui-collapse: tool rows are COLLAPSED by default — one summary row
+    // (name · exit · lines · duration) plus a `└` first result line, with
+    // consecutive same-tool calls folded into `Ran N …`.
+    //
+    // The Alt-FREE path is listed FIRST and the ⌥ chords second (verify 1,
+    // V1): a terminal configured to swallow Option delivers no ⌥ chord at
+    // all — it is the mac compose key, and tmux, iTerm and Terminal.app can
+    // each be set that way — and physical Option translation on the owner's
+    // own terminal is still unverified. The typed commands and ⌃O always
+    // arrive, so they are what the hint teaches.
+    "tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|normal|verbose] · /tasks [more] · ⌃O expands or collapses every row",
+    "  ⏎/space or click cycles the focused row (collapsed → bounded → show all) · ⇟/⇞ page a bounded row · also ⌥T ⌥N ⌥P ⌥V ⌥S where the terminal passes Option through",
 ];
 
 /// Builds the help command rows from the exact shared projection used by
@@ -46,6 +58,18 @@ pub const HELP_TEXT: &[&str] = &[
     "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
     "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
     "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
+    // 971-tui-collapse: tool rows are COLLAPSED by default — one summary row
+    // (name · exit · lines · duration) plus a `└` first result line, with
+    // consecutive same-tool calls folded into `Ran N …`.
+    //
+    // The Alt-FREE path is listed FIRST and the ⌥ chords second (verify 1,
+    // V1): a terminal configured to swallow Option delivers no ⌥ chord at
+    // all — it is the mac compose key, and tmux, iTerm and Terminal.app can
+    // each be set that way — and physical Option translation on the owner's
+    // own terminal is still unverified. The typed commands and ⌃O always
+    // arrive, so they are what the hint teaches.
+    "tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|normal|verbose] · /tasks [more] · ⌃O expands or collapses every row",
+    "  ⏎/space or click cycles the focused row (collapsed → bounded → show all) · ⇟/⇞ page a bounded row · also ⌥T ⌥N ⌥P ⌥V ⌥S where the terminal passes Option through",
     "  /queue <steer|subturn|turn> mid-turn input — safe boundary, next tool call, or turn end",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
     "  /provider [name]   anthropic · openai · gemini · kimi · grok · xai · deepseek",

@@ -76,6 +76,13 @@ pub fn slug_name(text: &str) -> String {
 /// (sim `SHELL_CMDS`, tui.js:1993-2008).
 pub const SHELL_CMDS: [&str; 6] = ["ls", "dir", "pwd", "cd", "mkdir", "touch"];
 const BACKTRACK_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
+/// Tool-call timings retained (971-tui-collapse). Older rows lose their
+/// duration segment rather than the map growing without bound.
+pub const TOOL_TIMING_MAX: usize = 1024;
+/// Transcript-tail entries `AppModel::note_tool_timings` walks per beat, so
+/// the observation cost stays constant in a long session. Comfortably more
+/// than one turn's worth of items.
+pub const TOOL_TIMING_SCAN: usize = 64;
 
 /// The demo VFS seed (sim tui.js:418-426).
 #[must_use]
@@ -4266,6 +4273,23 @@ pub enum Hit {
     SubTreeToggle,
     /// The pinned-todos header (collapse toggle, owner item 7).
     TodosToggle,
+    /// One collapsed TOOL row (971-tui-collapse) — click cycles it
+    /// collapsed → expanded → show all → collapsed. VALUE-CARRYING (the
+    /// stale-hit-map law): the item id the row was RENDERED for, so a
+    /// transcript that grew between the paint and the click can only ever
+    /// toggle the row the reader pointed at.
+    ToolRowToggle(String),
+    /// A folded run's `Ran N shell commands` row — opens the run into its
+    /// member rows, and folds it again on the next click.
+    ToolFoldToggle(String),
+    /// The bounded expanded region's `⏎ show all` affordance.
+    ToolShowAll(String),
+    /// The live background-task line under the composer — click expands it
+    /// into the per-task list, and folds it again.
+    TaskLineToggle,
+    /// The expanded list's `+K more` row — walks its pages (verify 1, F7:
+    /// this row used to be inert).
+    TaskLineMore,
     /// One pinned-todo row. Carries the todo's id so a stale rect can only
     /// ever light the row it was measured on. Clicking a row does nothing —
     /// the sim's rows are not buttons; the hit exists so the row can take
@@ -5254,6 +5278,27 @@ pub struct AppModel {
     /// header is a button and the collapsed form summarises the current
     /// item; owner item 7 promotes it from the deferred ledger).
     pub todos_collapsed: bool,
+    /// 971-tui-collapse: every reader-owned disclosure decision about the
+    /// transcript's TOOL rows — the verbosity mode, ⌥T's blanket override,
+    /// the per-row states, which folded runs are open, and the keyboard
+    /// focus. Collapsed BY DEFAULT (owner: "tool responses should be
+    /// compressed by default … then expand if needed by the user").
+    ///
+    /// Its `revision()` is a layout coordinate: `TranscriptLayoutCache`
+    /// invalidates on a bump exactly as it does on a width or theme change,
+    /// because collapsing a row moves every row start below it.
+    pub toolfold: crate::toolfold::ToolFold,
+    /// When each tool call started, and when it landed, on the shared
+    /// `clock_ms` wall clock. The protocol carries NO tool duration, so
+    /// this is a client-side observation kept out of the projection (which
+    /// is a pure reducer with no clock). Bounded: [`TOOL_TIMING_MAX`]
+    /// newest calls, and a row whose start was never observed drops its
+    /// duration segment rather than printing a fabricated `0s`.
+    pub tool_timings: std::collections::BTreeMap<String, crate::toolfold::ToolTiming>,
+    /// Monotone counter of persisted verbosity commits — the settings
+    /// store's write trigger (the `theme_commits` idiom: a commit
+    /// re-affirming the current value must still reach disk).
+    pub verbosity_commits: u64,
     /// An auto-resume turn is in flight (§2.7 guard).
     pub auto_resuming: bool,
     /// The aura orchestrator surface (persists across screen exits).
@@ -5280,6 +5325,32 @@ pub struct AppModel {
     /// Kept beside roster attention because the active session is checked
     /// out of its ordinary row.
     pub session_created_at_ms: std::collections::HashMap<SessionId, u64>,
+    /// The effect-permission posture the DAEMON reported per session
+    /// (`SessionMetadataV1::permission_overrides`). The bytes already
+    /// arrived on every session summary and were being discarded; the
+    /// background-task line under the composer reads them so the posture it
+    /// shows is observed truth, never the constant the TUI itself asked for
+    /// at `session.create`. Absent for a daemon that reports none — the
+    /// line then simply omits the segment.
+    pub session_permissions: std::collections::HashMap<
+        SessionId,
+        haider_protocol::session::SessionPermissionOverridesV1,
+    >,
+    /// The background-task line under the composer is expanded into its
+    /// per-task list (owner 2026-09-08). Collapsed by default; per-session
+    /// (the slot), because it is a view of THAT session's background work.
+    pub tasks_line_expanded: bool,
+    /// Which page of that list is showing (verify 1, F7).
+    pub tasks_line_page: usize,
+    /// A one-shot request to reveal one tool row in the transcript (verify
+    /// 1, F4). RENDER resolves it against its own width-keyed geometry —
+    /// the model cannot know which wrapped row an entry lands on — and
+    /// clears it only when it LANDS, exactly as `pending_jump` does.
+    pub pending_tool_reveal: std::cell::RefCell<Option<String>>,
+    /// Tool-row disclosure states read from the profile at boot, keyed by
+    /// session id (verify 1, F3). Consulted the FIRST time a session is
+    /// opened in this process; its own slot is authoritative afterwards.
+    pub persisted_tool_rows: std::collections::BTreeMap<String, crate::settings::ToolRowsRecord>,
     /// Durable last-model aliases retained outside checked-out rows so the
     /// all-sessions search can match the active session before/without a
     /// live model-selection repaint.
@@ -5508,6 +5579,13 @@ pub struct AppModel {
     /// the same rectangle here, which is the 971 F2 invariant the layout
     /// tests read.
     pub band_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
+    /// The rectangle the band's live background-task line actually occupied
+    /// last frame, or `None` when it drew none (nothing running and no
+    /// reported permission posture, or a frame too short for it).
+    /// Published exactly as [`Self::band_rect`] is, so the layout pins read
+    /// what was DRAWN rather than re-deriving it — the row must always sit
+    /// directly under the slot, on every surface.
+    pub tasks_line_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// Monotonic login ATTEMPT mint (TUI6.3 fix 1; TUI6.5 re-scope) —
     /// each card open AND each submit takes the next value (the identity
     /// is per stage ISSUANCE, not per card); never reused, so a retired
@@ -5740,6 +5818,9 @@ impl Default for AppModel {
             retry_inflight: false,
             graph_unsupported: false,
             todos_collapsed: false,
+            toolfold: crate::toolfold::ToolFold::default(),
+            tool_timings: std::collections::BTreeMap::new(),
+            verbosity_commits: 0,
             auto_resuming: false,
             aura: AuraModel::seed(),
             mode: RuntimeMode::Demo,
@@ -5752,6 +5833,11 @@ impl Default for AppModel {
             session_cache_rates: std::collections::HashMap::new(),
             session_attention: std::collections::HashMap::new(),
             session_created_at_ms: std::collections::HashMap::new(),
+            session_permissions: std::collections::HashMap::new(),
+            tasks_line_expanded: false,
+            tasks_line_page: 0,
+            pending_tool_reveal: std::cell::RefCell::new(None),
+            persisted_tool_rows: std::collections::BTreeMap::new(),
             session_last_models: std::collections::HashMap::new(),
             session_kinds: std::collections::HashMap::new(),
             active_session: None,
@@ -5824,6 +5910,7 @@ impl Default for AppModel {
             composer_rect: std::cell::Cell::new(None),
             status_rect: std::cell::Cell::new(None),
             band_rect: std::cell::Cell::new(None),
+            tasks_line_rect: std::cell::Cell::new(None),
             login_attempt_seq: 0,
             sticky_suppressed: std::cell::Cell::new(false),
             hovered: None,
@@ -6449,6 +6536,18 @@ impl AppModel {
         }
         // The ◉ talk chip's live hold (sim `.mic.live`, tui.js:5484-5489).
         if self.listening {
+            return true;
+        }
+        // Verify 1 (F5): the band's EXPANDED task list prints a live
+        // elapsed figure per row, and shells/monitors alone animate
+        // nothing else — so once startup settled the shared clock stopped
+        // and every label froze mid-count. An expanded list with anything
+        // running keeps the clock advancing on the SAME 600 ms beat every
+        // other animation rides (no new timer, the zero-idle-wakeup law is
+        // preserved because a COLLAPSED list still lets the TUI idle). The
+        // band is every view's, so this is checked before the per-screen
+        // match rather than inside it.
+        if self.tasks_line_expanded && self.background_work_running() {
             return true;
         }
         match self.screen {
@@ -8019,6 +8118,17 @@ impl AppModel {
                 KeyCode::Char('t') => self.cycle_theme(),
                 // ⌃G = the token panel (sim tui.js binding).
                 KeyCode::Char('g') => self.toggle_token_panel(),
+                // 971-tui-collapse round 2 (owner ruling 4): ⌃O is ⌥T's
+                // Alt-free twin. tmux, iTerm and Terminal.app can each be
+                // configured to swallow Option entirely (it is the compose
+                // key on a mac keyboard), so every gesture this wave added
+                // has a non-Alt path — ⌃O here, and a typed command for the
+                // rest (`/collapse`, `/verbosity`, `/tasks`). ⌃B is
+                // deliberately NOT used: it is tmux's own default prefix,
+                // which is exactly the terminal this fallback exists for.
+                KeyCode::Char('o') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
+                    self.toggle_all_tool_rows();
+                }
                 // TUI5 items 2+3 — readline editing keys, Claude Code
                 // parity: ⌃A/⌃E line edges, ⌃W word-back, ⌃K kill-to-end,
                 // ⌃U kill-to-start. Only while the composer actually owns
@@ -8812,6 +8922,35 @@ impl AppModel {
                     self.dirty = true;
                 }
             }
+            // Verify 1 (F2): ⇟/⇞ page the FOCUSED row's bounded output
+            // window. Guarded on a focus the reader SET and on the row
+            // actually being bounded-expanded — the guard's call answers
+            // `false` otherwise, so the keys keep falling through to
+            // whatever owns them next on every other surface.
+            KeyCode::PageDown | KeyCode::PageUp
+                if matches!(self.screen, Screen::Session | Screen::Subagent)
+                    && self.focused_tool_row().is_some()
+                    && self.page_focused_tool_output(key.code == KeyCode::PageDown) => {}
+            // 971-tui-collapse: with a tool row FOCUSED (⌥N/⌥P, or a
+            // click) and NOTHING drafted, ⏎/Space cycle that row's
+            // disclosure instead of submitting an empty turn. Both guards
+            // matter: a draft always wins, and with no focus the composer
+            // keeps both keys outright — the focus is only ever set by a
+            // deliberate gesture, so this can never steal a submit. ⌥P off
+            // the top of the list clears the focus and hands both keys back.
+            KeyCode::Enter | KeyCode::Char(' ')
+                if matches!(self.screen, Screen::Session | Screen::Subagent)
+                    && self.composer.is_empty()
+                    && self.composer.attachments().is_empty()
+                    && self.focused_tool_row().is_some() =>
+            {
+                self.cycle_focused_tool_row();
+            }
+            // The visible task pager shares the click/slash-command path.
+            // A drafted turn or an explicitly focused tool keeps Enter.
+            KeyCode::Enter if self.task_pager_enter_available() && self.task_pager_visible() => {
+                self.page_tasks_line();
+            }
             KeyCode::Enter => self.submit_composer(),
             KeyCode::Backspace => {
                 // B4b chip law: ⌫ at the very START of the draft (no
@@ -8907,6 +9046,38 @@ impl AppModel {
             // ⌥b/⌥f word movement (readline ESC-b/ESC-f — what most mac
             // terminals actually SEND for Option+arrow; Claude Code
             // honors both encodings, so we do too).
+            // 971-tui-collapse gestures. ⌥ modifiers, because the session
+            // composer owns every BARE character — the sim's ⌥F fleet door
+            // set this precedent.
+            KeyCode::Char('t')
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                self.toggle_all_tool_rows();
+            }
+            KeyCode::Char('v')
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                self.cycle_tool_verbosity();
+            }
+            // ⌥S expands the band's background-task line. Not
+            // screen-scoped: the band is every view's.
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.toggle_tasks_line();
+            }
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                self.move_tool_focus(true);
+            }
+            KeyCode::Char('p')
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                self.move_tool_focus(false);
+            }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.composer.word_left(false);
             }
@@ -15012,6 +15183,67 @@ impl AppModel {
                     self.select_account(&alias);
                 }
             }
+            // 971-tui-collapse round 2 (owner ruling 4): the Alt-free path
+            // to every gesture this wave added. Typed commands, because a
+            // terminal that swallows Option still delivers text — and
+            // because a name is discoverable where a chord is not. They are
+            // display-only, so they work in demo and live alike.
+            //
+            // NOT in the palette catalog: `COMMANDS` is shared with the
+            // daemon's `command.list` door, and widening it is a protocol
+            // change this lane does not make. `/help`'s keys line documents
+            // them instead (see `commands::HELP_INTRO_TEXT`).
+            "collapse" | "toolrows" => match arg.as_deref() {
+                Some("all") | Some("collapse") | Some("collapsed") => {
+                    self.set_all_tool_rows(false);
+                }
+                Some("expand") | Some("expanded") => self.set_all_tool_rows(true),
+                Some("next") => self.move_tool_focus(true),
+                Some("prev") | Some("previous") => self.move_tool_focus(false),
+                // F2's Alt-free page keys: the focused row's bounded
+                // output window, without reaching for PgDn/PgUp.
+                Some("down") | Some("more") => {
+                    if !self.page_focused_tool_output(true) {
+                        self.flash =
+                            Some("· /collapse down — focus a bounded row first (⌥N)".to_owned());
+                        self.dirty = true;
+                    }
+                }
+                Some("up") | Some("back") => {
+                    if !self.page_focused_tool_output(false) {
+                        self.flash =
+                            Some("· /collapse up — focus a bounded row first (⌥N)".to_owned());
+                        self.dirty = true;
+                    }
+                }
+                Some("toggle") | None => self.toggle_all_tool_rows(),
+                Some(other) => {
+                    self.flash = Some(format!(
+                        "· /collapse {other}? — all · expand · next · prev · down · up"
+                    ));
+                    self.dirty = true;
+                }
+            },
+            "verbosity" | "verbose" => match arg.as_deref() {
+                None => self.cycle_tool_verbosity(),
+                Some(name) => match crate::toolfold::Verbosity::parse(name) {
+                    Some(verbosity) => self.set_tool_verbosity(verbosity),
+                    None => {
+                        self.flash = Some(format!(
+                            "· /verbosity {name}? — quiet · normal · verbose (bare cycles)"
+                        ));
+                        self.dirty = true;
+                    }
+                },
+            },
+            "tasks" => match arg.as_deref() {
+                Some("more") | Some("next") | Some("page") => self.page_tasks_line(),
+                None | Some("toggle") => self.toggle_tasks_line(),
+                Some(other) => {
+                    self.flash = Some(format!("· /tasks {other}? — more (bare toggles the line)"));
+                    self.dirty = true;
+                }
+            },
             "" => {}
             other => {
                 // W-C M1: a user-loaded custom command merges OVER (never
@@ -15239,12 +15471,470 @@ impl AppModel {
             .count()
     }
 
-    /// The right-aligned counts on the `▾ subagents` band row (970 owner
-    /// item 1). Empty when there is nothing running — the row then collapses
-    /// exactly as it did before.
+    // ---- 971-tui-collapse: the band's background-task line ----
+
+    /// Anything running whose elapsed figure the expanded task list would
+    /// tick. Deliberately CHEAP — it runs on every animation beat, so it
+    /// counts rather than building the row list.
     #[must_use]
-    pub fn band_counts(&self) -> Vec<crate::taskrows::BandCount> {
-        crate::taskrows::band_counts(self.live_shell_count(), self.monitor_count)
+    pub fn background_work_running(&self) -> bool {
+        self.monitor_count > 0
+            || self.live_shell_count() > 0
+            || self.tasks.running_count() > 0
+            || tree_live_count(&self.chips) > 0
+    }
+
+    /// ⌥S / a click on the line — expand it into the per-task list, or fold
+    /// it back. Collapsed is the default and the resting state.
+    /// `+K more` / `/tasks more` — walk the expanded list's pages, wrapping
+    /// back to the first at the end (F7: the row used to be inert).
+    pub fn page_tasks_line(&mut self) {
+        let line = self.status_line();
+        if !self.tasks_line_expanded || line.pages() <= 1 {
+            self.tasks_line_expanded = true;
+            self.tasks_line_page = 0;
+            self.flash = Some("· background tasks — one page".to_owned());
+            self.dirty = true;
+            return;
+        }
+        self.tasks_line_page = (line.page() + 1) % line.pages();
+        self.flash = Some(format!(
+            "· background tasks — page {} of {}",
+            self.tasks_line_page + 1,
+            line.pages()
+        ));
+        self.dirty = true;
+    }
+
+    fn task_pager_visible(&self) -> bool {
+        let line = self.status_line();
+        line.expanded
+            && line.pages() > 1
+            && self
+                .tasks_line_rect
+                .get()
+                .is_some_and(|rect| rect.width > 0 && rect.height >= line.height())
+    }
+
+    /// Only advertise Enter when this surface will hand it to the pager.
+    pub(crate) fn task_pager_enter_available(&self) -> bool {
+        matches!(self.screen, Screen::Session | Screen::Subagent)
+            && self.clipboard_composer_visible()
+            && !self.shells_open
+            && !self.ssh_open
+            && !self.monitors_open
+            && self.model_picker.is_none()
+            && self.effort_picker.is_none()
+            && self.theme_picker.is_none()
+            && self.backtrack.is_none()
+            && self.projection.permission_card().is_none()
+            && self.composer.is_empty()
+            && self.composer.attachments().is_empty()
+            && self.focused_tool_row().is_none()
+    }
+
+    pub fn toggle_tasks_line(&mut self) {
+        self.tasks_line_expanded = !self.tasks_line_expanded;
+        // A fresh expansion opens on the first page; a stale one would hide
+        // the rows the reader just asked to see.
+        self.tasks_line_page = 0;
+        self.flash = Some(if self.tasks_line_expanded {
+            "· background tasks expanded — ⌥S · /tasks".to_owned()
+        } else {
+            "· background tasks collapsed — ⌥S · /tasks".to_owned()
+        });
+        self.dirty = true;
+    }
+
+    /// The permission posture the DAEMON reported for the attached session,
+    /// or `None` when it reported none (an older daemon, or a summary that
+    /// has not arrived yet). The line then omits the segment rather than
+    /// echoing back the constant the TUI itself sent at `session.create` —
+    /// that would be a hardcoded string dressed as observed truth.
+    #[must_use]
+    pub fn permission_mode(&self) -> Option<crate::statusline::PermissionMode> {
+        let id = self.active_session.as_ref()?;
+        self.session_permissions
+            .get(id)
+            .map(crate::statusline::PermissionMode::from_overrides)
+    }
+
+    /// Everything the band's background-task line renders from, gathered
+    /// once per frame from daemon-observed state.
+    ///
+    /// Every count here is truth the daemon sent: live registry shells
+    /// (`shell.list`), registered monitors (`monitor.list`), live subagents
+    /// (`AgentSpawned` + chip state), and running background shell tasks
+    /// (the `task_started`/`task_completed` facts). Each row's elapsed is an
+    /// observed start instant, and each row's ACTIVITY is present only where
+    /// the daemon actually reports one — see `statusline`'s honesty boundary.
+    #[must_use]
+    pub fn status_line(&self) -> crate::statusline::StatusLine {
+        use crate::statusline::{Counts, Row, RowKind, StatusLine};
+
+        let live_shells: Vec<&haider_rpc::ShellWire> = self
+            .shells
+            .iter()
+            .filter(|shell| {
+                matches!(
+                    &shell.status,
+                    haider_rpc::ShellStatusWire::Starting | haider_rpc::ShellStatusWire::Running
+                )
+            })
+            .collect();
+        let live_chips: Vec<&ChipModel> = flatten_chips(&self.chips)
+            .into_iter()
+            .filter_map(|(_, chip)| chip.is_live().then_some(chip))
+            .collect();
+        let live_tasks: Vec<&crate::taskrows::TaskRow> = self
+            .tasks
+            .rows()
+            .iter()
+            .filter(|row| row.state.is_running())
+            .collect();
+        let counts = Counts {
+            shells: live_shells.len(),
+            monitors: self.monitor_count,
+            agents: live_chips.len(),
+            tasks: live_tasks.len(),
+        };
+        let mut rows = vec![Row {
+            kind: RowKind::Main,
+            kind_label: RowKind::Main.label().to_owned(),
+            // The reference's row is simply `● main`. A session that has a
+            // TITLE names it beside the label; an untitled one leaves the
+            // label to stand alone rather than repeating itself.
+            name: self
+                .session_title
+                .clone()
+                .or_else(|| self.session_name.clone())
+                .unwrap_or_default(),
+            activity: None,
+            elapsed_ms: None,
+        }];
+        for chip in live_chips {
+            rows.push(Row {
+                kind: RowKind::Agent,
+                // The Loom `@type ·` prefix is the ONLY structured agent
+                // type on the wire; an untyped spawn falls back to the kind.
+                kind_label: self.loom_task_type(&chip.name).map_or_else(
+                    || RowKind::Agent.label().to_owned(),
+                    |(kind, _)| kind.id.clone(),
+                ),
+                name: chip.name.clone(),
+                activity: Some(chip.activity()),
+                elapsed_ms: chip.elapsed_ms(self.clock_ms),
+            });
+        }
+        for shell in live_shells {
+            rows.push(Row {
+                kind: RowKind::Shell,
+                kind_label: RowKind::Shell.label().to_owned(),
+                name: if shell.title.trim().is_empty() {
+                    shell.cwd_or_host.clone()
+                } else {
+                    shell.title.clone()
+                },
+                // A registry shell reports bytes and a last-activity
+                // instant, not a current line — so no activity column.
+                activity: None,
+                elapsed_ms: Some(self.clock_ms.saturating_sub(shell.created_at_ms)),
+            });
+        }
+        for monitor in &self.monitors {
+            rows.push(Row {
+                kind: RowKind::Monitor,
+                kind_label: RowKind::Monitor.label().to_owned(),
+                name: monitor_source_summary(monitor),
+                activity: monitor
+                    .last_event
+                    .as_ref()
+                    .map(|event| monitor_excerpt(&event.summary)),
+                elapsed_ms: Some(self.clock_ms.saturating_sub(monitor.created_at_ms)),
+            });
+        }
+        for task in live_tasks {
+            rows.push(Row {
+                kind: RowKind::Task,
+                kind_label: RowKind::Task.label().to_owned(),
+                name: task.name.clone(),
+                // NOT AVAILABLE on the wire: there is no `task_progress`
+                // event and no `task.list` RPC, so a live background task's
+                // current output line cannot be shown honestly. The row
+                // says what the task IS.
+                activity: None,
+                // A completed fact for an unseen task lands `started_at_ms:
+                // 0` (`TaskPanel::apply`); that is not an observed start.
+                elapsed_ms: (task.started_at_ms > 0)
+                    .then(|| self.clock_ms.saturating_sub(task.started_at_ms)),
+            });
+        }
+        // With nothing running the list is the session's row alone, which
+        // says nothing the summary did not — drop it.
+        if counts.is_empty() {
+            rows.clear();
+        }
+        StatusLine {
+            mode: self.permission_mode(),
+            counts,
+            rows,
+            expanded: self.tasks_line_expanded,
+            page: self.tasks_line_page,
+        }
+    }
+
+    // ---- 971-tui-collapse: collapsed tool rows ----
+
+    /// Observe tool-call start/finish times against the shared `clock_ms`.
+    ///
+    /// The protocol carries no tool duration and the projection is a pure
+    /// reducer with no clock, so the elapsed figure is a CLIENT-SIDE
+    /// observation taken here, once per runtime beat, from the tail of the
+    /// transcript. Only the tail is walked (`TOOL_TIMING_SCAN` entries), so
+    /// the cost is constant no matter how long the session runs.
+    ///
+    /// Honesty rule: a call whose START was never observed — a replayed
+    /// history, a restart mid-run — gets NO entry here, and the row then
+    /// omits its duration segment instead of printing a fabricated `0s`.
+    pub fn note_tool_timings(&mut self) {
+        let now = self.clock_ms;
+        if now == 0 {
+            return;
+        }
+        let entries = self.projection.entries();
+        let scan_from = entries.len().saturating_sub(TOOL_TIMING_SCAN);
+        let mut observed: Vec<(String, bool)> = Vec::new();
+        for entry in &entries[scan_from..] {
+            let crate::projection::TranscriptEntry::Item(block) = entry else {
+                continue;
+            };
+            if !matches!(
+                block.item,
+                haider_protocol::item::TurnItem::ToolCall { .. }
+                    | haider_protocol::item::TurnItem::CommandExecution { .. }
+            ) {
+                continue;
+            }
+            observed.push((block.item_id.as_str().to_owned(), block.streaming));
+        }
+        for (item_id, streaming) in observed {
+            match self.tool_timings.get_mut(&item_id) {
+                // A row that has stopped streaming FREEZES its clock at the
+                // first beat we saw it settled — never re-opened by a later
+                // status edit (a joined `ToolResult` mutates the entry).
+                Some(timing) if !streaming && timing.ended_ms.is_none() => {
+                    timing.ended_ms = Some(now);
+                }
+                Some(_) => {}
+                // First sight. A row already settled when we met it has no
+                // observed start, so it stays out of the map entirely.
+                None if streaming => {
+                    self.tool_timings
+                        .insert(item_id, crate::toolfold::ToolTiming::started(now));
+                }
+                None => {}
+            }
+        }
+        while self.tool_timings.len() > TOOL_TIMING_MAX {
+            let Some(oldest) = self.tool_timings.keys().next().cloned() else {
+                break;
+            };
+            self.tool_timings.remove(&oldest);
+        }
+    }
+
+    /// The projection currently on screen. A missing child has no rows;
+    /// it must never fall back to navigating the hidden main transcript.
+    fn viewed_tool_projection(&self) -> Option<&SessionProjection> {
+        match self.screen {
+            Screen::Subagent => self.viewed_chip().map(|chip| &chip.transcript),
+            Screen::Session => Some(&self.projection),
+            _ => None,
+        }
+    }
+
+    /// Focus only owns keys while its item belongs to the viewed transcript.
+    /// Disclosure remains session-scoped and keyed by the actual item id,
+    /// so a child's rows survive returning to main and session checkout.
+    fn focused_tool_row(&self) -> Option<&str> {
+        let id = self.toolfold.focus()?;
+        self.viewed_tool_projection()?
+            .entries()
+            .iter()
+            .any(|entry| {
+                matches!(entry,
+                crate::projection::TranscriptEntry::Item(block) if block.item_id.as_str() == id)
+            })
+            .then_some(id)
+    }
+
+    /// Every tool row in the viewed transcript, oldest first — the order
+    /// ⌥N/⌥P walks. Folded members are included: focusing one is exactly how
+    /// a reader reaches a row the fold speaks for.
+    #[must_use]
+    pub fn tool_row_ids(&self) -> Vec<String> {
+        let Some(projection) = self.viewed_tool_projection() else {
+            return Vec::new();
+        };
+        projection
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                let crate::projection::TranscriptEntry::Item(block) = entry else {
+                    return None;
+                };
+                matches!(
+                    block.item,
+                    haider_protocol::item::TurnItem::ToolCall { .. }
+                        | haider_protocol::item::TurnItem::CommandExecution { .. }
+                )
+                .then(|| block.item_id.as_str().to_owned())
+            })
+            .collect()
+    }
+
+    /// ⌥N / ⌥P — move the tool-row focus. From the resting `None` state
+    /// both land on the NEWEST row, which is the one a reader who just
+    /// watched a tool run is asking about.
+    pub fn move_tool_focus(&mut self, forward: bool) {
+        let rows = self.tool_row_ids();
+        if rows.is_empty() {
+            self.toolfold.set_focus(None);
+            self.flash = Some("· no tool rows in this transcript".to_owned());
+            self.dirty = true;
+            return;
+        }
+        let next = match self
+            .toolfold
+            .focus()
+            .and_then(|id| rows.iter().position(|row| row == id))
+        {
+            Some(index) if forward => (index + 1).min(rows.len() - 1),
+            // Backwards off the FIRST row releases the focus, which is how
+            // a reader hands ⏎/Space back to the composer without spending
+            // an Esc (Esc is session-scoped: it interrupts, never navigates).
+            Some(0) => {
+                self.toolfold.set_focus(None);
+                self.dirty = true;
+                return;
+            }
+            Some(index) => index - 1,
+            None => rows.len() - 1,
+        };
+        self.toolfold.set_focus(Some(&rows[next]));
+        // Verify 1 (F4): a focus the reader cannot SEE is not a focus. The
+        // frame resolves this anchor against its own width-keyed geometry
+        // after the layout reconciles, exactly as a tree jump does — the
+        // model cannot know the row a wrapped entry lands on.
+        *self.pending_tool_reveal.borrow_mut() = Some(rows[next].clone());
+        self.dirty = true;
+    }
+
+    /// ⏎ / Space on the focused row — the collapsed → expanded → show all →
+    /// collapsed cycle. Answers `false` when nothing is focused, so the
+    /// composer keeps both keys in the resting state.
+    pub fn cycle_focused_tool_row(&mut self) -> bool {
+        let Some(id) = self.focused_tool_row().map(str::to_owned) else {
+            return false;
+        };
+        self.toolfold.cycle(&id);
+        self.dirty = true;
+        true
+    }
+
+    /// ⌥T / ⌃O / `/collapse` — every tool row at once.
+    pub fn toggle_all_tool_rows(&mut self) {
+        self.toolfold.toggle_all();
+        self.note_tool_rows_state();
+    }
+
+    /// `/collapse all|expand` — the same law stated ABSOLUTELY, so a typed
+    /// command is idempotent.
+    ///
+    /// Verify 1 (F1): this used to no-op when the blanket already matched,
+    /// which left contrary per-row overrides open behind a "collapsed"
+    /// flash, and it could not beat the `verbose` default at all. It now
+    /// always commits an explicit blanket, which outranks the mode and
+    /// drops every override.
+    pub fn set_all_tool_rows(&mut self, expanded: bool) {
+        self.toolfold.set_blanket(if expanded {
+            crate::toolfold::Blanket::Expanded
+        } else {
+            crate::toolfold::Blanket::Collapsed
+        });
+        self.note_tool_rows_state();
+    }
+
+    /// PgDn/PgUp — page the FOCUSED row's bounded output window (F2).
+    /// Answers `false` when nothing is focused or the focused row is not
+    /// bounded-expanded, so the key falls through to whatever owns it next.
+    pub fn page_focused_tool_output(&mut self, forward: bool) -> bool {
+        let Some(item_id) = self.focused_tool_row().map(str::to_owned) else {
+            return false;
+        };
+        if self.toolfold.state_of(&item_id) != crate::toolfold::RowState::Expanded {
+            return false;
+        }
+        // The clamp comes from the same wrap the frame renders, at the
+        // width the frame last used, so the window can never scroll past
+        // what is actually there.
+        let width = self.transcript_view.get().width;
+        let Some(projection) = self.viewed_tool_projection() else {
+            return false;
+        };
+        let Some(rows) = projection.entries().iter().find_map(|entry| match entry {
+            crate::projection::TranscriptEntry::Item(block)
+                if block.item_id.as_str() == item_id =>
+            {
+                Some(crate::render::retained_output_rows(block, width))
+            }
+            _ => None,
+        }) else {
+            return false;
+        };
+        let max = rows.saturating_sub(crate::toolfold::EXPANDED_MAX_ROWS);
+        if max == 0 {
+            return false;
+        }
+        // A page keeps one row of overlap, so the reader never loses their
+        // place across a jump.
+        let step = crate::toolfold::EXPANDED_MAX_ROWS.saturating_sub(1).max(1);
+        let delta = isize::try_from(step).unwrap_or(1);
+        self.toolfold
+            .scroll_row(&item_id, if forward { delta } else { -delta }, max);
+        self.dirty = true;
+        true
+    }
+
+    fn note_tool_rows_state(&mut self) {
+        // The flash names BOTH paths, because the Alt one is the one a
+        // terminal can swallow.
+        self.flash = Some(if self.toolfold.all_expanded() {
+            "· tool rows expanded — ⌥T · ⌃O · /collapse".to_owned()
+        } else {
+            "· tool rows collapsed — ⌥T · ⌃O · /collapse".to_owned()
+        });
+        self.dirty = true;
+    }
+
+    /// ⌥V — the persisted quiet → normal → verbose cycle.
+    pub fn cycle_tool_verbosity(&mut self) {
+        let next = self.toolfold.verbosity().next();
+        self.set_tool_verbosity(next);
+    }
+
+    /// Commit one verbosity mode. The commit COUNTER is what reaches the
+    /// settings store, so re-affirming the current mode still writes (the
+    /// `theme_commits` law — a live probe once found no file after exactly
+    /// that flow).
+    pub fn set_tool_verbosity(&mut self, verbosity: crate::toolfold::Verbosity) {
+        self.toolfold.set_verbosity(verbosity);
+        self.verbosity_commits = self.verbosity_commits.saturating_add(1);
+        self.flash = Some(format!(
+            "· tool output: {} — ⌥V · /verbosity",
+            verbosity.name()
+        ));
+        self.dirty = true;
     }
 
     /// `/monitors` and its control subcommands. A bare `/monitors` opens the
@@ -16883,6 +17573,13 @@ impl AppModel {
         self.view_path.clear();
         self.subtree_collapsed = false;
         self.todos_collapsed = false;
+        // Detaching drops the transcript-local disclosure state; the
+        // verbosity MODE survives, because it is a profile preference.
+        self.toolfold.clear_session();
+        self.tool_timings.clear();
+        self.tasks_line_expanded = false;
+        self.tasks_line_page = 0;
+        *self.pending_tool_reveal.borrow_mut() = None;
         self.auto_resuming = false;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
@@ -17042,6 +17739,22 @@ impl AppModel {
         self.auto_resuming = slot.auto_resuming;
         self.subtree_collapsed = slot.subtree_collapsed;
         self.todos_collapsed = slot.todos_collapsed;
+        // The transcript's disclosure state rides the same A→B→A checkout
+        // law as the two older collapse flags: leaving a session keeps the
+        // rows the reader opened IN ITS SLOT, re-entering restores exactly.
+        // The slot is authoritative once this process has seen the
+        // session; the FIRST open after a restart falls back to the profile
+        // store (verify 1, F3).
+        // Consume boot state even when the reader later restores empty
+        // defaults: an empty initialized slot is still authoritative.
+        let (blanket, rows) = if let Some(record) = self.persisted_tool_rows.remove(id.as_str()) {
+            (record.blanket, record.rows)
+        } else {
+            (slot.tools_blanket, std::mem::take(&mut slot.tool_rows))
+        };
+        self.toolfold.restore(blanket, rows);
+        self.tasks_line_expanded = slot.tasks_line_expanded;
+        self.tasks_line_page = 0;
         self.session_title = slot.title.take();
         self.session_name = slot.name.take();
         self.session_head = std::mem::take(&mut slot.head);
@@ -17164,6 +17877,9 @@ impl AppModel {
             slot.auto_resuming = std::mem::take(&mut self.auto_resuming);
             slot.subtree_collapsed = std::mem::take(&mut self.subtree_collapsed);
             slot.todos_collapsed = std::mem::take(&mut self.todos_collapsed);
+            slot.tools_blanket = self.toolfold.blanket();
+            slot.tool_rows = self.toolfold.rows_snapshot();
+            slot.tasks_line_expanded = std::mem::take(&mut self.tasks_line_expanded);
             slot.title = self.session_title.take();
             slot.name = self.session_name.take();
             slot.head = std::mem::replace(
@@ -17494,6 +18210,17 @@ impl AppModel {
                 .insert(summary.session_id.clone(), metadata.created_at_ms);
             if prior != Some(metadata.created_at_ms) {
                 self.dirty = true;
+            }
+            // The permission posture the daemon reports. Only a REPORTED
+            // posture is stored: a daemon that omits the field leaves the
+            // entry absent and the status line shows no mode segment.
+            if let Some(overrides) = metadata.permission_overrides {
+                let prior = self
+                    .session_permissions
+                    .insert(summary.session_id.clone(), overrides);
+                if prior != Some(overrides) {
+                    self.dirty = true;
+                }
             }
         }
         if let Some(kind) = summary.kind {
@@ -18076,6 +18803,32 @@ impl AppModel {
             Hit::TodosToggle if self.screen == Screen::Session => {
                 self.todos_collapsed = !self.todos_collapsed;
             }
+            // A tool row's three doors (971-tui-collapse). Each carries the
+            // item id it was painted for; clicking also FOCUSES the row, so
+            // the mouse and ⌥N/⌥P agree about which row ⏎ then acts on.
+            Hit::ToolRowToggle(item_id)
+                if matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                self.toolfold.set_focus(Some(&item_id));
+                self.toolfold.cycle(&item_id);
+            }
+            Hit::ToolFoldToggle(item_id)
+                if matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                self.toolfold.set_focus(Some(&item_id));
+                self.toolfold.toggle_fold(&item_id);
+            }
+            Hit::ToolShowAll(item_id)
+                if matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                self.toolfold.set_focus(Some(&item_id));
+                self.toolfold
+                    .set(&item_id, crate::toolfold::RowState::ShowAll);
+            }
+            // The band's own line: it belongs to EVERY view (the F2 law), so
+            // this hit is not screen-scoped.
+            Hit::TaskLineToggle => self.toggle_tasks_line(),
+            Hit::TaskLineMore => self.page_tasks_line(),
             // Hover-only affordance (see the variant's doc comment).
             Hit::TodoRow(_) => {}
             // The collapsed subagents summary row — the fleet's clickable
