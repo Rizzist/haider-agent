@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -187,13 +188,13 @@ fun SessionDrawer(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                // R3 asks for a 44 dp head. Its three controls are targets, and
-                // a target may not be smaller than 48, so the row is 48 dp of
-                // layout with a 44 dp painted band — the same paint-versus-
-                // target split as every other row (verify-10 O7). The literal
-                // 44 dp *layout* row cannot coexist with legal targets inside
-                // it, which is recorded in the round report.
-                .height(ForgeSize.touch)
+                // R3's 44 dp, taken literally this time. The row is 44 dp of
+                // LAYOUT; each control keeps 48 dp of hit area by overflowing
+                // the row symmetrically, which `Modifier.requiredHeight`
+                // permits — the child measures 48 and the parent still
+                // occupies 44 (verify-11 O7). Nothing is clipped, because the
+                // controls' visuals are 32 dp inside that 48.
+                .height(ForgeSize.drawerRow)
                 .testTag(DRAWER_HEAD_TAG),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -338,7 +339,7 @@ private fun NewSessionButton(onClick: () -> Unit, onLongClick: () -> Unit) {
     val withLabel = stringResource(R.string.drawer_new_session_with)
     Box(
         modifier = Modifier
-            .size(ForgeSize.touch)
+            .requiredSize(ForgeSize.touch)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .semantics {
                 contentDescription = label

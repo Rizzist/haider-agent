@@ -65,6 +65,7 @@ class ProportionTest {
         const val SELECT_INK = 30f
         const val ROW_INK = 40f
         const val TOOL_INK = 36f
+        const val DRAWER_HEAD = 44f
     }
 
     // ---------- R1: the header is 48 dp with 32 dp visuals ----------
@@ -446,13 +447,15 @@ class ProportionTest {
     }
 
     @Test
-    fun `the drawer head is one 48 dp row`() {
+    fun `the drawer head is one 44 dp row`() {
         rule.setHaiderApp(ComposeHost.install(FakeScenario.Populated))
         rule.onNodeWithContentDescription("Open sessions, 1 session needs input").performClick()
         rule.waitForIdle()
         val head = rule.onNodeWithTag(DRAWER_HEAD_TAG, useUnmergedTree = true)
             .fetchSemanticsNode()
-        assertEquals(Spec.TARGET, dp(head.size.height.toFloat()).value, 0.5f)
+        // R3's literal 44, with the controls keeping 48 dp of hit area by
+        // required size (verify-11 O7). Round 12's 48 dp row is superseded.
+        assertEquals(Spec.DRAWER_HEAD, dp(head.size.height.toFloat()).value, 0.5f)
     }
 
     private fun needsInputOf(kind: String, title: String) =

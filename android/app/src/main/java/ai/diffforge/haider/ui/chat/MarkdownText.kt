@@ -21,6 +21,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
@@ -48,11 +50,7 @@ internal fun MarkdownText(
             val last = index == rendered.lastIndex
             when (block) {
                 is MarkdownBlock.Code -> Text(
-                    text = literalCode(
-                        block.text,
-                        colors.accent,
-                        showCaret && last,
-                    ),
+                    text = literalCode(block.text),
                     // mono: a fenced code block.
                     style = type.toolRow.copy(fontFamily = FontFamily.Monospace),
                     color = colors.chatText,
@@ -96,13 +94,15 @@ internal fun MarkdownText(
                     modifier = Modifier.padding(start = ForgeSpace.md),
                 )
                 is MarkdownBlock.Table -> Text(
-                    text = inlineMarkdown(
-                        block.rows.joinToString("\n") { row -> row.joinToString("  │  ") },
-                        colors.chatText,
-                        colors.accentSoft,
-                        colors.accent,
-                        showCaret && last,
-                    ),
+                    text = remember(block) {
+                        inlineMarkdown(
+                            block.rows.joinToString("\n") { row ->
+                                row.joinToString("  │  ")
+                            },
+                            colors.chatText,
+                            colors.accentSoft,
+                        )
+                    },
                     // A table of prose is prose. Only a table whose cells are
                     // code needs the fixed-width face, and this renderer
                     // cannot tell, so the default is the ramp people read
@@ -128,17 +128,8 @@ internal fun MarkdownText(
     }
 }
 
-private fun literalCode(
-    text: String,
-    caret: Color,
-    showCaret: Boolean,
-): AnnotatedString = buildAnnotatedString {
+private fun literalCode(text: String): AnnotatedString = buildAnnotatedString {
     append(text)
-    if (showCaret) {
-        withStyle(SpanStyle(background = caret)) {
-            append(" ")
-        }
-    }
 }
 
 @Composable
@@ -149,25 +140,37 @@ private fun InlineMarkdownLine(
     showCaret: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    // The caret is drawn, not spliced: it sits after the text as its own box,
+    // so the cached string survives every flip (verify-11 O5).
     val colors = Forge.colors
     val uriHandler = LocalUriHandler.current
-    // Memoised on the *text*, not on a per-frame alpha. The caret's alpha used
-    // to be an argument here, so every animation frame rebuilt the whole
-    // AnnotatedString and re-laid out the transcript — four cores' worth
-    // (verify-10 O5).
-    val annotated = remember(text, color, showCaret, colors.accentSoft, colors.accent) {
-        inlineMarkdown(
-            text,
-            color,
-            colors.accentSoft,
-            colors.accent,
-            showCaret,
-        )
+    // Keyed on the TEXT, and on nothing that blinks. Round 12 dropped the
+    // alpha but kept `showCaret` in the key, so every caret flip still
+    // rebuilt the string and re-laid out the line (verify-11 O5). The caret is
+    // drawn as its own element after the text instead.
+    val annotated = remember(text, color, colors.accentSoft) {
+        inlineMarkdown(text, color, colors.accentSoft)
     }
+    val caretColor = colors.accent
     ClickableText(
         text = annotated,
         style = style.copy(color = color),
-        modifier = modifier,
+        modifier = modifier.then(
+            if (showCaret) {
+                Modifier.drawWithContent {
+                    drawContent()
+                    val width = ForgeSize.caretWidth.toPx()
+                    val height = size.height.coerceAtMost(ForgeSize.caretHeight.toPx())
+                    drawRect(
+                        color = caretColor,
+                        topLeft = Offset(size.width - width, size.height - height),
+                        size = Size(width, height),
+                    )
+                }
+            } else {
+                Modifier
+            },
+        ),
         onClick = { offset ->
             annotated.getStringAnnotations(URL_TAG, offset, offset)
                 .firstOrNull()
@@ -181,8 +184,6 @@ private fun inlineMarkdown(
     text: String,
     color: Color,
     link: Color,
-    caret: Color,
-    showCaret: Boolean,
 ): AnnotatedString = buildAnnotatedString {
     var cursor = 0
     while (cursor < text.length) {
@@ -243,9 +244,6 @@ private fun inlineMarkdown(
             }
             else -> append(text[cursor++])
         }
-    }
-    if (showCaret) {
-        withStyle(SpanStyle(background = caret)) { append(" ") }
     }
 }
 

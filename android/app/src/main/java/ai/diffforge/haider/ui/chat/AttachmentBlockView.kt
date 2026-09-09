@@ -1,5 +1,7 @@
 package ai.diffforge.haider.ui.chat
 
+import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.ForgeIconButton
 import ai.diffforge.haider.ui.daemon.Attachment
 import ai.diffforge.haider.ui.daemon.DaemonService
 import ai.diffforge.haider.ui.daemon.TokenUsage
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.PictureAsPdf
 import androidx.compose.material.icons.rounded.ShortText
@@ -39,6 +42,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 
 const val ATTACHMENT_STRIP_TAG = "attachment_strip"
@@ -58,6 +62,14 @@ fun AttachmentStrip(
     attachments: List<Attachment>,
     service: DaemonService?,
     modifier: Modifier = Modifier,
+    /**
+     * Non-null in the composer, null in the transcript.
+     *
+     * A staged block had no way off the strip at all — the callback existed and
+     * was never wired — which also left a `too_many_attachments` refusal with
+     * no way out but abandoning the message (verify-11 O9).
+     */
+    onRemove: ((String) -> Unit)? = null,
 ) {
     if (attachments.isEmpty()) return
     FlowRow(
@@ -66,6 +78,7 @@ fun AttachmentStrip(
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
     ) {
         attachments.forEach { attachment ->
+            AttachmentTile(attachment = attachment, onRemove = onRemove) {
             when (attachment) {
                 is Attachment.Image -> ImageTile(attachment, service)
                 is Attachment.TextFile -> FileTile(
@@ -90,9 +103,51 @@ fun AttachmentStrip(
                     detail = "not shown here",
                 )
             }
+            }
         }
     }
 }
+
+/**
+ * One tile, with a removal control when the strip is editable.
+ *
+ * The control is its own 48 dp target beside the tile rather than a small cross
+ * on top of it: an overlay cross either breaks the target rule or covers the
+ * thumbnail it is meant to describe.
+ */
+@Composable
+private fun AttachmentTile(
+    attachment: Attachment,
+    onRemove: ((String) -> Unit)?,
+    content: @Composable () -> Unit,
+) {
+    if (onRemove == null) {
+        content()
+        return
+    }
+    val colors = Forge.colors
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.testTag(attachmentTileTag(attachment.artifact)),
+    ) {
+        content()
+        ForgeIconButton(
+            onClick = { onRemove(attachment.artifact) },
+            contentDescription = stringResource(R.string.cd_remove_attachment),
+            visual = ForgeSize.composerCircle,
+        ) {
+            Icon(
+                Icons.Rounded.Close,
+                contentDescription = null,
+                tint = colors.textMuted,
+                modifier = Modifier.size(ForgeSize.iconXs),
+            )
+        }
+    }
+}
+
+/** Per-attachment handle, so a pin can name the one it means. */
+fun attachmentTileTag(artifact: String): String = "attachment_tile_$artifact"
 
 @Composable
 private fun ImageTile(image: Attachment.Image, service: DaemonService?) {

@@ -51,6 +51,10 @@ object SendButtonMatrix {
         daemon: DaemonStatus,
         turnRunning: Boolean,
         inputRequired: Boolean,
+        /**
+         * True when there is *anything to send* — nonblank text or a staged
+         * attachment. The name predates attachments (verify-11 O8).
+         */
         hasText: Boolean,
         setupComplete: Boolean = true,
     ): ComposerState = when {

@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.requiredHeightIn
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -66,7 +67,7 @@ fun DaemonStatusRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .heightIn(min = ForgeSize.touch)
+            .requiredHeightIn(min = ForgeSize.touch)
             .clip(ForgeShapes.row)
             .clickable(onClick = onOpenDetails)
             .padding(horizontal = ForgeSpace.md)

@@ -11,6 +11,7 @@
     <string name="header_new_session">New session</string>
     <string name="cd_refresh_session">Refresh</string>
     <string name="attach_image">Image</string>
+    <string name="cd_remove_attachment">Remove this attachment</string>
     <string name="usage_footer_label">Tokens</string>
     <string name="usage_footer_estimate">estimate, not a bill</string>
     <string name="usage_footer_unavailable">This daemon does not report usage.</string>
