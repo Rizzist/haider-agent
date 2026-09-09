@@ -381,6 +381,77 @@ pub struct TaskOutputBuffer {
     tail: VecDeque<u8>,
     tail_cap: usize,
     total: u64,
+    progress_stdout: TaskProgressLine,
+    progress_stderr: TaskProgressLine,
+    progress_stream: Option<OutputStream>,
+}
+
+/// Parse complete lines before redacting: chunk boundaries and rolling-tail
+/// eviction must never expose a token suffix or lose PEM redaction state.
+#[derive(Debug, Default)]
+struct TaskProgressLine {
+    pending: Vec<u8>,
+    overflow: bool,
+    raw_private_key: bool,
+    private_key: bool,
+    last: Option<String>,
+}
+
+impl TaskProgressLine {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        let mut completed = false;
+        for byte in bytes {
+            if *byte == b'\n' {
+                completed = true;
+                if self.overflow {
+                    self.last = None;
+                    // A discarded line could contain a PEM opening marker.
+                    // Stay redacted until an explicit closing marker arrives.
+                    self.private_key = true;
+                    self.raw_private_key = true;
+                } else {
+                    let raw = String::from_utf8_lossy(&self.pending);
+                    // Normalization can hide a PEM marker inside an OSC payload.
+                    // Keep raw and displayed PEM state independently, so either
+                    // representation can protect following lines.
+                    let raw_safe = crate::redact::redact_line_with_private_key_state(
+                        &raw,
+                        &mut self.raw_private_key,
+                    );
+                    let line: String = crate::shell::strip_ansi(&raw)
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .collect();
+                    let normalized_safe = crate::redact::redact_line_with_private_key_state(
+                        &line,
+                        &mut self.private_key,
+                    );
+                    let mut safe = if raw_safe.replacements == 0 {
+                        normalized_safe.text
+                    } else if raw_safe.text == "[REDACTED:private_key]" {
+                        raw_safe.text
+                    } else {
+                        // Escape removal must not expose a suffix of a token
+                        // that was recognized only in the raw representation.
+                        "[REDACTED:task_line]".into()
+                    };
+                    let mut end = safe.len().min(256);
+                    while !safe.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    safe.truncate(end);
+                    self.last = Some(safe);
+                }
+                self.pending.clear();
+                self.overflow = false;
+            } else if self.pending.len() < 4096 {
+                self.pending.push(*byte);
+            } else {
+                self.overflow = true;
+            }
+        }
+        completed
+    }
 }
 
 impl TaskOutputBuffer {
@@ -393,10 +464,24 @@ impl TaskOutputBuffer {
             tail: VecDeque::new(),
             tail_cap,
             total: 0,
+            progress_stdout: TaskProgressLine::default(),
+            progress_stderr: TaskProgressLine::default(),
+            progress_stream: None,
         }
     }
 
     pub fn append(&mut self, bytes: &[u8]) {
+        self.append_stream(OutputStream::Stdout, bytes);
+    }
+
+    fn append_stream(&mut self, stream: OutputStream, bytes: &[u8]) {
+        let progress = match stream {
+            OutputStream::Stdout => &mut self.progress_stdout,
+            OutputStream::Stderr => &mut self.progress_stderr,
+        };
+        if progress.append(bytes) {
+            self.progress_stream = Some(stream);
+        }
         use sha2::Digest as _;
         self.original_hasher.update(bytes);
         self.total = self.total.saturating_add(bytes.len() as u64);
@@ -412,6 +497,15 @@ impl TaskOutputBuffer {
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.total
+    }
+
+    /// Last complete, redacted output line, bounded to 256 UTF-8 bytes.
+    #[must_use]
+    pub fn progress_line(&self) -> Option<&str> {
+        match self.progress_stream? {
+            OutputStream::Stdout => self.progress_stdout.last.as_deref(),
+            OutputStream::Stderr => self.progress_stderr.last.as_deref(),
+        }
     }
 
     /// Hash every captured byte, independent of retained head/tail limits.
@@ -631,8 +725,8 @@ async fn supervise_background_with_exit_observation(
             }
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
-                    Some(Captured::Chunk(_, bytes)) => {
-                        lock_task_output(&output).append(&bytes);
+                    Some(Captured::Chunk(stream, bytes)) => {
+                        lock_task_output(&output).append_stream(stream, &bytes);
                     }
                     Some(Captured::ReadError(stream, error)) => {
                         fatal.get_or_insert_with(|| ToolError::Runtime {
@@ -1124,3 +1218,7 @@ mod toolshape_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "task_activity_tests.rs"]
+mod task_activity_tests;

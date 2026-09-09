@@ -84,6 +84,8 @@ pub(crate) struct TaskEntry {
 struct SessionTasks {
     adopted: bool,
     tasks: HashMap<TaskId, TaskEntry>,
+    /// Shared by all observe callers, including batch reads and reconnects.
+    progress: HashMap<TaskId, (tokio::time::Instant, haider_rpc::ObserveTaskWire)>,
 }
 
 /// In-memory projection of every session's background tasks (hub-owned).
@@ -188,6 +190,58 @@ impl TaskRegistry {
                 .filter(|entry| entry.state == TaskLiveState::Running)
                 .count()
         })
+    }
+
+    /// Read the bounded live registry only; observing never adopts, journals,
+    /// or steers a task. Publish at most one new snapshot per task per second,
+    /// coalescing output at this wire boundary rather than slowing the pipes.
+    /// Terminal output remains on TaskCompleted/task_output and bypasses this
+    /// cache: completed tasks disappear from the next read immediately.
+    pub(crate) fn observe_tasks(&self, session_id: &SessionId) -> Vec<haider_rpc::ObserveTaskWire> {
+        let mut sessions = self.lock();
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let SessionTasks {
+            tasks, progress, ..
+        } = session;
+        progress.retain(|task, _| {
+            tasks.get(task).is_some_and(|entry| {
+                entry.state == TaskLiveState::Running && entry.output.is_some()
+            })
+        });
+        let tick = tokio::time::Instant::now();
+        let now = now_ms();
+        let mut tasks: Vec<_> = tasks
+            .values()
+            .filter(|entry| entry.state == TaskLiveState::Running)
+            .filter_map(|entry| {
+                // Re-adopted tasks and output already moved to terminal CAS have
+                // no live supervision buffer. Never invent a zero-byte reading.
+                let output = entry.output.as_ref()?;
+                if let Some((next, snapshot)) = progress.get(&entry.task)
+                    && tick < *next
+                {
+                    return Some(snapshot.clone());
+                }
+                let output = lock_task_output(output);
+                let snapshot = haider_rpc::ObserveTaskWire {
+                    task_id: entry.task.clone(),
+                    name: bounded_task_command(&haider_tools::redact_lockdown_text(&entry.name)),
+                    elapsed_ms: now.saturating_sub(entry.started_at_ms),
+                    last_line: output.progress_line().map(ToOwned::to_owned),
+                    bytes: output.total_bytes(),
+                };
+                progress.insert(
+                    entry.task.clone(),
+                    (tick + Duration::from_secs(1), snapshot.clone()),
+                );
+                Some(snapshot)
+            })
+            .collect();
+        tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
+        tasks.truncate(TASK_CONCURRENCY_CAP);
+        tasks
     }
 
     fn running_entries(&self, session_id: &SessionId) -> Vec<TaskEntry> {
@@ -1374,3 +1428,7 @@ fn internal_serialization(error: serde_json::Error) -> HaiderError {
 #[cfg(test)]
 #[path = "tasks_eviction_tests.rs"]
 mod eviction_tests;
+
+#[cfg(test)]
+#[path = "task_progress_wire_tests.rs"]
+mod task_progress_wire_tests;

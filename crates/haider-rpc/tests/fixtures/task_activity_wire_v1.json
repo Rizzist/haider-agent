@@ -1,0 +1,4 @@
+[
+  {"v":1,"kind":"shell.inventory_changed","inventory":{"count":6,"revision":14}},
+  {"v":1,"kind":"response","request_id":"activity","body":{"method":"session.observe","digest":{"session_id":"session-1","head_seq":42,"worker_generation":7,"title":"Activity","run_state":"running","branches":[],"main_head_seq":0,"pending_menus":[],"subagents":[{"agent_id":"agent-1","callsign":"fixture","task":"Review","state":"thinking","agent_type":{"id":"reviewer","name":"Code reviewer","color":"#abcdef","glyph":"✦"}}],"tasks":[{"task_id":"task-1","name":"tests","elapsed_ms":2500,"last_line":"checking crate","bytes":4096}],"shells":{"count":6,"revision":14},"updated_at_ms":1000,"last_event_kinds":[]}}}
+]

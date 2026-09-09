@@ -1516,3 +1516,183 @@ async fn session_delete_fence_kills_the_running_group() {
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
 }
+
+#[derive(Default)]
+struct ActivityReadSink(Mutex<Vec<haider_rpc::WireFrame>>);
+impl crate::session_hub::FrameSink for ActivityReadSink {
+    fn try_send(
+        &self,
+        frame: haider_rpc::WireFrame,
+    ) -> Result<(), crate::session_hub::FrameSendError> {
+        self.0.lock().expect("activity frames").push(frame);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn activity_observe_reads_live_process_output_without_journaling_or_cross_session_leaks() {
+    use haider_rpc::{RequestBody, RequestId, ResponseBody, WireFrame};
+    let profile = tempfile::tempdir().expect("profile");
+    let (workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = create_task_session(&hub, "activity-running", &cwd).await;
+    let other_id = create_task_session(&hub, "activity-other", &cwd).await;
+    let run_id = RunId::new("activity-run");
+    prepare_tool_run(&hub, &session_id, &run_id, "activity").await;
+    let dispatcher = task_dispatcher(&hub, &session_id, &cwd, "activity", &run_id).await;
+    let receipt = dispatch(&dispatcher, &run_id, "activity-spawn", "process_exec", serde_json::json!({
+        "command":"printf 'checking crate\\n'; while [ ! -f activity-finish ]; do sleep 0.02; done",
+        "background":true,
+    })).await;
+    let task = TaskId::new(receipt["task_id"].as_str().expect("task"));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if hub
+                .task_registry()
+                .observe_tasks(&session_id)
+                .iter()
+                .any(|task| task.last_line.as_deref() == Some("checking crate"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real child publishes live output");
+    let head = store.latest_seq(&session_id).await.expect("head");
+    let sink = Arc::new(ActivityReadSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("view connection");
+    connection
+        .request(
+            RequestId::new("activity-batch"),
+            RequestBody::SessionObserveBatch {
+                session_ids: vec![session_id.clone(), other_id],
+                last_event_limit: 0,
+                metadata_only: false,
+            },
+        )
+        .await
+        .expect("observe batch");
+    let digests = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                body: ResponseBody::SessionObserveBatch { digests },
+                ..
+            } => Some(digests.clone()),
+            _ => None,
+        })
+        .expect("batch response");
+    let live = digests[0].tasks.as_ref().expect("live task read");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].task_id, task);
+    assert_eq!(live[0].last_line.as_deref(), Some("checking crate"));
+    assert_eq!(live[0].bytes, 15);
+    assert_eq!(digests[1].tasks, Some(vec![]), "tasks stay session scoped");
+    assert_eq!(digests[0].shells.expect("shell inventory").count, 1);
+    assert_eq!(
+        store
+            .latest_seq(&session_id)
+            .await
+            .expect("head after reads"),
+        head,
+        "activity reads must not write the journal"
+    );
+    connection
+        .request(
+            RequestId::new("activity-metadata"),
+            RequestBody::SessionObserve {
+                session_id: session_id.clone(),
+                last_event_limit: 0,
+                metadata_only: true,
+            },
+        )
+        .await
+        .expect("metadata read");
+    let metadata = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                body: ResponseBody::SessionObserve { digest },
+                ..
+            } => Some(digest.clone()),
+            _ => None,
+        })
+        .expect("metadata response");
+    assert_eq!(metadata.tasks, None);
+    assert_eq!(metadata.shells, None);
+    std::fs::write(workspace.path().join("activity-finish"), b"done").expect("release child");
+    wait_for_completed(&store, &session_id, &task).await;
+    assert!(hub.task_registry().observe_tasks(&session_id).is_empty());
+    assert_eq!(hub.shell_registry().inventory().count, 0);
+    connection.close().await.expect("connection close");
+    dispatcher.close().await.expect("dispatcher close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn activity_real_interleaved_pipes_cannot_split_pem_redaction() {
+    let profile = tempfile::tempdir().expect("profile");
+    let (workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = create_task_session(&hub, "activity-streams", &cwd).await;
+    let run = RunId::new("activity-stream-run");
+    prepare_tool_run(&hub, &session, &run, "activity-streams").await;
+    let dispatcher = task_dispatcher(&hub, &session, &cwd, "activity-streams", &run).await;
+    let receipt = dispatch(&dispatcher, &run, "activity-stream-spawn", "process_exec", serde_json::json!({
+        "command": concat!(
+            "printf '%s' '-----BEGIN '; ",
+            "while [ ! -f stream-stderr ]; do sleep 0.02; done; printf 'diagnostic\\n' >&2; ",
+            "while [ ! -f stream-stdout ]; do sleep 0.02; done; printf 'PRIVATE KEY-----\\nAA==\\n'; ",
+            "while [ ! -f stream-finish ]; do sleep 0.02; done"
+        ),
+        "background":true
+    })).await;
+    let task = TaskId::new(receipt["task_id"].as_str().expect("task"));
+    for (expected_bytes, expected_line, release) in [
+        (11, None, "stream-stderr"),
+        (22, Some("diagnostic"), "stream-stdout"),
+        (44, Some("[REDACTED:private_key]"), "stream-finish"),
+    ] {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let tasks = hub.task_registry().observe_tasks(&session);
+                if let Some(live) = tasks.first() {
+                    assert!(!live.last_line.as_deref().unwrap_or("").contains("AA=="));
+                    if live.bytes == expected_bytes {
+                        assert_eq!(live.last_line.as_deref(), expected_line);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("supervisor captures gated stream phase");
+        std::fs::write(workspace.path().join(release), b"release").expect("release pipe phase");
+    }
+    wait_for_completed(&store, &session, &task).await;
+    dispatcher.close().await.expect("dispatcher close");
+    hub.shutdown().await.expect("hub close");
+    store.close().await.expect("store close");
+}

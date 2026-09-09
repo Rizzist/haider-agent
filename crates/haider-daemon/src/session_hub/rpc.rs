@@ -19,6 +19,10 @@ mod checkpoint_tests;
 #[path = "direct_ssh_tests.rs"]
 mod direct_ssh_tests;
 
+#[cfg(test)]
+#[path = "activity_wire_tests.rs"]
+mod activity_wire_tests;
+
 use super::*;
 use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
@@ -1578,6 +1582,13 @@ fn subagent_allocation_charge(subagent: &haider_rpc::ObserveSubagentWire) -> usi
         .saturating_add(string_spare(&subagent.task))
         .saturating_add(string_spare(&subagent.state))
         .saturating_add(subagent.provider.as_ref().map_or(0, string_spare));
+    if let Some(agent_type) = &subagent.agent_type {
+        total = total
+            .saturating_add(string_spare(&agent_type.id))
+            .saturating_add(string_spare(&agent_type.name))
+            .saturating_add(string_spare(&agent_type.color))
+            .saturating_add(string_spare(&agent_type.glyph));
+    }
     if let Some(lockdown) = &subagent.lockdown {
         total = total
             .saturating_add(lockdown.provider.as_ref().map_or(0, string_spare))
@@ -1710,6 +1721,8 @@ impl ObserveFoldSnapshot {
             main_head_seq: self.main_head_seq,
             latest_context_footprint: self.footprint.clone(),
             pending_menus: self.pending_menus.clone(),
+            tasks: None,
+            shells: None,
             subagents: self.subagents.clone(),
             lockdown: None,
             updated_at_ms: self.updated_at_ms,
@@ -2725,6 +2738,10 @@ async fn session_observe_digest(
         )
     };
     digest.workflow = workflow;
+    if !metadata_only {
+        digest.tasks = Some(hub.task_registry().observe_tasks(&digest.session_id));
+        digest.shells = Some(hub.shell_registry().inventory());
+    }
     digest.lockdown = active_provider
         .as_deref()
         .map(|provider| observed_lockdown_status(hub, Some(&digest.session_id), provider))
@@ -2950,6 +2967,14 @@ impl ObserveProjection {
             }
             EventPayload::AgentSpawned(manifest) => {
                 let provider = manifest.provider().map(ToOwned::to_owned);
+                let agent_type = manifest
+                    .coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.get("agent_type"))
+                    .and_then(|value| {
+                        serde_json::from_value::<haider_rpc::ObserveAgentTypeWire>(value.clone())
+                            .ok()
+                    });
                 let lockdown_bound = manifest
                     .coordinates
                     .as_ref()
@@ -2968,6 +2993,7 @@ impl ObserveProjection {
                         task: manifest.task,
                         state: "thinking".into(),
                         provider,
+                        agent_type,
                         lockdown_bound,
                         lockdown_auto_hermetic_bound,
                         lockdown: None,
@@ -2985,6 +3011,7 @@ impl ObserveProjection {
                         task: String::new(),
                         state,
                         provider: None,
+                        agent_type: None,
                         lockdown_bound: None,
                         lockdown_auto_hermetic_bound: None,
                         lockdown: None,
@@ -3065,6 +3092,8 @@ impl ObserveProjection {
             main_head_seq: self.main_head_seq,
             latest_context_footprint: self.footprint,
             pending_menus,
+            tasks: None,
+            shells: None,
             subagents: self.subagents.into_values().collect(),
             lockdown: None,
             updated_at_ms: self.updated_at_ms,

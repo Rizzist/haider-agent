@@ -2483,6 +2483,44 @@ impl SessionHub {
     }
 
     fn spawn_shell_registry_events(&self) -> Result<(), SessionHubError> {
+        let mut inventory = self.inner.shells.subscribe_inventory();
+        let mut cancel_inventory = self.inner.shell_registry_events_cancel.subscribe();
+        let weak_inventory = Arc::downgrade(&self.inner);
+        lock(&self.inner.actor_tasks)?.push(tokio::spawn(async move {
+            let mut next = tokio::time::Instant::now();
+            loop {
+                let changed = tokio::select! {
+                    _ = cancel_inventory.changed() => break,
+                    changed = inventory.changed() => changed,
+                };
+                if changed.is_err() {
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel_inventory.changed() => break,
+                    _ = tokio::time::sleep_until(next) => {},
+                }
+                // watch retains only the latest absolute state during a burst.
+                let current = *inventory.borrow_and_update();
+                let Some(inner) = weak_inventory.upgrade() else {
+                    break;
+                };
+                let sinks = match inner.diagnostic_sinks.lock() {
+                    Ok(sinks) => sinks.values().cloned().collect::<Vec<_>>(),
+                    Err(_) => break,
+                };
+                for sink in sinks {
+                    // Close on overflow so reconnect/read repairs the baseline.
+                    if sink
+                        .try_send_droppable(WireFrame::ShellInventoryChanged { inventory: current })
+                        .is_err()
+                    {
+                        sink.close_after_required_delivery_failure();
+                    }
+                }
+                next = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            }
+        }));
         let mut events = self.inner.shells.subscribe();
         let mut cancel = self.inner.shell_registry_events_cancel.subscribe();
         let weak = Arc::downgrade(&self.inner);

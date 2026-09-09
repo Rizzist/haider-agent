@@ -120,6 +120,7 @@ struct ShellEntry {
 struct ShellRegistryInner {
     entries: Mutex<BTreeMap<String, ShellEntry>>,
     events: broadcast::Sender<ShellRegistryEvent>,
+    inventory: watch::Sender<haider_rpc::ShellInventoryWire>,
 }
 
 /// Cloneable daemon-wide registry shared by local execution and SSH channels.
@@ -135,12 +136,33 @@ impl Default for ShellRegistry {
             inner: Arc::new(ShellRegistryInner {
                 entries: Mutex::new(BTreeMap::new()),
                 events,
+                inventory: watch::channel(haider_rpc::ShellInventoryWire::default()).0,
             }),
         }
     }
 }
 
 impl ShellRegistry {
+    pub(crate) fn inventory(&self) -> haider_rpc::ShellInventoryWire {
+        *self.inner.inventory.borrow()
+    }
+
+    pub(crate) fn subscribe_inventory(&self) -> watch::Receiver<haider_rpc::ShellInventoryWire> {
+        self.inner.inventory.subscribe()
+    }
+
+    // Called while entries is locked, so count and revision share one order.
+    fn change_inventory(&self, opened: bool) {
+        self.inner.inventory.send_modify(|inventory| {
+            inventory.count = if opened {
+                inventory.count.saturating_add(1)
+            } else {
+                inventory.count.saturating_sub(1)
+            };
+            inventory.revision = inventory.revision.saturating_add(1);
+        });
+    }
+
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<ShellRegistryEvent> {
         self.inner.events.subscribe()
     }
@@ -218,19 +240,22 @@ impl ShellRegistry {
             bytes_out: 0,
         };
         let (close, close_rx) = watch::channel(false);
-        self.inner
+        let mut entries = self
+            .inner
             .entries
             .lock()
-            .map_err(|_| ShellRegistryError::Poisoned)?
-            .insert(
-                id.clone(),
-                ShellEntry {
-                    wire: wire.clone(),
-                    close,
-                    control,
-                    owner: owner.clone(),
-                },
-            );
+            .map_err(|_| ShellRegistryError::Poisoned)?;
+        entries.insert(
+            id.clone(),
+            ShellEntry {
+                wire: wire.clone(),
+                close,
+                control,
+                owner: owner.clone(),
+            },
+        );
+        self.change_inventory(true);
+        drop(entries);
         let _ = self.inner.events.send(ShellRegistryEvent::Opened(wire));
         Ok(ShellHandle {
             id,
@@ -319,6 +344,9 @@ impl ShellRegistry {
             .get_mut(id)
             .ok_or_else(|| ShellRegistryError::NotFound(id.to_owned()))?;
         if entry.wire.status != ShellStatusWire::Closed {
+            if shell_is_active(&entry.wire) {
+                self.change_inventory(false);
+            }
             entry.wire.status = ShellStatusWire::Closed;
             entry.wire.last_activity_ms = unix_ms();
             entry.close.send_replace(true);
@@ -371,7 +399,12 @@ impl ShellRegistry {
         if entry.wire.status == ShellStatusWire::Closed {
             return Ok(entry.wire.clone());
         }
+        let was_active = shell_is_active(&entry.wire);
         apply(&mut entry.wire);
+        let active = shell_is_active(&entry.wire);
+        if was_active != active {
+            self.change_inventory(active);
+        }
         entry.wire.last_activity_ms = unix_ms();
         let wire = entry.wire.clone();
         drop(entries);
@@ -381,6 +414,13 @@ impl ShellRegistry {
             .send(ShellRegistryEvent::State(wire.clone()));
         Ok(wire)
     }
+}
+
+fn shell_is_active(shell: &ShellWire) -> bool {
+    matches!(
+        shell.status,
+        ShellStatusWire::Starting | ShellStatusWire::Running
+    )
 }
 
 /// Owner-side coordinate for publishing lifecycle changes and observing close.

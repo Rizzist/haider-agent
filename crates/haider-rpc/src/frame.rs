@@ -2228,6 +2228,9 @@ pub struct ObserveSubagentWire {
     /// manifests written before provider lockdown state was exposed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Loom display identity frozen at spawn. Absent for untyped or legacy children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<ObserveAgentTypeWire>,
     /// Daemon-internal turn-boundary pin carried through the observe fold.
     /// It is never serialized; `lockdown` is the public self-sufficient view.
     #[serde(skip)]
@@ -2240,7 +2243,37 @@ pub struct ObserveSubagentWire {
     pub lockdown: Option<LockdownStatusWire>,
 }
 
-/// One read-only digest reduced from committed daemon truth.
+/// Display-only subset of a Loom type; never includes its prompt or grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveAgentTypeWire {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub glyph: String,
+}
+
+/// Bounded live background-task read, independent of the committed journal head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveTaskWire {
+    pub task_id: haider_protocol::ids::TaskId,
+    pub name: String,
+    pub elapsed_ms: u64,
+    /// Last complete output line, redacted before truncation to 256 UTF-8 bytes.
+    /// Absent until a complete, bounded line is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_line: Option<String>,
+    pub bytes: u64,
+}
+
+/// Daemon-wide starting/running shell count. Revision resets with the daemon;
+/// compare it only within the same connection/worker generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellInventoryWire {
+    pub count: u64,
+    pub revision: u64,
+}
+
+/// Read-only committed session digest plus explicitly marked transient activity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionObserveDigest {
     pub session_id: SessionId,
@@ -2269,6 +2302,14 @@ pub struct SessionObserveDigest {
     pub pending_menus: Vec<ObserveMenuWire>,
     #[serde(default)]
     pub subagents: Vec<ObserveSubagentWire>,
+    /// Live supervised tasks (at most TASK_CONCURRENCY_CAP), sampled on this read.
+    /// This transient state is not journaled or fed into model context. Absent
+    /// on older daemons and metadata-only reads; an empty list means none live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<ObserveTaskWire>>,
+    /// Same daemon-wide inventory as the coalesced `shell.inventory_changed` signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shells: Option<ShellInventoryWire>,
     /// The capability ceiling frozen for the active model provider at its
     /// accepted turn boundary. A trust toggle changes the following turn,
     /// never this observed in-flight run.
@@ -3465,8 +3506,9 @@ pub enum RequestBody {
         session_id: SessionId,
         range: SeqRange,
     },
-    /// Returns a bounded, secret-free state digest derived from the committed
-    /// journal. `last_event_limit` affects only the trailing kind names.
+    /// Returns a bounded state digest derived from the committed journal, with
+    /// separately sampled live tasks and shell inventory. `last_event_limit`
+    /// affects only the trailing kind names.
     #[serde(rename = "session.observe")]
     SessionObserve {
         session_id: SessionId,
@@ -6029,6 +6071,9 @@ pub enum WireFrame {
     ShellState { shell: ShellWire },
     /// A terminal was explicitly closed and released its process/channel.
     ShellClosed { shell: ShellWire },
+    /// Latest absolute count, coalesced to at most one signal per second.
+    /// Re-read session.observe after reconnect or a lost notification.
+    ShellInventoryChanged { inventory: ShellInventoryWire },
     /// Transient output for an interactive shell. It is delivered only to the
     /// opening connection and is never stored in a registry row or journal.
     ShellOutput {
@@ -6162,6 +6207,10 @@ enum WireFrameRef<'a> {
     #[serde(rename = "shell.closed")]
     ShellClosed {
         shell: &'a ShellWire,
+    },
+    #[serde(rename = "shell.inventory_changed")]
+    ShellInventoryChanged {
+        inventory: ShellInventoryWire,
     },
     #[serde(rename = "shell.output")]
     ShellOutput {
@@ -6297,6 +6346,10 @@ enum WireFrameOwned {
     #[serde(rename = "shell.closed")]
     ShellClosed {
         shell: ShellWire,
+    },
+    #[serde(rename = "shell.inventory_changed")]
+    ShellInventoryChanged {
+        inventory: ShellInventoryWire,
     },
     #[serde(rename = "shell.output")]
     ShellOutput {
@@ -6489,6 +6542,9 @@ impl Serialize for WireFrame {
             },
             Self::PeerMessageReceived { message } => WireFrameRef::PeerMessageReceived { message },
             Self::PeerDeliveryChanged { receipt } => WireFrameRef::PeerDeliveryChanged { receipt },
+            Self::ShellInventoryChanged { inventory } => WireFrameRef::ShellInventoryChanged {
+                inventory: *inventory,
+            },
             Self::ShellOpened { shell } => WireFrameRef::ShellOpened { shell },
             Self::ShellState { shell } => WireFrameRef::ShellState { shell },
             Self::ShellClosed { shell } => WireFrameRef::ShellClosed { shell },
@@ -6661,6 +6717,9 @@ impl<'de> Deserialize<'de> for WireFrame {
             }
             WireFrameOwned::PeerDeliveryChanged { receipt } => {
                 Self::PeerDeliveryChanged { receipt }
+            }
+            WireFrameOwned::ShellInventoryChanged { inventory } => {
+                Self::ShellInventoryChanged { inventory }
             }
             WireFrameOwned::ShellOpened { shell } => Self::ShellOpened { shell },
             WireFrameOwned::ShellState { shell } => Self::ShellState { shell },

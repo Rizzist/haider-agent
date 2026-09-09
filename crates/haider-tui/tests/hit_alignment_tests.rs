@@ -196,14 +196,17 @@ fn palette_row_hits_align_and_click_runs_that_row() {
         model.handle(key(KeyCode::Char(c)));
     }
     // Session matches for /t, registry order: theme · tree · tokens ·
-    // talk (T2 registry extension) · tools.
+    // talk (T2 registry extension) · tools · tasks.
     let items = model.palette_items();
     let names: Vec<String> = items.iter().map(|s| s.label()).collect();
-    assert_eq!(names, ["/theme", "/tree", "/tokens", "/talk", "/tools"]);
+    assert_eq!(
+        names,
+        ["/theme", "/tree", "/tokens", "/talk", "/tools", "/tasks"]
+    );
     let (rows, hits, _) = draw(&model, 118, 34);
     for (item, label) in items
         .iter()
-        .zip(["/theme", "/tree", "/tokens", "/talk", "/tools"])
+        .zip(["/theme", "/tree", "/tokens", "/talk", "/tools", "/tasks"])
     {
         let rect = rect_for(&hits, Hit::PaletteRow(item.clone()));
         assert_eq!(rect.y, row_of(&rows, label), "palette row {label} aligned");
@@ -212,7 +215,7 @@ fn palette_row_hits_align_and_click_runs_that_row() {
         hits.iter()
             .filter(|(_, h)| matches!(h, Hit::PaletteRow(_)))
             .count(),
-        5,
+        6,
         "no hit region beyond the rendered rows"
     );
     // The bottom hint line is not clickable.
@@ -358,12 +361,12 @@ fn palette_carries_the_sim_signature() {
     assert_eq!(desc_x, 18, "fixed-width name column");
     assert_eq!(buffer[(desc_x, second_y)].fg, Color::from(theme.dim));
     // The hint is the LAST palette line, directly above the composer rule
-    // (five `/t` rows since T2 added `/talk`).
+    // (six `/t` rows including `/tasks`).
     let hint_y = row_of(&rows, "↑↓ options");
     assert_eq!(
         hint_y,
-        first_y + 5,
-        "hint sits at the bottom of the five rows"
+        first_y + 6,
+        "hint sits at the bottom of the six rows"
     );
 }
 

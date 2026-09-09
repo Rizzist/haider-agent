@@ -5827,3 +5827,101 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
 }
+
+#[tokio::test]
+async fn activity_typed_spawn_freezes_display_identity_in_the_replayed_manifest() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("activity-type-parent");
+    let run = RunId::new("activity-type-run");
+    accept_parent_with_interaction_mode(
+        &hub,
+        &parent,
+        &run,
+        "activity-type",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let record = haider_protocol::loom::LoomAgentType {
+        id: "reviewer".into(),
+        name: "Code reviewer".into(),
+        job: "Review code".into(),
+        in_type: "Brief".into(),
+        out_type: "Brief".into(),
+        clis: vec![],
+        apis: vec![],
+        denials: vec![],
+        skills: vec![],
+        scripts: vec![],
+        color: "#abcdef".into(),
+        glyph: "✦".into(),
+        rev: 1,
+    };
+    let metadata = hub
+        .session_metadata(&parent)
+        .await
+        .expect("metadata")
+        .expect("parent");
+    let coordinates = |record| SpawnCoordinates {
+        parent_session_id: parent.clone(),
+        parent_run_id: run.clone(),
+        parent_branch_id: None,
+        parent_agent_id: None,
+        tool_item_id: haider_protocol::ids::ItemId::new("activity-type-item"),
+        call_id: "activity-type-call".into(),
+        metadata: metadata.clone(),
+        agent_type: Some(record),
+        lockdown: false,
+        auto_hermetic: false,
+    };
+    let request = SpawnSubagent::from_tool_args(serde_json::json!({
+        "task":"Review", "prompt":"Review the fixture", "workflow":"plain"
+    }))
+    .expect("spawn request");
+    let delegation = DelegationHandle::new(hub.clone());
+    let first = delegation
+        .establish(coordinates(record.clone()), request.clone())
+        .await
+        .expect("typed spawn");
+    let expected = serde_json::json!({"id":"reviewer", "name":"Code reviewer", "color":"#abcdef", "glyph":"✦"});
+    assert_eq!(
+        first
+            .ticket
+            .manifest
+            .coordinates
+            .as_ref()
+            .expect("coordinates")["agent_type"],
+        expected
+    );
+    let mut edited = record;
+    edited.name = "Renamed later".into();
+    edited.color = "#000000".into();
+    edited.glyph = "!".into();
+    let replay = delegation
+        .establish(coordinates(edited.clone()), request.clone())
+        .await
+        .expect("replay");
+    assert_eq!(replay.ticket.id, first.ticket.id);
+    assert_eq!(
+        replay
+            .ticket
+            .manifest
+            .coordinates
+            .as_ref()
+            .expect("coordinates")["agent_type"],
+        expected
+    );
+    edited.clis = vec!["git".into()];
+    let changed_grant = delegation.establish(coordinates(edited), request).await;
+    let error = changed_grant
+        .err()
+        .expect("changed execution semantics still reject");
+    assert_eq!(
+        error.code,
+        haider_protocol::error::ErrorCode::InvalidArgument
+    );
+    drop(delegation);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close store");
+}
