@@ -1650,14 +1650,16 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // manual bytes remain zero. Full schema growth cannot waive the pipe gate.
     // Shipgate clarifies interactive/autonomous request_input prose (+96
     // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
+    // Durable completion controls add 630 platform-independent monitor
+    // description/schema bytes; monitor remains outside the default pipe.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_686;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_316;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_637;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_267;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_636;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_266;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_631;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_261;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

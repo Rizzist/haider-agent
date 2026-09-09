@@ -543,3 +543,79 @@ async fn cold_adoption_of_a_terminal_report_does_not_restart_its_source() {
     drop(reopened_hub);
     reopened_store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn verifier_deleted_session_retires_cached_incomplete_admission() {
+    use haider_protocol::completion::CompletionEvent;
+    let world = MonitorWorld::new("verifier-delete-admitting").await;
+    let mut report = test_report(
+        "verifier-delete-admitting-report",
+        "pending admission",
+        MonitorReportStatus::Matched,
+    );
+    report.session_id = world.session.clone();
+    observe_monitor(&world, report).await;
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&world.run),
+            None,
+            None,
+            "verifier-source-terminal",
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Done)).unwrap(),
+        )])
+        .await
+        .unwrap();
+    let service = world.hub.inner_monitor().clone();
+    let guard = service.completion_lock().await;
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    let obligation = journal.projection.pending.values().next().unwrap();
+    crate::completion::append(
+        &world.hub,
+        obligation,
+        CompletionEvent::CompletionAttempt {
+            obligation_id: obligation.obligation_id.clone(),
+            attempt: 1,
+            worker_generation: world.hub.worker_generation(),
+        },
+    )
+    .await
+    .unwrap();
+    // The durable prefix exists after an attempt/admission crash. A cold
+    // reconciler reads it before dispatch; deletion can win before admission.
+    service.completion_cache().await.clear();
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.projection.pending.values().next().unwrap().status,
+        CompletionStatus::Admitting
+    );
+    let MonitorWorld {
+        hub,
+        store,
+        session,
+        lease,
+        _root: root,
+        ..
+    } = world;
+    drop(lease);
+    hub.delete_session(session.clone()).await.unwrap();
+    drop(guard);
+    let first = crate::completion::reconcile(&hub, &session).await;
+    let second = crate::completion::reconcile(&hub, &session).await;
+    assert!(!hub.session_ids().await.unwrap().contains(&session));
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "deleted sessions must leave the retry scheduler, first={first:?}, second={second:?}"
+    );
+    hub.inner_monitor().shutdown().await.unwrap();
+    drop(hub);
+    store.close().await.unwrap();
+    drop(root);
+}

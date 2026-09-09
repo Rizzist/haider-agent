@@ -6205,7 +6205,16 @@ impl SessionHub {
                 )
             })?;
         match self.inner.store.delete_session(session_id.clone()).await {
-            Ok(()) => self.inner.monitors.release_session_tombstone(session_id),
+            Ok(()) => {
+                // Retire the durable projection before reconciliation can pass
+                // the monitor fence again. A failed delete must retain it.
+                self.inner
+                    .monitors
+                    .completion_cache()
+                    .await
+                    .remove(session_id);
+                self.inner.monitors.release_session_tombstone(session_id);
+            }
             Err(error) => {
                 self.inner
                     .monitors

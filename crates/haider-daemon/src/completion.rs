@@ -486,6 +486,10 @@ pub(crate) fn spawn_reconciler(
                     retries.push(session);
                 }
             }
+            tracing::debug!(
+                retry_count = retries.len(),
+                "follow-up reconciliation pass finished"
+            );
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(5)), if rescan || !retries.is_empty() => {
                     if rescan {
