@@ -64,6 +64,7 @@ mod binary_upload;
 mod cache_policy;
 #[cfg(test)]
 mod cache_policy_tests;
+mod completion;
 mod config;
 mod connection;
 #[cfg(test)]

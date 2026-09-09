@@ -4,6 +4,8 @@
 
 #![allow(clippy::expect_used)]
 
+#[path = "core_loop/completion_http_e2e.rs"]
+mod completion_http;
 mod support;
 
 use async_trait::async_trait;

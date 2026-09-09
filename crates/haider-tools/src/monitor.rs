@@ -38,6 +38,14 @@ pub enum MonitorRequest {
         lifetime: MonitorLifetime,
     },
     List,
+    FollowUp {
+        obligation_id: String,
+        #[serde(rename = "completion_action")]
+        action: CompletionControl,
+        attempt: u32,
+        #[serde(default)]
+        evidence_event_ids: Vec<haider_protocol::ids::EventId>,
+    },
     Update {
         monitor_id: String,
         source: MonitorSource,
@@ -68,11 +76,25 @@ pub enum MonitorRequest {
 enum MonitorRequestWire {
     Register(MonitorRegisterRequest),
     List(MonitorNoFields),
+    FollowUp(CompletionControlRequest),
     Update(MonitorUpdateRequest),
     Pause(MonitorIdRequest),
     Resume(MonitorIdRequest),
     Trigger(MonitorIdRequest),
     Remove(MonitorRemoveRequest),
+}
+
+pub use haider_protocol::completion::CompletionControl;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionControlRequest {
+    obligation_id: String,
+    #[serde(rename = "completion_action")]
+    action: CompletionControl,
+    attempt: u32,
+    #[serde(default)]
+    evidence_event_ids: Vec<haider_protocol::ids::EventId>,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +154,12 @@ impl<'de> Deserialize<'de> for MonitorRequest {
                 lifetime: request.lifetime,
             },
             MonitorRequestWire::List(MonitorNoFields {}) => Self::List,
+            MonitorRequestWire::FollowUp(request) => Self::FollowUp {
+                obligation_id: request.obligation_id,
+                action: request.action,
+                attempt: request.attempt,
+                evidence_event_ids: request.evidence_event_ids,
+            },
             MonitorRequestWire::Update(request) => Self::Update {
                 monitor_id: request.monitor_id,
                 source: request.source,
@@ -182,6 +210,21 @@ impl MonitorRequest {
                 lifetime.validate()
             }
             Self::List => Ok(()),
+            Self::FollowUp {
+                obligation_id,
+                evidence_event_ids,
+                ..
+            } => {
+                if obligation_id.is_empty()
+                    || obligation_id.len() > 256
+                    || evidence_event_ids.len() > 16
+                {
+                    return Err(ToolError::invalid_argument(
+                        "follow_up requires a bounded obligation id and at most 16 evidence ids",
+                    ));
+                }
+                Ok(())
+            }
             Self::Update {
                 monitor_id,
                 source,
@@ -210,6 +253,7 @@ impl MonitorRequest {
         match self {
             Self::Register { source, .. } | Self::Update { source, .. } => Some(source),
             Self::List
+            | Self::FollowUp { .. }
             | Self::Remove { .. }
             | Self::Pause { .. }
             | Self::Resume { .. }
@@ -1105,13 +1149,17 @@ fn bounded_nonempty(value: &str, maximum: usize, name: &str) -> ToolResult<()> {
 pub fn monitor_manifest() -> ToolManifest {
     ToolManifest {
         name: "monitor".into(),
-        description: "Register, list, update, pause, resume, trigger, or remove durable sms/process/file/poll/timer/cli watches. Matches coalesce per monitor: idle wakes as a subturn; busy queues to the next turn boundary. Command registration/update requires ProcessExec authorization for exact argv/cwd/env names; external files require FsRead authorization.".into(),
+        description: "List also returns pending follow-ups. Use follow_up with obligation_id, attempt, completion_action=claim/handled/dismiss/resume and evidence_event_ids. Claim task/menu work explicitly; handled requires committed action-result evidence for the consuming run (available in list); report-only monitors may cite a completed owner message. Reconcile side effects before repeating them. Register, list, update, pause, resume, trigger, or remove durable sms/process/file/poll/timer/cli watches. Matches coalesce per monitor: idle wakes as a subturn; busy queues to the next turn boundary. Command registration/update requires ProcessExec authorization for exact argv/cwd/env names; external files require FsRead authorization.".into(),
         effects: vec![],
         dispatch: DispatchMode::Await,
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "operation": { "type": "string", "enum": ["register", "list", "update", "pause", "resume", "trigger", "remove"] },
+                "operation": { "type": "string", "enum": ["register", "list", "update", "pause", "resume", "trigger", "remove", "follow_up"] },
+                "completion_action": { "type": "string", "enum": ["claim", "handled", "dismiss", "resume"] },
+                "obligation_id": { "type": "string" },
+                "attempt": { "type": "integer", "minimum": 0 },
+                "evidence_event_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 16 },
                 "monitor_id": { "type": "string" },
                 "source": {
                     "type": "object",

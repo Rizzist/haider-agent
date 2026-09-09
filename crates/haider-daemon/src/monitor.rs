@@ -586,6 +586,8 @@ impl MonitorReport {
         let body = json!({
             "type": "monitor_event",
             "monitor_id": self.monitor_id,
+            "obligation_id": format!("monitor:{}", self.report_id),
+            "handling": "Delivery is not completion. Reconcile the requested action, then use monitor follow_up handled with this obligation ID, current attempt, and committed successful result evidence IDs from monitor list.",
             "source": self.source,
             "status": self.status,
             "coalesced_count": self.coalesced_count,
@@ -1149,6 +1151,8 @@ struct MonitorServiceInner {
     sources: MonitorSourceHub,
     registry: MonitorRegistry,
     mutations: Mutex<()>,
+    completion_mutations: Mutex<()>,
+    completion_cache: Mutex<HashMap<SessionId, crate::completion::CompletionJournal>>,
     rates: StdMutex<HashMap<(SessionId, String), RateWindow>>,
     /// Deletion tombstones fence late adoption/scheduling until daemon exit.
     /// Session ids are immutable identities and are never reused in-place.
@@ -1191,6 +1195,8 @@ impl Default for MonitorService {
                 sources: MonitorSourceHub::new(),
                 registry: MonitorRegistry::default(),
                 mutations: Mutex::new(()),
+                completion_mutations: Mutex::new(()),
+                completion_cache: Mutex::new(HashMap::new()),
                 rates: StdMutex::new(HashMap::new()),
                 retired_sessions: StdMutex::new(HashSet::new()),
                 sink: StdRwLock::new(Arc::new(UnavailableMonitorDeliverySink)),
@@ -1216,6 +1222,20 @@ impl Default for MonitorService {
 }
 
 impl MonitorService {
+    pub(crate) fn completion_retired(&self, session: &SessionId) -> bool {
+        self.is_retired(session) || *self.inner.shutdown.borrow()
+    }
+
+    pub(crate) async fn completion_cache(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<SessionId, crate::completion::CompletionJournal>> {
+        self.inner.completion_cache.lock().await
+    }
+
+    pub(crate) async fn completion_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.completion_mutations.lock().await
+    }
+
     pub(crate) fn has_active_monitors(&self) -> bool {
         self.inner.registry.has_active_monitors()
     }
@@ -1246,7 +1266,10 @@ impl MonitorService {
             .write()
             .unwrap_or_else(PoisonError::into_inner) =
             Arc::new(SessionMonitorDeliverySink::from_weak(hub.clone()));
-        let mut source_tasks = Vec::new();
+        let mut source_tasks = vec![crate::completion::spawn_reconciler(
+            hub.clone(),
+            self.inner.shutdown.subscribe(),
+        )];
         for source in [
             MonitorSourceKind::Sms,
             MonitorSourceKind::Process,
@@ -4026,14 +4049,46 @@ impl MonitorService {
                 self.schedule_runner(hub.downgrade(), store.session_id().clone(), registration);
                 Ok(result)
             }
+            MonitorRequest::FollowUp {
+                obligation_id,
+                action,
+                attempt,
+                evidence_event_ids,
+            } => {
+                let receipt = crate::completion::control(
+                    hub,
+                    store,
+                    &coordinates,
+                    &obligation_id,
+                    action,
+                    attempt,
+                    evidence_event_ids,
+                )
+                .await
+                .map_err(|error| ToolError::invalid_argument(error.message))?;
+                Ok(tool_result(receipt, ToolResultStatus::Completed, None))
+            }
             MonitorRequest::List => {
+                let follow_ups = crate::completion::load(hub, store.session_id())
+                    .await
+                    .map_err(|error| ToolError::Runtime {
+                        message: error.message,
+                    })?;
+                let evidence = follow_ups
+                    .evidence
+                    .iter()
+                    .rev()
+                    .filter(|e| e.run_id.as_ref() == Some(&coordinates.run_id))
+                    .take(32)
+                    .map(|e| json!({"event_id": e.event_id, "seq": e.seq, "call_id": e.call_id, "owner_report": e.report}))
+                    .collect::<Vec<_>>();
                 let registrations = self.inner.registry.snapshot(store.session_id());
                 let monitors = registrations
                     .iter()
                     .map(|registration| self.monitor_tool_row(store.session_id(), registration))
                     .collect::<Vec<_>>();
                 Ok(tool_result(
-                    json!({"count": monitors.len(), "monitors": monitors}),
+                    json!({"count": monitors.len(), "monitors": monitors, "pending_follow_ups": follow_ups.projection.pending.values().collect::<Vec<_>>(), "action_evidence": evidence}),
                     ToolResultStatus::Completed,
                     None,
                 ))
@@ -5396,6 +5451,9 @@ impl MonitorService {
         self.cancel_runner(&session, &registration.monitor_id);
         if registration.paused
             || registration.exited
+            // A durable terminal observation survives a crash before delivery.
+            // Resume its outbox receipt without starting its source again.
+            || self.inner.registry.has_terminal_pending(&session, &registration.monitor_id)
             || registration.source.kind() == MonitorSourceKind::Sms
             || *self.inner.shutdown.borrow()
             || self.is_retired(&session)
@@ -6605,12 +6663,23 @@ impl SessionHub {
         &self,
         report: MonitorReport,
     ) -> Result<MonitorDeliveryReceipt, MonitorError> {
+        crate::completion::wake_monitor(self, report).await
+    }
+
+    pub(crate) async fn admit_monitor_report(
+        &self,
+        report: MonitorReport,
+        attempt: Option<u32>,
+    ) -> Result<MonitorDeliveryReceipt, MonitorError> {
         let text = report.prompt_text();
-        let identity = stable_digest(&[
+        let mut identity = stable_digest(&[
             report.session_id.as_str(),
             &report.monitor_id,
             &report.report_id,
         ]);
+        if let Some(attempt) = attempt {
+            identity = stable_digest(&[&identity, "follow-up-attempt", &attempt.to_string()]);
+        }
         let request_json = serde_json::to_string(&json!({
             "session_id": report.session_id,
             "monitor_id": report.monitor_id,
@@ -6640,6 +6709,17 @@ impl SessionHub {
             })
             .await
             .map_err(|error| MonitorError::Delivery(error.message))?;
+        if let Some(attempt) = attempt {
+            crate::completion::admitted(
+                self,
+                &report,
+                attempt,
+                &accepted.run_id,
+                accepted.accepted_seq,
+                accepted.worker_generation,
+            )
+            .await?;
+        }
         let accepted_disposition = accepted.disposition;
         let disposition = match accepted_disposition {
             TurnAdmissionDisposition::Started => "started",
@@ -6674,6 +6754,24 @@ impl SessionHub {
                 )));
             }
         };
+        if let Some(attempt) = attempt {
+            let journal = crate::completion::load(self, &report.session_id)
+                .await
+                .map_err(monitor_store_error)?;
+            let id = format!("monitor:{}", report.report_id);
+            if let Some(obligation) = journal.projection.pending.get(&id) {
+                crate::completion::append(
+                    self,
+                    obligation,
+                    haider_protocol::completion::CompletionEvent::CompletionDelivered {
+                        obligation_id: id,
+                        attempt,
+                    },
+                )
+                .await
+                .map_err(monitor_store_error)?;
+            }
+        }
         Ok(MonitorDeliveryReceipt {
             durable: true,
             handed_off,
@@ -6902,7 +7000,9 @@ fn monitor_request_id(request: &MonitorRequest) -> &str {
         | MonitorRequest::Resume { monitor_id }
         | MonitorRequest::Trigger { monitor_id }
         | MonitorRequest::Remove { monitor_id } => monitor_id,
-        MonitorRequest::Register { .. } | MonitorRequest::List => "",
+        MonitorRequest::Register { .. }
+        | MonitorRequest::List
+        | MonitorRequest::FollowUp { .. } => "",
     }
 }
 

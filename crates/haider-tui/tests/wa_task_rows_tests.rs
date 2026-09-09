@@ -60,6 +60,7 @@ fn started(task: &str, name: &str, command: &str, at_ms: u64) -> TaskEventPayloa
 
 fn completed(task: &str, name: &str, state: TaskTerminalState, tail: &str) -> TaskEventPayload {
     TaskEventPayload::TaskCompleted(TaskCompleted {
+        completion_consumer: None,
         task: TaskId::new(task),
         name: name.to_owned(),
         state,

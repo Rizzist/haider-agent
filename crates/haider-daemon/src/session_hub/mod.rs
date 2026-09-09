@@ -1091,6 +1091,7 @@ struct HubInner {
     commit_projection: Arc<CommitProjection>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     roster_publications: broadcast::Sender<SessionId>,
+    completion_publications: broadcast::Sender<SessionId>,
     /// Coalescing wake after a committed Loom registry event. Watchers always
     /// repair from the durable cursor log; this channel is never authority.
     loom_registry_publications: broadcast::Sender<u64>,
@@ -1175,6 +1176,7 @@ pub(super) struct CommitProjection {
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     roster_publications: broadcast::Sender<SessionId>,
+    completion_publications: broadcast::Sender<SessionId>,
     haider_code_plan_changes: watch::Sender<u64>,
 }
 
@@ -1190,6 +1192,11 @@ impl CommitProjection {
         }
         if let Some(envelope) = envelopes.last() {
             let _ = self.roster_publications.send(envelope.session_id.clone());
+            if envelopes.iter().any(crate::completion::needs_reconcile) {
+                let _ = self
+                    .completion_publications
+                    .send(envelope.session_id.clone());
+            }
         }
         if envelopes.iter().any(|envelope| {
             haider_protocol::session::ModelSelected::from_payload_value(&envelope.payload).is_some()
@@ -2403,6 +2410,7 @@ impl SessionHub {
         ));
         let (surface_publications, _) = watch::channel(0_u64);
         let (roster_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
+        let (completion_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
         let (loom_registry_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
         let (descendant_lineage_publications, _) = watch::channel(0_u64);
         let (haider_code_plan_changes, _) = watch::channel(0_u64);
@@ -2413,6 +2421,7 @@ impl SessionHub {
             hooks: Arc::clone(&hooks),
             observe_digests: Arc::clone(&observe_digests),
             roster_publications: roster_publications.clone(),
+            completion_publications: completion_publications.clone(),
             haider_code_plan_changes: haider_code_plan_changes.clone(),
         });
         let inner = Arc::new(HubInner {
@@ -2463,6 +2472,7 @@ impl SessionHub {
             commit_projection,
             observe_digests,
             roster_publications,
+            completion_publications,
             loom_registry_publications,
             haider_code_plan_changes,
             usage_report: Mutex::new(None),
@@ -3591,6 +3601,10 @@ impl SessionHub {
                 .into_iter()
                 .next(),
         )
+    }
+
+    pub(crate) fn subscribe_completion_reconcile(&self) -> broadcast::Receiver<SessionId> {
+        self.inner.completion_publications.subscribe()
     }
 
     pub(crate) fn subscribe_peer_reconcile(&self) -> broadcast::Receiver<SessionId> {

@@ -83,6 +83,7 @@ fn digest(
     menu: Option<ObserveMenuWire>,
 ) -> SessionObserveDigest {
     SessionObserveDigest {
+        pending_follow_ups: Vec::new(),
         session_id: SessionId::new(id),
         head_seq: 12,
         worker_generation: 7,
@@ -914,4 +915,44 @@ fn watch_streams_are_lf_framed_raw_envelopes_and_tolerate_additive_kinds() {
 #[test]
 fn fixture_paths_remain_inside_the_cli_test_tree() {
     assert!(fixture_path("observe_status.json").starts_with(Path::new(env!("CARGO_MANIFEST_DIR"))));
+}
+
+#[test]
+fn session_depth_preserves_pending_follow_ups_in_json_and_text() {
+    let mut observed = digest("pending-session", ObserveRunStateWire::Idle, None);
+    let pending = haider_protocol::completion::CompletionObligation {
+        obligation_id: "monitor:stable-report".into(),
+        source: haider_protocol::completion::CompletionSource::Monitor,
+        source_id: "stable-report".into(),
+        session_id: observed.session_id.clone(),
+        branch_id: None,
+        agent_id: None,
+        created_seq: 7,
+        action: "Reconcile the harmless marker".into(),
+        report_only: false,
+        status: haider_protocol::completion::CompletionStatus::Parked,
+        attempt: 1,
+        run_id: None,
+        accepted_seq: Some(8),
+        worker_generation: 7,
+        park_reason: Some(haider_protocol::completion::CompletionParkReason::RequestRepair),
+    };
+    observed.pending_follow_ups.push(pending.clone());
+    let document = SessionDocument {
+        schema: "haider.observe.v1",
+        kind: "session",
+        session: depth_view(observed),
+    };
+    assert_eq!(
+        document.session.json()["pending_follow_ups"],
+        serde_json::json!([pending])
+    );
+    assert!(session_human_text(&document).contains(
+        "pending follow-up: monitor:stable-report — attempt 1 — Reconcile the harmless marker"
+    ));
+    let empty = depth_view(digest("empty", ObserveRunStateWire::Idle, None));
+    assert!(
+        empty.json().get("pending_follow_ups").is_none(),
+        "older empty snapshots keep their wire shape"
+    );
 }

@@ -2243,6 +2243,10 @@ pub struct ObserveSubagentWire {
 /// One read-only digest reduced from committed daemon truth.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionObserveDigest {
+    /// Follow-up obligations survive transport delivery and successful turns.
+    /// Empty/absent remains compatible with pre-lifecycle daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_follow_ups: Vec<haider_protocol::completion::CompletionObligation>,
     pub session_id: SessionId,
     pub head_seq: u64,
     pub worker_generation: u64,

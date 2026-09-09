@@ -10,6 +10,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::{oneshot as tokio_oneshot, watch as tokio_watch};
 use tokio::time::timeout;
 
+#[path = "monitor_completion_tests.rs"]
+mod completion;
+
 #[test]
 fn monitor_event_payload_rejects_unknown_variant_fields() {
     let error = serde_json::from_value::<MonitorEventPayload>(serde_json::json!({

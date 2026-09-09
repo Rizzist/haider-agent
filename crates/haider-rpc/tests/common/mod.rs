@@ -1374,6 +1374,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-observe"),
             body: ResponseBody::SessionObserve {
                 digest: SessionObserveDigest {
+                    pending_follow_ups: Vec::new(),
                     session_id: SessionId::new("session-1"),
                     head_seq: 9,
                     worker_generation: 7,

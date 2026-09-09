@@ -796,6 +796,7 @@ mod tests {
 
     fn digest_with_menus(menus: Vec<ObserveMenuWire>) -> SessionObserveDigest {
         SessionObserveDigest {
+            pending_follow_ups: Vec::new(),
             session_id: SessionId::new("session-recover-test"),
             head_seq: 9,
             worker_generation: 1,

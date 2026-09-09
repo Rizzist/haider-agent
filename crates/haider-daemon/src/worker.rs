@@ -17597,7 +17597,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
     }
 
     async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
-        let dynamic = self.rebind_typed_workflow_execution().await?;
+        let mut dynamic = self.rebind_typed_workflow_execution().await?;
+        let pending = crate::completion::prompt(
+            self.output.store.hub(),
+            self.output.store.session_id(),
+            self.branch_id.as_ref(),
+            self.parent_agent_id.as_ref(),
+        )
+        .await?;
+        if !pending.is_empty() {
+            dynamic.push('\n');
+            dynamic.push_str(&pending);
+        }
         Ok(Some(join_volatile_context_tail(
             &dynamic,
             &self.session_context_tail,
