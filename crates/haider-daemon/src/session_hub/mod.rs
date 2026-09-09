@@ -98,6 +98,7 @@ mod peer_injection_tests;
 mod peer_store_rt_tests;
 
 mod actor;
+mod close;
 mod descendant_stream;
 mod replay;
 pub(crate) mod rpc;
@@ -1012,10 +1013,20 @@ struct HubInner {
     /// `actor_for` checks them at both sides of its await so deletion cannot
     /// race actor recreation or fresh admission.
     deleting_sessions: Mutex<HashSet<SessionId>>,
+    /// Temporary close fences never publish permanent deletion to observers.
+    closing_sessions: Mutex<HashSet<SessionId>>,
+    /// Hook execution holds a shared lease through its resource lifetime;
+    /// close requires exclusive access without waiting on active hook work.
+    session_activity: Mutex<HashMap<SessionId, Weak<tokio::sync::RwLock<()>>>>,
     /// Per-session actor joins are kept separately so deletion can join and
     /// release the completed task immediately instead of retaining one handle
     /// for every session served until daemon shutdown.
     session_actor_tasks: Mutex<HashMap<SessionId, JoinHandle<()>>>,
+    /// Close barriers outlive a cancelled RPC and are joined before shutdown
+    /// takes the actors they are retiring.
+    session_close_tasks: Mutex<Vec<JoinHandle<()>>>,
+    idle_release_tasks: Mutex<HashMap<SessionId, IdleReleaseTask>>,
+    close_admission_stopped: AtomicBool,
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Wakes the daemon-wide shell fan-out actor before shutdown joins the
     /// hub-owned task set. The registry sender itself lives in `HubInner`, so
@@ -1042,7 +1053,7 @@ struct HubInner {
     /// commands. This makes same-command retries idempotent even when two
     /// control connections race before either response is visible.
     checkpoint_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
-    replay_tasks: Mutex<Vec<JoinHandle<ReplayCompletion>>>,
+    replay_tasks: Mutex<HashMap<AttachmentId, ReplayTask>>,
     attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
     /// Connection-scoped nested-subagent streams. They share the ordinary
     /// attachment admission ledger and outbox lanes but have no single
@@ -1221,6 +1232,22 @@ struct SurfacePublishOutcome {
     accepted_status_revision: Option<u64>,
 }
 
+struct IdleReleaseTask {
+    head: watch::Sender<Option<u64>>,
+    task: JoinHandle<()>,
+}
+
+struct ReplayTask {
+    sessions: HashSet<SessionId>,
+    task: JoinHandle<ReplayCompletion>,
+}
+
+impl ReplayTask {
+    fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
 struct SurfaceWatchState {
     registrations: Arc<Mutex<HashMap<SessionId, u64>>>,
     task: JoinHandle<()>,
@@ -1325,6 +1352,7 @@ impl<T> Drop for OwnedTasks<T> {
 #[derive(Clone)]
 struct SessionActorHandle {
     commands: mpsc::Sender<ActorCommand>,
+    closing: Arc<AtomicBool>,
 }
 
 struct ForkCandidateReservation {
@@ -2024,8 +2052,16 @@ enum ActorCommand {
     FenceIfQuiescent {
         completed: oneshot::Sender<Result<bool, HaiderError>>,
     },
+    FenceForClose {
+        completed: oneshot::Sender<Result<bool, HaiderError>>,
+    },
     StopIfQuiescent {
         completed: oneshot::Sender<Result<bool, HaiderError>>,
+    },
+    /// Close drains the sidecar without aborting its blocking I/O, so the
+    /// acknowledgement is also a descriptor-lifetime barrier.
+    StopForClose {
+        completed: oneshot::Sender<Result<(), HaiderError>>,
     },
     Stop,
 }
@@ -2299,49 +2335,95 @@ impl SessionHub {
     }
 
     fn schedule_idle_derived_state_release(&self, session_id: SessionId, idle_seq: u64) {
+        let Ok(mut tasks) = self.inner.idle_release_tasks.lock() else {
+            return;
+        };
+        if self.inner.draining.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(task) = tasks.get(&session_id)
+            && !task.head.is_closed()
+        {
+            task.head.send_replace(Some(idle_seq));
+            return;
+        }
         let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
-            tokio::time::sleep(IDLE_DERIVED_STATE_RELEASE_DELAY).await;
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            if !matches!(inner.store.latest_seq(&session_id).await, Ok(head) if head == idle_seq) {
-                return;
-            }
-
-            let prompt_bytes = inner.prompt_history.evict_session_bodies(&session_id).await;
-            let turn_setup_entries = inner
-                .turn_setup_reductions
-                .remove_session(&session_id)
-                .await;
-            let observe_bytes = inner
-                .observe_digests
-                .remove_ready_at_head(&session_id, idle_seq);
-            if let Err(error) = inner.store.release_memory().await {
-                tracing::debug!(
-                    session_id = %session_id,
-                    ?error,
-                    "idle SQLite memory release failed"
-                );
-            }
-            let allocator_bytes = haider_platform::allocator_pressure_relief();
-            if retention_trace_enabled() {
-                let hub = SessionHub {
-                    inner: Arc::clone(&inner),
+        let task_session = session_id.clone();
+        let (head, mut receiver) = watch::channel(Some(idle_seq));
+        let task = tokio::spawn(async move {
+            loop {
+                let Some(idle_seq) = *receiver.borrow_and_update() else {
+                    return;
                 };
-                hub.trace_retention_snapshot(&session_id, idle_seq, "released")
-                    .await;
+                tokio::select! {
+                    _ = tokio::time::sleep(IDLE_DERIVED_STATE_RELEASE_DELAY) => {},
+                    changed = receiver.changed() => {
+                        if changed.is_err() { return; }
+                        continue;
+                    }
+                }
+                Self::release_idle_derived_state(&weak, &task_session, idle_seq).await;
+                // Finish once this head is released. Serialize closing the
+                // receiver with publishers so a concurrent idle head either
+                // stays in this task or starts a new task, never gets lost.
+                {
+                    let Some(inner) = weak.upgrade() else {
+                        return;
+                    };
+                    let Ok(_tasks) = inner.idle_release_tasks.lock() else {
+                        return;
+                    };
+                    if !receiver.has_changed().unwrap_or(false) {
+                        drop(receiver);
+                        return;
+                    }
+                }
             }
+        });
+        tasks.insert(session_id, IdleReleaseTask { head, task });
+    }
+
+    async fn release_idle_derived_state(
+        weak: &Weak<HubInner>,
+        session_id: &SessionId,
+        idle_seq: u64,
+    ) {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        if !matches!(inner.store.latest_seq(session_id).await, Ok(head) if head == idle_seq) {
+            return;
+        }
+
+        let prompt_bytes = inner.prompt_history.evict_session_bodies(session_id).await;
+        let turn_setup_entries = inner.turn_setup_reductions.remove_session(session_id).await;
+        let observe_bytes = inner
+            .observe_digests
+            .remove_ready_at_head(session_id, idle_seq);
+        if let Err(error) = inner.store.release_memory().await {
             tracing::debug!(
                 session_id = %session_id,
-                idle_seq,
-                prompt_bytes,
-                turn_setup_entries,
-                observe_bytes,
-                allocator_bytes,
-                "released journal-reconstructible idle session state"
+                ?error,
+                "idle SQLite memory release failed"
             );
-        });
+        }
+        let allocator_bytes = haider_platform::allocator_pressure_relief();
+        if retention_trace_enabled() {
+            let hub = SessionHub {
+                inner: Arc::clone(&inner),
+            };
+            hub.trace_retention_snapshot(session_id, idle_seq, "released")
+                .await;
+        }
+        tracing::debug!(
+            session_id = %session_id,
+            idle_seq,
+            prompt_bytes,
+            turn_setup_entries,
+            observe_bytes,
+            allocator_bytes,
+            "released journal-reconstructible idle session state"
+        );
     }
 
     /// Creates a hub with production's no-op boundary observer.
@@ -2434,14 +2516,19 @@ impl SessionHub {
             surfaces: Mutex::new(HashMap::new()),
             surface_publications,
             deleting_sessions: Mutex::new(HashSet::new()),
+            closing_sessions: Mutex::new(HashSet::new()),
+            session_activity: Mutex::new(HashMap::new()),
             session_actor_tasks: Mutex::new(HashMap::new()),
+            session_close_tasks: Mutex::new(Vec::new()),
+            idle_release_tasks: Mutex::new(HashMap::new()),
+            close_admission_stopped: AtomicBool::new(false),
             actor_tasks: Mutex::new(Vec::new()),
             shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
             run_budget_coordinators: Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
-            replay_tasks: Mutex::new(Vec::new()),
+            replay_tasks: Mutex::new(HashMap::new()),
             attachments: Mutex::new(HashMap::new()),
             descendant_attachments: Mutex::new(HashMap::new()),
             descendant_lineage_publications,
@@ -5997,7 +6084,11 @@ impl SessionHub {
         let workflow_selection = self.lock_workflow_selection(&session_id).await;
         {
             let mut deleting = lock(&self.inner.deleting_sessions).map_err(hub_error_as_store)?;
-            if !deleting.insert(session_id.clone()) {
+            if lock(&self.inner.closing_sessions)
+                .map_err(hub_error_as_store)?
+                .contains(&session_id)
+                || !deleting.insert(session_id.clone())
+            {
                 return Err(HaiderError::new(
                     ErrorCode::Busy,
                     "session deletion is already in progress",
@@ -6179,6 +6270,9 @@ impl SessionHub {
         // W-A fence law: session close kills every pgid the session owns,
         // after the actor is provably stopped and before the durable delete.
         self.fence_background_tasks(session_id).await;
+        // Monitor readers now have joins in the shared native task registry.
+        // Cancel and join their producers first: a persistent runner cannot
+        // close stdout until forget_session delivers its cancellation.
         self.inner
             .monitors
             .forget_session(self, session_id)
@@ -6190,6 +6284,8 @@ impl SessionHub {
                     true,
                 )
             })?;
+        self.inner.tasks.join_session(session_id).await?;
+        self.join_idle_release(session_id).await?;
         match self.inner.store.delete_session(session_id.clone()).await {
             Ok(()) => self.inner.monitors.release_session_tombstone(session_id),
             Err(error) => {
@@ -6379,6 +6475,13 @@ impl SessionHub {
                 false,
             )));
         }
+        if lock(&self.inner.closing_sessions)?.contains(&session_id) {
+            return Err(SessionHubError::Store(HaiderError::new(
+                ErrorCode::Busy,
+                "session close is in progress",
+                true,
+            )));
+        }
         if !allow_committed_fork_candidate
             && lock(&self.inner.fork_candidates)?.contains(&session_id)
         {
@@ -6414,6 +6517,13 @@ impl SessionHub {
                 false,
             )));
         }
+        if lock(&self.inner.closing_sessions)?.contains(&session_id) {
+            return Err(SessionHubError::Store(HaiderError::new(
+                ErrorCode::Busy,
+                "session close is in progress",
+                true,
+            )));
+        }
         if !allow_committed_fork_candidate
             && lock(&self.inner.fork_candidates)?.contains(&session_id)
         {
@@ -6426,7 +6536,10 @@ impl SessionHub {
         }
         let authority_epoch = last.as_ref().map_or(0, |envelope| envelope.authority_epoch);
         let (commands, receiver) = mpsc::channel(self.inner.config.actor_command_capacity);
-        let actor = SessionActorHandle { commands };
+        let actor = SessionActorHandle {
+            commands,
+            closing: Arc::new(AtomicBool::new(false)),
+        };
         let task = tokio::spawn(run_session_actor(
             session_id.clone(),
             head,
@@ -6440,6 +6553,7 @@ impl SessionHub {
             Arc::clone(&self.inner.metrics),
             Arc::clone(&self.inner.commit_projection),
             Arc::clone(&self.inner.force_stop),
+            Arc::clone(&actor.closing),
             receiver,
         ));
         lock(&self.inner.session_actor_tasks)?.insert(session_id.clone(), task);
@@ -6535,9 +6649,10 @@ impl SessionHub {
         // deleter observes this owner; if deletion wins, no stream is minted.
         let deleting = lock(&self.inner.deleting_sessions)?;
         session_ids.insert(root_session_id);
+        let closing = lock(&self.inner.closing_sessions)?;
         if session_ids
             .iter()
-            .any(|session_id| deleting.contains(session_id))
+            .any(|session_id| deleting.contains(session_id) || closing.contains(session_id))
         {
             return Ok(DescendantRegisterResult::SessionUnavailable);
         }
@@ -6559,6 +6674,7 @@ impl SessionHub {
                 cancel,
             },
         );
+        drop(closing);
         drop(deleting);
         slot.transfer();
         Ok(DescendantRegisterResult::Registered {
@@ -6576,7 +6692,9 @@ impl SessionHub {
         // initial registration. A successful insert makes deletion observe
         // this attachment; a pre-existing deletion tombstone refuses it.
         let deleting = lock(&self.inner.deleting_sessions)?;
-        if deleting.contains(&session_id) {
+        if deleting.contains(&session_id)
+            || lock(&self.inner.closing_sessions)?.contains(&session_id)
+        {
             return Ok(false);
         }
         let mut attachments = lock(&self.inner.descendant_attachments)?;
@@ -6603,14 +6721,28 @@ impl SessionHub {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
-        replay_tasks.retain(|handle| !handle.is_finished());
-        replay_tasks.push(tokio::spawn(run_descendant_stream(
-            self.clone(),
-            attachment_id,
-            prepared,
-            sink,
-            cancel,
-        )));
+        let Some(sessions) = lock(&self.inner.descendant_attachments)?
+            .get(&attachment_id)
+            .map(|owner| owner.session_ids.clone())
+        else {
+            // Its detach/close already won admission. Do not start a late
+            // subscription after the release barrier observed no replay.
+            return Ok(());
+        };
+        replay_tasks.retain(|_, handle| !handle.is_finished());
+        replay_tasks.insert(
+            attachment_id.clone(),
+            ReplayTask {
+                sessions,
+                task: tokio::spawn(run_descendant_stream(
+                    self.clone(),
+                    attachment_id,
+                    prepared,
+                    sink,
+                    cancel,
+                )),
+            },
+        );
         Ok(())
     }
 
@@ -6659,15 +6791,24 @@ impl SessionHub {
         // started must detach/refuse instead of appearing behind the deleter's
         // attachment check.
         let deleting = lock(&self.inner.deleting_sessions)?;
-        if deleting.contains(&session_id) {
+        let closing = lock(&self.inner.closing_sessions)?.contains(&session_id);
+        if deleting.contains(&session_id) || closing {
             drop(deleting);
             let _ = actor.commands.try_send(ActorCommand::Detach {
                 attachment_id: attachment_id.clone(),
             });
             return Err(SessionHubError::Store(HaiderError::new(
-                ErrorCode::InvalidArgument,
-                "session was deleted",
-                false,
+                if closing {
+                    ErrorCode::Busy
+                } else {
+                    ErrorCode::InvalidArgument
+                },
+                if closing {
+                    "session close is in progress"
+                } else {
+                    "session was deleted"
+                },
+                closing,
             )));
         }
         lock(&self.inner.attachments)?.insert(
@@ -6695,17 +6836,24 @@ impl SessionHub {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
-        let cancel = lock(&self.inner.attachments)?
-            .get(&registration.attachment_id)
-            .map(|owner| owner.cancel.subscribe())
-            .ok_or(SessionHubError::Closed)?;
         let mut replay_tasks = lock(&self.inner.replay_tasks)?;
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
+        // Check attachment ownership INSIDE replay admission. Close removes
+        // ownership before taking this same task registry: either it joins
+        // this task or this delayed attach handler cannot start one.
+        let Some(cancel) = lock(&self.inner.attachments)?
+            .get(&registration.attachment_id)
+            .map(|owner| owner.cancel.subscribe())
+        else {
+            return Ok(());
+        };
         // Finished handles carry no live task ownership. Reap them on each
         // admission so repeated attach/detach cannot grow this registry.
-        replay_tasks.retain(|handle| !handle.is_finished());
+        replay_tasks.retain(|_, handle| !handle.is_finished());
+        let attachment_id = registration.attachment_id.clone();
+        let sessions = HashSet::from([registration.attach_state.session_id.clone()]);
         let hub = self.clone();
         let task = tokio::spawn(run_replay(
             hub,
@@ -6718,7 +6866,7 @@ impl SessionHub {
         // The lock stays held from the drain recheck through spawn+push, so
         // shutdown's registry take either owns this task or rejects it before
         // it exists. No aborted-but-unjoined admission gap is possible.
-        replay_tasks.push(task);
+        replay_tasks.insert(attachment_id, ReplayTask { sessions, task });
         Ok(())
     }
 
@@ -6748,6 +6896,9 @@ impl SessionHub {
         attachment_id: &AttachmentId,
         connection_id: Option<&str>,
     ) -> Result<Option<DescendantAttachmentOwner>, SessionHubError> {
+        // Preserve the final dynamic cohort for close to join even after
+        // ordinary detach removed the live attachment owner.
+        let mut replays = lock(&self.inner.replay_tasks)?;
         let mut attachments = lock(&self.inner.descendant_attachments)?;
         let owned = attachments
             .get(attachment_id)
@@ -6757,6 +6908,9 @@ impl SessionHub {
         }
         let owner = attachments.remove(attachment_id);
         if let Some(owner) = owner.as_ref() {
+            if let Some(replay) = replays.get_mut(attachment_id) {
+                replay.sessions.clone_from(&owner.session_ids);
+            }
             let _ = owner.cancel.send(true);
             self.release_attachment_slot(&owner.connection_id);
         }
@@ -7295,6 +7449,21 @@ impl SessionHub {
     /// final marker is recorded and returns [`SessionHubShutdownOutcome::Forced`];
     /// it can never be mistaken for a graceful join.
     pub async fn shutdown(&self) -> Result<SessionHubShutdownOutcome, SessionHubError> {
+        // Serialize task registration with drain admission. Existing close
+        // barriers still need the actor and worker registries below.
+        let close_tasks = {
+            let mut tasks = lock(&self.inner.session_close_tasks)?;
+            self.inner
+                .close_admission_stopped
+                .store(true, Ordering::Release);
+            std::mem::take(&mut *tasks)
+        };
+        let mut close_tasks = OwnedTasks::new(close_tasks, Arc::clone(&self.inner.force_stop));
+        for outcome in close_tasks.join_all().await {
+            outcome.map_err(|error| {
+                SessionHubError::Task(format!("session close task failed: {error}"))
+            })?;
+        }
         self.inner
             .monitors
             .shutdown()
@@ -7313,7 +7482,10 @@ impl SessionHub {
         // backstop, all before the first await. If the global drain deadline
         // cancels this future, no hub task is detached and no actor starts
         // another store command.
-        let replay_tasks = std::mem::take(&mut *lock(&self.inner.replay_tasks)?);
+        let replay_tasks = std::mem::take(&mut *lock(&self.inner.replay_tasks)?)
+            .into_values()
+            .map(|replay| replay.task)
+            .collect();
         let mut replay_tasks = OwnedTasks::new(replay_tasks, Arc::clone(&self.inner.force_stop));
         let actors = {
             let mut actors = lock(&self.inner.actors)?;
@@ -7326,6 +7498,16 @@ impl SessionHub {
             OwnedTasks::new(session_actor_tasks, Arc::clone(&self.inner.force_stop));
         let actor_tasks = std::mem::take(&mut *lock(&self.inner.actor_tasks)?);
         let mut actor_tasks = OwnedTasks::new(actor_tasks, Arc::clone(&self.inner.force_stop));
+        let idle_release_tasks = std::mem::take(&mut *lock(&self.inner.idle_release_tasks)?);
+        let idle_handles = idle_release_tasks
+            .into_values()
+            .map(|idle| {
+                idle.head.send_replace(None);
+                idle.task
+            })
+            .collect();
+        let mut idle_release_tasks =
+            OwnedTasks::new(idle_handles, Arc::clone(&self.inner.force_stop));
         let append_commit_task = lock(&self.inner.append_commit_task)?.take();
         let mut append_commit_task = OwnedTasks::new(
             append_commit_task.into_iter().collect(),
@@ -7348,6 +7530,7 @@ impl SessionHub {
         }
         let _ = session_actor_tasks.join_all().await;
         let _ = actor_tasks.join_all().await;
+        let _ = idle_release_tasks.join_all().await;
         self.inner.append_committer.shutdown().await;
         let append_outcomes = append_commit_task.join_all().await;
         if append_outcomes.iter().any(Result::is_err) {

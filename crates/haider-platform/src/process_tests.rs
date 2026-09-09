@@ -1,5 +1,31 @@
 #![allow(clippy::expect_used)]
 
+#[test]
+fn linux_android_group_probe_excludes_pinned_zombie_and_retains_uncertainty() {
+    let root = tempfile::tempdir().expect("synthetic procfs");
+    let write_stat = |pid: u32, state: char, group: u32| {
+        let directory = root.path().join(pid.to_string());
+        std::fs::create_dir_all(&directory).expect("process directory");
+        std::fs::write(
+            directory.join("stat"),
+            format!("{pid} (name with ) paren) {state} 1 {group} 0 0"),
+        )
+        .expect("stat");
+    };
+    write_stat(42, 'Z', 42);
+    write_stat(43, 'S', 43);
+    assert!(
+        !super::linux_process_group_has_live_member_at(42, root.path()).expect("pinned leader"),
+        "an unreaped leader alone must not prevent cleanup from reaching wait"
+    );
+    write_stat(44, 'S', 42);
+    assert!(super::linux_process_group_has_live_member_at(42, root.path()).expect("descendant"));
+    write_stat(44, 'Z', 42);
+    assert!(!super::linux_process_group_has_live_member_at(42, root.path()).expect("zombie"));
+    std::fs::write(root.path().join("44/stat"), b"invalid").expect("uncertain stat");
+    assert!(super::linux_process_group_has_live_member_at(42, root.path()).expect("uncertain"));
+}
+
 #[cfg(windows)]
 #[test]
 fn process_exists_reports_current_process_and_rejects_zero() {

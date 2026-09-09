@@ -188,6 +188,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-detach"),
             body: RequestBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                close_session: false,
             },
         },
         // The pre-roster-truth summary shape: an older daemon omits the
@@ -296,6 +297,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-detach"),
             body: ResponseBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                closed_session_id: None,
             },
         },
         WireFrame::Response {

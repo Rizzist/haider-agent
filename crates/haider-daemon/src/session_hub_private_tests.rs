@@ -2,6 +2,9 @@
 //! Private session-hub accounting tests.
 
 use super::*;
+
+#[path = "session_close_tests.rs"]
+mod session_close_tests;
 use haider_accounts::Vault as _;
 use haider_protocol::EventPayload;
 use haider_protocol::cache::CacheRequestAttemptV1;
@@ -6694,7 +6697,10 @@ async fn aborting_deliver_frame_before_reoffer_keeps_fifo_admission_live() {
                 connection_id: "abort-test".into(),
                 session_id,
                 mode: AttachMode::View,
-                actor: SessionActorHandle { commands },
+                actor: SessionActorHandle {
+                    commands,
+                    closing: Arc::new(AtomicBool::new(false)),
+                },
                 cancel: owner_cancel,
             },
         );
