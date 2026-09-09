@@ -1064,6 +1064,7 @@ fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
                 reasoning_settings: "reasoning-shape-pin".into(),
             },
             cache_epoch: "cache-shape-pin".into(),
+            request_view_epoch: None,
             header_epoch: "provider-view-header-shape-pin".into(),
             compaction_epoch: "compaction-shape-pin".into(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),

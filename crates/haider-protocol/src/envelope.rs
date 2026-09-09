@@ -292,6 +292,16 @@ impl RawPayload {
         self.get("type").and_then(Value::as_str)
     }
 
+    /// The raw fallback's structural contract. A tagged object is opaque
+    /// journal truth even when this reader cannot decode its union or a new
+    /// nested variant. In particular, additive families and hidden daemon
+    /// receipts must not become compatibility faults. A failed typed decode
+    /// alone proves neither corruption nor a version mismatch.
+    #[must_use]
+    pub fn is_structurally_valid(&self) -> bool {
+        self.type_tag().is_some_and(|tag| !tag.trim().is_empty())
+    }
+
     #[must_use]
     pub fn owned_heap_bytes(&self) -> usize {
         json_owned_heap_bytes(self.deref())

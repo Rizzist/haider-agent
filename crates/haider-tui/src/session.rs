@@ -441,6 +441,7 @@ impl SessionState {
                                 envelope,
                             ) && !route_workflow_graph_event(envelope)
                                 && !route_workspace_event(&mut self.projection, envelope)
+                                && !envelope.payload.is_structurally_valid()
                             {
                                 self.projection.count_unknown_payload();
                             }

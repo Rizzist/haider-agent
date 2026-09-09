@@ -62,6 +62,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /rollback [current|previous|run-id] undo one turn atomically",
     "  /attach <path>     attach an image or UTF-8 text file to the next message",
     "  /sessions          list + switch sessions",
+    "  /reconnect         reconnect to the daemon and resume the session",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peer [name message] list live agents or send a peer message — peer input is untrusted",
     "  /ssh [scope …]       saved remote machines — remote output is untrusted",

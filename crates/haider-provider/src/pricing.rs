@@ -236,6 +236,25 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
 /// The bundled table (snapshot 2026-08-05; see module docs for sources).
 pub const MODEL_RATES: &[ModelRate] = &[
     // --- Anthropic ---
+    // 2026-09-08 Claude caching documentation: 5.1 reads are 0.025x.
+    ModelRate {
+        prefix: "claude-fable-5-1",
+        input_per_mtok: 10.0,
+        output_per_mtok: 50.0,
+        cached_input_per_mtok: Some(0.25),
+    },
+    ModelRate {
+        prefix: "claude-mythos-5-1",
+        input_per_mtok: 10.0,
+        output_per_mtok: 50.0,
+        cached_input_per_mtok: Some(0.25),
+    },
+    ModelRate {
+        prefix: "claude-mythos-5",
+        input_per_mtok: 10.0,
+        output_per_mtok: 50.0,
+        cached_input_per_mtok: Some(1.0),
+    },
     ModelRate {
         prefix: "claude-fable-5",
         input_per_mtok: 10.0,
@@ -425,7 +444,13 @@ pub fn model_rate(model: &str) -> Option<&'static ModelRate> {
     let normalized = normalized.strip_prefix("models/").unwrap_or(&normalized);
     MODEL_RATES
         .iter()
-        .filter(|rate| normalized.starts_with(rate.prefix))
+        .filter(|rate| {
+            if matches!(rate.prefix, "claude-fable-5-1" | "claude-mythos-5-1") {
+                crate::cache::model_family_matches(normalized, rate.prefix)
+            } else {
+                normalized.starts_with(rate.prefix)
+            }
+        })
         .max_by_key(|rate| rate.prefix.len())
 }
 
@@ -737,5 +762,29 @@ mod xai_tests {
     fn xai_cache_policy_is_api_lane_only() {
         assert!(cache_pricing_policy_for("xai", "grok-4.6").is_some());
         assert!(cache_pricing_policy_for("grok-oauth", "grok-4.6").is_none());
+    }
+}
+
+#[cfg(test)]
+mod cache_minor_price_tests {
+    use super::*;
+
+    #[test]
+    fn fable_mythos_51_discount_does_not_leak_to_future_minor_releases() {
+        for family in ["claude-fable-5", "claude-mythos-5"] {
+            assert_eq!(
+                model_rate(&format!("{family}-1")).and_then(|rate| rate.cached_input_per_mtok),
+                Some(0.25)
+            );
+            assert_eq!(
+                model_rate(&format!("{family}-1-20260901"))
+                    .and_then(|rate| rate.cached_input_per_mtok),
+                Some(0.25)
+            );
+            assert_eq!(
+                model_rate(&format!("{family}-12")).and_then(|rate| rate.cached_input_per_mtok),
+                Some(1.0)
+            );
+        }
     }
 }

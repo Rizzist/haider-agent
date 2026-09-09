@@ -1010,3 +1010,51 @@ fn tui_session_create_carries_automode_overrides() {
         other => panic!("create must carry automode overrides, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn explicit_reconnect_retires_socket_and_delivers_fresh_handshake_before_resume() {
+    let dir = short_dir();
+    let endpoint = dir.path().join("reconnect.sock");
+    let listener = UnixListener::bind(&endpoint).expect("bind");
+    let peer = tokio::spawn(async move {
+        for generation in 1..=2 {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut decoder = uds_codec::Decoder::new(LIMIT);
+            let frames = read_frames(&mut stream, &mut decoder).await;
+            assert!(matches!(frames.as_slice(), [WireFrame::Hello(_)]));
+            let mut welcome = welcome();
+            welcome.daemon_generation = generation;
+            welcome.daemon_version = env!("CARGO_PKG_VERSION").into();
+            write_frame(&mut stream, &WireFrame::Welcome(welcome)).await;
+            // Reconnect must close the first socket, not send a made-up RPC.
+            assert!(read_frames(&mut stream, &mut decoder).await.is_empty());
+        }
+    });
+    let mut link = link_to(dir.path(), &endpoint).await;
+    link.commands
+        .send(LiveCommand::Reconnect)
+        .await
+        .expect("reconnect");
+    assert!(matches!(
+        next_reply(&mut link).await,
+        LiveReply::Disconnected { .. }
+    ));
+    assert!(matches!(
+        next_reply(&mut link).await,
+        LiveReply::SupervisorRestarting { .. }
+    ));
+    let reply = next_reply(&mut link).await;
+    assert!(
+        matches!(reply, LiveReply::Handshake { ref version, ref client_version, protocol, .. }
+        if version == client_version && protocol == WIRE_PROTOCOL_VERSION)
+    );
+    assert!(matches!(
+        next_reply(&mut link).await,
+        LiveReply::Reconnected
+    ));
+    drop(link);
+    tokio::time::timeout(BOUND, peer)
+        .await
+        .expect("peer completion")
+        .expect("peer");
+}

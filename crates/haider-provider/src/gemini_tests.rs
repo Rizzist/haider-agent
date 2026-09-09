@@ -410,6 +410,7 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
                 reasoning_settings: "reasoning-a".into(),
             },
             cache_epoch: "epoch-a".into(),
+            request_view_epoch: None,
             header_epoch: String::new(),
             compaction_epoch: "compaction-a".into(),
             provider: GEMINI_PROVIDER_NAME.into(),
@@ -895,4 +896,161 @@ async fn gemini_explicit_cache_gate_uses_documented_model_minimums() {
         *backend.operations.lock().expect("operations lock"),
         ["create:1"]
     );
+}
+
+#[tokio::test]
+async fn gemini_cache_reuse_checks_exact_headers_account_history_and_web_fallback() {
+    for mutation in ["system", "tools", "account", "history", "web"] {
+        let registry = GeminiCacheRegistry::default();
+        let backend = Arc::new(RecordingCacheBackend::default());
+        let request = gemini_cache_request("gemini-2.5-flash");
+        registry
+            .prepare_generate_payload(
+                &request,
+                gemini_request_json(&request, None, false).expect("full payload"),
+                backend.clone(),
+                None,
+                false,
+            )
+            .await;
+        let mut changed = request.clone();
+        match mutation {
+            "system" => changed.system_prompt = Some("changed system".into()),
+            "tools" => changed.tools[0].description.push_str(" changed grant"),
+            "account" => {
+                changed
+                    .cache_metadata
+                    .as_mut()
+                    .expect("metadata")
+                    .account_scope = Some("other-account".into())
+            }
+            "history" => changed.messages[0] = Message::user_text("changed immutable history"),
+            "web" => {}
+            _ => unreachable!(),
+        }
+        let next = registry
+            .prepare_generate_payload(
+                &changed,
+                gemini_request_json(&changed, None, mutation == "web").expect("changed payload"),
+                backend.clone(),
+                None,
+                mutation == "web",
+            )
+            .await;
+        assert_ne!(next["cachedContent"], "cachedContents/mock-1", "{mutation}");
+        if mutation == "web" {
+            assert!(next.get("cachedContent").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_cache_append_only_turn_reuses_one_resource() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let mut request = gemini_cache_request("gemini-3.8-flash");
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("metadata")
+        .stable_prefix_tokens = 8192;
+    let first = registry
+        .prepare_generate_payload(
+            &request,
+            gemini_request_json(&request, None, false).expect("full payload"),
+            backend.clone(),
+            None,
+            false,
+        )
+        .await;
+    request.messages.push(Message::assistant(vec![Block::Text {
+        text: "completed answer".into(),
+    }]));
+    request.messages.push(Message::user_text(
+        "monitor wake: synthetic completed effect",
+    ));
+    let boundary = request.messages.len() - 1;
+    let metadata = request.cache_metadata.as_mut().expect("metadata");
+    metadata.stable_history_end = boundary;
+    metadata.current_user_start = boundary;
+    metadata.request_view_epoch = Some("next-accepted-turn-view".into());
+    let second = registry
+        .prepare_generate_payload(
+            &request,
+            gemini_request_json(&request, None, false).expect("full payload"),
+            backend.clone(),
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(first["cachedContent"], "cachedContents/mock-1");
+    assert_eq!(second["cachedContent"], first["cachedContent"]);
+}
+
+#[tokio::test]
+async fn gemini_prepared_arena_prefix_is_created_exactly_and_reused_by_content() {
+    use crate::Provider;
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let provider = provider_with_resolver(SocketAddr::from(([93, 184, 216, 34], 443)));
+    let mut request = gemini_cache_request("gemini-2.5-flash");
+    let text = "Large immutable reply. ".repeat(4096);
+    request.messages[0] = Message::user_text(text.clone());
+    for _ in 0..2 {
+        let mut prepared = provider.prepare_turn(&request).expect("prepared view");
+        let wire = prepared.wire.take().expect("wire");
+        assert!(!wire.reply_bindings.is_empty());
+        let result = registry
+            .prepare_generate_payload_with_boundary(
+                &request,
+                wire.payload,
+                wire.history_boundary,
+                backend.clone(),
+                false,
+                &wire.reply_bindings,
+            )
+            .await;
+        assert_eq!(result["cachedContent"], "cachedContents/mock-1");
+    }
+    assert_eq!(
+        *backend.operations.lock().expect("operations"),
+        ["create:1"]
+    );
+    {
+        let creates = backend.create_payloads.lock().expect("creates");
+        assert_eq!(creates[0]["contents"][0]["parts"][0]["text"], text);
+        assert!(
+            !creates[0]
+                .to_string()
+                .contains("__haider_provider_reply_arena_")
+        );
+    }
+    request.messages[0] = Message::user_text("Changed immutable reply. ".repeat(4096));
+    let mut prepared = provider.prepare_turn(&request).expect("changed view");
+    let wire = prepared.wire.take().expect("wire");
+    let changed = registry
+        .prepare_generate_payload_with_boundary(
+            &request,
+            wire.payload,
+            wire.history_boundary,
+            backend.clone(),
+            false,
+            &wire.reply_bindings,
+        )
+        .await;
+    assert_eq!(changed["cachedContent"], "cachedContents/mock-2");
+    if let Some(directory) = std::env::var_os("HAIDER_CACHE_EVIDENCE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("evidence directory");
+        let evidence = serde_json::json!({
+            "provenance": "recording GeminiCacheBackend; synthetic, no HTTP",
+            "operations": *backend.operations.lock().expect("operations"),
+            "create_payloads": *backend.create_payloads.lock().expect("payloads"),
+        });
+        std::fs::write(
+            directory.join("synthetic-gemini-resources.json"),
+            serde_json::to_vec_pretty(&evidence).expect("resource JSON"),
+        )
+        .expect("save resources");
+    }
 }

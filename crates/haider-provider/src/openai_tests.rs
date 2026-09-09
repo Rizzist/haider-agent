@@ -2252,6 +2252,7 @@ fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheM
             reasoning_settings: "reasoning-a".into(),
         },
         cache_epoch: "epoch-a".into(),
+        request_view_epoch: None,
         header_epoch: "provider-header-a".into(),
         compaction_epoch: "compaction-a".into(),
         provider: provider.into(),
@@ -5139,4 +5140,53 @@ async fn e1e_invalid_endpoint_is_permanent_connection_configuration() {
     );
     assert!(!error.retryable);
     assert!(error.message.contains("connection configuration failed"));
+}
+
+#[test]
+fn astra_cache_key_support_is_exact_and_preserves_account_epoch_and_fork_isolation() {
+    for model in ["gpt-6-astra", "gpt-6-astra-2026-09-01"] {
+        let mut request = probe_request(model);
+        request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+        let first = openai_prompt_cache_key(&request).expect("Astra key");
+        request.messages.push(Message::assistant(vec![Block::Text {
+            text: "answer".into(),
+        }]));
+        request
+            .messages
+            .push(Message::user_text("new accepted turn"));
+        request
+            .cache_metadata
+            .as_mut()
+            .expect("metadata")
+            .request_view_epoch = Some("next-view".into());
+        assert_eq!(Some(first.clone()), openai_prompt_cache_key(&request));
+        for mutation in ["account", "epoch", "fork"] {
+            let mut changed = request.clone();
+            let metadata = changed.cache_metadata.as_mut().expect("metadata");
+            match mutation {
+                "account" => metadata.account_scope = Some("other-account".into()),
+                "epoch" => metadata.cache_epoch.push_str("-compaction-or-grant"),
+                "fork" => {
+                    metadata.session_scope = "unrelated-fork".into();
+                    metadata.cache_cohort = None;
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                Some(first.clone()),
+                openai_prompt_cache_key(&changed),
+                "{mutation}"
+            );
+        }
+    }
+    for model in [
+        "gpt-6-unknown",
+        "gpt-6-astra-lookalike",
+        "gpt-6-astra-1",
+        "gpt-6-astra-v1",
+    ] {
+        let mut request = probe_request(model);
+        request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+        assert!(openai_prompt_cache_key(&request).is_none());
+    }
 }

@@ -99,6 +99,7 @@ pub enum ErrorAction {
     ContactAdmin,
     ContinuePartial,
     RetryFresh,
+    Reconnect,
     None,
 }
 
@@ -224,6 +225,7 @@ const fn error_action_bit(action: ErrorAction) -> u16 {
         ErrorAction::ContinuePartial => 9,
         ErrorAction::RetryFresh => 10,
         ErrorAction::None => 11,
+        ErrorAction::Reconnect => 12,
     }
 }
 

@@ -3977,7 +3977,8 @@ pub enum RequestBody {
         replace_existing: bool,
     },
     /// Starts a daemon-owned loopback authorization flow. The response is
-    /// delivered asynchronously after the coordinator binds `127.0.0.1:0`;
+    /// delivered asynchronously after the coordinator binds the provider's
+    /// registered port (or an ephemeral port) on numeric IPv4 loopback;
     /// the connection task performs only authorization and bounded handoff.
     #[serde(rename = "account.oauth_start")]
     AccountOAuthStart {

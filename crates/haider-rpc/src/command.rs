@@ -87,6 +87,11 @@ const fn session_client_cmd(
 /// The authoritative built-in catalog, in palette order.
 pub const COMMANDS: &[CommandSpec] = &[
     client_cmd("help", "Show all commands", ""),
+    client_cmd(
+        "reconnect",
+        "Reconnect to the daemon and resume from applied cursors",
+        "",
+    ),
     operation_cmd(
         "model",
         "Pick a model — every provider, full-screen search",

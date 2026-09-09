@@ -477,12 +477,12 @@ fn raw_stream_tracks_gaps_duplicates_and_unknown_payloads() {
     projection.apply_raw(&envelope(1, streaming.clone()));
     assert_eq!(projection.badge(), "● THINKING");
 
-    // Unknown payload kind: counted, stream continues (forward-compat law).
+    // Unknown tagged payload kind: skipped, stream continues (forward-compat law).
     projection.apply_raw(&envelope(
         2,
         serde_json::json!({"type": "from_the_future", "x": 1}),
     ));
-    assert_eq!(projection.unknown_payloads(), 1);
+    assert_eq!(projection.unknown_payloads(), 0);
 
     // Gap: recorded AND reduction STOPS. W3c3 (report R11 cut 2) outlaws
     // the pre-existing "record it and keep going" behavior: continuing

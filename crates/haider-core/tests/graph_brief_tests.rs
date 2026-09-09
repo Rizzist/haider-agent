@@ -43,7 +43,7 @@ async fn one_request(brief: Option<&str>) -> (haider_provider::TurnRequest, Arc<
 
 /// CG-M1 LAW: GraphBrief is provider-visible immediately before the accepted
 /// current user. It stays outside durable history while becoming an immutable
-/// provider-prefix block for this turn, with its own exact-view epoch.
+/// provider-prefix block for this turn, with its own exact history digest.
 #[tokio::test]
 async fn graph_brief_is_volatile_but_stable_inside_its_turn_epoch() {
     let brief = "GraphBrief: VERIFY attempt 2/8; gate all-of-3; evidence 1 green/0 red (1 effective); next: record 3 green VERIFY results.";
@@ -83,7 +83,14 @@ async fn graph_brief_is_volatile_but_stable_inside_its_turn_epoch() {
         active_metadata.prefix_digests.immutable_history,
         baseline_metadata.prefix_digests.immutable_history
     );
-    assert_ne!(active_metadata.cache_epoch, baseline_metadata.cache_epoch);
+    assert_eq!(
+        active_metadata.cache_epoch, baseline_metadata.cache_epoch,
+        "a volatile snapshot must not invalidate the reusable system/tool prefix"
+    );
+    assert_ne!(
+        active_metadata.request_view_epoch,
+        baseline_metadata.request_view_epoch
+    );
     assert!(
         active_metadata.stable_prefix_tokens > baseline_metadata.stable_prefix_tokens,
         "stable-prefix accounting includes the request-local snapshot bytes"
@@ -215,21 +222,48 @@ async fn volatile_snapshot_refreshes_at_each_logical_request_boundary() {
 
     let first_turn_requests = provider.requests();
     assert_eq!(first_turn_requests.len(), 3);
-    let first_turn_epochs = first_turn_requests
+    let first_turn_history_digests = first_turn_requests
         .iter()
         .map(|request| {
             request
                 .cache_metadata
                 .as_ref()
                 .expect("cache metadata")
-                .cache_epoch
+                .prefix_digests
+                .immutable_history
                 .clone()
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
-        first_turn_epochs.len(),
+        first_turn_history_digests.len(),
         3,
-        "each refreshed logical request declares its exact-view epoch"
+        "each refreshed logical request declares its exact history digest"
+    );
+    let cache_epoch = &first_turn_requests[0]
+        .cache_metadata
+        .as_ref()
+        .expect("cache metadata")
+        .cache_epoch;
+    assert!(first_turn_requests.iter().all(|request| {
+        &request
+            .cache_metadata
+            .as_ref()
+            .expect("cache metadata")
+            .cache_epoch
+            == cache_epoch
+    }));
+    assert_eq!(
+        first_turn_requests
+            .iter()
+            .map(|request| &request
+                .cache_metadata
+                .as_ref()
+                .expect("metadata")
+                .request_view_epoch)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "exact view epochs still declare snapshot changes independently of routing"
     );
     for (index, request) in first_turn_requests.iter().enumerate() {
         let expected = format!("GraphBrief snapshot {}", index + 1);
@@ -275,13 +309,24 @@ async fn volatile_snapshot_refreshes_at_each_logical_request_boundary() {
             .cache_metadata
             .as_ref()
             .expect("second-turn cache metadata")
-            .cache_epoch,
+            .prefix_digests
+            .immutable_history,
         first_turn_requests[2]
             .cache_metadata
             .as_ref()
             .expect("third request cache metadata")
+            .prefix_digests
+            .immutable_history,
+        "the accepted turn boundary declares a new exact snapshot digest"
+    );
+    assert_eq!(
+        &second_turn
+            .cache_metadata
+            .as_ref()
+            .expect("cache metadata")
             .cache_epoch,
-        "the accepted turn boundary declares a new snapshot epoch"
+        cache_epoch,
+        "accepted turns preserve routing identity while history matching stays exact"
     );
     assert!(
         second_turn

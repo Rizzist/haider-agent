@@ -448,6 +448,8 @@ pub enum CacheControlOmissionReasonV1 {
     ProviderMismatch,
     UnsupportedModel,
     Unverified,
+    BelowMinimum,
+    NoEligibleBoundary,
     AdapterUnavailable,
     #[serde(other)]
     Unknown,

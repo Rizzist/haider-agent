@@ -255,15 +255,106 @@ def measure(report_path: Path, bench_root: Path) -> dict:
     }
 
 
+def cache_neutral(value: dict) -> dict:
+    """Strip placement fields only at wire boundaries, never tool arguments."""
+    body = json.loads(json.dumps(value))
+    for key in ("cache_control", "prompt_cache_key", "prompt_cache_options"):
+        body.pop(key, None)
+    for section in ("tools", "system"):
+        for block in body.get(section, []) if isinstance(body.get(section), list) else []:
+            block.pop("cache_control", None)
+    for message in body.get("messages", []):
+        for block in message.get("content", []) if isinstance(message.get("content"), list) else []:
+            block.pop("cache_control", None)
+    return body
+
+
+def cache_capture_parts(record: dict, dialect: str) -> tuple[dict, dict]:
+    body = cache_neutral(record["body"])
+    if dialect == "anthropic-messages":
+        system = body.get("system", [])
+        if isinstance(system, str):
+            system = [{"type": "text", "text": system}]
+        body["system"] = system
+        fixed = {"system": system, "tools": body.get("tools", [])}
+    elif dialect == "gemini-generate-content":
+        if "cachedContent" in body:
+            prefix = record.get("cached_prefix")
+            if prefix is None:
+                raise ValueError("Gemini resource capture needs its exact cached_prefix; suffix alone is not full input")
+            body.pop("cachedContent")
+            body["contents"] = prefix["contents"] + body.get("contents", [])
+            body["system_instruction"] = prefix.get("systemInstruction")
+            body["tools"] = prefix.get("tools", [])
+        fixed = {"system_instruction": body.get("system_instruction"), "tools": body.get("tools", [])}
+    else:
+        raise ValueError(f"unsupported cache capture dialect: {dialect}")
+    return body, fixed
+
+
+def measure_cache_capture(capture: Path, bench_root: Path, dialect: str) -> dict:
+    """Count full logical input and wire overhead separately from cache usage.
+
+    The recorder's counters retain their declared provenance (the HTTP fake
+    uses byte/4 units). They are never relabeled as reference or billed tokens.
+    """
+    records = json.loads(capture.read_text())
+    if not records:
+        raise ValueError("empty cache capture")
+    tokenizer = ReferenceTokenizer(bench_root / "assets/ahrb_o200k_base_style_v1.tiktoken")
+    parts = [cache_capture_parts(record, dialect) for record in records]
+    bodies, fixed = zip(*parts)
+    counters = {key: sum(record["usage"][key] for record in records)
+                for key in ("logical", "uncached", "read", "write")}
+    if counters["logical"] != counters["uncached"] + counters["read"] or counters["write"] > counters["uncached"]:
+        raise ValueError("cache counters violate input conservation")
+    ttl_writes = {key: sum(record["usage"].get(key, 0) for record in records)
+                  for key in ("write_5m", "write_1h")}
+    models = {body.get("model") for body in bodies}
+    priced = (dialect == "anthropic-messages"
+              and models <= {"claude-fable-5-1", "claude-mythos-5-1"}
+              and sum(ttl_writes.values()) == counters["write"])
+    synthetic_cost = ((counters["uncached"] - counters["write"]
+                       + 1.25 * ttl_writes["write_5m"] + 2 * ttl_writes["write_1h"]
+                       + 0.025 * counters["read"]) * 10 / 1_000_000) if priced else None
+    return {
+        "schema": "haider.cache-capture.measure.v1", "dialect": dialect,
+        "capture_sha256": hashlib.sha256(capture.read_bytes()).hexdigest(),
+        "reference_vocabulary_sha256": tokenizer.sha256,
+        "request_count": len(records),
+        "logical_body_sha256": [hashlib.sha256(canonical(body)).hexdigest() for body in bodies],
+        "schema_bytes": [len(canonical(body.get("tools", []))) for body in bodies],
+        "fixed_overhead_reference_tokens": [tokenizer.count(canonical(prefix)) for prefix in fixed],
+        "logical_reference_tokens": sum(tokenizer.count(canonical(body)) for body in bodies),
+        "wire_reference_tokens": sum(tokenizer.count(canonical(record["body"])) for record in records),
+        "usage_provenance": "synthetic HTTP fake; deterministic byte/4 units, not provider billed tokens",
+        "usage": counters,
+        "synthetic_input_cost_usd": synthetic_cost,
+        "cache_write_ttl_units": ttl_writes,
+        "cost_provenance": "illustrative Fable/Mythos 5.1 rates with exact 5m/1h write splits applied to synthetic units; not measured billing" if priced else "no cost inferred: model price or write TTL unknown",
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--report", required=True, type=Path)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--report", type=Path)
+    inputs.add_argument("--cache-capture", type=Path)
+    parser.add_argument("--dialect", choices=["anthropic-messages", "gemini-generate-content"])
     parser.add_argument("--bench-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    result = measure(args.report, args.bench_root)
+    if args.cache_capture:
+        if not args.dialect:
+            parser.error("--cache-capture requires --dialect")
+        result = measure_cache_capture(args.cache_capture, args.bench_root, args.dialect)
+    else:
+        result = measure(args.report, args.bench_root)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    if args.cache_capture:
+        print(json.dumps(result, sort_keys=True))
+        return
     print(json.dumps({key: result[key] for key in (
         "model_turns", "per_turn_fixed_overhead_tokens", "system_side_tokens", "tool_side_tokens",
         "tool_result_content_bytes_per_result", "tool_result_envelope_overhead_bytes_per_result",

@@ -1,0 +1,257 @@
+[
+  {
+    "type": "workflow_graph_started",
+    "graph_id": "workflow",
+    "ast": {
+      "workflow_id": "fixture",
+      "workflow_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "input_type": "Text",
+      "output_type": "Text",
+      "nodes": [
+        {
+          "node": "BUILD",
+          "input_type": "Text",
+          "output_type": "Text",
+          "join": {
+            "initial_all": [
+              1
+            ]
+          }
+        }
+      ],
+      "edges": [
+        {
+          "id": 1,
+          "kind": "graph_input",
+          "to": "BUILD",
+          "evidence_type": "Text"
+        }
+      ],
+      "max_back_edge_activations": 1
+    },
+    "ast_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "type": "workflow_node_activated",
+    "graph_id": "workflow",
+    "node": "BUILD",
+    "iteration": 1,
+    "activation_order": 1,
+    "cause": "forward_join",
+    "inputs": [],
+    "input_ledger_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "type": "workflow_node_completed",
+    "graph_id": "workflow",
+    "node": "BUILD",
+    "iteration": 1,
+    "outputs": [],
+    "output_ledger_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "type": "workflow_node_rejected",
+    "graph_id": "workflow",
+    "node": "BUILD",
+    "iteration": 2,
+    "code": "abandoned",
+    "message": "fixture"
+  },
+  {
+    "type": "child_graph_attached",
+    "parent_run_id": "parent-run",
+    "parent_call_id": "call",
+    "parent_tool_item_id": "item",
+    "parent_attempt": {
+      "graph_id": "parent",
+      "node": "BUILD",
+      "attempt": 1
+    },
+    "parent_slot": "BUILD",
+    "parent_authority": "daemon_verified",
+    "child_session_id": "child",
+    "child_run_id": "child-run",
+    "child_graph_id": "child-graph",
+    "workflow": "implement_verify",
+    "template": "fixture",
+    "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "gate_reason": "fixture",
+    "cache_key": {
+      "task_shape": "fixture",
+      "effective_grant_digest": "fixture",
+      "gate_structure": "fixture"
+    }
+  },
+  {
+    "type": "child_template_observed",
+    "cache_key": {
+      "task_shape": "fixture",
+      "effective_grant_digest": "fixture",
+      "gate_structure": "fixture"
+    },
+    "parent_attempt": {
+      "graph_id": "parent",
+      "node": "BUILD",
+      "attempt": 1
+    },
+    "collapse_evidence_seq": 1,
+    "child_contract": {
+      "child_session_id": "child",
+      "child_run_id": "child-run",
+      "child_graph_id": "child-graph",
+      "report_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "template": {
+      "name": "fixture",
+      "version": 1,
+      "nodes": [
+        {
+          "name": "BUILD",
+          "gate": {
+            "kind": "command-green"
+          },
+          "executor": "inline",
+          "max_attempts": 1
+        }
+      ]
+    },
+    "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "type": "child_template_promoted",
+    "cache_key": {
+      "task_shape": "fixture",
+      "effective_grant_digest": "fixture",
+      "gate_structure": "fixture"
+    },
+    "template": "fixture",
+    "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "distinct_parent_attempts": 3
+  },
+  {
+    "type": "monitor_registered",
+    "registration": {}
+  },
+  {
+    "type": "monitor_removed",
+    "monitor_id": "fixture",
+    "reason": "completed",
+    "removed_at_ms": 1
+  },
+  {
+    "type": "monitor_tool_receipt",
+    "operation_id": "fixture",
+    "receipt": {}
+  },
+  {
+    "type": "monitor_client_receipt",
+    "operation_id": "fixture",
+    "receipt": {}
+  },
+  {
+    "type": "monitor_report_pending",
+    "pending": {}
+  },
+  {
+    "type": "monitor_report_delivered",
+    "report_id": "fixture",
+    "delivered_at_ms": 1
+  },
+  {
+    "type": "queue_changed",
+    "revision": 1,
+    "change": {
+      "kind": "enqueued",
+      "row": {
+        "id": "queue",
+        "text": "fixture",
+        "mode": "queue",
+        "ordinal": 1,
+        "created_at_ms": 1
+      }
+    }
+  },
+  {
+    "type": "queue_changed",
+    "revision": 2,
+    "change": {
+      "kind": "promoted_steer",
+      "id": "queue"
+    }
+  },
+  {
+    "type": "queue_changed",
+    "revision": 3,
+    "change": {
+      "kind": "consumed",
+      "id": "queue"
+    }
+  },
+  {
+    "type": "queue_changed",
+    "revision": 4,
+    "change": {
+      "kind": "removed",
+      "id": "queue"
+    }
+  },
+  {
+    "type": "response_started",
+    "delta": {}
+  },
+  {
+    "type": "prompt_retracted",
+    "prompt_seq": 1,
+    "prompt_node_id": "n",
+    "text": "fixture",
+    "attachments": []
+  },
+  {
+    "type": "run_retried",
+    "failed_run_id": "r1",
+    "prompt_run_id": "r0",
+    "user_seq": 1
+  },
+  {
+    "type": "provider_operation_reserved",
+    "request_kind": "main_turn"
+  },
+  {
+    "type": "future_additive_family",
+    "extension": {
+      "new": "field"
+    }
+  },
+  {
+    "type": "context_compaction",
+    "turn_ordinal": 7,
+    "request_ordinal": 3,
+    "operation_id": "fixture",
+    "covers_from": "n1",
+    "covers_to": "n2",
+    "dropped_item_count": 4,
+    "dropped_item_unit": "provider_message",
+    "retained_suffix_size": 5,
+    "retained_suffix_unit": "provider_message",
+    "summary_artifact": "blake3:fixture",
+    "resume_cause": "auto_mid_turn"
+  },
+  {
+    "type": "headless_run_configured",
+    "provider": "fake",
+    "model": "fixture",
+    "max_output_tokens": 4096
+  },
+  {
+    "type": "run_deadline_exceeded",
+    "deadline_unix_ms": 1
+  },
+  {
+    "type": "session_forked",
+    "source_session_id": "parent",
+    "fork_node_id": "node",
+    "fork_seq": 1,
+    "mode": "fork",
+    "context_epoch": "fresh"
+  }
+]
