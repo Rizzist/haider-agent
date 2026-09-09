@@ -7662,5 +7662,9 @@ fn report_status_name(status: MonitorReportStatus) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "monitor_completion_tests.rs"]
+mod completion_tests;
+
+#[cfg(test)]
 #[path = "monitor_tests.rs"]
 mod monitor_tests;

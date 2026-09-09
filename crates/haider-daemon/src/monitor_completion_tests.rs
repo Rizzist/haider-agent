@@ -1,6 +1,12 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use super::monitor_tests::{MonitorWorld, registration, test_report};
 use super::*;
+use haider_core::SqliteStoreHandle;
+use haider_protocol::EventPayload;
 use haider_protocol::completion::{CompletionSource, CompletionStatus};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::state::RunState;
 use haider_tools::CompletionControl;
 
 async fn pending_task(world: &MonitorWorld) -> String {
@@ -618,4 +624,122 @@ async fn verifier_deleted_session_retires_cached_incomplete_admission() {
     drop(hub);
     store.close().await.unwrap();
     drop(root);
+}
+
+#[test]
+fn verifier_delete_keeps_monitor_fence_until_cache_eviction() {
+    // A single blocking thread makes the durable-absence read a FIFO barrier:
+    // the prior SQLite delete task has completed and published its JoinHandle
+    // result before the absence query can execute. No timing sleep is needed.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build().unwrap().block_on(async {
+    use haider_protocol::completion::CompletionEvent;
+    let world = MonitorWorld::new("verifier-delete-admitting").await;
+    let mut report = test_report(
+        "verifier-delete-admitting-report",
+        "pending admission",
+        MonitorReportStatus::Matched,
+    );
+    report.session_id = world.session.clone();
+    observe_monitor(&world, report).await;
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&world.run),
+            None,
+            None,
+            "verifier-source-terminal",
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Done)).unwrap(),
+        )])
+        .await
+        .unwrap();
+    let service = world.hub.inner_monitor().clone();
+    let guard = service.completion_lock().await;
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    let obligation = journal.projection.pending.values().next().unwrap();
+    crate::completion::append(
+        &world.hub,
+        obligation,
+        CompletionEvent::CompletionAttempt {
+            obligation_id: obligation.obligation_id.clone(),
+            attempt: 1,
+            worker_generation: world.hub.worker_generation(),
+        },
+    )
+    .await
+    .unwrap();
+    // The durable prefix exists after an attempt/admission crash. A cold
+    // reconciler reads it before dispatch; deletion can win before admission.
+    service.completion_cache().await.clear();
+    let journal = crate::completion::load(&world.hub, &world.session)
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.projection.pending.values().next().unwrap().status,
+        CompletionStatus::Admitting
+    );
+    let MonitorWorld {
+        hub,
+        store,
+        session,
+        lease,
+        _root: root,
+        ..
+    } = world;
+    drop(lease);
+    // Force durable deletion to finish while eviction is blocked on its real
+    // mutex. A released tombstone here exposes the stale admitting cache.
+    let fenced = {
+        let cache_guard = hub.inner_monitor().completion_cache().await;
+        let deleting = hub.delete_session(session.clone());
+        tokio::pin!(deleting);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut deleting => panic!("delete completed while cache mutex was held: {result:?}"),
+            () = async {
+                loop {
+                    if !hub.session_ids().await.unwrap().contains(&session) { break; }
+                    tokio::task::yield_now().await;
+                }
+            } => (),
+        }
+    }).await.unwrap();
+        // SQLite has completed deletion. Poll that same future once explicitly so
+        // it consumes the durable result and reaches its blocked cache eviction.
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            assert!(deleting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let fenced = hub.inner_monitor().completion_retired(&session);
+        assert!(cache_guard.contains_key(&session));
+        drop(cache_guard);
+        deleting.await.unwrap();
+        fenced
+    };
+    assert!(
+        fenced,
+        "monitor tombstone released while stale completion cache still exists after durable deletion"
+    );
+    drop(guard);
+    let first = crate::completion::reconcile(&hub, &session).await;
+    let second = crate::completion::reconcile(&hub, &session).await;
+    assert!(!hub.session_ids().await.unwrap().contains(&session));
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "deleted sessions must leave the retry scheduler, first={first:?}, second={second:?}"
+    );
+    hub.inner_monitor().shutdown().await.unwrap();
+    drop(hub);
+    store.close().await.unwrap();
+    drop(root);
+    });
 }
