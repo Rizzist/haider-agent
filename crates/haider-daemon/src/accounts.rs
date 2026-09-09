@@ -1665,7 +1665,8 @@ async fn run_account_actor(
     source_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     source_reconcile.tick().await;
     let (source_event_tx, mut source_events) = watch::channel(0_u64);
-    let _source_watcher = CredentialSourceWatcher::new(&source_registry, source_event_tx.clone());
+    let _source_watcher = (!crate::android_policy::enabled())
+        .then(|| CredentialSourceWatcher::new(&source_registry, source_event_tx.clone()));
     let _source_event_tx = source_event_tx;
     let mut draining = false;
     if backfill_oauth_identities(&mut accounts, vault.as_ref()).await {
@@ -1736,8 +1737,8 @@ async fn run_account_actor(
                 }
                 continue;
             }
-            _ = source_reconcile.tick(), if !draining => AccountCommand::ReconcileSources,
-            changed = source_events.changed(), if !draining => {
+            _ = source_reconcile.tick(), if !draining && !crate::android_policy::enabled() => AccountCommand::ReconcileSources,
+            changed = source_events.changed(), if !draining && !crate::android_policy::enabled() => {
                 if changed.is_err() {
                     continue;
                 }
@@ -2288,7 +2289,10 @@ async fn run_account_actor(
                 let linked_source = source_registry.lock().ok().and_then(|registry| {
                     registry.find_by_alias(descriptor.alias.as_str()).cloned()
                 });
-                let result = if let Some(linked_source) = linked_source.filter(|source| {
+                let result = if crate::android_policy::enabled() && linked_source.is_some() {
+                    crate::oauth::require_credential_import_available()
+                        .map(|()| OAuthImportHealResult::NotImported)
+                } else if let Some(linked_source) = linked_source.filter(|source| {
                     crate::device_discovery::linked_kind_yields_access(source.kind)
                 }) {
                     let source_id = linked_source.id;
@@ -6908,6 +6912,9 @@ async fn handle_oauth_import_heal(
     if identity.alias != descriptor.alias.as_str() || identity.provider != descriptor.provider {
         return Ok(OAuthImportHealResult::NotImported);
     }
+    // Preserve import provenance: an error must stop healing/refresh rather
+    // than returning NotImported and authorizing refresh of a source-owned token.
+    crate::oauth::require_credential_import_available()?;
     let spec = oauth_import_source_spec(&identity.source)?;
     if spec.provider != descriptor.provider {
         return Ok(OAuthImportHealResult::NotImported);
@@ -11446,6 +11453,9 @@ fn reconcile_credential_sources(
     registry: &mut CredentialSourceRegistry,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
 ) -> Result<(), HaiderError> {
+    if crate::android_policy::enabled() {
+        return Ok(());
+    }
     let now = unix_ms_after(Duration::ZERO);
     let records = registry.records().to_vec();
     for mut record in records.into_iter().filter(|record| record.enabled) {
@@ -11689,6 +11699,9 @@ impl Vault for SourceLinkedVault {
     }
 
     fn resolve(&self, alias: &CredentialAlias) -> Result<SecretHandle, HaiderError> {
+        if crate::android_policy::enabled() {
+            return self.inner.resolve(alias);
+        }
         let source = self
             .registry
             .lock()
@@ -11972,6 +11985,9 @@ impl AccountsRuntime {
         // consumed HERE and never reaches the matches below.
         let source: Option<Arc<dyn Vault>> = match &dependencies.vault {
             VaultProvision::Available(inner) => Some(Arc::clone(inner)),
+            VaultProvision::PlatformDefault if crate::android_policy::enabled() => {
+                return Err(crate::android_policy::denied());
+            }
             VaultProvision::PlatformDefault => Some(Arc::new(haider_accounts::FileVault::new(
                 store_dir.join("vault"),
             )) as Arc<dyn Vault>),
@@ -12030,7 +12046,9 @@ impl AccountsRuntime {
             reconcile_provider_receipts(store, &accounts, &mut providers).await?;
             reserved_aliases
         };
-        import_bedrock_env_bearer(&mut accounts, &vault);
+        if !crate::android_policy::enabled() {
+            import_bedrock_env_bearer(&mut accounts, &vault);
+        }
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
         let management_revision = if schema_bootstrapped_from_zero {
             0

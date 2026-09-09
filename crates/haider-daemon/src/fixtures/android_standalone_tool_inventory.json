@@ -1,0 +1,2928 @@
+{
+  "restricted_child_definitions": [
+    {
+      "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "filter": {
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_tools"
+    },
+    {
+      "description": "interactive: ask one question or choice; autonomous: return the declared default or no_human_available without waiting; options=[{key, label, detail?}] for a choice",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {
+            "description": "Optional deterministic fallback: literal answer for question, option key for choice",
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "question",
+              "choice"
+            ],
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "detail": {
+                  "type": "string"
+                },
+                "key": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "label": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "label"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "title": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "request_input"
+    },
+    {
+      "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "fs_read"
+    },
+    {
+      "description": "List workspace paths matching a repository-aware glob; use it to find files by name or extension before reading them",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_hidden": {
+            "default": false,
+            "type": "boolean"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "pattern": {
+            "description": ".git paths are always excluded",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "respect_gitignore": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "name": "fs_glob"
+    },
+    {
+      "description": "Search workspace file contents; use it to locate symbols or text before reading or editing a file",
+      "input_schema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "pattern"
+            ]
+          },
+          {
+            "required": [
+              "query"
+            ]
+          }
+        ],
+        "properties": {
+          "case": {
+            "enum": [
+              "sensitive",
+              "insensitive",
+              "smart"
+            ],
+            "type": "string"
+          },
+          "context": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "maximum": 5,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "before": {
+                "maximum": 5,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "file_glob": {
+            "additionalProperties": false,
+            "properties": {
+              "exclude": {
+                "items": {
+                  "maxLength": 1024,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              "include": {
+                "items": {
+                  "maxLength": 1024,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "glob": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "include_hidden": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_matches": {
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "description": "regex sources are additionally capped at 1024 UTF-8 bytes before Unicode expansion",
+            "enum": [
+              "literal",
+              "simple",
+              "regex"
+            ],
+            "type": "string"
+          },
+          "multiline": {
+            "default": false,
+            "description": "Make ^ and $ match physical line boundaries in the line-streamed regex engine",
+            "type": "boolean"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "pattern": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Legacy alias for pattern",
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "respect_gitignore": {
+            "default": true,
+            "type": "boolean"
+          },
+          "root": {
+            "description": "Legacy alias for path",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "fs_search"
+    },
+    {
+      "description": "Create or replace one UTF-8 file; use it for a new file or a complete rewrite",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "fs_write"
+    },
+    {
+      "description": "Apply anchored replacements to one UTF-8 file; use it for focused changes after reading the current contents",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "edits": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "new": {
+                  "type": "string"
+                },
+                "old": {
+                  "description": "Must match uniquely unless replace_all is true",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "replace_all": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "old",
+                "new"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "edits"
+        ],
+        "type": "object"
+      },
+      "name": "fs_edit"
+    },
+    {
+      "description": "Create or replace one UTF-8 file; replacing an existing file requires a fresh read",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "Complete UTF-8 file contents; an empty string creates or truncates to an empty file",
+            "type": "string"
+          },
+          "file_path": {
+            "description": "Path inside the workspace; read an existing file before replacing it",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "write"
+    },
+    {
+      "description": "Replace exact text in one UTF-8 file after a fresh read; the anchor must be unique unless replace_all is true",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "file_path": {
+            "description": "Path inside the workspace; read the current file before editing",
+            "minLength": 1,
+            "type": "string"
+          },
+          "new_string": {
+            "description": "Replacement text; an empty string deletes the matched text",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "Exact existing text, including whitespace; must match uniquely unless replace_all",
+            "minLength": 1,
+            "type": "string"
+          },
+          "replace_all": {
+            "description": "Replace every exact match; at least one match is required; defaults to false",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_path",
+          "old_string",
+          "new_string"
+        ],
+        "type": "object"
+      },
+      "name": "edit"
+    },
+    {
+      "description": "Move, copy, or delete a workspace path; use it when the requested change affects filesystem structure",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "description": "Required for move and copy",
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation": {
+            "enum": [
+              "move",
+              "delete",
+              "copy"
+            ],
+            "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean"
+          },
+          "source": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "source"
+        ],
+        "type": "object"
+      },
+      "name": "fs_path"
+    },
+    {
+      "description": "delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_type": {
+            "description": "Registered Loom agent type for a TYPED child (capability-scoped specialist)",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "model": {
+            "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "parent_slot": {
+            "description": "Declared parent graph evidence slot for the single collapsed child contract",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "prompt": {
+            "description": "Complete task prompt for the child",
+            "maxLength": 32768,
+            "minLength": 1,
+            "type": "string"
+          },
+          "provider": {
+            "description": "Optional disambiguator when `model` is served by several providers; requires `model`",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "request_budget": {
+            "additionalProperties": false,
+            "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+            "properties": {
+              "hard_cap": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "tranche": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "tranche",
+              "hard_cap"
+            ],
+            "type": "object"
+          },
+          "task": {
+            "description": "Short display label for the child",
+            "maxLength": 80,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workflow": {
+            "description": "Optional child workflow proposal; omitted defaults to one bare attempt",
+            "pattern": "^(plain|implement_verify|deeper|workflow_ref\\([A-Za-z0-9_-]{1,64}\\))$",
+            "type": "string"
+          },
+          "workflow_author": {
+            "description": "Request graph-authoring capability; granted only for a deeper trigger",
+            "type": "boolean"
+          },
+          "workflow_trigger": {
+            "description": "Bounded reason the workflow earns its graph",
+            "enum": [
+              "mutation_with_independent_verification",
+              "dependent_phases",
+              "fan_out",
+              "distinct_review",
+              "crash_recovery"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "task",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "name": "spawn_subagent"
+    },
+    {
+      "description": "steer a running direct child or start an idle one (agent = id returned by spawn_subagent)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "description": "Opaque child agent id returned by spawn_subagent",
+            "minLength": 1,
+            "type": "string"
+          },
+          "message": {
+            "description": "Instruction to inject or start as the child's next turn",
+            "maxLength": 32768,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent",
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "message_subagent"
+    },
+    {
+      "description": "fetch a public https (or loopback http) URL and return its readable text",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_bytes": {
+            "description": "Optional smaller output cap in bytes.",
+            "minimum": 512,
+            "type": "integer"
+          },
+          "url": {
+            "description": "Absolute http(s) URL to fetch.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "web_fetch"
+    },
+    {
+      "description": "search the web, returning a bounded text summary",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "description": "The search query.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "web_search"
+    },
+    {
+      "description": "durable sms/process/file/poll/timer/cli watches; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy",
+      "input_schema": {
+        "properties": {
+          "action": {
+            "properties": {
+              "follow_up": {
+                "type": "string"
+              },
+              "report": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "filter": {
+            "properties": {
+              "case_sensitive": {
+                "type": "boolean"
+              },
+              "field": {
+                "enum": [
+                  "address",
+                  "body",
+                  "payload"
+                ],
+                "type": "string"
+              },
+              "operator": {
+                "enum": [
+                  "equals",
+                  "contains",
+                  "starts_with",
+                  "ends_with"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "field",
+              "operator",
+              "value"
+            ],
+            "type": "object"
+          },
+          "lifetime": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "session",
+                  "timeout"
+                ],
+                "type": "string"
+              },
+              "timeout_ms": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "monitor_id": {
+            "type": "string"
+          },
+          "occurrence": {
+            "enum": [
+              "once",
+              "every"
+            ],
+            "type": "string"
+          },
+          "operation": {
+            "enum": [
+              "register",
+              "list",
+              "update",
+              "pause",
+              "resume",
+              "trigger",
+              "remove"
+            ],
+            "type": "string"
+          },
+          "source": {
+            "additionalProperties": false,
+            "properties": {
+              "interval_ms": {
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "sms",
+                  "file",
+                  "timer"
+                ],
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "type": "object"
+      },
+      "name": "monitor"
+    },
+    {
+      "description": "read the daemon's cached model/provider catalog; filter matches model, provider, or alias without a network refresh",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "filter": {
+            "description": "Optional case-insensitive model/provider/alias substring",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_models"
+    }
+  ],
+  "root_active": {
+    "remembered_grants": [],
+    "tools": [
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "filter": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "list_tools"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Request one question or choice: interactive sessions wait for human input; autonomous sessions return the declared default or no_human_available without waiting",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "body": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "default": {
+                "description": "Optional deterministic fallback: literal answer for question, option key for choice",
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "question",
+                  "choice"
+                ],
+                "type": "string"
+              },
+              "options": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "label": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "key",
+                    "label"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "title": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "title"
+            ],
+            "type": "object"
+          },
+          "name": "request_input"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Present and record a full plan/proposal (markdown), then proceed autonomously without approval; returns {decision: accept, note: \"\"}",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "properties": {
+              "body": {
+                "maxLength": 32768,
+                "minLength": 1,
+                "type": "string"
+              },
+              "title": {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "body"
+            ],
+            "type": "object"
+          },
+          "name": "plan"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Register a Loom workflow (kind=workflow, source=pipe text) or agent type                       (kind=agent_type, record object). Requires a previously presented plan whose                       body contains the registration content; present one first.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "expected_digest": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "expected_rev": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "workflow",
+                  "agent_type"
+                ],
+                "type": "string"
+              },
+              "record": {
+                "type": "object"
+              },
+              "source": {
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "expected_rev"
+            ],
+            "type": "object"
+          },
+          "name": "loom_register"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Maintain your visible task plan. Use it for multi-step work: list the steps before starting, keep exactly one item `processing` while you work on it, and mark an item `completed` immediately when it is done. Every call REPLACES the whole list, so re-send all items each time, keeping each item's `id` stable; change one item's `state` to update or complete that specific todo. `dep` marks an item blocked until the referenced id completes. An empty list clears the plan. Not needed for trivial single-step tasks.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "properties": {
+              "items": {
+                "description": "The COMPLETE plan; this list replaces the previous one",
+                "items": {
+                  "properties": {
+                    "dep": {
+                      "description": "Optional id of the todo this one is blocked on",
+                      "type": "integer"
+                    },
+                    "id": {
+                      "description": "Stable id for this todo, kept across calls",
+                      "type": "integer"
+                    },
+                    "state": {
+                      "description": "listed = not started, processing = in progress (one at a time), completed = done",
+                      "enum": [
+                        "listed",
+                        "processing",
+                        "completed"
+                      ],
+                      "type": "string"
+                    },
+                    "text": {
+                      "description": "Short imperative description",
+                      "maxLength": 500,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "text",
+                    "state"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 50,
+                "type": "array"
+              }
+            },
+            "required": [
+              "items"
+            ],
+            "type": "object"
+          },
+          "name": "todo_write"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Record green or red evidence for the current open graph obligation. Use evidence_from=latest_process or latest_mutation for daemon-verified slots, latest_subject for model testimony. The daemon resolves this run's durable provenance and checks freshness and authority before advancing the gate.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "detail": {
+                "description": "Bounded evidence summary; normalized and fingerprinted by the daemon",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "evidence_from": {
+                "description": "Resolve the latest terminal process or applied mutation in this run from the journal; latest_subject supplies only the subject for model testimony. Cannot combine with explicit references. All freshness and authority checks still apply.",
+                "enum": [
+                  "latest_process",
+                  "latest_mutation",
+                  "latest_subject"
+                ],
+                "type": "string"
+              },
+              "graph_id": {
+                "description": "Active graph id from GraphBrief; binds evidence across graph.switch races",
+                "minLength": 1,
+                "type": "string"
+              },
+              "node": {
+                "description": "Must equal one of the current open obligations",
+                "pattern": "^[A-Z][A-Z0-9_-]{0,63}$",
+                "type": "string"
+              },
+              "signal": {
+                "additionalProperties": false,
+                "description": "Required for daemon-verified slots; must reference a durable process signal",
+                "properties": {
+                  "call_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "effect_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "run_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "call_id",
+                  "effect_id"
+                ],
+                "type": "object"
+              },
+              "slot": {
+                "description": "Required when the pinned all-of-N node declares evidence slots",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "subject_digest": {
+                "description": "Subject digest emitted by the referenced daemon signal, or the attested subject",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "verdict": {
+                "enum": [
+                  "green",
+                  "red"
+                ],
+                "type": "string"
+              },
+              "workspace_mutation": {
+                "additionalProperties": false,
+                "description": "Alternative daemon provenance for a durable filesystem mutation",
+                "properties": {
+                  "effect_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "run_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "effect_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "graph_id",
+              "node",
+              "verdict",
+              "detail"
+            ],
+            "type": "object"
+          },
+          "name": "graph_evidence"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_read"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "limit": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "offset": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "name": "fs_read"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "List workspace paths matching a repository-aware glob; use it to find files by name or extension before reading them",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_read"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "include_hidden": {
+                "default": false,
+                "type": "boolean"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "pattern": {
+                "description": ".git paths are always excluded",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "respect_gitignore": {
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "pattern"
+            ],
+            "type": "object"
+          },
+          "name": "fs_glob"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "Search workspace file contents; use it to locate symbols or text before reading or editing a file",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_read"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "anyOf": [
+              {
+                "required": [
+                  "pattern"
+                ]
+              },
+              {
+                "required": [
+                  "query"
+                ]
+              }
+            ],
+            "properties": {
+              "case": {
+                "enum": [
+                  "sensitive",
+                  "insensitive",
+                  "smart"
+                ],
+                "type": "string"
+              },
+              "context": {
+                "additionalProperties": false,
+                "properties": {
+                  "after": {
+                    "maximum": 5,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "before": {
+                    "maximum": 5,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "file_glob": {
+                "additionalProperties": false,
+                "properties": {
+                  "exclude": {
+                    "items": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "type": "array"
+                  },
+                  "include": {
+                    "items": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "glob": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "include_hidden": {
+                "default": false,
+                "type": "boolean"
+              },
+              "max_matches": {
+                "maximum": 200,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "mode": {
+                "description": "regex sources are additionally capped at 1024 UTF-8 bytes before Unicode expansion",
+                "enum": [
+                  "literal",
+                  "simple",
+                  "regex"
+                ],
+                "type": "string"
+              },
+              "multiline": {
+                "default": false,
+                "description": "Make ^ and $ match physical line boundaries in the line-streamed regex engine",
+                "type": "boolean"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "pattern": {
+                "maxLength": 65536,
+                "minLength": 1,
+                "type": "string"
+              },
+              "query": {
+                "description": "Legacy alias for pattern",
+                "maxLength": 65536,
+                "minLength": 1,
+                "type": "string"
+              },
+              "respect_gitignore": {
+                "default": true,
+                "type": "boolean"
+              },
+              "root": {
+                "description": "Legacy alias for path",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "fs_search"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Create or replace one UTF-8 file; use it for a new file or a complete rewrite",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ],
+            "type": "object"
+          },
+          "name": "fs_write"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Apply anchored replacements to one UTF-8 file; use it for focused changes after reading the current contents",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "edits": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "new": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "description": "Must match uniquely unless replace_all is true",
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "replace_all": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "old",
+                    "new"
+                  ],
+                  "type": "object"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "edits"
+            ],
+            "type": "object"
+          },
+          "name": "fs_edit"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Create or replace one UTF-8 file; replacing an existing file requires a fresh read",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "content": {
+                "description": "Complete UTF-8 file contents; an empty string creates or truncates to an empty file",
+                "type": "string"
+              },
+              "file_path": {
+                "description": "Path inside the workspace; read an existing file before replacing it",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "file_path",
+              "content"
+            ],
+            "type": "object"
+          },
+          "name": "write"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Replace exact text in one UTF-8 file after a fresh read; the anchor must be unique unless replace_all is true",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "file_path": {
+                "description": "Path inside the workspace; read the current file before editing",
+                "minLength": 1,
+                "type": "string"
+              },
+              "new_string": {
+                "description": "Replacement text; an empty string deletes the matched text",
+                "type": "string"
+              },
+              "old_string": {
+                "description": "Exact existing text, including whitespace; must match uniquely unless replace_all",
+                "minLength": 1,
+                "type": "string"
+              },
+              "replace_all": {
+                "description": "Replace every exact match; at least one match is required; defaults to false",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "file_path",
+              "old_string",
+              "new_string"
+            ],
+            "type": "object"
+          },
+          "name": "edit"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Move, copy, or delete a workspace path; use it when the requested change affects filesystem structure",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "destination": {
+                "description": "Required for move and copy",
+                "minLength": 1,
+                "type": "string"
+              },
+              "operation": {
+                "enum": [
+                  "move",
+                  "delete",
+                  "copy"
+                ],
+                "type": "string"
+              },
+              "overwrite": {
+                "type": "boolean"
+              },
+              "source": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation",
+              "source"
+            ],
+            "type": "object"
+          },
+          "name": "fs_path"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "Delegate one bounded task to a depth-capped local child under AgentSpawn policy; waits for the child report before returning its tool result. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
+          "dispatch": "deferred",
+          "effects": [
+            {
+              "class": "agent_spawn"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "agent_type": {
+                "description": "Registered Loom agent type for a TYPED child (capability-scoped specialist)",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "model": {
+                "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "parent_slot": {
+                "description": "Declared parent graph evidence slot for the single collapsed child contract",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "prompt": {
+                "description": "Complete task prompt for the child",
+                "maxLength": 32768,
+                "minLength": 1,
+                "type": "string"
+              },
+              "provider": {
+                "description": "Optional disambiguator when `model` is served by several providers; requires `model`",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "request_budget": {
+                "additionalProperties": false,
+                "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+                "properties": {
+                  "hard_cap": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "tranche": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "tranche",
+                  "hard_cap"
+                ],
+                "type": "object"
+              },
+              "task": {
+                "description": "Short display label for the child",
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              "workflow": {
+                "description": "Optional child workflow proposal; omitted defaults to one bare attempt",
+                "pattern": "^(plain|implement_verify|deeper|workflow_ref\\([A-Za-z0-9_-]{1,64}\\))$",
+                "type": "string"
+              },
+              "workflow_author": {
+                "description": "Request graph-authoring capability; granted only for a deeper trigger",
+                "type": "boolean"
+              },
+              "workflow_trigger": {
+                "description": "Bounded reason the workflow earns its graph",
+                "enum": [
+                  "mutation_with_independent_verification",
+                  "dependent_phases",
+                  "fan_out",
+                  "distinct_review",
+                  "crash_recovery"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "task",
+              "prompt"
+            ],
+            "type": "object"
+          },
+          "name": "spawn_subagent"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Message one of your direct child agents. Running children are steered in their current round; idle children start immediately. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "description": "Opaque child agent id returned by spawn_subagent",
+                "minLength": 1,
+                "type": "string"
+              },
+              "message": {
+                "description": "Instruction to inject or start as the child's next turn",
+                "maxLength": 32768,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "agent",
+              "message"
+            ],
+            "type": "object"
+          },
+          "name": "message_subagent"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Fetch a public https URL (or loopback http) and return its readable text. HTML is reduced to text; only text/* and application/json bodies are supported; output is capped at 98304 bytes with an honest truncation marker.",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "network",
+              "host": ""
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "max_bytes": {
+                "description": "Optional smaller output cap in bytes.",
+                "minimum": 512,
+                "type": "integer"
+              },
+              "url": {
+                "description": "Absolute http(s) URL to fetch.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "type": "object"
+          },
+          "name": "web_fetch"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Search the web and return a bounded text summary of the results.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "query": {
+                "description": "The search query.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "name": "web_search"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Observe and control an explicitly activated mobile capability, list apps, or read SMS data. Call screenshot or a11y_tree before coordinate or element actions.",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "read_sms"
+            },
+            {
+              "class": "mobile_observe"
+            },
+            {
+              "class": "mobile_control"
+            }
+          ],
+          "input_schema": {
+            "properties": {
+              "action": {
+                "description": "Mobile action to perform",
+                "enum": [
+                  "screenshot",
+                  "a11y_tree",
+                  "inspect",
+                  "tap",
+                  "long_press",
+                  "swipe",
+                  "type",
+                  "key",
+                  "open_app",
+                  "list_apps",
+                  "sms_read"
+                ],
+                "type": "string"
+              },
+              "element_id": {
+                "description": "Accessibility element id",
+                "type": "string"
+              },
+              "folder": {
+                "description": "Optional SMS folder such as inbox or sent",
+                "type": "string"
+              },
+              "from": {
+                "description": "Swipe start pixel",
+                "properties": {
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": "object"
+              },
+              "key": {
+                "enum": [
+                  "back",
+                  "home",
+                  "enter",
+                  "recents"
+                ],
+                "type": "string"
+              },
+              "limit": {
+                "description": "Optional maximum number of messages",
+                "type": "integer"
+              },
+              "name": {
+                "description": "Installed application name",
+                "type": "string"
+              },
+              "package": {
+                "description": "Android application package",
+                "type": "string"
+              },
+              "since": {
+                "description": "Optional backend-defined lower time bound",
+                "type": "string"
+              },
+              "text": {
+                "description": "Text to type",
+                "type": "string"
+              },
+              "to": {
+                "description": "Swipe end pixel",
+                "properties": {
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": "object"
+              },
+              "x": {
+                "description": "X pixel in the latest mobile screenshot",
+                "type": "integer"
+              },
+              "y": {
+                "description": "Y pixel in the latest mobile screenshot",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "type": "object"
+          },
+          "name": "mobile"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Register, list, update, pause, resume, trigger, or remove durable SMS, workspace-file, and native timer watches. Reports use the canonical session hub.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "follow_up": {
+                    "type": "string"
+                  },
+                  "report": {
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              },
+              "filter": {
+                "properties": {
+                  "case_sensitive": {
+                    "type": "boolean"
+                  },
+                  "field": {
+                    "enum": [
+                      "address",
+                      "body",
+                      "payload"
+                    ],
+                    "type": "string"
+                  },
+                  "operator": {
+                    "enum": [
+                      "equals",
+                      "contains",
+                      "starts_with",
+                      "ends_with"
+                    ],
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "field",
+                  "operator",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "lifetime": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "session",
+                      "timeout"
+                    ],
+                    "type": "string"
+                  },
+                  "timeout_ms": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              },
+              "monitor_id": {
+                "type": "string"
+              },
+              "occurrence": {
+                "enum": [
+                  "once",
+                  "every"
+                ],
+                "type": "string"
+              },
+              "operation": {
+                "enum": [
+                  "register",
+                  "list",
+                  "update",
+                  "pause",
+                  "resume",
+                  "trigger",
+                  "remove"
+                ],
+                "type": "string"
+              },
+              "source": {
+                "additionalProperties": false,
+                "properties": {
+                  "interval_ms": {
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "enum": [
+                      "sms",
+                      "file",
+                      "timer"
+                    ],
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "type": "object"
+          },
+          "name": "monitor"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "List the daemon's already-discovered model catalog. This is a cached local read and never refreshes provider inventory. Use filter when the bounded result is truncated.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "filter": {
+                "description": "Optional case-insensitive model/provider/alias substring",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "list_models"
+        }
+      }
+    ]
+  },
+  "root_inactive": {
+    "remembered_grants": [],
+    "tools": [
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "filter": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "list_tools"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Request one question or choice: interactive sessions wait for human input; autonomous sessions return the declared default or no_human_available without waiting",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "body": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "default": {
+                "description": "Optional deterministic fallback: literal answer for question, option key for choice",
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "question",
+                  "choice"
+                ],
+                "type": "string"
+              },
+              "options": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "label": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "key",
+                    "label"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "title": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "title"
+            ],
+            "type": "object"
+          },
+          "name": "request_input"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Present and record a full plan/proposal (markdown), then proceed autonomously without approval; returns {decision: accept, note: \"\"}",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "properties": {
+              "body": {
+                "maxLength": 32768,
+                "minLength": 1,
+                "type": "string"
+              },
+              "title": {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "body"
+            ],
+            "type": "object"
+          },
+          "name": "plan"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Register a Loom workflow (kind=workflow, source=pipe text) or agent type                       (kind=agent_type, record object). Requires a previously presented plan whose                       body contains the registration content; present one first.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "expected_digest": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "expected_rev": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "workflow",
+                  "agent_type"
+                ],
+                "type": "string"
+              },
+              "record": {
+                "type": "object"
+              },
+              "source": {
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "expected_rev"
+            ],
+            "type": "object"
+          },
+          "name": "loom_register"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Maintain your visible task plan. Use it for multi-step work: list the steps before starting, keep exactly one item `processing` while you work on it, and mark an item `completed` immediately when it is done. Every call REPLACES the whole list, so re-send all items each time, keeping each item's `id` stable; change one item's `state` to update or complete that specific todo. `dep` marks an item blocked until the referenced id completes. An empty list clears the plan. Not needed for trivial single-step tasks.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "properties": {
+              "items": {
+                "description": "The COMPLETE plan; this list replaces the previous one",
+                "items": {
+                  "properties": {
+                    "dep": {
+                      "description": "Optional id of the todo this one is blocked on",
+                      "type": "integer"
+                    },
+                    "id": {
+                      "description": "Stable id for this todo, kept across calls",
+                      "type": "integer"
+                    },
+                    "state": {
+                      "description": "listed = not started, processing = in progress (one at a time), completed = done",
+                      "enum": [
+                        "listed",
+                        "processing",
+                        "completed"
+                      ],
+                      "type": "string"
+                    },
+                    "text": {
+                      "description": "Short imperative description",
+                      "maxLength": 500,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "text",
+                    "state"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 50,
+                "type": "array"
+              }
+            },
+            "required": [
+              "items"
+            ],
+            "type": "object"
+          },
+          "name": "todo_write"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Record green or red evidence for the current open graph obligation. Use evidence_from=latest_process or latest_mutation for daemon-verified slots, latest_subject for model testimony. The daemon resolves this run's durable provenance and checks freshness and authority before advancing the gate.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "detail": {
+                "description": "Bounded evidence summary; normalized and fingerprinted by the daemon",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "evidence_from": {
+                "description": "Resolve the latest terminal process or applied mutation in this run from the journal; latest_subject supplies only the subject for model testimony. Cannot combine with explicit references. All freshness and authority checks still apply.",
+                "enum": [
+                  "latest_process",
+                  "latest_mutation",
+                  "latest_subject"
+                ],
+                "type": "string"
+              },
+              "graph_id": {
+                "description": "Active graph id from GraphBrief; binds evidence across graph.switch races",
+                "minLength": 1,
+                "type": "string"
+              },
+              "node": {
+                "description": "Must equal one of the current open obligations",
+                "pattern": "^[A-Z][A-Z0-9_-]{0,63}$",
+                "type": "string"
+              },
+              "signal": {
+                "additionalProperties": false,
+                "description": "Required for daemon-verified slots; must reference a durable process signal",
+                "properties": {
+                  "call_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "effect_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "run_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "call_id",
+                  "effect_id"
+                ],
+                "type": "object"
+              },
+              "slot": {
+                "description": "Required when the pinned all-of-N node declares evidence slots",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "subject_digest": {
+                "description": "Subject digest emitted by the referenced daemon signal, or the attested subject",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "verdict": {
+                "enum": [
+                  "green",
+                  "red"
+                ],
+                "type": "string"
+              },
+              "workspace_mutation": {
+                "additionalProperties": false,
+                "description": "Alternative daemon provenance for a durable filesystem mutation",
+                "properties": {
+                  "effect_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "run_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "effect_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "graph_id",
+              "node",
+              "verdict",
+              "detail"
+            ],
+            "type": "object"
+          },
+          "name": "graph_evidence"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_read"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "limit": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "offset": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "name": "fs_read"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "List workspace paths matching a repository-aware glob; use it to find files by name or extension before reading them",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_read"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "include_hidden": {
+                "default": false,
+                "type": "boolean"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "pattern": {
+                "description": ".git paths are always excluded",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "respect_gitignore": {
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "pattern"
+            ],
+            "type": "object"
+          },
+          "name": "fs_glob"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "Search workspace file contents; use it to locate symbols or text before reading or editing a file",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_read"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "anyOf": [
+              {
+                "required": [
+                  "pattern"
+                ]
+              },
+              {
+                "required": [
+                  "query"
+                ]
+              }
+            ],
+            "properties": {
+              "case": {
+                "enum": [
+                  "sensitive",
+                  "insensitive",
+                  "smart"
+                ],
+                "type": "string"
+              },
+              "context": {
+                "additionalProperties": false,
+                "properties": {
+                  "after": {
+                    "maximum": 5,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "before": {
+                    "maximum": 5,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "file_glob": {
+                "additionalProperties": false,
+                "properties": {
+                  "exclude": {
+                    "items": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "type": "array"
+                  },
+                  "include": {
+                    "items": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "glob": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "include_hidden": {
+                "default": false,
+                "type": "boolean"
+              },
+              "max_matches": {
+                "maximum": 200,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "mode": {
+                "description": "regex sources are additionally capped at 1024 UTF-8 bytes before Unicode expansion",
+                "enum": [
+                  "literal",
+                  "simple",
+                  "regex"
+                ],
+                "type": "string"
+              },
+              "multiline": {
+                "default": false,
+                "description": "Make ^ and $ match physical line boundaries in the line-streamed regex engine",
+                "type": "boolean"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "pattern": {
+                "maxLength": 65536,
+                "minLength": 1,
+                "type": "string"
+              },
+              "query": {
+                "description": "Legacy alias for pattern",
+                "maxLength": 65536,
+                "minLength": 1,
+                "type": "string"
+              },
+              "respect_gitignore": {
+                "default": true,
+                "type": "boolean"
+              },
+              "root": {
+                "description": "Legacy alias for path",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "fs_search"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Create or replace one UTF-8 file; use it for a new file or a complete rewrite",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ],
+            "type": "object"
+          },
+          "name": "fs_write"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Apply anchored replacements to one UTF-8 file; use it for focused changes after reading the current contents",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "edits": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "new": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "description": "Must match uniquely unless replace_all is true",
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "replace_all": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "old",
+                    "new"
+                  ],
+                  "type": "object"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "edits"
+            ],
+            "type": "object"
+          },
+          "name": "fs_edit"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Create or replace one UTF-8 file; replacing an existing file requires a fresh read",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "content": {
+                "description": "Complete UTF-8 file contents; an empty string creates or truncates to an empty file",
+                "type": "string"
+              },
+              "file_path": {
+                "description": "Path inside the workspace; read an existing file before replacing it",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "file_path",
+              "content"
+            ],
+            "type": "object"
+          },
+          "name": "write"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Replace exact text in one UTF-8 file after a fresh read; the anchor must be unique unless replace_all is true",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "file_path": {
+                "description": "Path inside the workspace; read the current file before editing",
+                "minLength": 1,
+                "type": "string"
+              },
+              "new_string": {
+                "description": "Replacement text; an empty string deletes the matched text",
+                "type": "string"
+              },
+              "old_string": {
+                "description": "Exact existing text, including whitespace; must match uniquely unless replace_all",
+                "minLength": 1,
+                "type": "string"
+              },
+              "replace_all": {
+                "description": "Replace every exact match; at least one match is required; defaults to false",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "file_path",
+              "old_string",
+              "new_string"
+            ],
+            "type": "object"
+          },
+          "name": "edit"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Move, copy, or delete a workspace path; use it when the requested change affects filesystem structure",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "fs_write"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "destination": {
+                "description": "Required for move and copy",
+                "minLength": 1,
+                "type": "string"
+              },
+              "operation": {
+                "enum": [
+                  "move",
+                  "delete",
+                  "copy"
+                ],
+                "type": "string"
+              },
+              "overwrite": {
+                "type": "boolean"
+              },
+              "source": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation",
+              "source"
+            ],
+            "type": "object"
+          },
+          "name": "fs_path"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "Delegate one bounded task to a depth-capped local child under AgentSpawn policy; waits for the child report before returning its tool result. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
+          "dispatch": "deferred",
+          "effects": [
+            {
+              "class": "agent_spawn"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "agent_type": {
+                "description": "Registered Loom agent type for a TYPED child (capability-scoped specialist)",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "model": {
+                "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "parent_slot": {
+                "description": "Declared parent graph evidence slot for the single collapsed child contract",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "prompt": {
+                "description": "Complete task prompt for the child",
+                "maxLength": 32768,
+                "minLength": 1,
+                "type": "string"
+              },
+              "provider": {
+                "description": "Optional disambiguator when `model` is served by several providers; requires `model`",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "request_budget": {
+                "additionalProperties": false,
+                "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+                "properties": {
+                  "hard_cap": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "tranche": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "tranche",
+                  "hard_cap"
+                ],
+                "type": "object"
+              },
+              "task": {
+                "description": "Short display label for the child",
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              "workflow": {
+                "description": "Optional child workflow proposal; omitted defaults to one bare attempt",
+                "pattern": "^(plain|implement_verify|deeper|workflow_ref\\([A-Za-z0-9_-]{1,64}\\))$",
+                "type": "string"
+              },
+              "workflow_author": {
+                "description": "Request graph-authoring capability; granted only for a deeper trigger",
+                "type": "boolean"
+              },
+              "workflow_trigger": {
+                "description": "Bounded reason the workflow earns its graph",
+                "enum": [
+                  "mutation_with_independent_verification",
+                  "dependent_phases",
+                  "fan_out",
+                  "distinct_review",
+                  "crash_recovery"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "task",
+              "prompt"
+            ],
+            "type": "object"
+          },
+          "name": "spawn_subagent"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Message one of your direct child agents. Running children are steered in their current round; idle children start immediately. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "description": "Opaque child agent id returned by spawn_subagent",
+                "minLength": 1,
+                "type": "string"
+              },
+              "message": {
+                "description": "Instruction to inject or start as the child's next turn",
+                "maxLength": 32768,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "agent",
+              "message"
+            ],
+            "type": "object"
+          },
+          "name": "message_subagent"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Fetch a public https URL (or loopback http) and return its readable text. HTML is reduced to text; only text/* and application/json bodies are supported; output is capped at 98304 bytes with an honest truncation marker.",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "network",
+              "host": ""
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "max_bytes": {
+                "description": "Optional smaller output cap in bytes.",
+                "minimum": 512,
+                "type": "integer"
+              },
+              "url": {
+                "description": "Absolute http(s) URL to fetch.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "type": "object"
+          },
+          "name": "web_fetch"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Search the web and return a bounded text summary of the results.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "query": {
+                "description": "The search query.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "name": "web_search"
+        }
+      },
+      {
+        "default": "not_applicable",
+        "manifest": {
+          "description": "Register, list, update, pause, resume, trigger, or remove durable SMS, workspace-file, and native timer watches. Reports use the canonical session hub.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "follow_up": {
+                    "type": "string"
+                  },
+                  "report": {
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              },
+              "filter": {
+                "properties": {
+                  "case_sensitive": {
+                    "type": "boolean"
+                  },
+                  "field": {
+                    "enum": [
+                      "address",
+                      "body",
+                      "payload"
+                    ],
+                    "type": "string"
+                  },
+                  "operator": {
+                    "enum": [
+                      "equals",
+                      "contains",
+                      "starts_with",
+                      "ends_with"
+                    ],
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "field",
+                  "operator",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "lifetime": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "session",
+                      "timeout"
+                    ],
+                    "type": "string"
+                  },
+                  "timeout_ms": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              },
+              "monitor_id": {
+                "type": "string"
+              },
+              "occurrence": {
+                "enum": [
+                  "once",
+                  "every"
+                ],
+                "type": "string"
+              },
+              "operation": {
+                "enum": [
+                  "register",
+                  "list",
+                  "update",
+                  "pause",
+                  "resume",
+                  "trigger",
+                  "remove"
+                ],
+                "type": "string"
+              },
+              "source": {
+                "additionalProperties": false,
+                "properties": {
+                  "interval_ms": {
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "enum": [
+                      "sms",
+                      "file",
+                      "timer"
+                    ],
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "type": "object"
+          },
+          "name": "monitor"
+        }
+      },
+      {
+        "default": "allow",
+        "manifest": {
+          "description": "List the daemon's already-discovered model catalog. This is a cached local read and never refreshes provider inventory. Use filter when the bounded result is truncated.",
+          "dispatch": "await",
+          "effects": [],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "filter": {
+                "description": "Optional case-insensitive model/provider/alias substring",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "list_models"
+        }
+      }
+    ]
+  },
+  "scenario": "root inventory from durable journal, mobile activation, restricted child provider definitions"
+}

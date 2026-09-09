@@ -33,7 +33,7 @@ fn canned_sms() -> MobileOutput {
     ])
 }
 
-fn memory_envelope(
+pub(super) fn memory_envelope(
     session_id: &SessionId,
     event: &str,
     text: &str,
@@ -224,14 +224,14 @@ async fn mobile_activation_is_root_prefix_bounded_case_insensitive() {
     );
 }
 
-struct MobileDispatcherFixture {
+pub(super) struct MobileDispatcherFixture {
     _profile: tempfile::TempDir,
     _workspace: tempfile::TempDir,
-    store: SqliteStoreHandle,
+    pub(super) store: SqliteStoreHandle,
     hub: SessionHub,
-    session_id: SessionId,
-    run_id: RunId,
-    dispatcher: Arc<dyn ToolDispatcher>,
+    pub(super) session_id: SessionId,
+    pub(super) run_id: RunId,
+    pub(super) dispatcher: Arc<dyn ToolDispatcher>,
 }
 
 async fn mobile_dispatcher_fixture(
@@ -242,14 +242,18 @@ async fn mobile_dispatcher_fixture(
     mobile_dispatcher_fixture_with_grant(label, user_text, backend, None).await
 }
 
-async fn mobile_dispatcher_fixture_with_grant(
+pub(super) async fn mobile_dispatcher_fixture_with_grant(
     label: &str,
     user_text: &str,
     backend: Arc<dyn MobileBackend>,
     grant: Option<Grant>,
 ) -> MobileDispatcherFixture {
     let profile = tempfile::tempdir().expect("profile");
+    #[cfg(not(feature = "android-standalone"))]
     let workspace = tempfile::tempdir().expect("workspace");
+    #[cfg(feature = "android-standalone")]
+    let workspace =
+        tempfile::tempdir_in(crate::android_workspace::test_root()).expect("Android workspace");
     let cwd = std::fs::canonicalize(workspace.path())
         .expect("canonical workspace")
         .to_string_lossy()
@@ -373,7 +377,7 @@ async fn mobile_dispatcher_fixture_with_grant(
     }
 }
 
-async fn close_fixture(fixture: MobileDispatcherFixture) {
+pub(super) async fn close_fixture(fixture: MobileDispatcherFixture) {
     fixture
         .dispatcher
         .close()

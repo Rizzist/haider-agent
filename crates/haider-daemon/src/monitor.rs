@@ -5636,6 +5636,9 @@ async fn run_monitor_source(
     registration: MonitorRegistration,
     mut cancelled: oneshot::Receiver<()>,
 ) {
+    if crate::android_policy::enabled() && registration.source.resolved_argv().is_some() {
+        return;
+    }
     match &registration.source {
         MonitorSource::Sms => {}
         MonitorSource::Timer { interval_ms } => {
@@ -5879,10 +5882,27 @@ where
     let relative = canonical.strip_prefix(&filesystem_root).map_err(|_| {
         MonitorError::InvalidEvent("watched file escaped its anchored filesystem root".into())
     })?;
-    let directory =
-        haider_platform::open_workspace_directory(&filesystem_root).map_err(|error| {
-            MonitorError::InvalidEvent(format!("cannot anchor watched filesystem: {error}"))
+    let (directory, relative) = if crate::android_policy::enabled() {
+        let parent = canonical
+            .parent()
+            .ok_or_else(|| MonitorError::InvalidEvent("watched path has no parent".into()))?;
+        let directory = crate::android_workspace::open(parent).map_err(|_| {
+            MonitorError::InvalidEvent(
+                "watched file is outside the Android workspace ceiling".into(),
+            )
         })?;
+        let name = canonical
+            .file_name()
+            .ok_or_else(|| MonitorError::InvalidEvent("watched path has no name".into()))?;
+        (directory, Path::new(name))
+    } else {
+        (
+            haider_platform::open_workspace_directory(&filesystem_root).map_err(|error| {
+                MonitorError::InvalidEvent(format!("cannot anchor watched filesystem: {error}"))
+            })?,
+            relative,
+        )
+    };
     let file = match haider_platform::open_workspace_file(directory, relative) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -6276,6 +6296,9 @@ fn monitor_command(
     command: &ApprovedMonitorCommand,
     workspace: &Path,
 ) -> Result<haider_tools::PreparedMonitorProcess, String> {
+    if crate::android_policy::enabled() {
+        return Err("shell-backed monitors are unavailable in android-standalone".into());
+    }
     haider_tools::monitor_process_command(
         &command.argv,
         workspace,
@@ -6707,7 +6730,7 @@ pub(crate) fn monitor_source_availability() -> Vec<haider_rpc::MonitorSourceAvai
         MonitorSourceKindWire as Source,
     };
 
-    vec![
+    let mut sources = vec![
         Row {
             source: Source::Sms,
             availability: Availability::Available,
@@ -6732,7 +6755,17 @@ pub(crate) fn monitor_source_availability() -> Vec<haider_rpc::MonitorSourceAvai
             source: Source::Cli,
             availability: Availability::Available,
         },
-    ]
+    ];
+    if crate::android_policy::enabled() {
+        for row in &mut sources {
+            if matches!(row.source, Source::Process | Source::Poll | Source::Cli) {
+                row.availability = Availability::Unavailable {
+                    reason: haider_rpc::MonitorSourceUnavailableReasonWire::AdapterInactive,
+                };
+            }
+        }
+    }
+    sources
 }
 
 pub(crate) fn monitor_list_rejected(

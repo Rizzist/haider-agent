@@ -107,6 +107,9 @@ pub(crate) fn discover_device_candidates_with_native_event(
 }
 
 pub(crate) fn discovery_is_disabled(profile_disabled: bool) -> bool {
+    if crate::android_policy::enabled() {
+        return true;
+    }
     profile_disabled || discovery_disabled_by_env()
 }
 
@@ -230,6 +233,9 @@ pub(crate) enum LinkedSourceReadFailure {
 pub(crate) fn read_linked_source(
     source: &CredentialSourceRecord,
 ) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
+    if crate::android_policy::enabled() {
+        return Err(LinkedSourceReadFailure::RequiresOriginClient);
+    }
     let store_mode = linked_source_store_mode(source);
     if source.kind == CredentialSourceKind::CodexHome
         && matches!(

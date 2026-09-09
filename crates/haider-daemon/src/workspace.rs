@@ -11,6 +11,13 @@ use haider_protocol::workspace::{WorkspaceUnavailable, WorkspaceUnavailableReaso
 #[must_use]
 pub(crate) fn unavailable(path: &Path) -> Option<WorkspaceUnavailable> {
     let stored = path.display().to_string();
+    if crate::android_policy::enabled() && crate::android_workspace::validate(path).is_err() {
+        return Some(WorkspaceUnavailable {
+            path: stored,
+            reason: WorkspaceUnavailableReason::NotReadable,
+            detail: "workspace is outside the immutable Android ceiling".into(),
+        });
+    }
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {

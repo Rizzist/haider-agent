@@ -2293,6 +2293,11 @@ pub fn monitor_process_command(
     cwd: &Path,
     env_allowlist: &[String],
 ) -> ToolResult<PreparedMonitorProcess> {
+    if cfg!(feature = "android-standalone") {
+        return Err(ToolError::invalid_argument(
+            "shell-backed monitors are unavailable in android-standalone",
+        ));
+    }
     let program = argv
         .first()
         .ok_or_else(|| ToolError::invalid_argument("monitor command argv is empty"))?;

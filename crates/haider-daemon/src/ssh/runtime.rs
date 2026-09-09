@@ -739,6 +739,9 @@ impl SshRuntime {
     }
 
     async fn connect(&self, profile: &SshProfile) -> Result<LiveSession, SshError> {
+        if crate::android_policy::enabled() {
+            return Err(SshError::SshAgentUnavailable);
+        }
         let observed = Arc::new(StdMutex::new(None));
         let handler = HostKeyHandler {
             expected: profile.ssh.host_key.clone(),

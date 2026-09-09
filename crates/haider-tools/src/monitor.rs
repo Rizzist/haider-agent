@@ -166,6 +166,15 @@ impl MonitorRequest {
     }
 
     fn validate(&self) -> ToolResult<()> {
+        if cfg!(feature = "android-standalone")
+            && self
+                .source()
+                .is_some_and(|source| source.resolved_argv().is_some())
+        {
+            return Err(ToolError::invalid_argument(
+                "shell-backed monitors are unavailable in android-standalone",
+            ));
+        }
         match self {
             Self::Register {
                 source,
@@ -997,6 +1006,11 @@ pub enum MonitorApproval {
 
 impl MonitorApproval {
     pub fn new(source: &MonitorSource, workspace: &Path) -> ToolResult<Option<Self>> {
+        if cfg!(feature = "android-standalone") && source.resolved_argv().is_some() {
+            return Err(ToolError::invalid_argument(
+                "shell-backed monitors are unavailable in android-standalone",
+            ));
+        }
         if let Some(command) = MonitorCommandApproval::new(source, workspace)? {
             return Ok(Some(Self::Command(command)));
         }
@@ -1014,6 +1028,10 @@ impl MonitorApproval {
         let resolved = canonicalize_monitor_watch_path(&requested)?;
         if resolved.starts_with(&workspace) {
             Ok(None)
+        } else if cfg!(feature = "android-standalone") {
+            Err(ToolError::invalid_argument(
+                "external file monitors are unavailable in android-standalone",
+            ))
         } else {
             Ok(Some(Self::ExternalFile { path: resolved }))
         }
@@ -1103,7 +1121,7 @@ fn bounded_nonempty(value: &str, maximum: usize, name: &str) -> ToolResult<()> {
 }
 
 pub fn monitor_manifest() -> ToolManifest {
-    ToolManifest {
+    let mut manifest = ToolManifest {
         name: "monitor".into(),
         description: "Register, list, update, pause, resume, trigger, or remove durable sms/process/file/poll/timer/cli watches. Matches coalesce per monitor: idle wakes as a subturn; busy queues to the next turn boundary. Command registration/update requires ProcessExec authorization for exact argv/cwd/env names; external files require FsRead authorization.".into(),
         effects: vec![],
@@ -1167,7 +1185,17 @@ pub fn monitor_manifest() -> ToolManifest {
             },
             "required": ["operation"]
         }),
+    };
+    if cfg!(feature = "android-standalone") {
+        manifest.description = "Register, list, update, pause, resume, trigger, or remove durable SMS, workspace-file, and native timer watches. Reports use the canonical session hub.".into();
+        manifest.input_schema["properties"]["source"] = serde_json::json!({
+            "type":"object", "properties": {
+                "kind":{"type":"string","enum":["sms","file","timer"]},
+                "path":{"type":"string"}, "interval_ms":{"type":"integer"}
+            }, "required":["kind"], "additionalProperties":false
+        });
     }
+    manifest
 }
 
 #[cfg(test)]

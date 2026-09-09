@@ -569,8 +569,7 @@ impl OAuthIdentityVerifier for OpenAiIdentityVerifier {
         if let Ok(mut slot) = self.guard_probe.lock() {
             slot.replace(Arc::clone(&origin_guard));
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
+        let client = haider_platform::native_http_client_builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(TOKEN_TIMEOUT)
@@ -1358,14 +1357,14 @@ impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
         &self,
         event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
-        if deterministic_native_store_unavailable() {
+        if crate::android_policy::enabled() || deterministic_native_store_unavailable() {
             return Err(ClaudeNativeCredentialFailure::Unavailable);
         }
         platform_claude_credential(self, event)
     }
 
     fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
-        if deterministic_native_store_unavailable() {
+        if crate::android_policy::enabled() || deterministic_native_store_unavailable() {
             return Err(ClaudeNativeCredentialFailure::Unavailable);
         }
         platform_claude_credential_probe(self)
@@ -1471,6 +1470,9 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
         &self,
         event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        if crate::android_policy::enabled() {
+            return Err(ClaudeNativeCredentialFailure::Unavailable);
+        }
         let attempt = {
             let mut state = self
                 .state
@@ -1517,6 +1519,9 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
     }
 
     fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
+        if crate::android_policy::enabled() {
+            return Err(ClaudeNativeCredentialFailure::Unavailable);
+        }
         let attempt = {
             let mut state = self
                 .state
@@ -1811,6 +1816,7 @@ pub(crate) fn load_claude_credential_input(
     native: &dyn ClaudeNativeCredentialStore,
     event: ClaudeNativeReadEvent,
 ) -> Result<ClaudeCredentialInput, HaiderError> {
+    require_credential_import_available()?;
     let native_failure = match native.read(event) {
         Ok(mut input) => {
             input.native_owner = true;
@@ -1849,6 +1855,19 @@ pub(crate) struct OAuthImportMaterial {
     pub claude_native_owner: bool,
 }
 
+/// Imported credentials remain owned by the originating client. Standalone
+/// must neither read that client's stores nor spend its rotating refresh token.
+pub(crate) fn require_credential_import_available() -> Result<(), HaiderError> {
+    if crate::android_policy::enabled() {
+        return Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            "credential import is unavailable on android-standalone; sign in on this device",
+            false,
+        ));
+    }
+    Ok(())
+}
+
 /// Reads and converts one daemon-local CLI credential file.
 ///
 /// The returned material is the first and only object allowed to leave this
@@ -1872,6 +1891,7 @@ pub(crate) fn load_oauth_import_material_with_native(
     native: &dyn ClaudeNativeCredentialStore,
     event: ClaudeNativeReadEvent,
 ) -> Result<OAuthImportMaterial, HaiderError> {
+    require_credential_import_available()?;
     let spec = oauth_import_source_spec(source)?;
     let path = oauth_import_path(source)?;
     let input = if spec.source == "claude-code" {
@@ -1901,6 +1921,7 @@ pub(crate) fn load_claude_native_import_material(
     native: &dyn ClaudeNativeCredentialStore,
     event: ClaudeNativeReadEvent,
 ) -> Result<OAuthImportMaterial, ClaudeNativeImportError> {
+    require_credential_import_available().map_err(ClaudeNativeImportError::Invalid)?;
     let mut input = native
         .read(event)
         .map_err(ClaudeNativeImportError::Access)?;
@@ -2005,6 +2026,7 @@ fn load_oauth_import_material_from_input(
 }
 
 fn read_oauth_import_file(path: &Path, source: &str) -> Result<Zeroizing<Vec<u8>>, HaiderError> {
+    require_credential_import_available()?;
     #[cfg(test)]
     OAUTH_IMPORT_READ_COUNT.fetch_add(1, Ordering::SeqCst);
     let file =
@@ -4932,6 +4954,11 @@ async fn send_callback_page(
     status: u16,
     html: &str,
 ) -> std::io::Result<()> {
+    #[cfg(target_os = "android")]
+    let html = html.replace(
+        "</main>",
+        "<p><a href=\"haider://oauth/return\">Return to Haider</a></p></main>",
+    );
     let reason = if status == 200 { "OK" } else { "Bad Request" };
     let headers = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nPragma: no-cache\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",

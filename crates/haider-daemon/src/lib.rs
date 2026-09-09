@@ -48,7 +48,14 @@
 //! The phase machine itself lives in `lifecycle.rs`; its legal transitions are
 //! documented on [`DaemonState`] and enforced by the state publisher.
 
+#[cfg(all(feature = "legacy-termux", feature = "android-standalone"))]
+compile_error!("android-standalone and legacy-termux are mutually exclusive");
+
 mod accounts;
+mod android_policy;
+#[cfg(all(test, unix, feature = "android-standalone"))]
+mod android_runtime_tests;
+mod android_workspace;
 pub mod antigravity_install;
 #[cfg(test)]
 mod antigravity_install_tests;

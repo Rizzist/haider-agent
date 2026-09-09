@@ -1,3 +1,5 @@
+#[cfg(all(unix, feature = "android-standalone"))]
+mod android;
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
@@ -203,6 +205,9 @@ struct DurableTurnBinding {
 #[derive(Debug, Clone)]
 pub(crate) struct LockdownManager {
     root: PathBuf,
+    sandbox_root: PathBuf,
+    #[cfg(all(unix, feature = "android-standalone"))]
+    sandbox_directory: std::sync::Arc<haider_platform::WorkspaceDirectory>,
 }
 
 impl LockdownManager {
@@ -231,18 +236,53 @@ impl LockdownManager {
     pub(crate) fn initialize(root: PathBuf) -> Result<Self, LockdownError> {
         check_root_budget(&root)?;
         ensure_private_directory(&root)?;
-        let manager = Self { root };
+        let sandbox_root = if crate::android_policy::enabled() {
+            crate::android_workspace::private_sandbox_root().map_err(|error| {
+                LockdownError::InvalidLedger {
+                    path: root.clone(),
+                    reason: error.message,
+                }
+            })?
+        } else {
+            root.clone()
+        };
+        #[cfg(not(all(unix, feature = "android-standalone")))]
+        ensure_private_directory(&sandbox_root)?;
+        let manager = Self {
+            root,
+            sandbox_root,
+            #[cfg(all(unix, feature = "android-standalone"))]
+            sandbox_directory: std::sync::Arc::new(
+                crate::android_workspace::open_private_sandbox().map_err(|error| {
+                    LockdownError::InvalidLedger {
+                        path: PathBuf::from(".haider-lockdown"),
+                        reason: error.message,
+                    }
+                })?,
+            ),
+        };
         manager.with_locked_ledger(|ledger| {
-            ledger.used = directory_size(&manager.root)?;
+            ledger.used = manager.sandbox_size()?;
             Ok(())
         })?;
         Ok(manager)
     }
 
+    fn sandbox_size(&self) -> Result<u64, LockdownError> {
+        #[cfg(all(unix, feature = "android-standalone"))]
+        {
+            android::size(&self.sandbox_directory)
+        }
+        #[cfg(not(all(unix, feature = "android-standalone")))]
+        {
+            directory_size(&self.sandbox_root)
+        }
+    }
+
     pub(crate) fn status(&self, provider: Option<&str>) -> Result<LockdownStatus, LockdownError> {
         let sandbox = provider.map(|name| self.provider_root(name)).transpose()?;
         self.with_locked_ledger(|ledger| {
-            ledger.used = directory_size(&self.root)?;
+            ledger.used = self.sandbox_size()?;
             Ok(LockdownStatus {
                 provider: provider.map(str::to_owned),
                 sandbox,
@@ -461,7 +501,7 @@ impl LockdownManager {
         limit: u64,
     ) -> Result<LockdownStatus, LockdownError> {
         self.with_locked_ledger(|ledger| {
-            ledger.used = directory_size(&self.root)?;
+            ledger.used = self.sandbox_size()?;
             if let Some(command_id) = command_id
                 && let Some(receipt) = ledger
                     .commands
@@ -515,6 +555,10 @@ impl LockdownManager {
         contents: &[u8],
         after_apply: impl FnOnce() -> Result<(), LockdownError>,
     ) -> Result<LockdownStatus, LockdownError> {
+        #[cfg(all(unix, feature = "android-standalone"))]
+        if crate::android_policy::enabled() {
+            return self.android_write(provider, relative_path, contents, after_apply);
+        }
         let provider_root = self.provider_root(provider)?;
         let target = sandbox_path(&provider_root, relative_path)?;
         let temporary_name = data_temporary_name(&target)?;
@@ -528,7 +572,7 @@ impl LockdownManager {
                 })?;
             refuse_existing_symlink_ancestors(&provider_root, &target)?;
 
-            ledger.used = directory_size(&self.root)?;
+            ledger.used = self.sandbox_size()?;
             match fs::symlink_metadata(&target) {
                 Ok(metadata) if metadata.is_file() => {}
                 Ok(_) => {
@@ -564,7 +608,7 @@ impl LockdownManager {
                 &mut applied,
                 after_apply,
             )?;
-            ledger.used = directory_size(&self.root)?;
+            ledger.used = self.sandbox_size()?;
             Ok(LockdownStatus {
                 provider: Some(provider.to_owned()),
                 sandbox: Some(provider_root.clone()),
@@ -587,6 +631,10 @@ impl LockdownManager {
         provider: &str,
         relative_path: &Path,
     ) -> Result<Vec<u8>, LockdownError> {
+        #[cfg(all(unix, feature = "android-standalone"))]
+        if crate::android_policy::enabled() {
+            return self.android_read(provider, relative_path);
+        }
         let provider_root = self.provider_root(provider)?;
         refuse_symlink(&provider_root)?;
         let target = if relative_path.as_os_str().is_empty() {
@@ -629,7 +677,7 @@ impl LockdownManager {
 
     pub(crate) fn provider_root(&self, provider: &str) -> Result<PathBuf, LockdownError> {
         let slug = provider_slug(provider)?;
-        let path = self.root.join(slug);
+        let path = self.sandbox_root.join(slug);
         check_path_budget(&path)?;
         Ok(path)
     }
@@ -833,6 +881,10 @@ pub(crate) fn global_if_initialized() -> Option<&'static LockdownManager> {
 pub(crate) fn allowed_tool_names() -> Vec<String> {
     ALLOWED_TOOLS
         .iter()
+        .filter(|name| {
+            !crate::android_policy::enabled()
+                || crate::worker::registered_tool_route(name).is_some()
+        })
         .map(|tool| (*tool).to_owned())
         .collect()
 }
@@ -1202,6 +1254,7 @@ fn cleanup_stale_temporaries(root: &Path) -> Result<(), LockdownError> {
     Ok(())
 }
 
+#[cfg(not(all(unix, feature = "android-standalone")))]
 fn directory_size(root: &Path) -> Result<u64, LockdownError> {
     let mut total = 0_u64;
     let mut directories = vec![root.to_path_buf()];

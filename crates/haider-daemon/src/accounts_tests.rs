@@ -14350,3 +14350,7 @@ fn customprov_manual_key_acceptance_requires_nonempty_utf8_without_controls() {
         assert!(!error.message.contains("key\nheader"));
     }
 }
+
+#[cfg(feature = "android-standalone")]
+#[path = "android_accounts_tests.rs"]
+mod android_accounts_tests;

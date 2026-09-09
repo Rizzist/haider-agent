@@ -34,6 +34,9 @@ pub struct GcloudCli;
 
 impl GcloudAccessTokenSource for GcloudCli {
     fn print_access_token(&self) -> Result<Zeroizing<Vec<u8>>, HaiderError> {
+        if crate::android_policy::enabled() {
+            return Err(crate::android_policy::denied());
+        }
         let output = std::process::Command::new("gcloud")
             .args(["auth", "print-access-token"])
             .stdin(std::process::Stdio::null())

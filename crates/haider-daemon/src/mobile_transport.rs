@@ -1,41 +1,54 @@
-//! Authenticated loopback transport for the companion Haider Android APK.
+//! Reverse device-capability transport for the Haider Android APK.
 //!
-//! The transport is deliberately opt-in and loopback-only. One actor owns
-//! each authenticated TCP connection, correlates daemon capability requests,
-//! and accepts the APK's push lane. The most recently authenticated APK wins.
+//! Standalone uses a peer-authenticated filesystem UDS. The legacy feature
+//! retains opt-in loopback TCP/token pairing. Both reuse the request actor;
+//! the most recently authenticated APK connection wins.
 
+#[cfg(feature = "legacy-termux")]
 #[path = "mobile_transport/chat_bridge.rs"]
 mod chat_bridge;
 
 use crate::{DaemonConfig, DaemonError, MonitorSourceHub, publish_sms_incoming};
 use async_trait::async_trait;
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
+#[cfg(feature = "legacy-termux")]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_protocol::effect::EffectClass;
 use haider_protocol::mobile::{A11yNode, MobileAction, MobileOutput, Point4, SmsMessage};
 use haider_tools::{MobileBackend, MobileCancelToken, MobileError, MobileResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "legacy-termux")]
 use std::ffi::OsStr;
 use std::fmt;
+#[cfg(feature = "legacy-termux")]
 use std::fs::OpenOptions;
+#[cfg(feature = "legacy-termux")]
 use std::io::Write as _;
+#[cfg(feature = "legacy-termux")]
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(feature = "legacy-termux")]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 use std::time::Duration;
+#[cfg(feature = "legacy-termux")]
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+#[cfg(feature = "legacy-termux")]
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const MOBILE_APK_ENV: &str = "HAIDER_MOBILE_APK";
+#[cfg(feature = "legacy-termux")]
 const MOBILE_HOME_ENV: &str = "HAIDER_HOME";
+#[cfg(feature = "legacy-termux")]
 const TOKEN_FILE_NAME: &str = "mobile-token";
+#[cfg(feature = "legacy-termux")]
 const TOKEN_RANDOM_BYTES: usize = 32;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const CONNECTION_COMMAND_CAPACITY: usize = 64;
@@ -79,6 +92,7 @@ struct MonitorChatStream {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "legacy-termux"), allow(dead_code))]
 enum ChatCommand {
     Send {
         text: String,
@@ -177,6 +191,7 @@ fn bounded_session_field(body: &Value, name: &str) -> Result<String, MobileChatE
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "legacy-termux"), allow(dead_code))]
 enum ChatEvent {
     Delta {
         text: String,
@@ -318,6 +333,7 @@ impl MobileChatError {
         Self::new("internal", message, true)
     }
 
+    #[cfg(feature = "legacy-termux")]
     fn daemon(error: impl fmt::Display) -> Self {
         Self::internal(error.to_string())
     }
@@ -346,10 +362,12 @@ struct ChatResponder {
 }
 
 impl ChatResponder {
+    #[cfg(feature = "legacy-termux")]
     fn is_closed(&self) -> bool {
         self.frames.is_closed()
     }
 
+    #[cfg(feature = "legacy-termux")]
     async fn wait_closed(&self) {
         self.frames.closed().await;
     }
@@ -449,8 +467,21 @@ where
         .read_exact(payload.as_mut_slice())
         .await
         .map_err(|error| TransportError::io("read mobile frame payload", error))?;
-    serde_json::from_slice(payload.as_slice())
-        .map_err(|error| TransportError::protocol(format!("invalid mobile JSON envelope: {error}")))
+    let envelope: Envelope = serde_json::from_slice(payload.as_slice()).map_err(|error| {
+        TransportError::protocol(format!("invalid mobile JSON envelope: {error}"))
+    })?;
+    if cfg!(feature = "android-standalone")
+        && envelope
+            .body
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(TransportError::protocol(
+            "mobile frame body must be a typed object",
+        ));
+    }
+    Ok(envelope)
 }
 
 async fn write_frame<W>(writer: &mut W, envelope: &Envelope) -> Result<(), TransportError>
@@ -466,6 +497,7 @@ where
     result
 }
 
+#[cfg(feature = "legacy-termux")]
 fn constant_time_token_eq(expected: &[u8], candidate: &[u8]) -> bool {
     // The generated token has a fixed encoded length. Iterate for the longer
     // input and fold the length difference into the same accumulator: neither
@@ -480,6 +512,7 @@ fn constant_time_token_eq(expected: &[u8], candidate: &[u8]) -> bool {
     bool::from(difference.ct_eq(&0))
 }
 
+#[cfg(feature = "legacy-termux")]
 fn generate_token() -> Result<Zeroizing<String>, TransportError> {
     let mut random = Zeroizing::new([0_u8; TOKEN_RANDOM_BYTES]);
     getrandom::fill(random.as_mut_slice())
@@ -487,6 +520,7 @@ fn generate_token() -> Result<Zeroizing<String>, TransportError> {
     Ok(Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice())))
 }
 
+#[cfg(feature = "legacy-termux")]
 fn write_mobile_token(home: &Path, token: &str) -> Result<PathBuf, TransportError> {
     std::fs::create_dir_all(home)
         .map_err(|error| TransportError::io("create HAIDER_HOME for mobile token", error))?;
@@ -502,6 +536,7 @@ fn write_mobile_token(home: &Path, token: &str) -> Result<PathBuf, TransportErro
 }
 
 #[cfg(unix)]
+#[cfg(feature = "legacy-termux")]
 fn write_mobile_token_unix(
     home: &Path,
     path: PathBuf,
@@ -545,6 +580,7 @@ fn write_mobile_token_unix(
 }
 
 #[cfg(not(unix))]
+#[cfg(feature = "legacy-termux")]
 fn write_mobile_token_portable(path: PathBuf, token: &str) -> Result<PathBuf, TransportError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -559,10 +595,12 @@ fn write_mobile_token_portable(path: PathBuf, token: &str) -> Result<PathBuf, Tr
     Ok(path)
 }
 
+#[cfg(feature = "legacy-termux")]
 fn mobile_apk_enabled() -> bool {
     std::env::var_os(MOBILE_APK_ENV).is_some_and(|value| value == OsStr::new("1"))
 }
 
+#[cfg(feature = "legacy-termux")]
 fn mobile_home(config: &DaemonConfig) -> PathBuf {
     std::env::var_os(MOBILE_HOME_ENV)
         .filter(|value| !value.is_empty())
@@ -570,6 +608,7 @@ fn mobile_home(config: &DaemonConfig) -> PathBuf {
         .unwrap_or_else(|| config.store_dir.clone())
 }
 
+#[cfg(feature = "legacy-termux")]
 pub(crate) async fn start_if_enabled(
     config: &DaemonConfig,
     hub: crate::SessionHub,
@@ -595,12 +634,14 @@ pub(crate) async fn start_if_enabled(
 }
 
 pub(crate) struct MobileTransportServer {
+    accept_stop: Option<oneshot::Sender<()>>,
     state: Arc<TransportState>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-termux"))]
     address: SocketAddr,
     task: Option<JoinHandle<()>>,
 }
 
+#[cfg(feature = "legacy-termux")]
 struct MobileChatIntegration {
     hub: crate::SessionHub,
     default_model: String,
@@ -608,6 +649,7 @@ struct MobileChatIntegration {
 }
 
 impl MobileTransportServer {
+    #[cfg(feature = "legacy-termux")]
     async fn start(
         home: &Path,
         integration: Option<MobileChatIntegration>,
@@ -633,6 +675,7 @@ impl MobileTransportServer {
         let token_path = write_mobile_token(home, token.as_str())?;
         let state = Arc::new(TransportState::new());
         let mut server = Self {
+            accept_stop: None,
             state,
             #[cfg(test)]
             address: SocketAddr::V4(address),
@@ -662,19 +705,25 @@ impl MobileTransportServer {
 
     pub(crate) async fn shutdown(&mut self) {
         self.state.clear_chat_bridge();
+        self.state.shutdown_connection().await;
         if let Some(task) = self.task.take() {
-            task.abort();
+            if let Some(stop) = self.accept_stop.take() {
+                let _ = stop.send(());
+            } else {
+                task.abort();
+            }
             let _ = task.await;
         }
         self.state.shutdown_connection().await;
         clear_transport(&self.state);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-termux"))]
     fn address(&self) -> SocketAddr {
         self.address
     }
 
+    #[cfg(feature = "legacy-termux")]
     pub(crate) fn install_chat_bridge(
         &self,
         hub: crate::SessionHub,
@@ -708,6 +757,7 @@ impl Drop for MobileTransportServer {
     }
 }
 
+#[cfg(feature = "legacy-termux")]
 async fn accept_connections(
     listener: TcpListener,
     state: Arc<TransportState>,
@@ -749,21 +799,45 @@ async fn accept_connections(
     state.shutdown_connection().await;
 }
 
+#[cfg(feature = "legacy-termux")]
 async fn serve_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     state: Arc<TransportState>,
     expected_token: Arc<Zeroizing<String>>,
 ) -> Result<(), TransportError> {
     stream
         .set_nodelay(true)
         .map_err(|error| TransportError::io("configure mobile TCP stream", error))?;
+    serve_io(stream, state, Some(expected_token.as_bytes())).await
+}
+
+async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut stream: S,
+    state: Arc<TransportState>,
+    expected_token: Option<&[u8]>,
+) -> Result<(), TransportError> {
     let mut hello = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream)).await {
         Ok(Ok(hello)) => hello,
-        Ok(Err(error)) => return Err(error),
+        Ok(Err(error)) => {
+            if expected_token.is_none() {
+                let rejection = Envelope {
+                    id: 1,
+                    body: json!({"type":"authReject", "reason":"invalid protocol hello"}),
+                };
+                let _ =
+                    tokio::time::timeout(HANDSHAKE_TIMEOUT, write_frame(&mut stream, &rejection))
+                        .await;
+            }
+            return Err(error);
+        }
         Err(_) => return Err(TransportError::protocol("mobile hello timed out")),
     };
     let hello_id = hello.id;
-    let hello_result = validate_hello(&hello, expected_token.as_bytes());
+    let hello_result = match expected_token {
+        #[cfg(feature = "legacy-termux")]
+        Some(token) => validate_hello(&hello, token),
+        _ => validate_standalone_hello(&hello),
+    };
     zeroize_hello_token(&mut hello);
     if let Err(reason) = hello_result {
         let rejection = Envelope {
@@ -810,6 +884,7 @@ fn zeroize_hello_token(hello: &mut Envelope) {
     }
 }
 
+#[cfg(feature = "legacy-termux")]
 fn validate_hello(hello: &Envelope, expected_token: &[u8]) -> Result<(), &'static str> {
     let body = hello.body.as_object();
     let body_type = body
@@ -832,15 +907,34 @@ fn validate_hello(hello: &Envelope, expected_token: &[u8]) -> Result<(), &'stati
     }
 }
 
-async fn connection_actor(
-    stream: TcpStream,
+async fn connection_actor<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
     state: &Arc<TransportState>,
     connection_id: u64,
     mut commands: mpsc::Receiver<ActorCommand>,
     mut monitor_streams: mpsc::Receiver<MonitorChatStream>,
     mut close: watch::Receiver<bool>,
 ) -> Result<(), TransportError> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    // Keep partial prefix/body reads alive when a command or push wins select.
+    let (frames, mut inbound) = mpsc::channel(2);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let frame = read_frame(&mut reader).await;
+            let failed = frame.is_err();
+            if frames.send(frame).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    struct AbortReader(tokio::task::AbortHandle);
+    impl Drop for AbortReader {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _reader_guard = AbortReader(reader_task.abort_handle());
+
     let mut pending = HashMap::<i64, oneshot::Sender<Result<Value, RequestFailure>>>::new();
     let (chat_output, mut chat_output_receiver) = mpsc::channel(CHAT_OUTPUT_CAPACITY);
     let (chat_commands, chat_command_receiver) = mpsc::channel(CHAT_COMMAND_CAPACITY);
@@ -851,13 +945,17 @@ async fn connection_actor(
     ));
     let result = loop {
         tokio::select! {
-            frame = read_frame(&mut reader) => {
+            frame = inbound.recv() => {
+                let Some(frame) = frame else { break Ok(()); };
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(error) => break Err(error),
                 };
                 if !state.is_current(connection_id) {
                     break Ok(());
+                }
+                if expected_standalone_bridge_denial(&frame.body) {
+                    break Err(TransportError::protocol("unsupported capability message"));
                 }
                 if is_bridge_request(&frame.body) {
                     if let Err(error) = dispatch_bridge_frame(
@@ -988,6 +1086,8 @@ async fn connection_actor(
     for (_, reply) in pending.drain() {
         let _ = reply.send(Err(RequestFailure::Disconnected));
     }
+    reader_task.abort();
+    let _ = reader_task.await;
     chat_worker_stop.send_replace(true);
     // Do not abort an accepted canonical turn. The detached FIFO worker keeps
     // observing it until terminal or until its responder notices this actor's
@@ -1255,6 +1355,7 @@ enum RequestFailure {
 struct ConnectionHandle {
     id: u64,
     commands: mpsc::Sender<ActorCommand>,
+    #[cfg_attr(not(feature = "legacy-termux"), allow(dead_code))]
     monitor_streams: mpsc::Sender<MonitorChatStream>,
     close: watch::Sender<bool>,
 }
@@ -1285,12 +1386,12 @@ impl RecentSmsCache {
         self.bytes = 0;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-termux"))]
     fn len(&self) -> usize {
         self.entries.len()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-termux"))]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1303,8 +1404,13 @@ impl TransportState {
             connection: StdRwLock::new(None),
             connected: AtomicBool::new(false),
             next_connection_id: AtomicU64::new(1),
-            // Negative IDs cannot collide with the APK's positive chat IDs.
-            next_request_id: AtomicI64::new(-1),
+            // Standalone v1 uses positive daemon IDs and has no chat ingress.
+            // Legacy negative IDs remain disjoint from APK-owned chat IDs.
+            next_request_id: AtomicI64::new(if cfg!(feature = "android-standalone") {
+                1
+            } else {
+                -1
+            }),
             capabilities: StdRwLock::new(Vec::new()),
             capabilities_seen: AtomicBool::new(false),
             incoming_sms,
@@ -1323,6 +1429,15 @@ impl TransportState {
     }
 
     fn allocate_request_id(&self) -> i64 {
+        #[cfg(feature = "android-standalone")]
+        {
+            self.next_request_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                    Some(if id == i64::MAX { 1 } else { id + 1 })
+                })
+                .unwrap_or(1)
+        }
+        #[cfg(not(feature = "android-standalone"))]
         self.next_request_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                 Some(if id == i64::MIN { -1 } else { id - 1 })
@@ -1423,6 +1538,7 @@ impl TransportState {
             .collect()
     }
 
+    #[cfg(feature = "legacy-termux")]
     fn install_chat_bridge(&self, bridge: Arc<dyn MobileChatBridge>) {
         *write_lock(&self.chat_bridge) = Some(bridge);
     }
@@ -1435,6 +1551,7 @@ impl TransportState {
         read_lock(&self.monitor_source_hub).clone()
     }
 
+    #[cfg(feature = "legacy-termux")]
     async fn send_monitor_chat(&self, text: String) -> Result<i64, MobileChatError> {
         let connection = self.current_connection().ok_or_else(|| {
             MobileChatError::new(
@@ -1983,6 +2100,105 @@ fn unexpected_response(expected: &str, response: &Value) -> MobileError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-termux"))]
 #[path = "mobile_transport_tests.rs"]
 mod mobile_transport_tests;
+
+fn expected_standalone_bridge_denial(body: &Value) -> bool {
+    cfg!(feature = "android-standalone") && is_bridge_request(body)
+}
+
+fn validate_standalone_hello(hello: &Envelope) -> Result<(), &'static str> {
+    let Some(body) = hello.body.as_object() else {
+        return Err("invalid hello");
+    };
+    if hello.id != 1
+        || body.len() != 2
+        || body.get("type").and_then(Value::as_str) != Some("hello")
+        || body
+            .get("apkVersion")
+            .and_then(Value::as_str)
+            .is_none_or(|v| v.trim().is_empty() || v.len() > 128)
+    {
+        Err("invalid hello")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, feature = "android-standalone"))]
+pub(crate) async fn start_if_enabled(
+    config: &DaemonConfig,
+    hub: crate::SessionHub,
+    _default_model: String,
+    _instance_id: String,
+) -> Result<Option<MobileTransportServer>, DaemonError> {
+    if std::env::var_os(MOBILE_APK_ENV).is_some() {
+        return Err(DaemonError::InvalidConfig {
+            message: "legacy mobile bootstrap conflicts with android-standalone".into(),
+        });
+    }
+    let state = Arc::new(TransportState::new());
+    state.install_monitor_source_hub(hub.monitor_source_hub());
+    let server = MobileTransportServer::start_standalone(&config.runtime_dir, state)
+        .await
+        .map_err(|_| DaemonError::Task {
+            message: "mobile capability socket unavailable".into(),
+        })?;
+    Ok(Some(server))
+}
+
+#[cfg(all(unix, feature = "android-standalone"))]
+impl MobileTransportServer {
+    async fn start_standalone(
+        runtime: &std::path::Path,
+        state: Arc<TransportState>,
+    ) -> Result<Self, TransportError> {
+        let endpoint = haider_platform::Endpoint::from_address(runtime.join("mobile.sock"));
+        let listener = haider_platform::BoundEndpoint::bind(&endpoint, runtime)
+            .await
+            .map_err(|_| TransportError::protocol("mobile capability socket unavailable"))?;
+        register_transport(&state);
+        let accept_state = Arc::clone(&state);
+        let (accept_stop, mut stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        // Unknown or different UID is rejected before any frame read.
+                        if !haider_platform::peer_is_owner(&stream, listener.owner_uid()).unwrap_or(false)
+                            || connections.len() >= MAX_HANDSHAKES { continue; }
+                        let state = Arc::clone(&accept_state);
+                        connections.spawn(async move { let _ = serve_io(stream, state, None).await; });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            // BoundEndpoint owns exact-inode stale/replacement-safe cleanup.
+        });
+        Ok(Self {
+            accept_stop: Some(accept_stop),
+            state,
+            task: Some(task),
+        })
+    }
+}
+
+#[cfg(all(test, unix, feature = "android-standalone"))]
+#[path = "mobile_standalone_tests.rs"]
+mod standalone_tests;
+
+#[cfg(not(any(feature = "legacy-termux", feature = "android-standalone")))]
+pub(crate) async fn start_if_enabled(
+    _config: &DaemonConfig,
+    _hub: crate::SessionHub,
+    _default_model: String,
+    _instance_id: String,
+) -> Result<Option<MobileTransportServer>, DaemonError> {
+    Ok(None)
+}

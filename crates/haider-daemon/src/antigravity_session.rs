@@ -110,6 +110,9 @@ impl AntigravityRuntimeRoot {
     /// Resolves the production root: the operator override when set, else
     /// `$HOME/.haider/antigravity`.
     pub(crate) fn resolve() -> Result<Self, HaiderError> {
+        if crate::android_policy::enabled() {
+            return Err(crate::android_policy::denied());
+        }
         if let Some(path) = std::env::var_os(ANTIGRAVITY_HOME_ENV).filter(|value| !value.is_empty())
         {
             return Ok(Self::new(path));
@@ -240,6 +243,9 @@ impl LeasedInstallation {
 pub(crate) fn leased_installation(
     root: &AntigravityRuntimeRoot,
 ) -> Result<LeasedInstallation, HaiderError> {
+    if crate::android_policy::enabled() {
+        return Err(crate::android_policy::denied());
+    }
     let pin = pin_for_host().map_err(install_error)?;
     let installer = AntigravityInstaller::new(root.install_root());
     let Some(installation) = installer.resolve(pin).map_err(install_error)? else {
@@ -663,6 +669,9 @@ impl AntigravityAdapterFactory {
         requested_model: &str,
         workspace: &str,
     ) -> Result<Arc<AntigravityAccountProvider>, HaiderError> {
+        if crate::android_policy::enabled() {
+            return Err(crate::android_policy::denied());
+        }
         let requested = requested_model.trim();
         if !requested.is_empty() && !offered.is_empty() {
             resolve_session_model(offered, agent_default, requested)?;

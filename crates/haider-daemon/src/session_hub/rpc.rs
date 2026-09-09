@@ -554,10 +554,26 @@ fn checkpoint_capture_digest_from_record(
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
+fn restore_checkpoint_with_authority(
+    plan: &haider_tools::CheckpointRestorePlan,
+    authority: Option<Arc<haider_platform::WorkspaceDirectory>>,
+) -> Result<Vec<haider_tools::CheckpointCapturePath>, haider_tools::CheckpointRestoreError> {
+    #[cfg(unix)]
+    if let Some(directory) = authority {
+        return haider_tools::restore_checkpoint_plan_anchored(plan, directory);
+    }
+    #[cfg(not(unix))]
+    let _ = authority;
+    haider_tools::restore_checkpoint_plan(plan)
+}
+
 async fn rollback_failed_checkpoint_command(
     plan: haider_tools::CheckpointRestorePlan,
+    authority: Option<Arc<haider_platform::WorkspaceDirectory>>,
 ) -> Result<(), SessionHubError> {
-    match tokio::task::spawn_blocking(move || haider_tools::restore_checkpoint_plan(&plan)).await {
+    match tokio::task::spawn_blocking(move || restore_checkpoint_with_authority(&plan, authority))
+        .await
+    {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(SessionHubError::Task(format!(
             "checkpoint command failed and workspace recovery also failed: {error}"
@@ -3679,6 +3695,15 @@ impl HubConnection {
                 ERROR_CODE_DRAINING,
                 "daemon is draining",
                 true,
+                None,
+            );
+        }
+        if crate::android_policy::request_denied(&body) {
+            return self.respond_error(
+                request_id,
+                "capability_denied",
+                "capability is unavailable in android-standalone",
+                false,
                 None,
             );
         }
@@ -10483,6 +10508,24 @@ impl HubConnection {
             .iter()
             .map(|checkpoint| checkpoint.checkpoint_id.clone())
             .collect::<Vec<_>>();
+        // Recovered sessions can retain an old cwd. A control attachment or
+        // stored full-trust grant cannot broaden the immutable Android ceiling.
+        let checkpoint_authority = if crate::android_policy::enabled() {
+            match crate::android_workspace::open(std::path::Path::new(&metadata.cwd)) {
+                Ok(directory) => Some(Arc::new(directory)),
+                Err(error) => {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        &error.to_string(),
+                        false,
+                        None,
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let plan = match self
             .checkpoint_restore_plan(&metadata.cwd, &source_checkpoints)
             .await
@@ -10496,8 +10539,9 @@ impl HubConnection {
             Err(CheckpointDoorFailure::Hub(error)) => return Err(error),
         };
         let plan_for_worker = plan.clone();
+        let authority_for_worker = checkpoint_authority.clone();
         let captures = match tokio::task::spawn_blocking(move || {
-            haider_tools::restore_checkpoint_plan(&plan_for_worker)
+            restore_checkpoint_with_authority(&plan_for_worker, authority_for_worker)
         })
         .await
         {
@@ -10580,7 +10624,11 @@ impl HubConnection {
         {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
-                rollback_failed_checkpoint_command(recovery_plan.clone()).await?;
+                rollback_failed_checkpoint_command(
+                    recovery_plan.clone(),
+                    checkpoint_authority.clone(),
+                )
+                .await?;
                 return self.respond_error(
                     request_id,
                     ERROR_CODE_INVALID_ARGUMENT,
@@ -10603,7 +10651,11 @@ impl HubConnection {
         }) {
             Ok(envelopes) => envelopes,
             Err(error) => {
-                rollback_failed_checkpoint_command(recovery_plan.clone()).await?;
+                rollback_failed_checkpoint_command(
+                    recovery_plan.clone(),
+                    checkpoint_authority.clone(),
+                )
+                .await?;
                 return Err(error);
             }
         };
@@ -10624,11 +10676,13 @@ impl HubConnection {
             Ok(CheckpointCommitOutcome::Committed { receipt, .. })
             | Ok(CheckpointCommitOutcome::IdempotentReplay { receipt }) => receipt,
             Err(CheckpointCommitFailure::DefinitelyUncommitted(SessionHubError::Store(error))) => {
-                rollback_failed_checkpoint_command(recovery_plan).await?;
+                rollback_failed_checkpoint_command(recovery_plan, checkpoint_authority.clone())
+                    .await?;
                 return self.respond_turn_error(request_id, error);
             }
             Err(CheckpointCommitFailure::DefinitelyUncommitted(error)) => {
-                rollback_failed_checkpoint_command(recovery_plan).await?;
+                rollback_failed_checkpoint_command(recovery_plan, checkpoint_authority.clone())
+                    .await?;
                 return Err(error);
             }
             Err(CheckpointCommitFailure::Ambiguous(error)) => {
@@ -10639,7 +10693,11 @@ impl HubConnection {
                 {
                     Ok(Some(receipt)) => receipt,
                     Ok(None) => {
-                        rollback_failed_checkpoint_command(recovery_plan).await?;
+                        rollback_failed_checkpoint_command(
+                            recovery_plan,
+                            checkpoint_authority.clone(),
+                        )
+                        .await?;
                         return Err(error);
                     }
                     Err(reconcile_error) => return Err(reconcile_error),
@@ -19902,6 +19960,10 @@ async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
     tokio::task::spawn_blocking(move || {
         let canonical = std::fs::canonicalize(&cwd)
             .map_err(|error| format!("cannot canonicalize session cwd: {error}"))?;
+        if crate::android_policy::enabled() {
+            crate::android_workspace::validate(&canonical)
+                .map_err(|_| "workspace is outside the immutable Android ceiling".to_owned())?;
+        }
         let canonical_text = canonical
             .to_str()
             .ok_or_else(|| "canonical session cwd is not valid UTF-8".to_owned())?

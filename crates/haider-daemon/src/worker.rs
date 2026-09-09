@@ -2652,7 +2652,11 @@ impl Default for DaemonDependencies {
     fn default() -> Self {
         Self {
             provider_factory: ProviderFactoryConfig::Accounts,
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: if crate::android_policy::enabled() {
+                Arc::new(AndroidToolFactory)
+            } else {
+                Arc::new(BrokerToolFactory)
+            },
             accounts: crate::accounts::AccountsDependencies::default(),
         }
     }
@@ -3426,6 +3430,9 @@ impl WorkerManagerHandle {
         command: String,
         cwd: Option<String>,
     ) -> Result<(), HaiderError> {
+        if crate::android_policy::enabled() {
+            return Err(crate::android_policy::denied());
+        }
         let (completed, response) = oneshot::channel();
         self.commands
             .try_send(ManagerCommand::ShellExec {
@@ -7492,6 +7499,9 @@ async fn perform_shell_exec(
     cancellation_wakes: &mut tokio::sync::watch::Receiver<u64>,
     drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), HaiderError> {
+    if crate::android_policy::enabled() {
+        return Err(crate::android_policy::denied());
+    }
     let run_id = pending.accepted.run_id.clone();
     let state = durable_run_state(lease, &run_id).await;
     if state.as_ref().is_some_and(RunState::is_terminal) {
@@ -13796,7 +13806,11 @@ fn initial_tool_exposure_for_turn(
 fn registered_tool_catalog() -> &'static RegisteredToolCatalog {
     static CATALOG: OnceLock<RegisteredToolCatalog> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        let tools: Arc<[RegisteredTool]> = build_registered_tools().into();
+        let tools: Arc<[RegisteredTool]> = build_registered_tools()
+            .into_iter()
+            .filter(|entry| crate::android_policy::route_allowed(entry.route))
+            .collect::<Vec<_>>()
+            .into();
         let provider_definitions: Arc<[ToolDefinition]> = tools
             .iter()
             .map(|entry| provider_definition(&entry.manifest))
@@ -14534,7 +14548,7 @@ fn grant_corrupt(message: impl Into<String>) -> HaiderError {
 }
 
 pub(crate) fn registered_tool_route(name: &str) -> Option<RegisteredToolRoute> {
-    if name == "exec" {
+    if name == "exec" && crate::android_policy::route_allowed(RegisteredToolRoute::ProcessExec) {
         return Some(RegisteredToolRoute::ProcessExec);
     }
     registered_tool_catalog().routes.get(name).copied()
@@ -15234,6 +15248,10 @@ struct WorkspaceUnavailableToolDispatcher {
 
 #[async_trait]
 impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
+    fn platform_tool_supported(&self, name: &str) -> bool {
+        !crate::android_policy::enabled() || registered_tool_route(name).is_some()
+    }
+
     async fn execute(
         &self,
         _run_id: &RunId,
@@ -15243,6 +15261,11 @@ impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
         _args: serde_json::Value,
         _cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
+        if !self.platform_tool_supported(name) {
+            return model_tool_argument_failure(ToolError::invalid_argument(format!(
+                "unsupported tool `{name}`"
+            )));
+        }
         let reason = bounded_failure_reason(&format!(
             "workspace unavailable: {}: {}; re-root the session before using `{name}`",
             self.unavailable.path,
@@ -15281,6 +15304,56 @@ impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
                 [ErrorAction::None],
             )),
         }))
+    }
+}
+
+/// Standalone definitions and dispatch use the same platform-filtered catalog.
+pub(crate) struct AndroidToolFactory;
+
+#[async_trait]
+impl TurnToolFactory for AndroidToolFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        registered_provider_definitions().to_vec()
+    }
+    fn shared_definitions(&self) -> Arc<[ToolDefinition]> {
+        registered_provider_definitions()
+    }
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let durable =
+            durable_session_tool_state(&context.store, context.store.session_id()).await?;
+        self.create_with_turn_snapshot(
+            context,
+            durable.grants,
+            durable.bindings,
+            durable.freshness,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+    async fn create_with_turn_snapshot(
+        &self,
+        context: WorkerToolContext,
+        grants: Vec<SessionGrant>,
+        bindings: HashMap<MenuId, (EffectClass, String)>,
+        freshness: HashMap<String, FileFreshness>,
+        dispatched: Arc<AtomicBool>,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        create_broker_tool_dispatcher(
+            context,
+            grants,
+            bindings,
+            freshness,
+            dispatched,
+            Arc::new(haider_tools::UnavailableComputerBackend::new(
+                "android-standalone",
+            )),
+            crate::mobile_transport::platform_mobile_backend(),
+            Arc::new(haider_tools::PassthroughScreenshotRedaction),
+        )
+        .await
     }
 }
 
@@ -15482,12 +15555,23 @@ async fn create_broker_tool_dispatcher(
     .await?;
     let active_tool_name = Arc::new(StdMutex::new(None));
     let journal = HubJournalSink::new(&context, Arc::clone(&active_tool_name), effect_dispatched);
-    let mut broker = EffectBroker::new_canonical(
-        Box::new(journal),
-        &context.metadata.cwd,
-        context.store.session_id().clone(),
-        context.store.worker_generation(),
-    )
+    let mut broker = if crate::android_policy::enabled() {
+        let directory = crate::android_workspace::open(Path::new(&context.metadata.cwd))?;
+        EffectBroker::new_anchored(
+            Box::new(journal),
+            PathBuf::from(&context.metadata.cwd),
+            directory,
+            context.store.session_id().clone(),
+            context.store.worker_generation(),
+        )
+    } else {
+        EffectBroker::new_canonical(
+            Box::new(journal),
+            &context.metadata.cwd,
+            context.store.session_id().clone(),
+            context.store.worker_generation(),
+        )
+    }
     .map_err(|error| {
         let unavailable = crate::workspace::unavailable(Path::new(&context.metadata.cwd))
             .unwrap_or(WorkspaceUnavailable {
@@ -15517,7 +15601,10 @@ async fn create_broker_tool_dispatcher(
             ToolPermissionDefault::NotApplicable => {}
         }
     }
-    for grant in durable_grants {
+    for grant in durable_grants
+        .into_iter()
+        .filter(|grant| crate::android_policy::effect_allowed(&grant.class))
+    {
         policy.allow_session_grant(grant).map_err(tool_error)?;
     }
     if haider_core::InteractionResolutionPolicy::new(context.metadata.interaction_mode)
@@ -15525,6 +15612,11 @@ async fn create_broker_tool_dispatcher(
         == haider_core::InteractionResolution::AutoApprove
     {
         policy.auto_allow_asks();
+    }
+    if crate::android_policy::enabled() {
+        for class in crate::android_policy::HARD_DENIED_EFFECTS.iter().cloned() {
+            policy.hard_deny(class, "android-standalone platform ceiling");
+        }
     }
     if context.lockdown.is_some() {
         for class in LOCKDOWN_HARD_DENIED_EFFECTS.iter().cloned() {
@@ -17563,8 +17655,11 @@ impl BrokerToolDispatcher {
 
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
-    async fn preflight_tool_call(&self, _name: &str) -> Result<(), HaiderError> {
-        if self.loom_provider_fenced {
+    fn platform_tool_supported(&self, name: &str) -> bool {
+        !crate::android_policy::enabled() || registered_tool_route(name).is_some()
+    }
+    async fn preflight_tool_call(&self, name: &str) -> Result<(), HaiderError> {
+        if !self.platform_tool_supported(name) || self.loom_provider_fenced {
             return Ok(());
         }
         let Some(status) = self
@@ -17635,6 +17730,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 "tool dispatch was cancelled before start",
                 false,
             ));
+        }
+        if crate::android_policy::enabled() && registered_tool_route(name).is_none() {
+            self.clear_cached_call(run_id, item_id, call_id);
+            return model_tool_argument_failure(ToolError::invalid_argument(format!(
+                "unsupported tool `{name}`"
+            )));
         }
         let typed_execution = self.typed_workflow_execution_snapshot().await;
         // Multiple calls from one provider response are fenced to the exact
@@ -20892,6 +20993,7 @@ pub(crate) async fn tool_inventory_snapshot(
     let remembered_grants = durable
         .grants
         .into_iter()
+        .filter(|grant| crate::android_policy::effect_allowed(&grant.class))
         .filter(|grant| {
             mobile_use_active
                 || !matches!(
@@ -22941,3 +23043,7 @@ fn computer_error(error: ComputerError) -> HaiderError {
 
 #[path = "provider_rebind.rs"]
 mod provider_rebind;
+
+#[cfg(all(test, feature = "android-standalone"))]
+#[path = "android_inventory_tests.rs"]
+mod android_inventory_tests;

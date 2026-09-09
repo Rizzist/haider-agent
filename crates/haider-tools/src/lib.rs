@@ -44,6 +44,8 @@ pub use broker::{
     EffectBrokerCloseError, EffectBrokerCloseReport, EffectOperation, JournalSink,
     PermissionPolicy, PolicyDecision, SessionGrant, SessionGrantScope,
 };
+#[cfg(unix)]
+pub use checkpoint::restore_checkpoint_plan_anchored;
 pub use checkpoint::{
     CheckpointCapture, CheckpointCapturePath, CheckpointRestoreError, CheckpointRestorePlan,
     CheckpointRestoreTarget, FreezeCheckpointInput, freeze_checkpoint, restore_checkpoint_plan,
