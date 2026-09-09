@@ -13298,6 +13298,7 @@ pub(crate) enum RegisteredToolRoute {
     Plan,
     LoomRegister,
     TodoWrite,
+    TaskOutcome,
     GraphEvidence,
     FsRead,
     FsGlob,
@@ -13614,6 +13615,11 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::TodoWrite,
             }
         },
+        registered_manifest(
+            haider_tools::task_outcome_manifest(),
+            ToolPermissionDefault::NotApplicable,
+            RegisteredToolRoute::TaskOutcome,
+        ),
         {
             let manifest = haider_tools::graph_evidence_manifest();
             RegisteredTool {
@@ -20339,6 +20345,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::ListTools
             | RegisteredToolRoute::Plan
             | RegisteredToolRoute::TodoWrite
+            | RegisteredToolRoute::TaskOutcome
             | RegisteredToolRoute::GraphEvidence
             | RegisteredToolRoute::WorkflowAuthor
             | RegisteredToolRoute::SpawnSubagent

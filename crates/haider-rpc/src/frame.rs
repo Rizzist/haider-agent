@@ -2258,6 +2258,13 @@ pub struct SessionObserveDigest {
     /// [`SessionSummary::run_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
+    /// Model-reported outcome from this selected run's committed terminal.
+    /// Absent for ordinary completion, legacy journals, and metadata-only reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_outcome: Option<haider_protocol::task_outcome::TaskOutcomeV1>,
+    /// Version of `task_outcome`; emitted together with a recognized outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_outcome_version: Option<u32>,
     /// `None` names the implicit main branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_branch_id: Option<BranchId>,

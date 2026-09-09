@@ -578,4 +578,17 @@ fn capability_profile_fallback_reapplies_profile_and_durable_promotions() {
     assert_eq!(config.tool_definitions(), before.as_ref());
     assert!(!names(&config).contains(&"process_exec"));
     assert!(names(&config).contains(&"web_fetch"));
+
+#[test]
+fn task_outcome_is_initially_visible_only_when_granted() {
+    let mut allowed = HarnessConfig::for_session(
+        SessionId::new("outcome-discovery"),
+        DeviceId::new("discovery-device"),
+        1,
+        1,
+    );
+    allowed.tools.push(definition("task_outcome"));
+    allowed.enable_tool_discovery(Vec::new());
+    assert!(names(&allowed).contains(&"task_outcome"));
+    assert!(!names(&config()).contains(&"task_outcome"));
 }

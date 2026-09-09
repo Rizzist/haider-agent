@@ -351,6 +351,8 @@ pub enum ErrorCode {
     /// a same-session continuation handle instead of a fresh retry.
     RequestBudgetExceeded,
     WorkflowUnfinished,
+    /// The model explicitly reported task failure through the typed tool surface.
+    TaskFailed,
     GraphAlreadyActive,
     GraphNotActive,
     GraphWrongNode,
@@ -404,6 +406,7 @@ impl ErrorCode {
             Self::LoopLimit => "loop_limit",
             Self::RequestBudgetExceeded => "request_budget_exceeded",
             Self::WorkflowUnfinished => "workflow_unfinished",
+            Self::TaskFailed => "task_failed",
             Self::GraphAlreadyActive => "graph_already_active",
             Self::GraphNotActive => "graph_not_active",
             Self::GraphWrongNode => "graph_wrong_node",
@@ -447,6 +450,7 @@ impl ErrorCode {
             Self::LoopLimit => "loop-limit",
             Self::RequestBudgetExceeded => "request-budget-exceeded",
             Self::WorkflowUnfinished => "workflow-unfinished",
+            Self::TaskFailed => "task-failed",
             Self::GraphAlreadyActive => "graph-already-active",
             Self::GraphNotActive => "graph-not-active",
             Self::GraphWrongNode => "graph-wrong-node",

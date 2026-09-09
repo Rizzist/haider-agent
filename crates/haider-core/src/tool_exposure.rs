@@ -14,6 +14,7 @@ const CODING_TOOLS: &[&str] = &[
     // headless clients. This remains an intersection with the granted pack.
     "spawn_subagent",
     "todo_write",
+    "task_outcome",
     "list_tools",
 ];
 /// Initial schema presentation, intersected with the installed authorized

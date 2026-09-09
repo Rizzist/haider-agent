@@ -3,6 +3,27 @@
 use super::*;
 use crate::model_select::SelectionRefusal;
 
+#[test]
+fn task_outcome_catalog_is_actor_owned_and_respects_the_grant_ceiling() {
+    let tool = registered_tool_by_name("task_outcome").expect("registered outcome tool");
+    assert_eq!(tool.route, RegisteredToolRoute::TaskOutcome);
+    assert!(tool.manifest.effects.is_empty());
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let full = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    assert!(full.iter().any(|tool| tool.name == "task_outcome"));
+    let grant = Grant {
+        tools: vec!["fs_read".into()],
+        effect_ceiling: vec![],
+    };
+    let limited = advertised_tool_definitions(
+        &factory,
+        Some(&grant),
+        "fake",
+        WebCapabilityDegrade::default(),
+    );
+    assert!(limited.iter().all(|tool| tool.name != "task_outcome"));
+}
+
 #[tokio::test]
 async fn unavailable_workspace_tool_call_is_a_typed_rejection_without_an_effect() {
     let dispatcher = WorkspaceUnavailableToolDispatcher {

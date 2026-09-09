@@ -50,6 +50,7 @@ pub mod session_fork;
 pub mod spawn_subagent;
 pub mod state;
 pub mod task;
+pub mod task_outcome;
 pub mod tool;
 pub mod trace;
 pub mod typed_agent;
