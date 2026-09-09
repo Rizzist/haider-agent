@@ -30,43 +30,32 @@ pub(crate) fn provider_error_message(value: &serde_json::Value) -> Option<&str> 
 }
 
 pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
-    let spans = header_secret_spans(detail);
-    let mut spans = spans.into_iter().peekable();
+    let mut spans = credential_spans(detail).into_iter().peekable();
     let mut output = String::new();
-    let mut redact_next = false;
     let mut offset = 0;
     for piece in detail.split_inclusive(char::is_whitespace) {
         let word = piece.trim_end_matches(char::is_whitespace);
         let whitespace = &piece[word.len()..];
-        while spans.peek().is_some_and(|span| span.range.end <= offset) {
+        while spans.peek().is_some_and(|span| span.end <= offset) {
             spans.next();
         }
-        let header_secret = spans
+        let secret = spans
             .peek()
-            .is_some_and(|span| span.range.start < offset + word.len());
-        let quoted_secret_ended = spans
-            .peek()
-            .is_some_and(|span| span.quoted && span.range.end <= offset + word.len());
-        offset += piece.len();
-        if word.is_empty() {
-            output.push_str(whitespace);
-            continue;
-        }
-        let normalized = word
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-            .to_ascii_lowercase();
-        if header_secret || redact_next || contains_provider_secret(&normalized) {
+            .is_some_and(|span| span.start < offset + word.len());
+        if !word.is_empty() && (secret || contains_provider_secret(&normalize_word(word))) {
             output.push_str("[REDACTED]");
-            redact_next = (header_secret || redact_next)
-                && !quoted_secret_ended
-                && is_authorization_scheme(&normalized);
         } else {
             output.push_str(word);
-            redact_next = normalized == "bearer" || is_secret_label(&normalized);
         }
         output.push_str(whitespace);
+        offset += piece.len();
     }
     (!output.trim().is_empty()).then_some(output)
+}
+
+fn normalize_word(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .to_ascii_lowercase()
 }
 
 const SECRET_LABELS: &[&str] = &[
@@ -89,82 +78,159 @@ fn is_secret_label(value: &str) -> bool {
         .any(|label| value.eq_ignore_ascii_case(label))
 }
 
-struct SecretSpan {
-    range: std::ops::Range<usize>,
-    quoted: bool,
+struct CredentialStart {
+    introducer: usize,
+    value: usize,
+    redact: usize,
+    authorization: bool,
+    assignment: bool,
 }
 
-fn header_secret_spans(detail: &str) -> Vec<SecretSpan> {
-    // Locate every header independently of whitespace: the preceding credential
-    // may be adjacent to another header, including inside compact JSON.
-    let mut headers = detail
+fn credential_starts(detail: &str) -> Vec<CredentialStart> {
+    // Discover introductions before consuming values so the earliest quoted
+    // value owns any apparent labels/assignments inside its matching quote.
+    let mut starts: Vec<_> = detail
         .match_indices([':', '='])
         .filter_map(|(separator, _)| {
             let prefix = detail[..separator]
                 .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'));
             SECRET_LABELS.iter().find_map(|label| {
                 let start = prefix.len().checked_sub(label.len())?;
-                prefix.get(start..)?.eq_ignore_ascii_case(label).then_some((
-                    start,
-                    separator + 1,
-                    label.ends_with("authorization"),
-                ))
+                if !prefix.get(start..)?.eq_ignore_ascii_case(label) {
+                    return None;
+                }
+                let value = detail.len()
+                    - detail[separator + 1..]
+                        .trim_start_matches(char::is_whitespace)
+                        .len();
+                Some(CredentialStart {
+                    introducer: start,
+                    value,
+                    redact: if value == separator + 1 { start } else { value },
+                    authorization: label.ends_with("authorization"),
+                    assignment: true,
+                })
             })
         })
-        .peekable();
-    let mut spans = Vec::new();
-    while let Some((header_start, value_start, authorization)) = headers.next() {
-        let value = &detail[value_start..];
-        let value_text = value.trim_start_matches(char::is_whitespace);
-        let text_start = detail.len() - value_text.len();
-        let start = if value.len() == value_text.len() {
-            header_start
-        } else {
-            text_start
-        };
-        if let Some(end) = quoted_credential_end(value_text, authorization) {
-            let end = text_start + end;
-            spans.push(SecretSpan {
-                range: start..end,
-                quoted: true,
-            });
-            // Apparent headers inside a quoted credential belong to that
-            // credential; only resume header matching after its closing quote.
-            while headers.peek().is_some_and(|header| header.0 < end) {
-                headers.next();
+        .collect();
+    let mut offset = 0;
+    for piece in detail.split_inclusive(char::is_whitespace) {
+        let word = piece.trim_end_matches(char::is_whitespace);
+        let normalized = normalize_word(word);
+        let assigned = word
+            .rsplit_once([':', '='])
+            .is_some_and(|(_, tail)| !tail.chars().any(|c| c.is_ascii_alphanumeric()));
+        if !assigned && (normalized == "bearer" || is_secret_label(&normalized)) {
+            let value = detail.len()
+                - detail[offset + word.len()..]
+                    .trim_start_matches(char::is_whitespace)
+                    .len();
+            // A separated ':'/'=' belongs to the assignment already found.
+            if value < detail.len() && !detail[value..].starts_with([':', '=']) {
+                starts.push(CredentialStart {
+                    introducer: offset,
+                    value,
+                    redact: value,
+                    authorization: true,
+                    assignment: false,
+                });
             }
+        }
+        offset += piece.len();
+    }
+    // Known prefixes can occur anywhere in a quoted value, including unknown
+    // assignments such as echoed="opaque head sk-... opaque tail".
+    let mut quotes = detail.match_indices(['\'', '"']).peekable();
+    while let Some((value, quote)) = quotes.next() {
+        // Apostrophes in diagnostic words do not open quoted values.
+        if quote == "'"
+            && detail[..value]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+            && detail[value + 1..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+        {
             continue;
         }
-        let next_header = headers.peek().map(|header| header.0);
-        let limit = next_header.unwrap_or(detail.len());
-        let value_text = &detail[text_start..limit];
-        let mut credential = value_text.trim_start_matches(['"', '\'']);
-        if authorization {
-            credential = strip_authorization_scheme(credential).unwrap_or(credential);
+        let Some(length) = quoted_value_end(&detail[value..], false) else {
+            continue;
+        };
+        let end = value + length;
+        if detail[value..end]
+            .split_whitespace()
+            .any(|word| contains_provider_secret(&normalize_word(word)))
+        {
+            starts.push(CredentialStart {
+                introducer: value,
+                value,
+                redact: value,
+                authorization: false,
+                assignment: false,
+            });
         }
-        credential =
-            credential.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'));
-        let credential_start = limit - credential.len();
-        // Explicit separators bound the whole value, including whitespace in
-        // an echoed credential. Without a delimiter, retain diagnostic prose
-        // after the credential's first word, as for a standalone Bearer token.
-        let end = credential
-            .find([';', ',', '\n', '\r', '"', '\'', '{', '}', '[', ']'])
-            .or_else(|| next_header.map(|_| credential.len()))
+        while quotes.peek().is_some_and(|(quote, _)| *quote < end) {
+            quotes.next();
+        }
+    }
+    starts.sort_by_key(|start| start.introducer);
+    starts
+}
+
+fn credential_spans(detail: &str) -> Vec<std::ops::Range<usize>> {
+    let starts = credential_starts(detail);
+    let mut headers = starts.iter().filter(|start| start.assignment).peekable();
+    let mut spans = Vec::new();
+    let mut consumed_until = 0;
+    for start in &starts {
+        if start.introducer < consumed_until {
+            continue;
+        }
+        let end = if let Some(end) = quoted_value_end(&detail[start.value..], start.authorization) {
+            start.value + end
+        } else {
+            while headers
+                .peek()
+                .is_some_and(|header| header.introducer < start.value)
+            {
+                headers.next();
+            }
+            let next_header = headers.peek().map(|header| header.introducer);
+            let limit = next_header.unwrap_or(detail.len());
+            let trim = |c: char| c.is_whitespace() || matches!(c, '\'' | '"');
+            let mut credential = detail[start.value..limit].trim_start_matches(trim);
+            if start.authorization {
+                while let Some(rest) = strip_authorization_scheme(credential) {
+                    credential = rest.trim_start_matches(trim);
+                }
+            }
+            // Assignments may delimit an unquoted multiword value. Standalone
+            // labels consume one credential, preserving subsequent prose.
+            let end = if start.assignment {
+                credential
+                    .find([';', ',', '\n', '\r', '"', '\'', '{', '}', '[', ']'])
+                    .or_else(|| next_header.map(|_| credential.len()))
+            } else {
+                None
+            }
             .unwrap_or_else(|| {
                 credential
                     .find(char::is_whitespace)
                     .unwrap_or(credential.len())
             });
-        spans.push(SecretSpan {
-            range: start..credential_start + end,
-            quoted: false,
-        });
+            limit - credential.len() + end
+        };
+        spans.push(start.redact..end);
+        consumed_until = end;
     }
     spans
 }
 
-fn quoted_credential_end(value: &str, authorization: bool) -> Option<usize> {
+// All value-consuming paths use this matching-quote/escape grammar. Separately
+// quoted or stacked authorization schemes introduce the same opaque value.
+fn quoted_value_end(value: &str, authorization: bool) -> Option<usize> {
     let mut credential = value;
     loop {
         if let Some(end) = closing_quote_end(credential) {

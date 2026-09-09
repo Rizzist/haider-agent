@@ -169,6 +169,44 @@ fn redacted_diagnostics_preserve_whitespace_control_sanitization_and_utf8_bound(
 }
 
 #[test]
+fn quoted_value_paths_preserve_the_exact_utf8_bound() {
+    for classify in [
+        replay_anthropic_http_error,
+        replay_gemini_http_error,
+        replay_openai_http_error,
+    ] {
+        for (introducer, head, public_prefix) in [
+            ("X-Api-Key:", "boundhead", "[REDACTED] [REDACTED] "),
+            (
+                "Authorization:Bearer ",
+                "boundhead",
+                "[REDACTED] [REDACTED] [REDACTED] ",
+            ),
+            ("apikey ", "boundhead", "apikey [REDACTED] [REDACTED] "),
+            ("Bearer ", "boundhead", "Bearer [REDACTED] [REDACTED] "),
+            ("echoed=", "sk-fixture-boundhead", "[REDACTED] [REDACTED] "),
+        ] {
+            let message = format!(
+                "Invalid request; {introducer}\"{head}, boundtail\"; {}",
+                "界🦀".repeat(300)
+            );
+            let structured = serde_json::json!({"error": {"message": message}}).to_string();
+            let expected = format!("Invalid request; {public_prefix}{}", "界🦀".repeat(300));
+            let mut end = 512;
+            while !expected.is_char_boundary(end) {
+                end -= 1;
+            }
+            for body in [structured.as_bytes(), message.as_bytes()] {
+                let detail = classify(400, None, body).presentation.detail;
+                assert_eq!(detail, expected[..end], "input: {message}");
+                assert!(!detail.contains(head));
+                assert!(!detail.contains("boundtail"));
+            }
+        }
+    }
+}
+
+#[test]
 fn every_credential_in_compact_diagnostics_is_redacted() -> Result<(), serde_json::Error> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
