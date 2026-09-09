@@ -331,7 +331,7 @@ impl StatusLine {
     /// a dead label (F7): it names the page it is on and the gesture that
     /// walks to the next, and wraps back to the first at the end.
     #[must_use]
-    pub fn overflow_segments(&self, hidden: usize) -> Vec<Segment> {
+    pub fn overflow_segments(&self, hidden: usize, enter_available: bool) -> Vec<Segment> {
         let (page, pages) = (self.page(), self.pages());
         let last = page + 1 == pages;
         vec![
@@ -339,7 +339,9 @@ impl StatusLine {
             Segment::new(format!("  +{hidden} more"), Tone::Meta),
             Segment::new(format!(" · page {} of {pages}", page + 1), Tone::Meta),
             Segment::new(
-                if last {
+                if !enter_available {
+                    " · /tasks more"
+                } else if last {
                     " · ⏎ back to the first"
                 } else {
                     " · ⏎ next page"

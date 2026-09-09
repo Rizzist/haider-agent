@@ -1594,7 +1594,7 @@ fn an_absolute_blanket_clears_contrary_overrides_and_outranks_the_mode() {
 #[test]
 fn a_long_output_line_wraps_rather_than_losing_its_suffix() {
     let long = format!("{}END_SENTINEL", "x".repeat(300));
-    let rows = tf::output_rows(&long, false, 40);
+    let rows = tf::output_rows(&long, 40);
     assert_eq!(rows.len(), (300 + 13usize).div_ceil(40));
     assert!(
         rows.concat().ends_with("END_SENTINEL"),
@@ -1603,9 +1603,9 @@ fn a_long_output_line_wraps_rather_than_losing_its_suffix() {
     assert!(rows.iter().all(|row| row.chars().count() <= 40));
     // A blank retained line is still a row — dropping it would reflow the
     // output the tool actually produced.
-    assert_eq!(tf::output_rows("a\n\nb\n", false, 10).len(), 3);
+    assert_eq!(tf::output_rows("a\n\nb\n", 10).len(), 3);
     // Width 0 degrades to the logical lines rather than looping forever.
-    assert_eq!(tf::output_rows("a\nb\n", false, 0).len(), 2);
+    assert_eq!(tf::output_rows("a\nb\n", 0).len(), 2);
 
     let mut model = session_model();
     tool_out(
@@ -1988,4 +1988,267 @@ fn a_page_a_finished_task_emptied_falls_back_to_the_first() {
     assert_eq!(line.page(), 0);
     assert_eq!(line.pages(), 1);
     assert!(line.listed().0.is_empty());
+}
+
+// ---- Round 3: the five remaining verifier findings ---------------------
+
+#[test]
+fn reset_to_empty_defaults_survives_revisiting_a_restarted_session() {
+    let mut model = session_model();
+    let restarted = SessionId::new("round3-restarted");
+    model.persisted_tool_rows.insert(
+        restarted.as_str().to_owned(),
+        haider_tui::settings::ToolRowsRecord {
+            blanket: tf::Blanket::Mode,
+            rows: [("t1".to_owned(), RowState::Expanded)]
+                .into_iter()
+                .collect(),
+        },
+    );
+    model.upsert_live_session(&restarted);
+    model.open_session(&restarted);
+    assert_eq!(model.toolfold.state_of("t1"), RowState::Expanded);
+    submit(&mut model, "/verbosity quiet");
+    submit(&mut model, "/verbosity normal");
+    assert!(!model.toolfold.has_session_state());
+    for _ in 0..2 {
+        model.open_session(&session_id());
+        model.open_session(&restarted);
+        assert_eq!(model.toolfold.state_of("t1"), RowState::Collapsed);
+        assert!(
+            !model.toolfold.has_session_state(),
+            "empty defaults are authoritative"
+        );
+    }
+}
+
+#[test]
+fn bounded_output_wraps_by_cells_without_splitting_graphemes() {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let body = format!("{} END", "界e\u{301}👩🏽‍💻".repeat(60));
+    for width in [17, 76, 116] {
+        let wrapped = tf::output_rows(&body, width);
+        assert!(wrapped.iter().all(|row| row.width() <= width));
+        assert_eq!(wrapped.concat(), body, "no suffix may disappear");
+        let mut offset = 0;
+        for row in &wrapped {
+            assert!(
+                body.grapheme_indices(true)
+                    .any(|(index, _)| index == offset)
+            );
+            offset += row.len();
+        }
+        let (start, end, _) = tf::bounded_window(wrapped.len(), 0, tf::EXPANDED_MAX_ROWS);
+        assert!(end - start <= 10, "ten measured rows fit ten terminal rows");
+    }
+}
+
+#[test]
+fn expanded_and_show_all_preserve_a_capped_single_line_fragment() {
+    let mut model = session_model();
+    let body = format!("{}RETAINED_END_SENTINEL", "x".repeat(10_000));
+    tool_out(
+        &mut model,
+        "tail",
+        "read_file",
+        ToolStatus::Completed,
+        "tail",
+        &body,
+    );
+    let block = model
+        .projection
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            haider_tui::projection::TranscriptEntry::Item(block)
+                if block.item_id.as_str() == "tail" =>
+            {
+                Some(block)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(block.output_truncated, "exercise the actual retention cap");
+    let retained = block.output_text();
+    assert!(
+        tf::output_rows(&retained, 76)
+            .concat()
+            .ends_with("RETAINED_END_SENTINEL")
+    );
+    submit(&mut model, "/collapse next");
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let bounded = rows(&model, 80, 24).join("\n");
+    assert!(
+        bounded.contains("xxxxxxxx"),
+        "expanded shows the retained fragment"
+    );
+    assert!(bounded.contains("show all"));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let all = rows(&model, 80, 24).join("\n");
+    assert!(
+        all.contains("RETAINED_END_SENTINEL"),
+        "show all reaches its final byte"
+    );
+    assert!(
+        all.contains("earlier output truncated"),
+        "truncation stays explicit"
+    );
+}
+
+#[test]
+fn expanded_output_also_preserves_the_fragment_before_a_retained_newline() {
+    assert_eq!(
+        tf::output_rows("partial first line\ncomplete second line\n", 80),
+        ["partial first line", "complete second line"]
+    );
+}
+
+#[test]
+fn subagent_focus_and_paging_use_its_transcript_and_preserve_main_disclosure() {
+    for width in [80, 120] {
+        let mut model = session_model();
+        tool_out(
+            &mut model,
+            "main-tool",
+            "grep",
+            ToolStatus::Completed,
+            "main",
+            "main result\n",
+        );
+        model.move_tool_focus(true);
+        let mut child = session_model();
+        let body: String = (0..25).map(|n| format!("CHILD_ROW_{n:02}\n")).collect();
+        tool_out(
+            &mut child,
+            "child-tool",
+            "grep",
+            ToolStatus::Completed,
+            "child",
+            &body,
+        );
+        let mut chip =
+            haider_tui::app::ChipModel::from_seed(haider_tui::mock::sample_seed_chip(2).unwrap());
+        chip.transcript = child.projection;
+        let agent = chip.agent.clone();
+        model.chips = vec![chip];
+        model.handle_hit(Hit::ChipRow(agent.clone()));
+        assert_eq!(model.screen, Screen::Subagent);
+        assert!(
+            !model.cycle_focused_tool_row(),
+            "hidden main focus cannot own Enter"
+        );
+        assert!(!model.page_focused_tool_output(true));
+        assert_eq!(model.tool_row_ids(), ["child-tool"]);
+        submit(&mut model, "/collapse next");
+        assert_eq!(model.toolfold.focus(), Some("child-tool"));
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let _ = rows(&model, width, 40);
+        for _ in 0..3 {
+            model.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(
+            model.toolfold.scroll_of("child-tool"),
+            15,
+            "clamp uses child rows, not main"
+        );
+        assert!(rows(&model, width, 40).join("\n").contains("CHILD_ROW_24"));
+        assert_eq!(model.toolfold.state_of("main-tool"), RowState::Collapsed);
+        model.handle_hit(Hit::SessionHome);
+        assert_eq!(model.screen, Screen::Session);
+        assert!(
+            !model.cycle_focused_tool_row(),
+            "hidden child focus cannot own Enter"
+        );
+        model.handle_hit(Hit::ChipRow(agent));
+        assert_eq!(model.toolfold.state_of("child-tool"), RowState::Expanded);
+        assert_eq!(model.toolfold.scroll_of("child-tool"), 15);
+    }
+}
+
+#[test]
+fn advertised_task_pager_enter_advances_every_page_and_wraps() {
+    for (width, height) in [(80, 24), (120, 40)] {
+        let mut model = tasks_model(6, 14);
+        submit(&mut model, "/tasks");
+        let pages = model.status_line().pages();
+        assert_eq!(pages, 3);
+        for page in 0..pages {
+            let frame = rows(&model, width, height).join("\n");
+            assert!(frame.contains(&format!("page {} of {pages}", page + 1)));
+            assert!(frame.contains(if page + 1 == pages {
+                "⏎ back to the first"
+            } else {
+                "⏎ next page"
+            }));
+            model.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(model.tasks_line_page, (page + 1) % pages);
+        }
+    }
+}
+
+#[test]
+fn task_pager_keeps_drafts_and_focused_tools_and_requires_visible_geometry() {
+    let mut model = tasks_model(6, 14);
+    model.toggle_tasks_line();
+    tool_out(
+        &mut model,
+        "focused",
+        "grep",
+        ToolStatus::Completed,
+        "main",
+        "result\n",
+    );
+    model.move_tool_focus(true);
+    let frame = rows(&model, 120, 40).join("\n");
+    assert!(frame.contains("/tasks more"));
+    assert!(!frame.contains("⏎ next page"));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(model.toolfold.state_of("focused"), RowState::Expanded);
+    assert_eq!(model.tasks_line_page, 0);
+    model.toolfold.set_focus(None);
+    for c in "/verbosity quiet".chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    assert!(rows(&model, 120, 40).join("\n").contains("/tasks more"));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(
+        model.toolfold.verbosity(),
+        Verbosity::Quiet,
+        "draft submits"
+    );
+    assert_eq!(model.tasks_line_page, 0);
+    let _ = rows(&model, 80, 12);
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(
+        model.tasks_line_page, 0,
+        "a hidden pager does not take Enter"
+    );
 }

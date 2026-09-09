@@ -8916,7 +8916,7 @@ impl AppModel {
             // whatever owns them next on every other surface.
             KeyCode::PageDown | KeyCode::PageUp
                 if matches!(self.screen, Screen::Session | Screen::Subagent)
-                    && self.toolfold.focus().is_some()
+                    && self.focused_tool_row().is_some()
                     && self.page_focused_tool_output(key.code == KeyCode::PageDown) => {}
             // 971-tui-collapse: with a tool row FOCUSED (⌥N/⌥P, or a
             // click) and NOTHING drafted, ⏎/Space cycle that row's
@@ -8928,9 +8928,15 @@ impl AppModel {
             KeyCode::Enter | KeyCode::Char(' ')
                 if matches!(self.screen, Screen::Session | Screen::Subagent)
                     && self.composer.is_empty()
-                    && self.toolfold.focus().is_some() =>
+                    && self.composer.attachments().is_empty()
+                    && self.focused_tool_row().is_some() =>
             {
                 self.cycle_focused_tool_row();
+            }
+            // The visible task pager shares the click/slash-command path.
+            // A drafted turn or an explicitly focused tool keeps Enter.
+            KeyCode::Enter if self.task_pager_enter_available() && self.task_pager_visible() => {
+                self.page_tasks_line();
             }
             KeyCode::Enter => self.submit_composer(),
             KeyCode::Backspace => {
@@ -15483,6 +15489,33 @@ impl AppModel {
         self.dirty = true;
     }
 
+    fn task_pager_visible(&self) -> bool {
+        let line = self.status_line();
+        line.expanded
+            && line.pages() > 1
+            && self
+                .tasks_line_rect
+                .get()
+                .is_some_and(|rect| rect.width > 0 && rect.height >= line.height())
+    }
+
+    /// Only advertise Enter when this surface will hand it to the pager.
+    pub(crate) fn task_pager_enter_available(&self) -> bool {
+        matches!(self.screen, Screen::Session | Screen::Subagent)
+            && self.clipboard_composer_visible()
+            && !self.shells_open
+            && !self.ssh_open
+            && !self.monitors_open
+            && self.model_picker.is_none()
+            && self.effort_picker.is_none()
+            && self.theme_picker.is_none()
+            && self.backtrack.is_none()
+            && self.projection.permission_card().is_none()
+            && self.composer.is_empty()
+            && self.composer.attachments().is_empty()
+            && self.focused_tool_row().is_none()
+    }
+
     pub fn toggle_tasks_line(&mut self) {
         self.tasks_line_expanded = !self.tasks_line_expanded;
         // A fresh expansion opens on the first page; a stale one would hide
@@ -15693,12 +15726,40 @@ impl AppModel {
         }
     }
 
-    /// Every tool row in the attached transcript, oldest first — the order
+    /// The projection currently on screen. A missing child has no rows;
+    /// it must never fall back to navigating the hidden main transcript.
+    fn viewed_tool_projection(&self) -> Option<&SessionProjection> {
+        match self.screen {
+            Screen::Subagent => self.viewed_chip().map(|chip| &chip.transcript),
+            Screen::Session => Some(&self.projection),
+            _ => None,
+        }
+    }
+
+    /// Focus only owns keys while its item belongs to the viewed transcript.
+    /// Disclosure remains session-scoped and keyed by the actual item id,
+    /// so a child's rows survive returning to main and session checkout.
+    fn focused_tool_row(&self) -> Option<&str> {
+        let id = self.toolfold.focus()?;
+        self.viewed_tool_projection()?
+            .entries()
+            .iter()
+            .any(|entry| {
+                matches!(entry,
+                crate::projection::TranscriptEntry::Item(block) if block.item_id.as_str() == id)
+            })
+            .then_some(id)
+    }
+
+    /// Every tool row in the viewed transcript, oldest first — the order
     /// ⌥N/⌥P walks. Folded members are included: focusing one is exactly how
     /// a reader reaches a row the fold speaks for.
     #[must_use]
     pub fn tool_row_ids(&self) -> Vec<String> {
-        self.projection
+        let Some(projection) = self.viewed_tool_projection() else {
+            return Vec::new();
+        };
+        projection
             .entries()
             .iter()
             .filter_map(|entry| {
@@ -15756,7 +15817,7 @@ impl AppModel {
     /// collapsed cycle. Answers `false` when nothing is focused, so the
     /// composer keeps both keys in the resting state.
     pub fn cycle_focused_tool_row(&mut self) -> bool {
-        let Some(id) = self.toolfold.focus().map(str::to_owned) else {
+        let Some(id) = self.focused_tool_row().map(str::to_owned) else {
             return false;
         };
         self.toolfold.cycle(&id);
@@ -15791,7 +15852,7 @@ impl AppModel {
     /// Answers `false` when nothing is focused or the focused row is not
     /// bounded-expanded, so the key falls through to whatever owns it next.
     pub fn page_focused_tool_output(&mut self, forward: bool) -> bool {
-        let Some(item_id) = self.toolfold.focus().map(str::to_owned) else {
+        let Some(item_id) = self.focused_tool_row().map(str::to_owned) else {
             return false;
         };
         if self.toolfold.state_of(&item_id) != crate::toolfold::RowState::Expanded {
@@ -15801,19 +15862,17 @@ impl AppModel {
         // width the frame last used, so the window can never scroll past
         // what is actually there.
         let width = self.transcript_view.get().width;
-        let Some(rows) = self
-            .projection
-            .entries()
-            .iter()
-            .find_map(|entry| match entry {
-                crate::projection::TranscriptEntry::Item(block)
-                    if block.item_id.as_str() == item_id =>
-                {
-                    Some(crate::render::retained_output_rows(block, width))
-                }
-                _ => None,
-            })
-        else {
+        let Some(projection) = self.viewed_tool_projection() else {
+            return false;
+        };
+        let Some(rows) = projection.entries().iter().find_map(|entry| match entry {
+            crate::projection::TranscriptEntry::Item(block)
+                if block.item_id.as_str() == item_id =>
+            {
+                Some(crate::render::retained_output_rows(block, width))
+            }
+            _ => None,
+        }) else {
             return false;
         };
         let max = rows.saturating_sub(crate::toolfold::EXPANDED_MAX_ROWS);
@@ -17678,11 +17737,10 @@ impl AppModel {
         // The slot is authoritative once this process has seen the
         // session; the FIRST open after a restart falls back to the profile
         // store (verify 1, F3).
-        let (blanket, rows) = if slot.tool_rows.is_empty()
-            && slot.tools_blanket == crate::toolfold::Blanket::Mode
-            && let Some(record) = self.persisted_tool_rows.get(id.as_str())
-        {
-            (record.blanket, record.rows())
+        // Consume boot state even when the reader later restores empty
+        // defaults: an empty initialized slot is still authoritative.
+        let (blanket, rows) = if let Some(record) = self.persisted_tool_rows.remove(id.as_str()) {
+            (record.blanket, record.rows)
         } else {
             (slot.tools_blanket, std::mem::take(&mut slot.tool_rows))
         };

@@ -20,6 +20,8 @@
 //! (`session::SessionState`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// How much of a tool call the transcript shows BEFORE anyone touches it.
 /// Persisted per profile (`tui-settings.json`) so an orchestration run stays
@@ -825,36 +827,38 @@ pub fn show_all_segments(above: usize, below: usize) -> Vec<Segment> {
 /// `width` cells, so no suffix is unreachable (verify 1, F2 — `ellipsize`
 /// silently dropped the tail of every long line, `show all` included).
 ///
-/// `tail_was_cut` drops the leading mid-line FRAGMENT the 8 KiB output cap
-/// leaves behind, for the same reason [`subline_segments_from`] does.
-/// Wrapping is by CHARACTER, not by word: tool output is paths, diffs and
-/// log lines, where a word break moves a column and a character break does
-/// not lose one.
+/// Expanded views retain even the leading mid-line fragment left by the
+/// output cap. The renderer labels truncation separately; only collapsed
+/// summaries skip that fragment. Wrap at grapheme boundaries using terminal
+/// cells, so wide glyphs cannot make a bounded page occupy extra rows.
 #[must_use]
-pub fn output_rows(output: &str, tail_was_cut: bool, width: usize) -> Vec<String> {
-    let body = if tail_was_cut {
-        output.split_once('\n').map_or("", |(_, rest)| rest)
-    } else {
-        output
-    };
+pub fn output_rows(output: &str, width: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
-    for line in body.lines() {
+    for line in output.lines() {
         if width == 0 {
             rows.push(line.to_owned());
             continue;
         }
-        let mut chars = line.chars().peekable();
-        let mut wrapped = false;
-        while chars.peek().is_some() {
-            let chunk: String = chars.by_ref().take(width).collect();
-            rows.push(chunk);
-            wrapped = true;
+        let mut row = String::new();
+        let mut cells = 0;
+        for grapheme in line.graphemes(true) {
+            // A glyph wider than the entire viewport cannot be drawn.
+            // Keep a visible replacement at that position until resize.
+            let grapheme = if grapheme.width() > width {
+                "�"
+            } else {
+                grapheme
+            };
+            let next = grapheme.width();
+            if cells + next > width {
+                rows.push(std::mem::take(&mut row));
+                cells = 0;
+            }
+            row.push_str(grapheme);
+            cells += next;
         }
-        if !wrapped {
-            // A blank retained line is a row: dropping it would silently
-            // reflow the output the tool actually produced.
-            rows.push(String::new());
-        }
+        // Blank retained lines are rows too.
+        rows.push(row);
     }
     rows
 }

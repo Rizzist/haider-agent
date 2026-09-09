@@ -12284,7 +12284,10 @@ fn render_task_line(
         if hidden > 0
             && let Ok(offset) = u16::try_from(rows.len())
         {
-            rows.push(toned_line(&status.overflow_segments(hidden), theme));
+            rows.push(toned_line(
+                &status.overflow_segments(hidden, model.task_pager_enter_available()),
+                theme,
+            ));
             row_hits.push((offset, Hit::TaskLineMore));
         }
     }
@@ -14954,11 +14957,7 @@ fn tool_disclosure_lines<'a>(
     }
     // Every retained row, hard-wrapped to the content budget: `show all`
     // now really does show all of it (F2).
-    let retained = tf::output_rows(
-        &output,
-        block.output_truncated,
-        cells.saturating_sub(OUTPUT_INDENT),
-    );
+    let retained = tf::output_rows(&output, cells.saturating_sub(OUTPUT_INDENT));
     let (start, end, below) = if matches!(state, RowState::ShowAll) {
         (0, retained.len(), 0)
     } else {
@@ -15004,7 +15003,6 @@ pub(crate) const OUTPUT_INDENT: usize = 4;
 pub fn retained_output_rows(block: &ItemBlock, width: u16) -> usize {
     crate::toolfold::output_rows(
         &block.output_text(),
-        block.output_truncated,
         (width as usize).saturating_sub(OUTPUT_INDENT),
     )
     .len()
