@@ -503,3 +503,79 @@ async fn discovery_is_committed_before_the_next_request_advertises_it() {
     let events = store.events(&SessionId::new("discovery-session")).await;
     assert!(events.iter().any(|event| matches!(event.payload.decode_event(), Ok(EventPayload::ToolResult { result: BoundedResult { data: Some(haider_protocol::tool::ToolResultData::ToolsDiscovered { promoted }), .. }, .. }) if promoted == ["monitor"])));
 }
+
+#[test]
+fn capability_profiles_preserve_promotions_across_refresh_and_grant_narrowing() {
+    for profile in [
+        ToolCapabilityProfile::Coding,
+        ToolCapabilityProfile::Inspection,
+        ToolCapabilityProfile::Automation,
+        ToolCapabilityProfile::Discovery,
+    ] {
+        let mut config = config();
+        config.restore_owned_tool_exposure();
+        config.shared_tools = None;
+        config.enable_tool_discovery_with_profile(profile, vec!["monitor".into(), "mobile".into()]);
+        assert!(names(&config).contains(&"monitor"));
+        assert!(!names(&config).contains(&"mobile"));
+        let result = config.discovered_tool_result(serde_json::json!({"filter": "spawn_subagent"}));
+        config.promote_committed_tools(&result);
+        let before = config.shared_tool_definitions();
+        config.install_provider_derived_request_state(&ProviderDerivedRequestState::default());
+        assert_eq!(config.tool_definitions(), before.as_ref());
+        // A refreshed grant can remove even a durably promoted name.
+        config.tools = vec![definition("list_tools"), definition("fs_read")];
+        config.shared_tools = None;
+        config.refresh_tool_exposure();
+        assert!(!names(&config).contains(&"spawn_subagent"));
+        assert!(!names(&config).contains(&"monitor"));
+        assert_eq!(
+            config.tool_exposure.as_ref().expect("exposure").profile,
+            profile
+        );
+    }
+}
+
+#[test]
+fn capability_profile_without_discovery_preserves_complete_restricted_catalog() {
+    for profile in [
+        ToolCapabilityProfile::Automation,
+        ToolCapabilityProfile::Discovery,
+    ] {
+        let mut config = HarnessConfig::for_session(
+            SessionId::new("restricted"),
+            DeviceId::new("restricted"),
+            0,
+            1,
+        );
+        let full = vec![definition("plan"), full_spawn_definition()];
+        config.tools = full.clone();
+        config.enable_tool_discovery_with_profile(profile, vec!["process_exec".into()]);
+        assert_eq!(config.tool_definitions(), full);
+        config.install_provider_derived_request_state(&ProviderDerivedRequestState::default());
+        assert_eq!(config.tool_definitions(), full);
+    }
+}
+
+#[test]
+fn capability_profile_fallback_reapplies_profile_and_durable_promotions() {
+    let mut config = config();
+    let full = config
+        .tool_exposure
+        .as_ref()
+        .expect("exposure")
+        .current
+        .clone();
+    config.tools = full.to_vec();
+    config.shared_tools = None;
+    config.provider_tool_fallback_tools = full.to_vec();
+    config.enable_tool_discovery_with_profile(
+        ToolCapabilityProfile::Inspection,
+        vec!["web_fetch".into()],
+    );
+    let before = config.shared_tool_definitions();
+    config.activate_provider_tool_fallback();
+    assert_eq!(config.tool_definitions(), before.as_ref());
+    assert!(!names(&config).contains(&"process_exec"));
+    assert!(names(&config).contains(&"web_fetch"));
+}

@@ -41,6 +41,7 @@ mod peer_prompt_tests;
 
 #[path = "tool_exposure.rs"]
 mod tool_exposure;
+pub use tool_exposure::ToolCapabilityProfile;
 
 use crate::{
     ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
