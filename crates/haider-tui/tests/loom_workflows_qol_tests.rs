@@ -417,6 +417,8 @@ fn reconnect_to_pre_catalog_daemon_renders_typed_absence_immediately() {
     driver.apply(
         &mut model,
         LiveReply::Handshake {
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
             features: [haider_rpc::FEATURE_LOOM_V1.to_owned()]
                 .into_iter()
                 .collect(),

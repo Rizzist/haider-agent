@@ -74,6 +74,8 @@ pub struct Link {
     /// What the daemon advertised at handshake (W5e-1b feature gating).
     pub daemon_features: std::collections::BTreeSet<String>,
     pub daemon_version: String,
+    pub client_version: String,
+    pub daemon_protocol: u32,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -84,6 +86,8 @@ impl Link {
         // Capture the handshake facts BEFORE the client moves into the task.
         let daemon_features = client.welcome().features.iter().cloned().collect();
         let daemon_version = client.welcome().daemon_version.clone();
+        let daemon_protocol = client.welcome().protocol;
+        let client_version = config.client_version.clone();
         let (commands_tx, commands_rx) = mpsc::channel(LINK_CAPACITY);
         let (replies_tx, replies) = mpsc::channel(LINK_CAPACITY);
         let task = tokio::spawn(supervise_link(
@@ -98,6 +102,8 @@ impl Link {
             replies,
             daemon_features,
             daemon_version,
+            client_version,
+            daemon_protocol,
             task,
         }
     }
@@ -228,7 +234,9 @@ async fn run_link(
         let dead = tokio::select! {
             command = async { commands.lock().await.recv().await } => {
                 let Some(command) = command else { return };
-                if issue(&client, command, &replies, &attaches_tx).await {
+                if matches!(command, LiveCommand::Reconnect) {
+                    let _ = client.close();
+                } else if issue(&client, command, &replies, &attaches_tx).await {
                     outstanding_attaches += 1;
                 }
                 None
@@ -347,6 +355,8 @@ async fn run_link(
                     let handshake = LiveReply::Handshake {
                         features: client.welcome().features.iter().cloned().collect(),
                         version: client.welcome().daemon_version.clone(),
+                        client_version: config.client_version.clone(),
+                        protocol: client.welcome().protocol,
                     };
                     if replies.send(handshake).await.is_err() {
                         return;
@@ -940,6 +950,8 @@ pub fn request_body_for_features(
     daemon_features: &std::collections::BTreeSet<String>,
 ) -> RequestBody {
     match command {
+        // Reconnect is consumed by the IO shell before RPC conversion.
+        LiveCommand::Reconnect => unreachable!("reconnect retires the socket before RPC mapping"),
         LiveCommand::List { cursor } => RequestBody::SessionList {
             cursor,
             limit: crate::live::LIST_PAGE,
