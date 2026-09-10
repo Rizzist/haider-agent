@@ -533,7 +533,12 @@ fn archive_bytes(root: &Path, members: &[Member]) -> Vec<u8> {
         }
     }
     let output = output.expect("xz fixture compressor is installed");
-    assert!(output.status.success(), "compress test archive");
+    assert!(
+        output.status.success(),
+        "compress test archive: status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     output.stdout
 }
 
