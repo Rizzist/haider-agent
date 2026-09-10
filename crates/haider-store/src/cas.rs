@@ -5,7 +5,7 @@
 //!   Identical bytes therefore deduplicate to one object; objects are
 //!   immutable and write-once.
 //! - Writes are atomic and durable: bytes go to a temp file in the target
-//!   shard, are fsynced, hard-linked into place without replacing an existing
+//!   shard, are fsynced, atomically published without replacing an existing
 //!   object, and the shard directory is fsynced. A reader never observes a
 //!   partially written object.
 //! - Corruption is detected, not prevented: `get` and `verify` re-hash the
@@ -29,6 +29,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 #[path = "cas_tests.rs"]
 mod cas_tests;
+
+#[cfg(all(
+    test,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+#[path = "cas_publication_tests.rs"]
+mod cas_publication_tests;
 
 /// Process-wide counter making temp-file names unique across threads.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -190,7 +197,7 @@ impl CasUpload {
         if shard_created {
             sync_directory(&self.cas.root, haider_platform::SyncPolicy::Full)?;
         }
-        match fs::hard_link(self.temporary_path.path(), &path) {
+        match publish_temporary(self.temporary_path.path(), &path) {
             Ok(()) => {
                 cleanup_temporary(
                     &mut self.temporary_path,
@@ -410,7 +417,7 @@ impl FileCas {
             sync_directory(&self.root, haider_platform::SyncPolicy::Full)?;
         }
 
-        match fs::hard_link(temporary_path.path(), &path) {
+        match publish_temporary(temporary_path.path(), &path) {
             Ok(()) => {
                 // Both directory mutations are durability boundaries: unlink
                 // the root staging name and persist the shard publication.
@@ -537,7 +544,7 @@ impl FileCas {
         }
         drop(temporary);
 
-        match fs::hard_link(temporary_path.path(), &path) {
+        match publish_temporary(temporary_path.path(), &path) {
             Ok(()) => {
                 cleanup_temporary(
                     &mut temporary_path,
@@ -608,7 +615,7 @@ impl FileCas {
             )
         })?;
         if self.verify_existing(&artifact, &path)? {
-            // The winner may still be between hard_link and shard sync.
+            // The winner may still be between publication and shard sync.
             // Independent puts must close their own durability boundary;
             // deferred batches retain their existing group-owned fence.
             if !defer_shard_sync {
@@ -638,7 +645,7 @@ impl FileCas {
         }
         drop(temporary);
 
-        match fs::hard_link(temporary_path.path(), &path) {
+        match publish_temporary(temporary_path.path(), &path) {
             Ok(()) => {
                 cleanup_temporary(&mut temporary_path, parent, policy)?;
                 Ok(artifact)
@@ -1392,6 +1399,42 @@ fn create_temporary(parent: &Path) -> StoreResult<(TemporaryPath, File)> {
     ))
 }
 
+/// Publish complete staged bytes without replacing a concurrent winner. Some
+/// sandboxes (notably Android app data) deny hard links even within one private
+/// directory. The fallback must use a no-replace rename: an ordinary rename
+/// could overwrite a winner between our existence check and publication.
+fn publish_temporary(source: &Path, target: &Path) -> std::io::Result<()> {
+    let result = link_temporary(source, target);
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+    {
+        return haider_platform::fs::rename_noreplace(source, target);
+    }
+    result
+}
+
+fn link_temporary(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(result) =
+        CAS_LINK_TEST_HOOK.with(|slot| slot.borrow_mut().as_mut().map(|hook| hook(source, target)))
+    {
+        return result;
+    }
+    fs::hard_link(source, target)
+}
+
+#[cfg(test)]
+type CasLinkTestHook = Box<dyn FnMut(&Path, &Path) -> std::io::Result<()>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static CAS_LINK_TEST_HOOK: std::cell::RefCell<Option<CasLinkTestHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// Owns an unpublished temp path and removes it even when publication exits
 /// early. Successful cleanup is explicit so its failure can be reported.
 struct TemporaryPath {
@@ -1436,7 +1479,7 @@ impl Drop for TemporaryPath {
 }
 
 /// Removes a staged object and persists all directory mutations, including a
-/// successful final hard link. The directory sync is attempted even if temp
+/// successful final publication. The directory sync is attempted even if temp
 /// removal fails, so a published object is still made durable.
 fn cleanup_temporary(
     temporary: &mut TemporaryPath,
@@ -1444,7 +1487,7 @@ fn cleanup_temporary(
     policy: haider_platform::SyncPolicy,
 ) -> StoreResult<()> {
     let remove_result = temporary.remove();
-    // Temp unlink and final hard-link publication share this directory boundary.
+    // Temp removal and final publication share this directory boundary.
     let sync_result = sync_directory(parent, policy);
     remove_result?;
     sync_result
@@ -1466,7 +1509,7 @@ fn sync_file(file: &File, path: &Path, policy: haider_platform::SyncPolicy) -> S
     haider_platform::fs::sync_file(file, policy).map_err(|error| io_error("sync file", path, error))
 }
 
-/// Fsyncs a directory so its entries (hard links, new subdirectories) survive a
+/// Fsyncs a directory so its entries (published files, new subdirectories) survive a
 /// crash.
 fn sync_directory(path: &Path, policy: haider_platform::SyncPolicy) -> StoreResult<()> {
     #[cfg(test)]

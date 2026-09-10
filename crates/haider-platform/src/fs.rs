@@ -317,6 +317,21 @@ fn execute_file_sync(file: &File, _operation: SyncOperation) -> std::io::Result<
     file.sync_all()
 }
 
+/// Atomically moves a staged file without replacing an existing destination.
+/// Both paths must be on the same filesystem. In particular, Android app-data
+/// policy permits this operation even when it denies creating hard links.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+pub fn rename_noreplace(source: &Path, target: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        target,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
 /// Atomically publishes `source` at `target`, replacing an existing target.
 ///
 /// Unix `rename(2)` already has replacement semantics. Windows'
