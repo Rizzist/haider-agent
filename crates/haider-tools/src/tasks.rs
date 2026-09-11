@@ -417,8 +417,7 @@ impl TaskProgressLine {
                     // Normalization can hide a PEM marker inside an OSC payload.
                     // Keep raw and displayed redaction state independently, so
                     // either representation can protect following lines.
-                    let raw_safe =
-                        crate::redact::redact_line_with_state(&raw, &mut self.raw_state);
+                    let raw_safe = crate::redact::redact_line_with_state(&raw, &mut self.raw_state);
                     let line: String = crate::shell::strip_ansi(&raw)
                         .chars()
                         .filter(|character| !character.is_control())
