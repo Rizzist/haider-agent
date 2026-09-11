@@ -545,7 +545,14 @@ fn typed_large_tool_results_keep_legacy_model_prefix_suffix_cap_and_replay_bytes
         let mut legacy = result(source.clone());
         legacy.truncated = true;
         let legacy_projection = super::model_tool_result_projection(tool, &legacy);
-        assert!(legacy_projection.preview.len() <= MODEL_PAYLOAD_CAP);
+        if tool == "fs_read" {
+            assert_eq!(
+                legacy_projection.preview, source,
+                "file producer owns prefix paging"
+            );
+        } else {
+            assert!(legacy_projection.preview.len() <= MODEL_PAYLOAD_CAP);
+        }
         assert!(legacy_projection.preview.starts_with("MODEL-HEAD\n"));
         assert!(legacy_projection.preview.ends_with("\nMODEL-TAIL"));
 
@@ -566,16 +573,25 @@ fn typed_large_tool_results_keep_legacy_model_prefix_suffix_cap_and_replay_bytes
             projection.preview, expected_model,
             "legacy payload plus only the declared footer"
         );
-        assert_ne!(
-            projection.preview, durable.preview,
-            "the provider payload still applies its smaller cap"
-        );
+        if tool == "fs_read" {
+            assert_eq!(
+                projection.preview, durable.preview,
+                "numbered file page is authoritative"
+            );
+        } else {
+            assert_ne!(
+                projection.preview, durable.preview,
+                "inventory cap still applies"
+            );
+        }
         let footer = projection
             .preview
             .lines()
             .last()
             .expect("declared final line");
-        assert!(projection.preview.len() <= MODEL_PAYLOAD_CAP + 1 + footer.len());
+        if tool != "fs_read" {
+            assert!(projection.preview.len() <= MODEL_PAYLOAD_CAP + 1 + footer.len());
+        }
         assert!(footer.contains(&format!(
             " payload_bytes={} ",
             legacy_projection.preview.len()
@@ -666,4 +682,41 @@ fn repaired_tool_name_preserves_declared_json_and_text_result_provenance() {
         }
         assert!(!corrected.payload_text().contains("[haider:truncated "));
     }
+}
+
+#[test]
+fn numbered_file_pages_keep_the_entire_prefix_and_continuation_at_model_boundary() {
+    let text = format!(
+        "1: {}\n[File preview truncated; continue with fs_read({{\"path\":\"handoff.md\",\"offset\":2}})]\n",
+        "x".repeat(50_000)
+    );
+    let mut result: haider_protocol::tool::BoundedResult =
+        serde_json::from_value(serde_json::json!({
+            "preview": text, "truncated": true
+        }))
+        .expect("result");
+    result.declare_truncation(haider_protocol::tool::ToolTruncation::from_bytes(
+        b"fixture",
+        result.preview.len(),
+    ));
+    let projection = super::model_tool_result_projection("fs_read", &result);
+    assert_eq!(projection.preview, result.preview);
+    assert!(!projection.preview.contains("haider_elision_v1"));
+}
+
+#[test]
+fn cursor_output_pages_survive_source_truncation_without_losing_their_middle() {
+    let source = "ordinary captured output\n".repeat(3000);
+    let chunk = &source[..50_000];
+    let preview = serde_json::json!({"task_id": "background-fixture", "chunk": chunk, "next_cursor": chunk.len(), "exhausted": false}).to_string();
+    let mut result = result(preview);
+    result.truncated = true;
+    result.cursor = Some(chunk.len().to_string());
+    result.declare_truncation(haider_protocol::tool::ToolTruncation::from_bytes(
+        source.as_bytes(),
+        result.preview.len(),
+    ));
+    let projection = super::model_tool_result_projection("task_output", &result);
+    assert_eq!(projection.preview, result.preview);
+    assert!(!projection.preview.contains("haider_elision_v1"));
 }

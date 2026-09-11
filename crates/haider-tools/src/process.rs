@@ -286,7 +286,7 @@ pub struct ProcessBounds {
 impl Default for ProcessBounds {
     fn default() -> Self {
         Self {
-            max_inline_bytes: crate::TOOL_RESULT_INLINE_MAX_BYTES,
+            max_inline_bytes: crate::ORCHESTRATION_PREVIEW_MAX_BYTES,
             max_output_bytes: 1024 * 1024,
             wall_timeout: Duration::from_secs(60),
             kill_grace: Duration::from_secs(2),
@@ -378,6 +378,10 @@ pub enum ProcessLifecycleEvent {
 #[async_trait]
 pub trait CommandOutputSink: Send + Sync {
     async fn emit(&self, call_id: &str, delta: ItemDelta) -> ToolResult<()>;
+    /// Flush incomplete secret-safe lines before the terminal outcome.
+    async fn finish(&self, _call_id: &str) -> ToolResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1603,6 +1607,9 @@ async fn supervise_process_with_exit_observation(
         live.store(false, Ordering::Release);
     }
 
+    if let Err(error) = output.finish(&call_id).await {
+        fatal.get_or_insert(error);
+    }
     let artifact_result = if transcript_failed {
         Ok(None)
     } else if let Some(spill) = spill {

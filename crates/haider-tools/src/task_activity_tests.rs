@@ -106,10 +106,17 @@ fn activity_streams_keep_partial_secrets_and_pem_state_separate() {
             .expect("safe line")
             .contains("[REDACTED:")
     );
+    // Committed output is redacted per stream before it reaches the bounds:
+    // stderr lines commit readable while the split stdout PEM line is still
+    // pending, and the recombined marker never reaches the tail.
+    let tail = buffer.tail_lossy();
+    let diagnostic = tail.find("diagnostic\n").expect("stderr committed");
+    let redacted = tail.find("[REDACTED:private_key]").expect("PEM redacted");
     assert!(
-        buffer
-            .tail_lossy()
-            .contains("-----BEGIN diagnostic\nPRIVATE KEY-----"),
-        "raw combined output remains unchanged"
+        diagnostic < redacted,
+        "stderr commits before the split stdout line completes"
     );
+    assert!(tail.contains("stderr stays readable\n"));
+    assert!(!tail.contains("PRIVATE KEY"), "split PEM never commits raw");
+    assert!(!tail.contains("sk-abc"), "split token never commits raw");
 }

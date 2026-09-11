@@ -821,6 +821,12 @@ async fn anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction() {
             Some("sk-abcdefghijklmnopqrstuv"),
         ),
         (
+            "multiline.txt",
+            "password=\"abc\\\nSYNTHETICTAIL987\" after\n".into(),
+            "REDACTED:secret_value",
+            Some("SYNTHETICTAIL987"),
+        ),
+        (
             ".env",
             "CUSTOM_SECRET=private-value\n".into(),
             "sensitive path",
@@ -834,7 +840,7 @@ async fn anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction() {
         ),
         (
             "key.txt",
-            "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n".into(),
+            "-----BEGIN\x20PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n".into(),
             "REDACTED:private_key",
             Some("private-material"),
         ),
@@ -2043,8 +2049,9 @@ async fn oversized_result_keeps_preview_and_freezes_full_payload_in_cas() {
         .expect("bounded read");
 
     assert!(result.truncated);
-    assert!(result.payload_text().len() <= 9);
-    assert_eq!(result.payload_text(), "αβγ de");
+    assert_eq!(result.payload_text().lines().next(), Some("1: αβγ"));
+    assert!(result.payload_text().contains("\"offset\":1"));
+    assert!(result.payload_text().contains("\"column\":4"));
     let marker = result
         .truncation
         .as_ref()
@@ -2577,4 +2584,37 @@ async fn toolshape_post_apply_failure_preserves_effects_and_original_failure_rec
             assert_eq!(effect.bytes, 6);
         }
     }
+}
+
+#[tokio::test]
+async fn explicit_handoff_read_preserves_owner_identifiers_and_redacts_secrets_in_journal() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let identifier = "01a0e893-52bc-7def-89ab-0123456789cd";
+    let digest = "859c9fd11efbc93ee3d6b5458111b031d4a6477f405146d65d543732901bdfc4";
+    let evidence_path =
+        format!("/workspace/harness/state/evidence/971-redaction/{identifier}/result.md");
+    let contents = format!(
+        "thread={identifier}\nsha256={digest}\npath={evidence_path}\n{}\napi=sk-abcdefghijklmnopQRSTUV\n",
+        "ordinary handoff text ".repeat(900)
+    );
+    fs::write(directory.path().join("handoff.md"), &contents).expect("handoff");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    let read = broker
+        .fs_read(
+            &FsRead::new("handoff.md"),
+            &allow(EffectClass::FsRead),
+            &mut RecordingCas::default(),
+            ResultBounds::file_read(),
+        )
+        .await
+        .expect("read");
+    assert!(read.preview.len() > 8 * 1024);
+    assert!(
+        read.preview
+            .starts_with(&format!("1: thread={identifier}\n"))
+    );
+    assert!(read.preview.contains(digest));
+    assert!(read.preview.contains(&evidence_path));
+    assert!(!read.preview.contains("sk-abcdefghijklmnopQRSTUV"));
+    assert!(!format!("{:?}", broker.journal_snapshot()).contains("sk-abcdefghijklmnopQRSTUV"));
 }
