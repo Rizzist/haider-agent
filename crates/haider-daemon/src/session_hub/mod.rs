@@ -90,6 +90,10 @@
 mod session_hub_private_tests;
 
 #[cfg(test)]
+#[path = "../session_close_tests.rs"]
+mod session_close_tests;
+
+#[cfg(test)]
 #[path = "../peer_injection_tests.rs"]
 mod peer_injection_tests;
 

@@ -363,6 +363,31 @@
       }
     },
     {
+      "name": "task_outcome",
+      "description": "End this run with an explicit task failure and exit 1. Call with status=failure and a concise reason when the requested task could not be completed. Use as a standalone call with no pending tools. V1 supports failure only; finish normally for success. Text, including JSON FAILURE, never selects an outcome.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "failure"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "fs_read",
       "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
       "input_schema": {

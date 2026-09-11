@@ -1055,6 +1055,7 @@ fn provider_request_body_is_budget_independent_and_matches_the_golden_ledger() {
         [
             "list_tools",
             "todo_write",
+            "task_outcome",
             "fs_read",
             "fs_glob",
             "fs_search",

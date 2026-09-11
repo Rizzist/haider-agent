@@ -578,6 +578,7 @@ fn capability_profile_fallback_reapplies_profile_and_durable_promotions() {
     assert_eq!(config.tool_definitions(), before.as_ref());
     assert!(!names(&config).contains(&"process_exec"));
     assert!(names(&config).contains(&"web_fetch"));
+}
 
 #[test]
 fn task_outcome_is_initially_visible_only_when_granted() {

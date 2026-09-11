@@ -5,7 +5,7 @@ The daemon can start a session with a smaller schema pack. Set
 
 | Profile | Initial tools, in catalog order |
 | --- | --- |
-| `coding` (default) | `list_tools`, `todo_write`, `fs_read`, `fs_glob`, `fs_search`, `fs_write`, `fs_edit`, `process_exec`, `spawn_subagent` |
+| `coding` (default) | `list_tools`, `todo_write`, `task_outcome`, `fs_read`, `fs_glob`, `fs_search`, `fs_write`, `fs_edit`, `process_exec`, `spawn_subagent` |
 | `inspection` | `list_tools`, `fs_read`, `fs_glob`, `fs_search` |
 | `automation` | `list_tools`, `fs_read`, `fs_glob`, `fs_search`, `fs_write`, `fs_edit`, `process_exec` |
 | `discovery` | `list_tools` |
@@ -24,6 +24,18 @@ grants and permission policy to restrict effects. The Android standalone ceiling
 and mobile/computer consent gates still apply. Explicit child or lockdown packs
 without `list_tools` retain their complete granted schemas so every granted tool
 remains reachable.
+
+Coding preserves the full default exposure, including `task_outcome` immediately
+after `todo_write`. Inspection, Automation and Discovery deliberately omit task
+tracking and outcome schemas from their initial packs. Each retains `list_tools`:
+an authorized task in any of these profiles can call
+`list_tools(filter="task_outcome")`, wait for the committed discovery result, then
+call `task_outcome` to report a typed failure. A direct call before promotion is
+rejected by the advertised-tool ceiling; it is not a typed task failure. A grant
+that excludes `task_outcome` continues to deny it after discovery. Restricted
+packs without `list_tools` retain `task_outcome` whenever it is granted. Profile
+selection therefore changes when the schema is presented, not whether an
+authorized task can report failure.
 
 `HAIDER_TOOL_EXPOSURE` continues to add comma-separated tool names to the initial
 profile. `HAIDER_TOOL_EXPOSURE=all` bypasses profile filtering and exposes the

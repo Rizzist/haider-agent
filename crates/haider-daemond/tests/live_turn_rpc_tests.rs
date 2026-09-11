@@ -5590,6 +5590,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "loom_register",
             // G1: the actor-owned todo surface.
             "todo_write",
+            "task_outcome",
             "graph_evidence",
             "fs_read",
             "fs_glob",

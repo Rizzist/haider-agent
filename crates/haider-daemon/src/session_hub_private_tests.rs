@@ -3,8 +3,6 @@
 
 use super::*;
 
-#[path = "session_close_tests.rs"]
-mod session_close_tests;
 use haider_accounts::Vault as _;
 use haider_protocol::EventPayload;
 use haider_protocol::cache::CacheRequestAttemptV1;
@@ -1915,7 +1913,7 @@ async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
 }
 
 #[derive(Default)]
-struct CapturingFrameSink(Mutex<Vec<WireFrame>>);
+pub(super) struct CapturingFrameSink(pub(super) Mutex<Vec<WireFrame>>);
 
 impl FrameSink for CapturingFrameSink {
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
@@ -5293,7 +5291,7 @@ fn run_payload_envelope(
     envelope
 }
 
-fn create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand {
+pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand {
     #[cfg(unix)]
     let cwd = "/tmp".into();
     #[cfg(windows)]
@@ -5318,7 +5316,7 @@ fn create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand 
     }
 }
 
-fn accept_command(
+pub(super) fn accept_command(
     session_id: &SessionId,
     run_id: &RunId,
     generation: u64,

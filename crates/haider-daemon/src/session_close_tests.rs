@@ -1,4 +1,6 @@
+#![allow(clippy::expect_used)]
 //! Close witnesses use completion channels, not elapsed-time guesses.
+use super::session_hub_private_tests::{CapturingFrameSink, accept_command, create_command};
 use super::*;
 
 async fn attach(hub: &SessionHub, session: &SessionId, mode: AttachMode) -> AttachmentId {
