@@ -1,0 +1,1542 @@
+[
+  {
+    "name": "original-r1",
+    "detail": "Invalid request; Authorization:Bearer fixture-opaque-secret",
+    "secrets": [
+      "fixture-opaque-secret"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED]"
+  },
+  {
+    "name": "scheme-0-Bearer-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:Bearer fixture-value-bearer retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-0-Bearer-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"Bearer fixture-value-bearer\" retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-0-Bearer-single-quoted",
+    "detail": "Invalid request; 'authorization'='Bearer fixture-value-bearer' retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-1-Basic-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:Basic fixture-value-basic retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-1-Basic-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"Basic fixture-value-basic\" retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-1-Basic-single-quoted",
+    "detail": "Invalid request; 'authorization'='Basic fixture-value-basic' retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-2-Token-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:Token fixture-value-token retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-2-Token-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"Token fixture-value-token\" retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-2-Token-single-quoted",
+    "detail": "Invalid request; 'authorization'='Token fixture-value-token' retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-3-bEaReR-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:bEaReR fixture-value-bearer retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-3-bEaReR-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"bEaReR fixture-value-bearer\" retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-3-bEaReR-single-quoted",
+    "detail": "Invalid request; 'authorization'='bEaReR fixture-value-bearer' retained detail",
+    "secrets": [
+      "fixture-value-bearer"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-4-bAsIc-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:bAsIc fixture-value-basic retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-4-bAsIc-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"bAsIc fixture-value-basic\" retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-4-bAsIc-single-quoted",
+    "detail": "Invalid request; 'authorization'='bAsIc fixture-value-basic' retained detail",
+    "secrets": [
+      "fixture-value-basic"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-5-tOkEn-compact",
+    "detail": "Invalid request; aUtHoRiZaTiOn:tOkEn fixture-value-token retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-5-tOkEn-double-quoted",
+    "detail": "Invalid request; \"Authorization\":\"tOkEn fixture-value-token\" retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "scheme-5-tOkEn-single-quoted",
+    "detail": "Invalid request; 'authorization'='tOkEn fixture-value-token' retained detail",
+    "secrets": [
+      "fixture-value-token"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "multiple-spaced",
+    "detail": "Invalid request; Authorization:Bearer fixture-first \"Authorization\":\"Basic fixture-second\" Authorization:Token fixture-third retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "fixture-third"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "multiple-newlines",
+    "detail": "Invalid request; Authorization: Bearer fixture-first\nAuthorization: Basic fixture-second\nAuthorization: Token fixture-third retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "fixture-third"
+    ],
+    "expected": "Invalid request; Authorization: [REDACTED] [REDACTED]\nAuthorization: [REDACTED] [REDACTED]\nAuthorization: [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "multiple-compact-json",
+    "detail": "Invalid request; [{\"Authorization\":\"Bearer fixture-first\"},{\"Authorization\":\"Basic fixture-second\"},{\"Authorization\":\"Token fixture-third\"}] retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "fixture-third"
+    ],
+    "expected": null
+  },
+  {
+    "name": "multiple-compact-semicolon",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;Authorization:Basic fixture-second retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "spacing",
+    "detail": "messages.2:\n  invalid  tool pairing",
+    "secrets": [],
+    "expected": "messages.2:\n  invalid  tool pairing"
+  },
+  {
+    "name": "tabs-controls",
+    "detail": "Invalid\u001b[31m\trequest; Authorization:Token\n\tfixture-control-secret retained detail",
+    "secrets": [
+      "fixture-control-secret"
+    ],
+    "expected": "Invalid [31m request; [REDACTED]\n [REDACTED] retained detail"
+  },
+  {
+    "name": "utf8-bound",
+    "detail": "Invalid request; Authorization:Bearer\n  \"fixture-utf8-secret\"\u001b[31m 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+    "secrets": [
+      "fixture-utf8-secret"
+    ],
+    "expected": "Invalid request; [REDACTED]\n  [REDACTED] 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+  },
+  {
+    "name": "utf8-only",
+    "detail": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+    "secrets": [],
+    "expected": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+  },
+  {
+    "name": "mixed-comma",
+    "detail": "Invalid request; Authorization:Bearer fixture-first,X-Api-Key: fixture-second,Proxy-Authorization: Basic Zml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "joined-schemes-comma",
+    "detail": "Invalid request; Authorization:Bearerfixture-first,X-Api-Key:fixture-second,Proxy-Authorization:BasicZml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-semicolon",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;X-Api-Key: fixture-second;Proxy-Authorization: Basic Zml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "joined-schemes-semicolon",
+    "detail": "Invalid request; Authorization:Bearerfixture-first;X-Api-Key:fixture-second;Proxy-Authorization:BasicZml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-adjacent",
+    "detail": "Invalid request; Authorization:Bearer fixture-firstX-Api-Key: fixture-secondProxy-Authorization: Basic Zml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "joined-schemes-adjacent",
+    "detail": "Invalid request; Authorization:Bearerfixture-firstX-Api-Key:fixture-secondProxy-Authorization:BasicZml4dHVyZS10aGlyZA== retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-quoted-json",
+    "detail": "Invalid request; [{\"Authorization\":\"Bearer fixture-first\"},{\"X-Api-Key\":\"fixture-second\"},{\"Proxy-Authorization\":\"Basic Zml4dHVyZS10aGlyZA==\"}] retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-single-quoted",
+    "detail": "Invalid request; 'Authorization'='Bearerfixture-first','x-api-key'='fixture-second';'Proxy-Authorization'='BasicZml4dHVyZS10aGlyZA==' retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "delimited-multiword",
+    "detail": "Invalid request; Authorization:Bearer fixture first part;X-Api-Key:fixture second part,Proxy-Authorization:Basic Zml4dHVyZS10aGlyZA==; retained detail",
+    "secrets": [
+      "fixture",
+      "first",
+      "second",
+      "part",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-multiword",
+    "detail": "Invalid request; \"Authorization\":\"Bearer fixture first part\",\"X-Api-Key\":\"fixture second part\"; retained detail",
+    "secrets": [
+      "fixture",
+      "first",
+      "second",
+      "part"
+    ],
+    "expected": null
+  },
+  {
+    "name": "mixed-controls",
+    "detail": "Invalid request; Authorization:Bearer\tfixture-first;X-Api-Key: fixture-second;Proxy-Authorization:Basic\n\tZml4dHVyZS10aGlyZA==\u001b[31m retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second",
+      "Zml4dHVyZS10aGlyZA=="
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-api-key",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;api-key=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-api_key",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;api_key=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-apikey",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;apikey=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-x_api_key",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;x_api_key=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-access_token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;access_token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-access-token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;access-token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-refresh_token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;refresh_token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "label-refresh-token",
+    "detail": "Invalid request; Authorization:Bearer fixture-first;refresh-token=fixture-second; retained detail",
+    "secrets": [
+      "fixture-first",
+      "fixture-second"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-aws",
+    "detail": "Invalid request; echoed=[AKIAFIXTURE0123456789], retained detail",
+    "secrets": [
+      "AKIAFIXTURE0123456789"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-github",
+    "detail": "Invalid request; echoed=[ghp_fixture0123456789abcdefgh], retained detail",
+    "secrets": [
+      "ghp_fixture0123456789abcdefgh"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-slack",
+    "detail": "Invalid request; echoed=[xoxb-fixture-0123456789], retained detail",
+    "secrets": [
+      "xoxb-fixture-0123456789"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-openai",
+    "detail": "Invalid request; echoed=[sk-fixture-secret-value], retained detail",
+    "secrets": [
+      "sk-fixture-secret-value"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-session",
+    "detail": "Invalid request; echoed=[sess-fixture-secret-value], retained detail",
+    "secrets": [
+      "sess-fixture-secret-value"
+    ],
+    "expected": null
+  },
+  {
+    "name": "prefix-jwt",
+    "detail": "Invalid request; echoed=[eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY], retained detail",
+    "secrets": [
+      "eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY"
+    ],
+    "expected": null
+  },
+  {
+    "name": "scheme-continuation",
+    "detail": "Invalid request; Authorization:Bearer Basic fixture-stacked-secret retained detail",
+    "secrets": [
+      "fixture-stacked-secret"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "quoted-inner-boundary-0",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head, v3tail0\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail0"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-1",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head; v3tail1\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail1"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-2",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head{ v3tail2\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail2"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-3",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head} v3tail3\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail3"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-4",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head[ v3tail4\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail4"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-5",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head] v3tail5\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail5"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-6",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head' v3tail6\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail6"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-inner-boundary-7",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:\"v3head\\\" v3tail7\"; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3tail7"
+    ],
+    "expected": null
+  },
+  {
+    "name": "single-quoted-comma",
+    "detail": "Invalid request; Authorization:Bearer v3outer;X-Api-Key:'v3head, v3single'; retained detail",
+    "secrets": [
+      "v3outer",
+      "v3head",
+      "v3single"
+    ],
+    "expected": null
+  },
+  {
+    "name": "header-inside-quoted-secret",
+    "detail": "Invalid request; X-Api-Key:\"v3first Authorization:Bearer v3middle, v3end\"; retained detail",
+    "secrets": [
+      "v3first",
+      "v3middle",
+      "v3end"
+    ],
+    "expected": null
+  },
+  {
+    "name": "isolated-alias-proxy-authorization",
+    "detail": "Invalid request; proxy-authorization v4opaque0 retained detail",
+    "secrets": [
+      "v4opaque0"
+    ],
+    "expected": "Invalid request; proxy-authorization [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-authorization",
+    "detail": "Invalid request; authorization v4opaque1 retained detail",
+    "secrets": [
+      "v4opaque1"
+    ],
+    "expected": "Invalid request; authorization [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-x-api-key",
+    "detail": "Invalid request; x-api-key v4opaque2 retained detail",
+    "secrets": [
+      "v4opaque2"
+    ],
+    "expected": "Invalid request; x-api-key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-x_api_key",
+    "detail": "Invalid request; x_api_key v4opaque3 retained detail",
+    "secrets": [
+      "v4opaque3"
+    ],
+    "expected": "Invalid request; x_api_key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-api-key",
+    "detail": "Invalid request; api-key v4opaque4 retained detail",
+    "secrets": [
+      "v4opaque4"
+    ],
+    "expected": "Invalid request; api-key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-api_key",
+    "detail": "Invalid request; api_key v4opaque5 retained detail",
+    "secrets": [
+      "v4opaque5"
+    ],
+    "expected": "Invalid request; api_key [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-apikey",
+    "detail": "Invalid request; apikey v4opaque6 retained detail",
+    "secrets": [
+      "v4opaque6"
+    ],
+    "expected": "Invalid request; apikey [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-access_token",
+    "detail": "Invalid request; access_token v4opaque7 retained detail",
+    "secrets": [
+      "v4opaque7"
+    ],
+    "expected": "Invalid request; access_token [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-access-token",
+    "detail": "Invalid request; access-token v4opaque8 retained detail",
+    "secrets": [
+      "v4opaque8"
+    ],
+    "expected": "Invalid request; access-token [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-refresh_token",
+    "detail": "Invalid request; refresh_token v4opaque9 retained detail",
+    "secrets": [
+      "v4opaque9"
+    ],
+    "expected": "Invalid request; refresh_token [REDACTED] retained detail"
+  },
+  {
+    "name": "isolated-alias-refresh-token",
+    "detail": "Invalid request; refresh-token v4opaque10 retained detail",
+    "secrets": [
+      "v4opaque10"
+    ],
+    "expected": "Invalid request; refresh-token [REDACTED] retained detail"
+  },
+  {
+    "name": "single-quoted-escaped-quote",
+    "detail": "Invalid request; X-Api-Key:'v4head\\' v4tail'; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-even-backslashes",
+    "detail": "Invalid request; X-Api-Key:\"v4even\\\\\"; retained detail",
+    "secrets": [
+      "v4even"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-odd-backslashes",
+    "detail": "Invalid request; X-Api-Key:\"v4head\\\\\\\" v4tail\"; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-headers-then-independent-header",
+    "detail": "Invalid request; X-Api-Key:\"v4head Authorization:Bearer v4middle, v4tail\"; access_token: v4outside; retained detail",
+    "secrets": [
+      "v4head",
+      "v4middle",
+      "v4tail",
+      "v4outside"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-stacked-schemes",
+    "detail": "Invalid request; Authorization:Bearer Basic \"v4head, v4tail\"; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-separate-schemes",
+    "detail": "Invalid request; Authorization:\"Bearer\" 'Basic' \"v4head, v4tail\"; retained detail",
+    "secrets": [
+      "v4head",
+      "v4tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "quoted-ending-scheme",
+    "detail": "Invalid request; X-Api-Key: \"v4head Bearer\" retained detail",
+    "secrets": [
+      "v4head"
+    ],
+    "expected": "Invalid request; X-Api-Key: [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "v4-whitespace-alias-quoted",
+    "detail": "Invalid request; apikey \"n4barehead, n4baretail\"; retained detail",
+    "secrets": [
+      "n4barehead",
+      "n4baretail"
+    ],
+    "expected": "Invalid request; apikey [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "v4-whitespace-scheme-quoted",
+    "detail": "Invalid request; Bearer \"n4bearhead, n4beartail\"; retained detail",
+    "secrets": [
+      "n4bearhead",
+      "n4beartail"
+    ],
+    "expected": "Invalid request; Bearer [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-assignment-double-comma",
+    "detail": "Invalid request; X-Api-Key:\"r5head, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-assignment-single-escape",
+    "detail": "Invalid request; X-Api-Key:'r5head\\' r5tail'; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-assignment-double-escape",
+    "detail": "Invalid request; X-Api-Key:\"r5head\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-assignment-odd-backslashes",
+    "detail": "Invalid request; X-Api-Key:\"r5head\\\\\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-assignment-even-backslashes",
+    "detail": "Invalid request; X-Api-Key:\"r5head\\\\\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-assignment-inner-headers",
+    "detail": "Invalid request; X-Api-Key:\"r5head apikey Bearer Authorization:Bearer r5middle, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5middle",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-assignment-ending-scheme",
+    "detail": "Invalid request; X-Api-Key:\"r5head Bearer\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-assignment-unicode-whitespace",
+    "detail": "Invalid request; X-Api-Key:\"r5head r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-double-comma",
+    "detail": "Invalid request; Authorization:Bearer \"r5head, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-single-escape",
+    "detail": "Invalid request; Authorization:Bearer 'r5head\\' r5tail'; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-double-escape",
+    "detail": "Invalid request; Authorization:Bearer \"r5head\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-odd-backslashes",
+    "detail": "Invalid request; Authorization:Bearer \"r5head\\\\\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-even-backslashes",
+    "detail": "Invalid request; Authorization:Bearer \"r5head\\\\\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-inner-headers",
+    "detail": "Invalid request; Authorization:Bearer \"r5head apikey Bearer Authorization:Bearer r5middle, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5middle",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-ending-scheme",
+    "detail": "Invalid request; Authorization:Bearer \"r5head Bearer\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-authorization-assignment-unicode-whitespace",
+    "detail": "Invalid request; Authorization:Bearer \"r5head r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-double-comma",
+    "detail": "Invalid request; apikey \"r5head, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-single-escape",
+    "detail": "Invalid request; apikey 'r5head\\' r5tail'; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-double-escape",
+    "detail": "Invalid request; apikey \"r5head\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-odd-backslashes",
+    "detail": "Invalid request; apikey \"r5head\\\\\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-even-backslashes",
+    "detail": "Invalid request; apikey \"r5head\\\\\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-inner-headers",
+    "detail": "Invalid request; apikey \"r5head apikey Bearer Authorization:Bearer r5middle, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5middle",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-ending-scheme",
+    "detail": "Invalid request; apikey \"r5head Bearer\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-label-unicode-whitespace",
+    "detail": "Invalid request; apikey \"r5head r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-double-comma",
+    "detail": "Invalid request; Authorization \"r5head, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-single-escape",
+    "detail": "Invalid request; Authorization 'r5head\\' r5tail'; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-double-escape",
+    "detail": "Invalid request; Authorization \"r5head\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-odd-backslashes",
+    "detail": "Invalid request; Authorization \"r5head\\\\\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-even-backslashes",
+    "detail": "Invalid request; Authorization \"r5head\\\\\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-inner-headers",
+    "detail": "Invalid request; Authorization \"r5head apikey Bearer Authorization:Bearer r5middle, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5middle",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-ending-scheme",
+    "detail": "Invalid request; Authorization \"r5head Bearer\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-authorization-unicode-whitespace",
+    "detail": "Invalid request; Authorization \"r5head r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-double-comma",
+    "detail": "Invalid request; Bearer \"r5head, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-single-escape",
+    "detail": "Invalid request; Bearer 'r5head\\' r5tail'; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-double-escape",
+    "detail": "Invalid request; Bearer \"r5head\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-odd-backslashes",
+    "detail": "Invalid request; Bearer \"r5head\\\\\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-even-backslashes",
+    "detail": "Invalid request; Bearer \"r5head\\\\\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-inner-headers",
+    "detail": "Invalid request; Bearer \"r5head apikey Bearer Authorization:Bearer r5middle, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5middle",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-ending-scheme",
+    "detail": "Invalid request; Bearer \"r5head Bearer\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-standalone-bearer-unicode-whitespace",
+    "detail": "Invalid request; Bearer \"r5head r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-double-comma",
+    "detail": "Invalid request; Bearer \"Basic\" Token \"r5head, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-single-escape",
+    "detail": "Invalid request; Bearer \"Basic\" Token 'r5head\\' r5tail'; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-double-escape",
+    "detail": "Invalid request; Bearer \"Basic\" Token \"r5head\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-odd-backslashes",
+    "detail": "Invalid request; Bearer \"Basic\" Token \"r5head\\\\\\\" r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-even-backslashes",
+    "detail": "Invalid request; Bearer \"Basic\" Token \"r5head\\\\\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-inner-headers",
+    "detail": "Invalid request; Bearer \"Basic\" Token \"r5head apikey Bearer Authorization:Bearer r5middle, r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5middle",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-ending-scheme",
+    "detail": "Invalid request; Bearer \"Basic\" Token \"r5head Bearer\"; retained detail",
+    "secrets": [
+      "r5head"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-stacked-schemes-unicode-whitespace",
+    "detail": "Invalid request; Bearer \"Basic\" Token \"r5head r5tail\"; retained detail",
+    "secrets": [
+      "r5head",
+      "r5tail"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-prefix-0-0",
+    "detail": "Invalid request; \"sk-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "sk-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-0-7",
+    "detail": "Invalid request; echoed=\"sk-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "sk-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-0-10",
+    "detail": "Invalid request; {\"echoed\":\"sk-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "sk-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-1-0",
+    "detail": "Invalid request; \"sess-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "sess-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-1-7",
+    "detail": "Invalid request; echoed=\"sess-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "sess-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-1-10",
+    "detail": "Invalid request; {\"echoed\":\"sess-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "sess-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-2-0",
+    "detail": "Invalid request; \"AKIAFIXTURE0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "AKIAFIXTURE0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-2-7",
+    "detail": "Invalid request; echoed=\"AKIAFIXTURE0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "AKIAFIXTURE0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-2-10",
+    "detail": "Invalid request; {\"echoed\":\"AKIAFIXTURE0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "AKIAFIXTURE0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-3-0",
+    "detail": "Invalid request; \"ghp_fixture0123456789abcdefgh, r5prefixtail\"; retained detail",
+    "secrets": [
+      "ghp_fixture0123456789abcdefgh",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-3-7",
+    "detail": "Invalid request; echoed=\"ghp_fixture0123456789abcdefgh, r5prefixtail\"; retained detail",
+    "secrets": [
+      "ghp_fixture0123456789abcdefgh",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-3-10",
+    "detail": "Invalid request; {\"echoed\":\"ghp_fixture0123456789abcdefgh, r5prefixtail\"; retained detail",
+    "secrets": [
+      "ghp_fixture0123456789abcdefgh",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-4-0",
+    "detail": "Invalid request; \"xoxb-fixture-0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "xoxb-fixture-0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-4-7",
+    "detail": "Invalid request; echoed=\"xoxb-fixture-0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "xoxb-fixture-0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-4-10",
+    "detail": "Invalid request; {\"echoed\":\"xoxb-fixture-0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "xoxb-fixture-0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-5-0",
+    "detail": "Invalid request; \"eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY, r5prefixtail\"; retained detail",
+    "secrets": [
+      "eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-5-7",
+    "detail": "Invalid request; echoed=\"eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY, r5prefixtail\"; retained detail",
+    "secrets": [
+      "eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-5-10",
+    "detail": "Invalid request; {\"echoed\":\"eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY, r5prefixtail\"; retained detail",
+    "secrets": [
+      "eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-apikey-firstword-header",
+    "detail": "Invalid request; apikey \"X-Api-Key:r5inner r5tail\"; access_token:\"r5outside\"; retained detail",
+    "secrets": [
+      "r5inner",
+      "r5tail",
+      "r5outside"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-Bearer-firstword-header",
+    "detail": "Invalid request; Bearer \"X-Api-Key:r5inner r5tail\"; access_token:\"r5outside\"; retained detail",
+    "secrets": [
+      "r5inner",
+      "r5tail",
+      "r5outside"
+    ],
+    "expected": null
+  },
+  {
+    "name": "r5-quoted-assignment-label-unquoted-value",
+    "detail": "Invalid request; \"Authorization\": Bearer r5quotedlabel retained detail",
+    "secrets": [
+      "r5quotedlabel"
+    ],
+    "expected": "Invalid request; \"Authorization\": [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-quoted-assignment-label-scheme-value",
+    "detail": "Invalid request; \"X-Api-Key\": \"Bearer\" retained detail",
+    "secrets": [
+      "Bearer"
+    ],
+    "expected": "Invalid request; \"X-Api-Key\": [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-middle-0",
+    "detail": "Invalid request; echoed=\"r5prefixhead sk-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "r5prefixhead",
+      "sk-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-middle-1",
+    "detail": "Invalid request; echoed=\"r5prefixhead sess-fixture-prefix-value, r5prefixtail\"; retained detail",
+    "secrets": [
+      "r5prefixhead",
+      "sess-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-middle-2",
+    "detail": "Invalid request; echoed=\"r5prefixhead AKIAFIXTURE0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "r5prefixhead",
+      "AKIAFIXTURE0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-middle-3",
+    "detail": "Invalid request; echoed=\"r5prefixhead ghp_fixture0123456789abcdefgh, r5prefixtail\"; retained detail",
+    "secrets": [
+      "r5prefixhead",
+      "ghp_fixture0123456789abcdefgh",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-middle-4",
+    "detail": "Invalid request; echoed=\"r5prefixhead xoxb-fixture-0123456789, r5prefixtail\"; retained detail",
+    "secrets": [
+      "r5prefixhead",
+      "xoxb-fixture-0123456789",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-middle-5",
+    "detail": "Invalid request; echoed=\"r5prefixhead eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY, r5prefixtail\"; retained detail",
+    "secrets": [
+      "r5prefixhead",
+      "eyJmaXh0dXJlMDEyMzQ.eyJmaXh0dXJlNTY3ODk.Zml4dHVyZTAxMjM0NTY",
+      "r5prefixtail"
+    ],
+    "expected": "Invalid request; [REDACTED] [REDACTED] [REDACTED] retained detail"
+  },
+  {
+    "name": "r5-prefix-preserves-contractions",
+    "detail": "Request can't parse; echoed=\"sk-fixture-prefix-value, r5prefixtail\"; field didn't match; retained detail",
+    "secrets": [
+      "sk-fixture-prefix-value",
+      "r5prefixtail"
+    ],
+    "expected": "Request can't parse; [REDACTED] [REDACTED] field didn't match; retained detail"
+  },
+  {
+    "name": "v5-label-newline-quote",
+    "detail": "Invalid request; api_key\n\t\"n5linehead, n5linetail\"; retained detail",
+    "secrets": [
+      "n5linehead",
+      "n5linetail"
+    ]
+  },
+  {
+    "name": "v5-scheme-quote-header",
+    "detail": "Invalid request; Bearer \"n5schemehead, X-Api-Key:n5inner n5schemetail\"; api_key=\"n5afterhead n5aftertail\"; retained detail",
+    "secrets": [
+      "n5schemehead",
+      "n5inner",
+      "n5schemetail",
+      "n5afterhead",
+      "n5aftertail"
+    ]
+  },
+  {
+    "name": "v5-nested-bound",
+    "detail": "Invalid request; Authorization:Bearer \"n5boundhead 界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀界'api_key=n5nested'🦀 n5boundtail\"; retained detail",
+    "secrets": [
+      "n5boundhead",
+      "n5nested",
+      "n5boundtail"
+    ]
+  },
+  {
+    "name": "v5-odd-backslash-storm",
+    "detail": "Invalid request; apikey \"n5stormhead\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\" api_key:n5storminner, n5stormtail\"; retained detail",
+    "secrets": [
+      "n5stormhead",
+      "n5storminner",
+      "n5stormtail"
+    ]
+  },
+  {
+    "name": "v5-even-backslash-storm",
+    "detail": "Invalid request; Bearer 'n5evenhead\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\'; Authorization:'n5evennext, n5eventail'; retained detail",
+    "secrets": [
+      "n5evenhead",
+      "n5evennext",
+      "n5eventail"
+    ]
+  },
+  {
+    "name": "v5-mixed-single-double",
+    "detail": "Invalid request; refresh-token\n'n5mixhead \"Bearer n5mixinner\" n5mixtail'; retained detail",
+    "secrets": [
+      "n5mixhead",
+      "n5mixinner",
+      "n5mixtail"
+    ]
+  },
+  {
+    "name": "v5-separately-quoted-schemes",
+    "detail": "Invalid request; Authorization:\"Bearer\" 'Basic' \"Token\" 'n5stackhead, n5stacktail'; retained detail",
+    "secrets": [
+      "n5stackhead",
+      "n5stacktail"
+    ]
+  },
+  {
+    "name": "v5-prefix-newline",
+    "detail": "Invalid request; echoed=\"n5prehead\n sk-fixture-n5prefix n5pretail\"; retained detail",
+    "secrets": [
+      "n5prehead",
+      "sk-fixture-n5prefix",
+      "n5pretail"
+    ]
+  },
+  {
+    "name": "v5-bearer-colon-newline",
+    "detail": "Invalid request; Bearer:\n\"n5colonhead, n5colontail\"; retained detail",
+    "secrets": [
+      "n5colonhead",
+      "n5colontail"
+    ]
+  },
+  {
+    "name": "v5-bearer-separated-equal",
+    "detail": "Invalid request; Bearer = 'n5eqhead, n5eqtail'; retained detail",
+    "secrets": [
+      "n5eqhead",
+      "n5eqtail"
+    ]
+  },
+  {
+    "name": "v5-unclosed-label",
+    "detail": "Invalid request; apikey \"n5openhead, n5opentail",
+    "secrets": [
+      "n5openhead",
+      "n5opentail"
+    ]
+  },
+  {
+    "name": "v5-unclosed-assignment",
+    "detail": "Invalid request; api_key=\"n5assignhead, n5assigntail",
+    "secrets": [
+      "n5assignhead",
+      "n5assigntail"
+    ]
+  },
+  {
+    "name": "v5-unclosed-scheme",
+    "detail": "Invalid request; Bearer \"n5bearopenhead, n5bearopentail",
+    "secrets": [
+      "n5bearopenhead",
+      "n5bearopentail"
+    ]
+  },
+  {
+    "name": "r6-short-prefix-punctuation-is-public",
+    "detail": "Invalid request; sk-short!!!!!!!! sess-short!!!!!!!! retained detail",
+    "secrets": [],
+    "expected": "Invalid request; sk-short!!!!!!!! sess-short!!!!!!!! retained detail"
+  }
+]

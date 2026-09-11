@@ -109,6 +109,9 @@ use haider_provider::{
     validate_provider_view_prefix,
 };
 
+#[path = "actor_wake.rs"]
+mod wake;
+
 pub const ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND: &str = "haider.route_replay_attempt.v1";
 pub const ROUTE_REPLAY_EVENT_EXTENSION_KIND: &str = "haider.route_replay_event.v1";
 
@@ -3928,6 +3931,14 @@ impl HarnessActor {
             }
             let newest_volatile_history_start = messages.len();
             messages.extend(std::mem::take(&mut self.pending_nudges));
+            let wake_remap = wake::normalize_tail(&mut messages);
+            let newest_volatile_history_start = wake_remap.boundary(newest_volatile_history_start);
+            stable_history_end = wake_remap.boundary(stable_history_end);
+            current_turn_start = wake_remap.boundary(current_turn_start);
+            latest_compaction_summary_end =
+                latest_compaction_summary_end.map(|end| wake_remap.boundary(end));
+            logical_request_cacheable_history_end =
+                wake_remap.boundary(logical_request_cacheable_history_end);
             let request_projection_compacted = match self
                 .enforce_context_policy(
                     &run_id,
@@ -4033,7 +4044,8 @@ impl HarnessActor {
                     previous_cache_request
                         .as_ref()
                         .map(|previous| previous.history_message_count)
-                });
+                })
+                .map(|end| wake_remap.boundary(end));
             // Move the canonical history into the provider request and take
             // it back immediately after the HTTP stream opens. Built-in
             // adapters borrow this request; only compatibility providers use
@@ -5813,6 +5825,33 @@ impl HarnessActor {
                                 }
                                 assistant_blocks.push(block);
                                 if !self.pending_subturns.is_empty() {
+                                    // A prior call in this same response may already
+                                    // have executed, or be awaiting its deferred result.
+                                    // Preserve those results before holding the new call.
+                                    if !deferred.is_empty() {
+                                        match self
+                                            .settle_deferred_tools(
+                                                &run_id,
+                                                &mut tools,
+                                                &mut deferred,
+                                                &cancel,
+                                            )
+                                            .await
+                                        {
+                                            Ok(mut results) => tool_results.append(&mut results),
+                                            Err(error) => {
+                                                return self
+                                                    .drive_error_outcome_with_items(
+                                                        &run_id,
+                                                        &mut message,
+                                                        &mut reasoning,
+                                                        &mut tools,
+                                                        error,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
                                     if let Err(error) =
                                         self.complete_tools_for_subturn(&run_id, &mut tools).await
                                     {
@@ -5835,15 +5874,16 @@ impl HarnessActor {
                                     // tool-use pair without claiming it ran.
                                     // The following user messages then form
                                     // the actual subturn request.
+                                    messages.append(&mut tool_results);
                                     messages.push(Message::tool_result(
                                         call_id,
-                                        "held before execution for a user subturn; revise or confirm the tool call",
+                                        wake::HELD_TOOL_RESULT,
                                         false,
                                     ));
                                     messages.extend(
                                         std::mem::take(&mut self.pending_subturns)
                                             .into_iter()
-                                            .map(Message::user_text),
+                                            .map(wake::input),
                                     );
                                     if let Err(error) = release_provider_budget_request(
                                         self.config.provider_budget_guard.as_ref(),
@@ -6565,7 +6605,7 @@ impl HarnessActor {
                             messages.extend(
                                 std::mem::take(&mut self.pending_subturns)
                                     .into_iter()
-                                    .map(Message::user_text),
+                                    .map(wake::input),
                             );
                             provider_attempt = 0;
                             thinking_pending = true;
