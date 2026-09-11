@@ -36,6 +36,8 @@ payload_kinds! {
         EventPayload::MenuClosed { .. } => "menu_closed",
         EventPayload::UserMessage { .. } => "user_message",
         EventPayload::PeerMessage(_) => "peer.message",
+        EventPayload::PeerOutbox(_) => "peer.outbox",
+        EventPayload::PeerDelivery(_) => "peer.delivery",
         EventPayload::QueueChanged(_) => "queue_changed",
         EventPayload::Item(_) => "item",
         EventPayload::Effect(_) => "effect",

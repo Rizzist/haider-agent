@@ -95,3 +95,25 @@ mod unix {
         assert!(path.exists());
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn offline_peer_registration_survives_stale_socket_sweep() {
+    use haider_platform::{
+        BoundEndpoint, Endpoint, PeerEndpointKind, peer_endpoint_paths, sweep_stale_endpoints,
+    };
+    let root = tempfile::tempdir_in("/tmp").expect("short runtime root");
+    let runtime = root.path().join("r");
+    let paths =
+        peer_endpoint_paths(&runtime, "registered", PeerEndpointKind::Haider).expect("paths");
+    let mut bound = BoundEndpoint::bind(&Endpoint::from_address(paths.socket.clone()), &runtime)
+        .await
+        .expect("bind");
+    std::fs::write(&paths.manifest, b"registered metadata").expect("manifest");
+    bound.close_listener();
+    std::mem::forget(bound);
+    assert_eq!(sweep_stale_endpoints(&runtime, None).await, 1);
+    assert!(paths.manifest.exists());
+    assert_eq!(sweep_stale_endpoints(&runtime, None).await, 0);
+    assert!(paths.manifest.exists());
+}

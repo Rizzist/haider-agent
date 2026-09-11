@@ -4471,12 +4471,17 @@ pub enum RequestBody {
     },
     /// Lists every currently live Haider session and registered external peer.
     #[serde(rename = "peer.list")]
-    PeerList {},
+    PeerList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<haider_protocol::peer::PeerStatusQuery>,
+    },
     /// Admits one attributable message to a live receiver boundary.
     /// The legacy receipt shape acknowledges this request synchronously.
     /// The sender is the connection's unique control-attached session.
     #[serde(rename = "peer.send")]
     PeerSend {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<haider_protocol::peer::PeerSendOptions>,
         to: String,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5510,7 +5515,15 @@ pub enum ResponseBody {
         receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
     },
     #[serde(rename = "peer.list")]
-    PeerList { agents: Vec<PeerDescriptor> },
+    PeerList {
+        agents: Vec<PeerDescriptor>,
+        /// Additive support marker, so callers can refuse an old sender
+        /// daemon before it silently ignores idempotency/cancellation options.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        delivery_status_supported: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<haider_protocol::peer::PeerStatusPage>,
+    },
     #[serde(rename = "peer.send")]
     PeerSend { receipt: PeerReceipt },
     #[serde(rename = "peer.name")]

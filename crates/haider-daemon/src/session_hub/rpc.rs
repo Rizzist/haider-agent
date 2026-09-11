@@ -6801,7 +6801,7 @@ impl HubConnection {
                 )
                 .await
             }
-            RequestBody::PeerList {} => {
+            RequestBody::PeerList { status } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
                         request_id,
@@ -6814,10 +6814,20 @@ impl HubConnection {
                 self.hub.enable_peer_events(&self.connection_id)?;
                 let service = self.hub.peer_service()?;
                 self.defer_peer_request(request_id, async move {
-                    service
-                        .list()
-                        .await
-                        .map(|agents| ResponseBody::PeerList { agents })
+                    if let Some(query) = status {
+                        return service.delivery_status(query).await.map(|status| {
+                            ResponseBody::PeerList {
+                                delivery_status_supported: true,
+                                agents: Vec::new(),
+                                status: Some(status),
+                            }
+                        });
+                    }
+                    service.list().await.map(|agents| ResponseBody::PeerList {
+                        delivery_status_supported: true,
+                        agents,
+                        status: None,
+                    })
                 })
             }
             RequestBody::PeerInject { .. } => self.respond_error(
@@ -6840,6 +6850,7 @@ impl HubConnection {
                 self.peer_notify_when_idle(request_id, to)
             }
             RequestBody::PeerSend {
+                options,
                 to,
                 message,
                 summary,
@@ -6868,7 +6879,13 @@ impl HubConnection {
                 let session_id = session_id.clone();
                 self.defer_peer_request(request_id, async move {
                     service
-                        .send(&session_id, to, message, summary)
+                        .send_with_options(
+                            &session_id,
+                            to,
+                            message,
+                            summary,
+                            options.unwrap_or_default(),
+                        )
                         .await
                         .map(|receipt| ResponseBody::PeerSend { receipt })
                 })
@@ -18690,11 +18707,19 @@ fn peer_error_response(error: crate::peer::PeerError) -> ResponseBody {
     let (code, message, retryable, data) = match error {
         crate::peer::PeerError::Ambiguous { candidates } => (
             ERROR_CODE_PEER_AMBIGUOUS,
-            "peer address is ambiguous; qualify it with an id prefix".to_owned(),
+            format!(
+                "peer address is ambiguous; candidates: {}",
+                candidates
+                    .iter()
+                    .map(|candidate| format!("{} [{}]", candidate.name, candidate.id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             false,
             Some(ErrorData::PeerAmbiguous { candidates }),
         ),
-        crate::peer::PeerError::Invalid { message } => {
+        crate::peer::PeerError::Invalid { message }
+        | crate::peer::PeerError::Refused { message } => {
             (ERROR_CODE_PEER_INVALID, message, false, None)
         }
         error => (ERROR_CODE_PEER_UNAVAILABLE, error.to_string(), false, None),

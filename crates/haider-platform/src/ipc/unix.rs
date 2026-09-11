@@ -1222,7 +1222,7 @@ pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> u
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if name == ENDPOINT_NAME || is_peer_socket_name(&name) || is_peer_manifest_name(&name) {
+            if name == ENDPOINT_NAME || is_peer_socket_name(&name) {
                 names.push(name);
             }
         }
@@ -1238,16 +1238,6 @@ pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> u
         if keep_name.as_deref() == Some(name.as_str()) {
             continue;
         }
-        if is_peer_manifest_name(&name) {
-            let socket_name = format!("{}.s", &name[..name.len() - 2]);
-            if rustix::fs::statat(&directory, socket_name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                .is_err_and(|error| error == Errno::NOENT)
-                && remove_verified_owner_file(&directory, &name, owner_uid).is_ok()
-            {
-                removed += 1;
-            }
-            continue;
-        }
         let socket_path = runtime_dir.join(&name);
         // Only a refused connect proves death. A live endpoint, a timeout, or
         // any other error leaves the node exactly as it is.
@@ -1259,10 +1249,6 @@ pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> u
                         .is_ok() =>
             {
                 removed += 1;
-                if is_peer_socket_name(&name) {
-                    let manifest_name = format!("{}.j", &name[..name.len() - 2]);
-                    let _ = remove_verified_owner_file(&directory, &manifest_name, owner_uid);
-                }
             }
             _ => {}
         }
@@ -1274,48 +1260,12 @@ fn is_peer_socket_name(name: &str) -> bool {
     is_peer_artifact_name(name, ".s")
 }
 
-fn is_peer_manifest_name(name: &str) -> bool {
-    is_peer_artifact_name(name, ".j")
-}
-
 fn is_peer_artifact_name(name: &str, extension: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() == 17
         && name.ends_with(extension)
         && (name.starts_with("ph-") || name.starts_with("px-"))
         && bytes[3..15].iter().all(u8::is_ascii_hexdigit)
-}
-
-fn remove_verified_owner_file(
-    directory: &OwnedFd,
-    name: &str,
-    expected_uid: u32,
-) -> Result<(), EndpointError> {
-    let stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(error) => {
-            return Err(EndpointError::io(
-                "lstat stale peer manifest",
-                Path::new(name),
-                error.into(),
-            ));
-        }
-    };
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_uid != expected_uid
-    {
-        return Err(EndpointError::Endpoint {
-            message: format!("refusing to remove unverified peer manifest {name}"),
-        });
-    }
-    match rustix::fs::unlinkat(directory, name, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
-        Err(error) => Err(EndpointError::io(
-            "remove stale peer manifest",
-            Path::new(name),
-            error.into(),
-        )),
-    }
 }
 
 async fn probe(path: &Path) -> std::io::Result<UnixStream> {

@@ -471,7 +471,7 @@ async fn peer_list_and_send_share_bounded_deferred_dispatch_and_cancel_on_close(
         connection
             .request(
                 RequestId::new(format!("pending-list-{index}")),
-                RequestBody::PeerList {},
+                RequestBody::PeerList { status: None },
             )
             .await
             .expect("defer list");
@@ -479,6 +479,7 @@ async fn peer_list_and_send_share_bounded_deferred_dispatch_and_cancel_on_close(
             .request(
                 RequestId::new(format!("pending-send-{index}")),
                 RequestBody::PeerSend {
+                    options: None,
                     to: "missing-target".into(),
                     message: "fixture".into(),
                     summary: None,
@@ -492,7 +493,10 @@ async fn peer_list_and_send_share_bounded_deferred_dispatch_and_cancel_on_close(
         0
     );
     connection
-        .request(RequestId::new("peer-overloaded"), RequestBody::PeerList {})
+        .request(
+            RequestId::new("peer-overloaded"),
+            RequestBody::PeerList { status: None },
+        )
         .await
         .expect("bounded peer overload response");
     assert!(sink.0.lock().expect("RPC sink").iter().any(|frame| matches!(frame,
@@ -808,5 +812,66 @@ async fn peer_idle_notice_refuses_target_removed_from_live_registry() {
     connection.close().await.expect("close connection");
     service.shutdown().await;
     hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn peer_legacy_admission_receipt_prevents_a_second_admission_after_upgrade() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let session = SessionId::new("legacy-peer-receiver");
+    store
+        .create_session(create_command(&session))
+        .await
+        .expect("session before hub");
+    let peer = message(&session);
+    let request_json = serde_json::to_string(&peer).expect("legacy semantic request");
+    let run_id = RunId::new("legacy-peer-run");
+    store
+        .accept_peer_turn(
+            TurnAcceptCommand {
+                command_id: format!("peer:{}", peer.msg_id),
+                request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                request_json,
+                session_id: session.clone(),
+                worker_generation: store.worker_generation(),
+                run_id: run_id.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: peer.render_for_prompt(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+                queued_event_id: EventId::new("legacy-peer-queued"),
+                user_event_id: EventId::new("legacy-peer-message"),
+                active_event_id: EventId::new("legacy-peer-active"),
+                device_id: DeviceId::new("receiver-device"),
+            },
+            peer.clone(),
+        )
+        .await
+        .expect("legacy admission before hub");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.actor_for(session.clone())
+        .await
+        .expect("resume legacy receiver actor");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies::unconfigured_for_tests(),
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("manager");
+    let replay = hub
+        .inject_peer_message(&peer)
+        .await
+        .expect("legacy receipt replay");
+    assert_eq!(replay.run_id, run_id);
+    let mut conflict = peer;
+    conflict.message = "different body".into();
+    assert!(hub.inject_peer_message(&conflict).await.is_err());
+    let events = store.read(&session, 0, 256).await.expect("journal");
+    assert_eq!(events.iter().filter(|event| matches!(event.payload.decode_event(), Ok(EventPayload::NodeCommitted(node)) if matches!(node.kind, NodeKind::Agent { .. }))).count(), 1);
+    manager.shutdown().await.expect("manager stop");
+    hub.shutdown().await.expect("hub stop");
     store.close().await.expect("store close");
 }
