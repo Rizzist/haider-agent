@@ -26,7 +26,7 @@ pub const HELP_INTRO_TEXT: &[&str] = &[
     // each be set that way — and physical Option translation on the owner's
     // own terminal is still unverified. The typed commands and ⌃O always
     // arrive, so they are what the hint teaches.
-    "tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|normal|verbose] · /tasks [more] · ⌃O expands or collapses every row",
+    "tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|default|verbose] · /tasks [more] · ⌃O expands or collapses every row",
     "  ⏎/space or click cycles the focused row (collapsed → bounded → show all) · ⇟/⇞ page a bounded row · also ⌥T ⌥N ⌥P ⌥V ⌥S where the terminal passes Option through",
 ];
 
@@ -68,7 +68,7 @@ pub const HELP_TEXT: &[&str] = &[
     // each be set that way — and physical Option translation on the owner's
     // own terminal is still unverified. The typed commands and ⌃O always
     // arrive, so they are what the hint teaches.
-    "tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|normal|verbose] · /tasks [more] · ⌃O expands or collapses every row",
+    "tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|default|verbose] · /tasks [more] · ⌃O expands or collapses every row",
     "  ⏎/space or click cycles the focused row (collapsed → bounded → show all) · ⇟/⇞ page a bounded row · also ⌥T ⌥N ⌥P ⌥V ⌥S where the terminal passes Option through",
     "  /queue <steer|subturn|turn> mid-turn input — safe boundary, next tool call, or turn end",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",

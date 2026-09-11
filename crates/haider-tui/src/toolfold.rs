@@ -24,7 +24,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// How much of a tool call the transcript shows BEFORE anyone touches it.
-/// Persisted per profile (`tui-settings.json`) so an orchestration run stays
+/// Persisted per session in `tui-settings.json` so an orchestration run stays
 /// quiet and a debugging run stays verbose across restarts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Verbosity {
@@ -47,7 +47,7 @@ impl Verbosity {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "quiet" => Some(Self::Quiet),
-            "normal" => Some(Self::Normal),
+            "default" | "normal" => Some(Self::Normal),
             "verbose" => Some(Self::Verbose),
             _ => None,
         }
@@ -57,12 +57,12 @@ impl Verbosity {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Quiet => "quiet",
-            Self::Normal => "normal",
+            Self::Normal => "default",
             Self::Verbose => "verbose",
         }
     }
 
-    /// The next mode in the ⌥V cycle: quiet → normal → verbose → quiet.
+    /// The next mode in the ⌥V cycle: quiet → default → verbose → quiet.
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
@@ -423,7 +423,7 @@ impl ToolFold {
         self.bump();
     }
 
-    /// ⌥V — the persisted quiet/normal/verbose cycle. Changing the mode
+    /// ⌥V — the persisted quiet/default/verbose cycle. Changing the mode
     /// also drops per-row overrides: the mode IS the new default, and a
     /// stale override would hide it.
     pub fn set_verbosity(&mut self, verbosity: Verbosity) {
@@ -470,7 +470,7 @@ impl ToolFold {
         self.bump();
     }
 
-    /// The persistable half of the state (the mode lives per profile).
+    /// The persistable per-row overrides (the mode is saved alongside them).
     #[must_use]
     pub fn rows_snapshot(&self) -> BTreeMap<String, RowState> {
         self.rows.clone()
@@ -512,8 +512,8 @@ impl ToolFold {
         self.bump();
     }
 
-    /// Detaching clears the transcript-local disclosure state; the mode
-    /// survives because it is a PROFILE preference, not a session's.
+    /// Clear transcript-local row choices while retaining the current mode.
+    /// Session checkout restores the destination's mode separately.
     pub fn clear_session(&mut self) {
         self.blanket = Blanket::Mode;
         self.rows.clear();

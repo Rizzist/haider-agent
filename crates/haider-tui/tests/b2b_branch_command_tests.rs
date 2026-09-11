@@ -410,3 +410,24 @@ fn the_status_bar_names_the_active_branch() {
         "the active fork's name reaches the status bar: {bar:?}"
     );
 }
+
+#[test]
+fn header_and_footer_follow_the_active_branch_after_switching_back_and_forth() {
+    let mut model = forked_model();
+    for target in [Some(bid("b-exp")), None, Some(bid("b-exp"))] {
+        model.switch_branch(target.as_ref());
+        let expected = model.active_branch_name();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(&model, frame);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let header: String = (0..5)
+            .flat_map(|y| (0..160).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(header.contains(&format!("branch {expected} ·")), "{header}");
+        assert!(status_bar(&model).contains(&format!("· {expected}")));
+    }
+}

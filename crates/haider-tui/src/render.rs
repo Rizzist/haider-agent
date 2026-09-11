@@ -6217,7 +6217,11 @@ fn render_session(
         ));
     }
     header_bottom.push(Span::styled(
-        format!(" · branch main · {}", identity.device),
+        format!(
+            " · branch {} · {}",
+            model.active_branch_name(),
+            identity.device
+        ),
         theme.dim_style(),
     ));
     // Shed chrome renders nothing: a 1-row header keeps only the product
@@ -13495,6 +13499,7 @@ fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         Constraint::Length(height.min(area.height)),
     ])
     .areas(area);
+    frame.render_widget(ratatui::widgets::Clear, panel);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
@@ -13556,6 +13561,7 @@ fn render_shells_overlay(
         Constraint::Length(height.min(area.height)),
     ])
     .areas(area);
+    frame.render_widget(ratatui::widgets::Clear, panel);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,

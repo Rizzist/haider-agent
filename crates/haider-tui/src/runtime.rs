@@ -452,7 +452,9 @@ pub fn sync_verbosity_persistence(
         return;
     }
     *seen_commits = model.verbosity_commits;
-    if let Some(store) = settings.as_mut() {
+    if model.active_session.is_none()
+        && let Some(store) = settings.as_mut()
+    {
         store.save_verbosity_if_changed(model.theme_choice, model.toolfold.verbosity());
     }
 }
@@ -483,6 +485,7 @@ pub fn sync_tool_rows_persistence(
             model.theme_choice,
             session.as_str(),
             &crate::settings::ToolRowsRecord {
+                verbosity: Some(model.toolfold.verbosity()),
                 blanket: model.toolfold.blanket(),
                 rows: model.toolfold.rows_snapshot(),
             },
@@ -691,6 +694,7 @@ pub async fn run_demo(
         .map_or_else(crate::toolfold::Verbosity::default, |store| {
             store.load_verbosity()
         });
+    model.default_tool_verbosity = verbosity;
     model.toolfold.seed_verbosity(verbosity);
     if let Some(store) = settings.as_mut() {
         store.set_verbosity(verbosity);
@@ -3802,6 +3806,7 @@ pub async fn run_live(
         .map_or_else(crate::toolfold::Verbosity::default, |store| {
             store.load_verbosity()
         });
+    model.default_tool_verbosity = verbosity;
     model.toolfold.seed_verbosity(verbosity);
     if let Some(store) = settings.as_mut() {
         store.set_verbosity(verbosity);

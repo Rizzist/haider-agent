@@ -848,7 +848,7 @@ fn a_pre_wave_settings_file_loads_as_the_normal_default() {
 }
 
 #[test]
-fn detaching_clears_the_transcript_state_but_keeps_the_profile_mode() {
+fn clearing_row_choices_keeps_the_mode_until_session_checkout() {
     let mut model = session_model();
     tool(
         &mut model,
@@ -864,7 +864,7 @@ fn detaching_clears_the_transcript_state_but_keeps_the_profile_mode() {
     assert_eq!(
         model.toolfold.verbosity(),
         Verbosity::Quiet,
-        "the MODE is a profile preference and outlives the transcript"
+        "clearing row choices does not change the current mode"
     );
 }
 
@@ -1469,8 +1469,8 @@ fn every_alt_gesture_has_an_alt_free_path() {
     submit(&mut model, "/verbosity");
     assert_eq!(
         model.toolfold.verbosity(),
-        Verbosity::Normal,
-        "bare /verbosity cycles"
+        Verbosity::Quiet,
+        "bare /verbosity reports without changing the mode"
     );
 
     // ⌥S ← /tasks
@@ -1710,6 +1710,7 @@ fn row_disclosure_survives_a_process_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("tui-settings.json");
     let record = haider_tui::settings::ToolRowsRecord {
+        verbosity: Some(Verbosity::Normal),
         blanket: tf::Blanket::Collapsed,
         rows: [("t1".to_owned(), RowState::ShowAll)].into_iter().collect(),
     };
@@ -1999,6 +2000,7 @@ fn reset_to_empty_defaults_survives_revisiting_a_restarted_session() {
     model.persisted_tool_rows.insert(
         restarted.as_str().to_owned(),
         haider_tui::settings::ToolRowsRecord {
+            verbosity: Some(Verbosity::Normal),
             blanket: tf::Blanket::Mode,
             rows: [("t1".to_owned(), RowState::Expanded)]
                 .into_iter()
@@ -2250,5 +2252,88 @@ fn task_pager_keeps_drafts_and_focused_tools_and_requires_visible_geometry() {
     assert_eq!(
         model.tasks_line_page, 0,
         "a hidden pager does not take Enter"
+    );
+}
+
+#[test]
+fn verbosity_command_reports_and_persists_each_sessions_mode() {
+    let dir = tempfile::tempdir().expect("settings");
+    let path = dir.path().join("tui-settings.json");
+    let mut settings = Some(haider_tui::settings::SettingsStore::at(path.clone()));
+    let mut model = session_model();
+    let a = session_id();
+    let b = SessionId::new("verbosity-b");
+    model.upsert_live_session(&b);
+    let mut seen = model.toolfold.revision();
+    submit(&mut model, "/verbosity verbose");
+    haider_tui::runtime::sync_tool_rows_persistence(&model, &mut seen, &mut settings);
+    let commits = model.verbosity_commits;
+    submit(&mut model, "/verbosity");
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .expect("current mode")
+            .contains("tool output: verbose")
+    );
+    assert_eq!(
+        model.verbosity_commits, commits,
+        "bare command is read-only"
+    );
+    model.open_session(&b);
+    assert_eq!(model.toolfold.verbosity(), Verbosity::Normal);
+    submit(&mut model, "/verbosity quiet");
+    haider_tui::runtime::sync_tool_rows_persistence(&model, &mut seen, &mut settings);
+    model.open_session(&a);
+    assert_eq!(model.toolfold.verbosity(), Verbosity::Verbose);
+    model.open_session(&b);
+    assert_eq!(model.toolfold.verbosity(), Verbosity::Quiet);
+    let mut restarted = session_model();
+    restarted.persisted_tool_rows = haider_tui::settings::SettingsStore::at(path).load_tool_rows();
+    restarted.upsert_live_session(&b);
+    restarted.open_session(&b);
+    assert_eq!(restarted.toolfold.verbosity(), Verbosity::Quiet);
+    restarted.open_session(&a);
+    assert_eq!(restarted.toolfold.verbosity(), Verbosity::Verbose);
+    submit(&mut restarted, "/verbosity default");
+    assert_eq!(restarted.toolfold.verbosity(), Verbosity::Normal);
+    assert!(
+        restarted
+            .flash
+            .as_deref()
+            .expect("default mode")
+            .contains("tool output: default")
+    );
+    // An explicit default must remain stored even when the launcher default
+    // is verbose; an empty row-override map must not erase that choice.
+    restarted.default_tool_verbosity = Verbosity::Verbose;
+    let mut restarted_seen = 0;
+    haider_tui::runtime::sync_tool_rows_persistence(&restarted, &mut restarted_seen, &mut settings);
+    let record = settings.as_ref().expect("settings").load_tool_rows();
+    assert_eq!(
+        record
+            .get(a.as_str())
+            .expect("explicit default persisted")
+            .verbosity,
+        Some(Verbosity::Normal)
+    );
+    let new_session = SessionId::new("verbosity-new");
+    restarted.upsert_live_session(&new_session);
+    restarted.open_session(&new_session);
+    assert_eq!(
+        restarted.toolfold.verbosity(),
+        Verbosity::Verbose,
+        "new sessions inherit the launcher preference"
+    );
+    restarted.open_session(&a);
+    assert_eq!(
+        restarted.toolfold.verbosity(),
+        Verbosity::Normal,
+        "an existing session retains its explicit default"
+    );
+    assert_eq!(
+        Verbosity::parse("normal"),
+        Some(Verbosity::Normal),
+        "legacy settings remain readable"
     );
 }
