@@ -507,6 +507,69 @@ fn capability_profile_packs_match_golden_and_report_estimator_delta() {
 }
 
 #[test]
+fn capability_profile_variants_only_change_windows_process_descriptions() {
+    fn normalized_fixture(path: &str) -> (serde_json::Value, usize, Vec<String>) {
+        let mut fixture: serde_json::Value = serde_json::from_str(match path {
+            "capability_profiles.json" => {
+                include_str!("../tests/fixtures/capability_profiles.json")
+            }
+            "capability_profiles.windows.json" => {
+                include_str!("../tests/fixtures/capability_profiles.windows.json")
+            }
+            _ => unreachable!("only capability profile fixtures are compared"),
+        })
+        .expect("capability profile fixture JSON");
+        let mut descriptions = Vec::new();
+        let profiles = fixture
+            .as_object_mut()
+            .expect("capability profile fixture object");
+        for tools in profiles.values_mut() {
+            for tool in tools.as_array_mut().expect("profile tool array") {
+                if tool.get("name") == Some(&serde_json::Value::String("process_exec".into())) {
+                    let description = tool["input_schema"]["properties"]["command"]
+                        .get_mut("description")
+                        .expect("process_exec command description")
+                        .as_str()
+                        .expect("process_exec command description string")
+                        .to_owned();
+                    descriptions.push(description);
+                    tool["input_schema"]["properties"]["command"]["description"] =
+                        serde_json::Value::String("<platform-specific process description>".into());
+                }
+            }
+        }
+        (fixture, descriptions.len(), descriptions)
+    }
+
+    let (shared, shared_count, shared_descriptions) =
+        normalized_fixture("capability_profiles.json");
+    let (windows, windows_count, windows_descriptions) =
+        normalized_fixture("capability_profiles.windows.json");
+    assert_eq!(
+        shared_count, 2,
+        "shared fixture must contain both process_exec profiles"
+    );
+    assert_eq!(
+        windows_count, 2,
+        "Windows fixture must contain both process_exec profiles"
+    );
+    assert!(
+        shared_descriptions
+            .iter()
+            .all(|description| description.contains("/bin/zsh"))
+    );
+    assert!(
+        windows_descriptions
+            .iter()
+            .all(|description| description.contains("PowerShell"))
+    );
+    assert_eq!(
+        shared, windows,
+        "fixtures may diverge only in process_exec descriptions"
+    );
+}
+
+#[test]
 fn capability_profiles_intersect_tool_and_effect_grants() {
     let grant = Grant {
         tools: vec![
