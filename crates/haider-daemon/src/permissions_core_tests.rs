@@ -1621,7 +1621,11 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         0,
     );
     let registry = registered_tools();
-    assert_eq!(authorized.len(), 29, "27 former tools plus session_transcript and task_outcome");
+    assert_eq!(
+        authorized.len(),
+        29,
+        "27 former tools plus session_transcript and task_outcome"
+    );
     let full_prefix: usize = authorized
         .iter()
         .map(|tool| {
