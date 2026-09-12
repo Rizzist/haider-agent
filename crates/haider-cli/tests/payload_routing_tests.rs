@@ -205,7 +205,10 @@ fn every_headless_verb_never_executes_the_observable_payload() {
             // result (69); the old invalid-command assertion is obsolete.
             assert_eq!(output.status.code(), Some(69), "{args:?}");
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!stderr.contains("unknown or incomplete command `peer`"), "{stderr}");
+            assert!(
+                !stderr.contains("unknown or incomplete command `peer`"),
+                "{stderr}"
+            );
         }
         assert_ne!(output.status.code(), Some(37), "{args:?}");
         assert!(
