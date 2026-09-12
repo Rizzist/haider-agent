@@ -14350,3 +14350,209 @@ fn customprov_manual_key_acceptance_requires_nonempty_utf8_without_controls() {
         assert!(!error.message.contains("key\nheader"));
     }
 }
+
+async fn create_provider_trust_test_session(
+    store: &SqliteStoreHandle,
+    dir: &std::path::Path,
+    name: &str,
+) -> haider_protocol::ids::SessionId {
+    let session_id = haider_protocol::ids::SessionId::new(name);
+    store
+        .create_session(haider_core::SessionCreateCommand {
+            command_id: format!("{name}-create"),
+            request_digest: format!("{name}-digest"),
+            request_json: r#"{"fixture":"provider-trust"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: dir.to_string_lossy().into_owned(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            model: "gpt-test".into(),
+            max_tokens: 4_096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "test-system-v1".into(),
+            event_id: haider_protocol::ids::EventId::new(format!("{name}-created")),
+            device_id: haider_protocol::ids::DeviceId::new("trust-test"),
+        })
+        .await
+        .expect("create trust session");
+
+    session_id
+}
+
+async fn run_provider_trust_test_command(
+    store: &SqliteStoreHandle,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    management: &ManagementSnapshot,
+    command_id: &str,
+    trust: ProviderTrustWire,
+    expected_revision: u64,
+) -> WireFrame {
+    let (sink, mut frames) = channel_sink();
+    handle_provider_set_trust(
+        store,
+        &memory_accounts(),
+        Some(management),
+        providers,
+        ProviderSetTrustJob {
+            command_id: command_id.into(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            trust,
+            expected_revision,
+            route: LoginRoute {
+                request_id: RequestId::new(command_id),
+                sink,
+            },
+        },
+    )
+    .await;
+    frames.recv().await.expect("trust response")
+}
+
+#[tokio::test]
+async fn provider_trust_multiple_sessions_is_atomic_replayable_and_restored_after_restart() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let a = create_provider_trust_test_session(&store, dir.path(), "trust-a").await;
+    let b = create_provider_trust_test_session(&store, dir.path(), "trust-b").await;
+    let mut providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    // Exact QA scenario: setting full on two already-full sessions, twice.
+    for (command, trust, expected) in [
+        ("full-1", ProviderTrustWire::Full, 0),
+        ("full-2", ProviderTrustWire::Full, 1),
+        ("lock", ProviderTrustWire::Lockdown, 2),
+    ] {
+        for _ in 0..2 {
+            let response = run_provider_trust_test_command(
+                &store,
+                &mut providers,
+                &management,
+                command,
+                trust,
+                expected,
+            )
+            .await;
+            assert!(
+                matches!(response, WireFrame::Response { body: ResponseBody::ProviderSetTrust { revision, .. }, .. } if revision == expected + 1),
+                "{response:?}"
+            );
+        }
+    }
+    let mut ids = HashSet::new();
+    for session in [&a, &b] {
+        let events = StoreHandle::read(&store, session, 0, 64)
+            .await
+            .expect("events");
+        let changes: Vec<_> = events
+            .iter()
+            .filter(|e| e.payload["type"] == "provider.trust_changed")
+            .collect();
+        assert_eq!(
+            changes.len(),
+            3,
+            "each command journals exactly once per session"
+        );
+        for (i, event) in changes.iter().enumerate() {
+            assert!(
+                ids.insert(event.event_id.clone()),
+                "global event ids must be unique"
+            );
+            assert_eq!(event.payload["revision"], (i + 1) as u64);
+        }
+    }
+    assert_eq!(management.read().expect("snapshot").revision, 3);
+    store.close().await.expect("close");
+    let store = open_store(dir.path()).await;
+    let mut reopened = test_provider_registry();
+    assert_eq!(
+        reopened.get(OPENAI_PROVIDER_NAME).expect("provider").trust,
+        ProviderTrustWire::Full
+    );
+    reconcile_provider_receipts(&store, &memory_accounts(), &mut reopened)
+        .await
+        .expect("restore committed trust");
+    assert_eq!(
+        reopened.get(OPENAI_PROVIDER_NAME).expect("provider").trust,
+        ProviderTrustWire::Lockdown
+    );
+    assert_eq!(store.management_revision().await.expect("revision"), 3);
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn provider_trust_second_session_append_failure_rolls_back_events_receipt_and_live_state() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let a = create_provider_trust_test_session(&store, dir.path(), "trust-a").await;
+    let b = create_provider_trust_test_session(&store, dir.path(), "trust-b").await;
+    let mut providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let command = "atomic-failure";
+    // Fail the SECOND insert with a real SQLite UNIQUE violation. The first
+    // session's insert has already executed inside the same transaction.
+    let mut collision = StoreHandle::read(&store, &b, 0, 1).await.expect("seed")[0].clone();
+    let event_id = format!("provider-trust-{command}");
+    collision.event_id =
+        haider_protocol::ids::EventId::new(format!("{}:{event_id}:{b}", event_id.len()));
+    collision.payload = serde_json::to_value(EventPayload::IdleDecayed)
+        .expect("payload")
+        .into();
+    StoreHandle::append(&store, std::slice::from_mut(&mut collision))
+        .await
+        .expect("inject conflict");
+    let before_a = StoreHandle::read(&store, &a, 0, 64).await.expect("a");
+    let before_b = StoreHandle::read(&store, &b, 0, 64).await.expect("b");
+    let response = run_provider_trust_test_command(
+        &store,
+        &mut providers,
+        &management,
+        command,
+        ProviderTrustWire::Lockdown,
+        0,
+    )
+    .await;
+    assert!(
+        matches!(response, WireFrame::Response { body: ResponseBody::Error { ref message, .. }, .. } if message.contains("UNIQUE constraint failed")),
+        "{response:?}"
+    );
+    assert_eq!(
+        StoreHandle::read(&store, &a, 0, 64)
+            .await
+            .expect("a unchanged"),
+        before_a
+    );
+    assert_eq!(
+        StoreHandle::read(&store, &b, 0, 64)
+            .await
+            .expect("b unchanged"),
+        before_b
+    );
+    assert_eq!(
+        providers.get(OPENAI_PROVIDER_NAME).expect("provider").trust,
+        ProviderTrustWire::Full
+    );
+    assert_eq!(management.read().expect("snapshot").revision, 0);
+    assert_eq!(store.management_revision().await.expect("revision"), 0);
+    let receipts = store
+        .management_receipts(PROVIDER_SET_TRUST_METHOD.into())
+        .await
+        .expect("receipts");
+    assert!(
+        receipts.is_empty(),
+        "failed operations leave no pending mutation to replay"
+    );
+    store.close().await.expect("close");
+    let store = open_store(dir.path()).await;
+    let mut reopened = test_provider_registry();
+    reconcile_provider_receipts(&store, &memory_accounts(), &mut reopened)
+        .await
+        .expect("restart after failed operation");
+    assert_eq!(
+        reopened.get(OPENAI_PROVIDER_NAME).expect("provider").trust,
+        ProviderTrustWire::Full
+    );
+    assert_eq!(store.management_revision().await.expect("revision"), 0);
+    store.close().await.expect("close");
+}

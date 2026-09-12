@@ -4,14 +4,13 @@
 //!
 //! Settings today: the theme CHOICE (`system` or a fixed key), the
 //! desktop-notification toggle, the last committed model pick, and the
-//! tool-output VERBOSITY (971-tui-collapse: quiet · normal · verbose, so an
+//! tool-output VERBOSITY (971-tui-collapse: quiet · default · verbose, so an
 //! orchestration run opens quiet and a debugging run opens verbose). The
 //! resolved theme is NOT persisted — `system` re-evaluates the terminal's
 //! appearance on every boot, which is the whole point of the choice layer.
 //!
-//! Verbosity is a PROFILE preference. WHICH ROWS a reader opened is
-//! SESSION state, and verify 1 (F3) required it to survive a process
-//! restart too, so it is persisted here as well — keyed by session id,
+//! Verbosity and the rows a reader opened are SESSION state. Both survive
+//! checkout and process restart using the same disclosure record, keyed by session id,
 //! versioned on its own, and bounded both ways so a long-lived profile can
 //! never grow this file without limit. The in-process session slot
 //! (`session::SessionState::tool_rows`) stays authoritative once a session
@@ -69,6 +68,8 @@ struct ToolRowsDto {
     /// The blanket the reader stated, by name (`mode` · `collapsed` ·
     /// `expanded`).
     blanket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verbosity: Option<String>,
     /// Item id → row state name (`collapsed` · `expanded` · `show_all`).
     rows: BTreeMap<String, String>,
 }
@@ -80,6 +81,7 @@ const TOOL_ROWS_VERSION: u32 = 1;
 /// rather than guessed — a stale row simply opens collapsed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolRowsRecord {
+    pub verbosity: Option<Verbosity>,
     pub blanket: Blanket,
     pub rows: BTreeMap<String, RowState>,
 }
@@ -92,7 +94,7 @@ impl ToolRowsRecord {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.blanket == Blanket::Mode && self.rows.is_empty()
+        self.verbosity.is_none() && self.blanket == Blanket::Mode && self.rows.is_empty()
     }
 }
 
@@ -235,6 +237,7 @@ impl SettingsStore {
                 (
                     session,
                     ToolRowsRecord {
+                        verbosity: record.verbosity.as_deref().and_then(Verbosity::parse),
                         blanket: Blanket::parse(&record.blanket).unwrap_or_default(),
                         rows,
                     },
@@ -382,6 +385,7 @@ impl SettingsStore {
                         session.clone(),
                         ToolRowsDto {
                             version: TOOL_ROWS_VERSION,
+                            verbosity: record.verbosity.map(|mode| mode.name().to_owned()),
                             blanket: record.blanket.name().to_owned(),
                             rows: record
                                 .rows

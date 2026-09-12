@@ -73,6 +73,10 @@
       "production": 0,
       "test": 0
     },
+    "haider-webextract": {
+      "production": 0,
+      "test": 0
+    },
     "xtask": {
       "production": 0,
       "test": 0

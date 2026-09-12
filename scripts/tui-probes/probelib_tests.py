@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Hermetic laws for PTY probe text parsing and the profile guard."""
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -45,6 +47,35 @@ class ThrowawayProfileTests(unittest.TestCase):
                 probelib.require_throwaway_profile(descendant),
                 os.path.realpath(descendant),
             )
+
+
+class VerdictTests(unittest.TestCase):
+    def run_verdict(self, child_clean, checks):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            probelib.verdict(
+                "probe", b"\x1b[?1049h\x1b[?1049l", child_clean, checks
+            )
+        return raised.exception.code, output.getvalue().splitlines()
+
+    def test_early_failures_remain_visible_in_ladder_tail(self):
+        code, lines = self.run_verdict(
+            False,
+            [("session surface", False)] + [(f"later {i}", True) for i in range(30)],
+        )
+        self.assertEqual(code, 1)
+        self.assertNotIn("session surface = False", lines[-25:])
+        self.assertIn(
+            "probe failed checks: child_exited_cleanly; session surface", lines[-25:]
+        )
+        self.assertEqual(lines[-1], "probe = FAIL")
+
+    def test_passing_checks_and_explicit_skip_keep_success_exit(self):
+        code, lines = self.run_verdict(True, [("present", True), ("tiny", "SKIP")])
+        self.assertEqual(code, 0)
+        self.assertIn("tiny = SKIP (by design at this size)", lines)
+        self.assertFalse(any("failed checks:" in line for line in lines))
+        self.assertEqual(lines[-1], "probe = PASS")
 
 
 if __name__ == "__main__":

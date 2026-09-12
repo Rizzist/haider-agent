@@ -5315,6 +5315,8 @@ pub struct AppModel {
     /// invalidates on a bump exactly as it does on a width or theme change,
     /// because collapsing a row moves every row start below it.
     pub toolfold: crate::toolfold::ToolFold,
+    /// Launcher preference, inherited only by sessions without a saved mode.
+    pub default_tool_verbosity: crate::toolfold::Verbosity,
     /// When each tool call started, and when it landed, on the shared
     /// `clock_ms` wall clock. The protocol carries NO tool duration, so
     /// this is a client-side observation kept out of the projection (which
@@ -5851,6 +5853,7 @@ impl Default for AppModel {
             graph_unsupported: false,
             todos_collapsed: false,
             toolfold: crate::toolfold::ToolFold::default(),
+            default_tool_verbosity: crate::toolfold::Verbosity::default(),
             tool_timings: std::collections::BTreeMap::new(),
             verbosity_commits: 0,
             auto_resuming: false,
@@ -15563,13 +15566,18 @@ impl AppModel {
                 }
             },
             "verbosity" | "verbose" => match arg.as_deref() {
-                None => self.cycle_tool_verbosity(),
+                None => {
+                    self.flash = Some(format!(
+                        "· tool output: {} — /verbosity quiet|default|verbose",
+                        self.toolfold.verbosity().name()
+                    ));
+                    self.dirty = true;
+                }
                 Some(name) => match crate::toolfold::Verbosity::parse(name) {
                     Some(verbosity) => self.set_tool_verbosity(verbosity),
                     None => {
-                        self.flash = Some(format!(
-                            "· /verbosity {name}? — quiet · normal · verbose (bare cycles)"
-                        ));
+                        self.flash =
+                            Some(format!("· /verbosity {name}? — quiet · default · verbose"));
                         self.dirty = true;
                     }
                 },
@@ -16255,7 +16263,7 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// ⌥V — the persisted quiet → normal → verbose cycle.
+    /// ⌥V — the persisted quiet → default → verbose cycle.
     pub fn cycle_tool_verbosity(&mut self) {
         let next = self.toolfold.verbosity().next();
         self.set_tool_verbosity(next);
@@ -16267,6 +16275,9 @@ impl AppModel {
     /// that flow).
     pub fn set_tool_verbosity(&mut self, verbosity: crate::toolfold::Verbosity) {
         self.toolfold.set_verbosity(verbosity);
+        if self.active_session.is_none() {
+            self.default_tool_verbosity = verbosity;
+        }
         self.verbosity_commits = self.verbosity_commits.saturating_add(1);
         self.flash = Some(format!(
             "· tool output: {} — ⌥V · /verbosity",
@@ -17911,8 +17922,8 @@ impl AppModel {
         self.view_path.clear();
         self.subtree_collapsed = false;
         self.todos_collapsed = false;
-        // Detaching drops the transcript-local disclosure state; the
-        // verbosity MODE survives, because it is a profile preference.
+        // Clear the detached transcript's row choices. Opening another
+        // session restores its own mode and disclosure record.
         self.toolfold.clear_session();
         self.tool_timings.clear();
         self.tasks_line_expanded = false;
@@ -18085,11 +18096,18 @@ impl AppModel {
         // store (verify 1, F3).
         // Consume boot state even when the reader later restores empty
         // defaults: an empty initialized slot is still authoritative.
-        let (blanket, rows) = if let Some(record) = self.persisted_tool_rows.remove(id.as_str()) {
-            (record.blanket, record.rows)
-        } else {
-            (slot.tools_blanket, std::mem::take(&mut slot.tool_rows))
-        };
+        let (verbosity, blanket, rows) =
+            if let Some(record) = self.persisted_tool_rows.remove(id.as_str()) {
+                (record.verbosity, record.blanket, record.rows)
+            } else {
+                (
+                    slot.tool_verbosity,
+                    slot.tools_blanket,
+                    std::mem::take(&mut slot.tool_rows),
+                )
+            };
+        self.toolfold
+            .seed_verbosity(verbosity.unwrap_or(self.default_tool_verbosity));
         self.toolfold.restore(blanket, rows);
         self.tasks_line_expanded = slot.tasks_line_expanded;
         self.tasks_line_page = 0;
@@ -18215,6 +18233,7 @@ impl AppModel {
             slot.auto_resuming = std::mem::take(&mut self.auto_resuming);
             slot.subtree_collapsed = std::mem::take(&mut self.subtree_collapsed);
             slot.todos_collapsed = std::mem::take(&mut self.todos_collapsed);
+            slot.tool_verbosity = Some(self.toolfold.verbosity());
             slot.tools_blanket = self.toolfold.blanket();
             slot.tool_rows = self.toolfold.rows_snapshot();
             slot.tasks_line_expanded = std::mem::take(&mut self.tasks_line_expanded);
@@ -18228,6 +18247,7 @@ impl AppModel {
             slot.workspace_cwd = self.session_workspace_cwd.take();
         }
         self.last_detached = Some(active);
+        self.toolfold.seed_verbosity(self.default_tool_verbosity);
         self.lockdown_status = None;
         self.lockdown_overlay = false;
         self.msg_queue.clear();

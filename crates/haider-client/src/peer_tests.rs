@@ -56,6 +56,8 @@ fn typed_peer_responses_preserve_contract_fields() {
     };
     assert_eq!(
         peer_list_response(ResponseBody::PeerList {
+            delivery_status_supported: false,
+            status: None,
             agents: vec![descriptor.clone()]
         })
         .expect("peer list"),
@@ -69,6 +71,7 @@ fn typed_peer_responses_preserve_contract_fields() {
         descriptor
     );
     let receipt = PeerReceipt {
+        status: None,
         msg_id: "msg-1".into(),
         delivery: PeerDelivery::Queued,
         reason: None,
@@ -118,6 +121,7 @@ fn received_and_delivery_frames_map_to_typed_subscription_events() {
         Some(PeerEvent::Received(message))
     );
     let receipt = PeerReceipt {
+        status: None,
         msg_id: "msg-1".into(),
         delivery: PeerDelivery::Delivered,
         reason: None,
@@ -140,5 +144,25 @@ fn idle_notice_preserves_typed_non_live_refusal() {
     });
     assert!(
         matches!(result, Err(super::peer::PeerClientError::Refused { code, retryable: false, .. }) if code == haider_rpc::ERROR_CODE_PEER_UNAVAILABLE)
+    );
+}
+
+#[test]
+fn legacy_sender_is_refused_before_delivery_options_can_be_ignored() {
+    assert!(
+        super::peer::require_delivery_support(ResponseBody::PeerList {
+            agents: Vec::new(),
+            status: None,
+            delivery_status_supported: false,
+        })
+        .is_err()
+    );
+    assert!(
+        super::peer::require_delivery_support(ResponseBody::PeerList {
+            agents: Vec::new(),
+            status: None,
+            delivery_status_supported: true,
+        })
+        .is_ok()
     );
 }

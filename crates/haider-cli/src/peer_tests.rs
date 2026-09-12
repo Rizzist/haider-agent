@@ -22,6 +22,7 @@ fn peer_cli_parser_pins_all_surfaces() {
     assert_eq!(
         parse_peer_command(&args(&["send", "reviewer", "inspect this"])),
         Ok(PeerCommand::Send {
+            options: Default::default(),
             session: None,
             to: "reviewer".into(),
             message: "inspect this".into(),
@@ -152,6 +153,7 @@ fn peer_json_contract_shapes_are_golden() {
     );
 
     let receipt = PeerReceipt {
+        status: None,
         msg_id: "msg-1".into(),
         delivery: PeerDelivery::Delivered,
         reason: None,
@@ -185,6 +187,7 @@ fn peer_cli_explicit_sender_is_preserved() {
             "hello"
         ])),
         Ok(PeerCommand::Send {
+            options: Default::default(),
             session: Some("sender".into()),
             to: "session:target@device".into(),
             message: "hello".into()
@@ -200,4 +203,64 @@ fn peer_cli_explicit_sender_is_preserved() {
     assert!(parse_peer_command(&args(&["send", "--session", "", "target", "hello"])).is_err());
     assert!(parse_peer_command(&args(&["send", "--session", "sender"])).is_err());
     assert!(parse_peer_command(&args(&["name", "--session"])).is_err());
+}
+
+#[test]
+fn peer_delivery_cli_options_status_watch_and_cancel() {
+    use haider_protocol::peer::PeerSendOptions;
+    assert_eq!(
+        parse_peer_command(&args(&[
+            "send",
+            "--session",
+            "s",
+            "--id",
+            "m",
+            "--ttl-ms",
+            "1000",
+            "target",
+            "hello"
+        ])),
+        Ok(PeerCommand::Send {
+            session: Some("s".into()),
+            options: PeerSendOptions {
+                msg_id: Some("m".into()),
+                ttl_ms: Some(1000),
+                cancel: false
+            },
+            to: "target".into(),
+            message: "hello".into()
+        })
+    );
+    assert_eq!(
+        parse_peer_command(&args(&["status", "--session", "s", "--after", "42", "m"])),
+        Ok(PeerCommand::Status {
+            session: Some("s".into()),
+            msg_id: Some("m".into()),
+            after_seq: 42,
+            watch: false
+        })
+    );
+    assert_eq!(
+        parse_peer_command(&args(&["watch", "--session", "s"])),
+        Ok(PeerCommand::Status {
+            session: Some("s".into()),
+            msg_id: None,
+            after_seq: 0,
+            watch: true
+        })
+    );
+    assert!(matches!(
+        parse_peer_command(&args(&["status", "--session", "s", "--cancel", "m"])),
+        Ok(PeerCommand::Send {
+            options: PeerSendOptions { cancel: true, .. },
+            ..
+        })
+    ));
+    for bad in [
+        ["send", "--id"].as_slice(),
+        ["status", "--after", "bad"].as_slice(),
+        ["status", "--cancel", "m", "extra"].as_slice(),
+    ] {
+        assert!(parse_peer_command(&args(bad)).is_err());
+    }
 }

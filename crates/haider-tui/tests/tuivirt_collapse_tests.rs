@@ -385,3 +385,45 @@ fn the_expanded_task_list_pins_at_both_sizes() {
     model.toggle_tasks_line();
     pin("task_line_expanded", &model);
 }
+
+#[test]
+fn overlays_clear_long_transcript_cells() {
+    let mut model = session_model();
+    for i in 0..60 {
+        push_agent(
+            &mut model,
+            &format!("overlay-{i}"),
+            &"TRANSCRIPT_SENTINEL ".repeat(12),
+        );
+    }
+    assert!(
+        draw(&model, 120, 40)
+            .rows
+            .iter()
+            .any(|row| row.contains("TRANSCRIPT_SENTINEL"))
+    );
+    model.help_open = true;
+    for (width, height) in COLLAPSE_SIZES {
+        let snapshot = draw(&model, width, height);
+        assert!(
+            !snapshot
+                .rows
+                .iter()
+                .any(|row| row.contains("TRANSCRIPT_SENTINEL"))
+        );
+        check_golden("help_over_long_transcript", &snapshot);
+    }
+    model.help_open = false;
+    model.shells_open = true;
+    for (width, height) in COLLAPSE_SIZES {
+        let snapshot = draw(&model, width, height);
+        let row = snapshot
+            .rows
+            .iter()
+            .position(|row| row.starts_with("shells  "))
+            .expect("shell panel");
+        assert_eq!(snapshot.rows[row + 1].trim(), "no terminal sessions");
+        assert!(snapshot.rows[row + 2].trim().is_empty());
+        check_golden("empty_shells_over_long_transcript", &snapshot);
+    }
+}

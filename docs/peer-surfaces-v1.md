@@ -27,14 +27,22 @@ the model.
 
 ```text
 haider peer list [--json]
-haider peer send <name> <message>
+haider peer send [--session <id>] [--id <msg-id>] [--ttl-ms <ms>] <address> <message>
 haider peer send <name> -
 haider peer name <new-name>
 haider peer watch
+haider peer status --session <id> [msg-id]
+haider peer watch --session <id> [msg-id]
+haider peer status --session <id> --cancel <msg-id>
 ```
 
 `peer send … -` reads the message verbatim from standard input. `peer watch`
 writes one JSON object per received message or delivery-state change.
+`peer send` prints the complete JSON receipt, including its additive durable
+status. `status` and `watch --session` replay/follow journal pages using schema
+`haider.peer.status.v1`, with `receipts`, `next_seq` and `has_more` in `status`.
+See [delivery semantics](peer-messaging-v1.md) for bounds, restart/replay,
+rendezvous opt-in and the distinction between admission and action completion.
 `peer name` uses the additive `peer.name {name}` control method and returns the
 renamed peer descriptor for the caller's one bound session.
 

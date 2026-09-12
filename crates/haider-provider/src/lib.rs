@@ -24,6 +24,7 @@ mod catalog_tests;
 mod effort;
 #[cfg(test)]
 mod effort_tests;
+mod error_detail;
 mod gemini;
 #[cfg(test)]
 mod gemini_tests;

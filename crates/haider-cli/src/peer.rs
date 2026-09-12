@@ -7,6 +7,7 @@ use haider_client::{
     EnsureOptions, PeerClientError, PeerDelivery, PeerDeliveryReason, PeerDescriptor, PeerEvent,
     PeerKind, PeerReceipt, PeerState, ProfileEnv, ensure_daemon, peer_messaging, resolve_profile,
 };
+use haider_protocol::peer::{PeerSendOptions, PeerStatusQuery};
 use serde::Serialize;
 
 use super::run::{EX_BLOCKED, EX_IOERR, EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};
@@ -20,9 +21,16 @@ pub(crate) enum PeerCommand {
         json: bool,
     },
     Send {
+        options: PeerSendOptions,
         session: Option<String>,
         to: String,
         message: String,
+    },
+    Status {
+        session: Option<String>,
+        msg_id: Option<String>,
+        after_seq: u64,
+        watch: bool,
     },
     Name {
         session: Option<String>,
@@ -61,20 +69,15 @@ pub(crate) enum PeerEventDocument<'a> {
 }
 
 pub(crate) fn parse_peer_command(rest: &[String]) -> Result<PeerCommand, String> {
+    if rest.first().is_some_and(|command| {
+        command == "send" || command == "status" || (command == "watch" && rest.len() > 1)
+    }) {
+        return parse_delivery_command(rest);
+    }
     match rest {
         [command] if command == "list" => Ok(PeerCommand::List { json: false }),
         [command, flag] if command == "list" && flag == "--json" => {
             Ok(PeerCommand::List { json: true })
-        }
-        [command, to, message] if command == "send" && to != "--session" && !to.is_empty() && !message.is_empty() => {
-            Ok(PeerCommand::Send {
-                session: None,
-                to: to.clone(),
-                message: message.clone(),
-            })
-        }
-        [command, flag, session, to, message] if command == "send" && flag == "--session" && !session.is_empty() && !to.is_empty() && !message.is_empty() => {
-            Ok(PeerCommand::Send { session: Some(session.clone()), to: to.clone(), message: message.clone() })
         }
         [command, name] if command == "name" && name != "--session" && !name.is_empty() => {
             Ok(PeerCommand::Name { session: None, name: name.clone() })
@@ -87,10 +90,83 @@ pub(crate) fn parse_peer_command(rest: &[String]) -> Result<PeerCommand, String>
             Ok(PeerCommand::WaitIdle { to: to.clone() })
         }
         _ => Err(
-            "usage: peer list [--json] | peer send [--session <id>] <address> <message|-> | peer name [--session <id>] <new-name> | peer watch | peer wait-idle <address>"
+            "usage: peer list [--json] | peer send [--session <id>] [--id <msg-id>] [--ttl-ms <ms>] <address> <message|-> | peer status [--session <id>] [--after <seq>] [msg-id] | peer status [--session <id>] --cancel <msg-id> | peer name [--session <id>] <new-name> | peer watch | peer wait-idle <address>"
                 .into(),
         ),
     }
+}
+
+fn parse_delivery_command(rest: &[String]) -> Result<PeerCommand, String> {
+    let mut session = None;
+    let mut options = PeerSendOptions::default();
+    let mut after_seq = 0;
+    let mut index = 1;
+    while rest.get(index).is_some_and(|value| value.starts_with("--")) {
+        let flag = &rest[index];
+        let value = rest
+            .get(index + 1)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag.as_str() {
+            "--session" if session.is_none() => session = Some(value.clone()),
+            "--id" if rest[0] == "send" && options.msg_id.is_none() => {
+                options.msg_id = Some(value.clone())
+            }
+            "--ttl-ms" if rest[0] == "send" && options.ttl_ms.is_none() => {
+                options.ttl_ms = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "--ttl-ms requires milliseconds")?,
+                )
+            }
+            "--after" if rest[0] != "send" => {
+                after_seq = value
+                    .parse()
+                    .map_err(|_| "--after requires a journal sequence")?
+            }
+            "--cancel" if rest[0] == "status" && options.msg_id.is_none() => {
+                options.cancel = true;
+                options.msg_id = Some(value.clone());
+            }
+            _ => return Err(format!("unknown or repeated peer option {flag}")),
+        }
+        index += 2;
+    }
+    let args = &rest[index..];
+    if options.cancel {
+        if !args.is_empty() {
+            return Err("peer status --cancel does not accept extra arguments".into());
+        }
+        return Ok(PeerCommand::Send {
+            session,
+            options,
+            to: String::new(),
+            message: String::new(),
+        });
+    }
+    if rest[0] == "send" {
+        if let [to, message] = args
+            && !to.is_empty()
+            && !message.is_empty()
+        {
+            return Ok(PeerCommand::Send {
+                session,
+                options,
+                to: to.clone(),
+                message: message.clone(),
+            });
+        }
+        return Err("peer send requires an address and message".into());
+    }
+    if args.len() > 1 || args.first().is_some_and(|id| id.is_empty()) {
+        return Err("peer status/watch accepts at most one msg-id".into());
+    }
+    Ok(PeerCommand::Status {
+        session,
+        msg_id: args.first().cloned(),
+        after_seq,
+        watch: rest[0] == "watch",
+    })
 }
 
 pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
@@ -183,15 +259,49 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
             }
             Ok(PeerCommandOutcome::Complete)
         }),
-        PeerCommand::Send { to, message, .. } => {
-            peers.send(to, message, None).await.map(|receipt| {
-                println!("{} {}", receipt.msg_id, delivery_label(receipt.delivery));
+        PeerCommand::Send {
+            to,
+            message,
+            options,
+            ..
+        } => peers
+            .send_with_options(to, message, None, options)
+            .await
+            .and_then(|receipt| {
+                print_json(&receipt)?;
                 if receipt.delivery == PeerDelivery::Refused {
-                    PeerCommandOutcome::RefusedDelivery(receipt)
+                    Ok(PeerCommandOutcome::RefusedDelivery(receipt))
                 } else {
-                    PeerCommandOutcome::Complete
+                    Ok(PeerCommandOutcome::Complete)
                 }
-            })
+            }),
+        PeerCommand::Status {
+            session,
+            msg_id,
+            after_seq,
+            watch,
+        } => {
+            let session = session.or_else(|| std::env::var("HAIDER_SESSION_ID").ok());
+            if let Some(session) = session.filter(|value| !value.trim().is_empty()) {
+                replay_status(
+                    &peers,
+                    PeerStatusQuery {
+                        session_id: haider_protocol::ids::SessionId::new(session),
+                        msg_id,
+                        after_seq,
+                    },
+                    watch,
+                )
+                .await
+            } else {
+                Err(PeerClientError::Refused {
+                    code: "peer_invalid".into(),
+                    message: "peer status/watch requires --session <id> or HAIDER_SESSION_ID"
+                        .into(),
+                    retryable: false,
+                    data: None,
+                })
+            }
         }
         PeerCommand::Name { name, .. } => peers.set_name(name).await.map(|agent| {
             println!("{}", agent.name);
@@ -250,6 +360,27 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
     }
 }
 
+async fn replay_status(
+    peers: &haider_client::peer::PeerMessaging<'_>,
+    mut query: PeerStatusQuery,
+    watch: bool,
+) -> Result<PeerCommandOutcome, PeerClientError> {
+    loop {
+        let page = peers.status(query.clone()).await?;
+        if !watch || !page.receipts.is_empty() {
+            print_json(&serde_json::json!({"schema": "haider.peer.status.v1", "status": page}))?;
+        }
+        query.after_seq = page.next_seq;
+        if page.has_more {
+            continue;
+        }
+        if !watch {
+            return Ok(PeerCommandOutcome::Complete);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 async fn attach_sender(
     client: &haider_client::RpcClient,
     sender: String,
@@ -285,6 +416,7 @@ fn read_stdin_message(command: PeerCommand) -> io::Result<PeerCommand> {
             session,
             to,
             message,
+            options,
         } if message == "-" => {
             let mut message = String::new();
             io::stdin().read_to_string(&mut message)?;
@@ -298,6 +430,7 @@ fn read_stdin_message(command: PeerCommand) -> io::Result<PeerCommand> {
                 session,
                 to,
                 message,
+                options,
             })
         }
         command => Ok(command),
@@ -336,15 +469,6 @@ const fn state_label(state: PeerState) -> &'static str {
     match state {
         PeerState::Idle => "idle",
         PeerState::Busy => "busy",
-    }
-}
-
-const fn delivery_label(delivery: PeerDelivery) -> &'static str {
-    match delivery {
-        PeerDelivery::Queued => "queued",
-        PeerDelivery::Delivered => "delivered",
-        PeerDelivery::Expired => "expired",
-        PeerDelivery::Refused => "refused",
     }
 }
 

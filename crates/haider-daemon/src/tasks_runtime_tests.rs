@@ -1696,3 +1696,256 @@ async fn activity_real_interleaved_pipes_cannot_split_pem_redaction() {
     hub.shutdown().await.expect("hub close");
     store.close().await.expect("store close");
 }
+
+#[tokio::test]
+async fn background_capture_redacts_before_paging_and_completion_journaling() {
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let original = format!(
+        "{}\n-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\nsk-abcdefghijklmnopQRSTUV",
+        (0..6000)
+            .map(|i| format!("line {i}: orchestration evidence\n"))
+            .collect::<String>()
+    );
+    let original = format!("{}{original}", redaction_repair_fixture());
+    std::fs::write(std::path::Path::new(&cwd).join("capture.txt"), &original).expect("fixture");
+    let safe = haider_tools::redact_output_text(&original);
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = create_task_session(&hub, "background-safe-session", &cwd).await;
+    let run = RunId::new("background-safe-run");
+    prepare_tool_run(&hub, &session, &run, "background-safe").await;
+    let dispatcher = task_dispatcher(&hub, &session, &cwd, "background-safe", &run).await;
+    let spawned = dispatch(
+        &dispatcher,
+        &run,
+        "background-safe-spawn",
+        "process_exec",
+        serde_json::json!({"command": "cat capture.txt", "background": true}),
+    )
+    .await;
+    let task = TaskId::new(spawned["task_id"].as_str().expect("task id"));
+    let (_, completed) = wait_for_completed(&store, &session, &task).await;
+    assert_eq!(completed.output_bytes, safe.len() as u64);
+    assert!(completed.tail.ends_with("[REDACTED:api_key]"));
+    assert!(!completed.tail.contains("AA=="));
+    let mut cursor = 0;
+    let mut full = String::new();
+    let mut pages = 0;
+    loop {
+        let page = dispatch(
+            &dispatcher,
+            &run,
+            &format!("background-safe-page-{pages}"),
+            "task_output",
+            serde_json::json!({"task_id": task, "cursor": cursor}),
+        )
+        .await;
+        full.push_str(page["chunk"].as_str().expect("chunk"));
+        pages += 1;
+        if page["exhausted"] == true {
+            break;
+        }
+        let next = page["next_cursor"].as_u64().expect("cursor");
+        assert!(next > cursor);
+        cursor = next;
+    }
+    assert!(pages >= 3);
+    assert_eq!(full, safe);
+    assert_repair_secrets_absent(&full);
+    assert_repair_carriers_present(&full);
+    for envelope in read_all(&store, &session).await {
+        let text = serde_json::to_string(&envelope).expect("journal JSON");
+        assert!(!text.contains("sk-abcdefghijklmnopQRSTUV"));
+        assert!(!text.contains("AA=="));
+        assert_repair_secrets_absent(&text);
+    }
+    eprintln!(
+        "background capture: safe_bytes={} pages={pages}; completion journal and pages contain no synthetic secrets",
+        safe.len()
+    );
+    dispatcher.close().await.expect("close dispatcher");
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close store");
+}
+
+/// Real shell, daemon dispatcher, journal and CAS; only synthetic credentials.
+#[tokio::test]
+async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() {
+    use base64::Engine as _;
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let original = format!(
+        "{}\napi=sk-abcdefghijklmnopQRSTUV\n-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\nlast line\n",
+        (0..6000)
+            .map(|i| format!("line {i}: orchestration evidence\n"))
+            .collect::<String>()
+    );
+    let original = format!("{}{original}", redaction_repair_fixture());
+    std::fs::write(std::path::Path::new(&cwd).join("capture.txt"), &original).expect("fixture");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = create_task_session(&hub, "capture-session", &cwd).await;
+    let run = RunId::new("capture-run");
+    prepare_tool_run(&hub, &session, &run, "capture").await;
+    let dispatcher = task_dispatcher(&hub, &session, &cwd, "capture", &run).await;
+    let outcome = dispatcher
+        .execute(
+            &run,
+            &ItemId::new("capture-item"),
+            "capture-call",
+            "process_exec",
+            serde_json::json!({"command": "cat capture.txt"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("capture process");
+    let ToolDispatchResult::Completed(bounded) = outcome else {
+        panic!("foreground process must complete");
+    };
+    let result: serde_json::Value =
+        serde_json::from_str(bounded.payload_text()).expect("result JSON");
+    // The core normally appends this result after the process signal. Persist
+    // that same fact here to exercise the restart lookup without the cache.
+    let mut facts = [crate::tasks::test_task_fact_envelope(
+        &hub,
+        &session,
+        &run,
+        "capture-tool-result",
+        serde_json::to_value(EventPayload::ToolResult {
+            call_id: "capture-call".into(),
+            result: bounded,
+        })
+        .expect("tool result event"),
+    )];
+    hub.append(&mut facts).await.expect("persist result");
+    assert_eq!(result["exit_code"], 0);
+    assert_repair_secrets_absent(&result.to_string());
+    assert_repair_carriers_present(result["output"].as_str().expect("preview"));
+    let handle = format!("capture:{}", result["effect_id"].as_str().expect("effect"));
+    assert!(
+        result["output"]
+            .as_str()
+            .expect("output")
+            .contains("task_output(")
+    );
+    assert!(
+        result["output"]
+            .as_str()
+            .expect("output")
+            .contains("omitted_bytes")
+    );
+    let mut cursor = 0;
+    let mut full = String::new();
+    let mut pages = 0;
+    loop {
+        let page = dispatch(
+            &dispatcher,
+            &run,
+            &format!("capture-page-{pages}"),
+            "task_output",
+            serde_json::json!({"task_id": handle, "cursor": cursor}),
+        )
+        .await;
+        full.push_str(page["chunk"].as_str().expect("chunk"));
+        pages += 1;
+        if page["exhausted"] == true {
+            break;
+        }
+        let next = page["next_cursor"].as_u64().expect("cursor");
+        assert!(next > cursor);
+        cursor = next;
+    }
+    assert!(pages >= 3);
+    assert_eq!(full, haider_tools::redact_output_text(&original));
+    assert!(!full.contains("sk-"));
+    assert!(!full.contains("AA=="));
+    assert_repair_secrets_absent(&full);
+    assert_repair_carriers_present(&full);
+    let facade = TaskFacade::new(hub.clone());
+    let restored = facade
+        .restore_foreground_capture(&session, &handle)
+        .await
+        .expect("journal capture lookup");
+    assert_eq!(Some(restored.as_str()), result["artifact"].as_str());
+    eprintln!(
+        "foreground capture: raw_bytes={} redacted_bytes={} pages={pages}; preview and journal secrets absent; durable lookup succeeded",
+        original.len(),
+        full.len()
+    );
+    let foreign = create_task_session(&hub, "capture-foreign", &cwd).await;
+    assert!(
+        TaskFacade::new(hub.clone())
+            .foreground_capture_page(&foreign, &handle, Some(0))
+            .await
+            .is_err()
+    );
+    for envelope in read_all(&store, &session).await {
+        assert_repair_secrets_absent(&serde_json::to_string(&envelope).expect("journal"));
+        if let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Delta {
+            delta: haider_protocol::item::ItemDelta::CommandOutput { chunk_b64, .. },
+            ..
+        })) = envelope.payload.decode_event()
+        {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(chunk_b64)
+                .expect("journal chunk");
+            let text = String::from_utf8(bytes).expect("UTF8");
+            assert!(!text.contains("sk-abcdefghijklmnopQRSTUV"));
+            assert!(!text.contains("AA=="));
+            assert_repair_secrets_absent(&text);
+        }
+    }
+    dispatcher.close().await.expect("close dispatcher");
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close store");
+}
+
+fn redaction_repair_fixture() -> &'static str {
+    concat!(
+        "https://owner:fixturepass@example.test/repo\n",
+        "postgres://owner:p%40ssw0rd@db.test/app\n",
+        "password=\"abc\\\"SYNTHETICTAIL987\"\n",
+        "password='abc\\'SYNTHETICTAIL987'\n",
+        "password=\"abc\\\\SYNTHETICTAIL987\"\n",
+        "password='abc\\\\SYNTHETICTAIL987'\n",
+        "password=\"abc\nSYNTHETICTAIL987\" after\n",
+        "password='abc\nSYNTHETICTAIL987' after\n",
+        "password=\"abc\\\nSYNTHETICTAIL987\" after\n",
+        "password='abc\\\r\nSYNTHETICTAIL987' after\n",
+        "HEAD:752dfaa79475887978ffeb8eaa73134d7a933c7d\n",
+        "urn:uuid:01a0e893-52bc-7def-89ab-0123456789cd\n",
+        "thread-01a0e893-52bc-7def-89ab-0123456789cd\n",
+        "01a0e893-52bc-7def-89ab-0123456789cd.result.md\n",
+        "QmYwAPJzv5CZsnAzt8auVZRnGi2CQCqK4HCb2jdPrFAgDq\n",
+        "run_id=aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY\n",
+    )
+}
+
+fn assert_repair_secrets_absent(text: &str) {
+    for secret in ["fixturepass", "p%40ssw0rd", "SYNTHETICTAIL987"] {
+        assert!(!text.contains(secret), "secret {secret} leaked");
+    }
+}
+
+fn assert_repair_carriers_present(text: &str) {
+    for carrier in redaction_repair_fixture()
+        .lines()
+        .skip_while(|line| !line.starts_with("HEAD:"))
+    {
+        assert!(text.contains(carrier), "carrier {carrier} lost");
+    }
+    for authority in [
+        "https://owner:[REDACTED:secret_value]@",
+        "postgres://owner:[REDACTED:secret_value]@",
+    ] {
+        assert!(
+            text.contains(authority),
+            "username/authority lost: {authority}"
+        );
+    }
+}

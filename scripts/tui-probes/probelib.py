@@ -201,12 +201,19 @@ def verdict(name, out, child_clean, checks):
         ("panic_free", not panicked),
         ("child_exited_cleanly", child_clean),
     ]
-    ok = True
+    failed = []
     for label, value in base + list(checks):
         if value == "SKIP":
             print(f"{label} = SKIP (by design at this size)")
             continue
-        print(f"{label} = {bool(value)}")
-        ok = ok and bool(value)
+        passed = bool(value)
+        print(f"{label} = {passed}")
+        if not passed:
+            failed.append(label)
+    # The ladder shows only a failing probe's tail. Keep the cause next to
+    # the verdict even when later checks all pass.
+    if failed:
+        print(f"{name} failed checks: {'; '.join(failed)}")
+    ok = not failed
     print(f"{name} =", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

@@ -1614,10 +1614,12 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Preserve wave's platform-derived pin: process_exec.command.description
     // names /bin/zsh and /bin/sh on POSIX (78 bytes), and absolute System32
     // PowerShell on Windows (75 bytes). Its actual serialized contribution
-    // is measured below; the invariant pin is 5_592 + 574 = 6_166.
+    // is measured below; the delegation invariant was 5_592 + 574 = 6_166.
+    // Redaction paging adds fs_read.column's serialized property (+40) and
+    // its default compact description (+2): 6_166 + 42 = 6_208; POSIX 6_286.
     // Keep the reduction floor independent of this exact-value pin: adding
     // delegation cannot waive the existing release budget.
-    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_166;
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_208;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1652,14 +1654,21 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
     // Durable completion controls add 630 platform-independent monitor
     // description/schema bytes; monitor remains outside the default pipe.
+    // Redaction paging adds fs_read's full description (151 -> 180, +29)
+    // and column schema (199 -> 239, +40), plus task_output's description
+    // (183 -> 214, +31) and task_id prose (297 -> 295 schema bytes, -2).
+    // Full manifest delta = 29 + 40 + 31 - 2 = 98 on every platform:
+    // macOS 21_637 -> 22_365 with both lanes. task_output is undisclosed in
+    // the default pipe; only fs_read's compact prose/schema add the 42 bytes
+    // accounted above.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_316;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_414;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_267;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_365;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_266;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_364;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_261;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_359;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

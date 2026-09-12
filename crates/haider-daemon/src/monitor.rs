@@ -602,9 +602,10 @@ impl MonitorReport {
             .to_string()
             .replace('&', "\\u0026")
             .replace('<', "\\u003c")
-            .replace('>', "\\u003e");
+            .replace('>', "\\u003e")
+            .replace('`', "\\u0060");
         format!(
-            "<monitor-event monitor=\"{}\" source=\"{}\" occurrence=\"{}\">\n{}\nmonitor_dropped_count={}\n</monitor-event>",
+            "<monitor-event monitor=\"{}\" source=\"{}\" occurrence=\"{}\">\n```json\n{}\n```\nmonitor_dropped_count={}\n</monitor-event>",
             escape_monitor_attribute(&self.monitor_id),
             monitor_source_name(self.source),
             monitor_occurrence_name(self.occurrence),

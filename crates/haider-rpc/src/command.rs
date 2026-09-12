@@ -248,8 +248,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     client_cmd(
         "verbosity",
-        "Set transcript detail",
-        "[quiet|normal|verbose]",
+        "Show or set session tool-output detail",
+        "[quiet|default|verbose]",
     ),
     session_client_cmd("tasks", "Show background tasks", ""),
 ];

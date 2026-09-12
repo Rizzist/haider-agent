@@ -109,6 +109,9 @@ use haider_provider::{
     validate_provider_view_prefix,
 };
 
+#[path = "actor_wake.rs"]
+mod wake;
+
 pub const ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND: &str = "haider.route_replay_attempt.v1";
 pub const ROUTE_REPLAY_EVENT_EXTENSION_KIND: &str = "haider.route_replay_event.v1";
 
@@ -291,6 +294,12 @@ fn model_tool_payload_projection(
     result: &BoundedResult,
 ) -> ModelToolResultProjection {
     const INVENTORY_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+    /// 972 symmetric cap: UNTRUNCATED results above this byte threshold get a
+    /// head/tail projection at the provider boundary too — a producer that
+    /// never set `truncated` (e.g. a `web_fetch` page inside its own output
+    /// cap) no longer ships tens of KiB to the model verbatim. Full bytes stay
+    /// in the durable result for paging/replay.
+    const OVERSIZE_MODEL_PREVIEW_MAX_BYTES: usize = 16 * 1024;
     if result.truncation.is_some() && result.payload_text() != result.preview {
         // A producer already bounded this output and declared the exact raw
         // byte provenance. Keep the final marker intact on first send/replay.
@@ -324,6 +333,37 @@ fn model_tool_payload_projection(
         return ModelToolResultProjection {
             preview: projected.preview,
             truncated: true,
+            savings,
+        };
+    }
+    // Numbered file reads and cursor-based task output own their pages. A
+    // second head/tail reducer loses content while advancing past that page.
+    let producer_owns_page = (tool_name == "fs_read"
+        && result.data.is_none()
+        && result.reason.as_deref() != Some("lockdown secret redaction forced on"))
+        || (tool_name == "task_output" && result.cursor.is_some());
+    if producer_owns_page {
+        let savings = result.truncated.then(|| {
+            let (omitted, exact) = inline_text_elision_disclosure(result.payload_text())
+                .unwrap_or_else(|| {
+                    result.truncation.as_ref().map_or((1, false), |marker| {
+                        (
+                            marker.original_bytes.saturating_sub(marker.payload_bytes) as usize,
+                            false,
+                        )
+                    })
+                });
+            OutputSavings::from_provider_request_bytes(
+                "bounded_tool_result",
+                haider_tools::provider_request_text_projection_bytes(result.payload_text()),
+                haider_tools::provider_request_text_projection_bytes(&result.preview),
+                omitted,
+                exact,
+            )
+        });
+        return ModelToolResultProjection {
+            preview: result.preview.clone(),
+            truncated: result.truncated,
             savings,
         };
     }
@@ -364,6 +404,48 @@ fn model_tool_payload_projection(
                     "bounded_tool_result",
                     omitted_bytes_at_least,
                     omitted_bytes_exact,
+                );
+                return ModelToolResultProjection {
+                    preview: elided.text,
+                    truncated: true,
+                    savings: Some(elided.savings),
+                };
+            }
+            // 972 symmetric model-boundary cap: an UNTRUNCATED `web_fetch`
+            // result used to bypass every head/tail projection, so a 96 KiB
+            // page that fit its producer cap still hit the provider whole.
+            // Any such result over this threshold now gets the same
+            // machine-readable head/tail elision at a more generous 16 KiB
+            // (web_fetch prose survives a head/tail cut better than logs).
+            // The durable BoundedResult keeps the full bytes for paged reads
+            // and replay; only the provider-bound projection shrinks.
+            if tool_name == "web_fetch" && result.preview.len() > OVERSIZE_MODEL_PREVIEW_MAX_BYTES {
+                let elided = disclosed_omission.map_or_else(
+                    || {
+                        haider_tools::elide_text_head_tail(
+                            &result.preview,
+                            OVERSIZE_MODEL_PREVIEW_MAX_BYTES,
+                            "oversize_tool_result_model_boundary",
+                        )
+                        .unwrap_or_else(|| {
+                            haider_tools::mark_text_elision(
+                                &result.preview,
+                                0,
+                                "oversize_tool_result_model_boundary",
+                                1,
+                                false,
+                            )
+                        })
+                    },
+                    |(omitted_bytes_at_least, omitted_bytes_exact)| {
+                        haider_tools::mark_text_elision(
+                            &result.preview,
+                            OVERSIZE_MODEL_PREVIEW_MAX_BYTES,
+                            "oversize_tool_result_model_boundary",
+                            omitted_bytes_at_least,
+                            omitted_bytes_exact,
+                        )
+                    },
                 );
                 return ModelToolResultProjection {
                     preview: elided.text,
@@ -3928,6 +4010,14 @@ impl HarnessActor {
             }
             let newest_volatile_history_start = messages.len();
             messages.extend(std::mem::take(&mut self.pending_nudges));
+            let wake_remap = wake::normalize_tail(&mut messages);
+            let newest_volatile_history_start = wake_remap.boundary(newest_volatile_history_start);
+            stable_history_end = wake_remap.boundary(stable_history_end);
+            current_turn_start = wake_remap.boundary(current_turn_start);
+            latest_compaction_summary_end =
+                latest_compaction_summary_end.map(|end| wake_remap.boundary(end));
+            logical_request_cacheable_history_end =
+                wake_remap.boundary(logical_request_cacheable_history_end);
             let request_projection_compacted = match self
                 .enforce_context_policy(
                     &run_id,
@@ -4033,7 +4123,8 @@ impl HarnessActor {
                     previous_cache_request
                         .as_ref()
                         .map(|previous| previous.history_message_count)
-                });
+                })
+                .map(|end| wake_remap.boundary(end));
             // Move the canonical history into the provider request and take
             // it back immediately after the HTTP stream opens. Built-in
             // adapters borrow this request; only compatibility providers use
@@ -5813,6 +5904,33 @@ impl HarnessActor {
                                 }
                                 assistant_blocks.push(block);
                                 if !self.pending_subturns.is_empty() {
+                                    // A prior call in this same response may already
+                                    // have executed, or be awaiting its deferred result.
+                                    // Preserve those results before holding the new call.
+                                    if !deferred.is_empty() {
+                                        match self
+                                            .settle_deferred_tools(
+                                                &run_id,
+                                                &mut tools,
+                                                &mut deferred,
+                                                &cancel,
+                                            )
+                                            .await
+                                        {
+                                            Ok(mut results) => tool_results.append(&mut results),
+                                            Err(error) => {
+                                                return self
+                                                    .drive_error_outcome_with_items(
+                                                        &run_id,
+                                                        &mut message,
+                                                        &mut reasoning,
+                                                        &mut tools,
+                                                        error,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
                                     if let Err(error) =
                                         self.complete_tools_for_subturn(&run_id, &mut tools).await
                                     {
@@ -5835,15 +5953,16 @@ impl HarnessActor {
                                     // tool-use pair without claiming it ran.
                                     // The following user messages then form
                                     // the actual subturn request.
+                                    messages.append(&mut tool_results);
                                     messages.push(Message::tool_result(
                                         call_id,
-                                        "held before execution for a user subturn; revise or confirm the tool call",
+                                        wake::HELD_TOOL_RESULT,
                                         false,
                                     ));
                                     messages.extend(
                                         std::mem::take(&mut self.pending_subturns)
                                             .into_iter()
-                                            .map(Message::user_text),
+                                            .map(wake::input),
                                     );
                                     if let Err(error) = release_provider_budget_request(
                                         self.config.provider_budget_guard.as_ref(),
@@ -6565,7 +6684,7 @@ impl HarnessActor {
                             messages.extend(
                                 std::mem::take(&mut self.pending_subturns)
                                     .into_iter()
-                                    .map(Message::user_text),
+                                    .map(wake::input),
                             );
                             provider_attempt = 0;
                             thinking_pending = true;

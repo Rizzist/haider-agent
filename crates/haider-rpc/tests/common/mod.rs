@@ -2013,11 +2013,13 @@ pub fn transcript() -> Vec<WireFrame> {
         // event shapes leave every historical byte pin unchanged.
         WireFrame::Request {
             request_id: RequestId("request-peer-list".into()),
-            body: RequestBody::PeerList {},
+            body: RequestBody::PeerList { status: None },
         },
         WireFrame::Response {
             request_id: RequestId("request-peer-list".into()),
             body: ResponseBody::PeerList {
+                delivery_status_supported: false,
+                status: None,
                 agents: vec![PeerDescriptor {
                     id: "session-peer".into(),
                     device_id: String::new(),
@@ -2034,6 +2036,7 @@ pub fn transcript() -> Vec<WireFrame> {
         WireFrame::Request {
             request_id: RequestId("request-peer-send".into()),
             body: RequestBody::PeerSend {
+                options: None,
                 to: "workspace-a1b2c3".into(),
                 message: "Please inspect the failing boundary.".into(),
                 summary: Some("debug boundary".into()),
@@ -2043,6 +2046,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId("request-peer-send".into()),
             body: ResponseBody::PeerSend {
                 receipt: PeerReceipt {
+                    status: None,
                     msg_id: "msg-peer-1".into(),
                     delivery: PeerDelivery::Queued,
                     reason: None,
@@ -2069,6 +2073,7 @@ pub fn transcript() -> Vec<WireFrame> {
         },
         WireFrame::PeerDeliveryChanged {
             receipt: PeerReceipt {
+                status: None,
                 msg_id: "msg-peer-1".into(),
                 delivery: PeerDelivery::Delivered,
                 reason: None,
@@ -2648,6 +2653,7 @@ pub fn peer_agent_injection_transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-peer-inject"),
             body: ResponseBody::PeerSend {
                 receipt: PeerReceipt {
+                    status: None,
                     msg_id: "message-agent-1".into(),
                     delivery: PeerDelivery::Delivered,
                     reason: None,

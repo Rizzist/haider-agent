@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 pub const REDACTED_ENV_VALUE: &str = "•redacted";
 /// Maximum first-send bytes emitted by any deterministic output adapter.
-pub const REDUCED_TOOL_OUTPUT_MAX_BYTES: usize = 8 * 1024;
+pub const REDUCED_TOOL_OUTPUT_MAX_BYTES: usize = crate::ORCHESTRATION_PREVIEW_MAX_BYTES;
 
 /// Deterministic, first-send-only process output reducers. The raw transcript
 /// remains the artifact authority; these values are prompt-facing diet facts.

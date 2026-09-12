@@ -1515,6 +1515,33 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Commit provider trust and all of its session journal entries together.
+    pub async fn finalize_provider_trust_receipt<T>(
+        &self,
+        command_id: String,
+        response: T,
+        expected_revision: u64,
+        request: (String, String),
+        envelopes: Vec<RawEnvelope>,
+    ) -> Result<u64, HaiderError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_provider_trust_receipt(
+                    &command_id,
+                    &response,
+                    expected_revision,
+                    (&request.0, &request.1),
+                    envelopes,
+                )
+            })
+        })
+        .await
+    }
+
     pub async fn finalize_account_remove_receipt<T>(
         &self,
         command_id: String,
