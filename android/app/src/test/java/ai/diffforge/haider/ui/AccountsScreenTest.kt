@@ -9,6 +9,8 @@ import ai.diffforge.haider.ui.theme.ForgeTheme
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -55,6 +57,24 @@ class AccountsScreenTest {
                 )
             }
         }
+    }
+
+    /**
+     * With the daemon stopped, the initial provider read throws
+     * `IOException("connection_lost")` straight out of the load effect, and
+     * unguarded it killed the process on entry (971-V round 2,
+     * `accounts-crash.log`). The throw must become the unavailable surface.
+     */
+    @Test
+    fun `a stopped daemon yields the unavailable surface, not a crash`() {
+        repository.providersFailure = "connection_lost"
+        render()
+        rule.waitForIdle()
+        rule.onNodeWithText("Accounts is unavailable — connection_lost").assertIsDisplayed()
+        // Withheld, not emptied: no rows to misread as "you have none", and no
+        // Add door whose every save could only fail.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Work"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Add account"))
     }
 
     @Test
@@ -120,6 +140,50 @@ class AccountsScreenTest {
         assertEquals(before, repository.snapshot.value.accounts.size)
         // Save is what validates now, so a short key is refused there.
         rule.onNodeWithText("invalid_api_key").assertIsDisplayed()
+    }
+
+    /**
+     * A fresh profile: DeepSeek is the fixture's `available = false` provider,
+     * which is exactly the state every built-in provider is in before it has a
+     * credential. It must still be selectable, and Save must still enable
+     * (971-V F5 — every choice was greyed out and Save never enabled).
+     */
+    @Test
+    fun `an unavailable built-in provider can still be given a key`() {
+        render()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("API key").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("DeepSeek").assertIsEnabled()
+        rule.onNodeWithContentDescription("DeepSeek").performClick()
+        // Save is disabled until there is a key, and enabled once there is one.
+        rule.onNodeWithText("Save").assertIsNotEnabled()
+        rule.onNodeWithTag(ACCOUNTS_KEY_FIELD_TAG).performTextInput("sk-live-abcdefgh9999")
+        rule.waitForIdle()
+        rule.onNodeWithText("Save").assertIsEnabled()
+        rule.onNodeWithText("Save").performClick()
+        rule.waitForIdle()
+        assertTrue(repository.calls.contains("account.login_api"))
+        assertTrue(repository.snapshot.value.accounts.any { it.provider == "deepseek" })
+    }
+
+    /** The same rule on the sign-in form: Start cannot be unreachable (971-V F5). */
+    @Test
+    fun `sign-in offers every provider that declares oauth`() {
+        render()
+        rule.onNodeWithText("Add account").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Sign in with a provider").performClick()
+        rule.waitForIdle()
+        // Google declares no OAuth at all, so it is not on this form; every row
+        // that IS on it can be chosen.
+        assertEquals(0, rule.onAllNodesWithContentDescriptionSafe("Google"))
+        rule.onNodeWithContentDescription("Anthropic").assertIsEnabled()
+        rule.onNodeWithText("Start sign-in").assertIsNotEnabled()
+        rule.onNodeWithContentDescription("Anthropic").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithText("Start sign-in").assertIsEnabled()
     }
 
     @Test

@@ -216,7 +216,11 @@ class RpcClient(
                     try {
                         val body = frame.objectAt("body")
                         when (body.string("method")) {
-                            "error" -> item.reply.completeExceptionally(RpcRemoteException(body.string("code"), body.optionalBoolean("retryable") ?: false))
+                            // `data` carries the typed recovery coordinates for the
+                            // codes that have them; dropping it forced callers to
+                            // classify a failure by reading `message`.
+                            "error" -> item.reply.completeExceptionally(RpcRemoteException(body.string("code"),
+                                body.optionalBoolean("retryable") ?: false, body["data"] as? JsonObject))
                             item.method -> { item.onResponse(body); item.reply.complete(body) }
                             else -> throw RpcProtocolException("response_method_mismatch")
                         }

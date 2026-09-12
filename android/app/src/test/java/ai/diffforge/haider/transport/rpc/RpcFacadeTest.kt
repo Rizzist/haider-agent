@@ -2,6 +2,8 @@ package ai.diffforge.haider.transport.rpc
 
 import ai.diffforge.haider.ui.accounts.AccountResult
 import ai.diffforge.haider.ui.accounts.AuthKind
+import ai.diffforge.haider.ui.accounts.CustomModelsProbe
+import ai.diffforge.haider.ui.accounts.ModelInventoryAuthority
 import ai.diffforge.haider.ui.accounts.OAuthFlow as UiFlow
 import ai.diffforge.haider.ui.accounts.OAuthStatus as UiStatus
 import ai.diffforge.haider.ui.daemon.*
@@ -24,7 +26,10 @@ class RpcFacadeTest {
         generation, RpcEndpoint("/private/h.sock", 1, generation), 0, null, NetworkState.Available, true, false,
         null, false, 1, 10, 200)
     private class Daemon(private val owner: CoroutineScope, private val deferredMethod: String? = null,
-        private val responseGate: CompletableDeferred<Unit>? = null, private val response: (JsonObject) -> JsonObject) : Closeable {
+        private val responseGate: CompletableDeferred<Unit>? = null,
+        /** The real Hello advertises features; the facade's Loom door reads them (971-V F8). */
+        private val features: List<String> = listOf("loom_v1"),
+        private val response: (JsonObject) -> JsonObject) : Closeable {
         private val listener = ServerSocket(0)
         private val peers = CopyOnWriteArrayList<Socket>()
         val requests = CopyOnWriteArrayList<JsonObject>()
@@ -38,7 +43,8 @@ class RpcFacadeTest {
                             writePeer(peer, obj("v" to 1, "kind" to "welcome", "protocol" to 1,
                                 "instance_id" to "facade", "daemon_generation" to 1, "frame_limit" to RpcWire.MAX_BODY,
                                 "daemon_version" to "0.0.970", "profile_id" to "android-default",
-                                "capabilities_granted" to JsonArray(listOf("view", "control").map(::JsonPrimitive))))
+                                "capabilities_granted" to JsonArray(listOf("view", "control").map(::JsonPrimitive)),
+                                "features" to JsonArray(features.map(::JsonPrimitive))))
                             while (isActive) {
                                 val frame = RpcWire.read(peer.getInputStream()) ?: break
                                 if (frame.string("kind") == "ping") {
@@ -70,6 +76,8 @@ class RpcFacadeTest {
         override fun close() { listener.close(); peers.forEach { it.close() }; server.cancel() }
     }
     private fun provider() = obj("provider" to "p", "enabled" to true, "availability" to "available", "api_family" to "openai_responses",
+        // A router-style catalog: advisory is what licenses a free-text model id.
+        "inventory_authority" to "advisory",
         "models" to JsonArray(listOf(JsonPrimitive("m"))), "default_model" to "m", "auth_methods" to JsonArray(listOf("api_key", "oauth").map(::JsonPrimitive)),
         "model_details" to JsonArray(listOf(obj("name" to "m", "context_window" to 4096, "supported_efforts" to JsonArray(listOf(JsonPrimitive("high")))))))
     private fun account() = obj("alias" to "work", "provider" to "p", "auth_method" to "oauth", "active" to true,
@@ -105,6 +113,14 @@ class RpcFacadeTest {
             "menu.answer" -> obj("method" to method, "resolution_seq" to 6)
             "vault.stage" -> obj("method" to method, "vault_reference" to "synthetic-stage", "expires_at_ms" to System.currentTimeMillis() + 300_000)
             "provider.models_refresh" -> obj("method" to method, "provider" to provider(), "revision" to 13)
+            // Receipt-free CAS ingress; the address is what a turn then names.
+            "artifact.put" -> obj("method" to method, "artifact" to "blake3:synthetic-artifact",
+                "bytes" to body.string("data_base64").length)
+            "provider.models_probe" -> obj("method" to method, "provider" to body.string("provider"),
+                "models" to JsonArray(listOf("probe-b", "probe-a").map(::JsonPrimitive)), "default_model" to "probe-b")
+            "provider.configure" -> obj("method" to method, "provider" to provider(), "revision" to 14)
+            "loom.list" -> obj("method" to method, "revision" to 3,
+                "agent_types" to JsonArray(emptyList()), "workflows" to JsonArray(emptyList()))
             "account.login_api", "account.add", "account.set_active", "account.refresh" -> obj("method" to method, "descriptor" to account())
             "account.remove" -> obj("method" to method, "removed_alias" to "work", "revision" to 10)
             "account.oauth_start" -> obj("method" to method, "availability" to obj("available" to true), "flow_id" to "synthetic-flow", "authorization_url" to "https://example.invalid/authorize")
@@ -153,13 +169,21 @@ class RpcFacadeTest {
             withTimeout(5000) { ui.models.first { it != null } }
             assertFalse(ui.shell.value.available)
             assertEquals("process_exec_disabled", ui.shell.value.reason)
+            // Existing sessions start on Ask, and BOTH modes are offered: Auto
+            // is this client's standing consent, not a daemon setting, so it is
+            // available without a wire door (971-V F3).
             assertEquals(PermissionMode.Ask, ui.permissionMode.value)
-            assertEquals(setOf(PermissionMode.Ask), ui.supportedPermissionModes)
+            assertEquals(setOf(PermissionMode.Ask, PermissionMode.Auto), ui.supportedPermissionModes)
+            ui.setPermissionMode(PermissionMode.Auto)
+            assertEquals(PermissionMode.Auto, ui.permissionMode.value)
             ui.setPermissionMode(PermissionMode.Ask)
-            val policyFailure = runCatching { ui.setPermissionMode(PermissionMode.Auto) }.exceptionOrNull()
-            assertEquals("permission_mode_unavailable", policyFailure?.message)
             assertEquals(PermissionMode.Ask, ui.permissionMode.value)
+            // No invented method: the mode is never pushed to the daemon.
             assertFalse(daemon.requests.any { it.string("method") == "tool.policy" })
+            assertFalse(daemon.requests.any { it.string("method").contains("permission_mode") })
+            // A secret card is never answered by standing consent, whatever the
+            // mode says, so the fixture session stays parked on its own menu.
+            assertNotNull(ui.sessions.value.first { it.id == "s" }.needsInput)
             assertEquals(listOf("high"), ui.providers.value.effortsFor("p", "m"))
             assertEquals(4096L, ui.providers.value.model("p", "m")!!.contextWindow)
             assertTrue(ui.providers.value.effortsFor("p", "absent").isEmpty())
@@ -191,12 +215,30 @@ class RpcFacadeTest {
             assertEquals("steer", daemon.requests.last { it.string("method") == "turn.submit" }.string("mode"))
             ui.send("s", "queued", mode = Delivery.Queue)
             assertEquals("queue", daemon.requests.last { it.string("method") == "turn.submit" }.string("mode"))
-            val submissions = daemon.requests.count { it.string("method") == "turn.submit" }
-            val attachmentFailure = runCatching {
-                ui.send("s", "keep my attachment", listOf(Attachment.TextFile("blake3:synthetic", "fixture.txt", 1)))
-            }.exceptionOrNull()
-            assertEquals("attachment_transport_unavailable", (attachmentFailure as? TurnRefused)?.code)
-            assertEquals(submissions, daemon.requests.count { it.string("method") == "turn.submit" })
+            // Attachments: `artifact.put` puts the bytes in the daemon's CAS and
+            // `turn.submit` names the address it returned. Round 11 refused every
+            // nonempty list before it reached the wire (971-V F2).
+            val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)
+            val staged = ui.stageAttachment(png, "image/png", null)
+            assertEquals(Attachment.Image("blake3:synthetic-artifact", "image/png"), staged)
+            assertTrue(daemon.requests.any { it.string("method") == "artifact.put" })
+            // The bytes ride base64, never raw, and never as a path.
+            assertEquals(java.util.Base64.getEncoder().encodeToString(png),
+                daemon.requests.last { it.string("method") == "artifact.put" }.string("data_base64"))
+            // The composer's own thumbnail comes from what it just handed over:
+            // this wire has no artifact GET door to read it back with.
+            assertArrayEquals(png, ui.attachmentBytes("blake3:synthetic-artifact"))
+            assertNull(ui.attachmentBytes("blake3:never-staged"))
+            ui.send("s", "look at this", listOf(staged!!))
+            val withBlock = daemon.requests.last { it.string("method") == "turn.submit" }
+            val block = (withBlock["attachments"] as JsonArray).single().jsonObject
+            assertEquals("image", block.string("kind"))
+            assertEquals("blake3:synthetic-artifact", block.string("artifact"))
+            assertEquals("image/png", block.string("mime"))
+            // A kind whose facts this client cannot state is refused here, with
+            // its own code, rather than reported as "too large" (971-V F2).
+            val refused = runCatching { ui.stageAttachment(png, "application/pdf", "fixture.pdf") }.exceptionOrNull()
+            assertEquals(AttachmentLimits.KIND_UNSUPPORTED, (refused as? AttachmentRefused)?.code)
             assertFalse(ui.queue.value.supported)
             assertFalse(ui.usage.value.supported)
             assertTrue(daemon.requests.filter { it.string("method") == "session.attach" }.all { it.string("mode") == "control" })
@@ -551,7 +593,7 @@ class RpcFacadeTest {
     @Test fun controlLeaseBlocksConcurrentActivationUntilProtectedRequestCompletes() = runBlocking<Unit> {
         val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val release = CompletableDeferred<Unit>()
-        val daemon = Daemon(owner, "session.rename", release, ::response)
+        val daemon = Daemon(owner, "session.rename", release, response = ::response)
         val client = RpcClient(owner, daemon::socket)
         val directory = Files.createTempDirectory("control-lease").toFile()
         val binder = object : RpcControlPlane {
@@ -598,5 +640,128 @@ class RpcFacadeTest {
         assertEquals("0.0.970", RpcUiMapping.target(snapshot())!!.appVersion)
         assertNull(RpcUiMapping.target(snapshot().copy(phase = DaemonPhase.Stopping)))
         assertThrows(RpcProtocolException::class.java) { RpcUiMapping.target(snapshot().copy(daemonGeneration = 99)) }
+    }
+
+    /**
+     * The 971-V UI findings, as one seam test over the real facade.
+     *
+     * Every assertion here is a door the production adapter did not have: Auto
+     * standing consent (F3), the custom-server probe/configure pair (F9), the
+     * inventory authority the picker gates free-text model entry on (F6), the
+     * Loom capability read from the actual Hello (F8), and re-observation after
+     * a reconnect (F4).
+     */
+    @Test fun productionAdapterAnswersStandingConsentCustomServersAndTheLoomDoor() = runBlocking<Unit> {
+        val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        // A device-capability approval, exactly as the daemon publishes one:
+        // one covered tool name and a decision-tagged option.
+        val parked = obj("session_id" to "s", "head_seq" to 2, "worker_generation" to 7,
+            "provider" to "p", "last_model" to "m", "run_state" to "parked_permission", "run_id" to "run",
+            "needs_input" to obj("kind" to "permission", "title" to "Allow sms.list for the last 20 messages?",
+                "safe_body" to JsonArray(listOf(JsonPrimitive("The agent asked to read your recent texts."))),
+                "menu_id" to "menu-sms", "request_seq" to 5, "worker_generation" to 7, "secret_answer" to false,
+                "options" to JsonArray(listOf(
+                    obj("key" to "allow", "label" to "Allow once", "decision" to "allow_once"),
+                    obj("key" to "reject", "label" to "Don't allow", "decision" to "reject_once")))))
+        val daemon = Daemon(owner) { body ->
+            when (body.string("method")) {
+                "session.list" -> obj("method" to "session.list", "sessions" to JsonArray(listOf(parked)))
+                else -> response(body)
+            }
+        }
+        val client = RpcClient(owner, daemon::socket)
+        val directory = Files.createTempDirectory("vfix").toFile()
+        val binder = object : RpcControlPlane {
+            override val snapshots = MutableStateFlow<DaemonServiceSnapshot?>(snapshot())
+            override suspend fun start() = Unit
+            override suspend fun stop() = Unit
+            override suspend fun restart() = Unit
+            override suspend fun reportNotificationPermission(granted: Boolean, permanentlyDenied: Boolean) = Unit
+        }
+        val service = RpcDaemonService(owner, binder, directory, "/private/workspaces", "p", "m", 4096, client)
+        val ui: DaemonService = service
+        try {
+            withTimeout(5000) { ui.sessions.first { it.size == 1 } }
+            ui.activate("s")
+            withTimeout(5000) { ui.models.first { it != null } }
+
+            // F6: the advisory authority the daemon published survives all the
+            // way to the option the picker reads.
+            assertEquals("advisory", ui.providers.value.providers.single().inventoryAuthority)
+            assertEquals("advisory", ui.models.value!!.providers.single().inventoryAuthority)
+
+            // F8: `loom_v1` is in the actual Hello, so the screen gets a
+            // registry rather than the hardcoded unavailable reason.
+            assertNull(ui.loomUnavailable())
+            assertNotNull(ui.loomList(false))
+            assertTrue(daemon.requests.any { it.string("method") == "loom.list" })
+
+            // F3: switching to Auto answers the covered card with its
+            // `allow_once` option, using the coordinates the card carried.
+            ui.setPermissionMode(PermissionMode.Auto)
+            val answered = withTimeout(5000) {
+                var found: JsonObject? = null
+                while (found == null) {
+                    found = daemon.requests.lastOrNull { it.string("method") == "menu.answer" }
+                    if (found == null) delay(20)
+                }
+                found
+            }
+            assertEquals("menu-sms", answered.string("menu_id"))
+            assertEquals("allow", answered.string("option_key"))
+            assertEquals(0L, answered.number("option_index"))
+            assertEquals(5L, answered.number("request_seq"))
+            assertEquals(7L, answered.number("worker_generation"))
+            // Consent is spent once per menu, however often the roster re-emits.
+            delay(120)
+            assertEquals(1, daemon.requests.count { it.string("method") == "menu.answer" })
+
+            // F4: a restarted daemon reconnects on the same socket path, so the
+            // Binder target never changes. Re-observation has to come from the
+            // connection epoch instead.
+            val attachmentsBefore = daemon.requests.count { it.string("method") == "session.attach" }
+            client.close()
+            withTimeout(5000) { client.state.first { it != RpcConnectionState.CONNECTED } }
+            client.connect(RpcUiMapping.target(snapshot())!!)
+            withTimeout(5000) {
+                while (daemon.requests.count { it.string("method") == "session.attach" } <= attachmentsBefore) delay(20)
+            }
+            assertTrue(daemon.requests.count { it.string("method") == "session.list" } > 1)
+        } finally { service.close(); daemon.close(); owner.cancel(); directory.deleteRecursively() }
+    }
+
+    /** F9: the custom-server card's two doors, on the production adapter. */
+    @Test fun customServerProbesAndConfiguresThroughTheProductionAdapter() = runBlocking<Unit> {
+        val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val daemon = Daemon(owner, response = ::response)
+        val client = RpcClient(owner, daemon::socket)
+        val source = AccountsRepository(client, owner)
+        val adapter = RpcAccountsRepository(client, source, owner)
+        val ui: ai.diffforge.haider.ui.accounts.AccountsRepository = adapter
+        try {
+            client.connect(RpcUiMapping.target(snapshot())!!)
+            ui.refreshProviders()
+            withTimeout(3000) { ui.providers.first { it.isNotEmpty() } }
+            // Round 11 left the interface defaults in place, so the real form
+            // answered `provider_models_probe_v1` / `provider_configure_v1`
+            // while the daemon advertised both (971-V F9).
+            val probe = ui.probeCustomModels("local", "http://127.0.0.1:1", "openai_chat_completions", keyless = true)
+            assertEquals(CustomModelsProbe.Models(listOf("probe-b", "probe-a"), "probe-b"), probe)
+            val request = daemon.requests.last { it.string("method") == "provider.models_probe" }
+            // Read-only discovery: no command id, because it is not a durable mutation.
+            assertFalse(request.containsKey("command_id"))
+            assertEquals(JsonPrimitive(true), request["keyless"])
+            assertFalse(request.containsKey("probe_vault_reference"))
+
+            assertEquals(AccountResult.Ok, ui.configureCustomProvider("local", "http://127.0.0.1:1",
+                "openai_chat_completions", "none", listOf("probe-b"), "probe-b", expectedRevision = 12))
+            val configure = daemon.requests.last { it.string("method") == "provider.configure" }
+            assertEquals(12L, configure.number("expected_revision"))
+            assertEquals(JsonPrimitive(true), configure["enabled"])
+            // The stage is spent by `account.login_api`, never here.
+            assertFalse(configure.containsKey("probe_vault_reference"))
+            // F6: the authority the summary stated reaches the UI descriptor.
+            assertEquals(ModelInventoryAuthority.Advisory, ui.providers.value.single().inventoryAuthority)
+        } finally { adapter.close(); source.close(); client.close(); daemon.close(); owner.cancel() }
     }
 }

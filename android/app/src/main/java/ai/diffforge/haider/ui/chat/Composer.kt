@@ -9,6 +9,7 @@ import ai.diffforge.haider.ui.state.ModelNames
 import ai.diffforge.haider.ui.state.PermissionMode
 import ai.diffforge.haider.ui.state.SendButtonState
 import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeBreakpoint
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
@@ -17,6 +18,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -123,47 +125,53 @@ fun Composer(
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.sm),
     ) {
         if (showPickers) {
-            // One row at 360 dp. Round 10 used a FlowRow and the third select
-            // wrapped at exactly 360, a 52 dp displacement (verify-10 O3), so
-            // the three share the width instead: each takes a third and its
-            // value ellipsises rather than pushing the next one down. It still
-            // wraps below 360, where a third of the width cannot hold a label
-            // and a value.
-            // A Row, not a FlowRow. `weight` inside a FlowRow is applied after
-            // it has already decided to wrap, so the third select still moved
-            // to a second line at exactly 360 dp (verify-10 O3). Three equal
-            // thirds always share one row and ellipsise their value instead.
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                ModelSelect(
-                    state = chip,
-                    onOpenModel = onOpenModel,
-                    onRetry = onRetryModels,
-                    onStartDaemon = onStartDaemon,
-                    modifier = Modifier.weight(1f),
-                )
-                LabelledSelect(
-                    label = stringResource(R.string.select_label_effort),
-                    value = effort ?: stringResource(R.string.select_value_default),
-                    contentDescription = stringResource(R.string.cd_change_effort),
-                    onClick = onOpenEffort,
-                    modifier = Modifier.weight(1f),
-                )
-                LabelledSelect(
-                    label = stringResource(R.string.select_label_permissions),
-                    value = stringResource(
-                        when (permissionMode) {
-                            PermissionMode.Auto -> R.string.permission_mode_auto
-                            PermissionMode.Ask -> R.string.permission_mode_ask
-                        },
-                    ),
-                    contentDescription = stringResource(R.string.cd_change_permissions),
-                    onClick = onOpenPermissions,
-                    modifier = Modifier.weight(1f),
-                )
+            // A Row, not a FlowRow: `weight` inside a FlowRow is applied after
+            // it has already decided to wrap, so the third select moved to a
+            // second line at exactly 360 dp (verify-10 O3). Three equal thirds
+            // always share one row.
+            //
+            // A third of a narrow row could not hold a label AND a value, so
+            // every value ellipsised and the permission mode was unreadable
+            // without opening its picker (971-V F8). Below the breakpoint the
+            // labels drop and the values get the whole chip — the label
+            // survives in `contentDescription` (addition F, S5).
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                val compact = maxWidth < ForgeBreakpoint.compactSelects
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    ModelSelect(
+                        state = chip,
+                        onOpenModel = onOpenModel,
+                        onRetry = onRetryModels,
+                        onStartDaemon = onStartDaemon,
+                        compact = compact,
+                        modifier = Modifier.weight(1f),
+                    )
+                    LabelledSelect(
+                        label = stringResource(R.string.select_label_effort),
+                        value = effort ?: stringResource(R.string.select_value_default),
+                        contentDescription = stringResource(R.string.cd_change_effort),
+                        onClick = onOpenEffort,
+                        compact = compact,
+                        modifier = Modifier.weight(1f),
+                    )
+                    LabelledSelect(
+                        label = stringResource(R.string.select_label_permissions),
+                        value = stringResource(
+                            when (permissionMode) {
+                                PermissionMode.Auto -> R.string.permission_mode_auto
+                                PermissionMode.Ask -> R.string.permission_mode_ask
+                            },
+                        ),
+                        contentDescription = stringResource(R.string.cd_change_permissions),
+                        onClick = onOpenPermissions,
+                        compact = compact,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             }
         }
 
@@ -337,6 +345,8 @@ private fun LabelledSelect(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    /** Narrow screens show the value alone; the label stays spoken. */
+    compact: Boolean = false,
     leading: (@Composable () -> Unit)? = null,
 ) {
     val colors = Forge.colors
@@ -363,7 +373,9 @@ private fun LabelledSelect(
             horizontalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
         ) {
             leading?.invoke()
-            Text(label, style = type.selectLabel, color = colors.textMuted, maxLines = 1)
+            if (!compact) {
+                Text(label, style = type.selectLabel, color = colors.textMuted, maxLines = 1)
+            }
             Text(
                 value,
                 style = type.chip,
@@ -390,11 +402,13 @@ private fun ModelSelect(
     onRetry: () -> Unit,
     onStartDaemon: () -> Unit,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
 ) {
     val label = stringResource(R.string.select_label_model)
     when (state) {
         is ModelChipState.Resolved -> LabelledSelect(
             label = label,
+            compact = compact,
             modifier = modifier,
             value = state.shortModel,
             contentDescription = stringResource(R.string.cd_change_model),
@@ -405,6 +419,7 @@ private fun ModelSelect(
         )
         ModelChipState.Loading -> LabelledSelect(
             label = label,
+            compact = compact,
             modifier = modifier,
             value = stringResource(R.string.select_value_default),
             contentDescription = stringResource(R.string.chip_model_loading_cd),
@@ -413,6 +428,7 @@ private fun ModelSelect(
         )
         is ModelChipState.Error -> LabelledSelect(
             label = label,
+            compact = compact,
             modifier = modifier,
             value = stringResource(R.string.chip_model_error),
             contentDescription = stringResource(R.string.chip_model_error),
@@ -420,6 +436,7 @@ private fun ModelSelect(
         )
         ModelChipState.DaemonDown -> LabelledSelect(
             label = label,
+            compact = compact,
             modifier = modifier,
             value = stringResource(R.string.chip_model_no_daemon),
             contentDescription = stringResource(R.string.chip_model_no_daemon),
@@ -427,6 +444,7 @@ private fun ModelSelect(
         )
         ModelChipState.Changing -> LabelledSelect(
             label = label,
+            compact = compact,
             modifier = modifier,
             value = stringResource(R.string.chip_model_changing),
             contentDescription = stringResource(R.string.cd_change_model),

@@ -1,7 +1,11 @@
 package ai.diffforge.haider.transport.rpc
 
 import ai.diffforge.haider.ui.accounts.AccountResult
+import ai.diffforge.haider.ui.accounts.AccountsRpcAdapter
 import ai.diffforge.haider.ui.accounts.AuthKind
+import ai.diffforge.haider.ui.accounts.CustomModelsProbe
+import ai.diffforge.haider.ui.accounts.CustomProbeFailure
+import ai.diffforge.haider.ui.accounts.ModelInventoryAuthority
 import ai.diffforge.haider.ui.accounts.OAuthStyle
 import ai.diffforge.haider.ui.accounts.ModelDetail
 import ai.diffforge.haider.ui.accounts.Account as UiAccount
@@ -178,6 +182,31 @@ class RpcAccountsRepository(private val client: RpcClient, private val source: A
         val owned = owned(flow) ?: return
         try { source.cancelOAuth(owned.flow) } finally { synchronized(flows) { flows.remove(flow) } }
     }
+    /**
+     * Read-only discovery for a server the daemon does not know yet.
+     *
+     * The typed probe failure is preserved: `provider_probe_failed` carries the
+     * daemon's own `failure` in its error data, and the card offers a manual id
+     * from that rather than from a guess. Feature absence is its own answer.
+     */
+    override suspend fun probeCustomModels(provider: String, origin: String, apiFamily: String,
+        keyless: Boolean, probeVaultReference: String?): CustomModelsProbe = try {
+        val probed = source.probeCustomModels(provider, origin, apiFamily, keyless, probeVaultReference)
+        CustomModelsProbe.Models(probed.models, probed.defaultModel)
+    } catch (cancelled: CancellationException) { throw cancelled }
+    catch (error: RpcRemoteException) {
+        if (error.code == AccountsRpcAdapter.ERROR_PROVIDER_PROBE_FAILED)
+            CustomModelsProbe.Failed(CustomProbeFailure.of(error.failure), error.code)
+        else CustomModelsProbe.Unavailable(error.code)
+    }
+    catch (_: IOException) { CustomModelsProbe.Unavailable("connection_lost") }
+
+    override suspend fun configureCustomProvider(provider: String, origin: String, apiFamily: String,
+        authRequirement: String, models: List<String>, defaultModel: String?, expectedRevision: Long): AccountResult =
+        mutation(operationKey("configure", provider, origin, apiFamily, authRequirement, expectedRevision.toString())) {
+            source.configureCustomProvider(it, provider, origin, apiFamily, authRequirement, models, defaultModel, expectedRevision)
+        }
+
     override suspend fun accountExists(provider: String, alias: String): Boolean {
         source.refresh()
         if (source.loadError.value != null) throw IOException("accounts_unavailable")
@@ -190,7 +219,11 @@ class RpcAccountsRepository(private val client: RpcClient, private val source: A
             value.active, value.identity, value.status)
         internal fun provider(value: ProviderDescriptor) = UiProvider(value.id, value.id, value.supportsApiKey, value.supportsOAuth,
             OAuthStyle.Unknown, value.available, value.unavailableReason, value.models,
-            value.modelDetails.associate { it.id to ModelDetail(it.supportedEfforts, it.defaultEffort, it.contextWindow) }, value.defaultModel, value.apiFamily)
+            value.modelDetails.associate { it.id to ModelDetail(it.supportedEfforts, it.defaultEffort, it.contextWindow) },
+            value.defaultModel, value.apiFamily,
+            // Carried, not dropped: the picker's free-text model field is gated
+            // on this and nothing forwarded it (971-V F6).
+            ModelInventoryAuthority.of(value.inventoryAuthority), value.endpoint)
         internal fun status(value: OAuthStatus): UiStatus = when (value.status) {
             "waiting_browser", "waiting_device" -> UiStatus.Waiting
             "exchanging" -> UiStatus.Exchanging

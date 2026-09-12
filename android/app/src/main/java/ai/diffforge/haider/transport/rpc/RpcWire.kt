@@ -6,7 +6,15 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 
 class RpcProtocolException(val code: String) : IOException(code)
-class RpcRemoteException(val code: String, val retryable: Boolean = false) : IOException(code)
+class RpcRemoteException(val code: String, val retryable: Boolean = false, val data: JsonObject? = null) : IOException(code) {
+    /**
+     * `ErrorData::ProviderProbeFailed.failure` (frame.rs:5633).
+     *
+     * The typed recovery coordinate, so a probe failure is classified from the
+     * daemon's own field and never by reading `message`.
+     */
+    val failure: String? get() = data?.optionalString("failure")
+}
 
 internal val wireJson = Json { isLenient = false; ignoreUnknownKeys = true }
 internal fun obj(vararg fields: Pair<String, Any?>): JsonObject = buildJsonObject {

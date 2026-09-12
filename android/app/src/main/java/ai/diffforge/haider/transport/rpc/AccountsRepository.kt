@@ -14,7 +14,16 @@ data class Account(val alias: String, val provider: String, val label: String?, 
 data class ProviderDescriptor(val id: String, val supportsApiKey: Boolean, val supportsOAuth: Boolean,
     val available: Boolean, val models: List<String>, val defaultModel: String?,
     val unavailableReason: String? = null, val apiFamily: String? = null,
-    val modelDetails: List<ai.diffforge.haider.transport.SessionModel> = emptyList())
+    val modelDetails: List<ai.diffforge.haider.transport.SessionModel> = emptyList(),
+    /**
+     * `ProviderSummaryWire.inventory_authority` (frame.rs:1227). Dropping it
+     * here is what silently disabled custom model entry for an advisory
+     * provider all the way up in the picker (971-V F6); absent stays "unknown",
+     * which is the conservative reading.
+     */
+    val inventoryAuthority: String = "unknown",
+    /** `ProviderSummaryWire.endpoint`, so two local servers can be told apart. */
+    val endpoint: String? = null)
 data class AccountsSnapshot(val revision: Long?, val accounts: List<Account>)
 
 /** Transient connection-owned capability; never use in saved-state, logs, Binder or notifications. */
@@ -121,6 +130,25 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
     override suspend fun cancelOAuth(flow: OAuthFlow) {
         RpcResponses.oauthStatus(client.request(RpcMethods.oauthCancel(flow.flowId, flow.attemptId), flow.epoch).objectAt("status"))
     }
+    /**
+     * `provider.models_probe`, on the connection the form was read on.
+     *
+     * Read-only: no provider, account or cache is written, and [reference] is
+     * borrowed rather than consumed, so the following `account.login_api` can
+     * still spend the same stage.
+     */
+    override suspend fun probeCustomModels(provider: String, origin: String, apiFamily: String,
+        keyless: Boolean, reference: String?): RpcResponses.ProbedModels =
+        RpcResponses.probedModels(client.request(RpcMethods.probeModels(provider, origin, apiFamily, keyless, reference)))
+
+    /** `provider.configure` — the durable create, fenced by the revision the form was read at. */
+    override suspend fun configureCustomProvider(command: String, provider: String, origin: String,
+        apiFamily: String, authRequirement: String, models: List<String>, defaultModel: String?, revision: Long) {
+        RpcResponses.refreshedProvider(client.request(RpcMethods.configureProvider(command, provider, origin,
+            apiFamily, authRequirement, models, defaultModel, revision)))
+        refreshes.trySend(Unit)
+    }
+
     suspend fun refreshProviders() {
         val epoch = client.connectionEpoch
         val body = client.request(RpcMethods.providers(), epoch)
@@ -145,7 +173,9 @@ class AccountsRepository(private val client: RpcClient, scope: CoroutineScope) :
                     val model = it.jsonObject
                     ai.diffforge.haider.transport.SessionModel(model.string("name"), model.optionalNumber("context_window"),
                         model.strings("supported_efforts").toList(), model.optionalString("default_effort"))
-                })
+                },
+                value.optionalString("inventory_authority") ?: "unknown",
+                value.optionalString("endpoint"))
         }
         internal fun checkAvailability(value: JsonObject) {
             if ((value["availability"] as? JsonObject)?.optionalString("state") == "unavailable") throw RpcRemoteException("snapshot_unavailable")

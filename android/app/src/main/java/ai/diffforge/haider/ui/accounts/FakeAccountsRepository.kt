@@ -69,6 +69,13 @@ class FakeAccountsRepository(
     /** Set to a public code to make the next mutation fail. */
     var nextFailure: String? = null
 
+    /**
+     * Set to make the provider read throw, the way the RPC repository does when
+     * the daemon is stopped (`IOException("connection_lost")`). Unlike
+     * [nextFailure] it is not consumed: a dead daemon stays dead.
+     */
+    var providersFailure: String? = null
+
     /** Set to simulate the connection or UI process dying mid-flow. */
     var flowLost: Boolean = false
 
@@ -182,6 +189,7 @@ class FakeAccountsRepository(
 
     override suspend fun refreshProviders() {
         calls += AccountsRpcAdapter.METHOD_PROVIDER_LIST
+        providersFailure?.let { throw java.io.IOException(it) }
     }
 
     // ---------- custom servers ----------

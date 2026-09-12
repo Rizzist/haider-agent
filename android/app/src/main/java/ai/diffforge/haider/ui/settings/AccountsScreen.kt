@@ -74,6 +74,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /** Staging failed for a reason that is not the key: connection, expiry, capacity. */
@@ -127,6 +128,7 @@ fun AccountsScreen(
     var stagedReference by remember { mutableStateOf<String?>(null) }
     var addSheet by remember { mutableStateOf(false) }
     var openAccount by remember { mutableStateOf<String?>(null) }
+    var unavailable by remember { mutableStateOf<String?>(null) }
 
     // The custom-server card runs four doors deep and holds its own key, so it
     // has its own controller and its own buffer — the API-key form's `secret`
@@ -162,8 +164,21 @@ fun AccountsScreen(
         }
     }
     LaunchedEffect(Unit) {
-        repository.refresh()
-        repository.refreshProviders()
+        // A stopped daemon is an answer, not something to die on: the RPC read
+        // throws `connection_lost` out of this very effect, and unguarded it
+        // killed the process on entry (971-V round 2, `accounts-crash.log`) —
+        // the same class the model chip's Refresh already survives (971-V F4).
+        try {
+            repository.refresh()
+            repository.refreshProviders()
+            unavailable = null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            // The transport's IOException carries its stable public code as
+            // the message ("connection_lost"); keep it rather than flatten it.
+            unavailable = error.message?.takeIf { it.isNotBlank() } ?: "accounts_unavailable"
+        }
     }
 
     fun clearSecret() {
@@ -216,6 +231,21 @@ fun AccountsScreen(
                 .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.lg),
             verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
         ) {
+            unavailable?.let { reason ->
+                // Nothing else: an empty list would read as "you have none",
+                // and an Add door whose daemon is gone could only fail (the
+                // Loom registry's unavailable surface makes the same call).
+                Text(
+                    stringResource(
+                        R.string.accounts_unavailable,
+                        stringResource(R.string.accounts_title),
+                        reason,
+                    ),
+                    style = type.emptyBody,
+                    color = colors.textMuted,
+                )
+                return@Column
+            }
             notice?.let { Text(it, style = type.sessionMeta, color = colors.accent) }
 
             if (snapshot.accounts.isEmpty()) {
@@ -257,6 +287,7 @@ fun AccountsScreen(
 
                 AddAccountForm.ApiKey -> Card {
                     ProviderPicker(
+                        form = AddAccountForm.ApiKey,
                         providers = providers.filter { it.supportsApiKey },
                         selected = provider,
                         onSelect = { provider = it },
@@ -381,6 +412,7 @@ fun AccountsScreen(
                 // make a running sign-in disappear (verify-6 O4).
                 AddAccountForm.SignIn -> if (attempt == null) Card {
                         ProviderPicker(
+                            form = AddAccountForm.SignIn,
                             providers = providers.filter { it.supportsOAuth },
                             selected = provider,
                             onSelect = { provider = it },
@@ -667,6 +699,7 @@ private fun AccountDetailSheet(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ProviderPicker(
+    form: AddAccountForm,
     providers: List<ProviderDescriptor>,
     selected: String?,
     onSelect: (String) -> Unit,
@@ -682,17 +715,25 @@ private fun ProviderPicker(
             verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
         ) {
             providers.forEach { descriptor ->
+                // Not `descriptor.available`: on a fresh profile a built-in
+                // provider is unavailable *for want of this very credential*,
+                // and gating the form on it made setup circular (971-V F5).
+                val selectable = AddAccountFormPolicy.selectable(
+                    form = form,
+                    supportsApiKey = descriptor.supportsApiKey,
+                    supportsOAuth = descriptor.supportsOAuth,
+                )
                 ForgeChip(
                     onClick = { onSelect(descriptor.id) },
                     selected = selected == descriptor.id,
-                    enabled = descriptor.available,
+                    enabled = selectable,
                     contentDescription = descriptor.label,
                 ) {
                     Text(
                         descriptor.label,
                         style = type.chip,
                         color = when {
-                            !descriptor.available -> colors.textMuted
+                            !selectable -> colors.textMuted
                             selected == descriptor.id -> colors.accent
                             else -> colors.textSoft
                         },

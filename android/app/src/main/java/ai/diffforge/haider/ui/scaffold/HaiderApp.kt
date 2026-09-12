@@ -188,8 +188,10 @@ fun HaiderApp(
         BackHandler(enabled = drawerState.isOpen) {
             scope.launch { drawerState.close() }
         }
+        // Back goes where the screen's own back control goes, one level at a
+        // time: Looms -> Settings -> session surface (971-V F8).
         BackHandler(enabled = drawerState.isClosed && state.overlay != Overlay.None) {
-            viewModel.closeOverlay()
+            viewModel.back()
         }
 
         val accountsSnapshot by accounts.snapshot.collectAsState()

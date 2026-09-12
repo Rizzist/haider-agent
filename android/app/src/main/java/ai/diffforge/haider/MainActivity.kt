@@ -132,14 +132,34 @@ class MainActivity : ComponentActivity() {
      */
     private val imagePicker = registerForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
-    ) { uri ->
-        val target = uri ?: return@registerForActivityResult
+    ) { uri -> stage(uri, fallbackMime = "image/*") }
+
+    /**
+     * Any document, for the attach sheet's "Photo or file".
+     *
+     * The filter is images and text: those are the two block kinds this client
+     * can state truthfully on `turn.submit`, and offering a type that would be
+     * refused after the picker closed is worse than not offering it.
+     */
+    private val filePicker = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> stage(uri, fallbackMime = "application/octet-stream") }
+
+    /** Reads what the picker returned and hands the bytes to the view model. */
+    private fun stage(uri: Uri?, fallbackMime: String) {
+        val target = uri ?: return
         val bytes = runCatching {
             contentResolver.openInputStream(target)?.use { it.readBytes() }
-        }.getOrNull() ?: return@registerForActivityResult
-        val mime = contentResolver.getType(target) ?: "image/*"
-        viewModel?.attach(bytes, mime, name = null)
+        }.getOrNull() ?: return
+        val mime = contentResolver.getType(target) ?: fallbackMime
+        viewModel?.attach(bytes, mime, name = displayName(target))
     }
+
+    /** `OpenableColumns.DISPLAY_NAME`, so a text file keeps the name the model sees. */
+    private fun displayName(uri: Uri): String? = runCatching {
+        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+    }.getOrNull()
 
     private val smsPermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -391,14 +411,55 @@ class MainActivity : ComponentActivity() {
                 startActivity(Intent(this, ScreenConsentActivity::class.java))
             // The picker returns bytes; staging them into the daemon's CAS is
             // the view model's job (turn.submit carries the block, not a path).
-            SystemAction.PickImage -> imagePicker.launch(
-                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-            )
-            SystemAction.Screenshot, SystemAction.PickFile -> Unit
+            //
+            // Launching is guarded because the photo picker is not on every
+            // image: the 16 KiB API 35 emulator has no activity for
+            // ACTION_PICK_IMAGES at all, and the unhandled
+            // ActivityNotFoundException killed the UI process (971-V F10).
+            // A capability that is absent is reported, never fatal.
+            SystemAction.PickImage -> launchPicker(SystemAction.PickImage) {
+                imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }
+            SystemAction.PickFile -> launchPicker(SystemAction.PickFile) {
+                filePicker.launch(arrayOf("image/*", "text/*"))
+            }
+            // The capture service owns the consent and the bytes. With a live
+            // projection this is a real screenshot attachment; without one it
+            // asks for consent and says so, instead of the sheet closing on
+            // nothing at all (971-V F10).
+            SystemAction.Screenshot -> {
+                val capture = ai.diffforge.haider.service.ScreenCaptureService.instance
+                if (capture == null) {
+                    ai.diffforge.haider.service.ScreenCaptureService.requestConsent(this)
+                    viewModel?.noteAttachmentUnavailable(SCREENSHOT_CONSENT_PENDING)
+                } else {
+                    lifecycleScope.launch {
+                        val png = capture.captureOnce()
+                        if (png == null) viewModel?.noteAttachmentUnavailable(SCREENSHOT_CONSENT_PENDING)
+                        else viewModel?.attach(png, "image/png", name = null)
+                    }
+                }
+            }
             is SystemAction.CopyText -> {
                 val clipboard = getSystemService(ClipboardManager::class.java)
                 clipboard?.setPrimaryClip(ClipData.newPlainText("haider", action.text))
             }
+        }
+    }
+
+    /**
+     * Launches a picker, or reports that this device has none.
+     *
+     * `ActivityResultLauncher.launch` throws when nothing resolves the intent,
+     * and that throw is on the main thread inside a click handler — it is a
+     * crash, not a failed attachment. The notice carries the action's own name
+     * so the composer can say which affordance is unavailable here.
+     */
+    private inline fun launchPicker(action: SystemAction, launch: () -> Unit) {
+        try { launch() } catch (_: android.content.ActivityNotFoundException) {
+            viewModel?.noteAttachmentUnavailable(
+                if (action == SystemAction.PickImage) IMAGE_PICKER_UNAVAILABLE else FILE_PICKER_UNAVAILABLE,
+            )
         }
     }
 
@@ -420,6 +481,16 @@ class MainActivity : ComponentActivity() {
 
 private const val PERMISSION_PREFERENCES = "haider_permissions"
 private const val KEY_NOTIFICATIONS_REQUESTED = "notifications_requested"
+
+/**
+ * Attachment affordances this device does not have.
+ *
+ * Stable snake_case codes, in the same shape as the daemon's own public codes,
+ * because the composer renders an attachment notice verbatim.
+ */
+const val IMAGE_PICKER_UNAVAILABLE = "image_picker_unavailable"
+const val FILE_PICKER_UNAVAILABLE = "file_picker_unavailable"
+const val SCREENSHOT_CONSENT_PENDING = "screenshot_consent_pending"
 
 /** The version string shown in the header, drawer and start surface. */
 object BuildConfigVersion {
