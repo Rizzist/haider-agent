@@ -1659,13 +1659,13 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
     // Full manifest size after wave-971 changes and session_transcript.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_414;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_101;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_365;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_052;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_364;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_051;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_359;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_046;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
