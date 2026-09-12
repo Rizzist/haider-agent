@@ -4,7 +4,6 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::ffi::OsStringExt;
 
 use base64::Engine as _;
 use haider_protocol::EventPayload;
@@ -14,6 +13,25 @@ use haider_tui::app::{AppEvent, AppModel, Screen};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod common;
+
+#[cfg(unix)]
+fn non_utf8_name() -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+
+    OsString::from_vec(b"bad-\xff.txt".to_vec())
+}
+
+#[cfg(windows)]
+fn non_utf8_name() -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+
+    // A lone surrogate is the Windows equivalent of an invalid UTF-8 byte:
+    // it exercises lossy filename handling without assuming UTF-16 validity.
+    OsString::from_wide(&[
+        'b' as u16, 'a' as u16, 'd' as u16, '-' as u16, 0xD800, '.' as u16, 't' as u16, 'x' as u16,
+        't' as u16,
+    ])
+}
 
 fn session_model() -> AppModel {
     let mut model = common::launcher_model();
@@ -198,7 +216,7 @@ fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
     for index in 0..300 {
         fs::write(root.path().join(format!("file-{index:03}.txt")), "x").expect("file");
     }
-    let non_utf8 = OsString::from_vec(b"bad-\xff.txt".to_vec());
+    let non_utf8 = non_utf8_name();
     let non_utf8_created = fs::write(root.path().join(&non_utf8), "x").is_ok();
     if !non_utf8_created {
         assert!(non_utf8.to_string_lossy().contains('�'));
