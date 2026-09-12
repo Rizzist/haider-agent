@@ -110,11 +110,12 @@ impl ProcessId {
 /// Retained kernel identity for one already-authenticated process.
 ///
 /// Capture this while the IPC peer is still connected, then await it after
-/// shutdown. Linux pins the task with a pidfd, macOS arms EVFILT_PROC before
+/// shutdown. Linux pins the task with a pidfd (or a retained procfs directory
+/// on kernels/translators without pidfd support), macOS arms EVFILT_PROC before
 /// the PID can be reused, and Windows retains a SYNCHRONIZE process handle.
 pub struct ProcessExitMonitor {
     #[cfg(target_os = "linux")]
-    descriptor: rustix::fd::OwnedFd,
+    linux: LinuxExitMonitor,
     #[cfg(target_os = "macos")]
     queue: nix::sys::event::Kqueue,
     #[cfg(target_os = "macos")]
@@ -134,8 +135,14 @@ impl ProcessExitMonitor {
 
             let pid = Pid::from_raw(pid.as_raw_nonzero().get())
                 .ok_or_else(|| std::io::Error::other("process-exit monitor PID became zero"))?;
-            let descriptor = pidfd_open(pid, PidfdFlags::NONBLOCK).map_err(std::io::Error::from)?;
-            Ok(Self { descriptor })
+            let linux = match pidfd_open(pid, PidfdFlags::NONBLOCK) {
+                Ok(descriptor) => LinuxExitMonitor::Pidfd(descriptor),
+                Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL) => {
+                    LinuxExitMonitor::capture_proc(pid)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            Ok(Self { linux })
         }
 
         #[cfg(target_os = "macos")]
@@ -187,9 +194,19 @@ impl ProcessExitMonitor {
     pub async fn wait(self) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            let descriptor = tokio::io::unix::AsyncFd::new(self.descriptor)?;
-            let _ready = descriptor.readable().await?;
-            Ok(())
+            match self.linux {
+                LinuxExitMonitor::Pidfd(descriptor) => {
+                    let descriptor = tokio::io::unix::AsyncFd::new(descriptor)?;
+                    let _ready = descriptor.readable().await?;
+                    Ok(())
+                }
+                LinuxExitMonitor::Proc(directory) => {
+                    while !proc_directory_exited(&directory)? {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Ok(())
+                }
+            }
         }
 
         #[cfg(target_os = "macos")]
@@ -248,6 +265,75 @@ impl ProcessExitMonitor {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxExitMonitor {
+    Pidfd(rustix::fd::OwnedFd),
+    Proc(rustix::fd::OwnedFd),
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxExitMonitor {
+    fn capture_proc(pid: rustix::process::Pid) -> std::io::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+        let directory = rustix::fs::open(
+            format!("/proc/{pid}"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| match error {
+            // A fully reaped PID no longer resolves; report the same
+            // NotFound identity failure a pidfd capture reports as ESRCH.
+            rustix::io::Errno::NOENT | rustix::io::Errno::SRCH => std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "process exited before its monitor was armed",
+            ),
+            other => other.into(),
+        })?;
+        // Validate the descriptor-relative probe before sending shutdown,
+        // when failure can still be reported without having changed the
+        // authenticated daemon's state. A zombie keeps its monitor: the
+        // retained identity has already exited, so wait() resolves
+        // immediately, exactly as a pidfd armed on a zombie would.
+        proc_directory_exited(&directory)?;
+        Ok(Self::Proc(directory))
+    }
+}
+
+/// Open relative to the retained process directory, never re-resolve a numeric
+/// PID. Procfs FDs cannot act on a reused PID; after exit they return ESRCH or
+/// ENOENT. See kernel.org/doc/html/latest/filesystems/proc.html, section 1.1.
+#[cfg(target_os = "linux")]
+fn proc_directory_exited(directory: &rustix::fd::OwnedFd) -> std::io::Result<bool> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Read as _;
+    let stat = match rustix::fs::openat(
+        directory,
+        "stat",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::SRCH | rustix::io::Errno::NOENT) => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    let mut text = String::new();
+    match std::fs::File::from(stat).read_to_string(&mut text) {
+        Ok(_) => {}
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
+    }
+    // comm may contain spaces and parentheses; state follows the LAST ')'.
+    let state = text
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid process stat")
+        })?;
+    Ok(matches!(state, 'Z' | 'X' | 'x'))
 }
 
 #[cfg(unix)]

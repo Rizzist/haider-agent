@@ -1712,14 +1712,24 @@ fn adapt_events(output: RunOutput, events: mpsc::Receiver<HeadlessEvent>) -> io:
 
 fn adapt_events_to(
     output: RunOutput,
+    events: mpsc::Receiver<HeadlessEvent>,
+    stdout: impl Write,
+    stderr: impl Write,
+) -> io::Result<()> {
+    adapt_events_to_with_clock(output, events, stdout, stderr, Instant::now)
+}
+
+fn adapt_events_to_with_clock(
+    output: RunOutput,
     mut events: mpsc::Receiver<HeadlessEvent>,
     mut stdout: impl Write,
     mut stderr: impl Write,
+    mut now: impl FnMut() -> Instant,
 ) -> io::Result<()> {
     let mut announced = false;
     let mut stdout_dirty = false;
     let mut stdout_unflushed_envelopes = 0_usize;
-    let mut last_stdout_flush = Instant::now();
+    let mut last_stdout_flush = now();
     let mut turn_trace = None::<(u64, Instant)>;
     let mut next_event = events.blocking_recv();
     while let Some(event) = next_event {
@@ -1762,7 +1772,7 @@ fn adapt_events_to(
                         stdout.flush()?;
                         stdout_dirty = false;
                         stdout_unflushed_envelopes = 0;
-                        last_stdout_flush = Instant::now();
+                        last_stdout_flush = now();
                     }
                     RunOutput::Json => {
                         // Single-JSON stdout remains exactly one document; the
@@ -1805,7 +1815,8 @@ fn adapt_events_to(
                     stdout_unflushed_envelopes = stdout_unflushed_envelopes.saturating_add(1);
                     flush_stdout = is_terminal_run_state(envelope.as_ref())
                         || stdout_unflushed_envelopes >= JSONL_FLUSH_ENVELOPES
-                        || last_stdout_flush.elapsed() >= JSONL_FLUSH_INTERVAL;
+                        || now().saturating_duration_since(last_stdout_flush)
+                            >= JSONL_FLUSH_INTERVAL;
                 }
             }
             HeadlessEvent::Terminal(terminal) => {
@@ -1850,7 +1861,7 @@ fn adapt_events_to(
             stdout.flush()?;
             stdout_dirty = false;
             stdout_unflushed_envelopes = 0;
-            last_stdout_flush = Instant::now();
+            last_stdout_flush = now();
         }
 
         next_event = match events.try_recv() {
@@ -1860,7 +1871,7 @@ fn adapt_events_to(
                     stdout.flush()?;
                     stdout_dirty = false;
                     stdout_unflushed_envelopes = 0;
-                    last_stdout_flush = Instant::now();
+                    last_stdout_flush = now();
                 }
                 events.blocking_recv()
             }
@@ -2863,6 +2874,26 @@ mod tests {
     /// batch then performs four flushes instead of the accepted+terminal pair.
     #[test]
     fn jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal() {
+        // Serialization may exceed the real 3 ms interval on a translated or
+        // loaded host. Freeze only this batching test's clock; production keeps
+        // its latency bound, which the advancing-clock test below exercises.
+        let now = Instant::now();
+        assert_queued_jsonl_flushes(|| now, 2);
+    }
+
+    #[test]
+    fn jsonl_adapter_flushes_a_queued_batch_when_the_interval_expires() {
+        let mut now = Instant::now();
+        assert_queued_jsonl_flushes(
+            || {
+                now += JSONL_FLUSH_INTERVAL;
+                now
+            },
+            4,
+        );
+    }
+
+    fn assert_queued_jsonl_flushes(now: impl FnMut() -> Instant, expected_flushes: usize) {
         fn envelope(seq: u64, state: &str) -> RawEnvelope {
             serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
@@ -2896,12 +2927,12 @@ mod tests {
 
         let mut stdout = FlushCountingWriter::default();
         let mut stderr = Vec::new();
-        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr)
+        adapt_events_to_with_clock(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr, now)
             .expect("adapter succeeds");
 
         assert_eq!(
-            stdout.flushes, 2,
-            "accepted and terminal flush exactly once"
+            stdout.flushes, expected_flushes,
+            "acceptance, terminal and elapsed-interval flush boundaries"
         );
         assert_eq!(
             stdout.bytes.iter().filter(|byte| **byte == b'\n').count(),

@@ -225,6 +225,68 @@ fn timed_out_child_wait_does_not_pin_runtime_shutdown() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn procfs_exit_monitor_retains_identity_when_pidfd_is_unavailable() {
+    let mut child = tokio::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn gated child");
+    let gate = child.stdin.take().expect("child exit gate");
+    let pid =
+        rustix::process::Pid::from_raw(child.id().expect("child PID") as i32).expect("nonzero PID");
+    let linux = super::LinuxExitMonitor::capture_proc(pid).expect("retain procfs identity");
+    let monitor = super::ProcessExitMonitor { linux };
+    let wait = monitor.wait();
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut wait)
+            .await
+            .is_err()
+    );
+    drop(gate);
+    child.wait().await.expect("reap only owned child");
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("exit notification deadline")
+        .expect("observe retained exit");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn procfs_exit_monitor_observes_zombie_before_reaping() {
+    let mut child = std::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn gated child");
+    let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child PID");
+    let super::LinuxExitMonitor::Proc(directory) =
+        super::LinuxExitMonitor::capture_proc(pid).expect("retain procfs identity")
+    else {
+        unreachable!("procfs monitor")
+    };
+    assert!(!super::proc_directory_exited(&directory).expect("live child"));
+    drop(child.stdin.take());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !super::proc_directory_exited(&directory).expect("probe zombie") {
+        assert!(std::time::Instant::now() < deadline, "child did not exit");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // A zombie still pins its identity at capture time, matching a pidfd
+    // armed on a zombie: the monitor is retained and resolves immediately.
+    let super::LinuxExitMonitor::Proc(zombie) =
+        super::LinuxExitMonitor::capture_proc(pid).expect("zombie still pins identity")
+    else {
+        unreachable!("procfs monitor")
+    };
+    assert!(super::proc_directory_exited(&zombie).expect("zombie reports exited"));
+    child.wait().expect("reap child after observing zombie");
+    assert!(super::proc_directory_exited(&directory).expect("retained descriptor after reap"));
+}
+
 /// MUTATION CHECK: replace either armed kqueue wait with a 50 ms Tokio
 /// polling backoff. The observer must deliver the exit without advancing the
 /// paused clock, so that mutation cannot reach even its first poll.
