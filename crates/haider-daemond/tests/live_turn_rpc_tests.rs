@@ -2242,7 +2242,9 @@ fn different_exec_command() -> String {
 
 #[cfg(unix)]
 fn restart_exec_command() -> String {
-    "printf 'attempt\\n' >> attempts.log; printf started; sleep 1".into()
+    // The daemon's output redactor publishes complete lines. Keep the process
+    // alive after a flushed start marker so the crash window remains real.
+    "printf 'attempt\\n' >> attempts.log; printf 'started\\n'; sleep 1".into()
 }
 
 #[cfg(windows)]
