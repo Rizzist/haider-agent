@@ -59,6 +59,24 @@ class AccountsScreenTest {
         }
     }
 
+    /**
+     * With the daemon stopped, the initial provider read throws
+     * `IOException("connection_lost")` straight out of the load effect, and
+     * unguarded it killed the process on entry (971-V round 2,
+     * `accounts-crash.log`). The throw must become the unavailable surface.
+     */
+    @Test
+    fun `a stopped daemon yields the unavailable surface, not a crash`() {
+        repository.providersFailure = "connection_lost"
+        render()
+        rule.waitForIdle()
+        rule.onNodeWithText("Accounts is unavailable — connection_lost").assertIsDisplayed()
+        // Withheld, not emptied: no rows to misread as "you have none", and no
+        // Add door whose every save could only fail.
+        assertEquals(0, rule.onAllNodesWithTextSafe("Work"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Add account"))
+    }
+
     @Test
     fun `an existing account shows its provider and masked identity`() {
         render()
