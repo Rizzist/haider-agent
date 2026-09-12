@@ -839,6 +839,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "computer",
             "monitor",
             "list_models",
+            "session_transcript",
             "peer_list",
             "peer_send",
             "ssh_list",
@@ -1620,7 +1621,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         0,
     );
     let registry = registered_tools();
-    assert_eq!(authorized.len(), 28, "27 former tools plus task_outcome");
+    assert_eq!(authorized.len(), 29, "27 former tools plus session_transcript and task_outcome");
     let full_prefix: usize = authorized
         .iter()
         .map(|tool| {
@@ -1637,13 +1638,13 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         .sum();
     // Union full-pack pin: 971 redaction (+98) plus 972 task_outcome (+515).
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_929;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_616;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_880;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_567;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_879;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_566;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_874;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_561;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1662,7 +1663,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         - 2;
     let expected_pipe_bytes =
         EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
-    assert_eq!(registered_tools().len(), 31);
+    assert_eq!(registered_tools().len(), 32);
     assert_eq!(
         tools.len(),
         10,
