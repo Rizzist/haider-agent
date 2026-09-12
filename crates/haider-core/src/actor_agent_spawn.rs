@@ -242,11 +242,11 @@ impl HarnessActor {
                 self.apply_tool_delta(run_id, tools, &call_id, args[consumed..].to_owned())
                     .await?;
             }
-            if self
-                .complete_tool(run_id, tools, deferred, &call_id, cancel)
-                .await?
-                .is_some()
-            {
+            if !matches!(
+                self.complete_tool(run_id, tools, deferred, &call_id, cancel)
+                    .await?,
+                CompletedTool::Continue(None)
+            ) {
                 return Err(DriveError::Store(HaiderError::new(
                     ErrorCode::InvalidArgument,
                     "agent spawn was rejected; inspect the durable tool result",

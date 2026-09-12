@@ -601,7 +601,10 @@ async fn control_attachment(
 
 async fn detach(client: &haider_client::RpcClient, attachment_id: AttachmentId) {
     let _ = client
-        .request(RequestBody::SessionDetach { attachment_id })
+        .request(RequestBody::SessionDetach {
+            attachment_id,
+            close_session: false,
+        })
         .await;
 }
 

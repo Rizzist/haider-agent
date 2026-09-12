@@ -100,13 +100,14 @@ where
 fn detach_body(name: &str) -> RequestBody {
     RequestBody::SessionDetach {
         attachment_id: AttachmentId::new(name.to_owned()),
+        close_session: false,
     }
 }
 
 /// The identity a recorded request body carries, for order assertions.
 fn label(body: &RequestBody) -> String {
     match body {
-        RequestBody::SessionDetach { attachment_id } => attachment_id.as_str().to_owned(),
+        RequestBody::SessionDetach { attachment_id, .. } => attachment_id.as_str().to_owned(),
         other => format!("unexpected:{other:?}"),
     }
 }

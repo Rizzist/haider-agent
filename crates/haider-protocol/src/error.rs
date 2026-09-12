@@ -353,6 +353,8 @@ pub enum ErrorCode {
     /// a same-session continuation handle instead of a fresh retry.
     RequestBudgetExceeded,
     WorkflowUnfinished,
+    /// The model explicitly reported task failure through the typed tool surface.
+    TaskFailed,
     GraphAlreadyActive,
     GraphNotActive,
     GraphWrongNode,
@@ -377,6 +379,8 @@ pub enum ErrorCode {
     Internal,
     /// A daemon-enforced headless run budget reached its durable limit.
     BudgetExhausted,
+    /// The logical provider request exhausted its last-progress idle budget.
+    IdleTimeout,
     /// Forward-compat catch-all: unknown codes from newer peers land here.
     #[serde(other)]
     Unknown,
@@ -404,6 +408,7 @@ impl ErrorCode {
             Self::LoopLimit => "loop_limit",
             Self::RequestBudgetExceeded => "request_budget_exceeded",
             Self::WorkflowUnfinished => "workflow_unfinished",
+            Self::TaskFailed => "task_failed",
             Self::GraphAlreadyActive => "graph_already_active",
             Self::GraphNotActive => "graph_not_active",
             Self::GraphWrongNode => "graph_wrong_node",
@@ -411,6 +416,7 @@ impl ErrorCode {
             Self::WorkspaceUnavailable => "workspace_unavailable",
             Self::ProviderError => "provider_error",
             Self::ProviderTimeout => "provider_timeout",
+            Self::IdleTimeout => "idle_timeout",
             Self::VisionUnsupported => "vision_unsupported",
             Self::StoreCorrupt => "store_corrupt",
             Self::StoreLocked => "store_locked",
@@ -446,6 +452,7 @@ impl ErrorCode {
             Self::LoopLimit => "loop-limit",
             Self::RequestBudgetExceeded => "request-budget-exceeded",
             Self::WorkflowUnfinished => "workflow-unfinished",
+            Self::TaskFailed => "task-failed",
             Self::GraphAlreadyActive => "graph-already-active",
             Self::GraphNotActive => "graph-not-active",
             Self::GraphWrongNode => "graph-wrong-node",
@@ -453,6 +460,7 @@ impl ErrorCode {
             Self::WorkspaceUnavailable => "workspace-unavailable",
             Self::ProviderError => "provider-error",
             Self::ProviderTimeout => "provider-timeout",
+            Self::IdleTimeout => "idle-timeout",
             Self::VisionUnsupported => "vision-unsupported",
             Self::StoreCorrupt => "store-corrupt",
             Self::StoreLocked => "store-locked",

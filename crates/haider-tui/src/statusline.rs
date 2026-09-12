@@ -218,6 +218,80 @@ impl StatusLine {
         self.mode.is_some() || !self.counts.is_empty()
     }
 
+    /// The unstyled, screen-reader-friendly status sentence.
+    ///
+    /// The rich row uses compact glyphs and colour to stay within a terminal
+    /// width. Plain consumers need the same facts in words, with the
+    /// permission posture and live counts named explicitly. This is derived
+    /// from the same observed fields as [`Self::summary_segments`], so it
+    /// cannot drift into a second status source.
+    #[must_use]
+    pub fn plain_summary(&self) -> String {
+        if !self.shows() {
+            return "background status: idle".to_owned();
+        }
+        let mut parts = Vec::with_capacity(2);
+        if let Some(mode) = self.mode {
+            parts.push(mode.label().to_owned());
+        }
+        let counts = self.counts.text();
+        if !counts.is_empty() {
+            parts.push(counts);
+        }
+        format!("background status: {}", parts.join("; "))
+    }
+
+    /// A complete plain grammar for the status band, including expanded rows.
+    ///
+    /// Each row names its kind and whether the following text is reported
+    /// activity or the item's name. That explicit grammar is easier to scan
+    /// with a screen reader than a bare `○`/`●` glyph and remains faithful to
+    /// the daemon's honesty boundary when activity is unavailable.
+    #[must_use]
+    pub fn plain_grammar(&self) -> Vec<String> {
+        if !self.shows() {
+            return Vec::new();
+        }
+        let mut lines = vec![self.plain_summary()];
+        if !self.expanded {
+            return lines;
+        }
+        // Clarity audit against report.md rows 31, 32 and 42: say the kind
+        // once, name whether the detail is observed activity or identity,
+        // and keep the hidden-row affordance explicit for keyboard users.
+        let (listed, hidden) = self.listed();
+        for row in listed {
+            let kind = if row.kind_label == row.kind.label() {
+                row.kind_label.clone()
+            } else {
+                format!("{} {}", row.kind_label, row.kind.label())
+            };
+            let detail_kind = if row.activity.is_some() {
+                "activity"
+            } else {
+                "name"
+            };
+            let detail = row.activity.as_deref().unwrap_or(&row.name);
+            let elapsed = row
+                .elapsed_ms
+                .map(|ms| format!("; elapsed {}", crate::format::fmt_elapsed(ms)))
+                .unwrap_or_default();
+            if detail.is_empty() {
+                lines.push(format!("  {kind}"));
+            } else {
+                lines.push(format!("  {kind} — {detail_kind}: {detail}{elapsed}"));
+            }
+        }
+        if hidden > 0 {
+            lines.push(format!(
+                "  {hidden} more background rows; page {} of {}",
+                self.page() + 1,
+                self.pages()
+            ));
+        }
+        lines
+    }
+
     /// Pages the list spans — at least one, so `page 1 of 1` is sayable.
     #[must_use]
     pub fn pages(&self) -> usize {

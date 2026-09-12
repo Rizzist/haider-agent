@@ -185,6 +185,7 @@ impl Theme {
         Style::default()
             .fg(self.gold.into())
             .bg(self.gold_soft.into())
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Fenced code block interior (F2d): body ink on the bar tint — a
@@ -198,7 +199,10 @@ impl Theme {
     /// metadata ink on the block ground (floor pinned).
     #[must_use]
     pub fn md_fence_style(&self) -> Style {
-        Style::default().fg(self.dim.into()).bg(self.bar_bg.into())
+        Style::default()
+            .fg(self.dim.into())
+            .bg(self.bar_bg.into())
+            .add_modifier(Modifier::BOLD)
     }
 
     /// One markdown span kind → its themed style (F2d). Every kind maps

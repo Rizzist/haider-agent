@@ -1422,7 +1422,7 @@ async fn restart_adoption_reaps_stale_pgids_through_the_liveness_seam() {
     assert_eq!(
         live_completed.state,
         TaskTerminalState::Failed {
-            reason: "orphaned by daemon restart; stale process group reaped".into()
+            reason: "orphaned by daemon restart; stale process group termination requested".into()
         }
     );
     assert_eq!(
@@ -1435,7 +1435,7 @@ async fn restart_adoption_reaps_stale_pgids_through_the_liveness_seam() {
     assert_eq!(
         dead_completed.state,
         TaskTerminalState::Failed {
-            reason: "orphaned by daemon restart (process group already gone; output lost)".into()
+            reason: "orphaned by daemon restart (reaper reported already dead; output lost)".into()
         }
     );
     for task in ["task-adopt-live", "task-adopt-dead"] {

@@ -30,6 +30,7 @@ pub enum Command<'a> {
     SessionRetract(&'a [String]),
     Session(&'a [String]),
     SessionTranscript(&'a [String]),
+    SessionSubmit(&'a [String]),
     Account(&'a [String]),
     Provider(&'a [String]),
     Lockdown(&'a [String]),
@@ -68,6 +69,7 @@ pub fn parse_command(args: &[String]) -> Result<Command<'_>, String> {
         [c, r @ ..] if c == "daemon" => Command::Daemon(r),
         [c, r @ ..] if c == "sessions" => Command::Sessions(r),
         [c, s, r @ ..] if c == "session" && s == "transcript" => Command::SessionTranscript(r),
+        [c, s, r @ ..] if c == "session" && s == "submit" => Command::SessionSubmit(r),
         [c, id, s, r @ ..] if c == "session" && s == "config" => Command::SessionConfig(id, r),
         [c, id, s, r @ ..] if c == "session" && s == "recover" => Command::SessionRecover(id, r),
         [c, id, s, r @ ..] if c == "session" && s == "seen" => Command::SessionSeen(id, r),
@@ -154,6 +156,7 @@ mod tests {
             | Command::SessionRetract(_)
             | Command::Session(_)
             | Command::SessionTranscript(_)
+            | Command::SessionSubmit(_)
             | Command::Account(_)
             | Command::Provider(_)
             | Command::Lockdown(_)

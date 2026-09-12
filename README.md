@@ -70,6 +70,8 @@ and provider lockdown remain hard boundaries. The older
 `--allow-writes`, `--allow-exec`, and `--auto-allow` flags are accepted as
 compatibility aliases; autonomous runs already allow Ask-policy effects.
 
+Ordinary headless conversations can reuse a native session with `haider run --session <id> --output json "next prompt"` or `haider session submit <id> -`. See [the submission contract](docs/session-submit-v1.md) for identity, stdin, errors and RPC binding.
+
 ---
 
 ## ⚔️ What is Haider?

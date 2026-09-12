@@ -2836,6 +2836,90 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
     store.close().await.expect("reopen store close");
 }
 
+/// A temporary close fence must suspend dispatch, not report an unhandled
+/// row: startup replay treats the latter as fatal and stops the hook engine.
+#[tokio::test]
+async fn hook_dispatch_waits_for_native_close_fence_before_executing() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let marker_guard = tempfile::tempdir().expect("marker");
+    let marker = marker_guard.path().join("fenced-hook");
+    let mut fixture =
+        EngineFixture::start(&append_marker_command(&marker), 1_000, false, "exec").await;
+    // Drive the handler directly so its first lease poll is observable. Stop
+    // only the fixture's engine loop; keep the service's execution policy live.
+    let task = fixture.engine.task.take().expect("engine task");
+    task.abort();
+    assert!(task.await.expect_err("loop cancelled").is_cancelled());
+    let mut events = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "fenced-hook-started",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture
+        .store
+        .append(&mut events)
+        .await
+        .expect("durable fact");
+    let hydration = HookStartupHydrator::prepare(&fixture.store)
+        .await
+        .expect("hydrate");
+    let hydration = finish_hook_hydration_for_test(&fixture.store, hydration)
+        .await
+        .expect("replay state");
+    let (mut state, _) = hydration.into_state();
+    let activity = fixture
+        .hub
+        .try_session_activity(&fixture.session_id)
+        .expect("lease");
+    let activity_lock = Arc::clone(tokio::sync::OwnedRwLockReadGuard::rwlock(&activity));
+    drop(activity);
+    let fence = activity_lock.write_owned().await;
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut acks = Vec::new();
+    let mut discoveries = super::BatchDiscoveryCache::new();
+    let flights = Arc::new(std::sync::Mutex::new(super::HookDispatchFlights::default()));
+    let mut dispatch = Box::pin(super::handle_and_complete(
+        super::HookHandleContext {
+            service: &fixture.service,
+            state: &mut state,
+            jobs: &mut jobs,
+            acks: &mut acks,
+            batch_discoveries: &mut discoveries,
+            inflight_dispatches: &flights,
+        },
+        events[0].clone(),
+        false,
+    ));
+    // The first poll reaches the lease before any other asynchronous work.
+    // No scheduler delay is used to establish that the fence blocks dispatch.
+    std::future::poll_fn(|cx| {
+        assert!(
+            dispatch.as_mut().poll(cx).is_pending(),
+            "close must wait, not fail replay"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    assert!(!marker.exists());
+    drop(fence);
+    let outcome = tokio::time::timeout(
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        dispatch,
+    )
+    .await
+    .expect("dispatch resumes when close releases the lease");
+    assert!(outcome.completed);
+    assert_eq!(marker_lines(&marker), 1);
+    assert!(acks.contains(&(fixture.session_id.clone(), events[0].seq)));
+    assert!(super::flush_hook_dispatch_acks(&fixture.service, acks).await);
+    while jobs.join_next().await.is_some() {}
+    fixture.close().await;
+}
+
 /// MUTATION CHECK: acknowledge a replay page before handling it, skip the
 /// per-page flush, or replay acknowledged rows too. Expected RUNTIME failure:
 /// recovery fires a marker for the pre-acknowledged fact, misses one of the
@@ -4136,5 +4220,100 @@ async fn server_mode_respawns_after_the_process_exits() {
         2,
         "each exit is followed by a lazy respawn for the next event"
     );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn removed_run_server_retains_session_until_native_cleanup_join() {
+    let (fixture, _) = server_fixture(0, TestServerKind::Resident).await;
+    let discovery =
+        discover(&fixture.workspace, &fixture.service.inner.profile_root).expect("discovery");
+    let definition = discovery
+        .hooks
+        .values()
+        .next()
+        .expect("server definition")
+        .clone();
+    let scope = (fixture.session_id.clone(), fixture.run_id.clone());
+    let response = fixture
+        .service
+        .inner
+        .servers
+        .try_dispatch(
+            fixture.service.clone(),
+            definition,
+            Arc::from(b"{}".as_slice()),
+            Some(scope.clone()),
+        )
+        .expect("dispatch");
+    let super::hooks_server::ServerReply::Result(result) =
+        response.await.expect("native server response")
+    else {
+        panic!("definition changed");
+    };
+    assert_eq!(result.exit_code, Some(0));
+    let state = server_test_state(&fixture);
+    let release = state.hold_native_cleanup();
+    fixture.service.inner.servers.kill_scope(&scope);
+    wait_for_server_stopped(&state).await;
+    let activity = fixture
+        .hub
+        .try_session_activity(&fixture.session_id)
+        .expect("shared lease");
+    let serial = Arc::clone(tokio::sync::OwnedRwLockReadGuard::rwlock(&activity));
+    drop(activity);
+    assert!(
+        serial.clone().try_write_owned().is_err(),
+        "removed actor does not erase native cleanup owner"
+    );
+    release.send(()).expect("release native cleanup");
+    fixture
+        .hub
+        .task_registry()
+        .join_session(&fixture.session_id)
+        .await
+        .expect("actual actor and cleanup joins");
+    fixture
+        .hub
+        .task_registry()
+        .join_session(&fixture.session_id)
+        .await
+        .expect("any cleanup registered during cancellation");
+    assert!(
+        serial.try_write_owned().is_ok(),
+        "lease released only after real cleanup"
+    );
+    fixture.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn timed_out_hook_capture_joins_and_closes_its_native_reader() {
+    use crate::native_process::{NativeOwner, NativeTask};
+    use tokio::io::AsyncReadExt;
+    let fixture = EngineFixture::start("printf unused", 2_000, false, "exec").await;
+    let session = SessionId::new("isolated-native-capture");
+    let activity = fixture.hub.try_session_activity(&session).expect("lease");
+    let serial = Arc::clone(tokio::sync::OwnedRwLockReadGuard::rwlock(&activity));
+    let owner = NativeOwner::new(&fixture.hub, &session, activity);
+    let (reader, mut peer) = tokio::net::UnixStream::pair().expect("native socket pair");
+    let capture = NativeOwner::scope(Some(owner), async move {
+        NativeTask::spawn(super::read_limited(reader, 32))
+    })
+    .await;
+    let error = super::await_hook_capture(capture)
+        .await
+        .err()
+        .expect("reader held beyond result deadline");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    fixture
+        .hub
+        .task_registry()
+        .join_session(&session)
+        .await
+        .expect("reader cancellation joined");
+    let mut byte = [0];
+    assert_eq!(peer.read(&mut byte).await.expect("reader peer EOF"), 0);
+    assert!(serial.try_write_owned().is_ok());
     fixture.close().await;
 }

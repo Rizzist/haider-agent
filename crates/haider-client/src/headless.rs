@@ -1580,6 +1580,7 @@ fn write_event_spool_record(
 struct HeadlessEventOutput {
     sender: Option<mpsc::UnboundedSender<HeadlessEvent>>,
     stream_envelopes: bool,
+    stream_session_history: bool,
     ledger: Option<HeadlessEventLedgerWriter>,
 }
 
@@ -1588,6 +1589,7 @@ impl HeadlessEventOutput {
         Self {
             sender: Some(sender),
             stream_envelopes: mode.streams_envelopes(),
+            stream_session_history: true,
             ledger: mode
                 .retains_result_ledger()
                 .then(|| HeadlessEventLedgerWriter::new(mode.spools_immediately())),
@@ -1613,7 +1615,7 @@ impl HeadlessEventOutput {
         if correlated && let Some(ledger) = self.ledger.as_mut() {
             ledger.record(&envelope);
         }
-        if self.stream_envelopes {
+        if self.stream_envelopes && (correlated || self.stream_session_history) {
             self.emit(HeadlessEvent::Envelope(Box::new(envelope)));
         }
     }
@@ -2118,6 +2120,49 @@ pub async fn run_headless_with_session_config_event_mode_and_interrupts(
     .await
 }
 
+/// Submits a new ordinary turn in an existing native session. The session's
+/// workspace, model, permissions and request ceiling remain authoritative.
+/// Run pins/budget continuation use their separate lifecycle entry points.
+/// Streaming modes emit only the new run's correlated envelopes; prior session
+/// history is replayed internally without re-emitting old terminal records.
+pub async fn submit_headless_with_event_mode_and_interrupts(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    request: HeadlessRunRequest,
+    session_id: SessionId,
+    output: mpsc::Sender<HeadlessEvent>,
+    event_mode: HeadlessEventMode,
+    interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
+) -> Result<HeadlessRunResult, HeadlessRunError> {
+    if session_id.as_str().trim().is_empty()
+        || request.provider.is_some()
+        || request.model.is_some()
+        || !request.permission_overrides.is_empty()
+        || request.journal_pin
+        || request.detached
+        || request.seed.is_some()
+        || request.replay_of.is_some()
+        || !request.budget.is_empty()
+    {
+        return Err(rpc_error(
+            "session submit",
+            "invalid_argument".into(),
+            "ordinary session submission requires a session id and inherits its configuration; run pins and budgets use the separate lifecycle commands".into(),
+            false,
+        ));
+    }
+    run_headless_with_start(
+        profile,
+        ensure,
+        request,
+        HeadlessStart::Existing(session_id),
+        output,
+        event_mode,
+        interrupts,
+    )
+    .await
+}
+
 /// Continues a terminal request-budget checkpoint in its original session.
 /// A fresh turn preserves completed tool history and receives a fresh request
 /// allowance. The daemon atomically validates the continuation handle.
@@ -2144,6 +2189,7 @@ pub async fn resume_headless_with_event_mode_and_interrupts(
 
 enum HeadlessStart {
     New(HeadlessSessionConfig),
+    Existing(SessionId),
     Resume(RunId),
 }
 
@@ -2159,7 +2205,10 @@ async fn run_headless_with_start(
     let daemon_lifetime = ensure.daemon_lifetime;
     let daemon_ownership = Arc::new(Mutex::new(None));
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
-    let reducer_output = HeadlessEventOutput::new(event_sender, event_mode);
+    let mut reducer_output = HeadlessEventOutput::new(event_sender, event_mode);
+    // Ordinary continuation replays history internally, but its external
+    // event stream must not re-emit previous runs' terminal records.
+    reducer_output.stream_session_history = !matches!(&start, HeadlessStart::Existing(_));
     let forwarder = tokio::spawn(forward_headless_events(event_receiver, output));
     let teardown_client = ensure.client.clone();
     let result = run_headless_inner(
@@ -2853,9 +2902,12 @@ async fn run_headless_inner(
     daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
     mut interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
-    let (session_config, resume_run_id) = match start {
-        HeadlessStart::New(config) => (config, None),
-        HeadlessStart::Resume(run_id) => (HeadlessSessionConfig::default(), Some(run_id)),
+    let (session_config, resume_run_id, existing_session_id) = match start {
+        HeadlessStart::New(config) => (config, None, None),
+        HeadlessStart::Existing(session_id) => {
+            (HeadlessSessionConfig::default(), None, Some(session_id))
+        }
+        HeadlessStart::Resume(run_id) => (HeadlessSessionConfig::default(), Some(run_id), None),
     };
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
         return Err(attachment_error(
@@ -2904,7 +2956,53 @@ async fn run_headless_inner(
         HeadlessConnection::open(profile, ensure.clone(), Arc::clone(&daemon_ownership)),
     )
     .await?;
-    let create_identity = if resume_run_id.is_none() {
+    // Resolve the target before uploading attachments: an unavailable session
+    // must not leave new artifact writes behind.
+    let existing_session = if let Some(session_id) = existing_session_id {
+        let response = before_acceptance_deadline(timeout_deadline, "session.read", async {
+            connection
+                .client
+                .request(RequestBody::SessionRead {
+                    session_id: session_id.clone(),
+                    range: SeqRange {
+                        start_seq: 1,
+                        end_seq: 1,
+                    },
+                })
+                .await
+                .map_err(|error| client_error_as_headless("session.read", error))
+        })
+        .await?;
+        let session = match response {
+            ResponseBody::SessionRead { result } if result.session_id == session_id => result,
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => {
+                let code = if code == haider_rpc::ERROR_CODE_NOT_FOUND {
+                    "session_not_found".into()
+                } else {
+                    code
+                };
+                return Err(rpc_error("session.read", code, message, retryable));
+            }
+            _ => {
+                return Err(protocol_error(
+                    "session.read",
+                    "response coordinates did not match the session",
+                ));
+            }
+        };
+        let metadata = session
+            .metadata
+            .ok_or_else(|| protocol_error("session.read", "session metadata is unavailable"))?;
+        Some((session_id, metadata, session.head_seq))
+    } else {
+        None
+    };
+    let create_identity = if resume_run_id.is_none() && existing_session.is_none() {
         Some(
             before_acceptance_deadline(
                 timeout_deadline,
@@ -2985,6 +3083,18 @@ async fn run_headless_inner(
                 model,
             )
         }
+    } else if let Some((session_id, metadata, head_seq)) = existing_session {
+        // Replay the existing journal through the common reducer. Its run-id
+        // filter isolates the new response while retaining session task facts.
+        // The attach barrier supplies the current worker generation before submit.
+        (
+            session_id,
+            0,
+            head_seq,
+            None,
+            metadata.provider,
+            metadata.model,
+        )
     } else {
         let Some((create_provider, create_model, resolve_provider, resolve_model)) =
             create_identity
@@ -4319,7 +4429,10 @@ async fn detach_existing(
     };
     match connection
         .client
-        .request(RequestBody::SessionDetach { attachment_id })
+        .request(RequestBody::SessionDetach {
+            attachment_id,
+            close_session: false,
+        })
         .await
     {
         Ok(ResponseBody::SessionDetach { .. }) | Ok(ResponseBody::Error { .. }) => Ok(()),
@@ -5091,6 +5204,9 @@ fn terminal_kind(
         HeadlessOutcome::Timeout => HeadlessTerminalKind::Timeout,
         HeadlessOutcome::Errored | HeadlessOutcome::InputRequired | HeadlessOutcome::Started => {
             match failure.map(|failure| &failure.code) {
+                Some(HeadlessFailureCode::Run(ErrorCode::IdleTimeout)) => {
+                    HeadlessTerminalKind::Timeout
+                }
                 Some(HeadlessFailureCode::Run(ErrorCode::BudgetExhausted)) => {
                     HeadlessTerminalKind::Budget
                 }

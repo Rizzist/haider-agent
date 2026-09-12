@@ -202,7 +202,7 @@ fn attach_state(session: &SessionId, replay_through_seq: u64) -> AttachState {
 /// The wire identity of a request body, for wire-order assertions.
 fn label(body: &RequestBody) -> String {
     match body {
-        RequestBody::SessionDetach { attachment_id } => {
+        RequestBody::SessionDetach { attachment_id, .. } => {
             format!("detach:{}", attachment_id.as_str())
         }
         RequestBody::SessionAttach { session_id, .. } => {
@@ -378,8 +378,11 @@ async fn detach_then_attach_reaches_the_wire_in_that_order() {
                             }
                         }
                         let response = match body {
-                            RequestBody::SessionDetach { attachment_id } => {
-                                ResponseBody::SessionDetach { attachment_id }
+                            RequestBody::SessionDetach { attachment_id, .. } => {
+                                ResponseBody::SessionDetach {
+                                    attachment_id,
+                                    closed_session_id: None,
+                                }
                             }
                             RequestBody::SessionAttach { session_id, .. } => {
                                 ResponseBody::SessionAttach {
@@ -651,6 +654,7 @@ fn request_body_round_trips_the_attachment_commands() {
         }),
         RequestBody::SessionDetach {
             attachment_id: attachment(4),
+            close_session: false
         }
     );
     assert_eq!(

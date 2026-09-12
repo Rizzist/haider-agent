@@ -344,6 +344,36 @@ impl PeerService {
         drop(publications);
     }
 
+    /// The hub has already evicted the actor under its close admission fence.
+    /// Join publication/subscription owners before acknowledging native close.
+    pub(crate) async fn close_session(&self, session_id: &SessionId) -> Result<(), PeerError> {
+        // A reconciliation may have captured the actor before eviction. Wait
+        // for it, then remove its publication so that snapshot cannot recreate
+        // a socket behind the close acknowledgement.
+        let _serial = self.reconcile_serial.lock().await;
+        let publication = self
+            .publications
+            .lock()
+            .map_err(|_| PeerError::Unavailable {
+                message: "peer publication registry is poisoned".into(),
+            })?
+            .remove(session_id.as_str());
+        if let Some(publication) = publication {
+            #[cfg(unix)]
+            {
+                publication.cancel.send_replace(true);
+                publication
+                    .task
+                    .await
+                    .map_err(|error| PeerError::Unavailable {
+                        message: format!("peer listener join failed during session close: {error}"),
+                    })?;
+            }
+            remove_manifest(&publication.paths.manifest).await;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn list(self: &Arc<Self>) -> Result<Vec<PeerDescriptor>, PeerError> {
         self.ensure_running()?;
         self.reconcile_once().await?;
@@ -549,6 +579,9 @@ impl PeerService {
     }
 
     async fn heartbeat_once(&self) -> Result<(), PeerError> {
+        // Serialize manifest writes with close; a captured heartbeat must not
+        // recreate a retired session's manifest after the close barrier.
+        let _serial = self.reconcile_serial.lock().await;
         #[cfg(test)]
         self.heartbeat_count.fetch_add(1, Ordering::Relaxed);
         let now = now_ms();
@@ -1092,6 +1125,16 @@ fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+async fn remove_manifest(path: &Path) {
+    let path = path.to_owned();
+    let _ = tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    })
+    .await;
 }
 
 async fn write_manifest(

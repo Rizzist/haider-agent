@@ -80,6 +80,85 @@ struct BodyFixture {
     chunks: VecDeque<Vec<u8>>,
 }
 
+struct PacedIdleFixture {
+    chunks: VecDeque<Vec<u8>>,
+}
+
+impl SseChunkSource for PacedIdleFixture {
+    async fn next_chunk(
+        &mut self,
+        _route_gating: crate::RouteGating,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        Ok(self.chunks.pop_front())
+    }
+}
+
+/// Raw SSE comments count as received progress even without a decoded frame.
+/// Removing the raw-chunk observation makes the operation expire at 4 s.
+#[tokio::test(start_paused = true)]
+async fn operation_idle_deadline_observes_raw_comments_before_decoding() {
+    let idle = crate::ProviderIdleDeadline::default();
+    idle.begin_attempt(Some(Duration::from_secs(4)));
+    let source = PacedIdleFixture {
+        chunks: VecDeque::from([
+            b": keepalive\n\n".to_vec(),
+            b": keepalive\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ]),
+    };
+    let (sender, mut receiver) = mpsc::channel(4);
+    let context = idle
+        .scope(async { crate::SseRequestContext::capture(crate::RouteGating::Disabled) })
+        .await;
+    let started = tokio::time::Instant::now();
+    let producer = tokio::spawn(stream_sse_source(
+        source,
+        None,
+        sender,
+        Duration::from_secs(4),
+        Duration::from_secs(60),
+        DecoderKind::Chat(CompatibleDialect::Generic),
+        context,
+    ));
+    tokio::select! {
+        error = idle.wait() => panic!("raw progress was ignored: {error:?}"),
+        result = producer => result.expect("decoder exits"),
+    }
+    assert_eq!(started.elapsed(), Duration::from_secs(9));
+    assert!(matches!(
+        receiver.recv().await,
+        Some(Ok(StreamEvent::Finish { .. }))
+    ));
+    // Consumer-side work after the received terminal is not provider silence.
+    tokio::time::advance(Duration::from_secs(8)).await;
+    assert!(idle.expired().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_chunks_do_not_extend_operation_idle_deadline() {
+    let idle = crate::ProviderIdleDeadline::default();
+    idle.begin_attempt(Some(Duration::from_secs(4)));
+    let (sender, _receiver) = mpsc::channel(4);
+    let context = idle
+        .scope(async { crate::SseRequestContext::capture(crate::RouteGating::Disabled) })
+        .await;
+    let producer = tokio::spawn(stream_sse_source(
+        PacedIdleFixture {
+            chunks: VecDeque::from([Vec::new(), Vec::new()]),
+        },
+        None,
+        sender,
+        Duration::from_secs(4),
+        Duration::from_secs(60),
+        DecoderKind::Chat(CompatibleDialect::Generic),
+        context,
+    ));
+    let error = idle.wait().await;
+    assert_eq!(error.idle_timeout.expect("evidence").elapsed_ms, 4_000);
+    producer.abort();
+}
+
 struct StubDnsResolver {
     answers: Mutex<VecDeque<Vec<SocketAddr>>>,
     calls: AtomicUsize,

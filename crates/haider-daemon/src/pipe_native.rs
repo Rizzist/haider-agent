@@ -535,8 +535,8 @@ impl PipeNativeWriter {
         }
     }
 
-    /// Drops a clean boot-only writer without marking the durable sidecar
-    /// dirty. The first live actor reopens it from its self-describing cursor;
+    /// Drops a clean boot-only or joined session writer without marking the
+    /// durable sidecar dirty. The next actor reopens its self-describing cursor;
     /// keeping every profile session's file open before Ready would defeat the
     /// bounded startup fold on mature profiles.
     pub(crate) fn release_clean(&self, session_id: &SessionId) {

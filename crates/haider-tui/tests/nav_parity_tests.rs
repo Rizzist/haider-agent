@@ -1,0 +1,302 @@
+//! Navigation parity contracts for transcript search and workspace mentions.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::ffi::OsString;
+use std::fs;
+use std::os::unix::ffi::OsStringExt;
+
+use base64::Engine as _;
+use haider_protocol::EventPayload;
+use haider_protocol::ids::ItemId;
+use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem};
+use haider_tui::app::{AppEvent, AppModel, Screen};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+mod common;
+
+fn session_model() -> AppModel {
+    let mut model = common::launcher_model();
+    model.mode = haider_tui::app::RuntimeMode::Live;
+    model.sessions.clear();
+    let id = haider_protocol::ids::SessionId::new("nav-session");
+    model.upsert_live_session(&id);
+    model.open_session(&id);
+    model.requests.clear();
+    model.screen = Screen::Session;
+    model
+}
+
+fn agent(model: &mut AppModel, id: &str, text: &str) {
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new(id),
+            item: TurnItem::AgentMessage {
+                text: text.to_owned().into(),
+            },
+        }));
+}
+
+#[test]
+fn workspace_mentions_index_files_and_tab_accepts_the_selected_path() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    fs::create_dir(root.path().join("src")).expect("source directory");
+    fs::write(root.path().join("src/main.rs"), "fn main() {}").expect("source file");
+    fs::write(root.path().join("README.md"), "# readme").expect("readme");
+
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.session_workspace_cwd = Some(root.path().to_string_lossy().into_owned());
+    model.handle(common::key(KeyCode::Char('@')));
+    for character in "src/".chars() {
+        model.handle(common::key(KeyCode::Char(character)));
+    }
+
+    let completion = model
+        .mention_completion
+        .as_ref()
+        .expect("@ opens file completion");
+    assert!(
+        completion
+            .candidates
+            .iter()
+            .any(|path| path == "src/main.rs")
+    );
+    assert!(!completion.candidates.iter().any(|path| path == "README.md"));
+
+    model.handle(common::key(KeyCode::Tab));
+    assert_eq!(model.composer.text(), "@src/main.rs");
+    assert!(model.mention_completion.is_none());
+}
+
+#[test]
+fn ctrl_f_opens_a_transcript_search_without_mutating_the_composer() {
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.composer.insert_str("draft");
+    model.handle(common::ctrl(KeyCode::Char('f')));
+    assert!(model.transcript_search.is_some());
+    assert_eq!(model.composer.text(), "draft");
+
+    model.handle(common::key(KeyCode::Char('x')));
+    assert_eq!(model.transcript_search.as_ref().unwrap().query, "x");
+    model.handle(common::key(KeyCode::Esc));
+    assert!(model.transcript_search.is_none());
+
+    // The control chord is explicit; a bare `f` remains normal composer input.
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('f'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(model.composer.text(), "draftf");
+}
+
+#[test]
+fn transcript_search_preserves_arrival_order_and_wraps_selection() {
+    let mut model = session_model();
+    agent(&mut model, "first", "needle one");
+    agent(&mut model, "second", "needle two");
+    agent(&mut model, "last", "unrelated");
+
+    model.handle(common::ctrl(KeyCode::Char('f')));
+    for character in "needle".chars() {
+        model.handle(common::key(KeyCode::Char(character)));
+    }
+    let search = model.transcript_search.as_ref().expect("search open");
+    assert_eq!(
+        search.matches,
+        vec![0, 1],
+        "matches stay in transcript order"
+    );
+    assert_eq!(search.selected, 0);
+
+    model.handle(common::key(KeyCode::Enter));
+    assert_eq!(model.transcript_search.as_ref().unwrap().selected, 1);
+    model.handle(common::key(KeyCode::Enter));
+    assert_eq!(model.transcript_search.as_ref().unwrap().selected, 0);
+    model.handle(common::key(KeyCode::Up));
+    assert_eq!(model.transcript_search.as_ref().unwrap().selected, 1);
+}
+
+#[test]
+fn wide_unicode_search_rows_render_and_match() {
+    let mut model = session_model();
+    agent(&mut model, "wide", "界界 — needle — 日本語");
+    model.handle(common::ctrl(KeyCode::Char('f')));
+    for character in "界界".chars() {
+        model.handle(common::key(KeyCode::Char(character)));
+    }
+    assert_eq!(model.transcript_search.as_ref().unwrap().matches, vec![0]);
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            haider_tui::render::render(&model, frame);
+        })
+        .expect("render");
+    assert_eq!(model.transcript_search.as_ref().unwrap().query, "界界");
+}
+
+#[test]
+fn search_does_not_steal_bounded_capture_paging() {
+    let mut model = session_model();
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("capture"),
+            item: TurnItem::CommandExecution {
+                call_id: "call-capture".to_owned(),
+                command: "capture".to_owned(),
+                status: ToolStatus::InProgress,
+                exit_code: None,
+            },
+        }));
+    let output = (0..40)
+        .map(|n| format!("capture line {n}\n"))
+        .collect::<String>();
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Delta {
+            item_id: ItemId::new("capture"),
+            delta: ItemDelta::CommandOutput {
+                stream: OutputStream::Stdout,
+                chunk_b64: base64::engine::general_purpose::STANDARD.encode(output.as_bytes()),
+            },
+        }));
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("capture"),
+            item: TurnItem::CommandExecution {
+                call_id: "call-capture".to_owned(),
+                command: "capture".to_owned(),
+                status: ToolStatus::Completed,
+                exit_code: Some(0),
+            },
+        }));
+    model.move_tool_focus(true);
+    model.cycle_focused_tool_row();
+    model.handle(common::ctrl(KeyCode::Char('f')));
+    let before = model.toolfold.scroll_of("capture");
+    model.handle(common::key(KeyCode::PageDown));
+    assert_eq!(
+        model.toolfold.scroll_of("capture"),
+        before,
+        "search owns PageDown"
+    );
+    model.handle(common::key(KeyCode::Esc));
+    model.handle(common::key(KeyCode::PageDown));
+    let after = model.toolfold.scroll_of("capture");
+    assert_eq!(after, before + 9, "one bounded paging path remains");
+}
+
+#[test]
+fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    for index in 0..300 {
+        fs::write(root.path().join(format!("file-{index:03}.txt")), "x").expect("file");
+    }
+    let non_utf8 = OsString::from_vec(b"bad-\xff.txt".to_vec());
+    let non_utf8_created = fs::write(root.path().join(&non_utf8), "x").is_ok();
+    if !non_utf8_created {
+        assert!(non_utf8.to_string_lossy().contains('�'));
+    }
+
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.session_workspace_cwd = Some(root.path().to_string_lossy().into_owned());
+    model.handle(common::key(KeyCode::Char('@')));
+    let completion = model
+        .mention_completion
+        .as_ref()
+        .expect("empty query opens completion");
+    assert!(
+        completion.candidates.len() <= 64,
+        "completion remains bounded"
+    );
+
+    model.handle(common::key(KeyCode::Esc));
+    model.composer.set_text("");
+    model.handle(common::key(KeyCode::Char('@')));
+    for character in "bad-".chars() {
+        model.handle(common::key(KeyCode::Char(character)));
+    }
+    let completion = model
+        .mention_completion
+        .as_ref()
+        .expect("non-UTF8 query completion");
+    if non_utf8_created {
+        assert!(
+            completion
+                .candidates
+                .iter()
+                .any(|candidate| candidate.contains("bad-"))
+        );
+    } else {
+        assert!(non_utf8.to_string_lossy().contains('�'));
+    }
+}
+
+#[test]
+fn resume_session_list_conventions_are_explicit_and_filterable() {
+    let mut model = common::launcher_model();
+    model.mode = haider_tui::app::RuntimeMode::Live;
+    model.sessions.clear();
+    let first = haider_protocol::ids::SessionId::new("session-alpha");
+    let second = haider_protocol::ids::SessionId::new("session-beta");
+    model.upsert_live_session(&first);
+    model.upsert_live_session(&second);
+    model
+        .sessions
+        .iter_mut()
+        .find(|row| row.id == first)
+        .unwrap()
+        .title = Some("Deploy API".to_owned());
+    model
+        .sessions
+        .iter_mut()
+        .find(|row| row.id == first)
+        .unwrap()
+        .dir = "/work/api".to_owned();
+    model
+        .sessions
+        .iter_mut()
+        .find(|row| row.id == first)
+        .unwrap()
+        .model_short = "gpt-5.6".to_owned();
+    let second_row = model
+        .sessions
+        .iter_mut()
+        .find(|row| row.id == second)
+        .unwrap();
+    second_row.title = Some("Review UI".to_owned());
+    second_row.dir = "/work/beta".to_owned();
+    second_row.model_short = "qwen".to_owned();
+    model.enter_sessions();
+    assert_eq!(
+        model.screen,
+        Screen::Sessions,
+        "/resume opens the full list"
+    );
+    assert_eq!(model.session_browser_rows().len(), 2);
+    model.handle(common::key(KeyCode::Char('d')));
+    assert_eq!(
+        model.session_browser_rows().len(),
+        1,
+        "title/dir/model/id search is live"
+    );
+    assert_eq!(model.session_browser_rows()[0].id, first);
+    model.handle(common::key(KeyCode::Enter));
+    assert_eq!(
+        model.active_session_id(),
+        Some(&first),
+        "Enter opens the selected row"
+    );
+    assert!(
+        haider_tui::commands::HELP_TEXT
+            .iter()
+            .any(|line| line.contains("/sessions"))
+    );
+}

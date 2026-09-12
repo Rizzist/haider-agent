@@ -43,7 +43,7 @@ MIGRATED to daemon RPC, preserving its pinned JSONL and exit-code laws
      response, usage, permission_denials[], error) — additive-only in v1.
    - jsonl: the frozen RawEnvelope-per-LF contract, monotonic reduced
      seqs, correlated terminal line (existing fixtures are laws).
-5. **Exit codes** (research table): 0 done · 2 usage · 65 provider ·
+5. **Exit codes** (research table): 0 done · 1 [typed task failure](972-task-outcome-contract.md) · 2 usage · 65 provider ·
    69 daemon-unavailable · 70 internal · 74 output I/O (BrokenPipe
    deliberate) · 76 protocol/feature/version · 77 blocked
    input-required · 124 timeout · 130 user cancel. Table-driven test.

@@ -162,6 +162,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
                 request_id: RequestId::new("detach"),
                 body: RequestBody::SessionDetach {
                     attachment_id: attachment_id.clone(),
+                    close_session: false,
                 },
             },
             config.frame_limit,
@@ -170,7 +171,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
     assert!(matches!(
         client.next_reply().await,
         WireFrame::Response {
-            body: ResponseBody::SessionDetach { attachment_id: found },
+            body: ResponseBody::SessionDetach { attachment_id: found, .. },
             ..
         } if found == attachment_id
     ));

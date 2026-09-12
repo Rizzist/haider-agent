@@ -21,7 +21,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::error::HaiderError;
+use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{AgentId, BranchId, EventId, RunId, SessionId, TaskId};
 use haider_protocol::state::RunState;
 use haider_protocol::task::{
@@ -45,7 +45,7 @@ const TASK_COMMAND_SUMMARY_BYTES: usize = 512;
 /// Bounded failure-reason detail carried by a failed completion.
 const TASK_FAILURE_REASON_CHARS: usize = 400;
 /// One `task_output` cursor read returns at most this many bytes.
-pub(crate) const TASK_OUTPUT_READ_BYTES: usize = haider_tools::ORCHESTRATION_PREVIEW_MAX_BYTES;
+pub(crate) const TASK_OUTPUT_READ_BYTES: usize = 8 * 1024;
 /// Kill settles when the supervised ladder reports terminal within this
 /// margin past TERM + grace + KILL.
 const KILL_SETTLE_MARGIN: Duration = Duration::from_secs(3);
@@ -93,9 +93,50 @@ struct SessionTasks {
 #[derive(Default)]
 pub(crate) struct TaskRegistry {
     sessions: StdMutex<HashMap<SessionId, SessionTasks>>,
+    pipelines: StdMutex<HashMap<SessionId, Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl TaskRegistry {
+    pub(crate) fn track_pipeline(&self, session: &SessionId, task: tokio::task::JoinHandle<()>) {
+        let mut pipelines = self
+            .pipelines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let tasks = pipelines.entry(session.clone()).or_default();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    pub(crate) async fn join_session(&self, session: &SessionId) -> Result<(), HaiderError> {
+        let mut failure = None;
+        loop {
+            let tasks = self
+                .pipelines
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(session)
+                .unwrap_or_default();
+            if tasks.is_empty() {
+                break;
+            }
+            // Cancellation and recovery can register final cleanup while
+            // their producer is being joined. Drain those cohorts too.
+            for task in tasks {
+                if let Err(error) = task.await {
+                    failure = Some(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                format!("background task pipeline failed during session close: {error}"),
+                true,
+            ));
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, SessionTasks>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -246,8 +287,6 @@ impl TaskRegistry {
             .values()
             .filter(|entry| entry.state == TaskLiveState::Running)
             .filter_map(|entry| {
-                // Re-adopted tasks and output already moved to terminal CAS have
-                // no live supervision buffer. Never invent a zero-byte reading.
                 let output = entry.output.as_ref()?;
                 if let Some((next, snapshot)) = progress.get(&entry.task)
                     && tick < *next
@@ -260,8 +299,6 @@ impl TaskRegistry {
                     name: bounded_task_command(&haider_tools::redact_lockdown_text(&entry.name)),
                     elapsed_ms: now.saturating_sub(entry.started_at_ms),
                     last_line: output.progress_line().map(ToOwned::to_owned),
-                    // Live activity counts raw bytes seen; the redactor may
-                    // still hold an unfinished line back from commitment.
                     bytes: output.captured_bytes(),
                 };
                 progress.insert(
@@ -274,6 +311,18 @@ impl TaskRegistry {
         tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
         tasks.truncate(TASK_CONCURRENCY_CAP);
         tasks
+    }
+
+    pub(crate) fn release_terminal_session(&self, session_id: &SessionId) {
+        let mut sessions = self.lock();
+        if sessions.get(session_id).is_some_and(|session| {
+            session
+                .tasks
+                .values()
+                .all(|entry| entry.state != TaskLiveState::Running)
+        }) {
+            sessions.remove(session_id);
+        }
     }
 
     fn running_entries(&self, session_id: &SessionId) -> Vec<TaskEntry> {
@@ -371,6 +420,47 @@ impl TaskFacade {
             .await
     }
 
+    /// Supervisor startup must admit recovery before spawning it. Otherwise
+    /// a task first polled after close could reopen the evicted actor. The
+    /// supervisor is retired before close drains this shared join registry.
+    pub(crate) fn start_session_adoption(&self, session_id: &SessionId) -> Result<(), HaiderError> {
+        self.start_session_adoption_with_probe(session_id, probe_group_liveness)
+    }
+
+    /// Polled by the supervisor itself. A refused close releases the lease
+    /// and resumes startup; retiring the supervisor drops this pending future
+    /// before any recovery task can be spawned behind a successful close.
+    pub(crate) async fn start_session_adoption_when_available(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), HaiderError> {
+        let _activity = self.hub.session_activity(session_id).await?;
+        self.start_session_adoption(session_id)
+    }
+
+    pub(crate) fn start_session_adoption_with_probe<P>(
+        &self,
+        session_id: &SessionId,
+        probe: P,
+    ) -> Result<(), HaiderError>
+    where
+        P: Fn(i32) -> PidLiveness + Send + Sync + 'static,
+    {
+        let activity = self.hub.try_session_activity(session_id)?;
+        let facade = self.clone();
+        let session = session_id.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = facade
+                .adopt_session_with_activity(&session, probe, activity)
+                .await
+            {
+                tracing::warn!(session_id = %session, ?error, "background-task adoption failed at supervisor start");
+            }
+        });
+        self.hub.task_registry().track_pipeline(session_id, task);
+        Ok(())
+    }
+
     /// LT6 seam: adoption with an injectable pid-liveness probe. A started
     /// fact without a completed fact is an orphan candidate; a live stale
     /// pgid is killed (TERM → grace → KILL) and the completion journaled
@@ -379,6 +469,35 @@ impl TaskFacade {
         &self,
         session_id: &SessionId,
         probe: P,
+    ) -> Result<(), HaiderError>
+    where
+        P: Fn(i32) -> PidLiveness + Send + Sync + 'static,
+    {
+        let activity = self.hub.try_session_activity(session_id)?;
+        let facade = self.clone();
+        let session = session_id.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = facade
+                .adopt_session_with_activity(&session, probe, activity)
+                .await;
+            let _ = send.send(result);
+        });
+        self.hub.task_registry().track_pipeline(session_id, task);
+        receive.await.map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("task recovery stopped: {error}"),
+                true,
+            )
+        })?
+    }
+
+    async fn adopt_session_with_activity<P>(
+        &self,
+        session_id: &SessionId,
+        probe: P,
+        activity: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<(), HaiderError>
     where
         P: Fn(i32) -> PidLiveness + Send + Sync,
@@ -423,13 +542,35 @@ impl TaskFacade {
             }
             // Orphan: a prior daemon life started it and never completed it.
             let reap = reap_orphan_group(started.fact.pid, self.kill_grace, &probe).await;
+            {
+                // Every reaper outcome needs an independent absence witness:
+                // even AlreadyDead can originate from a TERM permission or
+                // missing-process result. Retain the admitted lease until a
+                // read-only probe observes absence. Never signal the numeric
+                // orphan PGID after the original sweep relinquishes it.
+                let pid = started.fact.pid;
+                let retained_activity = Arc::clone(&activity);
+                registry.track_pipeline(
+                    session_id,
+                    tokio::spawn(async move {
+                        let _activity = retained_activity;
+                        while !matches!(
+                            haider_tools::probe_group_liveness_evidence(pid),
+                            haider_tools::EvidencePidLiveness::Dead
+                        ) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }),
+                );
+            }
             let reason = match reap {
                 haider_tools::OrphanReap::AlreadyDead => {
-                    "orphaned by daemon restart (process group already gone; output lost)"
+                    "orphaned by daemon restart (reaper reported already dead; output lost)"
                         .to_owned()
                 }
                 haider_tools::OrphanReap::Killed => {
-                    "orphaned by daemon restart; stale process group reaped".to_owned()
+                    "orphaned by daemon restart; stale process group termination requested"
+                        .to_owned()
                 }
                 haider_tools::OrphanReap::Failed { message } => bounded_chars(
                     &format!("orphaned by daemon restart; reap failed: {message}"),
@@ -540,12 +681,14 @@ impl TaskFacade {
             Err(error) => {
                 let (kill, kill_signal) = task_kill_channel();
                 kill.kill();
-                tokio::spawn(supervise_background(
-                    spawn,
-                    kill_signal,
-                    shared_task_output(0, 0),
-                    self.kill_grace,
-                ));
+                let grace = self.kill_grace;
+                registry.track_pipeline(
+                    &context.session_id,
+                    tokio::spawn(async move {
+                        supervise_background(spawn, kill_signal, shared_task_output(0, 0), grace)
+                            .await;
+                    }),
+                );
                 return Err(ToolError::Runtime {
                     message: format!("cannot register background shell: {error}"),
                 });
@@ -554,12 +697,13 @@ impl TaskFacade {
         if let Err(error) = shell.running() {
             let (kill, kill_signal) = task_kill_channel();
             kill.kill();
-            tokio::spawn(supervise_background(
-                spawn,
-                kill_signal,
-                shared_task_output(0, 0),
-                self.kill_grace,
-            ));
+            let grace = self.kill_grace;
+            registry.track_pipeline(
+                &context.session_id,
+                tokio::spawn(async move {
+                    supervise_background(spawn, kill_signal, shared_task_output(0, 0), grace).await;
+                }),
+            );
             return Err(ToolError::Runtime {
                 message: format!("cannot start registered background shell: {error}"),
             });
@@ -597,12 +741,13 @@ impl TaskFacade {
             // supervised ladder so the group is reaped, then fail honestly.
             let (kill, kill_signal) = task_kill_channel();
             kill.kill();
-            tokio::spawn(supervise_background(
-                spawn,
-                kill_signal,
-                shared_task_output(0, 0),
-                self.kill_grace,
-            ));
+            let grace = self.kill_grace;
+            registry.track_pipeline(
+                &context.session_id,
+                tokio::spawn(async move {
+                    supervise_background(spawn, kill_signal, shared_task_output(0, 0), grace).await;
+                }),
+            );
             let _ = shell.exited(None);
             return Err(runtime_tool_error(error));
         }
@@ -629,7 +774,7 @@ impl TaskFacade {
         let pipeline_task = task.clone();
         let output_for_shell = Arc::clone(&output);
         let supervision = supervise_background(spawn, kill_signal, output, self.kill_grace);
-        tokio::spawn(async move {
+        let pipeline = tokio::spawn(async move {
             tokio::pin!(supervision);
             let mut close = shell.close_receiver();
             let mut close_open = true;
@@ -652,6 +797,7 @@ impl TaskFacade {
                 .complete_task(&session_id, &pipeline_task, status)
                 .await;
         });
+        registry.track_pipeline(&context.session_id, pipeline);
         Ok(BoundedResult {
             preview: json!({
                 "task_id": task,
@@ -1272,7 +1418,7 @@ impl TaskFacade {
 
 /// Test-only fact builder: the exact production envelope shape without a
 /// spawned child, for staging prior-life journal states.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn test_task_fact_envelope(
     hub: &SessionHub,
     session_id: &SessionId,

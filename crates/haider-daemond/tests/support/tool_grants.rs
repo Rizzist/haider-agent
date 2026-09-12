@@ -234,6 +234,7 @@ async fn economy_without_promotions_keeps_request_count_and_coding_schemas() {
         [
             "list_tools",
             "todo_write",
+            "task_outcome",
             "fs_read",
             "fs_glob",
             "fs_search",

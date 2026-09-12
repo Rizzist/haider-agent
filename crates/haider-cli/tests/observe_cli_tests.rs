@@ -109,6 +109,8 @@ fn digest(
         title: "Inspect durable automation truth".into(),
         run_state,
         run_id: None,
+        task_outcome: None,
+        task_outcome_version: None,
         active_branch_id: Some(BranchId::new("branch-review")),
         branches: vec![BranchDescriptor {
             branch_id: BranchId::new("branch-review"),
@@ -959,4 +961,37 @@ fn session_depth_preserves_pending_follow_ups_in_json_and_text() {
         empty.json().get("pending_follow_ups").is_none(),
         "older empty snapshots keep their wire shape"
     );
+}
+
+#[test]
+fn selected_task_outcome_is_forwarded_to_cli_json_and_not_reassigned_by_roster() {
+    use haider_protocol::ids::RunId;
+    use haider_protocol::task_outcome::TaskOutcomeV1;
+    let legacy = digest("outcome", ObserveRunStateWire::Errored, None);
+    let legacy_json = summary_view(legacy.clone()).json();
+    assert!(legacy_json.get("task_outcome").is_none());
+    assert!(legacy_json.get("task_outcome_version").is_none());
+    let mut current = legacy;
+    current.run_id = Some(RunId::new("failed-run"));
+    current.task_outcome = Some(TaskOutcomeV1::Failure {
+        reason: "Required input is unavailable".into(),
+    });
+    current.task_outcome_version = Some(1);
+    let mut view = summary_view(current);
+    let json = view.json();
+    assert_eq!(json["run_id"], "failed-run");
+    assert_eq!(json["active_branch"], "branch-review");
+    assert_eq!(json["task_outcome_version"], 1);
+    assert_eq!(
+        json["task_outcome"],
+        serde_json::json!({"status":"failure", "reason":"Required input is unavailable"})
+    );
+    let mut roster: SessionSummary = serde_json::from_value(serde_json::json!({"session_id":"outcome", "head_seq":12, "worker_generation":7, "run_id":"failed-run"})).expect("roster");
+    merge_roster_summary(&mut view, &roster);
+    assert_eq!(view.json()["task_outcome"], json["task_outcome"]);
+    roster.run_id = Some(RunId::new("new-run"));
+    merge_roster_summary(&mut view, &roster);
+    assert_eq!(view.json()["run_id"], "new-run");
+    assert!(view.json().get("task_outcome").is_none());
+    assert!(view.json().get("task_outcome_version").is_none());
 }

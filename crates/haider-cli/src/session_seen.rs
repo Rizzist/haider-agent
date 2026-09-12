@@ -146,7 +146,10 @@ async fn execute(
         .await
         .map_err(SeenError::Client);
     let _ = client
-        .request(RequestBody::SessionDetach { attachment_id })
+        .request(RequestBody::SessionDetach {
+            attachment_id,
+            close_session: false,
+        })
         .await;
     match result? {
         ResponseBody::SessionSeen {

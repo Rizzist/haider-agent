@@ -4,6 +4,57 @@ use super::*;
 use crate::session_hub::SessionHubConfig;
 use haider_core::SqliteStoreHandle;
 
+#[tokio::test]
+async fn session_join_drains_cleanup_registered_by_a_joined_producer() {
+    let registry = Arc::new(TaskRegistry::default());
+    let session = SessionId::new("cleanup-cohorts");
+    let (release_producer, producer_gate) = tokio::sync::oneshot::channel();
+    let (release_cleanup, cleanup_gate) = tokio::sync::oneshot::channel();
+    let (cleanup_registered, registered) = tokio::sync::oneshot::channel();
+    let producer_registry = Arc::clone(&registry);
+    let producer_session = session.clone();
+    registry.track_pipeline(
+        &session,
+        tokio::spawn(async move {
+            producer_gate.await.expect("release producer");
+            producer_registry.track_pipeline(
+                &producer_session,
+                tokio::spawn(async move {
+                    cleanup_gate.await.expect("release actual cleanup");
+                }),
+            );
+            cleanup_registered.send(()).expect("cleanup registered");
+        }),
+    );
+    let join = registry.join_session(&session);
+    tokio::pin!(join);
+    assert!(futures_util::poll!(&mut join).is_pending());
+    assert!(
+        !registry
+            .pipelines
+            .lock()
+            .expect("pipelines")
+            .contains_key(&session)
+    );
+    release_producer
+        .send(())
+        .expect("produce cleanup during join");
+    registered.await.expect("registered next cohort");
+    assert!(
+        futures_util::poll!(&mut join).is_pending(),
+        "the next cohort must also be joined"
+    );
+    release_cleanup.send(()).expect("finish cleanup");
+    join.await.expect("all cohorts joined");
+    assert!(
+        !registry
+            .pipelines
+            .lock()
+            .expect("pipelines")
+            .contains_key(&session)
+    );
+}
+
 #[test]
 fn started_command_summary_keeps_identity_tail_and_machine_marker() {
     let command = format!(

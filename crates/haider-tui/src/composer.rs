@@ -391,6 +391,13 @@ impl Composer {
         self.cursor
     }
 
+    /// Place the caret at a grapheme boundary. Completion and click mapping
+    /// use this seam to keep the logical cursor beside the inserted token.
+    pub fn set_cursor(&mut self, byte: usize) {
+        self.cursor = nearest_boundary(&self.text, byte.min(self.text.len()));
+        self.anchor = None;
+    }
+
     /// The text-mutation revision this composer is at (TUI5.1 fix 2).
     #[must_use]
     pub fn revision(&self) -> u64 {
