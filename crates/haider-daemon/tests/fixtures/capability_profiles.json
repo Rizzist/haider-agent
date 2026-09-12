@@ -16,10 +16,14 @@
     },
     {
       "name": "fs_read",
-      "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+      "description": "read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "column": {
+            "minimum": 1,
+            "type": "integer"
+          },
           "limit": {
             "minimum": 1,
             "type": "integer"
@@ -389,10 +393,14 @@
     },
     {
       "name": "fs_read",
-      "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+      "description": "read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "column": {
+            "minimum": 1,
+            "type": "integer"
+          },
           "limit": {
             "minimum": 1,
             "type": "integer"
@@ -729,10 +737,14 @@
     },
     {
       "name": "fs_read",
-      "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+      "description": "read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "column": {
+            "minimum": 1,
+            "type": "integer"
+          },
           "limit": {
             "minimum": 1,
             "type": "integer"
