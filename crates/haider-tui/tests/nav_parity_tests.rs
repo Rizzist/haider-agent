@@ -96,8 +96,8 @@ fn ctrl_f_opens_a_transcript_search_without_mutating_the_composer() {
 fn transcript_search_preserves_arrival_order_and_wraps_selection() {
     let mut model = session_model();
     agent(&mut model, "first", "needle one");
-    agent(&mut model, "middle", "unrelated");
-    agent(&mut model, "last", "needle two");
+    agent(&mut model, "second", "needle two");
+    agent(&mut model, "last", "unrelated");
 
     model.handle(common::ctrl(KeyCode::Char('f')));
     for character in "needle".chars() {
@@ -106,7 +106,7 @@ fn transcript_search_preserves_arrival_order_and_wraps_selection() {
     let search = model.transcript_search.as_ref().expect("search open");
     assert_eq!(
         search.matches,
-        vec![0, 2],
+        vec![0, 1],
         "matches stay in transcript order"
     );
     assert_eq!(search.selected, 0);
