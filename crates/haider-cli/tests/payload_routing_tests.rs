@@ -199,13 +199,13 @@ fn every_headless_verb_never_executes_the_observable_payload() {
             .output()
             .expect("headless output");
         if args[0] == "peer" {
-            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            // peer-delivery (a002eb8b) made `peer list` a real daemon
+            // command. With discovery disabled and no daemon in this
+            // boundary test it now reaches the typed daemon-unavailable
+            // result (69); the old invalid-command assertion is obsolete.
+            assert_eq!(output.status.code(), Some(69), "{args:?}");
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("unknown or incomplete command `peer`"),
-                "{stderr}"
-            );
-            assert!(!stderr.contains("peer list"), "{stderr}");
+            assert!(!stderr.contains("unknown or incomplete command `peer`"), "{stderr}");
         }
         assert_ne!(output.status.code(), Some(37), "{args:?}");
         assert!(
