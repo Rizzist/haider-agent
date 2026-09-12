@@ -427,7 +427,7 @@ async fn content_types_gate_to_text_and_json_only() {
         .await
         .expect("json passes");
     assert_eq!(json.content_type, "application/json");
-    assert_eq!(json.text, "{\"ok\":true}");
+    assert_eq!(json.text, "ok: true");
 
     let markdown = fetch_public_url(&format!("{base}/markdown"), None)
         .await

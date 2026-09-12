@@ -968,7 +968,40 @@ fn utf8_suffix_len(text: &str, max_bytes: usize) -> usize {
 /// dependency-free extractor.
 #[must_use]
 pub fn reduce_html_to_text(html: &str) -> String {
-    haider_webextract::extract(html, "").markdown
+    reduce_html_to_text_with_base(html, "")
+}
+
+fn reduce_html_to_text_with_base(html: &str, base_url: &str) -> String {
+    let markdown = haider_webextract::extract(html, base_url).markdown;
+    markdown_links_to_parenthetical(&markdown)
+}
+
+/// Keep the provider's established plain-text link shape while the shared
+/// extractor remains a Markdown producer for its standalone API.
+fn markdown_links_to_parenthetical(markdown: &str) -> String {
+    let mut output = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(open) = rest.find('[') {
+        output.push_str(&rest[..open]);
+        let Some(label_end) = rest[open + 1..].find("](") else {
+            output.push_str(&rest[open..]);
+            return output;
+        };
+        let label_end = open + 1 + label_end;
+        let url_start = label_end + 2;
+        let Some(url_end) = rest[url_start..].find(')') else {
+            output.push_str(&rest[open..]);
+            return output;
+        };
+        let url_end = url_start + url_end;
+        output.push_str(&rest[open + 1..label_end]);
+        output.push_str(" (");
+        output.push_str(&rest[url_start..url_end]);
+        output.push(')');
+        rest = &rest[url_end + 1..];
+    }
+    output.push_str(rest);
+    output
 }
 
 /// Reduces structured responses before they enter the durable tool result.
@@ -979,7 +1012,7 @@ fn reduce_response_body(content_type: &str, bytes: &[u8], url: &str) -> String {
     let body = String::from_utf8_lossy(bytes);
     match content_type {
         "text/html" | "application/xml" | "text/xml" | "application/xhtml+xml" => {
-            haider_webextract::extract(&body, url).markdown
+            reduce_html_to_text_with_base(&body, url)
         }
         "application/json" | "application/ld+json" => reduce_json_to_text(&body),
         _ => body.into_owned(),
@@ -1027,11 +1060,13 @@ fn render_json_value(
             }
             for item in items {
                 let before = lines.len();
-                render_json_value(item, None, depth + usize::from(key.is_some()) + 1, lines);
+                let item_depth = if key.is_some() { depth + 1 } else { depth };
+                render_json_value(item, None, item_depth, lines);
                 if lines.len() == before {
                     lines.push(format!("{prefix}- {item}"));
                 } else if let Some(line) = lines.get_mut(before) {
-                    line.insert_str(0, &format!("{prefix}- "));
+                    let indent = line.len() - line.trim_start().len();
+                    line.insert_str(indent, "- ");
                 }
             }
         }
