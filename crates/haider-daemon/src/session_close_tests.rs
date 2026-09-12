@@ -823,47 +823,73 @@ async fn native_close_after_monitor_remove_joins_the_real_timer_runner() {
     store.close().await.expect("store close");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_close_refuses_monitor_registration_between_commit_and_publication() {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+    struct PublicationBarrier {
+        armed: std::sync::atomic::AtomicBool,
+        persisted: std::sync::atomic::AtomicBool,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl SessionHubObserver for PublicationBarrier {
+        fn observe(&self, observation: HubObservation) {
+            if !matches!(observation, HubObservation::Persisted { .. })
+                || !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            self.persisted
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.release
+                .lock()
+                .expect("publication release")
+                .take()
+                .expect("publication release receiver")
+                .recv()
+                .expect("release publication barrier");
+        }
+    }
+
     let root = tempfile::tempdir().expect("root");
-    let (store, hub) = open_retention_test_hub(root.path()).await.expect("hub");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let (release, resume) = std::sync::mpsc::channel();
+    let observer = Arc::new(PublicationBarrier {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        persisted: std::sync::atomic::AtomicBool::new(false),
+        release: std::sync::Mutex::new(Some(resume)),
+    });
+    let hub =
+        SessionHub::with_observer(store.clone(), SessionHubConfig::default(), observer.clone())
+            .expect("hub");
     let session = SessionId::new("close-registering-monitor");
     hub.create_internal_session(create_command(&session, session.as_str()))
         .await
         .expect("create");
     let attachment = attach(&hub, &session, AttachMode::Control).await;
+    observer
+        .armed
+        .store(true, std::sync::atomic::Ordering::Release);
     let monitors = hub.inner_monitor();
     let mut register =
         Box::pin(monitors.client_register(&hub, close_timer_request(&hub, &session)));
-    loop {
-        // The registration is manually driven on this current-thread runtime.
-        // Its append runs in the actor while the client continuation stays
-        // unpolled; inspect committed facts before polling that continuation.
-        assert!(
-            matches!(
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !observer
+            .persisted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(matches!(
                 register
                     .as_mut()
                     .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Pending
-            ),
-            "registration must reach its post-append suspension"
-        );
-        let history = store
-            .read(&session, 0, 256)
-            .await
-            .expect("committed history");
-        if history.iter().any(|envelope| {
-            envelope
-                .event_id
-                .as_str()
-                .starts_with("monitor-client-registered-")
-        }) {
-            break;
+            ));
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("registration reached durable commit barrier");
     assert!(
         !monitors.has_session_resources(&session),
         "runner and projection are not published yet"
@@ -875,6 +901,7 @@ async fn native_close_refuses_monitor_registration_between_commit_and_publicatio
             .code,
         ErrorCode::Busy
     );
+    release.send(()).expect("release publication");
     let registered = register.await;
     let haider_rpc::MonitorRegisterOutcomeWire::Registered { monitor } = registered.outcome else {
         panic!("registration refused: {registered:?}");
