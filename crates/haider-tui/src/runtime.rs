@@ -3257,13 +3257,14 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
     for payload in demo_script() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
-    let mut output = crate::plain::render_plain_with_cache(
+    let mut output = crate::plain::render_plain_with_status(
         &model.projection,
         model.identity.context_window,
         // W-G: the plain surface mirrors the always-visible pill (the last
         // measured rate persists at rest), not the old streaming-only row.
         model.throughput_pill().as_ref(),
         &model.cache_usage,
+        &model.status_line(),
     );
     output.push_str(&crate::plain::agent_metrics_plain(&model));
     output

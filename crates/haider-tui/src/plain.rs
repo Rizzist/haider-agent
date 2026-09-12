@@ -23,6 +23,23 @@ pub const fn status_glyph(status: ToolStatus) -> &'static str {
     }
 }
 
+/// Spoken status vocabulary for terminals that cannot convey the glyph's
+/// meaning through colour or shape. Keep this beside `status_glyph` so the
+/// rich and plain renderers cannot disagree about the protocol state.
+#[must_use]
+pub const fn status_word(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Pending => "pending",
+        ToolStatus::InProgress => "running",
+        ToolStatus::Completed => "completed",
+        ToolStatus::Rejected => "rejected",
+        ToolStatus::Conflict => "conflict",
+        ToolStatus::Failed => "failed",
+        ToolStatus::Cancelled => "cancelled",
+        ToolStatus::Unknown => "unknown",
+    }
+}
+
 /// Render the whole session view as plain lines: transcript, pinned todos,
 /// open menu, throughput row, status line. `window` sizes the context meter
 /// (0 = no meter). `throughput` is the live token-rate readout when a turn is
@@ -48,11 +65,42 @@ pub fn render_plain_with_cache(
     render_plain_impl(projection, window, throughput, Some(cache_usage))
 }
 
+/// Plain rendering with the live background-task band included. The band is
+/// inserted immediately above the global context status, matching the rich
+/// layout's bottom-to-top order while preserving the historical `render_plain`
+/// output for callers that only have a projection.
+#[must_use]
+pub fn render_plain_with_status(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    cache_usage: &crate::cache_usage::SessionUsageFold,
+    background: &crate::statusline::StatusLine,
+) -> String {
+    render_plain_impl_with_status(
+        projection,
+        window,
+        throughput,
+        Some(cache_usage),
+        Some(background),
+    )
+}
+
 fn render_plain_impl(
     projection: &SessionProjection,
     window: u64,
     throughput: Option<&crate::throughput::ThroughputReadout>,
     cache_usage: Option<&crate::cache_usage::SessionUsageFold>,
+) -> String {
+    render_plain_impl_with_status(projection, window, throughput, cache_usage, None)
+}
+
+fn render_plain_impl_with_status(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    cache_usage: Option<&crate::cache_usage::SessionUsageFold>,
+    background: Option<&crate::statusline::StatusLine>,
 ) -> String {
     let mut out = String::new();
     for entry in projection.entries() {
@@ -212,6 +260,12 @@ fn render_plain_impl(
     if let Some(totals) = &cache_totals {
         out.push_str(&cache_breakdown_plain(totals));
         out.push('\n');
+    }
+    if let Some(background) = background {
+        for line in background.plain_grammar() {
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
     out.push_str(&status_line(projection, window));
     if let Some(totals) = &cache_totals {
@@ -516,6 +570,8 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             if block.output_decode_error {
                 out.push_str(" · output partly undecodable");
             }
+            out.push_str(" · status ");
+            out.push_str(status_word(*status));
             out.push('\n');
         }
         TurnItem::CommandExecution {
@@ -529,6 +585,8 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             if let Some(code) = exit_code {
                 out.push_str(&format!(" · exit {code}"));
             }
+            out.push_str(" · status ");
+            out.push_str(status_word(*status));
             out.push('\n');
             if block.output_truncated {
                 out.push_str("  ⋯ earlier output truncated\n");

@@ -211,6 +211,22 @@ pub fn spinner_frame(phase: u8) -> &'static str {
     SPINNER[(phase as usize) % SPINNER.len()]
 }
 
+/// Spinner glyph selected for the current motion preference.
+///
+/// Screen readers and users who prefer reduced motion still get the same
+/// live-row state, but the glyph stays stable so successive frames do not
+/// create needless terminal churn. The rich renderer passes `false`; plain
+/// and accessibility consumers can opt into the stable form without adding a
+/// second animation clock.
+#[must_use]
+pub fn spinner_frame_for(phase: u8, reduced_motion: bool) -> &'static str {
+    if reduced_motion {
+        SPINNER[0]
+    } else {
+        spinner_frame(phase)
+    }
+}
+
 /// A tool call's duration. [`crate::format::fmt_elapsed`] is built for
 /// minutes and hours and floors everything under a second to `0s` — which on
 /// a tool row reads exactly like the fabricated zero this wave refuses to
@@ -627,13 +643,27 @@ pub struct RowFacts<'a> {
 /// what the format pins assert against.
 #[must_use]
 pub fn summary_segments(facts: &RowFacts<'_>, phase: u8, width: usize) -> Vec<Segment> {
+    summary_segments_with_motion(facts, phase, width, false)
+}
+
+/// Build a tool summary while honoring a caller's reduced-motion preference.
+/// Rich rendering keeps the historical animated default; plain and
+/// accessibility surfaces can request a stable running glyph while retaining
+/// the same status and timing facts.
+#[must_use]
+pub fn summary_segments_with_motion(
+    facts: &RowFacts<'_>,
+    phase: u8,
+    width: usize,
+    reduced_motion: bool,
+) -> Vec<Segment> {
     let mut head = vec![
         Segment::new("  ", Tone::Structure),
         Segment::new(
             format!(
                 "{} ",
                 if facts.streaming && facts.spinner {
-                    spinner_frame(phase)
+                    spinner_frame_for(phase, reduced_motion)
                 } else {
                     facts.glyph
                 }
@@ -1201,10 +1231,15 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
     let glob = text("glob").or_else(|| text("include"));
     let description = text("description").or_else(|| text("desc"));
     match name {
-        "bash" | "shell" | "sh" | "zsh" | "process_exec" | "ssh_shell" | "command" => command
-            .or(description)
-            .map(str::to_owned)
-            .unwrap_or_else(|| arg_summary(args)),
+        "bash" | "shell" | "sh" | "zsh" | "process_exec" | "ssh_shell" | "command" => {
+            match (command, description) {
+                (Some(command), Some(description)) if command != description => {
+                    format!("{command} — {description}")
+                }
+                (Some(command), _) | (_, Some(command)) => command.to_owned(),
+                _ => arg_summary(args),
+            }
+        }
         "fs_read" | "read" | "read_file" | "file_read" => {
             let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
             if let Some(range) = text("line_range").or_else(|| text("lines")) {
@@ -1239,10 +1274,11 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
         }
         "fs_edit" | "edit" | "write" | "file_edit" => {
             let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
-            if let Some(operation) = text("operation").or_else(|| text("action")) {
-                if !operation.is_empty() && operation != "edit" {
-                    summary = format!("{operation} {summary}");
-                }
+            if let Some(operation) = text("operation").or_else(|| text("action"))
+                && !operation.is_empty()
+                && operation != "edit"
+            {
+                summary = format!("{operation} {summary}");
             }
             summary
         }
