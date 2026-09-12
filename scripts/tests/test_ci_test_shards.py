@@ -45,9 +45,19 @@ class ShardTests(unittest.TestCase):
         self.assertIn('haider-tui', sorted(EXPECTED)[::3])
 
     def test_invalid_or_empty_shards_fail_before_cargo(self):
-        for index, count in [('0','3'),('4','3'),('1','0'),('a','3'),('2','1'),('20','20')]:
-            result = self.command('--list-crates', HAIDER_CI_SHARD_INDEX=index, HAIDER_CI_SHARD_TOTAL=count)
-            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        # One crate per shard is valid; the next shard is the first empty one.
+        empty_shard = str(len(EXPECTED) + 1)
+        for index, count in [('0','3'),('4','3'),('1','0'),('a','3'),('2','1'),
+                             (empty_shard, empty_shard)]:
+            with self.subTest(index=index, count=count):
+                result = self.command('--list-crates', HAIDER_CI_SHARD_INDEX=index, HAIDER_CI_SHARD_TOTAL=count)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_last_one_crate_shard_is_nonempty(self):
+        count = str(len(EXPECTED))
+        result = self.command('--list-crates', HAIDER_CI_SHARD_INDEX=count, HAIDER_CI_SHARD_TOTAL=count)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), [sorted(EXPECTED)[-1]])
 
     def driver(self, index=None, fail_crate=''):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,7 +116,9 @@ fi
         with patch.object(Path, 'write_text', windows_text):
             result, calls, _ = self.driver(1)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(calls[-1].startswith('test --no-fail-fast -p xtask'))
+        # Shards use sorted stride order; xtask need not belong to shard 1.
+        last_crate = sorted(EXPECTED)[::3][-1]
+        self.assertEqual(calls[-1], f'test --no-fail-fast -p {last_crate} --locked')
 
     def test_unsharded_keeps_workspace_compile_and_failures_collect(self):
         result, calls, summary = self.driver(fail_crate='haider-core')
