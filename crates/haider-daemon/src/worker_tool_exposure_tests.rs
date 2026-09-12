@@ -519,11 +519,7 @@ fn bounded_unified_diff(expected: &str, actual: &str) -> String {
     let actual_lines = actual.lines().collect::<Vec<_>>();
     let mut diff = String::from("--- golden\n+++ runtime\n");
     let mut emitted = 0;
-    for (index, (golden, runtime)) in expected_lines
-        .iter()
-        .zip(actual_lines.iter())
-        .enumerate()
-    {
+    for (index, (golden, runtime)) in expected_lines.iter().zip(actual_lines.iter()).enumerate() {
         if golden == runtime {
             continue;
         }
@@ -531,7 +527,12 @@ fn bounded_unified_diff(expected: &str, actual: &str) -> String {
             diff.push_str("... diff truncated ...\n");
             break;
         }
-        diff.push_str(&format!("@@ line {} @@\n-{}\n+{}\n", index + 1, golden, runtime));
+        diff.push_str(&format!(
+            "@@ line {} @@\n-{}\n+{}\n",
+            index + 1,
+            golden,
+            runtime
+        ));
         emitted += 1;
     }
     if emitted < MAX_LINES && expected_lines.len() != actual_lines.len() {
@@ -541,7 +542,11 @@ fn bounded_unified_diff(expected: &str, actual: &str) -> String {
                 diff.push_str("... diff truncated ...\n");
                 break;
             }
-            diff.push_str(&format!("@@ line {} @@\n-{}\n+\n", start + offset + 1, line));
+            diff.push_str(&format!(
+                "@@ line {} @@\n-{}\n+\n",
+                start + offset + 1,
+                line
+            ));
             emitted += 1;
         }
         for (offset, line) in actual_lines[start..].iter().enumerate() {
@@ -549,7 +554,11 @@ fn bounded_unified_diff(expected: &str, actual: &str) -> String {
                 diff.push_str("... diff truncated ...\n");
                 break;
             }
-            diff.push_str(&format!("@@ line {} @@\n-\n+{}\n", start + offset + 1, line));
+            diff.push_str(&format!(
+                "@@ line {} @@\n-\n+{}\n",
+                start + offset + 1,
+                line
+            ));
             emitted += 1;
         }
     }
