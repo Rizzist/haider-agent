@@ -406,8 +406,17 @@ fn capability_profile_packs_match_golden_and_report_estimator_delta() {
     }
     assert_eq!(ToolCapabilityProfile::from_name("unknown"), None);
     let actual = serde_json::to_string_pretty(&packs).expect("profile goldens") + "\n";
+    // `process_exec` retains the native shell contract in its schema. Keep
+    // that platform-specific description in a target-specific fixture while
+    // sharing the profile shape and reduction assertions below.
+    let fixture = if cfg!(windows) {
+        "capability_profiles.windows.json"
+    } else {
+        "capability_profiles.json"
+    };
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/capability_profiles.json");
+        .join("tests/fixtures")
+        .join(fixture);
     if std::env::var_os("HAIDER_UPDATE_CAPABILITY_GOLDEN").is_some() {
         std::fs::write(&path, &actual).expect("write golden");
     }
