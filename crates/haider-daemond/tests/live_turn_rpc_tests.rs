@@ -2252,7 +2252,7 @@ fn restart_exec_command() -> String {
     windows_powershell_command(concat!(
         "[IO.File]::AppendAllText('attempts.log',('attempt'+[char]10),",
         "[Text.Encoding]::ASCII);",
-        "[Console]::Out.Write('started');[Console]::Out.Flush();",
+        "[Console]::Out.Write(('started'+[char]10));[Console]::Out.Flush();",
         "Start-Sleep -Seconds 1"
     ))
 }
@@ -2326,12 +2326,11 @@ fn cancellable_exec_command() -> String {
 
 #[cfg(windows)]
 fn cancellable_exec_fixture_command(workspace: &std::path::Path) -> String {
-    // Keep the real PowerShell -> cmd.exe -> cmd.exe process tree, but move
-    // the fixture program out of PowerShell's command-line parser. Hosted
-    // Windows runners have taken nearly the entire production process budget
-    // before the former large inline script executed its first statement.
-    // These batch files exercise the same inherited Job membership while
-    // making process readiness depend only on actual child scheduling.
+    // Keep the fixture program out of PowerShell's command-line parser because
+    // hosted Windows runners can spend most of the process budget parsing a
+    // large inline script. Start the batch child directly with ProcessStartInfo:
+    // shell `start /b` is asynchronous and may create a Job-breakaway child,
+    // which would survive the daemon's cancellation sweep.
     fs::write(
         workspace.join("cancel-descendant.cmd"),
         concat!(
@@ -2347,32 +2346,34 @@ fn cancellable_exec_fixture_command(workspace: &std::path::Path) -> String {
         ),
     )
     .expect("write cancellable descendant fixture");
-    fs::write(
-        workspace.join("cancel-parent.cmd"),
-        concat!(
-            "@echo off\r\n",
-            ">ps-alive.log <nul set /p \"=x\"\r\n",
-            "start \"\" /b \"%SystemRoot%\\System32\\cmd.exe\" /d /s /c \"\"cancel-descendant.cmd\"\"\r\n",
-            ":wait_for_descendant\r\n",
-            "if not exist descendant-started.log (\r\n",
-            "  \"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
-            "  goto wait_for_descendant\r\n",
-            ")\r\n",
-            ">heartbeat.log <nul set /p \"=xx\"\r\n",
-            "<nul set /p \"=started\"\r\n",
-            ":heartbeat\r\n",
-            ">>heartbeat.log <nul set /p \"=x\"\r\n",
-            "<nul set /p \"=y\"\r\n",
-            "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
-            "goto heartbeat\r\n",
-        ),
-    )
-    .expect("write cancellable parent fixture");
     windows_powershell_command(concat!(
         "[IO.File]::WriteAllText('powershell-parent.pid',",
         "$PID.ToString([Globalization.CultureInfo]::InvariantCulture),",
         "[Text.Encoding]::ASCII);",
-        "& '.\\cancel-parent.cmd'"
+        "[IO.File]::WriteAllText('ps-alive.log','x',[Text.Encoding]::ASCII);",
+        "$workspace=(Get-Location).Path;[Environment]::CurrentDirectory=$workspace;",
+        "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
+        "$start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$cmd;",
+        "$start.Arguments='/D /S /C cancel-descendant.cmd';",
+        "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
+        "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
+        "if($null -eq $child){throw 'descendant process did not start'};",
+        "[IO.File]::WriteAllText('descendant.pid',",
+        "$child.Id.ToString([Globalization.CultureInfo]::InvariantCulture),",
+        "[Text.Encoding]::ASCII);",
+        "$ready=[IO.Path]::Combine($workspace,'descendant-started.log');",
+        "$readyWait=[Diagnostics.Stopwatch]::StartNew();",
+        "while(-not [IO.File]::Exists($ready)){",
+        "if($child.HasExited){$child.Dispose();throw 'descendant exited before its ready marker'};",
+        "if($readyWait.ElapsedMilliseconds -ge 45000){try{$child.Kill()}catch{};$child.Dispose();",
+        "throw 'descendant did not create its ready marker within 45 seconds'};",
+        "Start-Sleep -Milliseconds 10};$readyWait.Stop();",
+        "if($child.HasExited){$child.Dispose();throw 'descendant exited immediately after its ready marker'};",
+        "$child.Dispose();",
+        "[IO.File]::WriteAllText('heartbeat.log','xx',[Text.Encoding]::ASCII);",
+        "[Console]::Out.Write(('started'+[char]10));[Console]::Out.Flush();",
+        "while($true){[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
+        "[Console]::Out.Write('y');[Console]::Out.Flush();Start-Sleep -Milliseconds 10}"
     ))
 }
 
