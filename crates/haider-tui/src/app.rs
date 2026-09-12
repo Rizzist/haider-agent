@@ -4088,6 +4088,33 @@ pub struct SessionBrowserRow {
     pub created_at_ms: Option<u64>,
 }
 
+/// Incremental search over the currently attached transcript.  Matching is
+/// entry based so the renderer can jump through its existing wrapped-row
+/// geometry without copying or reflowing the transcript.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptSearch {
+    pub query: String,
+    pub matches: Vec<usize>,
+    pub selected: usize,
+}
+
+impl TranscriptSearch {
+    #[must_use]
+    pub fn active(&self) -> bool {
+        !self.query.is_empty()
+    }
+}
+
+/// Local @-mention completion. Agent/workflow names are deliberately not
+/// included; this index contains workspace paths only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MentionCompletion {
+    pub start: usize,
+    pub query: String,
+    pub candidates: Vec<String>,
+    pub selected: usize,
+}
+
 impl SessionAttention {
     #[must_use]
     pub fn unseen(&self) -> bool {
@@ -5717,6 +5744,11 @@ pub struct AppModel {
     /// Search-as-you-type query for the all-sessions browser.
     pub session_browser_query: String,
     pub session_browser_return: Option<Screen>,
+    /// Ctrl-F transcript search overlay and the renderer-resolved jump.
+    pub transcript_search: Option<TranscriptSearch>,
+    pub search_jump: std::cell::RefCell<Option<usize>>,
+    /// Composer-local filesystem @-mention completion.
+    pub mention_completion: Option<MentionCompletion>,
     /// W-G: the live token-throughput sampler for the ACTIVE session. Fed on
     /// the existing frame clock (`note_throughput`) while a turn streams,
     /// reset to empty when idle — a pure ring buffer, so idle frames cost
@@ -5949,6 +5981,9 @@ impl Default for AppModel {
             session_browser_sel: 0,
             session_browser_query: String::new(),
             session_browser_return: None,
+            transcript_search: None,
+            search_jump: std::cell::RefCell::new(None),
+            mention_completion: None,
             throughput: crate::throughput::ThroughputTracker::new(),
             usage: UsageState::default(),
         }
@@ -7012,6 +7047,249 @@ impl AppModel {
                 (!rest.is_empty()).then(|| rest.to_owned())
             }
         }
+    }
+
+    fn transcript_search_text(entry: &crate::projection::TranscriptEntry) -> String {
+        use haider_protocol::item::TurnItem;
+        use std::fmt::Write as _;
+
+        // Keep search independent of the wire protocol: this is the same
+        // user-visible text the transcript renders, including bounded tool
+        // output, while avoiding unstable `Debug` labels and field names.
+        let mut text = String::new();
+        match entry {
+            crate::projection::TranscriptEntry::User { text: value, .. }
+            | crate::projection::TranscriptEntry::Note { text: value }
+            | crate::projection::TranscriptEntry::Error { text: value, .. } => text.push_str(value),
+            crate::projection::TranscriptEntry::Peer {
+                sender,
+                text: value,
+                ..
+            } => {
+                let _ = write!(text, "{sender}: {value}");
+            }
+            crate::projection::TranscriptEntry::Refusal {
+                provider,
+                tool,
+                reason,
+            } => {
+                let _ = write!(text, "{provider} {tool}: {reason}");
+            }
+            crate::projection::TranscriptEntry::Shell { cmd, out } => {
+                let _ = write!(text, "$ {cmd}\n{out}");
+            }
+            crate::projection::TranscriptEntry::Item(block) => match &block.item {
+                TurnItem::AgentMessage { text: value }
+                | TurnItem::IncompleteAgentMessage { text: value, .. } => {
+                    text.push_str(&value.to_owned_string());
+                }
+                TurnItem::Reasoning { summary } => text.push_str(&summary.to_owned_string()),
+                TurnItem::ToolCall { name, args, .. } => {
+                    let _ = write!(text, "{name} {args}");
+                }
+                TurnItem::CommandExecution { command, .. } => text.push_str(command),
+                TurnItem::FileChange { path, .. } => text.push_str(path),
+                TurnItem::ChildSpawn { agent } => text.push_str(agent.as_str()),
+                TurnItem::ChildResult { report } => text.push_str(&report.summary),
+                TurnItem::Plan { items } => {
+                    for item in items {
+                        let _ = write!(text, "{} ", item.text);
+                    }
+                }
+                TurnItem::ContextCompaction {
+                    summary_artifact, ..
+                } => {
+                    text.push_str(summary_artifact.as_str());
+                }
+                TurnItem::Extension { kind, data } => {
+                    let _ = write!(text, "{kind} {data}");
+                }
+                TurnItem::Refusal { reason } => text.push_str(reason),
+            },
+        }
+        if let crate::projection::TranscriptEntry::Item(block) = entry
+            && !block.output_tail.is_empty()
+        {
+            let _ = write!(text, "\n{}", block.output_text());
+        }
+        text
+    }
+
+    fn refresh_transcript_search(&mut self) {
+        let Some(search) = self.transcript_search.as_mut() else {
+            return;
+        };
+        let needle = search.query.to_lowercase();
+        search.matches = if needle.is_empty() {
+            Vec::new()
+        } else {
+            self.projection
+                .entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    Self::transcript_search_text(entry)
+                        .to_lowercase()
+                        .contains(&needle)
+                        .then_some(index)
+                })
+                .collect()
+        };
+        search.selected = search.selected.min(search.matches.len().saturating_sub(1));
+        *self.search_jump.borrow_mut() = search.matches.get(search.selected).copied();
+    }
+
+    fn open_transcript_search(&mut self) {
+        self.transcript_search = Some(TranscriptSearch::default());
+        self.dirty = true;
+    }
+
+    fn close_transcript_search(&mut self) {
+        self.transcript_search = None;
+        *self.search_jump.borrow_mut() = None;
+        self.dirty = true;
+    }
+
+    fn search_move(&mut self, forward: bool) {
+        let Some(search) = self.transcript_search.as_mut() else {
+            return;
+        };
+        if search.matches.is_empty() {
+            return;
+        }
+        let len = search.matches.len();
+        search.selected = if forward {
+            (search.selected + 1) % len
+        } else {
+            (search.selected + len - 1) % len
+        };
+        *self.search_jump.borrow_mut() = search.matches.get(search.selected).copied();
+        self.dirty = true;
+    }
+
+    fn workspace_mention_candidates(&self) -> Vec<String> {
+        let cwd = self
+            .session_workspace_cwd
+            .as_deref()
+            .or_else(|| (!self.session_dir.is_empty()).then_some(self.session_dir.as_str()));
+        let real_cwd = cwd.filter(|path| std::path::Path::new(path).is_dir());
+        // A live workspace index must never be polluted by the demo VFS. The
+        // latter is only a fallback for the local demo, where no real cwd is
+        // attached and shell paths are intentionally synthetic.
+        let mut out = if real_cwd.is_some() {
+            Vec::new()
+        } else {
+            self.vfs
+                .values()
+                .flat_map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| !entry.ends_with('/'))
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(cwd) = real_cwd {
+            let root = std::path::Path::new(cwd);
+            let mut stack = vec![root.to_path_buf()];
+            let mut visited = 0usize;
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if visited >= 256 {
+                        break;
+                    }
+                    visited += 1;
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .is_some_and(|name| name == ".git" || name == "target")
+                    {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if let Ok(rel) = path.strip_prefix(root) {
+                        out.push(
+                            rel.to_string_lossy()
+                                .replace(std::path::MAIN_SEPARATOR, "/"),
+                        );
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn refresh_mention_completion(&mut self) {
+        let cursor = self.composer.cursor();
+        let text = self.composer.text();
+        let prefix = &text[..cursor.min(text.len())];
+        let Some(at) = prefix.rfind('@') else {
+            self.mention_completion = None;
+            return;
+        };
+        if at > 0
+            && !prefix[..at]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_whitespace())
+        {
+            self.mention_completion = None;
+            return;
+        }
+        let query = &prefix[at + 1..];
+        if query.chars().any(char::is_whitespace) {
+            self.mention_completion = None;
+            return;
+        }
+        let needle = query.to_lowercase();
+        let candidates: Vec<String> = self
+            .workspace_mention_candidates()
+            .into_iter()
+            .filter(|candidate| candidate.to_lowercase().contains(&needle))
+            .take(64)
+            .collect();
+        let selected = self
+            .mention_completion
+            .as_ref()
+            .map_or(0, |completion| completion.selected)
+            .min(candidates.len().saturating_sub(1));
+        self.mention_completion = Some(MentionCompletion {
+            start: at,
+            query: query.to_owned(),
+            candidates,
+            selected,
+        });
+    }
+
+    fn accept_mention_completion(&mut self) -> bool {
+        let Some(completion) = self.mention_completion.clone() else {
+            return false;
+        };
+        let Some(candidate) = completion.candidates.get(completion.selected) else {
+            return false;
+        };
+        let text = self.composer.text().to_owned();
+        let cursor = self.composer.cursor();
+        let end = completion.start + 1 + completion.query.len();
+        let mut replacement = String::with_capacity(text.len() + candidate.len());
+        replacement.push_str(&text[..completion.start]);
+        replacement.push('@');
+        replacement.push_str(candidate);
+        replacement.push_str(&text[end.min(text.len())..]);
+        self.composer.set_text(replacement);
+        self.composer
+            .set_cursor((completion.start + 1 + candidate.len()).min(cursor + candidate.len()));
+        self.note_composer_edit();
+        // The inserted path is now a complete token; do not immediately
+        // reopen the same popup from the edit epilogue.
+        self.mention_completion = None;
+        true
     }
 
     /// Reduce one event into the model. Returns nothing; render reads state,
@@ -8129,6 +8407,9 @@ impl AppModel {
                 KeyCode::Char('o') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
                     self.toggle_all_tool_rows();
                 }
+                KeyCode::Char('f') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
+                    self.open_transcript_search();
+                }
                 // TUI5 items 2+3 — readline editing keys, Claude Code
                 // parity: ⌃A/⌃E line edges, ⌃W word-back, ⌃K kill-to-end,
                 // ⌃U kill-to-start. Only while the composer actually owns
@@ -8157,6 +8438,31 @@ impl AppModel {
         }
         if self.screen == Screen::Sessions {
             self.handle_sessions_key(key);
+            return;
+        }
+        if self.transcript_search.is_some() {
+            match key.code {
+                KeyCode::Esc => self.close_transcript_search(),
+                KeyCode::Enter | KeyCode::Down => self.search_move(true),
+                KeyCode::Up => self.search_move(false),
+                KeyCode::Backspace => {
+                    if let Some(search) = self.transcript_search.as_mut() {
+                        search.query.pop();
+                        search.selected = 0;
+                    }
+                    self.refresh_transcript_search();
+                    self.dirty = true;
+                }
+                KeyCode::Char(character) if !character.is_control() => {
+                    if let Some(search) = self.transcript_search.as_mut() {
+                        search.query.push(character);
+                        search.selected = 0;
+                    }
+                    self.refresh_transcript_search();
+                    self.dirty = true;
+                }
+                _ => {}
+            }
             return;
         }
         // Boot renders no composer — hidden input must not accumulate or
@@ -8848,6 +9154,37 @@ impl AppModel {
                 _ => {}
             }
         }
+        if let Some(completion) = self.mention_completion.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mention_completion = None;
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Up => {
+                    if !completion.candidates.is_empty() {
+                        completion.selected = (completion.selected + completion.candidates.len()
+                            - 1)
+                            % completion.candidates.len();
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Down => {
+                    if !completion.candidates.is_empty() {
+                        completion.selected =
+                            (completion.selected + 1) % completion.candidates.len();
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter if !completion.candidates.is_empty() => {
+                    self.accept_mention_completion();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc if self.screen == Screen::Session => {
                 if self.token_panel {
@@ -9166,6 +9503,7 @@ impl AppModel {
         self.palette_scroll = 0;
         self.palette_dismissed = false;
         self.close_backtrack();
+        self.refresh_mention_completion();
         if self.screen == Screen::Loom {
             self.note_loom_author_edit();
         }

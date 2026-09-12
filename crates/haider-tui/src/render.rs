@@ -6375,6 +6375,17 @@ fn render_session(
             None => *model.pending_jump.borrow_mut() = Some(jump),
         }
     }
+    // Search jumps resolve through the same cached entry geometry as Ctrl-O
+    // and tool reveals.  The reducer only chooses an entry; this frame owns
+    // the wrapped-row coordinate and clamps it to the real viewport.
+    if let Some(index) = model.search_jump.borrow_mut().take()
+        && index < model.projection.entries().len()
+    {
+        let row = transcript_cache.row_start(&model.projection, index);
+        model
+            .scroll_back
+            .set(max_scroll_rows.saturating_sub(row.min(max_scroll_rows)));
+    }
     let scroll_back = model.scroll_back.get();
     let (visible_lines, visible_base, visible_total, scroll) = virtualized_transcript_lines(
         &mut transcript_cache,
@@ -6414,6 +6425,14 @@ fn render_session(
             render_plan_document(plan, theme, frame, transcript_area, model.plan_scroll.get());
         model.plan_scroll_max.set(max_scroll);
     } else {
+        let visible_lines = highlight_transcript_lines(
+            visible_lines,
+            model
+                .transcript_search
+                .as_ref()
+                .map_or("", |search| search.query.as_str()),
+            theme,
+        );
         let paragraph = Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false });
         frame.render_widget(
             paragraph.scroll((
@@ -6443,6 +6462,7 @@ fn render_session(
             transcript_area,
             hits,
         );
+        render_transcript_search(model, theme, frame, transcript_area);
     }
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
@@ -7022,6 +7042,60 @@ fn render_session(
     }
 }
 
+fn render_transcript_search(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let Some(search) = &model.transcript_search else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let count = search.matches.len();
+    let position = if count == 0 { 0 } else { search.selected + 1 };
+    let label = format!(
+        " 🔎 {}  {position}/{count}  · ↑↓ next/prev · enter jump · esc close",
+        search.query
+    );
+    let rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            ellipsize(&label, area.width as usize),
+            theme.menu_style(),
+        ))
+        .style(theme.menu_style()),
+        rect,
+    );
+}
+
+/// Mark matching transcript rows without rebuilding the cached Markdown
+/// layout. A row-level reversed accent keeps the original spans (including
+/// wide Unicode and code styling) intact while making every hit visible.
+fn highlight_transcript_lines(
+    lines: Vec<Line<'static>>,
+    query: &str,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return lines;
+    }
+    let style = theme.gold_style().add_modifier(Modifier::REVERSED);
+    lines
+        .into_iter()
+        .map(|line| {
+            let hit = line
+                .spans
+                .iter()
+                .any(|span| span.content.to_lowercase().contains(&needle));
+            if hit { line.style(style) } else { line }
+        })
+        .collect()
+}
+
 /// ⌃G / `/tokens` — context by model (sim tui.js:2946-2977), floated
 /// above the input band. Live rows carry the W7b footprint truth: an
 /// EXACT snapshot prints plain splits, an ESTIMATED one keeps the sim's
@@ -7293,10 +7367,12 @@ fn render_sessions(
         // two surfaces read identically).
         let mark = if row.needs_input.is_some() {
             Span::styled("  ◆ ", theme.gold_style())
+        } else if row.busy {
+            Span::styled("  ◉ ", theme.gold_style())
         } else if row.unseen {
             Span::styled("  ● ", theme.maroon_style())
         } else {
-            Span::styled("    ", theme.dim_style())
+            Span::styled("  · ", theme.dim_style())
         };
         let mut spans = vec![
             mark,
@@ -12404,11 +12480,19 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // the band — the same shared-predicate discipline as the chip row, so
     // the geometry and the paint can never disagree.
     let notice = u16::from(model.composer_notice.is_some());
+    let completion = model
+        .mention_completion
+        .as_ref()
+        .filter(|completion| !completion.candidates.is_empty())
+        .map_or(0, |completion| {
+            u16::try_from(completion.candidates.len().min(4)).unwrap_or(4)
+        });
     u16::try_from(rows)
         .unwrap_or(1)
         .saturating_add(chips)
         .saturating_add(ghost)
         .saturating_add(notice)
+        .saturating_add(completion)
 }
 
 /// The gold rule + composer rows on the input ground (sim InputBar,
@@ -12586,6 +12670,50 @@ fn render_composer(
         Paragraph::new(Text::from(lines)).style(theme.input_style()),
         row_area,
     );
+    if let Some(completion) = &model.mention_completion
+        && !completion.candidates.is_empty()
+        && row_area.height > 0
+    {
+        let visible = completion.candidates.len().min(4);
+        let start = completion
+            .selected
+            .saturating_sub(visible.saturating_sub(1));
+        let popup_lines = completion
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, candidate)| {
+                let marker = if index == completion.selected {
+                    "▸ "
+                } else {
+                    "  "
+                };
+                Line::styled(
+                    format!(" {marker}@{}", candidate),
+                    if index == completion.selected {
+                        theme.menu_style()
+                    } else {
+                        theme.dim_style()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let popup_height = u16::try_from(popup_lines.len())
+            .unwrap_or(row_area.height)
+            .min(row_area.height);
+        let popup = Rect {
+            x: row_area.x,
+            y: row_area.y + row_area.height - popup_height,
+            width: row_area.width,
+            height: popup_height,
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(popup_lines)).style(theme.menu_style()),
+            popup,
+        );
+    }
     // The chip's rect goes FIRST: hit_at takes the first match, so the
     // chip keeps its cells over the row-wide text region below.
     if let Some((offset, width)) = chip_at {
