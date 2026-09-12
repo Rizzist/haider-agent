@@ -1172,6 +1172,86 @@ pub fn arg_summary(args: &serde_json::Value) -> String {
     String::new()
 }
 
+/// Build the compact, tool-aware description shown in a semantic row.
+///
+/// Tool adapters already carry the useful fields in their JSON arguments, so
+/// this remains a renderer-only policy: no wire change and no second fold
+/// mechanism.  The generic [`arg_summary`] is retained for callers that do
+/// not know the tool name; transcript rows should prefer this function.
+#[must_use]
+pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
+    let text = |key: &str| args.get(key).and_then(serde_json::Value::as_str);
+    let count = |keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            args.get(*key).and_then(|value| {
+                value
+                    .as_u64()
+                    .map(|number| number.to_string())
+                    .or_else(|| value.as_array().map(|items| items.len().to_string()))
+            })
+        })
+    };
+    let command = text("command").or_else(|| text("cmd"));
+    let path = text("path")
+        .or_else(|| text("file"))
+        .or_else(|| text("file_path"));
+    let query = text("query")
+        .or_else(|| text("pattern"))
+        .or_else(|| text("search"));
+    let glob = text("glob").or_else(|| text("include"));
+    let description = text("description").or_else(|| text("desc"));
+    match name {
+        "bash" | "shell" | "sh" | "zsh" | "process_exec" | "ssh_shell" | "command" => command
+            .or(description)
+            .map(str::to_owned)
+            .unwrap_or_else(|| arg_summary(args)),
+        "fs_read" | "read" | "read_file" | "file_read" => {
+            let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
+            if let Some(range) = text("line_range").or_else(|| text("lines")) {
+                summary.push_str(" · ");
+                summary.push_str(range);
+            }
+            summary
+        }
+        "fs_search" | "grep" | "ripgrep" | "search" | "file_search" => {
+            let mut summary = match (query, glob, path) {
+                (Some(query), Some(glob), _) => format!("\"{query}\" {glob}"),
+                (Some(query), None, Some(path)) => format!("\"{query}\" in {path}"),
+                (Some(query), None, None) => format!("\"{query}\""),
+                _ => arg_summary(args),
+            };
+            if let Some(matches) = count(&["match_count", "matches", "count", "results"]) {
+                summary.push_str(" · ");
+                summary.push_str(&matches);
+                summary.push_str(if matches == "1" { " match" } else { " matches" });
+            }
+            summary
+        }
+        "agent_spawn" | "task" | "task_spawn" | "subagent" => {
+            let label = text("label").or_else(|| text("name")).or(description);
+            let state = text("state").or_else(|| text("status"));
+            match (label, state) {
+                (Some(label), Some(state)) => format!("{label} · {state}"),
+                (Some(label), None) => label.to_owned(),
+                (None, Some(state)) => state.to_owned(),
+                _ => arg_summary(args),
+            }
+        }
+        "fs_edit" | "edit" | "write" | "file_edit" => {
+            let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
+            if let Some(operation) = text("operation").or_else(|| text("action")) {
+                if !operation.is_empty() && operation != "edit" {
+                    summary = format!("{operation} {summary}");
+                }
+            }
+            summary
+        }
+        _ => description
+            .map(str::to_owned)
+            .unwrap_or_else(|| arg_summary(args)),
+    }
+}
+
 /// Human-readable summary of one CU-2 computer action. The transcript is the
 /// owner's window into a session that can move their real cursor, so the row
 /// renders exactly what the model is doing to the screen.

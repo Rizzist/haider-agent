@@ -489,10 +489,32 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             summary.visit_strs(|part| out.push_str(part));
             out.push('\n');
         }
-        TurnItem::ToolCall { name, status, .. } => {
-            out.push_str(&format!("⚒ {name} {}", status_glyph(*status)));
+        TurnItem::ToolCall {
+            name, status, args, ..
+        } => {
+            let summary = crate::toolfold::semantic_summary(name, args);
+            out.push_str(&format!("⚒ {name}"));
+            out.push(' ');
+            out.push_str(status_glyph(*status));
+            if !summary.is_empty() {
+                out.push_str(" · ");
+                out.push_str(&summary);
+            }
+            let retained = block.output_text().lines().count();
+            if retained > 0 {
+                out.push_str(&format!(
+                    " · {retained} line{}",
+                    if retained == 1 { "" } else { "s" }
+                ));
+            }
             if let Some(reason) = &block.tool_reason {
                 out.push_str(&format!(" · {reason}"));
+            }
+            if block.output_truncated {
+                out.push_str(" · output truncated");
+            }
+            if block.output_decode_error {
+                out.push_str(" · output partly undecodable");
             }
             out.push('\n');
         }
