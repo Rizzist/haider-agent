@@ -7,8 +7,8 @@
 //! connection so a DNS rebind between check and connect cannot re-aim the
 //! request. Redirects are followed manually (cap
 //! [`WEB_FETCH_MAX_REDIRECTS`]) with the SAME validation re-run per hop.
-//! Bodies are content-type gated (`text/*` + `application/json`), HTML is
-//! reduced to readable text by a small in-crate reducer, and output is
+//! Bodies are content-type gated (text, JSON, and XML), structured content is
+//! reduced to readable text, and output is
 //! capped at [`WEB_FETCH_OUTPUT_CAP_BYTES`] with an honest truncation marker.
 
 use std::collections::{HashMap, VecDeque};
@@ -27,14 +27,6 @@ pub const WEB_FETCH_OUTPUT_CAP_BYTES: usize = 96 * 1024;
 const WEB_FETCH_MIN_OUTPUT_CAP_BYTES: usize = 512;
 /// Hard cap on raw bytes read off the wire before reduction.
 const WEB_FETCH_SOURCE_CAP_BYTES: usize = 4 * 1024 * 1024;
-/// Max nested DROP_CONTENT elements tracked at once (H2). A closing tag scans
-/// this stack (`rposition`), so an UNBOUNDED stack makes `<script>`×N then
-/// `</style>`×N (each a full scan that matches nothing) O(N²) within the 4 MiB
-/// source cap → CPU exhaustion. Bounding the depth keeps every close O(1);
-/// opens past the cap are ignored (their content is still dropped while the
-/// stack is non-empty) — this is a reduction of hostile input, not a fidelity
-/// contract, and legitimate documents never nest drop-chrome this deep.
-const MAX_DROP_STACK_DEPTH: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -530,11 +522,7 @@ async fn fetch_public_url_inner(
             .flatten();
         let content_type = declared_media_type(&response)?;
         let (bytes, source_truncated, original) = read_body_bounded(response, deadline).await?;
-        let text = if content_type == "text/html" {
-            reduce_html_to_text(&String::from_utf8_lossy(&bytes))
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
+        let text = reduce_response_body(&content_type, &bytes, current.as_str());
         let (text, truncated) = cap_output(text, output_cap, source_truncated);
         let truncation = truncated.then_some(original);
         let outcome = WebFetchOutcome {
@@ -738,8 +726,8 @@ fn overall_deadline_error() -> ProviderError {
     )
 }
 
-/// Content-type gate (decision 5): `text/*` and `application/json` pass;
-/// everything else — PDF included (deferred to W-D) — is a typed refusal.
+/// Content-type gate (decision 5): text, JSON, and XML pass; everything else
+/// — PDF included (deferred to W-D) — is a typed refusal.
 fn declared_media_type(response: &reqwest::Response) -> Result<String, ProviderError> {
     let declared = response
         .headers()
@@ -752,7 +740,14 @@ fn declared_media_type(response: &reqwest::Response) -> Result<String, ProviderE
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if media_type.starts_with("text/") || media_type == "application/json" {
+    if media_type.starts_with("text/")
+        || media_type == "application/json"
+        || media_type.ends_with("+json")
+        || matches!(
+            media_type.as_str(),
+            "application/xml" | "application/xhtml+xml"
+        )
+    {
         Ok(media_type)
     } else {
         Err(refused(format!(
@@ -969,295 +964,118 @@ fn utf8_suffix_len(text: &str, max_bytes: usize) -> usize {
 /// Reduces an HTML document to readable text (decision 5): script/style/nav
 /// and other chrome are DROPPED with their content, headings keep a `#`
 /// prefix, list items a `-` marker, links keep their href, pre/code content
-/// keeps its whitespace, and entities decode minimally. Deliberately small
-/// and dependency-free — a reduction, not a rendering.
+/// keeps its whitespace, and entities decode minimally through the shared
+/// dependency-free extractor.
 #[must_use]
 pub fn reduce_html_to_text(html: &str) -> String {
-    /// Elements whose entire CONTENT is dropped.
-    const DROP_CONTENT: &[&str] = &[
-        "script", "style", "noscript", "template", "svg", "head", "nav", "iframe", "object",
-    ];
-    /// Elements that force a line break around themselves.
-    const BLOCK: &[&str] = &[
-        "p",
-        "div",
-        "section",
-        "article",
-        "header",
-        "footer",
-        "main",
-        "aside",
-        "table",
-        "tr",
-        "ul",
-        "ol",
-        "blockquote",
-        "form",
-        "figure",
-        "figcaption",
-        "details",
-        "summary",
-    ];
+    haider_webextract::extract(html, "").markdown
+}
 
-    let mut output = String::new();
-    let mut chars = html.char_indices().peekable();
-    let mut drop_stack: Vec<String> = Vec::new();
-    let mut pre_depth = 0usize;
-    let mut pending_href: Option<String> = None;
+/// Reduces structured responses before they enter the durable tool result.
+/// HTML and XML use the shared readable-content extractor; JSON is rendered
+/// as concise key/value lines so field names and array members remain visible
+/// without shipping punctuation and nesting whitespace to the model.
+fn reduce_response_body(content_type: &str, bytes: &[u8], url: &str) -> String {
+    let body = String::from_utf8_lossy(bytes);
+    match content_type {
+        "text/html" | "application/xml" | "text/xml" | "application/xhtml+xml" => {
+            haider_webextract::extract(&body, url).markdown
+        }
+        "application/json" | "application/ld+json" => reduce_json_to_text(&body),
+        _ => body.into_owned(),
+    }
+}
 
-    while let Some((index, character)) = chars.next() {
-        if character != '<' {
-            if drop_stack.is_empty() {
-                push_text(&mut output, character, pre_depth > 0);
+fn reduce_json_to_text(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_owned();
+    };
+    let mut lines = Vec::new();
+    render_json_value(&value, None, 0, &mut lines);
+    if lines.is_empty() {
+        body.to_owned()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn render_json_value(
+    value: &serde_json::Value,
+    key: Option<&str>,
+    depth: usize,
+    lines: &mut Vec<String>,
+) {
+    const MAX_DEPTH: usize = 12;
+    let prefix = "  ".repeat(depth.min(MAX_DEPTH));
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(key) = key {
+                lines.push(format!("{prefix}{key}:"));
             }
-            continue;
-        }
-        // Comments (and CDATA/doctype noise) skip to their terminator.
-        let rest = &html[index..];
-        if rest.starts_with("<!--") {
-            let end = html[index..].find("-->").map(|offset| index + offset + 3);
-            skip_until(&mut chars, end);
-            continue;
-        }
-        if rest.starts_with("<!") || rest.starts_with("<?") {
-            let end = html[index..].find('>').map(|offset| index + offset + 1);
-            skip_until(&mut chars, end);
-            continue;
-        }
-        let Some(end) = tag_end(html, index) else {
-            break; // Unterminated tag: everything after is markup noise.
-        };
-        let tag = &html[index + 1..end];
-        skip_until(&mut chars, Some(end + 1));
-        let closing = tag.starts_with('/');
-        let name = tag
-            .trim_start_matches('/')
-            .split(|character: char| character.is_ascii_whitespace() || character == '/')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if name.is_empty() {
-            continue;
-        }
-        if DROP_CONTENT.contains(&name.as_str()) {
-            if closing {
-                if let Some(position) = drop_stack.iter().rposition(|open| *open == name) {
-                    drop_stack.truncate(position);
-                }
-            } else if !tag.ends_with('/') && drop_stack.len() < MAX_DROP_STACK_DEPTH {
-                // H2: opens past the depth cap are IGNORED — the stack is still
-                // non-empty so content stays dropped, but the O(1) close bound
-                // holds. Never let a hostile page grow this scan unboundedly.
-                drop_stack.push(name);
+            for (child_key, child) in object {
+                render_json_value(
+                    child,
+                    Some(child_key),
+                    depth + usize::from(key.is_some()),
+                    lines,
+                );
             }
-            continue;
         }
-        if !drop_stack.is_empty() {
-            continue;
-        }
-        match name.as_str() {
-            "br" => output.push('\n'),
-            "pre" => {
-                if closing {
-                    pre_depth = pre_depth.saturating_sub(1);
-                } else {
-                    pre_depth += 1;
-                }
-                ensure_break(&mut output);
+        serde_json::Value::Array(items) => {
+            if let Some(key) = key {
+                lines.push(format!("{prefix}{key}:"));
             }
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                ensure_break(&mut output);
-                if !closing {
-                    let level = name.as_bytes()[1] - b'0';
-                    for _ in 0..level {
-                        output.push('#');
-                    }
-                    output.push(' ');
+            for item in items {
+                let before = lines.len();
+                render_json_value(item, None, depth + usize::from(key.is_some()) + 1, lines);
+                if lines.len() == before {
+                    lines.push(format!("{prefix}- {item}"));
+                } else if let Some(line) = lines.get_mut(before) {
+                    line.insert_str(0, &format!("{prefix}- "));
                 }
             }
-            "li" => {
-                if !closing {
-                    ensure_break(&mut output);
-                    output.push_str("- ");
-                } else {
-                    ensure_break(&mut output);
-                }
-            }
-            "td" | "th" if closing && !output.ends_with(char::is_whitespace) => {
-                output.push(' ');
-            }
-            "a" => {
-                if closing {
-                    if let Some(href) = pending_href.take()
-                        && (href.starts_with("http://") || href.starts_with("https://"))
-                    {
-                        output.push_str(" (");
-                        output.push_str(&href);
-                        output.push(')');
-                    }
-                } else {
-                    pending_href = attribute_value(tag, "href").map(decode_entities);
-                }
-            }
-            _ if BLOCK.contains(&name.as_str()) => ensure_break(&mut output),
-            _ => {}
+        }
+        serde_json::Value::String(text) => {
+            lines.push(format!("{prefix}{}: {text}", key.unwrap_or("value")));
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            lines.push(format!("{prefix}{}: {value}", key.unwrap_or("value")));
         }
     }
-
-    collapse_blank_runs(&output)
-}
-
-fn tag_end(html: &str, start: usize) -> Option<usize> {
-    let mut quote: Option<char> = None;
-    for (offset, character) in html[start..].char_indices() {
-        match (quote, character) {
-            (None, '"' | '\'') => quote = Some(character),
-            (Some(open), _) if character == open => quote = None,
-            (None, '>') => return Some(start + offset),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn skip_until(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, end: Option<usize>) {
-    match end {
-        Some(end) => {
-            while chars.peek().is_some_and(|(index, _)| *index < end) {
-                chars.next();
-            }
-        }
-        None => while chars.next().is_some() {},
-    }
-}
-
-fn attribute_value(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let position = lower.find(name)?;
-    let rest = tag[position + name.len()..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let mut characters = rest.chars();
-    match characters.next()? {
-        quote @ ('"' | '\'') => {
-            let rest = &rest[1..];
-            let end = rest.find(quote)?;
-            Some(rest[..end].to_owned())
-        }
-        _ => Some(
-            rest.split(|character: char| character.is_ascii_whitespace() || character == '>')
-                .next()
-                .unwrap_or_default()
-                .to_owned(),
-        ),
-    }
-}
-
-fn push_text(output: &mut String, character: char, preformatted: bool) {
-    if preformatted {
-        output.push(character);
-        return;
-    }
-    if character.is_whitespace() {
-        if !output.is_empty() && !output.ends_with(char::is_whitespace) {
-            output.push(' ');
-        }
-        return;
-    }
-    if character == '&' {
-        // Entities are decoded in a later pass over collected text; push the
-        // raw character here — `collapse_blank_runs` runs `decode_entities`.
-        output.push('&');
-        return;
-    }
-    output.push(character);
-}
-
-fn ensure_break(output: &mut String) {
-    while output.ends_with(' ') {
-        output.pop();
-    }
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
-    }
-}
-
-fn decode_entities(text: impl AsRef<str>) -> String {
-    let text = text.as_ref();
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(position) = rest.find('&') {
-        output.push_str(&rest[..position]);
-        rest = &rest[position..];
-        // H3: scan for the terminating ';' within the first 12 bytes WITHOUT
-        // a raw byte slice — `rest[..12]` can fall mid-codepoint (`&aaaa…é;`)
-        // and panic. `char_indices` never yields a non-boundary index, and
-        // ';' is ASCII so its index equals its byte offset.
-        let Some(end) = rest
-            .char_indices()
-            .take_while(|(index, _)| *index < 12)
-            .find(|(_, character)| *character == ';')
-            .map(|(index, _)| index)
-        else {
-            output.push('&');
-            rest = &rest[1..];
-            continue;
-        };
-        let entity = &rest[1..end];
-        let decoded = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some(' '),
-            _ => entity
-                .strip_prefix('#')
-                .and_then(|number| {
-                    number.strip_prefix('x').map_or_else(
-                        || number.parse::<u32>().ok(),
-                        |hex| u32::from_str_radix(hex, 16).ok(),
-                    )
-                })
-                .and_then(char::from_u32),
-        };
-        match decoded {
-            Some(decoded) => {
-                output.push(decoded);
-                rest = &rest[end + 1..];
-            }
-            None => {
-                output.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    output.push_str(rest);
-    output
-}
-
-fn collapse_blank_runs(text: &str) -> String {
-    let decoded = decode_entities(text);
-    let mut output = String::with_capacity(decoded.len());
-    let mut blank_lines = 0usize;
-    for line in decoded.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            blank_lines += 1;
-            if blank_lines > 1 {
-                continue;
-            }
-        } else {
-            blank_lines = 0;
-        }
-        output.push_str(trimmed);
-        output.push('\n');
-    }
-    let trimmed = output.trim_matches('\n');
-    trimmed.to_owned()
 }
 
 fn refused(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
+}
+
+#[cfg(test)]
+mod structured_reduction_tests {
+    use super::reduce_response_body;
+
+    #[test]
+    fn json_reduction_keeps_fields_without_wire_punctuation() {
+        let reduced = reduce_response_body(
+            "application/json",
+            br#"{"title":"Rust","items":[{"name":"ownership"},{"name":"borrowing"}]}"#,
+            "",
+        );
+        assert!(reduced.contains("title: Rust"));
+        assert!(reduced.contains("- name: ownership"));
+        assert!(reduced.contains("- name: borrowing"));
+        assert!(!reduced.contains("{\"title\""));
+    }
+
+    #[test]
+    fn xml_reduction_uses_readable_extraction() {
+        let reduced = reduce_response_body(
+            "application/xml",
+            br#"<feed><nav>ignore</nav><entry><p>Release</p><p>Stable</p></entry></feed>"#,
+            "",
+        );
+        assert!(reduced.contains("Release"));
+        assert!(reduced.contains("Stable"));
+        assert!(!reduced.contains("ignore"));
+    }
 }
 
 #[cfg(test)]
