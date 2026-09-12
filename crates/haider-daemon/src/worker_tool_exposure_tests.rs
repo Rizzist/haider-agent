@@ -493,9 +493,12 @@ fn capability_profile_packs_match_golden_and_report_estimator_delta() {
     if std::env::var_os("HAIDER_UPDATE_CAPABILITY_GOLDEN").is_some() {
         std::fs::write(&path, &actual).expect("write golden");
     }
+    let expected = std::fs::read_to_string(path).expect("checked-in profile golden");
     assert_eq!(
         actual,
-        std::fs::read_to_string(path).expect("checked-in profile golden")
+        expected,
+        "capability profile golden mismatch\n{}",
+        bounded_unified_diff(&expected, &actual)
     );
     let coding = estimate_provider_request_input_tokens(&[], &system, &packs["coding"], &[]);
     let automation =
@@ -504,6 +507,56 @@ fn capability_profile_packs_match_golden_and_report_estimator_delta() {
         automation < coding,
         "fewer schema bytes must reduce the repository estimate"
     );
+}
+
+/// Keep a future golden failure useful even when the JSON is large. This is a
+/// deliberately small line diff rather than a second platform-sensitive
+/// dependency: the complete candidate and fixture remain available locally,
+/// while CI gets the first bounded set of changed lines.
+fn bounded_unified_diff(expected: &str, actual: &str) -> String {
+    const MAX_LINES: usize = 80;
+    let expected_lines = expected.lines().collect::<Vec<_>>();
+    let actual_lines = actual.lines().collect::<Vec<_>>();
+    let mut diff = String::from("--- golden\n+++ runtime\n");
+    let mut emitted = 0;
+    for (index, (golden, runtime)) in expected_lines
+        .iter()
+        .zip(actual_lines.iter())
+        .enumerate()
+    {
+        if golden == runtime {
+            continue;
+        }
+        if emitted >= MAX_LINES {
+            diff.push_str("... diff truncated ...\n");
+            break;
+        }
+        diff.push_str(&format!("@@ line {} @@\n-{}\n+{}\n", index + 1, golden, runtime));
+        emitted += 1;
+    }
+    if emitted < MAX_LINES && expected_lines.len() != actual_lines.len() {
+        let start = expected_lines.len().min(actual_lines.len());
+        for (offset, line) in expected_lines[start..].iter().enumerate() {
+            if emitted >= MAX_LINES {
+                diff.push_str("... diff truncated ...\n");
+                break;
+            }
+            diff.push_str(&format!("@@ line {} @@\n-{}\n+\n", start + offset + 1, line));
+            emitted += 1;
+        }
+        for (offset, line) in actual_lines[start..].iter().enumerate() {
+            if emitted >= MAX_LINES {
+                diff.push_str("... diff truncated ...\n");
+                break;
+            }
+            diff.push_str(&format!("@@ line {} @@\n-\n+{}\n", start + offset + 1, line));
+            emitted += 1;
+        }
+    }
+    if emitted == 0 {
+        diff.push_str("(only newline formatting differs)\n");
+    }
+    diff
 }
 
 #[test]
@@ -541,6 +594,13 @@ fn capability_profile_variants_only_change_windows_process_descriptions() {
         (fixture, descriptions.len(), descriptions)
     }
 
+    // The only platform-conditioned pack field is the process_exec command
+    // schema description (`worker.rs:21882-21886`, #[cfg(unix)]/#[cfg(windows)]).
+    // `fs_read`'s column field and wording are unconditional manifest/manual
+    // content (`haider-tools/src/filesystem.rs:399-417`), so they must remain
+    // byte-identical. `computer_manifest` is platform-described too
+    // (`haider-tools/src/computer.rs:727-735`) but none of the four profiles
+    // advertises `computer` (`haider-core/src/tool_exposure.rs:5-60`).
     let (shared, shared_count, shared_descriptions) =
         normalized_fixture("capability_profiles.json");
     let (windows, windows_count, windows_descriptions) =
@@ -565,7 +625,7 @@ fn capability_profile_variants_only_change_windows_process_descriptions() {
     );
     assert_eq!(
         shared, windows,
-        "fixtures may diverge only in process_exec descriptions"
+        "fixtures may diverge only in the cfg-gated process_exec command description"
     );
 }
 
