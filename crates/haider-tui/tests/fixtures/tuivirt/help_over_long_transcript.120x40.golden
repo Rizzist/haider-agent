@@ -1,0 +1,81 @@
+# tuivirt golden · help_over_long_transcript · 120x40
+00|help  esc closes                                                                                                        |
+   ~ Rgb(217, 181, 68)/Rgb(25, 25, 25)/NONE×4; Rgb(58, 58, 58)/Rgb(25, 25, 25)/NONE×12; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×104
+01|commands                                                                                                                |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×8; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×112
+02|menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:                                |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×88; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×32
+03|  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web                                |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×88; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×32
+04|keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pi|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×120
+05|tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|default|verbose] · /tasks [more] · ⌃O expands o|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×120
+06|  ⏎/space or click cycles the focused row (collapsed → bounded → show all) · ⇟/⇞ page a bounded row · also ⌥T ⌥N ⌥P ⌥V ⌥|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×120
+07|  /reconnect  Reconnect to the daemon and resume from applied cursors                                                   |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×69; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×51
+08|  /model [query]  Pick a model — every provider, full-screen search                                                     |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×67; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×53
+09|  /provider [name]  Switch provider — the model follows                                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×55; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×65
+10|  /effort [level|default]  Reasoning effort — bare /effort opens the ladder picker                                      |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×82; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×38
+11|  /fast  Toggle fast mode (supported pairs only)                                                                        |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×48; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×72
+12|  /theme [system·light·dark·desert·oasis]  Change the theme — bare /theme opens the picker                              |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×90; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×30
+13|  /tree  Open the session tree — jump to or fork any node                                                               |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×57; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×63
+14|  /fork  Fork the session at the current point                                                                          |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×46; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×74
+15|  /branch [new|name]  Branches — list and switch; `new` forks at the last committed node                                |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×88; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×32
+16|  /undo [last|id]  Undo the latest durable file checkpoint                                                              |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×58; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×62
+17|  /redo [last|id]  Redo the latest undone file checkpoint                                                               |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×57; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×63
+18|  /checkpoints  List durable file checkpoints for this branch                                                           |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×61; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×59
+19|  /rollback [current|previous|run-id]  Roll back every file edit from one turn                                          |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×78; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×42
+20|  /attach <path>  Attach a file — image or UTF-8 text, uploaded now, rides your next message                            |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×92; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×28
+21|  /sessions  List sessions — attach, or start fresh                                                                     |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×51; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×69
+22|  /aura  Aura Mode — a voice/orchestrator session (spawns sessions, never codes)                                        |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×40
+23|  /peer <name> <message>  List live peers or send: /peer <name> <message>                                               |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×73; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×47
+24|  /ssh [scope all|none|name,…|shell name]  SSH profiles — list, scope, or open a remote shell                           |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×93; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×27
+25|  /shells  List local and SSH terminal sessions                                                                         |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×47; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×73
+26|  /monitors  Existing session monitor details                                                                           |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×45; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×75
+27|  /accounts  Accounts — provider credentials (OAuth / API), pick the active one                                         |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×79; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×41
+28|  /account <alias>  Switch the active account for its provider                                                          |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×62; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×58
+29|  /providers  Providers — registry truth: endpoints, models, defaults, health                                           |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×77; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×43
+30|  /usage [provider]  Usage — cross-provider limit meters, costs, local stats                                            |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×76; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×44
+31|  /login <provider> <oauth|api>  Add a provider account                                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×55; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×65
+32|  /clear  Clear back to the main screen; typing there starts a new session                                              |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×74; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×46
+33|  /back  Back to the main screen — same as /clear                                                                       |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×49; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×71
+34|  /compact  Compact context now — history stays in the tree                                                             |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×59; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×61
+35|  /tokens  Token panel — context by model (also ⌃G)                                                                     |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×51; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×69
+36|  /history [number]  Recall durable prompts — newest first (also esc esc)                                               |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×73; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×47
+37|  /hooks  Hooks — review and trust third-party hooks                                                                    |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×52; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×68
+38|  /voice  Voice — enable and pick STT / TTS providers                                                                   |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×53; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×67
+39| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                        |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×78

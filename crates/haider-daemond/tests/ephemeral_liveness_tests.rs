@@ -315,6 +315,41 @@ fn wait_for_cleanup(
     }
 }
 
+/// Peer delivery deliberately keeps a daemon's `ph-*.j` registration after
+/// its endpoint shuts down so another resident can queue bounded offline work.
+/// The monitor wake path creates that registration; assert daemon-owned
+/// artifacts are gone while allowing the peer contract's durable manifest.
+fn wait_for_cleanup_preserving_peer_registration(
+    runtime: &tokio::runtime::Runtime,
+    profile: &ResolvedProfile,
+    mut child: Option<&mut ChildGuard>,
+    daemon_pid: Option<u32>,
+) {
+    wait_until(
+        runtime,
+        profile,
+        "ephemeral daemon runtime cleanup with peer registration",
+        || {
+            !pid_path(profile).exists()
+                && !profile.endpoint_path.exists()
+                && std::fs::read_dir(&profile.runtime_dir).is_ok_and(|entries| {
+                    entries.flatten().all(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with("ph-") && name.ends_with(".j"))
+                    })
+                })
+        },
+        || {
+            process_snapshot(profile, child.as_deref_mut(), daemon_pid)
+                .observation("pid_file_absent", !pid_path(profile).exists())
+                .observation("endpoint_absent", !profile.endpoint_path.exists())
+                .observation("runtime_dir_exists", profile.runtime_dir.exists())
+        },
+    );
+}
+
 #[cfg(unix)]
 fn process_has_exited(pid: u32) -> bool {
     let raw = i32::try_from(pid).expect("daemon pid fits Unix pid_t");
@@ -935,7 +970,12 @@ fn active_monitor_holds_ephemeral_daemon_until_expiry() {
     );
     assert!(pid_path(&profile).exists());
 
-    wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
+    wait_for_cleanup_preserving_peer_registration(
+        &runtime,
+        &profile,
+        Some(&mut helper),
+        Some(daemon_pid),
+    );
 }
 
 /// S3(d): one runtime root may contain many profiles, but every writable

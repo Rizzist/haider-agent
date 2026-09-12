@@ -488,7 +488,10 @@ async fn peer_event_route_excludes_an_attached_legacy_connection() {
             .expect("attach peer route connection");
     }
     opted
-        .request(RequestId::new("peer-opt-in"), RequestBody::PeerList {})
+        .request(
+            RequestId::new("peer-opt-in"),
+            RequestBody::PeerList { status: None },
+        )
         .await
         .expect("opt into peer event family");
 
@@ -496,6 +499,7 @@ async fn peer_event_route_excludes_an_attached_legacy_connection() {
         &session_id,
         WireFrame::PeerDeliveryChanged {
             receipt: PeerReceipt {
+                status: None,
                 msg_id: "msg-route".into(),
                 delivery: PeerDelivery::Delivered,
                 reason: None,
@@ -560,7 +564,7 @@ fn retired_peer_persistence_surfaces_are_absent() {
 }
 
 #[cfg(unix)]
-async fn live_peer_fixture(
+pub(crate) async fn live_peer_fixture(
     root: &std::path::Path,
     runtime: &std::path::Path,
     id: &str,
@@ -594,6 +598,36 @@ async fn live_peer_fixture(
     })
     .await
     .expect("live session");
+    // A create-command replay does not resume a historical actor. Reconnect
+    // through the real attachment door when reopening the fixture store.
+    let sink = std::sync::Arc::new(PeerEventSink::default());
+    let connection = hub
+        .open_connection(
+            [haider_rpc::Capability::View].into(),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("resume connection");
+    connection
+        .request(
+            haider_rpc::RequestId::new("resume-peer"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: SessionId::new(id),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::View,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("resume peer attachment");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        haider_rpc::WireFrame::Response {
+            body: haider_rpc::ResponseBody::SessionAttach { .. },
+            ..
+        }
+    )));
+    connection.close().await.expect("detach fixture connection");
     let service = super::peer::PeerService::start(runtime.to_path_buf(), &hub)
         .await
         .expect("peer service");

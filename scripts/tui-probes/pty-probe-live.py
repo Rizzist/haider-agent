@@ -395,9 +395,18 @@ try:
     #    turn but never left the front door passes check 4 and fails here.
     #    (It replaces a check that OR-ed `got_reply` into itself and so could
     #    not fail at all — design review D1-3.)
-    tail = sink[0][before_submit:]
+    # The shared bottom band keeps both placeholders on the SAME row.
+    # Ratatui can retain their common spaces and emit `message`, a cursor
+    # move, then `haider`: a correct screen need not contain the contiguous
+    # substring in its incremental bytes. Inspect a full repaint, just as
+    # the pending-card checks below do, without substituting the reply for
+    # the independent session-surface witness.
+    session_screen = repaint(fd, pump, sink)
     checks.append(
-        ("the launcher gave way to the daemon's session surface", b"message haider" in tail)
+        (
+            "the launcher gave way to the daemon's session surface",
+            b"message haider" in session_screen,
+        )
     )
 
     # 5b. §6.4: "a second terminal attaches to the same session and sees

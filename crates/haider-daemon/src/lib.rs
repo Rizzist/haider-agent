@@ -71,6 +71,7 @@ mod binary_upload;
 mod cache_policy;
 #[cfg(test)]
 mod cache_policy_tests;
+mod completion;
 mod config;
 mod connection;
 #[cfg(test)]
@@ -85,6 +86,7 @@ mod endpoint;
 #[path = "endpoint_tests.rs"]
 mod endpoint_tests;
 mod error;
+mod foreground_capture;
 mod gcloud;
 mod haider_code_plan;
 #[cfg(test)]

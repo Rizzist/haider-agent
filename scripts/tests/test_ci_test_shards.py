@@ -12,7 +12,8 @@ SCRIPT = ROOT / 'scripts/ci-test.sh'
 EXPECTED = {'haider-platform', 'haider-protocol', 'haider-accounts', 'haider-core',
             'haider-pdf', 'haider-provider', 'haider-daemon', 'haider-daemond',
             'haider-rpc', 'haider-tui', 'haider-tui-exe', 'haider-cli', 'haider-compat',
-            'haider-store', 'haider-tools', 'haider-client', 'haider-verify', 'haider-stt', 'xtask'}
+            'haider-store', 'haider-tools', 'haider-client', 'haider-verify', 'haider-webextract',
+            'haider-stt', 'xtask'}
 
 
 @unittest.skipUnless(

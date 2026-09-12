@@ -1,0 +1,332 @@
+{
+  "anthropic": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "watch the file",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "id": "registration",
+            "input": {},
+            "name": "monitor",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "Monitor started",
+            "tool_use_id": "registration",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "id": "pending",
+            "input": {},
+            "name": "inspect",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "No result is available for this call at the input boundary; do not assume execution succeeded.",
+            "tool_use_id": "pending",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "<monitor-event monitor=\"monitor-fixture\" source=\"file\" occurrence=\"once\">\n```json\n{\"type\":\"monitor_event\",\"payload\":\"file changed\"}\n```\n</monitor-event>",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-fable-5-1",
+    "stream": true
+  },
+  "anthropic_oauth": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "watch the file",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "id": "registration",
+            "input": {},
+            "name": "monitor",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "Monitor started",
+            "tool_use_id": "registration",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "id": "pending",
+            "input": {},
+            "name": "inspect",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "No result is available for this call at the input boundary; do not assume execution succeeded.",
+            "tool_use_id": "pending",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "<monitor-event monitor=\"monitor-fixture\" source=\"file\" occurrence=\"once\">\n```json\n{\"type\":\"monitor_event\",\"payload\":\"file changed\"}\n```\n</monitor-event>",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-fable-5-1",
+    "stream": true,
+    "system": [
+      {
+        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "type": "text"
+      }
+    ]
+  },
+  "chat": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "watch the file",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{}",
+              "name": "monitor"
+            },
+            "id": "registration",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "Monitor started",
+        "role": "tool",
+        "tool_call_id": "registration"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{}",
+              "name": "inspect"
+            },
+            "id": "pending",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "No result is available for this call at the input boundary; do not assume execution succeeded.",
+        "role": "tool",
+        "tool_call_id": "pending"
+      },
+      {
+        "content": [
+          {
+            "text": "<monitor-event monitor=\"monitor-fixture\" source=\"file\" occurrence=\"once\">\n```json\n{\"type\":\"monitor_event\",\"payload\":\"file changed\"}\n```\n</monitor-event>",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "gpt-5",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "gemini": {
+    "contents": [
+      {
+        "parts": [
+          {
+            "text": "watch the file"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "parts": [
+          {
+            "functionCall": {
+              "args": {},
+              "name": "monitor"
+            }
+          }
+        ],
+        "role": "model"
+      },
+      {
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "monitor",
+              "response": {
+                "result": "Monitor started",
+                "truncated": false
+              }
+            }
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "parts": [
+          {
+            "functionCall": {
+              "args": {},
+              "name": "inspect"
+            }
+          }
+        ],
+        "role": "model"
+      },
+      {
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "inspect",
+              "response": {
+                "result": "No result is available for this call at the input boundary; do not assume execution succeeded.",
+                "truncated": false
+              }
+            }
+          },
+          {
+            "text": "<monitor-event monitor=\"monitor-fixture\" source=\"file\" occurrence=\"once\">\n```json\n{\"type\":\"monitor_event\",\"payload\":\"file changed\"}\n```\n</monitor-event>"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 4096
+    }
+  },
+  "openai": {
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "input": [
+      {
+        "content": [
+          {
+            "text": "watch the file",
+            "type": "input_text"
+          }
+        ],
+        "role": "user",
+        "type": "message"
+      },
+      {
+        "arguments": "{}",
+        "call_id": "registration",
+        "name": "monitor",
+        "type": "function_call"
+      },
+      {
+        "call_id": "registration",
+        "output": "Monitor started",
+        "type": "function_call_output"
+      },
+      {
+        "arguments": "{}",
+        "call_id": "pending",
+        "name": "inspect",
+        "type": "function_call"
+      },
+      {
+        "call_id": "pending",
+        "output": "No result is available for this call at the input boundary; do not assume execution succeeded.",
+        "type": "function_call_output"
+      },
+      {
+        "content": [
+          {
+            "text": "<monitor-event monitor=\"monitor-fixture\" source=\"file\" occurrence=\"once\">\n```json\n{\"type\":\"monitor_event\",\"payload\":\"file changed\"}\n```\n</monitor-event>",
+            "type": "input_text"
+          }
+        ],
+        "role": "user",
+        "type": "message"
+      }
+    ],
+    "max_output_tokens": 4096,
+    "model": "gpt-5",
+    "reasoning": {
+      "summary": "auto"
+    },
+    "store": false,
+    "stream": true
+  }
+}

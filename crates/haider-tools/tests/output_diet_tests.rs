@@ -268,3 +268,46 @@ fn head_tail_elision_is_deterministic_utf8_safe_and_tail_weighted() {
     assert!(elision.get("tokens_before_estimate").is_none());
     assert!(elision.get("token_estimation_method").is_none());
 }
+
+#[test]
+fn orchestration_sized_plain_output_survives_and_larger_streams_disclose_exact_bytes() {
+    let text = (0..500)
+        .map(|i| format!("handoff row {i}: ordinary orchestration evidence\n"))
+        .collect::<String>();
+    assert!(text.len() > 8 * 1024);
+    assert!(text.len() < REDUCED_TOOL_OUTPUT_MAX_BYTES);
+    assert_eq!(reduce_tool_output("process_exec", &text, false).text, text);
+    let text = (0..5000)
+        .map(|i| format!("handoff row {i}: ordinary orchestration evidence\n"))
+        .collect::<String>();
+    let reduced = reduce_tool_output("process_exec", &text, false);
+    assert!(reduced.text.len() <= REDUCED_TOOL_OUTPUT_MAX_BYTES);
+    assert!(reduced.text.starts_with("handoff row 0:"));
+    assert!(
+        reduced
+            .text
+            .ends_with("handoff row 4999: ordinary orchestration evidence\n")
+    );
+    let marker: serde_json::Value = reduced
+        .text
+        .lines()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .expect("elision marker");
+    let marker = &marker["haider_elision_v1"];
+    assert_eq!(marker["omitted_bytes_exact"], true);
+    assert_eq!(
+        marker["omitted_bytes"].as_u64().expect("omitted")
+            + marker["retained_head_bytes"].as_u64().expect("head")
+            + marker["retained_tail_bytes"].as_u64().expect("tail"),
+        text.len() as u64
+    );
+}
+
+#[test]
+fn default_capture_paging_uses_half_the_request_tranche() {
+    let budget = haider_protocol::request_budget::RequestBudgetV1::default();
+    let capture = haider_tools::ProcessBounds::default().max_output_bytes;
+    let pages = capture.div_ceil(haider_tools::ORCHESTRATION_PREVIEW_MAX_BYTES);
+    assert_eq!(pages * 2, budget.tranche);
+    assert_eq!(pages * 4, budget.hard_cap);
+}

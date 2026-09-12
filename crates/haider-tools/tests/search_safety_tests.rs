@@ -279,7 +279,7 @@ async fn search_and_read_redact_without_spilling_inline_results() {
     fs::write(root.path().join("three-kib.txt"), &three_kib).expect("3 KiB fixture");
     fs::write(
         root.path().join("embedded-key.txt"),
-        "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+        "-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
     )
     .expect("embedded key");
     let mut broker = broker(root.path(), 2);
@@ -349,7 +349,12 @@ async fn search_and_read_redact_without_spilling_inline_results() {
         )
         .await
         .expect("3 KiB read");
-    assert_eq!(plain.preview, three_kib);
+    let numbered: String = three_kib
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(index, line)| format!("{}: {line}", index + 1))
+        .collect();
+    assert_eq!(plain.preview, numbered);
     assert!(plain.artifact.is_none());
 
     let ranged = broker
@@ -481,4 +486,39 @@ fn typed_reason_names_remain_wire_stable() {
         serde_json::to_string(&ToolTruncationReason::TimeBudget).expect("serialize"),
         "\"time_budget\""
     );
+}
+
+#[tokio::test]
+async fn search_tail_matches_keep_multiline_quote_state_before_context_selection() {
+    let root = tempfile::tempdir().expect("root");
+    fs::create_dir(root.path().join(".git")).expect("git marker");
+    let mut broker = broker(root.path(), 2);
+    let mut cas = RecordingCas::default();
+    for quote in ['\'', '"'] {
+        for newline in ["\n", "\r\n", "\\\n", "\\\r\n"] {
+            fs::write(
+                root.path().join("multiline.txt"),
+                format!("password={quote}abc{newline}SYNTHETICTAIL987{quote} after\npublic\n"),
+            )
+            .expect("fixture");
+            let result = broker
+                .fs_search(
+                    &FsSearch::new(".", "SYNTHETICTAIL987"),
+                    &allow_read(),
+                    &mut cas,
+                    ResultBounds::default(),
+                )
+                .await
+                .expect("search tail");
+            assert!(!result.preview.contains("SYNTHETICTAIL987"));
+            let Some(ToolResultData::FsSearch { matches, .. }) = result.data else {
+                panic!("typed search data");
+            };
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].line, 2);
+            assert_eq!(matches[0].text, "[REDACTED:secret_value] after");
+            assert!(result.artifact.is_none());
+            assert!(cas.0.is_empty());
+        }
+    }
 }

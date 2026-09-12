@@ -133,6 +133,79 @@ pub struct PeerReceipt {
     pub delivery: PeerDelivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<PeerDeliveryReason>,
+    /// Durable sender status; absent on legacy admission-only receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<PeerReceiptStatus>,
+}
+
+/// Sender transport state. Delivered means durable receiver admission,
+/// including its busy turn queue; it never acknowledges a model action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDeliveryState {
+    Accepted,
+    Held,
+    HeldForApproval,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerReceiptStatus {
+    pub state: PeerDeliveryState,
+    /// Stable sender address for sender-scoped message IDs. Legacy receipts
+    /// without this field cannot be correlated to a transcript peer row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Bounded diagnostic, including the connect/refusal reason when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub to: String,
+    pub accepted_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Additive options on peer.send. Reuse a caller-selected msg_id after a
+/// lost reply; a different payload with that ID is refused. Cancellation is
+/// terminal only before confirmed receiver admission, not a recall.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerSendOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel: bool,
+}
+
+/// A bounded journal replay through the existing peer.list method. The
+/// cursor is the sender session journal sequence, not an in-memory index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStatusQuery {
+    pub session_id: crate::ids::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    #[serde(default)]
+    pub after_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStatusPage {
+    pub receipts: Vec<PeerReceipt>,
+    pub next_seq: u64,
+    pub has_more: bool,
+}
+
+/// Sender journal authority, independent of runtime socket liveness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerOutboxEntry {
+    pub message: PeerMessage,
+    pub target: PeerDescriptor,
+    /// Daemon outbox order, allocated under the send lock and committed with
+    /// the entry. Pending entries retain this order across timestamp ties,
+    /// clock changes, sender sessions and daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueue_order: Option<u64>,
 }
 
 /// Transcript message. The old timing fields are retained for decoding

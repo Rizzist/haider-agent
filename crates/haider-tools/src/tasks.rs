@@ -373,7 +373,7 @@ impl EffectBroker {
 /// reads and the completion artifact, a rolling tail preview, and a total
 /// byte counter. Output beyond the cap is dropped — never buffered — so
 /// memory stays bounded while the task keeps running.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskOutputBuffer {
     original_hasher: sha2::Sha256,
     retained: Vec<u8>,
@@ -381,6 +381,75 @@ pub struct TaskOutputBuffer {
     tail: VecDeque<u8>,
     tail_cap: usize,
     total: u64,
+    captured: u64,
+    progress_stdout: TaskProgressLine,
+    progress_stderr: TaskProgressLine,
+    progress_stream: Option<OutputStream>,
+    pending_lines: [crate::OutputRedactor; 2],
+}
+
+/// Parse complete lines before redacting: chunk boundaries and rolling-tail
+/// eviction must never expose a token suffix or lose PEM redaction state.
+#[derive(Clone, Debug, Default)]
+struct TaskProgressLine {
+    pending: Vec<u8>,
+    overflow: bool,
+    raw_state: crate::redact::RedactionState,
+    state: crate::redact::RedactionState,
+    last: Option<String>,
+}
+
+impl TaskProgressLine {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        let mut completed = false;
+        for byte in bytes {
+            if *byte == b'\n' {
+                completed = true;
+                if self.overflow {
+                    self.last = None;
+                    // A discarded line could contain a PEM opening marker or an
+                    // unfinished quoted value. Stay redacted until an explicit
+                    // delimiter arrives.
+                    self.state.discard_oversized_line();
+                    self.raw_state.discard_oversized_line();
+                } else {
+                    let raw = String::from_utf8_lossy(&self.pending);
+                    // Normalization can hide a PEM marker inside an OSC payload.
+                    // Keep raw and displayed redaction state independently, so
+                    // either representation can protect following lines.
+                    let raw_safe = crate::redact::redact_line_with_state(&raw, &mut self.raw_state);
+                    let line: String = crate::shell::strip_ansi(&raw)
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .collect();
+                    let normalized_safe =
+                        crate::redact::redact_line_with_state(&line, &mut self.state);
+                    let mut safe = if raw_safe.replacements == 0 {
+                        normalized_safe.text
+                    } else if raw_safe.text == "[REDACTED:private_key]" {
+                        raw_safe.text
+                    } else {
+                        // Escape removal must not expose a suffix of a token
+                        // that was recognized only in the raw representation.
+                        "[REDACTED:task_line]".into()
+                    };
+                    let mut end = safe.len().min(256);
+                    while !safe.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    safe.truncate(end);
+                    self.last = Some(safe);
+                }
+                self.pending.clear();
+                self.overflow = false;
+            } else if self.pending.len() < 4096 {
+                self.pending.push(*byte);
+            } else {
+                self.overflow = true;
+            }
+        }
+        completed
+    }
 }
 
 impl TaskOutputBuffer {
@@ -393,10 +462,57 @@ impl TaskOutputBuffer {
             tail: VecDeque::new(),
             tail_cap,
             total: 0,
+            captured: 0,
+            progress_stdout: TaskProgressLine::default(),
+            progress_stderr: TaskProgressLine::default(),
+            progress_stream: None,
+            pending_lines: Default::default(),
         }
     }
 
+    /// Live reads include a redacted snapshot of unfinished lines. Keep those
+    /// views separate from committed bytes so a later token suffix cannot
+    /// freeze an unclassified fragment into the completion journal or CAS.
+    #[must_use]
+    pub fn live_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.finish_streams();
+        snapshot
+    }
+
     pub fn append(&mut self, bytes: &[u8]) {
+        self.track_progress(OutputStream::Stdout, bytes);
+        self.captured = self.captured.saturating_add(bytes.len() as u64);
+        self.commit(bytes);
+    }
+
+    fn append_stream(&mut self, stream: OutputStream, bytes: &[u8]) {
+        self.track_progress(stream, bytes);
+        self.captured = self.captured.saturating_add(bytes.len() as u64);
+        // Classify before the retained-head or completion-tail bounds can
+        // split a credential. Unfinished lines remain replaceable live views.
+        let index = usize::from(stream == OutputStream::Stderr);
+        let safe = self.pending_lines[index].push_bytes(bytes);
+        self.commit(&safe);
+    }
+
+    fn finish_streams(&mut self) {
+        for mut redactor in std::mem::take(&mut self.pending_lines) {
+            self.commit(&redactor.finish_bytes());
+        }
+    }
+
+    fn track_progress(&mut self, stream: OutputStream, bytes: &[u8]) {
+        let progress = match stream {
+            OutputStream::Stdout => &mut self.progress_stdout,
+            OutputStream::Stderr => &mut self.progress_stderr,
+        };
+        if progress.append(bytes) {
+            self.progress_stream = Some(stream);
+        }
+    }
+
+    fn commit(&mut self, bytes: &[u8]) {
         use sha2::Digest as _;
         self.original_hasher.update(bytes);
         self.total = self.total.saturating_add(bytes.len() as u64);
@@ -412,6 +528,23 @@ impl TaskOutputBuffer {
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.total
+    }
+
+    /// Raw bytes seen so far, including unfinished lines the redactor still
+    /// holds back from commitment. Live-activity progress counts these;
+    /// durable completion facts and paging use [`Self::total_bytes`].
+    #[must_use]
+    pub fn captured_bytes(&self) -> u64 {
+        self.captured
+    }
+
+    /// Last complete, redacted output line, bounded to 256 UTF-8 bytes.
+    #[must_use]
+    pub fn progress_line(&self) -> Option<&str> {
+        match self.progress_stream? {
+            OutputStream::Stdout => self.progress_stdout.last.as_deref(),
+            OutputStream::Stderr => self.progress_stderr.last.as_deref(),
+        }
     }
 
     /// Hash every captured byte, independent of retained head/tail limits.
@@ -454,6 +587,10 @@ impl TaskOutputBuffer {
         (self.retained[start..end].to_vec(), end as u64)
     }
 }
+
+#[cfg(test)]
+#[path = "task_output_redaction_tests.rs"]
+mod output_redaction_tests;
 
 /// Shared handle to one task's live output.
 pub type SharedTaskOutput = Arc<Mutex<TaskOutputBuffer>>;
@@ -631,8 +768,8 @@ async fn supervise_background_with_exit_observation(
             }
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
-                    Some(Captured::Chunk(_, bytes)) => {
-                        lock_task_output(&output).append(&bytes);
+                    Some(Captured::Chunk(stream, bytes)) => {
+                        lock_task_output(&output).append_stream(stream, &bytes);
                     }
                     Some(Captured::ReadError(stream, error)) => {
                         fatal.get_or_insert_with(|| ToolError::Runtime {
@@ -800,6 +937,7 @@ async fn supervise_background_with_exit_observation(
         }
     }
 
+    lock_task_output(&output).finish_streams();
     if exit_status.is_none() && !killed {
         fatal.get_or_insert_with(|| ToolError::Runtime {
             message: format!("background task `{call_id}` ended without an exit status"),
@@ -1045,7 +1183,7 @@ where
 pub fn task_output_manifest() -> haider_protocol::tool::ToolManifest {
     haider_protocol::tool::ToolManifest {
         name: "task_output".into(),
-        description: "Read bounded output from a background task started with \
+        description: "Read a foreground capture handle or bounded output from a background task started with \
                       process_exec background=true. Without a cursor it returns the \
                       rolling tail preview; with a cursor it pages the retained output."
             .into(),
@@ -1057,7 +1195,7 @@ pub fn task_output_manifest() -> haider_protocol::tool::ToolManifest {
                 "task_id": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Task id returned by the background process_exec call"
+                    "description": "Task id or capture handle returned by process_exec"
                 },
                 "cursor": {
                     "type": "integer",
@@ -1124,3 +1262,7 @@ mod toolshape_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "task_activity_tests.rs"]
+mod task_activity_tests;

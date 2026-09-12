@@ -218,6 +218,7 @@ pub(crate) struct SessionSummaryView {
 }
 
 pub(crate) struct SessionDepthView {
+    pub pending_follow_ups: Vec<haider_protocol::completion::CompletionObligation>,
     pub summary: SessionSummaryView,
     pub pending_menus: Vec<haider_rpc::ObserveMenuWire>,
     pub parked_permissions: Vec<String>,
@@ -395,6 +396,9 @@ impl ObserveJson for SessionSummaryView {
 impl ObserveJson for SessionDepthView {
     fn json(&self) -> Value {
         let mut object = self.summary.json().as_object().cloned().unwrap_or_default();
+        if !self.pending_follow_ups.is_empty() {
+            object.insert("pending_follow_ups".into(), json!(self.pending_follow_ups));
+        }
         object.insert(
             "pending_menus".into(),
             Value::Array(
@@ -1103,9 +1107,11 @@ pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
             state: subagent.state.clone(),
         })
         .collect();
+    let pending_follow_ups = digest.pending_follow_ups.clone();
     let pending_menus = digest.pending_menus.clone();
     let last_event_kinds = digest.last_event_kinds.clone();
     SessionDepthView {
+        pending_follow_ups,
         summary: summary_view(digest),
         pending_menus,
         parked_permissions,
@@ -1383,6 +1389,14 @@ pub(crate) fn session_human_text(document: &SessionDocument) -> String {
         session.summary.subagent_count,
         session.summary.updated_at,
     );
+    for obligation in &session.pending_follow_ups {
+        text.push_str(&format!(
+            "pending follow-up: {} — attempt {} — {}\n",
+            obligation.obligation_id,
+            obligation.attempt,
+            obligation.action.replace('\n', " "),
+        ));
+    }
     for menu in &session.pending_menus {
         let description = menu
             .permission_description

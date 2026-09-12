@@ -472,11 +472,7 @@ impl DelegationHandle {
         let child_run_id = RunId::new(format!("run-child-{identity}"));
         let lease = LeaseId::new(format!("lease-child-{identity}"));
         let callsign = callsign_from_identity(&identity);
-        let existing_public_spawn = if direct_operator_spawn {
-            self.hub.delegation(agent_id.clone()).await?
-        } else {
-            None
-        };
+        let existing_spawn = self.hub.delegation(agent_id.clone()).await?;
         let registered_workflow = match request.workflow.as_ref() {
             Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
                 if graph_template(name).is_none() =>
@@ -661,6 +657,24 @@ impl DelegationHandle {
             "lockdown": child_lockdown,
             "auto_hermetic": coordinates.auto_hermetic,
         });
+        // Display identity is not new retry semantics. Reuse the first
+        // durable value (including legacy absence) after a registry edit;
+        // grants/CLI scope still undergo the existing semantics check.
+        if let Some(existing) = &existing_spawn {
+            if let Some(display) = existing
+                .manifest
+                .coordinates
+                .as_ref()
+                .and_then(|coordinates| coordinates.get("agent_type"))
+            {
+                manifest_coordinates["agent_type"] = display.clone();
+            }
+        } else if let Some(record) = coordinates.agent_type.as_ref() {
+            manifest_coordinates["agent_type"] = serde_json::json!({
+                "id": record.id, "name": record.name,
+                "color": record.color, "glyph": record.glyph,
+            });
+        }
         if public_headless {
             manifest_coordinates["public_headless"] = serde_json::Value::Bool(true);
         }
@@ -695,8 +709,9 @@ impl DelegationHandle {
             budget_tokens: Some(coordinates.metadata.max_tokens),
             placement: Placement::Local,
             lease,
-            fencing_epoch: existing_public_spawn
+            fencing_epoch: existing_spawn
                 .as_ref()
+                .filter(|_| direct_operator_spawn)
                 .map_or(self.hub.worker_generation(), |record| {
                     record.manifest.fencing_epoch
                 }),

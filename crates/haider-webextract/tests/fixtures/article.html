@@ -1,0 +1,10 @@
+<!doctype html>
+<html><head><title>Rust memory safety</title><script>tracking()</script></head>
+<body><nav>Home · Archive · Subscribe</nav>
+<main class="article"><h1>Rust memory safety</h1><p class="byline">By Ada Lovelace</p>
+<p>Rust prevents use after free and data races while keeping predictable performance.</p>
+<p>The ownership model makes every reference easy to audit, and the compiler explains how to fix mistakes.</p>
+<h2>Example</h2><pre><code>let message = String::from("hello");
+println!("{message}");</code></pre>
+<table><thead><tr><th>Rule</th><th>Result</th></tr></thead><tbody><tr><td>Ownership</td><td>One responsible owner</td></tr><tr><td>Borrowing</td><td>Checked references</td></tr></tbody></table>
+</main><aside class="related">Related links and advertisements</aside><footer>Copyright 2026</footer></body></html>

@@ -807,6 +807,7 @@ fn golden_additive_task_facts_and_unknown_kind_tolerance() {
     });
     golden("task_started", &started);
     let completed = TaskEventPayload::TaskCompleted(TaskCompleted {
+        completion_consumer: None,
         task: TaskId::new("task-3f9a"),
         name: "cargo".into(),
         state: TaskTerminalState::Completed { exit_code: Some(0) },

@@ -1091,6 +1091,7 @@ struct HubInner {
     commit_projection: Arc<CommitProjection>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     roster_publications: broadcast::Sender<SessionId>,
+    completion_publications: broadcast::Sender<SessionId>,
     /// Coalescing wake after a committed Loom registry event. Watchers always
     /// repair from the durable cursor log; this channel is never authority.
     loom_registry_publications: broadcast::Sender<u64>,
@@ -1175,6 +1176,7 @@ pub(super) struct CommitProjection {
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     roster_publications: broadcast::Sender<SessionId>,
+    completion_publications: broadcast::Sender<SessionId>,
     haider_code_plan_changes: watch::Sender<u64>,
 }
 
@@ -1190,6 +1192,11 @@ impl CommitProjection {
         }
         if let Some(envelope) = envelopes.last() {
             let _ = self.roster_publications.send(envelope.session_id.clone());
+            if envelopes.iter().any(crate::completion::needs_reconcile) {
+                let _ = self
+                    .completion_publications
+                    .send(envelope.session_id.clone());
+            }
         }
         if envelopes.iter().any(|envelope| {
             haider_protocol::session::ModelSelected::from_payload_value(&envelope.payload).is_some()
@@ -2403,6 +2410,7 @@ impl SessionHub {
         ));
         let (surface_publications, _) = watch::channel(0_u64);
         let (roster_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
+        let (completion_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
         let (loom_registry_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
         let (descendant_lineage_publications, _) = watch::channel(0_u64);
         let (haider_code_plan_changes, _) = watch::channel(0_u64);
@@ -2413,6 +2421,7 @@ impl SessionHub {
             hooks: Arc::clone(&hooks),
             observe_digests: Arc::clone(&observe_digests),
             roster_publications: roster_publications.clone(),
+            completion_publications: completion_publications.clone(),
             haider_code_plan_changes: haider_code_plan_changes.clone(),
         });
         let inner = Arc::new(HubInner {
@@ -2463,6 +2472,7 @@ impl SessionHub {
             commit_projection,
             observe_digests,
             roster_publications,
+            completion_publications,
             loom_registry_publications,
             haider_code_plan_changes,
             usage_report: Mutex::new(None),
@@ -2483,6 +2493,44 @@ impl SessionHub {
     }
 
     fn spawn_shell_registry_events(&self) -> Result<(), SessionHubError> {
+        let mut inventory = self.inner.shells.subscribe_inventory();
+        let mut cancel_inventory = self.inner.shell_registry_events_cancel.subscribe();
+        let weak_inventory = Arc::downgrade(&self.inner);
+        lock(&self.inner.actor_tasks)?.push(tokio::spawn(async move {
+            let mut next = tokio::time::Instant::now();
+            loop {
+                let changed = tokio::select! {
+                    _ = cancel_inventory.changed() => break,
+                    changed = inventory.changed() => changed,
+                };
+                if changed.is_err() {
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel_inventory.changed() => break,
+                    _ = tokio::time::sleep_until(next) => {},
+                }
+                // watch retains only the latest absolute state during a burst.
+                let current = *inventory.borrow_and_update();
+                let Some(inner) = weak_inventory.upgrade() else {
+                    break;
+                };
+                let sinks = match inner.diagnostic_sinks.lock() {
+                    Ok(sinks) => sinks.values().cloned().collect::<Vec<_>>(),
+                    Err(_) => break,
+                };
+                for sink in sinks {
+                    // Close on overflow so reconnect/read repairs the baseline.
+                    if sink
+                        .try_send_droppable(WireFrame::ShellInventoryChanged { inventory: current })
+                        .is_err()
+                    {
+                        sink.close_after_required_delivery_failure();
+                    }
+                }
+                next = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            }
+        }));
         let mut events = self.inner.shells.subscribe();
         let mut cancel = self.inner.shell_registry_events_cancel.subscribe();
         let weak = Arc::downgrade(&self.inner);
@@ -3593,8 +3641,16 @@ impl SessionHub {
         )
     }
 
+    pub(crate) fn subscribe_completion_reconcile(&self) -> broadcast::Receiver<SessionId> {
+        self.inner.completion_publications.subscribe()
+    }
+
     pub(crate) fn subscribe_peer_reconcile(&self) -> broadcast::Receiver<SessionId> {
         self.inner.roster_publications.subscribe()
+    }
+
+    pub(crate) fn notify_peer_delivery_settled(&self, session: SessionId) {
+        let _ = self.inner.roster_publications.send(session);
     }
 
     pub(crate) fn peer_control_sessions(
@@ -3673,6 +3729,28 @@ impl SessionHub {
             ))
         })?;
         let manager = self.worker_manager()?;
+        // Honor an admission committed by the legacy global-msg-id scheme.
+        // A conflicting legacy receipt must refuse, never become a second
+        // admission under the new sender-scoped coordinates after upgrade.
+        let legacy_json = serde_json::to_string(message)
+            .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        if let Some(accepted) = self
+            .inner
+            .store
+            .turn_accept_receipt(
+                format!("peer:{}", message.msg_id),
+                blake3::hash(legacy_json.as_bytes()).to_hex().to_string(),
+                legacy_json,
+            )
+            .await?
+        {
+            drop(_selection);
+            manager
+                .submit(accepted.clone())
+                .await
+                .map_err(SessionHubError::from)?;
+            return Ok(accepted);
+        }
         let (command_id, request_digest, request_json) = peer_turn_coordinates(message)?;
         let command = TurnAcceptCommand {
             command_id,
@@ -4214,6 +4292,15 @@ impl SessionHub {
 
     pub(crate) fn device_id(&self) -> DeviceId {
         self.inner.device_id.clone()
+    }
+
+    /// Peer addresses use the existing durable profile installation identity,
+    /// independently of journal worker/device generation fencing.
+    pub(crate) fn peer_device_id(&self) -> String {
+        format!(
+            "profile-{}",
+            self.inner.store.cached_profile_installation_id()
+        )
     }
 
     pub(crate) fn cache_diagnostic_key(&self) -> CacheDiagnosticKey {
@@ -5933,12 +6020,22 @@ impl SessionHub {
         self.inner.store.session_ids().await.map_err(Into::into)
     }
 
-    /// Return true only when every durable run in the profile is terminal.
+    /// Return true only when every durable run and peer send is terminal.
     ///
     /// Auto-spawn retirement calls this after the last client disconnects.
     /// The journal remains the authority: resident-worker count and volatile
     /// actor state are deliberately insufficient for a shutdown decision.
     pub(crate) async fn daemon_is_durably_quiescent(&self) -> Result<bool, SessionHubError> {
+        // The service is recovered before the listener starts; its outbox
+        // tracks durable pending sends. Admission and recipient tasks
+        // hold permits across journal commits, transport and terminal removal,
+        // guarding retirement even while no entry is visible in the map.
+        let peer = lock(&self.inner.peer_service)?.clone();
+        if let Some(peer) = peer
+            && peer.has_pending_sends().await
+        {
+            return Ok(false);
+        }
         for session_id in self.session_ids().await? {
             if self.session_has_nonterminal_runs(&session_id).await? {
                 return Ok(false);
@@ -6228,7 +6325,16 @@ impl SessionHub {
                 )
             })?;
         match self.inner.store.delete_session(session_id.clone()).await {
-            Ok(()) => self.inner.monitors.release_session_tombstone(session_id),
+            Ok(()) => {
+                // Retire the durable projection before reconciliation can pass
+                // the monitor fence again. A failed delete must retain it.
+                self.inner
+                    .monitors
+                    .completion_cache()
+                    .await
+                    .remove(session_id);
+                self.inner.monitors.release_session_tombstone(session_id);
+            }
             Err(error) => {
                 self.inner
                     .monitors
@@ -8125,12 +8231,21 @@ fn random_id(prefix: &str) -> Result<String, SessionHubError> {
 fn peer_turn_coordinates(
     message: &haider_protocol::peer::PeerMessage,
 ) -> Result<(String, String, String), SessionHubError> {
-    let request_json = serde_json::to_string(message).map_err(|error| {
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "msg_id": message.msg_id, "from": message.from.address(), "to": message.to,
+        "message": message.message, "summary": message.summary,
+        "queued_at": message.queued_at, "expires_at": message.expires_at,
+    }))
+    .map_err(|error| {
         SessionHubError::Task(format!("cannot encode peer delivery coordinates: {error}"))
     })?;
     let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
     Ok((
-        format!("peer:{}", message.msg_id),
+        format!(
+            "peer:{}:{}",
+            blake3::hash(message.from.address().as_bytes()).to_hex(),
+            message.msg_id
+        ),
         request_digest,
         request_json,
     ))

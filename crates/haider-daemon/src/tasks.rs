@@ -45,7 +45,7 @@ const TASK_COMMAND_SUMMARY_BYTES: usize = 512;
 /// Bounded failure-reason detail carried by a failed completion.
 const TASK_FAILURE_REASON_CHARS: usize = 400;
 /// One `task_output` cursor read returns at most this many bytes.
-pub(crate) const TASK_OUTPUT_READ_BYTES: usize = 8 * 1024;
+pub(crate) const TASK_OUTPUT_READ_BYTES: usize = haider_tools::ORCHESTRATION_PREVIEW_MAX_BYTES;
 /// Kill settles when the supervised ladder reports terminal within this
 /// margin past TERM + grace + KILL.
 const KILL_SETTLE_MARGIN: Duration = Duration::from_secs(3);
@@ -84,6 +84,9 @@ pub(crate) struct TaskEntry {
 struct SessionTasks {
     adopted: bool,
     tasks: HashMap<TaskId, TaskEntry>,
+    /// Shared by all observe callers, including batch reads and reconnects.
+    progress: HashMap<TaskId, (tokio::time::Instant, haider_rpc::ObserveTaskWire)>,
+    captures: std::collections::VecDeque<(String, haider_protocol::ids::ArtifactRef)>,
 }
 
 /// In-memory projection of every session's background tasks (hub-owned).
@@ -95,6 +98,35 @@ pub(crate) struct TaskRegistry {
 impl TaskRegistry {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, SessionTasks>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn retain_capture(
+        &self,
+        session_id: &SessionId,
+        handle: String,
+        artifact: haider_protocol::ids::ArtifactRef,
+    ) {
+        let mut sessions = self.lock();
+        let session = sessions.entry(session_id.clone()).or_default();
+        session.captures.retain(|(existing, _)| existing != &handle);
+        // Four complete 64-request turns; only references are retained.
+        if session.captures.len() >= 256 {
+            session.captures.pop_front();
+        }
+        session.captures.push_back((handle, artifact));
+    }
+
+    pub(crate) fn capture(
+        &self,
+        session_id: &SessionId,
+        handle: &str,
+    ) -> Option<haider_protocol::ids::ArtifactRef> {
+        self.lock()
+            .get(session_id)?
+            .captures
+            .iter()
+            .find(|(key, _)| key == handle)
+            .map(|(_, artifact)| artifact.clone())
     }
 
     /// Marks the session adopted; returns whether THIS caller owns adoption.
@@ -190,6 +222,60 @@ impl TaskRegistry {
         })
     }
 
+    /// Read the bounded live registry only; observing never adopts, journals,
+    /// or steers a task. Publish at most one new snapshot per task per second,
+    /// coalescing output at this wire boundary rather than slowing the pipes.
+    /// Terminal output remains on TaskCompleted/task_output and bypasses this
+    /// cache: completed tasks disappear from the next read immediately.
+    pub(crate) fn observe_tasks(&self, session_id: &SessionId) -> Vec<haider_rpc::ObserveTaskWire> {
+        let mut sessions = self.lock();
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let SessionTasks {
+            tasks, progress, ..
+        } = session;
+        progress.retain(|task, _| {
+            tasks.get(task).is_some_and(|entry| {
+                entry.state == TaskLiveState::Running && entry.output.is_some()
+            })
+        });
+        let tick = tokio::time::Instant::now();
+        let now = now_ms();
+        let mut tasks: Vec<_> = tasks
+            .values()
+            .filter(|entry| entry.state == TaskLiveState::Running)
+            .filter_map(|entry| {
+                // Re-adopted tasks and output already moved to terminal CAS have
+                // no live supervision buffer. Never invent a zero-byte reading.
+                let output = entry.output.as_ref()?;
+                if let Some((next, snapshot)) = progress.get(&entry.task)
+                    && tick < *next
+                {
+                    return Some(snapshot.clone());
+                }
+                let output = lock_task_output(output);
+                let snapshot = haider_rpc::ObserveTaskWire {
+                    task_id: entry.task.clone(),
+                    name: bounded_task_command(&haider_tools::redact_lockdown_text(&entry.name)),
+                    elapsed_ms: now.saturating_sub(entry.started_at_ms),
+                    last_line: output.progress_line().map(ToOwned::to_owned),
+                    // Live activity counts raw bytes seen; the redactor may
+                    // still hold an unfinished line back from commitment.
+                    bytes: output.captured_bytes(),
+                };
+                progress.insert(
+                    entry.task.clone(),
+                    (tick + Duration::from_secs(1), snapshot.clone()),
+                );
+                Some(snapshot)
+            })
+            .collect();
+        tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
+        tasks.truncate(TASK_CONCURRENCY_CAP);
+        tasks
+    }
+
     fn running_entries(&self, session_id: &SessionId) -> Vec<TaskEntry> {
         self.lock()
             .get(session_id)
@@ -261,7 +347,7 @@ pub(crate) struct TaskSpawnContext {
 /// every clone shares the ONE projection inside the hub.
 #[derive(Clone)]
 pub(crate) struct TaskFacade {
-    hub: SessionHub,
+    pub(crate) hub: SessionHub,
     kill_grace: Duration,
 }
 
@@ -352,6 +438,7 @@ impl TaskFacade {
             };
             let state = TaskTerminalState::Failed { reason };
             let completed = TaskCompleted {
+                completion_consumer: None,
                 task: task.clone(),
                 name: started.fact.name.clone(),
                 state: state.clone(),
@@ -558,7 +645,7 @@ impl TaskFacade {
                     }
                 }
             };
-            let output_bytes = lock_task_output(&output_for_shell).total_bytes();
+            let output_bytes = lock_task_output(&output_for_shell).captured_bytes();
             let _ = shell.add_output(usize::try_from(output_bytes).unwrap_or(usize::MAX));
             let _ = shell.exited(status.exit_code);
             facade
@@ -653,6 +740,7 @@ impl TaskFacade {
             }
         };
         let mut completed = TaskCompleted {
+            completion_consumer: None,
             task: task.clone(),
             name: entry.name.clone(),
             state: state.clone(),
@@ -678,8 +766,13 @@ impl TaskFacade {
         }
         let notice =
             haider_core::task_event_notice(&TaskEventPayload::TaskCompleted(completed.clone()));
+        let mut completion_consumer = None;
         let delivery = match self.active_run(session_id).await {
             Ok(Some((active_run, active_branch))) => {
+                completion_consumer = Some(haider_protocol::task::TaskCompletionConsumer {
+                    run_id: active_run.clone(),
+                    branch_id: active_branch.clone(),
+                });
                 match self
                     .steer_completion(session_id, &active_run, active_branch, &entry, &notice)
                     .await
@@ -699,6 +792,11 @@ impl TaskFacade {
             }
         };
         completed.delivery = delivery;
+        completed.completion_consumer = if delivery == TaskCompletionDelivery::DeliveredSteer {
+            completion_consumer
+        } else {
+            None
+        };
         // Exactly ONE prompt copy: the durable steer user message owns it on
         // the steer path, the fact owns it on the queued path.
         let prompt = match delivery {
@@ -735,6 +833,11 @@ impl TaskFacade {
         task_id: &str,
         cursor: Option<u64>,
     ) -> ToolResult<BoundedResult> {
+        if task_id.starts_with("capture:") {
+            return self
+                .foreground_capture_page(session_id, task_id, cursor)
+                .await;
+        }
         self.adopt_session(session_id)
             .await
             .map_err(runtime_tool_error)?;
@@ -764,7 +867,7 @@ impl TaskFacade {
                         let Some(output) = entry.output.as_ref() else {
                             return Err(missing_task_output_backing(&task));
                         };
-                        let buffer = lock_task_output(output);
+                        let buffer = lock_task_output(output).live_snapshot();
                         (
                             buffer.total_bytes(),
                             buffer.truncated(),
@@ -819,7 +922,7 @@ impl TaskFacade {
                         let Some(output) = entry.output.as_ref() else {
                             return Err(missing_task_output_backing(&task));
                         };
-                        let buffer = lock_task_output(output);
+                        let buffer = lock_task_output(output).live_snapshot();
                         let (bytes, next_cursor, exhausted) = read_task_output_page(
                             buffer.retained(),
                             cursor,
@@ -1374,3 +1477,7 @@ fn internal_serialization(error: serde_json::Error) -> HaiderError {
 #[cfg(test)]
 #[path = "tasks_eviction_tests.rs"]
 mod eviction_tests;
+
+#[cfg(test)]
+#[path = "task_progress_wire_tests.rs"]
+mod task_progress_wire_tests;

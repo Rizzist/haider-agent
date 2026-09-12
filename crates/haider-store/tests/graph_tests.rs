@@ -1414,6 +1414,7 @@ fn workspace_revisions_advance_only_on_mutations_and_rebuild_uniformly() {
             .append(&mut background_effect_facts)
             .expect("append background process spawn");
         let completed = TaskCompleted {
+            completion_consumer: None,
             task: TaskId::new("background-mutation-task"),
             name: "background-mutation".into(),
             state: TaskTerminalState::Completed { exit_code: Some(0) },

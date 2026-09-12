@@ -21,8 +21,19 @@
 //!
 //! CONTRAST LAW (pinned in `ui_themes_tests`): every ink slot clears a
 //! WCAG-derived floor against the ground it renders on — body text ≥ 6.5:1,
-//! emphasis ≥ 8:1, metadata ≥ 3.4:1, accents/states ≥ 3.2:1, filled-badge
-//! foregrounds ≥ 2.7:1 — and `faint` stays inside its barely-there band.
+//! emphasis ≥ 8:1, metadata (`dim`) ≥ 4.5:1, accents/states ≥ 3.2:1,
+//! filled-badge foregrounds ≥ 2.7:1 — and `faint` stays inside its
+//! barely-there band.
+//!
+//! 971-tui-collapse raised the metadata floor from 3.4 to the WCAG AA body
+//! floor of 4.5:1. `dim` stopped being decoration the moment collapsed tool
+//! rows put the exit code, the line count and the duration on it (owner:
+//! "all this darker text in the TUI is making navigation difficult"), so it
+//! must be READ, not merely noticed. Desert (3.59) and Water (4.45) were the
+//! two grounds under the new floor; both dims were darkened along their own
+//! hue until they cleared 5:1, so every theme now sits at 5.01 or better.
+//! `faint` keeps its band and its job: structural glyphs only — never text
+//! anyone has to read.
 
 /// A concrete sRGB color. Truecolor terminals render it exactly; the `--plain`
 /// fallback ignores colors entirely.
@@ -319,7 +330,7 @@ pub const DESERT: Theme = {
         frame: maroon.over(bg, 280),
         text: Rgb::hex(0x4d3a20),
         bright: Rgb::hex(0x2e2110),
-        dim: Rgb::hex(0x8a7350),
+        dim: Rgb::hex(0x705d41),
         faint: Rgb::hex(0xd2bf9b),
         gold,
         gold_soft: gold.over(bg, 140),
@@ -353,7 +364,7 @@ pub const WATER: Theme = {
         frame: gold.over(bg, 280),
         text: Rgb::hex(0x243b47),
         bright: Rgb::hex(0x122730),
-        dim: Rgb::hex(0x53707e),
+        dim: Rgb::hex(0x4c6774),
         faint: Rgb::hex(0xb7ccd2),
         gold,
         gold_soft: gold.over(bg, 140),

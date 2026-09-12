@@ -19,6 +19,10 @@ mod checkpoint_tests;
 #[path = "direct_ssh_tests.rs"]
 mod direct_ssh_tests;
 
+#[cfg(test)]
+#[path = "activity_wire_tests.rs"]
+mod activity_wire_tests;
+
 use super::*;
 use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
@@ -1311,6 +1315,7 @@ struct ObservedRun {
 
 #[derive(serde::Serialize)]
 struct ObserveProjection {
+    completions: haider_protocol::completion::CompletionProjection,
     event_limit: usize,
     event_kinds: VecDeque<String>,
     title: Option<String>,
@@ -1380,6 +1385,7 @@ struct ObserveFold {
 
 #[derive(Clone)]
 struct ObserveFoldSnapshot {
+    pending_follow_ups: Vec<haider_protocol::completion::CompletionObligation>,
     head_seq: u64,
     title: Option<String>,
     run_state: haider_rpc::ObserveRunStateWire,
@@ -1477,6 +1483,13 @@ impl ObserveFold {
             .collect::<Vec<_>>();
         branches.sort_by_key(|branch| branch.created_seq);
         ObserveFoldSnapshot {
+            pending_follow_ups: self
+                .projection
+                .completions
+                .pending
+                .values()
+                .cloned()
+                .collect(),
             head_seq: self.head_seq,
             title: self.projection.title.clone(),
             run_state,
@@ -1594,6 +1607,13 @@ fn subagent_allocation_charge(subagent: &haider_rpc::ObserveSubagentWire) -> usi
         .saturating_add(string_spare(&subagent.task))
         .saturating_add(string_spare(&subagent.state))
         .saturating_add(subagent.provider.as_ref().map_or(0, string_spare));
+    if let Some(agent_type) = &subagent.agent_type {
+        total = total
+            .saturating_add(string_spare(&agent_type.id))
+            .saturating_add(string_spare(&agent_type.name))
+            .saturating_add(string_spare(&agent_type.color))
+            .saturating_add(string_spare(&agent_type.glyph));
+    }
     if let Some(lockdown) = &subagent.lockdown {
         total = total
             .saturating_add(lockdown.provider.as_ref().map_or(0, string_spare))
@@ -1713,6 +1733,7 @@ impl ObserveFoldSnapshot {
         });
         let event_start = self.event_kinds.len().saturating_sub(event_limit);
         haider_rpc::SessionObserveDigest {
+            pending_follow_ups: self.pending_follow_ups.clone(),
             session_id,
             head_seq: self.head_seq,
             worker_generation,
@@ -1726,6 +1747,8 @@ impl ObserveFoldSnapshot {
             main_head_seq: self.main_head_seq,
             latest_context_footprint: self.footprint.clone(),
             pending_menus: self.pending_menus.clone(),
+            tasks: None,
+            shells: None,
             subagents: self.subagents.clone(),
             lockdown: None,
             updated_at_ms: self.updated_at_ms,
@@ -2741,6 +2764,10 @@ async fn session_observe_digest(
         )
     };
     digest.workflow = workflow;
+    if !metadata_only {
+        digest.tasks = Some(hub.task_registry().observe_tasks(&digest.session_id));
+        digest.shells = Some(hub.shell_registry().inventory());
+    }
     digest.lockdown = active_provider
         .as_deref()
         .map(|provider| observed_lockdown_status(hub, Some(&digest.session_id), provider))
@@ -2821,6 +2848,7 @@ fn observed_lockdown_manager_status(
 impl ObserveProjection {
     fn new(event_limit: usize) -> Self {
         Self {
+            completions: haider_protocol::completion::CompletionProjection::default(),
             event_limit,
             event_kinds: VecDeque::with_capacity(event_limit),
             title: None,
@@ -2837,6 +2865,7 @@ impl ObserveProjection {
     }
 
     fn apply(&mut self, envelope: haider_protocol::envelope::RawEnvelope) {
+        self.completions.apply(&envelope);
         self.graphs.apply_envelope(&envelope);
         self.updated_at_ms = self.updated_at_ms.max(envelope.committed_at_ms);
         if let Some(kind) = envelope
@@ -2966,6 +2995,14 @@ impl ObserveProjection {
             }
             EventPayload::AgentSpawned(manifest) => {
                 let provider = manifest.provider().map(ToOwned::to_owned);
+                let agent_type = manifest
+                    .coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.get("agent_type"))
+                    .and_then(|value| {
+                        serde_json::from_value::<haider_rpc::ObserveAgentTypeWire>(value.clone())
+                            .ok()
+                    });
                 let lockdown_bound = manifest
                     .coordinates
                     .as_ref()
@@ -2984,6 +3021,7 @@ impl ObserveProjection {
                         task: manifest.task,
                         state: "thinking".into(),
                         provider,
+                        agent_type,
                         lockdown_bound,
                         lockdown_auto_hermetic_bound,
                         lockdown: None,
@@ -3001,6 +3039,7 @@ impl ObserveProjection {
                         task: String::new(),
                         state,
                         provider: None,
+                        agent_type: None,
                         lockdown_bound: None,
                         lockdown_auto_hermetic_bound: None,
                         lockdown: None,
@@ -3068,6 +3107,7 @@ impl ObserveProjection {
         let pending_menus: Vec<haider_rpc::ObserveMenuWire> = self.menus.into_values().collect();
         let needs_input = needs_input(run_state, &pending_menus);
         haider_rpc::SessionObserveDigest {
+            pending_follow_ups: self.completions.pending.into_values().collect(),
             session_id,
             head_seq,
             worker_generation,
@@ -3081,6 +3121,8 @@ impl ObserveProjection {
             main_head_seq: self.main_head_seq,
             latest_context_footprint: self.footprint,
             pending_menus,
+            tasks: None,
+            shells: None,
             subagents: self.subagents.into_values().collect(),
             lockdown: None,
             updated_at_ms: self.updated_at_ms,
@@ -6784,7 +6826,7 @@ impl HubConnection {
                 )
                 .await
             }
-            RequestBody::PeerList {} => {
+            RequestBody::PeerList { status } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
                         request_id,
@@ -6797,10 +6839,20 @@ impl HubConnection {
                 self.hub.enable_peer_events(&self.connection_id)?;
                 let service = self.hub.peer_service()?;
                 self.defer_peer_request(request_id, async move {
-                    service
-                        .list()
-                        .await
-                        .map(|agents| ResponseBody::PeerList { agents })
+                    if let Some(query) = status {
+                        return service.delivery_status(query).await.map(|status| {
+                            ResponseBody::PeerList {
+                                delivery_status_supported: true,
+                                agents: Vec::new(),
+                                status: Some(status),
+                            }
+                        });
+                    }
+                    service.list().await.map(|agents| ResponseBody::PeerList {
+                        delivery_status_supported: true,
+                        agents,
+                        status: None,
+                    })
                 })
             }
             RequestBody::PeerInject { .. } => self.respond_error(
@@ -6823,6 +6875,7 @@ impl HubConnection {
                 self.peer_notify_when_idle(request_id, to)
             }
             RequestBody::PeerSend {
+                options,
                 to,
                 message,
                 summary,
@@ -6851,7 +6904,13 @@ impl HubConnection {
                 let session_id = session_id.clone();
                 self.defer_peer_request(request_id, async move {
                     service
-                        .send(&session_id, to, message, summary)
+                        .send_with_options(
+                            &session_id,
+                            to,
+                            message,
+                            summary,
+                            options.unwrap_or_default(),
+                        )
                         .await
                         .map(|receipt| ResponseBody::PeerSend { receipt })
                 })
@@ -18714,11 +18773,19 @@ fn peer_error_response(error: crate::peer::PeerError) -> ResponseBody {
     let (code, message, retryable, data) = match error {
         crate::peer::PeerError::Ambiguous { candidates } => (
             ERROR_CODE_PEER_AMBIGUOUS,
-            "peer address is ambiguous; qualify it with an id prefix".to_owned(),
+            format!(
+                "peer address is ambiguous; candidates: {}",
+                candidates
+                    .iter()
+                    .map(|candidate| format!("{} [{}]", candidate.name, candidate.id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             false,
             Some(ErrorData::PeerAmbiguous { candidates }),
         ),
-        crate::peer::PeerError::Invalid { message } => {
+        crate::peer::PeerError::Invalid { message }
+        | crate::peer::PeerError::Refused { message } => {
             (ERROR_CODE_PEER_INVALID, message, false, None)
         }
         error => (ERROR_CODE_PEER_UNAVAILABLE, error.to_string(), false, None),

@@ -1615,10 +1615,12 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Preserve wave's platform-derived pin: process_exec.command.description
     // names /bin/zsh and /bin/sh on POSIX (78 bytes), and absolute System32
     // PowerShell on Windows (75 bytes). Its actual serialized contribution
-    // is measured below; the invariant pin is 5_592 + 574 = 6_166.
+    // is measured below; the delegation invariant was 5_592 + 574 = 6_166.
+    // Redaction paging adds fs_read.column's serialized property (+40) and
+    // its default compact description (+2): 6_166 + 42 = 6_208; POSIX 6_286.
     // Keep the reduction floor independent of this exact-value pin: adding
     // delegation cannot waive the existing release budget.
-    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_166;
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_208;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1655,15 +1657,15 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // manual bytes remain zero. Full schema growth cannot waive the pipe gate.
     // Shipgate clarifies interactive/autonomous request_input prose (+96
     // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
-    // session_transcript adds 687 bytes only to the full discovered catalog.
+    // Full manifest size after wave-971 changes and session_transcript.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_373;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_414;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_324;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_365;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_323;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_364;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_318;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_359;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

@@ -386,6 +386,8 @@ pub enum EntryDto {
     Peer {
         #[serde(default)]
         msg_id: String,
+        #[serde(default)]
+        sender_address: String,
         sender: String,
         sender_kind: String,
         text: String,
@@ -582,12 +584,14 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
         },
         TranscriptEntry::Peer {
             msg_id,
+            sender_address,
             sender,
             sender_kind,
             text,
             receipt,
         } => EntryDto::Peer {
             msg_id: msg_id.clone(),
+            sender_address: sender_address.clone(),
             sender: sender.clone(),
             sender_kind: sender_kind.clone(),
             text: text.clone(),
@@ -835,12 +839,14 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
         },
         EntryDto::Peer {
             msg_id,
+            sender_address,
             sender,
             sender_kind,
             text,
             receipt,
         } => TranscriptEntry::Peer {
             msg_id,
+            sender_address,
             sender,
             sender_kind,
             text,

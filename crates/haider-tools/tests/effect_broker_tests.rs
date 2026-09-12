@@ -1035,7 +1035,7 @@ async fn successful_dispatch_has_strict_four_phase_order() {
         .fs_read(&FsRead::new(&path), &policy, &mut UnusedCas, bounds)
         .await
         .expect("read succeeds");
-    assert_eq!(result.preview, "small result");
+    assert_eq!(result.preview, "1: small result");
 
     let phases = effect_phases(&broker);
     assert!(matches!(phases[0], EffectPhase::Intent(_)));

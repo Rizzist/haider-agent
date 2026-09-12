@@ -845,7 +845,8 @@ fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_reject
 /// LAW (LW1, anthropic request golden): with the web-tools flag the request
 /// declares BOTH server tools with these exact shapes — basic
 /// `web_search_20250305` (max_uses 8) and `web_fetch_20250910` with
-/// citations disabled and the pinned content budget — appended after the
+/// citations disabled and the pinned content budget (15k tokens / 5 uses,
+/// the 972 token-cost reduction) — appended after the
 /// client tools; without the flag the tools array is byte-identical to the
 /// pre-W-B shape (and absent entirely when no client tool is advertised).
 #[test]
@@ -886,8 +887,8 @@ fn web_tools_declaration_is_exact_and_absent_without_the_flag() {
             "type": "web_fetch_20250910",
             "name": "web_fetch",
             "citations": {"enabled": false},
-            "max_content_tokens": 100000,
-            "max_uses": 10,
+            "max_content_tokens": 15000,
+            "max_uses": 5,
         })
     );
 

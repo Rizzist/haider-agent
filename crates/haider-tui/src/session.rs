@@ -125,6 +125,14 @@ pub struct SessionState {
     pub auto_resuming: bool,
     pub subtree_collapsed: bool,
     pub todos_collapsed: bool,
+    /// This session's default tool disclosure, blanket override, and row
+    /// choices travel together across checkout and in `tui-settings.json`.
+    pub tool_verbosity: Option<crate::toolfold::Verbosity>,
+    pub tools_blanket: crate::toolfold::Blanket,
+    /// The background-task line under the composer is expanded into its
+    /// per-task list. Collapsed by default (owner 2026-09-08).
+    pub tasks_line_expanded: bool,
+    pub tool_rows: std::collections::BTreeMap<String, crate::toolfold::RowState>,
     // ---- Launcher-row statics (sim session fields the demo never edits).
     pub model_short: String,
     pub device: String,
@@ -209,6 +217,10 @@ impl SessionState {
             auto_resuming: false,
             subtree_collapsed: false,
             todos_collapsed: false,
+            tool_verbosity: None,
+            tools_blanket: crate::toolfold::Blanket::default(),
+            tasks_line_expanded: false,
+            tool_rows: std::collections::BTreeMap::new(),
             model_short: String::new(),
             device: String::new(),
             ago: String::new(),

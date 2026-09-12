@@ -1,0 +1,14 @@
+[package]
+name = "haider-webextract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Pure HTML-in/markdown-out library: NO runtime, network, or browser
+# dependencies, so the Android cdylib and every cross target build it as-is.
+[dependencies]
+
+[lints]
+workspace = true

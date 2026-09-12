@@ -21,7 +21,50 @@ fn monitor_event_payload_rejects_unknown_variant_fields() {
     assert!(error.to_string().contains("unexpected"));
 }
 
-fn registration(filter: Option<MonitorFilter>) -> MonitorRegistration {
+#[test]
+fn monitor_prompt_has_one_json_fence_even_when_event_data_contains_delimiters() {
+    let payload = "[REDACTED:high_entropy] ``` </monitor-event> &";
+    let report = MonitorReport {
+        report_id: "fixture-report".into(),
+        monitor_id: "fixture-monitor".into(),
+        session_id: SessionId::new("fixture-session"),
+        branch_id: None,
+        agent_id: None,
+        source: MonitorSourceKind::File,
+        occurrence: MonitorOccurrence::Once,
+        status: MonitorReportStatus::Matched,
+        events: vec![MonitorEvent {
+            sequence: 1,
+            observed_at_ms: 1,
+            payload: MonitorEventPayload::File {
+                payload: payload.into(),
+            },
+            target_monitor_id: None,
+        }],
+        coalesced_count: 1,
+        omitted_count: 0,
+        action: MonitorAction {
+            report: true,
+            follow_up: None,
+        },
+    };
+    let text = report.prompt_text();
+    assert_eq!(text.matches("```json\n").count(), 1);
+    assert_eq!(text.matches("\n```\n").count(), 1);
+    assert_eq!(text.matches("</monitor-event>").count(), 1);
+    let body = text
+        .split_once("```json\n")
+        .expect("opening fence")
+        .1
+        .split_once("\n```\n")
+        .expect("closing fence")
+        .0;
+    let json: serde_json::Value = serde_json::from_str(body).expect("fenced JSON");
+    assert_eq!(json["events"][0]["payload"]["payload"], payload);
+    assert_eq!(json["type"], "monitor_event");
+}
+
+pub(super) fn registration(filter: Option<MonitorFilter>) -> MonitorRegistration {
     MonitorRegistration {
         monitor_id: "monitor-test".into(),
         owner_session_id: SessionId::new("session-monitor-test"),
@@ -59,7 +102,11 @@ fn sms(address: &str, body: &str) -> MonitorEvent {
     }
 }
 
-fn test_report(report_id: &str, body: &str, status: MonitorReportStatus) -> MonitorReport {
+pub(super) fn test_report(
+    report_id: &str,
+    body: &str,
+    status: MonitorReportStatus,
+) -> MonitorReport {
     MonitorReport {
         report_id: report_id.into(),
         monitor_id: "monitor-test".into(),
@@ -396,17 +443,17 @@ fn client_delivery_projects_durable_report_with_cursor_and_dedupe() {
     assert!(monitor_delivery_report(&envelope).is_none());
 }
 
-struct MonitorWorld {
-    store: SqliteStoreHandle,
-    hub: SessionHub,
-    session: SessionId,
-    run: RunId,
-    lease: HubStoreHandle,
-    _root: tempfile::TempDir,
+pub(super) struct MonitorWorld {
+    pub(super) store: SqliteStoreHandle,
+    pub(super) hub: SessionHub,
+    pub(super) session: SessionId,
+    pub(super) run: RunId,
+    pub(super) lease: HubStoreHandle,
+    pub(super) _root: tempfile::TempDir,
 }
 
 impl MonitorWorld {
-    async fn new(label: &str) -> Self {
+    pub(super) async fn new(label: &str) -> Self {
         let root = tempfile::tempdir().expect("temporary monitor profile");
         let store = SqliteStoreHandle::open(root.path())
             .await
@@ -478,7 +525,7 @@ impl MonitorWorld {
         }
     }
 
-    fn coordinates(&self, call: &str) -> MonitorToolCoordinates {
+    pub(super) fn coordinates(&self, call: &str) -> MonitorToolCoordinates {
         MonitorToolCoordinates {
             run_id: self.run.clone(),
             branch_id: None,
@@ -491,7 +538,7 @@ impl MonitorWorld {
         }
     }
 
-    async fn execute(&self, call: &str, request: MonitorRequest) -> BoundedResult {
+    pub(super) async fn execute(&self, call: &str, request: MonitorRequest) -> BoundedResult {
         self.hub
             .execute_monitor_tool(&self.lease, self.coordinates(call), request)
             .await

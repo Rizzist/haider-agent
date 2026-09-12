@@ -1,0 +1,20 @@
+# Live task activity (additive observe contract)
+
+No RPC method is added: the 136-method catalog and model tool/economy payloads stay unchanged.
+
+`session.observe` and `session.observe_batch` add two optional fields on each digest:
+
+- `tasks`: up to `TASK_CONCURRENCY_CAP` (8) locally supervised background tasks, sorted by `task_id`. Each row has `task_id`, a bounded/redacted `name`, `elapsed_ms`, total captured `bytes`, and optional `last_line`.
+- `shells`: daemon-wide `{count, revision}` for starting/running local and SSH shells. Exited/closed rows retained by `shell.list` do not count.
+
+These fields are independent of `head_seq` and `updated_at_ms`. Task progress uses a daemon-enforced, per-task one-second snapshot throttle at the observe wire boundary, shared across connections, reconnects, and single/batch reads. The first read publishes immediately; subsequent reads within that second return the identical row (including elapsed time and byte count). The next eligible read coalesces intermediate output into the latest snapshot. Thus passive observers see at most one distinct running update per second per task, regardless of polling rate. This remains a request/response contract, not an unsolicited task-output stream.
+
+Terminal state bypasses the progress throttle: the existing `TaskCompleted` event immediately carries the final state and output summary through the journal stream, and the next observe read removes the live row without waiting for its one-second deadline. The existing `task_output` tool retains terminal output. Progress snapshots are not journal events and do not reach provider context. An empty task list means none currently supervised in this session. Older daemons and metadata-only reads omit both fields; absence means unavailable. Restarted/orphaned tasks have no live output and are not presented as live activity. Shell inventory is sampled at read time.
+
+The complete-line parser retains at most 4,096 pending bytes per stdout/stderr stream and returns at most 256 UTF-8 bytes after existing secret redaction. It checks raw and terminal-normalized text independently so escape removal cannot hide a private-key opening marker. A recognized raw credential withholds the whole line. It preserves separate private-key/line state for stdout and stderr across output chunks and rolling-tail eviction; one pipe cannot finish the other pipe's partial secret. The latest complete line from either stream is displayed. Partial lines are withheld. An oversized line is omitted and conservatively enters private-key redaction until an explicit PEM end marker. Raw byte totals retain their existing meaning. Consumers may poll observe once per second while showing live task rows; there is no task-output event or added journal traffic.
+
+Every established RPC connection receives `{"kind":"shell.inventory_changed","inventory":{"count":6,"revision":14}}` (with the ordinary `v:1` envelope) when the active count changes. Bursts coalesce to the latest absolute count at at most one notification per second. Output-only updates do not trigger it. Revisions can skip and reset with the daemon. Pair revision ordering with the current connection/worker generation. Read `session.observe` after attach/reconnect for a baseline; buffer notifications while reading and retain the greatest revision in that generation. A transport unable to accept the signal is closed so reconnect can repair the baseline. Existing shell lifecycle/output frames remain unchanged.
+
+Each `ObserveSubagentWire` can add `agent_type: {id, name, color, glyph}`. This is the display subset of the Loom type frozen into the durable spawn manifest, so later registry edits do not relabel an existing child. Untyped, legacy, or malformed display coordinates omit it. Consumers must not infer a type from `AgentRole`, task text, callsign, or the parent session.
+
+The shared command catalog adds one client-owned entry each for `/collapse [all|expand|next|prev]`, `/verbosity [quiet|normal|verbose]`, and `/tasks`. Collapse/tasks require a session. Rendering and consumption belong to the TUI follow-up lane.

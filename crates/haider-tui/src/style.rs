@@ -229,6 +229,33 @@ impl Theme {
         }
     }
 
+    /// One collapsed-tool-row [`crate::toolfold::Tone`] → its themed ink
+    /// (971-tui-collapse). `toolfold.rs` decides what a run of text MEANS;
+    /// this is the single seam where the meaning becomes a colour, so the
+    /// mechanical no-raw-color law (`every_surface_uses_theme_slots`) still
+    /// holds over the new module.
+    ///
+    /// Note what `Body` and `Meta` are for: expanded tool output used to
+    /// render in `faint` (1.4:1 — the owner's "darker text" complaint), and
+    /// now rides `dim`, which this wave pinned at ≥ 4.5:1 on every ground.
+    /// `Structure` is the ONLY faint slot left on these rows: the `└` elbow
+    /// and the leading indent, glyphs nobody reads.
+    #[must_use]
+    pub fn tone_style(&self, tone: crate::toolfold::Tone) -> Style {
+        use crate::toolfold::Tone;
+        match tone {
+            Tone::Body => Style::default().fg(self.text.into()),
+            Tone::Meta => self.dim_style(),
+            Tone::Structure => self.faint_style(),
+            Tone::Name => self.maroon_style(),
+            Tone::Emphasis => self.bright_style().add_modifier(Modifier::BOLD),
+            Tone::Accent => self.gold_style(),
+            Tone::Ok => self.ok_style(),
+            Tone::Warn => self.warn_style(),
+            Tone::Err => self.err_style(),
+        }
+    }
+
     /// Success / warning / error inks.
     #[must_use]
     pub fn ok_style(&self) -> Style {

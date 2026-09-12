@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 pub const REDACTED_ENV_VALUE: &str = "•redacted";
 /// Maximum first-send bytes emitted by any deterministic output adapter.
-pub const REDUCED_TOOL_OUTPUT_MAX_BYTES: usize = 8 * 1024;
+pub const REDUCED_TOOL_OUTPUT_MAX_BYTES: usize = crate::ORCHESTRATION_PREVIEW_MAX_BYTES;
 
 /// Deterministic, first-send-only process output reducers. The raw transcript
 /// remains the artifact authority; these values are prompt-facing diet facts.
@@ -281,7 +281,7 @@ fn detect_output_adapter(tool: &str, output: &str) -> OutputAdapter {
     }
 }
 
-fn strip_ansi(input: &str) -> String {
+pub(crate) fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0usize;

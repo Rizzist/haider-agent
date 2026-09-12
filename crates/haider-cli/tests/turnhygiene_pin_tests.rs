@@ -821,7 +821,11 @@ fn run_jsonl_tool_turn_matches_the_normalized_golden() {
     )
     .expect("preview JSON");
     assert_eq!(preview["exit_code"], 3);
-    assert_eq!(preview["output"], "golden");
+    let preview_output = preview["output"].as_str().expect("preview output");
+    assert!(
+        preview_output.starts_with("golden\n[Capture: 6 bytes retained; at least 0 source bytes unavailable. Page the full secret-redacted capture with task_output("),
+        "capture handle preview must remain visible: {preview_output:?}"
+    );
     assert_eq!(preview["output_bytes"], 6);
     assert_eq!(preview["status"], "failed");
     assert_eq!(

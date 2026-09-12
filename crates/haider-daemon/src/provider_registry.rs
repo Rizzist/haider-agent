@@ -123,7 +123,9 @@ pub(crate) struct ProviderProfileV1 {
     pub promotion_model: Option<String>,
     pub provenance: ProviderProvenance,
     /// Missing in pre-lockdown records means Full so an upgrade cannot
-    /// silently revoke capabilities from an existing custom provider.
+    /// silently revoke capabilities from an existing custom provider. Later
+    /// trust changes are authoritative in committed SQLite receipts, replayed
+    /// over this seed before the account actor becomes ready.
     #[serde(default)]
     pub trust: ProviderTrustWire,
 }
@@ -594,24 +596,29 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         Ok(profile)
     }
 
-    pub(crate) fn set_trust(
-        &mut self,
+    pub(crate) fn preview_trust(
+        &self,
         provider: &str,
         trust: ProviderTrustWire,
-    ) -> Result<ProviderProfileV1, HaiderError> {
+        has_credential: &dyn Fn(&str) -> bool,
+    ) -> Result<ProviderSummaryWire, HaiderError> {
         if matches!(trust, ProviderTrustWire::Unknown) {
             return Err(invalid("provider trust must be full or lockdown"));
         }
-        let mut next = self.profiles.clone();
-        let profile = next
-            .iter_mut()
-            .find(|profile| profile.provider_id == provider)
+        let mut profile = self
+            .get(provider)
+            .cloned()
             .ok_or_else(|| invalid(format!("provider `{provider}` is not registered")))?;
         profile.trust = trust;
-        let profile = profile.clone();
-        self.store.save(&next)?;
-        self.profiles = next;
-        Ok(profile)
+        Ok(self.summary_profile(&profile, has_credential))
+    }
+
+    /// SQLite's committed trust receipt is authoritative. This infallible
+    /// publication follows its commit; startup replays it before Ready.
+    pub(crate) fn publish_trust(&mut self, provider: &str, trust: ProviderTrustWire) {
+        if let Some(profile) = self.profiles.iter_mut().find(|p| p.provider_id == provider) {
+            profile.trust = trust;
+        }
     }
 
     pub(crate) fn validate_configure(

@@ -12,6 +12,7 @@ mod checkpoint;
 mod checkpoint_tests;
 mod computer;
 mod error;
+mod file_preview;
 mod filesystem;
 mod filesystem_aliases;
 mod filesystem_edit_diagnostic;
@@ -21,8 +22,10 @@ mod list_models;
 mod message_subagent;
 mod mobile;
 mod monitor;
+mod output_redactor;
 mod plan;
 mod process;
+pub use output_redactor::{OutputRedactor, redact_process_output};
 mod redact;
 mod repo;
 mod request_input;
@@ -39,6 +42,12 @@ mod workspace_receipt;
 /// that crosses this boundary is frozen in CAS and represented by a bounded
 /// preview plus its artifact reference.
 pub const TOOL_RESULT_INLINE_MAX_BYTES: usize = 8 * 1024;
+
+/// A 1 MiB orchestration capture fits in 16 reads, half of the core's default
+/// 32-request soft tranche (and a quarter of its 64-request hard ceiling).
+/// Share this allowance across file pages, shell previews and capture pages.
+pub const ORCHESTRATION_PREVIEW_MAX_BYTES: usize = 1024 * 1024 / 16;
+pub const FILE_PREVIEW_MAX_LINES: usize = 2_000;
 
 pub use broker::{
     ALLOW_SCREEN_CONTROL_SESSION_GRANT, ALLOW_SCREEN_SESSION_GRANT, AlwaysAllowRule, EffectBroker,
@@ -97,11 +106,11 @@ pub use mobile::{
     MobileResult, UnavailableMobileBackend, mobile_manifest, platform_mobile_backend,
 };
 pub use monitor::{
-    MAX_MONITOR_FILTER_CHARS, MAX_MONITOR_FOLLOW_UP_CHARS, MAX_MONITOR_ID_CHARS, MonitorAction,
-    MonitorApproval, MonitorCliPreset, MonitorCommandApproval, MonitorFilter, MonitorFilterField,
-    MonitorFilterOperator, MonitorLifetime, MonitorOccurrence, MonitorPollUntil,
-    MonitorProcessRestart, MonitorRequest, MonitorSource, MonitorSourceKind, cli_preset_argv,
-    monitor_manifest,
+    CompletionControl, MAX_MONITOR_FILTER_CHARS, MAX_MONITOR_FOLLOW_UP_CHARS, MAX_MONITOR_ID_CHARS,
+    MonitorAction, MonitorApproval, MonitorCliPreset, MonitorCommandApproval, MonitorFilter,
+    MonitorFilterField, MonitorFilterOperator, MonitorLifetime, MonitorOccurrence,
+    MonitorPollUntil, MonitorProcessRestart, MonitorRequest, MonitorSource, MonitorSourceKind,
+    cli_preset_argv, monitor_manifest,
 };
 pub use plan::{
     PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan, PlanResult,
@@ -113,7 +122,7 @@ pub use process::{
     ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
     ProcessSignal, monitor_process_command,
 };
-pub use redact::redact_lockdown_text;
+pub use redact::{redact_lockdown_text, redact_output_text};
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{
     BuiltinResult, ComposerSubmission, EnvViewEntry, OutputAdapter, REDACTED_ENV_VALUE,

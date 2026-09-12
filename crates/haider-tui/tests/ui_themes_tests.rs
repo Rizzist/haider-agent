@@ -181,7 +181,14 @@ fn every_theme_clears_the_contrast_floors() {
         // Inks on the page ground.
         floor("text", theme.text, theme.bg, 6.5);
         floor("bright", theme.bright, theme.bg, 8.0);
-        floor("dim", theme.dim, theme.bg, 3.4);
+        // 971-tui-collapse RAISED this floor from 3.4 to the WCAG AA body
+        // floor. `dim` stopped being decoration the moment collapsed tool
+        // rows put the exit code, the line count and the duration on it
+        // (owner: "all this darker text in the TUI is making navigation
+        // difficult"), so it must be READ, not merely noticed. Desert and
+        // Water were the two grounds under the new floor and both dims were
+        // darkened along their own hue; every theme now clears 5:1.
+        floor("dim", theme.dim, theme.bg, 4.5);
         floor("gold", theme.gold, theme.bg, 3.2);
         floor("maroon", theme.maroon, theme.bg, 4.0);
         floor("ok", theme.ok, theme.bg, 3.2);

@@ -175,8 +175,10 @@ fn request_json_inner(
             "type": "web_fetch_20250910",
             "name": "web_fetch",
             "citations": {"enabled": false},
-            "max_content_tokens": 100000,
-            "max_uses": 10,
+            // 972 token-cost fix: 100k-token pages were the dominant context
+            // spender; 15k keeps a full article while bounding the worst case.
+            "max_content_tokens": 15000,
+            "max_uses": 5,
         }));
     }
     let cache_plan = cache_ttl.and_then(|_| {

@@ -420,7 +420,7 @@ async fn edit_requires_exactly_one_anchor_or_nonempty_replace_all() {
     let policy = allow(EffectClass::FsWrite);
     let ledger = ChangeLedger::new();
     let turn = attribution("anchors", "turn");
-    assert_eq!(read_file(&mut broker, "edit.txt").await, "same same\n");
+    assert_eq!(read_file(&mut broker, "edit.txt").await, "1: same same\n");
 
     let missing = broker
         .fs_edit(
@@ -477,7 +477,7 @@ async fn multi_edit_rejects_atomically_when_a_later_anchor_is_bad() {
     let (mut broker, _) = broker(directory.path(), "batch", 1);
     assert_eq!(
         read_file(&mut broker, "batch.txt").await,
-        "alpha beta gamma\n"
+        "1: alpha beta gamma\n"
     );
 
     let error = broker
@@ -791,7 +791,7 @@ async fn stale_mutation_is_typed_and_requires_a_reread() {
     let (mut broker, _) = broker(directory.path(), "stale", 1);
     let ledger = ChangeLedger::new();
     let turn = attribution("stale", "turn");
-    assert_eq!(read_file(&mut broker, "stale.txt").await, "before\n");
+    assert_eq!(read_file(&mut broker, "stale.txt").await, "1: before\n");
     fs::write(&path, "external literal\n").expect("external edit");
 
     let error = broker
@@ -819,7 +819,7 @@ async fn stale_mutation_is_typed_and_requires_a_reread() {
 
     assert_eq!(
         read_file(&mut broker, "stale.txt").await,
-        "external literal\n"
+        "1: external literal\n"
     );
     broker
         .fs_edit(
@@ -915,7 +915,7 @@ async fn recovery_rebuilds_both_fresh_and_stale_verdicts_from_outcomes() {
     let path = directory.path().join("restart.txt");
     fs::write(&path, "first\n").expect("seed");
     let (mut first, first_journal) = broker(directory.path(), "restart", 1);
-    assert_eq!(read_file(&mut first, "restart.txt").await, "first\n");
+    assert_eq!(read_file(&mut first, "restart.txt").await, "1: first\n");
     let records = first_journal.freshness();
     assert_eq!(records.len(), 1);
 
@@ -960,13 +960,13 @@ async fn child_edit_trips_parent_stale_without_sharing_session_state() {
     let (mut parent, parent_journal) = broker(directory.path(), "parent", 1);
     assert_eq!(
         read_file(&mut parent, "shared.txt").await,
-        "parent saw this\n"
+        "1: parent saw this\n"
     );
 
     let (mut child, _) = broker(directory.path(), "child", 1);
     assert_eq!(
         read_file(&mut child, "shared.txt").await,
-        "parent saw this\n"
+        "1: parent saw this\n"
     );
     child
         .fs_edit(
@@ -1046,7 +1046,7 @@ async fn landed_write_with_ledger_failure_still_updates_freshness() {
     let directory = tempfile::tempdir().expect("temporary directory");
     fs::write(directory.path().join("ledger.txt"), "one").expect("seed");
     let (mut broker, _) = broker(directory.path(), "ledger-freshness", 1);
-    assert_eq!(read_file(&mut broker, "ledger.txt").await, "one");
+    assert_eq!(read_file(&mut broker, "ledger.txt").await, "1: one");
     let turn = attribution("ledger-freshness", "turn");
     let policy = allow(EffectClass::FsWrite);
 
@@ -1083,7 +1083,7 @@ async fn landed_write_with_ledger_failure_still_updates_freshness() {
 /// MUTATION CHECK: alter the legacy preview/flags or spill an inline read to
 /// CAS. Expected RUNTIME failure: one of these exact assertions differs.
 #[tokio::test]
-async fn existing_read_and_create_write_results_remain_byte_exact() {
+async fn numbered_read_and_create_write_preserve_exact_content() {
     let directory = tempfile::tempdir().expect("temporary directory");
     fs::write(directory.path().join("read.txt"), "exact\n").expect("seed");
     let (mut broker, _) = broker(directory.path(), "golden", 1);
@@ -1096,7 +1096,7 @@ async fn existing_read_and_create_write_results_remain_byte_exact() {
         )
         .await
         .expect("read");
-    assert_eq!(read.preview, "exact\n");
+    assert_eq!(read.preview, "1: exact\n");
     assert!(!read.truncated);
     assert!(read.artifact.is_none());
     assert!(read.cursor.is_none());

@@ -973,6 +973,7 @@ mod reducer_filter_tests {
             status: ToolStatus::Completed,
         };
         let task_completed = TaskCompleted {
+            completion_consumer: None,
             task: TaskId::new("recovery-evidence-task"),
             name: "fixture task".into(),
             state: TaskTerminalState::Completed { exit_code: Some(0) },

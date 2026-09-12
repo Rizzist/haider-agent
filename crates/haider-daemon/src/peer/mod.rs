@@ -1,4 +1,6 @@
-//! Live peer discovery and transcript-journaled turn-boundary injection.
+//! Registered peer discovery and journaled, idempotent boundary delivery.
+
+mod delivery;
 
 use crate::session_hub::{SessionHub, SessionHubError, WeakSessionHub};
 use haider_protocol::ids::SessionId;
@@ -67,6 +69,9 @@ pub(crate) enum PeerError {
     },
     Platform(haider_platform::EndpointError),
     Hub(SessionHubError),
+    Refused {
+        message: String,
+    },
 }
 
 impl PeerError {
@@ -82,10 +87,18 @@ impl PeerError {
 impl std::fmt::Display for PeerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ambiguous { .. } => formatter.write_str("peer address is ambiguous"),
-            Self::Invalid { message } | Self::Unavailable { message } => {
-                formatter.write_str(message)
-            }
+            Self::Ambiguous { candidates } => write!(
+                formatter,
+                "peer address is ambiguous; candidates: {}",
+                candidates
+                    .iter()
+                    .map(|candidate| format!("{} [{}]", candidate.name, candidate.id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Invalid { message }
+            | Self::Unavailable { message }
+            | Self::Refused { message } => formatter.write_str(message),
             Self::Io {
                 operation,
                 path,
@@ -116,7 +129,16 @@ impl From<haider_platform::EndpointError> for PeerError {
 
 impl From<SessionHubError> for PeerError {
     fn from(error: SessionHubError) -> Self {
-        Self::Hub(error)
+        match error {
+            SessionHubError::Store(error)
+                if error.code == haider_protocol::error::ErrorCode::InvalidArgument =>
+            {
+                Self::Invalid {
+                    message: error.to_string(),
+                }
+            }
+            error => Self::Hub(error),
+        }
     }
 }
 
@@ -134,6 +156,8 @@ struct LocalPublication {
     paths: haider_platform::PeerEndpointPaths,
 }
 
+const SEND_CAPACITY: usize = 32;
+
 /// One profile daemon's live roster and per-session injection endpoints.
 pub(crate) struct PeerService {
     runtime_dir: PathBuf,
@@ -144,6 +168,10 @@ pub(crate) struct PeerService {
     admissions: Arc<tokio::sync::Semaphore>,
     publications: Mutex<HashMap<String, LocalPublication>>,
     background: Mutex<Option<JoinHandle<()>>>,
+    outbox: tokio::sync::Mutex<delivery::Outbox>,
+    sends: Arc<tokio::sync::Semaphore>,
+    send_admission: tokio::sync::Mutex<()>,
+    recipient_guards: tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     reconcile_count: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -155,6 +183,24 @@ impl PeerService {
         runtime_dir: PathBuf,
         hub: &SessionHub,
     ) -> Result<Arc<Self>, PeerError> {
+        #[cfg(all(unix, not(target_os = "android")))]
+        let runtime_dir = std::env::var_os("HAIDER_PEER_RENDEZVOUS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or(runtime_dir);
+        if !runtime_dir.is_absolute() {
+            return Err(PeerError::Invalid {
+                message: "peer rendezvous must be an absolute owner-private directory".into(),
+            });
+        }
+        let directory = runtime_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            haider_platform::prepare_runtime_directory(&directory).map(|_| ())
+        })
+        .await
+        .map_err(|error| PeerError::Unavailable {
+            message: format!("prepare peer rendezvous failed: {error}"),
+        })??;
+        let outbox = delivery::recover(hub).await?;
         let service = Arc::new(Self {
             runtime_dir,
             hub: hub.downgrade(),
@@ -164,6 +210,10 @@ impl PeerService {
             admissions: Arc::new(tokio::sync::Semaphore::new(32)),
             publications: Mutex::new(HashMap::new()),
             background: Mutex::new(None),
+            outbox: tokio::sync::Mutex::new(outbox),
+            sends: Arc::new(tokio::sync::Semaphore::new(SEND_CAPACITY)),
+            send_admission: tokio::sync::Mutex::new(()),
+            recipient_guards: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             reconcile_count: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -236,6 +286,9 @@ impl PeerService {
                     // event driven, with the 30-second audit as repair.
                     service.heartbeat_once().await
                 };
+                if let Err(error) = service.drain_outbox().await {
+                    tracing::warn!(target: "haider.peer", %error, "peer outbox drain failed");
+                }
                 if let Err(error) = result {
                     if reconcile {
                         debounce.get_or_insert_with(|| {
@@ -285,12 +338,10 @@ impl PeerService {
         for publication in publications {
             let _ = publication.cancel.send(true);
             let _ = publication.task.await;
-            remove_manifest(&publication.paths.manifest).await;
+            // Registration survives endpoint shutdown for bounded offline delivery.
         }
         #[cfg(windows)]
-        for publication in publications {
-            remove_manifest(&publication.paths.manifest).await;
-        }
+        drop(publications);
     }
 
     pub(crate) async fn list(self: &Arc<Self>) -> Result<Vec<PeerDescriptor>, PeerError> {
@@ -306,64 +357,8 @@ impl PeerService {
         message: String,
         summary: Option<String>,
     ) -> Result<PeerReceipt, PeerError> {
-        self.ensure_running()?;
-        validate_text("peer address", &to, PEER_ADDRESS_MAX_BYTES, false)?;
-        validate_header("peer address", &to)?;
-        validate_text("peer message", &message, PEER_MESSAGE_MAX_BYTES, false)?;
-        if let Some(summary) = summary.as_deref() {
-            validate_text("peer summary", summary, PEER_SUMMARY_MAX_BYTES, true)?;
-        }
-        self.reconcile_once().await?;
-        let agents = self.discover().await?;
-        // Local publications are authoritative for Haider sender identity.
-        // A same-UID external manifest must never be able to rename a local
-        // session or acquire verified provenance by reusing its id.
-        let sender = self
-            .publications
-            .lock()
-            .map_err(|_| PeerError::Unavailable {
-                message: "peer publication registry is poisoned".into(),
-            })?
-            .get(from.as_str())
-            .map(|publication| publication.descriptor.clone())
-            .ok_or_else(|| PeerError::Unavailable {
-                message: format!("sender session {from} is not a live peer"),
-            })?;
-        let target = resolve_address(&to, &agents)?;
-        let message = PeerMessage {
-            msg_id: random_id("msg")?,
-            from: PeerSender {
-                id: sender.id.clone(),
-                device_id: sender.device_id.clone(),
-                mode: match sender.state {
-                    PeerState::Busy => "prompting",
-                    PeerState::Idle => "idle",
-                }
-                .into(),
-                name: sender.name.clone(),
-                kind: PeerKind::HaiderSession,
-                trust: PeerTrust::VerifiedHaider,
-            },
-            to: target.id.clone(),
-            message: message.into(),
-            summary,
-            queued_at: now_ms(),
-            // Retained solely to decode older journal/wire records. Delivery
-            // lifetime is the live target and its normal transcript queue.
-            expires_at: 0,
-        };
-        if self.is_local(&target.id)? {
-            return self.enqueue_local(message).await;
-        }
-        #[cfg(unix)]
-        {
-            let path = endpoint_path_for(&self.runtime_dir, &target)?;
-            exchange_delivery(&path, message).await
-        }
-        #[cfg(windows)]
-        Err(PeerError::Unavailable {
-            message: "peer is not live on this device".into(),
-        })
+        self.send_with_options(from, to, message, summary, Default::default())
+            .await
     }
 
     /// A one-shot subscription. Subscribe before the authoritative snapshot,
@@ -464,7 +459,7 @@ impl PeerService {
         self.reconcile_count.fetch_add(1, Ordering::Relaxed);
         let summaries = self.hub()?.peer_session_summaries().await?;
         let now = now_ms();
-        let device_id = self.hub()?.device_id().to_string();
+        let device_id = self.hub()?.peer_device_id();
         let desired = summaries
             .into_iter()
             .map(|summary| {
@@ -545,7 +540,9 @@ impl PeerService {
                     let _ = publication.cancel.send(true);
                     let _ = publication.task.await;
                 }
-                remove_manifest(&publication.paths.manifest).await;
+                #[cfg(windows)]
+                drop(publication);
+                // Losing residency removes only the endpoint, not registration.
             }
         }
         Ok(())
@@ -710,32 +707,45 @@ impl PeerService {
                 message: message.clone(),
             },
         );
-        // This is only the legacy-shaped synchronous admission answer, not
-        // a delivery journal or retry protocol. The transcript is authoritative.
-        Ok(receipt(
+        // Keep legacy busy/idle delivery values, with an additive status
+        // confirming durable admission in either case.
+        let mut receipt = receipt(
             &message.msg_id,
             match accepted.disposition {
                 haider_core::TurnAdmissionDisposition::Started => PeerDelivery::Delivered,
                 _ => PeerDelivery::Queued,
             },
             None,
-        ))
+        );
+        receipt.status = Some(haider_protocol::peer::PeerReceiptStatus {
+            state: haider_protocol::peer::PeerDeliveryState::Delivered,
+            from: Some(message.from.address()),
+            reason: None,
+            to: message.to.clone(),
+            accepted_at_ms: message.queued_at,
+            updated_at_ms: now_ms(),
+        });
+        Ok(receipt)
     }
 
     #[cfg(unix)]
-    async fn registered_wire_sender(&self, id: &str) -> Result<PeerSender, PeerError> {
+    async fn registered_wire_sender(
+        &self,
+        id: &str,
+        device_id: &str,
+    ) -> Result<PeerSender, PeerError> {
         if self.is_local(id)? {
             return Err(PeerError::Invalid {
                 message: format!("socket peer cannot claim local Haider session {id:?}"),
             });
         }
         let descriptor = self
-            .discover()
+            .known_peers()
             .await?
             .into_iter()
-            .find(|agent| agent.id == id)
+            .find(|agent| agent.id == id && agent.device_id == device_id)
             .ok_or_else(|| PeerError::Invalid {
-                message: format!("socket peer {id:?} has no live, unambiguous manifest"),
+                message: format!("socket peer {id:?} has no registered, unambiguous manifest"),
             })?;
         Ok(wire_sender_from_descriptor(descriptor))
     }
@@ -751,7 +761,7 @@ impl PeerService {
                 if message.to != target_id {
                     return Err(PeerError::Invalid { message: "wrong peer endpoint target".into() });
                 }
-                message.from = self.registered_wire_sender(&message.from.id).await?;
+                message.from = self.registered_wire_sender(&message.from.id, &message.from.device_id).await?;
                 let receipt = self.enqueue_local(message).await?;
                 Ok(haider_rpc::ResponseBody::PeerSend { receipt })
             }
@@ -934,7 +944,14 @@ pub(super) fn resolve_address(
     match matches.as_slice() {
         [agent] => Ok((*agent).clone()),
         [] => Err(PeerError::Unavailable {
-            message: format!("no live peer matches {address:?}"),
+            message: format!(
+                "no registered peer matches {address:?}; candidates: {}",
+                agents
+                    .iter()
+                    .map(|agent| format!("{} ({})", agent.address(), agent.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }),
         _ => Err(PeerError::Ambiguous {
             candidates: matches
@@ -1044,6 +1061,7 @@ fn receipt(
     reason: Option<PeerDeliveryReason>,
 ) -> PeerReceipt {
     PeerReceipt {
+        status: None,
         msg_id: msg_id.to_owned(),
         delivery,
         reason,
@@ -1239,31 +1257,6 @@ fn replace_manifest_staging(source: &Path, target: &Path) -> std::io::Result<()>
         }
         Err(error) => Err(error),
     }
-}
-
-async fn remove_manifest(path: &Path) {
-    let path = path.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
-        Ok(()) => sync_parent(&path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(PeerError::io("remove peer manifest", &path, error)),
-    })
-    .await;
-}
-
-fn sync_parent(path: &Path) -> Result<(), PeerError> {
-    #[cfg(unix)]
-    {
-        let parent = path.parent().ok_or_else(|| PeerError::Invalid {
-            message: format!("runtime artifact {} has no parent", path.display()),
-        })?;
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| PeerError::io("sync peer runtime directory", parent, error))?;
-    }
-    #[cfg(windows)]
-    let _ = path;
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -1484,8 +1477,16 @@ async fn connect_peer(path: &Path) -> Result<haider_client::Connected, PeerError
         },
     )
     .await
-    .map_err(|error| PeerError::Unavailable {
-        message: error.to_string(),
+    .map_err(|error| match error {
+        haider_client::ConnectError::PermissionDenied(_)
+        | haider_client::ConnectError::Rejected(_)
+        | haider_client::ConnectError::Frame(_)
+        | haider_client::ConnectError::UnexpectedFrame => PeerError::Refused {
+            message: error.to_string(),
+        },
+        _ => PeerError::Unavailable {
+            message: error.to_string(),
+        },
     })?;
     if !connected
         .welcome
@@ -1493,7 +1494,7 @@ async fn connect_peer(path: &Path) -> Result<haider_client::Connected, PeerError
         .contains(haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1)
     {
         let _ = connected.client.close();
-        return Err(PeerError::Unavailable {
+        return Err(PeerError::Refused {
             message: "target lacks peer_agent_injection_v1".into(),
         });
     }
@@ -1504,18 +1505,44 @@ async fn connect_peer(path: &Path) -> Result<haider_client::Connected, PeerError
 pub(super) async fn exchange_delivery(
     path: &Path,
     message: PeerMessage,
+    device_id: &str,
 ) -> Result<PeerReceipt, PeerError> {
     let connected = connect_peer(path).await?;
+    if connected.welcome.instance_id != message.to || connected.welcome.profile_id != device_id {
+        let _ = connected.client.close();
+        return Err(PeerError::Refused {
+            message: "endpoint Welcome names a different receiver or device".into(),
+        });
+    }
     let response = connected
         .client
         .request(haider_rpc::RequestBody::PeerInject { message })
         .await;
     let _ = connected.client.close();
-    let response = response.map_err(|error| PeerError::Unavailable {
-        message: error.to_string(),
+    let response = response.map_err(|error| match error {
+        haider_client::ClientError::Encode(_)
+        | haider_client::ClientError::MissingFeature(_)
+        | haider_client::ClientError::Disconnected(
+            haider_client::DisconnectReason::Protocol(_)
+            | haider_client::DisconnectReason::Fatal(_),
+        ) => PeerError::Refused {
+            message: error.to_string(),
+        },
+        _ => PeerError::Unavailable {
+            message: error.to_string(),
+        },
     })?;
-    haider_client::peer::peer_send_response(response).map_err(|error| PeerError::Unavailable {
-        message: error.to_string(),
+    haider_client::peer::peer_send_response(response).map_err(|error| match error {
+        haider_client::PeerClientError::Refused { ref code, .. }
+            if code == haider_rpc::ERROR_CODE_PEER_UNAVAILABLE =>
+        {
+            PeerError::Unavailable {
+                message: error.to_string(),
+            }
+        }
+        _ => PeerError::Refused {
+            message: error.to_string(),
+        },
     })
 }
 
@@ -1567,7 +1594,7 @@ fn serve_peer_connection(
                 instance_id: target.clone(),
                 daemon_generation: 0,
                 frame_limit: frame_limit as u32,
-                profile_id: hub.device_id().to_string(),
+                profile_id: hub.peer_device_id(),
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 lifecycle_phase: LifecyclePhase::Ready,
                 capabilities_granted: Default::default(),
@@ -1718,3 +1745,7 @@ async fn write_frame_limited<W: AsyncWrite + Unpin>(
         .await
         .map_err(|error| PeerError::io("flush peer RPC", "<peer>", error))
 }
+
+#[cfg(all(test, unix))]
+#[path = "../peer_delivery_tests.rs"]
+mod peer_delivery_tests;

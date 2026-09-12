@@ -19,7 +19,6 @@ mod tuivirt_common;
 use haider_protocol::EventPayload;
 use haider_protocol::ids::SessionId;
 use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, RuntimeMode, Screen};
-use haider_tui::taskrows::{BandCountKind, band_counts, band_counts_text};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tuivirt_common::{SIZES, draw, session_model};
 
@@ -109,28 +108,32 @@ fn submit(model: &mut AppModel, text: &str) {
 
 // ------------------------------------------------- item 1: the task line --
 
+/// 971-tui-collapse round 2 (owner DEDUPE ruling): the counts moved OFF
+/// the `▾ subagents` row and onto the band's background-task line under the
+/// composer, which is their single source now. `taskrows::band_counts` is
+/// retired; `statusline::Counts` carries the same zero-omission and
+/// pluralisation law — and reports agents and background tasks besides.
 #[test]
-fn band_counts_omit_zero_and_pluralise_one_and_many_separately() {
-    // The pluralisation contract the retired status segment used to own.
-    assert!(band_counts(0, 0).is_empty());
-    assert_eq!(
-        band_counts_text(&band_counts(1, 1)),
-        "· 1 shell · 1 monitor"
+fn the_counts_omit_zero_and_pluralise_one_and_many_separately() {
+    let counts = |shells, monitors| {
+        haider_tui::statusline::Counts {
+            shells,
+            monitors,
+            agents: 0,
+            tasks: 0,
+        }
+        .text()
+    };
+    assert!(
+        haider_tui::statusline::Counts::default().is_empty(),
+        "nothing running is nothing to say"
     );
-    assert_eq!(
-        band_counts_text(&band_counts(2, 3)),
-        "· 2 shells · 3 monitors"
-    );
-    // Each half is omitted on its own, never rendered as `· 0 shells`.
-    assert_eq!(band_counts_text(&band_counts(0, 2)), "· 2 monitors");
-    assert_eq!(band_counts_text(&band_counts(4, 0)), "· 4 shells");
-}
-
-#[test]
-fn band_counts_carry_their_own_overlay_kind() {
-    let counts = band_counts(1, 1);
-    assert_eq!(counts[0].kind, BandCountKind::Shells);
-    assert_eq!(counts[1].kind, BandCountKind::Monitors);
+    assert_eq!(counts(0, 0), "");
+    assert_eq!(counts(1, 1), "1 shell, 1 monitor");
+    assert_eq!(counts(2, 3), "2 shells, 3 monitors");
+    // Each half is omitted on its own, never rendered as `0 shells`.
+    assert_eq!(counts(0, 2), "2 monitors");
+    assert_eq!(counts(4, 0), "4 shells");
 }
 
 #[test]
@@ -147,11 +150,11 @@ fn live_shell_count_ignores_exited_and_closed_shells() {
     // live ones, exactly as the retired segment did.
     assert_eq!(model.shells.len(), 3);
     assert_eq!(model.live_shell_count(), 1);
-    assert_eq!(band_counts_text(&model.band_counts()), "· 1 shell");
+    assert_eq!(model.status_line().counts.shells, 1);
 }
 
 #[test]
-fn the_band_row_carries_the_counts_right_aligned_at_every_width() {
+fn the_task_line_carries_the_counts_at_every_width() {
     let mut model = monitor_session();
     model.shells.push(shell("sh-one"));
     model.shells.push(shell("sh-two"));
@@ -159,62 +162,74 @@ fn the_band_row_carries_the_counts_right_aligned_at_every_width() {
     for (width, height) in SIZES {
         let frame = draw(&model, width, height);
         let row = frame
-            .row_containing("· 2 shells")
-            .expect("the band row carries the counts");
+            .row_containing("2 shells")
+            .expect("the band's task line carries the counts");
         let text = &frame.rows[row];
         assert!(
-            text.contains("· 2 shells · 1 monitor"),
+            text.contains("2 shells, 1 monitor"),
             "counts must read as one run at {width}x{height}: {text}"
         );
-        // Right-aligned: the run ends at the row's last non-blank cell.
+        // And they appear EXACTLY once on the frame — the whole point of
+        // the DEDUPE ruling: the `▾ subagents` row no longer repeats them
+        // three rows above.
         assert_eq!(
-            text.trim_end().chars().count(),
-            text.trim_end().len().min(text.trim_end().chars().count()),
-            "row must not be padded past its counts at {width}x{height}"
+            frame
+                .rows
+                .iter()
+                .filter(|row| row.contains("2 shells"))
+                .count(),
+            1,
+            "the counts have ONE source at {width}x{height}"
         );
         assert!(
-            text.trim_end().ends_with("· 1 monitor"),
-            "counts must be RIGHT-aligned at {width}x{height}: {text}"
+            !frame.contains("· 2 shells ·"),
+            "the retired right-aligned band-row run is gone at {width}x{height}"
         );
     }
 }
 
 #[test]
-fn each_band_count_is_its_own_click_target() {
+fn each_kind_of_task_row_is_its_own_click_target() {
+    // The overlay doors 970 owner item 1 hung on the counts follow them to
+    // the task line: expanded, a shell row opens `/shells` and a monitor
+    // row opens `/monitors`.
     let mut model = monitor_session();
     model.shells.push(shell("sh-one"));
-    model.monitor_count = 2;
+    model.monitor_count = 1;
+    model.monitors = vec![timer("mon-a", haider_rpc::MonitorStateWire::Armed)];
+    model.toggle_tasks_line();
     for (width, height) in SIZES {
         let frame = draw(&model, width, height);
         let (shell_rect, _) = frame
             .find_hit(|hit| matches!(hit, Hit::ShellStatus))
-            .unwrap_or_else(|| panic!("shell count clickable at {width}x{height}"));
+            .unwrap_or_else(|| panic!("shell row clickable at {width}x{height}"));
         let (monitor_rect, _) = frame
             .find_hit(|hit| matches!(hit, Hit::MonitorStatus))
-            .unwrap_or_else(|| panic!("monitor count clickable at {width}x{height}"));
-        // Same row, disjoint, and in reading order — one click can never
-        // mean both counts.
-        assert_eq!(shell_rect.y, monitor_rect.y);
-        assert!(
-            shell_rect.x + shell_rect.width <= monitor_rect.x,
-            "count rects overlap at {width}x{height}"
+            .unwrap_or_else(|| panic!("monitor row clickable at {width}x{height}"));
+        assert_ne!(
+            shell_rect.y, monitor_rect.y,
+            "one click can never mean both kinds at {width}x{height}"
         );
     }
 }
 
 #[test]
-fn the_counts_row_stands_alone_when_nothing_is_delegated() {
-    // No subagents at all: the band row still owes the counts, because the
-    // status-bar segment that used to carry them is gone.
+fn the_subagents_row_is_absent_when_nothing_is_delegated() {
+    // 971-tui-collapse round 2: with no subagents that panel has nothing of
+    // its own to say, so it owes no row — the counts it used to carry live
+    // under the composer now.
     let mut model = monitor_session();
     model.monitor_count = 1;
     let frame = draw(&model, 118, 36);
-    assert!(frame.contains("· 1 monitor"));
     assert!(
-        frame.has_hit(|hit| matches!(hit, Hit::MonitorStatus)),
-        "the lone counts row stays clickable"
+        frame.contains("1 monitor"),
+        "the task line still reports it"
     );
-    // …and with nothing running the row collapses entirely, as before.
+    assert!(
+        !frame.contains("subagents"),
+        "the counts-only `▾ subagents` row is retired"
+    );
+    // …and with nothing running at all neither row appears.
     model.monitor_count = 0;
     let quiet = draw(&model, 118, 36);
     assert!(!quiet.contains("monitor"));

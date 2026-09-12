@@ -1,0 +1,49 @@
+# tuivirt golden · help_over_long_transcript · 80x24
+00|help  esc closes                                                                |
+   ~ Rgb(217, 181, 68)/Rgb(25, 25, 25)/NONE×4; Rgb(58, 58, 58)/Rgb(25, 25, 25)/NONE×12; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×64
+01|commands                                                                        |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×8; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×72
+02|menus — every card (permission · hook trust · recovery · voice · tools) is a typ|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+03|  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff F|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+04|keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the l|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+05|tool rows — /collapse [all|expand|next|prev|down|up] · /verbosity [quiet|default|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+06|  ⏎/space or click cycles the focused row (collapsed → bounded → show all) · ⇟/⇞|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+07|  /reconnect  Reconnect to the daemon and resume from applied cursors           |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×69; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×11
+08|  /model [query]  Pick a model — every provider, full-screen search             |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×67; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×13
+09|  /provider [name]  Switch provider — the model follows                         |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×55; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×25
+10|  /effort [level|default]  Reasoning effort — bare /effort opens the ladder pick|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+11|  /fast  Toggle fast mode (supported pairs only)                                |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×48; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×32
+12|  /theme [system·light·dark·desert·oasis]  Change the theme — bare /theme opens |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+13|  /tree  Open the session tree — jump to or fork any node                       |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×57; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×23
+14|  /fork  Fork the session at the current point                                  |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×46; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×34
+15|  /branch [new|name]  Branches — list and switch; `new` forks at the last commit|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+16|  /undo [last|id]  Undo the latest durable file checkpoint                      |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×58; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×22
+17|  /redo [last|id]  Redo the latest undone file checkpoint                       |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×57; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×23
+18|  /checkpoints  List durable file checkpoints for this branch                   |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×61; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×19
+19|  /rollback [current|previous|run-id]  Roll back every file edit from one turn  |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×78; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×2
+20|  /attach <path>  Attach a file — image or UTF-8 text, uploaded now, rides your |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+21|  /sessions  List sessions — attach, or start fresh                             |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×51; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×29
+22|  /aura  Aura Mode — a voice/orchestrator session (spawns sessions, never codes)|
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38

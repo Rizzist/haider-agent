@@ -1952,6 +1952,7 @@ dependencies = [
  "haider-accounts",
  "haider-platform",
  "haider-protocol",
+ "haider-webextract",
  "httpdate",
  "reqwest",
  "rustls",
@@ -2082,6 +2083,10 @@ dependencies = [
 
 [[package]]
 name = "haider-verify"
+version = "0.0.970"
+
+[[package]]
+name = "haider-webextract"
 version = "0.0.970"
 
 [[package]]

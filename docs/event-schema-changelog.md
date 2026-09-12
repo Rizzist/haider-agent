@@ -21,6 +21,38 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.971 — pending follow-up obligations
+
+Additive raw payload kinds: `payload:completion_attempt`,
+`payload:completion_admitted`, `payload:completion_delivered`,
+`payload:completion_parked`, `payload:completion_resumed`,
+`payload:completion_handled`, and `payload:completion_dismissed`.
+They reference the stable monitor report, task completion, or answered menu
+obligation and its consuming attempt. Source delivery and successful turn
+termination do not clear it; only a handled receipt or explicit dismissal does.
+`task_completed` adds optional `completion_consumer` with the actual steered
+`run_id` and `branch_id`. Omission preserves queued/non-autostart behavior.
+`session.observe` adds `pending_follow_ups`, omitted when empty. Existing monitor
+operations add `follow_up` with `completion_action`, `obligation_id`, expected
+`attempt`, and committed `evidence_event_ids`. The RPC method pin remains 136.
+Existing JSON/MessagePack fixtures remain unchanged; extension goldens pin the
+new event tags. See [the follow-up contract](completion-pending-v1.md).
+
+### v0.0.971 — sender delivery receipts and offline outbox
+
+New journal kinds `payload:peer.outbox` and `payload:peer.delivery` record the
+sender's bounded outbox entry and receipt transitions. Both omit prompt and
+transcript rendering. Receipts add optional `status` with state, reason,
+recipient address, and acceptance/update timestamps. `delivered` records
+durable receiver admission, including its busy queue, not completed effects.
+
+Existing `peer.send` adds optional idempotency/expiry/cancellation options;
+`peer.list` adds an optional status query/page and an additive
+`delivery_status_supported` response marker. The 136 wire methods and feature
+bits remain unchanged. No retired `.q` mailbox is read or written. Known peer
+manifests survive socket downtime; stable peer device identity uses the
+existing durable profile installation ID. See [the peer contract](peer-messaging-v1.md).
+
 ### v0.0.970 — peer input is a transcript agent speaker
 
 `NodeKind` adds `kind: "agent"` carrying `message`. New peer admissions commit

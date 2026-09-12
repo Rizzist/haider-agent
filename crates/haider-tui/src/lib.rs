@@ -37,6 +37,7 @@ pub mod select;
 pub mod session;
 pub mod settings;
 pub mod ssh_terminal;
+pub mod statusline;
 pub mod stream_recovery;
 pub mod stt_runtime;
 pub mod style;
@@ -45,6 +46,7 @@ pub mod taskrows;
 pub mod terms_journal;
 pub mod theme;
 pub mod throughput;
+pub mod toolfold;
 pub mod wordmark;
 
 /// Crate marker used by the workspace self-test.

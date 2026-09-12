@@ -2242,7 +2242,9 @@ fn different_exec_command() -> String {
 
 #[cfg(unix)]
 fn restart_exec_command() -> String {
-    "printf 'attempt\\n' >> attempts.log; printf started; sleep 1".into()
+    // The daemon's output redactor publishes complete lines. Keep the process
+    // alive after a flushed start marker so the crash window remains real.
+    "printf 'attempt\\n' >> attempts.log; printf 'started\\n'; sleep 1".into()
 }
 
 #[cfg(windows)]
@@ -2257,9 +2259,11 @@ fn restart_exec_command() -> String {
 
 #[cfg(unix)]
 fn cancellable_exec_command() -> String {
+    // The daemon's output redactor publishes complete lines. The newline lets
+    // the observer see the child before cancellation while the loop runs.
     concat!(
         "(sleep 0.35; printf survived > descendant-survived.log) & ",
-        "printf x >> heartbeat.log; printf started; ",
+        "printf x >> heartbeat.log; printf 'started\\n'; ",
         "while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done"
     )
     .into()

@@ -1,0 +1,34 @@
+[
+  {
+    "expires_at": 1788946988751,
+    "from": {
+      "device_id": "profile-dev-46e28603ebf31020dc57bb9f884f2b8a",
+      "id": "session-37434835c3ed21729b039abf7c73b734",
+      "kind": "haider_session",
+      "mode": "idle",
+      "name": "hpv-fz507vkt-63e7cb",
+      "trust": "untrusted_external"
+    },
+    "message": "synthetic sender one visible message",
+    "msg_id": "per-sender-id",
+    "queued_at": 1788943388751,
+    "to": "session-326a3d19ebcd33ddcc395629d4c37c84",
+    "type": "peer.message"
+  },
+  {
+    "expires_at": 1788946988779,
+    "from": {
+      "device_id": "profile-dev-46e28603ebf31020dc57bb9f884f2b8a",
+      "id": "session-fccfed3a133bcfddf24b5740d6912f01",
+      "kind": "haider_session",
+      "mode": "idle",
+      "name": "hpv-fz507vkt-b48e30",
+      "trust": "untrusted_external"
+    },
+    "message": "synthetic sender two visible message",
+    "msg_id": "per-sender-id",
+    "queued_at": 1788943388779,
+    "to": "session-326a3d19ebcd33ddcc395629d4c37c84",
+    "type": "peer.message"
+  }
+]

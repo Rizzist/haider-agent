@@ -30,15 +30,20 @@ pub(crate) fn nearest_anchor_candidate(path: &Path, text: &str, anchor: &str) ->
     let anchor_pairs = bigrams(&anchor_normalized);
     let mut window = VecDeque::with_capacity(line_count);
     let mut best: Option<Candidate> = None;
-    let mut private_key = false;
-    let mut lines = text.lines().enumerate().peekable();
+    let mut redaction = crate::redact::RedactionState::default();
+    let mut lines = text.split_inclusive('\n').enumerate().peekable();
     while let Some((index, line)) = lines.next() {
         // Redact before clipping: truncating a token first could leave a
         // recognizable credential prefix outside the redactor's patterns.
-        // Streaming state also protects a window beginning inside a PEM key.
-        let redacted = crate::redact::redact_line_with_private_key_state(line, &mut private_key);
-        let clipped: String = redacted.text.chars().take(CANDIDATE_MAX_CHARS).collect();
-        let line_truncated = clipped.len() < redacted.text.len();
+        // Carry quote/escape and PEM state before selecting a candidate window.
+        let redacted = crate::redact::redact_line_with_state(line, &mut redaction);
+        let content = redacted
+            .text
+            .strip_suffix("\r\n")
+            .or_else(|| redacted.text.strip_suffix('\n'))
+            .unwrap_or(&redacted.text);
+        let clipped: String = content.chars().take(CANDIDATE_MAX_CHARS).collect();
+        let line_truncated = clipped.len() < content.len();
         window.push_back((clipped, line_truncated));
         if window.len() > line_count {
             window.pop_front();

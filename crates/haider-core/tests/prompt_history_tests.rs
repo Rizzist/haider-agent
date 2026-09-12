@@ -6037,6 +6037,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         started_at_ms: 1,
     });
     let completed = TaskEventPayload::TaskCompleted(TaskCompleted {
+        completion_consumer: None,
         task: haider_protocol::ids::TaskId::new("task-11"),
         name: "watcher".into(),
         state: TaskTerminalState::Completed { exit_code: Some(0) },
@@ -6051,6 +6052,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         workspace_mutation: None,
     });
     let steered = TaskEventPayload::TaskCompleted(TaskCompleted {
+        completion_consumer: None,
         task: haider_protocol::ids::TaskId::new("task-12"),
         name: "steered".into(),
         state: TaskTerminalState::Killed,
