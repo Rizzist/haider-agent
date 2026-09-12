@@ -1132,7 +1132,7 @@ pub fn signal_process_group_id(pid: ProcessId, signal: ProcessSignal) -> std::io
     signal_process_group(group, signal)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn process_group_exists(group: ProcessGroup) -> std::io::Result<bool> {
     match rustix::process::test_kill_process_group(unix_pid(group.0)?) {
         Ok(()) => linux_process_group_has_live_member(group),
@@ -1142,9 +1142,20 @@ pub fn process_group_exists(group: ProcessGroup) -> std::io::Result<bool> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_process_group_has_live_member(group: ProcessGroup) -> std::io::Result<bool> {
-    for entry in std::fs::read_dir("/proc")? {
+    linux_process_group_has_live_member_at(group.0, std::path::Path::new("/proc"))
+}
+
+// Android uses the same kernel stat layout and zombie lifetime as Linux.
+// In particular, our own WNOWAIT-pinned zombie is not a live member. Keep
+// uncertain/withheld procfs observations conservative on either target.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn linux_process_group_has_live_member_at(
+    group: u32,
+    proc_root: &std::path::Path,
+) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(proc_root)? {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => return Ok(true),
@@ -1156,7 +1167,7 @@ fn linux_process_group_has_live_member(group: ProcessGroup) -> std::io::Result<b
         else {
             continue;
         };
-        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+        let stat = match std::fs::read(proc_root.join(pid.to_string()).join("stat")) {
             Ok(stat) => stat,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             // If procfs withholds a visible process, retain kill(2)'s
@@ -1166,14 +1177,14 @@ fn linux_process_group_has_live_member(group: ProcessGroup) -> std::io::Result<b
         let Some((state, process_group)) = linux_proc_state_and_group(&stat) else {
             return Ok(true);
         };
-        if process_group == group.0 && !matches!(state, b'Z' | b'X') {
+        if process_group == group && !matches!(state, b'Z' | b'X') {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn linux_proc_state_and_group(stat: &[u8]) -> Option<(u8, u32)> {
     // The comm field is parenthesized and may itself contain `)`, so split at
     // the last close-paren. The next fields are state, parent pid, and pgid.
@@ -1185,13 +1196,46 @@ fn linux_proc_state_and_group(stat: &[u8]) -> Option<(u8, u32)> {
     Some((state, process_group))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 pub fn process_group_exists(group: ProcessGroup) -> std::io::Result<bool> {
     match rustix::process::test_kill_process_group(unix_pid(group.0)?) {
         Ok(()) | Err(rustix::io::Errno::PERM) => Ok(true),
         Err(rustix::io::Errno::SRCH) => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Tests whether a pinned macOS group contains only its unreaped leader.
+///
+/// The caller must retain the leader's Child without reaping it throughout this
+/// probe. Unlike killpg's permission result, the native process list includes
+/// members that are already exiting but have not finished releasing resources.
+/// Waiting for descendants to leave the list also waits for their final reap.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn process_group_contains_only_leader(
+    group: ProcessGroup,
+    leader: ProcessId,
+) -> std::io::Result<bool> {
+    let group_id = unix_pid(group.0)?.as_raw_nonzero().get();
+    // Two entries suffice: the pinned leader plus any other group member.
+    // A full buffer means cleanup is pending, so truncation cannot imply exit.
+    let mut members = [0_i32; 2];
+    // SAFETY: members is an initialized, aligned writable array of two pid_t
+    // values, its exact byte capacity is passed, and libproc retains no pointer.
+    let count = unsafe {
+        libc::proc_listpgrppids(
+            group_id,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(&members) as libc::c_int,
+        )
+    };
+    if count <= 0 {
+        // The caller's unreaped leader must still exist. Zero can also mask a
+        // libproc error; neither case is a successful cleanup witness.
+        return Err(std::io::Error::other("pinned process group is unavailable"));
+    }
+    Ok(count == 1 && members[0] == leader.as_raw_nonzero().get())
 }
 
 #[cfg(windows)]

@@ -584,6 +584,10 @@ pub const FEATURE_WIRE_MSGPACK_V1: &str = "wire_msgpack_v1";
 /// Daemon can omit superseded item deltas from the durable store phase of a
 /// session attachment replay while preserving the replay cursor and live tail.
 pub const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
+
+/// `session.detach` can close a quiescent session's native resources without
+/// deleting its journal. Only a Control attachment may request this barrier.
+pub const FEATURE_SESSION_CLOSE_V1: &str = "session_close_v1";
 /// ADE capability sniff: `haider export` renders seq-keyed rows (pipe/json
 /// carry per-turn journal seq + a head_seq cursor, `--since` is exact).
 pub const FEATURE_EXPORT_SEQ_V1: &str = "export_seq_v1";
@@ -2291,6 +2295,13 @@ pub struct SessionObserveDigest {
     /// [`SessionSummary::run_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
+    /// Model-reported outcome from this selected run's committed terminal.
+    /// Absent for ordinary completion, legacy journals, and metadata-only reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_outcome: Option<haider_protocol::task_outcome::TaskOutcomeV1>,
+    /// Version of `task_outcome`; emitted together with a recognized outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_outcome_version: Option<u32>,
     /// `None` names the implicit main branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_branch_id: Option<BranchId>,
@@ -3655,10 +3666,15 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "is_false")]
         sealed_replay: bool,
     },
-    /// Ends event delivery for one attachment; never affects session
-    /// authority or worker ownership.
+    /// Ends event delivery for one attachment. With `close_session`, also
+    /// evicts its quiescent session after joining session tasks. Active work
+    /// or other attachments cause a retryable refusal; durable history stays.
     #[serde(rename = "session.detach")]
-    SessionDetach { attachment_id: AttachmentId },
+    SessionDetach {
+        attachment_id: AttachmentId,
+        #[serde(default, skip_serializing_if = "is_false")]
+        close_session: bool,
+    },
     /// Atomically creates one durable named ref at an exact committed node.
     #[serde(rename = "branch.create")]
     BranchCreate {
@@ -4594,6 +4610,10 @@ impl RequestBody {
     #[must_use]
     pub const fn additive_shape_feature(&self) -> Option<&'static str> {
         match self {
+            Self::SessionDetach {
+                close_session: true,
+                ..
+            } => Some(FEATURE_SESSION_CLOSE_V1),
             Self::TurnRetract { .. } => Some(FEATURE_TURN_RETRACT_V1),
             Self::HeadlessRunStart { spec, .. } if spec.agent_spawn.is_some() => {
                 Some(FEATURE_AGENT_CLI_V1)
@@ -4891,7 +4911,13 @@ pub enum ResponseBody {
         attach_state: AttachState,
     },
     #[serde(rename = "session.detach")]
-    SessionDetach { attachment_id: AttachmentId },
+    SessionDetach {
+        attachment_id: AttachmentId,
+        /// Present only after a requested native close barrier completes.
+        /// The transport connection and profile-wide services remain open.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed_session_id: Option<SessionId>,
+    },
     /// Stable, secret-free coordinates of an atomic `branch.create` (R2).
     #[serde(rename = "branch.create")]
     BranchCreate {

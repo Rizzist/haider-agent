@@ -6201,3 +6201,49 @@ fn peer_delivery_extensions_roundtrip_without_new_methods() {
         );
     }
 }
+
+#[test]
+fn observe_task_outcome_is_additive_and_roundtrips_both_codecs() {
+    let legacy = serde_json::json!({"session_id":"outcome", "head_seq":29, "worker_generation":1, "title":"task", "run_state":"errored", "run_id":"failed-run", "main_head_seq":0, "updated_at_ms":42});
+    let mut digest: haider_rpc::SessionObserveDigest =
+        serde_json::from_value(legacy.clone()).expect("legacy digest decodes");
+    assert!(digest.task_outcome.is_none());
+    assert!(digest.task_outcome_version.is_none());
+    assert_eq!(
+        serde_json::to_value(&digest)
+            .expect("legacy encodes")
+            .get("task_outcome"),
+        None
+    );
+    digest.task_outcome = Some(haider_protocol::task_outcome::TaskOutcomeV1::Failure {
+        reason: "Required input is unavailable".into(),
+    });
+    digest.task_outcome_version = Some(1);
+    let frame = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("observe-outcome"),
+        body: ResponseBody::SessionObserve { digest },
+    };
+    let encoded = serde_json::to_value(&frame).expect("frame encodes");
+    let decoded: WireFrame = serde_json::from_value(encoded).expect("JSON frame decodes");
+    assert_eq!(frame, decoded);
+    let packed = rmp_serde::to_vec_named(&frame).expect("MessagePack frame encodes");
+    let decoded: WireFrame = rmp_serde::from_slice(&packed).expect("MessagePack frame decodes");
+    assert_eq!(frame, decoded);
+    #[derive(Deserialize)]
+    struct LegacyDigest {
+        run_id: Option<String>,
+        run_state: String,
+    }
+    let WireFrame::Response {
+        body: ResponseBody::SessionObserve { digest },
+        ..
+    } = frame
+    else {
+        panic!("observe frame")
+    };
+    let old: LegacyDigest =
+        serde_json::from_value(serde_json::to_value(digest).expect("current digest"))
+            .expect("old client ignores additive fields");
+    assert_eq!(old.run_id.as_deref(), Some("failed-run"));
+    assert_eq!(old.run_state, "errored");
+}

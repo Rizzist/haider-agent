@@ -32,7 +32,7 @@ struct ServerRequest {
 
 struct ServerHandle {
     sender: mpsc::Sender<ServerRequest>,
-    task: JoinHandle<()>,
+    task: crate::native_process::NativeTask<()>,
     definition_key: String,
     digest: String,
     workspace_cwd: PathBuf,
@@ -47,6 +47,7 @@ pub(super) struct ServerTestState {
     leader_pid: std::sync::atomic::AtomicU32,
     running: std::sync::atomic::AtomicBool,
     wedge_reap: std::sync::atomic::AtomicBool,
+    native_cleanup_gate: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 #[cfg(test)]
@@ -58,6 +59,15 @@ impl ServerTestState {
 
     pub(super) fn is_running(&self) -> bool {
         self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn hold_native_cleanup(&self) -> oneshot::Sender<()> {
+        let (release, gate) = oneshot::channel();
+        *self
+            .native_cleanup_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        release
     }
 
     pub(super) fn wedge_reap(&self) {
@@ -79,6 +89,11 @@ impl HookServerRegistry {
         input: Arc<[u8]>,
         run_scope: Option<(SessionId, RunId)>,
     ) -> Result<oneshot::Receiver<ServerReply>, ServerDispatchError> {
+        let activity = run_scope
+            .as_ref()
+            .map(|(session_id, _)| service.inner.hub.try_session_activity(session_id))
+            .transpose()
+            .map_err(|_| ServerDispatchError::Closed)?;
         let definition_key = definition.subscriber_key();
         let key = match &run_scope {
             Some((session_id, run_id)) => {
@@ -99,31 +114,42 @@ impl HookServerRegistry {
                         let actor_service = service.clone();
                         let actor_definition = definition.clone();
                         let actor_run_override = run_scope.is_some();
+                        let owner = activity.clone().zip(run_scope.as_ref()).map(
+                            |(activity, (session, _))| {
+                                crate::native_process::NativeOwner::new(
+                                    &service.inner.hub,
+                                    session,
+                                    activity,
+                                )
+                            },
+                        );
                         #[cfg(test)]
                         let test_state = Arc::new(ServerTestState::default());
                         #[cfg(test)]
                         let actor_test_state = Arc::clone(&test_state);
                         #[cfg(test)]
-                        let task = tokio::spawn(async move {
-                            run_server_actor(
-                                actor_service,
-                                actor_definition,
-                                receiver,
-                                actor_run_override,
-                                actor_test_state,
-                            )
-                            .await;
-                        });
+                        let task =
+                            crate::native_process::NativeTask::spawn_owned(owner, async move {
+                                run_server_actor(
+                                    actor_service,
+                                    actor_definition,
+                                    receiver,
+                                    actor_run_override,
+                                    actor_test_state,
+                                )
+                                .await;
+                            });
                         #[cfg(not(test))]
-                        let task = tokio::spawn(async move {
-                            run_server_actor(
-                                actor_service,
-                                actor_definition,
-                                receiver,
-                                actor_run_override,
-                            )
-                            .await;
-                        });
+                        let task =
+                            crate::native_process::NativeTask::spawn_owned(owner, async move {
+                                run_server_actor(
+                                    actor_service,
+                                    actor_definition,
+                                    receiver,
+                                    actor_run_override,
+                                )
+                                .await;
+                            });
                         ServerHandle {
                             sender,
                             task,
@@ -205,8 +231,8 @@ impl HookServerRegistry {
                 })
                 .collect::<Vec<_>>()
         };
-        for task in tasks {
-            let _ = task.await;
+        for mut task in tasks {
+            let _ = task.wait().await;
         }
     }
 
@@ -243,18 +269,16 @@ impl HookServerRegistry {
 }
 
 struct ServerProcess {
-    child: tokio::process::Child,
+    child: crate::native_process::NativeProcess,
     stdin: tokio::process::ChildStdin,
     stdout: BufReader<tokio::process::ChildStdout>,
-    group: ProcessGroupGuard,
     #[cfg(test)]
     test_state: Arc<ServerTestState>,
 }
 
 impl ServerProcess {
     async fn kill(mut self) -> HookChildReapOutcome {
-        self.group.kill();
-        let _ = self.child.start_kill();
+        self.child.signal_kill();
         #[cfg(test)]
         if self
             .test_state
@@ -275,6 +299,15 @@ async fn stop_server(process: ServerProcess, context: &'static str) {
 #[cfg(test)]
 impl Drop for ServerProcess {
     fn drop(&mut self) {
+        if let Some(gate) = self
+            .test_state
+            .native_cleanup_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            self.child.delay_cleanup(gate);
+        }
         self.test_state
             .running
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -342,9 +375,9 @@ async fn run_server_actor(
             return;
         }
         if let Some(active) = process.as_mut() {
-            match active.child.try_wait() {
-                Ok(None) => {}
-                Ok(Some(_)) => {
+            match active.child.leader_exited() {
+                Ok(false) => {}
+                Ok(true) => {
                     if let Some(process) = process.take() {
                         // The leader is gone, but descendants may still own
                         // the process group. Kill the group before respawn.
@@ -529,24 +562,16 @@ fn spawn_server(
     haider_platform::configure_background_process(&mut command);
     let mut child = command
         .spawn()
+        .and_then(crate::native_process::NativeProcess::register)
         .map_err(|error| format!("hook server spawn failed: {error}"))?;
-    let raw_pid = child.id().ok_or_else(|| {
-        let _ = child.start_kill();
-        "hook server did not expose a process id".to_owned()
-    })?;
-    let group = haider_platform::register_process_group(raw_pid).map_err(|error| {
-        let _ = child.start_kill();
-        format!("hook server process-group registration failed: {error}")
-    })?;
-    let mut group = ProcessGroupGuard { pid: Some(group) };
-    let stdin = child.stdin.take().ok_or_else(|| {
-        group.kill();
-        let _ = child.start_kill();
+    #[cfg(test)]
+    let raw_pid = child.id();
+    let stdin = child.take_stdin().ok_or_else(|| {
+        child.signal_kill();
         "hook server stdin unavailable".to_owned()
     })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        group.kill();
-        let _ = child.start_kill();
+    let stdout = child.take_stdout().ok_or_else(|| {
+        child.signal_kill();
         "hook server stdout unavailable".to_owned()
     })?;
     #[cfg(test)]
@@ -562,7 +587,6 @@ fn spawn_server(
         child,
         stdin,
         stdout: BufReader::new(stdout),
-        group,
         #[cfg(test)]
         test_state,
     })

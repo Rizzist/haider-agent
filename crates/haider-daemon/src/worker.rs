@@ -78,8 +78,8 @@ use haider_core::{
     ProviderViewAppendRequest, RequestInputCheckpoint, RouteWaitCheckpoint,
     SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
     SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    SubmitRouteWaitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnTraceContext,
-    UserCommandOutput, build_cache_request_diagnostic, build_context_accounting,
+    SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    TurnTraceContext, UserCommandOutput, build_cache_request_diagnostic, build_context_accounting,
     classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
     presentation_for_haider_error, register_turn_trace, registered_turn_trace,
@@ -2555,10 +2555,15 @@ pub trait TurnToolFactory: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     /// An injected factory's declared surface is explicit configuration.
-    /// The production broker opts into coding-tier discovery; `Some(names)`
-    /// adds names to that tier, while `None` exposes the authorized catalog.
+    /// The production broker opts into capability-profile discovery; `Some(names)`
+    /// adds names to that profile, while `None` exposes the authorized catalog.
     fn initial_tool_exposure(&self) -> Option<Vec<String>> {
         None
+    }
+
+    /// Initial presentation only; authorization is applied before this profile.
+    fn tool_capability_profile(&self) -> ToolCapabilityProfile {
+        ToolCapabilityProfile::Coding
     }
 
     /// Immutable definition storage for turn-time filtering. Injected
@@ -2667,6 +2672,19 @@ impl DaemonDependencies {
         self.tool_factory = Arc::new(ConfiguredToolExposureFactory {
             inner: self.tool_factory,
             names,
+            profile: None,
+        });
+        self
+    }
+
+    /// Chooses initial schemas without changing grants or explicit exposure.
+    #[must_use]
+    pub fn with_tool_capability_profile(mut self, profile: ToolCapabilityProfile) -> Self {
+        let names = self.tool_factory.initial_tool_exposure();
+        self.tool_factory = Arc::new(ConfiguredToolExposureFactory {
+            inner: self.tool_factory,
+            names,
+            profile: Some(profile),
         });
         self
     }
@@ -2675,6 +2693,7 @@ impl DaemonDependencies {
 struct ConfiguredToolExposureFactory {
     inner: Arc<dyn TurnToolFactory>,
     names: Option<Vec<String>>,
+    profile: Option<ToolCapabilityProfile>,
 }
 
 #[async_trait]
@@ -2689,6 +2708,11 @@ impl TurnToolFactory for ConfiguredToolExposureFactory {
 
     fn initial_tool_exposure(&self) -> Option<Vec<String>> {
         self.names.clone()
+    }
+
+    fn tool_capability_profile(&self) -> ToolCapabilityProfile {
+        self.profile
+            .unwrap_or_else(|| self.inner.tool_capability_profile())
     }
 
     async fn create(
@@ -4717,15 +4741,19 @@ async fn run_supervisor(
     let mut delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
     // W-A: rebuild this session's background-task projection and reap
     // prior-generation orphans as soon as the session becomes live again.
-    {
+    let mut adoption = {
         let tasks = crate::tasks::TaskFacade::new(lease.hub().clone());
         let session_id = lease.session_id().clone();
-        tokio::spawn(async move {
-            if let Err(error) = tasks.adopt_session(&session_id).await {
-                tracing::warn!(%session_id, ?error, "background-task adoption failed at supervisor start");
+        Box::pin(async move {
+            if let Err(error) = tasks
+                .start_session_adoption_when_available(&session_id)
+                .await
+            {
+                tracing::warn!(%session_id, ?error, "background-task adoption admission failed");
             }
-        });
-    }
+        })
+    };
+    let mut adoption_pending = true;
 
     loop {
         if retire_requested && active.is_none() {
@@ -5104,6 +5132,9 @@ async fn run_supervisor(
                             return false;
                         }
                     }
+                }
+                () = &mut adoption, if adoption_pending => {
+                    adoption_pending = false;
                 }
                 command = commands.recv() => {
                     match command {
@@ -5551,6 +5582,9 @@ async fn run_supervisor(
             }
         } else {
             tokio::select! {
+                () = &mut adoption, if adoption_pending => {
+                    adoption_pending = false;
+                }
                 command = commands.recv() => match command {
                     Some(SupervisorCommand::Submit(pending)) => {
                         idle_deadline = None;
@@ -7187,7 +7221,10 @@ async fn perform_manual_compaction(
         lockdown.is_some(),
         durable_tools.promoted_tools,
     ) {
-        post_compaction_config.enable_tool_discovery(configured);
+        post_compaction_config.enable_tool_discovery_with_profile(
+            dependencies.tool_factory.tool_capability_profile(),
+            configured,
+        );
     }
     let post_compaction_tools = post_compaction_config.shared_tool_definitions();
     let post_compaction_tool_digest = post_compaction_config.canonical_tool_pack_digest();
@@ -9113,7 +9150,10 @@ async fn start_turn(
         lockdown.is_some(),
         promoted_tools,
     ) {
-        config.enable_tool_discovery(configured);
+        config.enable_tool_discovery_with_profile(
+            dependencies.tool_factory.tool_capability_profile(),
+            configured,
+        );
     }
     // Cache prefix law: common policy is the complete system prompt; native
     // semantics follow in the advertised schemas. Session/task/identity state
@@ -13263,6 +13303,7 @@ pub(crate) enum RegisteredToolRoute {
     Plan,
     LoomRegister,
     TodoWrite,
+    TaskOutcome,
     GraphEvidence,
     FsRead,
     FsGlob,
@@ -13579,6 +13620,11 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::TodoWrite,
             }
         },
+        registered_manifest(
+            haider_tools::task_outcome_manifest(),
+            ToolPermissionDefault::NotApplicable,
+            RegisteredToolRoute::TaskOutcome,
+        ),
         {
             let manifest = haider_tools::graph_evidence_manifest();
             RegisteredTool {
@@ -13786,7 +13832,9 @@ fn initial_tool_exposure_for_turn(
     lockdown: bool,
     promoted: Vec<String>,
 ) -> Option<Vec<String>> {
-    if grant.is_some() || lockdown {
+    // Explicit packs without a discovery door remain fully advertised. The
+    // installed definitions enforce both tool names and effect ceilings.
+    if lockdown || grant.is_some_and(|grant| !grant.tools.iter().any(|name| name == "list_tools")) {
         return None;
     }
     let mut configured = factory.initial_tool_exposure()?;
@@ -15291,6 +15339,14 @@ impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
 
 #[async_trait]
 impl TurnToolFactory for BrokerToolFactory {
+    fn tool_capability_profile(&self) -> ToolCapabilityProfile {
+        std::env::var("HAIDER_TOOL_PROFILE")
+            .ok()
+            .as_deref()
+            .and_then(ToolCapabilityProfile::from_name)
+            .unwrap_or_default()
+    }
+
     fn initial_tool_exposure(&self) -> Option<Vec<String>> {
         configured_tool_exposure(std::env::var("HAIDER_TOOL_EXPOSURE").ok().as_deref())
     }
@@ -20313,6 +20369,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::ListTools
             | RegisteredToolRoute::Plan
             | RegisteredToolRoute::TodoWrite
+            | RegisteredToolRoute::TaskOutcome
             | RegisteredToolRoute::GraphEvidence
             | RegisteredToolRoute::WorkflowAuthor
             | RegisteredToolRoute::SpawnSubagent

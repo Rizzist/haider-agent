@@ -42,6 +42,7 @@ use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
+use haider_protocol::task_outcome::TaskOutcomeV1;
 use haider_rpc::{ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_RESTAGE_REQUIRED, ProviderSummaryWire};
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1293,6 +1294,7 @@ fn direct_ssh_session(sessions: &[SessionId]) -> DirectSshSession<'_> {
 #[derive(Debug, serde::Serialize)]
 struct ObservedRun {
     state: RunState,
+    task_outcome: Option<TaskOutcomeV1>,
     seq: u64,
     branch_id: Option<BranchId>,
 }
@@ -1375,6 +1377,7 @@ struct ObserveFoldSnapshot {
     run_state: haider_rpc::ObserveRunStateWire,
     /// Identity of the run `run_state` describes; `None` when idle.
     run_id: Option<RunId>,
+    task_outcome: Option<TaskOutcomeV1>,
     active_branch_id: Option<BranchId>,
     branches: Vec<haider_protocol::branch::BranchDescriptor>,
     main_head_node_id: Option<haider_protocol::ids::NodeId>,
@@ -1459,6 +1462,7 @@ impl ObserveFold {
         });
         let run_id = selected.map(|(run_id, _)| run_id.clone());
         let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
+        let task_outcome = selected.and_then(|(_, run)| run.task_outcome.clone());
         let mut branches = self
             .projection
             .branches
@@ -1478,6 +1482,7 @@ impl ObserveFold {
             title: self.projection.title.clone(),
             run_state,
             run_id,
+            task_outcome,
             active_branch_id,
             branches,
             main_head_node_id: self.projection.main_head_node_id.clone(),
@@ -1663,6 +1668,9 @@ fn observe_projection_allocation_charge(projection: &ObserveProjection) -> usize
         total = total.saturating_add(string_spare(kind));
     }
     for (run_id, run) in &projection.runs {
+        if let Some(TaskOutcomeV1::Failure { reason }) = &run.task_outcome {
+            total = total.saturating_add(string_spare(reason));
+        }
         total = total
             .saturating_add(run_id.0.capacity().saturating_sub(run_id.0.len()))
             .saturating_add(run.branch_id.as_ref().map_or(0, |branch| {
@@ -1725,6 +1733,8 @@ impl ObserveFoldSnapshot {
             title,
             run_state: self.run_state,
             run_id: self.run_id.clone(),
+            task_outcome: self.task_outcome.clone(),
+            task_outcome_version: self.task_outcome.as_ref().map(|_| 1),
             active_branch_id: self.active_branch_id.clone(),
             branches: self.branches.clone(),
             main_head_node_id: self.main_head_node_id.clone(),
@@ -2866,6 +2876,21 @@ impl ObserveProjection {
         let seq = envelope.seq;
         let branch_id = envelope.branch_id;
         let run_id = envelope.run_id;
+        if envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("session_forked")
+            && haider_protocol::session_fork::SessionForked::from_payload_value(&envelope.payload)
+                .is_some()
+        {
+            // Forks retain the parent's journal prefix for context, including
+            // terminal run facts. Only runs after this durable boundary belong
+            // to the child for adjudication. Apply the same reset during live
+            // folding and restart reconstruction without changing history.
+            self.runs.clear();
+            return;
+        }
         if let Some(created) =
             haider_protocol::branch::BranchCreated::from_payload_value(&envelope.payload)
         {
@@ -2882,10 +2907,28 @@ impl ObserveProjection {
             }
             EventPayload::RunState(state) => {
                 if let Some(run_id) = run_id {
+                    // Read only the versioned metadata on this run/branch's
+                    // terminal envelope, never a tool receipt or assistant text.
+                    // Replacing the whole record clears an older outcome when
+                    // the same run changes state (including legacy terminals).
+                    let task_outcome = if state == RunState::Errored
+                        && envelope
+                            .payload
+                            .get("task_outcome_version")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(1)
+                    {
+                        envelope.payload.get("task_outcome").and_then(|value| {
+                            serde_json::from_value::<TaskOutcomeV1>(value.clone()).ok()
+                        })
+                    } else {
+                        None
+                    };
                     self.runs.insert(
                         run_id,
                         ObservedRun {
                             state,
+                            task_outcome,
                             seq,
                             branch_id,
                         },
@@ -3071,6 +3114,7 @@ impl ObserveProjection {
         });
         let run_id = selected.map(|(run_id, _)| run_id.clone());
         let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
+        let task_outcome = selected.and_then(|(_, run)| run.task_outcome.clone());
         let title = self.title.unwrap_or_else(|| {
             metadata
                 .as_ref()
@@ -3099,6 +3143,8 @@ impl ObserveProjection {
             title,
             run_state,
             run_id,
+            task_outcome_version: task_outcome.as_ref().map(|_| 1),
+            task_outcome,
             active_branch_id,
             branches,
             main_head_node_id: self.main_head_node_id,
@@ -4273,8 +4319,16 @@ impl HubConnection {
                 self.session_attach(request_id, session_id, after_seq, mode, sealed_replay)
                     .await
             }
-            RequestBody::SessionDetach { attachment_id } => {
-                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+            RequestBody::SessionDetach {
+                attachment_id,
+                close_session,
+            } => {
+                let operation = if close_session {
+                    Operation::Control
+                } else {
+                    Operation::View
+                };
+                if let Err(message) = authorize(&self.capabilities, operation) {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_CAPABILITY_DENIED,
@@ -4283,7 +4337,56 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_detach(request_id, attachment_id).await
+                if close_session {
+                    match self
+                        .hub
+                        .close_attachment_session(
+                            attachment_id.clone(),
+                            self.connection_id.clone(),
+                            Arc::clone(&self.sink),
+                        )
+                        .await
+                    {
+                        Ok(session_id) => {
+                            let watch_task = {
+                                let mut watch = lock(&self.surface_watch)?;
+                                if let Some(state) = watch.as_ref() {
+                                    lock(&state.registrations)?.remove(&session_id);
+                                }
+                                if watch.as_ref().is_some_and(|state| {
+                                    state
+                                        .registrations
+                                        .lock()
+                                        .is_ok_and(|registrations| registrations.is_empty())
+                                }) {
+                                    watch.take().map(|state| state.task)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(task) = watch_task {
+                                task.abort();
+                                let _ = task.await;
+                            }
+                            self.send(WireFrame::Response {
+                                request_id,
+                                body: ResponseBody::SessionDetach {
+                                    attachment_id,
+                                    closed_session_id: Some(session_id),
+                                },
+                            })
+                        }
+                        Err(error) => self.respond_error(
+                            request_id,
+                            error.code.as_str(),
+                            &error.message,
+                            error.retryable,
+                            None,
+                        ),
+                    }
+                } else {
+                    self.session_detach(request_id, attachment_id).await
+                }
             }
             RequestBody::BranchCreate {
                 command_id,
@@ -17304,6 +17407,15 @@ impl HubConnection {
         session_id: SessionId,
         range: SeqRange,
     ) -> Result<(), SessionHubError> {
+        if lock(&self.hub.inner.deleting_sessions)?.contains(&session_id) {
+            return self.respond_error(
+                request_id,
+                "session_closed",
+                "session is closed or being deleted",
+                false,
+                None,
+            );
+        }
         let head = self.hub.inner.store.latest_seq(&session_id).await?;
         if head == 0 {
             return self.respond_error(
@@ -17730,6 +17842,15 @@ impl HubConnection {
         mode: AttachMode,
         sealed_replay: bool,
     ) -> Result<(), SessionHubError> {
+        if lock(&self.hub.inner.deleting_sessions)?.contains(&session_id) {
+            return self.respond_error(
+                request_id,
+                "session_closed",
+                "session is closed or being deleted",
+                false,
+                None,
+            );
+        }
         if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
             return self.respond_error(
                 request_id,
@@ -17906,7 +18027,10 @@ impl HubConnection {
             let _ = self.sink.purge_attachment(&attachment_id);
             return self.send(WireFrame::Response {
                 request_id,
-                body: ResponseBody::SessionDetach { attachment_id },
+                body: ResponseBody::SessionDetach {
+                    attachment_id,
+                    closed_session_id: None,
+                },
             });
         }
         let Some(owner) = owner else {
@@ -17926,7 +18050,10 @@ impl HubConnection {
         SessionHub::finish_detach(&attachment_id, owner).await;
         self.send(WireFrame::Response {
             request_id,
-            body: ResponseBody::SessionDetach { attachment_id },
+            body: ResponseBody::SessionDetach {
+                attachment_id,
+                closed_session_id: None,
+            },
         })
     }
 
@@ -20091,6 +20218,98 @@ mod run_identity_tests {
             projection.apply(envelope);
         }
         projection.finish(SessionId::new("session-run-identity"), head, 1, None)
+    }
+
+    fn task_terminal(run: &str, seq: u64, branch: &str) -> RawEnvelope {
+        let mut envelope = state_envelope(run, seq, RunState::Errored);
+        envelope.branch_id = Some(BranchId::new(branch));
+        envelope
+            .payload
+            .insert_metadata("task_outcome_version", serde_json::json!(1));
+        envelope.payload.insert_metadata(
+            "task_outcome",
+            serde_json::json!({
+                "status": "failure", "reason": "Required input is unavailable"
+            }),
+        );
+        envelope
+    }
+
+    #[test]
+    fn observed_task_outcome_follows_the_selected_run_and_branch() {
+        let terminal = task_terminal("failed-run", 2, "failed-branch");
+        let digest = digest_of(vec![terminal.clone()]);
+        assert_eq!(digest.run_id, Some(RunId::new("failed-run")));
+        assert_eq!(
+            digest.active_branch_id,
+            Some(BranchId::new("failed-branch"))
+        );
+        assert_eq!(digest.task_outcome_version, Some(1));
+        assert_eq!(
+            digest.task_outcome,
+            Some(TaskOutcomeV1::Failure {
+                reason: "Required input is unavailable".into(),
+            })
+        );
+
+        // A live branch wins over a newer terminal on a sibling branch.
+        let mut live = state_envelope("live-run", 1, RunState::Streaming);
+        live.branch_id = Some(BranchId::new("live-branch"));
+        let digest = digest_of(vec![live, terminal.clone()]);
+        assert_eq!(digest.run_id, Some(RunId::new("live-run")));
+        assert_eq!(digest.active_branch_id, Some(BranchId::new("live-branch")));
+        assert!(digest.task_outcome.is_none());
+        assert!(digest.task_outcome_version.is_none());
+
+        // A later ordinary terminal also replaces the selected failure.
+        let digest = digest_of(vec![
+            terminal.clone(),
+            state_envelope("new-run", 3, RunState::Done),
+        ]);
+        assert_eq!(digest.run_id, Some(RunId::new("new-run")));
+        assert!(digest.task_outcome.is_none());
+        // Replacing a state on the same run must clear its previous metadata.
+        let digest = digest_of(vec![
+            terminal,
+            state_envelope("failed-run", 3, RunState::Errored),
+        ]);
+        assert!(digest.task_outcome.is_none());
+    }
+
+    #[test]
+    fn observe_ignores_unversioned_unknown_and_nonterminal_task_metadata() {
+        let terminal = task_terminal("failure", 1, "branch");
+        let mut variants = Vec::new();
+        for version in [serde_json::Value::Null, serde_json::json!(2)] {
+            let mut envelope = terminal.clone();
+            envelope
+                .payload
+                .insert_metadata("task_outcome_version", version);
+            variants.push(envelope);
+        }
+        let mut malformed = terminal.clone();
+        malformed
+            .payload
+            .insert_metadata("task_outcome", serde_json::json!({"status": "future"}));
+        variants.push(malformed);
+        for state in [RunState::Streaming, RunState::Done, RunState::Cancelled] {
+            let mut envelope = state_envelope("failure", 1, state);
+            envelope
+                .payload
+                .insert_metadata("task_outcome_version", serde_json::json!(1));
+            envelope
+                .payload
+                .insert_metadata("task_outcome", terminal.payload["task_outcome"].clone());
+            variants.push(envelope);
+        }
+        let mut uncorrelated = terminal;
+        uncorrelated.run_id = None;
+        variants.push(uncorrelated);
+        for envelope in variants {
+            let digest = digest_of(vec![envelope]);
+            assert!(digest.task_outcome.is_none());
+            assert!(digest.task_outcome_version.is_none());
+        }
     }
 
     #[test]

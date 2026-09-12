@@ -107,6 +107,7 @@ mod manual_retry_tests;
 mod mobile_transport;
 mod model_select;
 mod monitor;
+mod native_process;
 mod oauth;
 mod peer;
 #[cfg(test)]

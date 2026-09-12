@@ -133,8 +133,8 @@ async fn classify_hook_child_reap(
     }
 }
 
-async fn reap_hook_child(child: &mut tokio::process::Child) -> HookChildReapOutcome {
-    classify_hook_child_reap(child.wait()).await
+async fn reap_hook_child(child: &mut crate::native_process::NativeProcess) -> HookChildReapOutcome {
+    classify_hook_child_reap(child.finish()).await
 }
 
 fn report_hook_child_reap(context: &'static str, outcome: HookChildReapOutcome) {
@@ -369,6 +369,36 @@ struct HookServiceInner {
 }
 
 impl HookService {
+    /// Dormant no-hook outbox rows are durable history for future hook
+    /// installation, not live resource owners. Never acknowledge them merely
+    /// to evict an actor. The hub holds an exclusive hook-activity lease while
+    /// making this check, so dispatch cannot cross the close barrier.
+    pub(crate) async fn permits_native_close(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, HaiderError> {
+        if !self
+            .inner
+            .store
+            .has_pending_hook_dispatches(session_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        let metadata = self
+            .inner
+            .store
+            .session_metadata(session_id)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(ErrorCode::InvalidArgument, "session is absent", false)
+            })?;
+        let discovery = discover_cached_async(self, PathBuf::from(metadata.cwd))
+            .await
+            .map_err(|message| HaiderError::new(ErrorCode::Busy, message, true))?;
+        Ok(discovery.hooks.is_empty() && discovery.notices.is_empty() && !discovery.config_changed)
+    }
+
     #[cfg(test)]
     fn snapshot_persist_count(&self) -> u64 {
         self.inner.snapshot_persist_count.load(Ordering::Relaxed)
@@ -2461,6 +2491,20 @@ async fn handle_and_complete(
     } = context;
     let payload = decode_committed_payload(&envelope.payload);
     let terminal_scope = terminal_run_scope(&envelope, &payload);
+    // Close may hold the exclusive lease briefly and then refuse pending
+    // hooks. Wait for that decision: treating contention as a dispatch failure
+    // would terminate startup replay and strand the durable outbox.
+    let Ok(activity) = service
+        .inner
+        .hub
+        .session_activity(&envelope.session_id)
+        .await
+    else {
+        return HandleOutcome {
+            terminal_scope,
+            completed: false,
+        };
+    };
     let committed = DecodedCommittedEnvelope {
         envelope: envelope.clone(),
         payload,
@@ -2468,14 +2512,22 @@ async fn handle_and_complete(
     advance_durable_cursor(state, &envelope);
     let mut pending = Vec::new();
     let mut terminal_server_scope = None;
-    if !handle_committed(
-        service,
-        state,
-        jobs,
-        committed,
-        &mut pending,
-        &mut terminal_server_scope,
-        batch_discoveries,
+    let native_owner = crate::native_process::NativeOwner::new(
+        &service.inner.hub,
+        &envelope.session_id,
+        Arc::clone(&activity),
+    );
+    if !crate::native_process::NativeOwner::scope(
+        Some(native_owner),
+        handle_committed(
+            service,
+            state,
+            jobs,
+            committed,
+            &mut pending,
+            &mut terminal_server_scope,
+            batch_discoveries,
+        ),
     )
     .await
     {
@@ -2494,6 +2546,7 @@ async fn handle_and_complete(
             .insert(coordinate.clone());
         let inflight_dispatches = Arc::clone(inflight_dispatches);
         jobs.spawn(async move {
+            let _activity = activity;
             let handled = complete_server_fires(&service, pending).await;
             if let Some(scope) = &terminal_server_scope {
                 service.inner.servers.kill_scope(scope);
@@ -3117,6 +3170,14 @@ async fn deliver_subscriber(
     };
     loop {
         if !state.subscribers.contains_key(&key) {
+            let activity = if let Some((session_id, _)) = &run_scope {
+                let Ok(activity) = service.inner.hub.try_session_activity(session_id) else {
+                    return false;
+                };
+                Some(activity)
+            } else {
+                None // Profile subscribers have an independent lifetime.
+            };
             let (sender, receiver) = mpsc::channel(SUBSCRIBE_QUEUE);
             state.subscribers.insert(
                 key.clone(),
@@ -3132,9 +3193,17 @@ async fn deliver_subscriber(
             let definition = definition.clone();
             let cause = envelope.clone();
             let run_override = run_scope.is_some();
-            jobs.spawn(async move {
-                run_subscriber(service, definition, cause, receiver, run_override).await;
+            let owner = activity.map(|activity| {
+                crate::native_process::NativeOwner::new(
+                    &service.inner.hub,
+                    &cause.session_id,
+                    activity,
+                )
             });
+            jobs.spawn(crate::native_process::NativeOwner::scope(
+                owner,
+                run_subscriber(service, definition, cause, receiver, run_override),
+            ));
         }
         let Some(handle) = state.subscribers.get(&key) else {
             continue;
@@ -3852,48 +3921,36 @@ async fn run_command(
     #[cfg(windows)]
     configure_hook_cwd(&mut command, &cwd_fd);
     haider_platform::configure_background_process(&mut command);
-    let mut child = match command.spawn() {
+    let mut child = match command
+        .spawn()
+        .and_then(crate::native_process::NativeProcess::register)
+    {
         Ok(child) => child,
         Err(error) => return failed_process_output(&format!("hook spawn failed: {error}")),
     };
-    let Some(raw_pid) = child.id() else {
-        let _ = child.start_kill();
-        return failed_process_output("hook process did not expose a process id");
-    };
-    let pid = match haider_platform::register_process_group(raw_pid) {
-        Ok(group) => Some(group),
-        Err(error) => {
-            let _ = child.start_kill();
-            return failed_process_output(&format!(
-                "hook process-group registration failed: {error}"
-            ));
-        }
-    };
-    let leader_pid = haider_platform::process_id(Some(raw_pid));
-    let mut process_group = ProcessGroupGuard { pid };
-    let mut stdin = child.stdin.take();
-    let Some(stdout) = child.stdout.take() else {
-        process_group.kill();
-        let _ = child.start_kill();
+    let mut stdin = child.take_stdin();
+    let Some(stdout) = child.take_stdout() else {
+        child.signal_kill();
         let reap = reap_hook_child(&mut child).await;
         report_hook_child_reap("spawn_stdout_unavailable", reap);
         return failed_process_output("hook stdout unavailable");
     };
-    let Some(stderr) = child.stderr.take() else {
-        process_group.kill();
-        let _ = child.start_kill();
+    let Some(stderr) = child.take_stderr() else {
+        child.signal_kill();
         let reap = reap_hook_child(&mut child).await;
         report_hook_child_reap("spawn_stderr_unavailable", reap);
         return failed_process_output("hook stderr unavailable");
     };
-    let stdout_task = tokio::spawn(read_limited(stdout, MAX_STREAM_OUTPUT_BYTES));
-    let stderr_task = tokio::spawn(read_limited(stderr, MAX_STREAM_OUTPUT_BYTES));
+    let stdout_task =
+        crate::native_process::NativeTask::spawn(read_limited(stdout, MAX_STREAM_OUTPUT_BYTES));
+    let stderr_task =
+        crate::native_process::NativeTask::spawn(read_limited(stderr, MAX_STREAM_OUTPUT_BYTES));
     let leader = async {
         if let Some(mut stdin) = stdin.take() {
             stdin.write_all(input).await?;
             stdin.shutdown().await?;
         }
-        observe_hook_leader_exit(&mut child, leader_pid).await
+        child.observe_exit().await
     };
     let outcome = tokio::select! {
         outcome = tokio::time::timeout(definition.timeout, leader) => Some(outcome),
@@ -3901,38 +3958,24 @@ async fn run_command(
     };
     match outcome {
         None => {
-            process_group.kill();
-            let _ = child.start_kill();
+            child.signal_kill();
             let reap = reap_hook_child(&mut child).await;
             report_hook_child_reap("shutdown", reap);
             drain_hook_capture(stdout_task, "shutdown_stdout").await;
             drain_hook_capture(stderr_task, "shutdown_stderr").await;
             cancelled_process_output()
         }
-        Some(Ok(Ok(status))) => {
-            // The leader is reaped, but a descendant can still own inherited
-            // output handles. Terminate the Job before draining so natural
-            // leader exit cannot park the hook until its wall timeout.
-            process_group.kill();
-            let status = match status {
-                Some(status) => status,
-                None => match reap_hook_child(&mut child).await {
-                    HookChildReapOutcome::Exited(status) => status,
-                    HookChildReapOutcome::WaitFailed(error) => {
-                        drain_hook_capture(stdout_task, "reap_failure_stdout").await;
-                        drain_hook_capture(stderr_task, "reap_failure_stderr").await;
-                        return failed_process_output(&format!("hook leader reap failed: {error}"));
-                    }
-                    HookChildReapOutcome::TimedOut(timeout) => {
-                        report_hook_child_reap(
-                            "natural_exit",
-                            HookChildReapOutcome::TimedOut(timeout),
-                        );
-                        drain_hook_capture(stdout_task, "reap_timeout_stdout").await;
-                        drain_hook_capture(stderr_task, "reap_timeout_stderr").await;
-                        return failed_process_output(&timeout.to_string());
-                    }
-                },
+        Some(Ok(Ok(()))) => {
+            let status = match reap_hook_child(&mut child).await {
+                HookChildReapOutcome::Exited(status) => status,
+                outcome => {
+                    report_hook_child_reap("natural_exit", outcome);
+                    drain_hook_capture(stdout_task, "reap_failure_stdout").await;
+                    drain_hook_capture(stderr_task, "reap_failure_stderr").await;
+                    return failed_process_output(
+                        "hook native cleanup did not finish within the result deadline",
+                    );
+                }
             };
             let stdout = await_hook_capture(stdout_task).await;
             let stderr = await_hook_capture(stderr_task).await;
@@ -3951,8 +3994,7 @@ async fn run_command(
             }
         }
         Some(Ok(Err(error))) => {
-            process_group.kill();
-            let _ = child.start_kill();
+            child.signal_kill();
             let reap = reap_hook_child(&mut child).await;
             report_hook_child_reap("execution_error", reap);
             drain_hook_capture(stdout_task, "execution_error_stdout").await;
@@ -3960,8 +4002,7 @@ async fn run_command(
             failed_process_output(&format!("hook execution failed: {error}"))
         }
         Some(Err(_)) => {
-            process_group.kill();
-            let _ = child.start_kill();
+            child.signal_kill();
             let reap = reap_hook_child(&mut child).await;
             report_hook_child_reap("wall_timeout", reap);
             let stdout = optional_hook_capture(stdout_task, "wall_timeout_stdout").await;
@@ -3984,28 +4025,11 @@ async fn run_command(
     }
 }
 
-#[cfg(windows)]
-async fn observe_hook_leader_exit(
-    child: &mut tokio::process::Child,
-    _pid: Option<haider_platform::ProcessId>,
-) -> std::io::Result<Option<std::process::ExitStatus>> {
-    child.wait().await.map(Some)
-}
-
-#[cfg(unix)]
-async fn observe_hook_leader_exit(
-    _child: &mut tokio::process::Child,
-    pid: Option<haider_platform::ProcessId>,
-) -> std::io::Result<Option<std::process::ExitStatus>> {
-    let pid = pid.ok_or_else(|| std::io::Error::other("hook leader PID is unavailable"))?;
-    haider_platform::observe_process_leader_exit(pid).await?;
-    Ok(None)
-}
-
 async fn await_hook_capture(
-    task: tokio::task::JoinHandle<std::io::Result<CapturedBytes>>,
+    mut task: crate::native_process::NativeTask<std::io::Result<CapturedBytes>>,
 ) -> std::io::Result<CapturedBytes> {
-    match haider_platform::bounded_wait("hook output capture", HOOK_CHILD_REAP_TIMEOUT, task).await
+    match haider_platform::bounded_wait("hook output capture", HOOK_CHILD_REAP_TIMEOUT, task.wait())
+        .await
     {
         haider_platform::BoundedWait::Completed(result) => result
             .map_err(|error| std::io::Error::other(format!("output reader stopped: {error}")))?,
@@ -4017,7 +4041,7 @@ async fn await_hook_capture(
 }
 
 async fn drain_hook_capture(
-    task: tokio::task::JoinHandle<std::io::Result<CapturedBytes>>,
+    task: crate::native_process::NativeTask<std::io::Result<CapturedBytes>>,
     context: &'static str,
 ) {
     if let Err(error) = await_hook_capture(task).await {
@@ -4026,7 +4050,7 @@ async fn drain_hook_capture(
 }
 
 async fn optional_hook_capture(
-    task: tokio::task::JoinHandle<std::io::Result<CapturedBytes>>,
+    task: crate::native_process::NativeTask<std::io::Result<CapturedBytes>>,
     context: &'static str,
 ) -> Option<CapturedBytes> {
     match await_hook_capture(task).await {
@@ -4141,26 +4165,6 @@ fn cancelled_process_output() -> HookProcessResult {
     }
 }
 
-struct ProcessGroupGuard {
-    pid: Option<haider_platform::ProcessGroup>,
-}
-
-impl ProcessGroupGuard {
-    fn kill(&mut self) {
-        if let Some(pid) = self.pid.take() {
-            let _ =
-                haider_platform::signal_process_group(pid, haider_platform::ProcessSignal::Kill);
-            haider_platform::release_process_group(pid);
-        }
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
 async fn run_subscriber(
     service: HookService,
     definition: HookDefinition,
@@ -4176,7 +4180,7 @@ async fn run_subscriber(
         if *shutdown.borrow() || !definition_current(&service, &definition, run_override).await {
             break;
         }
-        let Some((mut child, group)) = spawn_subscriber(&definition) else {
+        let Some(mut child) = spawn_subscriber(&definition) else {
             service
                 .journal(
                     &cause,
@@ -4210,8 +4214,7 @@ async fn run_subscriber(
             backoff = next_subscriber_backoff(backoff);
             continue;
         };
-        let mut process_group = ProcessGroupGuard { pid: Some(group) };
-        let mut stdin = child.stdin.take();
+        let mut stdin = child.take_stdin();
         service
             .journal(
                 &cause,
@@ -4231,26 +4234,29 @@ async fn run_subscriber(
                     let _ = message.delivered.send(());
                 } else {
                     pending = Some(message);
-                    process_group.kill();
-                    let _ = child.start_kill();
+                    child.signal_kill();
                 }
             }
             tokio::select! {
-                status = child.wait() => break status.ok().and_then(|status| status.code()),
+                _ = child.observe_exit() => {
+                    let reap = reap_hook_child(&mut child).await;
+                    break match reap {
+                        HookChildReapOutcome::Exited(status) => status.code(),
+                        outcome => { report_hook_child_reap("subscription_exit", outcome); None }
+                    };
+                },
                 event = events.recv() => match event {
                     Some(message) => {
                         if write_jsonl(stdin.as_mut(), &message.input).await.is_ok() {
                             let _ = message.delivered.send(());
                         } else {
                             pending = Some(message);
-                            process_group.kill();
-                            let _ = child.start_kill();
-                        }
+                            child.signal_kill();
+                                }
                     }
                     None => {
-                        process_group.kill();
-                        let _ = child.start_kill();
-                        let reap = reap_hook_child(&mut child).await;
+                        child.signal_kill();
+                            let reap = reap_hook_child(&mut child).await;
                         report_hook_child_reap("subscription_input_closed", reap);
                         service.journal(
                             &cause,
@@ -4267,15 +4273,14 @@ async fn run_subscriber(
                     }
                 },
                 _ = shutdown.changed() => {
-                    process_group.kill();
-                    let _ = child.start_kill();
+                    child.signal_kill();
                     let reap = reap_hook_child(&mut child).await;
                     report_hook_child_reap("subscription_shutdown", reap);
                     return;
                 },
             }
         };
-        process_group.kill();
+        child.signal_kill();
         service
             .journal(
                 &cause,
@@ -4333,9 +4338,7 @@ async fn subscriber_backoff(
     }
 }
 
-fn spawn_subscriber(
-    definition: &HookDefinition,
-) -> Option<(tokio::process::Child, haider_platform::ProcessGroup)> {
+fn spawn_subscriber(definition: &HookDefinition) -> Option<crate::native_process::NativeProcess> {
     let cwd_fd = open_canonical_directory(&definition.workspace_cwd)?;
     #[cfg(unix)]
     let mut command = hook_command(&definition.command, std::env::var_os("SHELL"));
@@ -4359,16 +4362,10 @@ fn spawn_subscriber(
     #[cfg(windows)]
     configure_hook_cwd(&mut command, &cwd_fd);
     haider_platform::configure_background_process(&mut command);
-    let mut child = command.spawn().ok()?;
-    let raw_pid = child.id()?;
-    let group = match haider_platform::register_process_group(raw_pid) {
-        Ok(group) => group,
-        Err(_) => {
-            let _ = child.start_kill();
-            return None;
-        }
-    };
-    Some((child, group))
+    command
+        .spawn()
+        .and_then(crate::native_process::NativeProcess::register)
+        .ok()
 }
 
 async fn write_jsonl(

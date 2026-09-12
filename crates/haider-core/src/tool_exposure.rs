@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-const CORE_TOOLS: &[&str] = &[
+const CODING_TOOLS: &[&str] = &[
     "fs_read",
     "fs_glob",
     "fs_search",
@@ -14,8 +14,55 @@ const CORE_TOOLS: &[&str] = &[
     // headless clients. This remains an intersection with the granted pack.
     "spawn_subagent",
     "todo_write",
+    "task_outcome",
     "list_tools",
 ];
+/// Initial schema presentation, intersected with the installed authorized
+/// catalog. Profiles do not grant permissions or remove discoverable tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolCapabilityProfile {
+    /// General coding, including first-request delegation and task tracking.
+    #[default]
+    Coding,
+    /// Locate and inspect files; mutations remain available through discovery.
+    Inspection,
+    /// Filesystem/process workflows without task-tracking or delegation schemas.
+    Automation,
+    /// Start with the discovery entry point alone.
+    Discovery,
+}
+
+impl ToolCapabilityProfile {
+    /// Stable configuration names; unknown values must not select a new pack.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim() {
+            "coding" => Some(Self::Coding),
+            "inspection" => Some(Self::Inspection),
+            "automation" => Some(Self::Automation),
+            "discovery" => Some(Self::Discovery),
+            _ => None,
+        }
+    }
+
+    fn initial_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Coding => CODING_TOOLS,
+            Self::Inspection => &["list_tools", "fs_read", "fs_glob", "fs_search"],
+            Self::Automation => &[
+                "list_tools",
+                "fs_read",
+                "fs_glob",
+                "fs_search",
+                "fs_write",
+                "fs_edit",
+                "process_exec",
+            ],
+            Self::Discovery => &["list_tools"],
+        }
+    }
+}
+
 const DISCOVERY_ROW_CAP: usize = 8;
 
 /// First-request delegation needs only the ordinary task/prompt contract.
@@ -65,6 +112,7 @@ fn default_delegation_definition(tool: &ToolDefinition) -> Option<ToolDefinition
 
 #[derive(Debug, Clone)]
 pub(super) struct ToolExposure {
+    profile: ToolCapabilityProfile,
     promoted: BTreeSet<String>,
     current: Arc<[ToolDefinition]>,
     fallback: Option<Arc<[ToolDefinition]>>,
@@ -74,7 +122,18 @@ impl HarnessConfig {
     /// Enables the coding surface plus durable/configured discoveries. The
     /// already-installed pack remains the complete authorization ceiling.
     pub fn enable_tool_discovery(&mut self, promoted: Vec<String>) {
+        self.enable_tool_discovery_with_profile(ToolCapabilityProfile::Coding, promoted);
+    }
+
+    /// Selects an initial capability pack after authorization. Committed and
+    /// configured discoveries are still intersected with that full catalog.
+    pub fn enable_tool_discovery_with_profile(
+        &mut self,
+        profile: ToolCapabilityProfile,
+        promoted: Vec<String>,
+    ) {
         self.tool_exposure = Some(ToolExposure {
+            profile,
             promoted: promoted.into_iter().collect(),
             current: self.shared_tool_definitions(),
             fallback: self.full_fallback_tool_definitions(),
@@ -128,13 +187,21 @@ impl HarnessConfig {
         // Filter in catalog order. Discovery order, duplicate calls and
         // set iteration can never reorder a stable advertised prefix.
         let select = |full: &[ToolDefinition]| -> Arc<[ToolDefinition]> {
+            // A restricted catalog without discovery must remain reachable.
+            // This also preserves explicit child/lockdown/standalone packs.
+            let can_discover = full.iter().any(|tool| tool.name == "list_tools");
             full.iter()
                 .filter(|tool| {
-                    CORE_TOOLS.contains(&tool.name.as_str())
+                    !can_discover
+                        || exposure
+                            .profile
+                            .initial_tools()
+                            .contains(&tool.name.as_str())
                         || exposure.promoted.contains(&tool.name)
                 })
                 .map(|tool| {
-                    if !exposure.promoted.contains(&tool.name)
+                    if can_discover
+                        && !exposure.promoted.contains(&tool.name)
                         && let Some(default) = default_delegation_definition(tool)
                     {
                         default

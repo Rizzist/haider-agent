@@ -819,6 +819,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "plan",
             "loom_register",
             "todo_write",
+            "task_outcome",
             "graph_evidence",
             "fs_read",
             "fs_glob",
@@ -1606,20 +1607,9 @@ fn search_and_mutation_tool_schema_descriptions_are_pinned() {
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Keep wave's stricter pre-diet comparator (before docsync's +304 bytes).
     // Provider-dialect JSON framing is measured separately by AHRB.
-    const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
-    // Confbench's task/prompt default delegation stub: POSIX
-    // 5_670 + 574 = 6_244 (name 14 + usage 256 + schema 304).
-    // Optional controls retain their full declaration via durable discovery;
-    // the required property constraints/prose are unchanged in the stub.
-    // Preserve wave's platform-derived pin: process_exec.command.description
-    // names /bin/zsh and /bin/sh on POSIX (78 bytes), and absolute System32
-    // PowerShell on Windows (75 bytes). Its actual serialized contribution
-    // is measured below; the delegation invariant was 5_592 + 574 = 6_166.
-    // Redaction paging adds fs_read.column's serialized property (+40) and
-    // its default compact description (+2): 6_166 + 42 = 6_208; POSIX 6_286.
-    // Keep the reduction floor independent of this exact-value pin: adding
-    // delegation cannot waive the existing release budget.
-    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_208;
+    const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_602;
+    // Union of 971 redaction paging (+42) and 972 task_outcome (+515) additions.
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_723;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1630,7 +1620,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         0,
     );
     let registry = registered_tools();
-    assert_eq!(authorized.len(), 27, "26 former tools plus list_tools");
+    assert_eq!(authorized.len(), 28, "27 former tools plus task_outcome");
     let full_prefix: usize = authorized
         .iter()
         .map(|tool| {
@@ -1645,30 +1635,15 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
                     .len()
         })
         .sum();
-    // Computer parity adds 771 full-schema bytes for triple_click, region crops,
-    // and key-chord descriptions: macOS 20_770 -> 21_541.
-    // Other hosts retain platform deltas: Linux +49, Windows -1, Unix -6.
-    // Computer remains a stub in the default pipe: invariant 6_166 -> 6_166;
-    // manual bytes remain zero. Full schema growth cannot waive the pipe gate.
-    // Shipgate clarifies interactive/autonomous request_input prose (+96
-    // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
-    // Durable completion controls add 630 platform-independent monitor
-    // description/schema bytes; monitor remains outside the default pipe.
-    // Redaction paging adds fs_read's full description (151 -> 180, +29)
-    // and column schema (199 -> 239, +40), plus task_output's description
-    // (183 -> 214, +31) and task_id prose (297 -> 295 schema bytes, -2).
-    // Full manifest delta = 29 + 40 + 31 - 2 = 98 on every platform:
-    // macOS 21_637 -> 22_365 with both lanes. task_output is undisclosed in
-    // the default pipe; only fs_read's compact prose/schema add the 42 bytes
-    // accounted above.
+    // Union full-pack pin: 971 redaction (+98) plus 972 task_outcome (+515).
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_414;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_929;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_365;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_880;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_364;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_879;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_359;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 22_874;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1687,11 +1662,11 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         - 2;
     let expected_pipe_bytes =
         EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
-    assert_eq!(registered_tools().len(), 30);
+    assert_eq!(registered_tools().len(), 31);
     assert_eq!(
         tools.len(),
-        9,
-        "seven coding tools, discovery, and delegation"
+        10,
+        "seven coding tools, discovery, delegation, and task outcome"
     );
     let spawn = tools
         .iter()

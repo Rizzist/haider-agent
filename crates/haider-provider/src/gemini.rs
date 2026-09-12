@@ -497,17 +497,24 @@ impl GeminiProvider {
         let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
         let semantic_progress_timeout = Self::transport_config().semantic_progress_timeout;
         let turn_trace = crate::current_turn_trace_context();
+        let idle_deadline = crate::ProviderIdleDeadline::current();
         let producer = tokio::spawn(async move {
-            stream_sse_source_with_trace(
-                response,
-                account,
-                next_call_index,
-                sender,
-                chunk_idle_timeout,
-                semantic_progress_timeout,
-                turn_trace,
-            )
-            .await;
+            let stream = async move {
+                stream_sse_source_with_trace(
+                    response,
+                    account,
+                    next_call_index,
+                    sender,
+                    chunk_idle_timeout,
+                    semantic_progress_timeout,
+                    turn_trace,
+                )
+                .await;
+            };
+            match idle_deadline {
+                Some(idle) => idle.scope(stream).await,
+                None => stream.await,
+            }
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
@@ -599,6 +606,14 @@ impl GeminiProvider {
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    fn idle_timeout(&self) -> Option<Duration> {
+        Some(Self::transport_config().chunk_idle_timeout)
+    }
+
+    fn reports_raw_progress(&self) -> bool {
+        true
+    }
+
     fn trusts_default_route_absence(&self) -> bool {
         true
     }
@@ -1970,6 +1985,7 @@ async fn stream_sse_source_with_trace<S: GeminiSseChunkSource>(
     semantic_progress_timeout: Duration,
     turn_trace: Option<(crate::TurnTraceContext, u64)>,
 ) {
+    let idle_deadline = crate::ProviderIdleDeadline::current();
     let mut decoder = GeminiDecoder::new(account, next_call_index);
     let mut progress = crate::ProviderProgressClock::new(
         chunk_idle_timeout,
@@ -1980,7 +1996,11 @@ async fn stream_sse_source_with_trace<S: GeminiSseChunkSource>(
         let chunk = match progress.wait_for_next(source.next_chunk(), &sender).await {
             Ok(Some(Ok(Some(chunk)))) => chunk,
             Ok(Some(Ok(None))) => {
-                send_items(&sender, decoder.finish()).await;
+                let items = decoder.finish();
+                if let Some(idle) = &idle_deadline {
+                    idle.observe_items(&items);
+                }
+                send_items(&sender, items).await;
                 return;
             }
             Ok(Some(Err(error))) => {
@@ -2007,8 +2027,16 @@ async fn stream_sse_source_with_trace<S: GeminiSseChunkSource>(
         if let Some((trace, request_ordinal)) = &turn_trace {
             trace.emit_first_byte(*request_ordinal);
         }
+        if !chunk.as_ref().is_empty()
+            && let Some(idle) = &idle_deadline
+        {
+            idle.observe_progress();
+        }
         progress.observe_raw_chunk();
         let items = decoder.push(chunk.as_ref());
+        if let Some(idle) = &idle_deadline {
+            idle.observe_items(&items);
+        }
         if crate::has_semantic_progress(&items) {
             progress.observe_semantic_progress();
         }

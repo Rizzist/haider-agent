@@ -2239,9 +2239,15 @@ async fn completed_leader_with_pipe_holding_descendant_is_bounded() {
         .expect("command approval");
     let command = ApprovedMonitorCommand::from_approval(&approval);
     let workspace = root.path().to_string_lossy().into_owned();
+    let (_cancel, mut cancelled) = tokio_oneshot::channel();
     let error = timeout(
         Duration::from_secs(2),
-        run_command_capped(&command, Some(&workspace), Duration::from_millis(200)),
+        run_command_capped(
+            &command,
+            Some(&workspace),
+            Duration::from_millis(200),
+            &mut cancelled,
+        ),
     )
     .await
     .expect("capped command hung on inherited pipe")
@@ -2364,36 +2370,210 @@ async fn process_runner_emits_lines_exit_and_on_failure_restart() {
 }
 
 #[cfg(unix)]
+fn monitor_descendant_lifeline(root: &std::path::Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    assert!(
+        std::process::Command::new("mkfifo")
+            .args([root.join("release.fifo"), root.join("lifetime.fifo")])
+            .status()
+            .expect("create fixture FIFOs")
+            .success()
+    );
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).expect("nonblocking flag fits"),
+        )
+        .open(root.join("lifetime.fifo"))
+        .expect("open descendant lifetime reader")
+}
+
+#[cfg(unix)]
+fn assert_monitor_descendant_exited(reader: &mut std::fs::File) {
+    use std::io::Read as _;
+    let mut marker = [0];
+    reader
+        .read_exact(&mut marker)
+        .expect("descendant opened its lifetime descriptor");
+    assert_eq!(marker, *b"r");
+    // The fixture holds its writer while blocked on release.fifo. EOF now is
+    // a native exit witness; a live descendant returns WouldBlock and fails
+    // immediately. No polling grace and no post-reap numeric PID/group probe.
+    assert_eq!(
+        reader
+            .read(&mut marker)
+            .expect("descendant must have closed its writer at completion"),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn deletion_cancels_process_monitor_before_joining_native_readers() {
+    let world = MonitorWorld::new("delete-process-readers").await;
+    let mut lifeline = monitor_descendant_lifeline(world._root.path());
+    let source = MonitorSource::Process {
+        command: "exec 3> lifetime.fifo; printf r >&3; echo ready; read token < release.fifo; touch after-close".into(),
+        cwd: None,
+        env_passthrough: Vec::new(),
+        restart: MonitorProcessRestart::Never,
+    };
+    let approval = haider_tools::MonitorCommandApproval::new(&source, world._root.path())
+        .expect("approval")
+        .expect("command");
+    let mut coordinates = world.coordinates("register-delete-process");
+    coordinates.approved_command = Some(ApprovedMonitorCommand::from_approval(&approval));
+    let mut events = world
+        .hub
+        .monitor_source_hub()
+        .subscribe(MonitorSourceKind::Process);
+    let registered = world
+        .hub
+        .execute_monitor_tool(
+            &world.lease,
+            coordinates,
+            MonitorRequest::Register {
+                source,
+                filter: None,
+                action: MonitorAction {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: MonitorOccurrence::Every,
+                lifetime: MonitorLifetime::Session,
+            },
+        )
+        .await
+        .expect("register approved persistent process");
+    assert_eq!(registered.status, ToolResultStatus::Completed);
+    loop {
+        let event = events.recv().await.expect("native reader readiness");
+        if matches!(event.payload, MonitorEventPayload::Process { line, terminal: false, .. } if line == "ready")
+        {
+            break;
+        }
+    }
+    let mut done = [monitor_envelope(
+        &world.session,
+        Some(&world.run),
+        None,
+        None,
+        "delete-process-done",
+        DeviceId::new("delete-process-device"),
+        world.store.worker_generation(),
+        serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("done"),
+    )];
+    world.lease.append(&mut done).await.expect("quiescent run");
+    // Cancellation owns the native exit; release.fifo is never opened by
+    // the fixture. Use an ordering witness, not a success-by-timeout.
+    world
+        .hub
+        .delete_session(world.session.clone())
+        .await
+        .expect("delete joins monitor");
+    assert_monitor_descendant_exited(&mut lifeline);
+    assert!(!world._root.path().join("after-close").exists());
+    assert!(
+        world
+            .store
+            .session_metadata(&world.session)
+            .await
+            .expect("metadata")
+            .is_none()
+    );
+    world.hub.shutdown().await.expect("shutdown");
+    world.store.close().await.expect("store close");
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn cancelling_process_runner_kills_its_descendant_group() {
     let root = tempfile::tempdir().expect("process cancellation root");
-    let marker = root.path().join("descendant-must-not-write");
+    let mut lifeline = monitor_descendant_lifeline(root.path());
     let source = MonitorSource::Process {
-        command: "(sleep 1; touch descendant-must-not-write) & wait".into(),
+        command: "echo $$ > leader.pid; (exec 3> lifetime.fifo; printf r >&3; echo ready; read token < release.fifo; touch after-close) & wait".into(),
         cwd: None,
         env_passthrough: Vec::new(),
         restart: MonitorProcessRestart::Never,
     };
     let approval = haider_tools::MonitorCommandApproval::new(&source, root.path())
-        .expect("process approval")
-        .expect("command approval");
+        .expect("approval")
+        .expect("command");
     let mut watch = registration(None);
     watch.source = source;
     watch.workspace_root = Some(root.path().to_string_lossy().into_owned());
     watch.approved_command = Some(ApprovedMonitorCommand::from_approval(&approval));
     let service = MonitorService::default();
+    let mut subscription = service.source_hub().subscribe(MonitorSourceKind::Process);
     service
         .inner
         .registry
         .insert(&watch.owner_session_id, watch.clone());
     let (cancel, cancelled) = tokio_oneshot::channel();
     let task = tokio::spawn(run_monitor_source(service, watch, cancelled));
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    cancel.send(()).expect("cancel process runner");
-    task.await.expect("cancelled process runner");
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    assert!(
-        !marker.exists(),
-        "cancelled descendant escaped its process group"
-    );
+    loop {
+        let event = subscription.recv().await.expect("child readiness event");
+        if matches!(event.payload, MonitorEventPayload::Process { line, terminal: false, .. } if line == "ready")
+        {
+            break;
+        }
+    }
+    let leader: u32 = std::fs::read_to_string(root.path().join("leader.pid"))
+        .expect("leader identity")
+        .trim()
+        .parse()
+        .expect("pid");
+    let group = haider_platform::process_group(Some(leader)).expect("owned group identity");
+    assert!(haider_platform::process_group_exists(group).expect("live fixture"));
+    cancel.send(()).expect("cancel runner");
+    task.await.expect("runner joined");
+    assert_monitor_descendant_exited(&mut lifeline);
+    assert!(!root.path().join("after-close").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_monitor_commands_reap_redirected_descendants() {
+    for poll in [false, true] {
+        let root = tempfile::tempdir().expect("redirected descendant root");
+        let mut lifeline = monitor_descendant_lifeline(root.path());
+        // The child waits on a fixture-owned FIFO with all output redirected.
+        // The leader and pipe drains finish normally; output-drain timeouts
+        // cannot accidentally cover this process-tree lifetime regression.
+        let source = MonitorSource::Process {
+            command: "(exec 3> lifetime.fifo; printf r >&3; : > child-ready; read token < release.fifo; touch after-close) </dev/null >/dev/null 2>&1 & while [ ! -f child-ready ]; do sleep 0.01; done; exit 0".into(),
+            cwd: None, env_passthrough: Vec::new(), restart: MonitorProcessRestart::Never,
+        };
+        let approval = haider_tools::MonitorCommandApproval::new(&source, root.path())
+            .expect("approval")
+            .expect("command");
+        let command = ApprovedMonitorCommand::from_approval(&approval);
+        let workspace = root.path().to_string_lossy().into_owned();
+        let (_cancel, mut cancelled) = tokio_oneshot::channel();
+        if poll {
+            let result = run_command_capped(
+                &command,
+                Some(&workspace),
+                MONITOR_PIPE_DRAIN_TIMEOUT,
+                &mut cancelled,
+            )
+            .await
+            .expect("capped command")
+            .expect("not cancelled");
+            assert_eq!(result.exit_code, 0);
+        } else {
+            let mut watch = registration(None);
+            watch.source = source;
+            watch.workspace_root = Some(workspace);
+            watch.approved_command = Some(command);
+            let service = MonitorService::default();
+            service
+                .inner
+                .registry
+                .insert(&watch.owner_session_id, watch.clone());
+            run_monitor_source(service, watch, cancelled).await;
+        }
+        assert_monitor_descendant_exited(&mut lifeline);
+        assert!(!root.path().join("after-close").exists());
+    }
 }

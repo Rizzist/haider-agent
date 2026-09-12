@@ -1393,6 +1393,14 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn idle_timeout(&self) -> Option<Duration> {
+        Some(self.transport_config.chunk_idle_timeout)
+    }
+
+    fn reports_raw_progress(&self) -> bool {
+        true
+    }
+
     fn trusts_default_route_absence(&self) -> bool {
         self.route_gating().enabled()
     }
@@ -1624,6 +1632,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     let crate::SseRequestContext {
         route_gating,
         turn_trace,
+        idle_deadline,
     } = context;
     let mut decoder = SseDecoder::with_native_computer(account, native_computer);
     let mut progress = crate::ProviderProgressClock::new(
@@ -1638,7 +1647,11 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
         {
             Ok(Some(Ok(Some(chunk)))) => chunk,
             Ok(Some(Ok(None))) => {
-                send_items(&sender, decoder.finish()).await;
+                let items = decoder.finish();
+                if let Some(idle) = &idle_deadline {
+                    idle.observe_items(&items);
+                }
+                send_items(&sender, items).await;
                 return;
             }
             Ok(Some(Err(error))) => {
@@ -1665,8 +1678,16 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
         if let Some((trace, request_ordinal)) = &turn_trace {
             trace.emit_first_byte(*request_ordinal);
         }
+        if !chunk.as_ref().is_empty()
+            && let Some(idle) = &idle_deadline
+        {
+            idle.observe_progress();
+        }
         progress.observe_raw_chunk();
         let items = decoder.push(chunk.as_ref());
+        if let Some(idle) = &idle_deadline {
+            idle.observe_items(&items);
+        }
         if crate::has_semantic_progress(&items) {
             progress.observe_semantic_progress();
         }

@@ -74,6 +74,7 @@ pub use headless::{
     resume_headless_with_event_mode_and_interrupts, run_headless, run_headless_with_session_config,
     run_headless_with_session_config_and_event_mode,
     run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
+    submit_headless_with_event_mode_and_interrupts,
 };
 pub use lockdown::{
     LockdownClientError, ProviderLockdown, lockdown_set_quota_response, lockdown_status_response,

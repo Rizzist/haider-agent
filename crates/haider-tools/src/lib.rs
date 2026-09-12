@@ -31,6 +31,7 @@ mod repo;
 mod request_input;
 mod shell;
 mod spawn_subagent;
+mod task_outcome;
 mod tasks;
 mod todo_write;
 mod webfetch;
@@ -125,6 +126,7 @@ pub use shell::{
     estimated_text_tokens, estimated_tokens, reduce_tool_output,
 };
 pub use spawn_subagent::{SpawnSubagent, spawn_subagent_manifest};
+pub use task_outcome::{TASK_OUTCOME_REASON_MAX_BYTES, parse_task_outcome, task_outcome_manifest};
 pub use tasks::{
     BACKGROUND_KILL_GRACE, BackgroundExec, BackgroundExitStatus, BackgroundSpawn,
     EvidencePidLiveness, MAX_TASK_NAME_CHARS, OrphanReap, PidLiveness, SharedTaskOutput,

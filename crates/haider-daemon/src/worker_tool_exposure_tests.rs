@@ -7,6 +7,7 @@ fn configured_factory(names: Option<Vec<String>>) -> ConfiguredToolExposureFacto
     ConfiguredToolExposureFactory {
         inner: Arc::new(BrokerToolFactory),
         names,
+        profile: None,
     }
 }
 
@@ -143,6 +144,7 @@ fn production_coding_surface_and_explicit_names_remain_authorized() {
         [
             "list_tools",
             "todo_write",
+            "task_outcome",
             "fs_read",
             "fs_glob",
             "fs_search",
@@ -428,4 +430,267 @@ async fn cold_journal_workspace_selection_preserves_discovery_but_revokes_capabi
         state.promoted_tools
     );
     assert!(!setup.durable_tool_state().mobile_use_active);
+}
+
+fn capability_profile_config(
+    profile: ToolCapabilityProfile,
+    grant: Option<&Grant>,
+) -> HarnessConfig {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(ConfiguredToolExposureFactory {
+        inner: Arc::new(BrokerToolFactory),
+        names: Some(Vec::new()),
+        profile: Some(profile),
+    });
+    let mut config =
+        HarnessConfig::for_session(SessionId::new("profile"), DeviceId::new("profile"), 0, 1);
+    config.tools =
+        advertised_tool_definitions(&factory, grant, "fake", WebCapabilityDegrade::default());
+    if let Some(promoted) =
+        initial_tool_exposure_for_turn(factory.as_ref(), grant, false, Vec::new())
+    {
+        config.enable_tool_discovery_with_profile(factory.tool_capability_profile(), promoted);
+    }
+    config
+}
+
+#[test]
+fn capability_profile_packs_match_golden_and_report_estimator_delta() {
+    let profiles = [
+        ("coding", ToolCapabilityProfile::Coding),
+        ("inspection", ToolCapabilityProfile::Inspection),
+        ("automation", ToolCapabilityProfile::Automation),
+        ("discovery", ToolCapabilityProfile::Discovery),
+    ];
+    let mut packs = std::collections::BTreeMap::new();
+    let system = Some(SystemPromptBuilder::shared_immutable_base(
+        &[],
+        "fixture-grant",
+    ));
+    for (name, profile) in profiles {
+        assert_eq!(ToolCapabilityProfile::from_name(name), Some(profile));
+        let config = capability_profile_config(profile, None);
+        let estimate =
+            estimate_provider_request_input_tokens(&[], &system, config.tool_definitions(), &[]);
+        println!(
+            "capability_profile={name} estimated_fixed_tokens={estimate} tools={}",
+            config.tool_definitions().len()
+        );
+        packs.insert(name, config.tool_definitions().to_vec());
+    }
+    assert_eq!(ToolCapabilityProfile::from_name("unknown"), None);
+    let actual = serde_json::to_string_pretty(&packs).expect("profile goldens") + "\n";
+    // `process_exec` retains the native shell contract in its schema. Keep
+    // that platform-specific description in a target-specific fixture while
+    // sharing the profile shape and reduction assertions below.
+    let fixture = if cfg!(windows) {
+        "capability_profiles.windows.json"
+    } else {
+        "capability_profiles.json"
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture);
+    if std::env::var_os("HAIDER_UPDATE_CAPABILITY_GOLDEN").is_some() {
+        std::fs::write(&path, &actual).expect("write golden");
+    }
+    assert_eq!(
+        actual,
+        std::fs::read_to_string(path).expect("checked-in profile golden")
+    );
+    let coding = estimate_provider_request_input_tokens(&[], &system, &packs["coding"], &[]);
+    let automation =
+        estimate_provider_request_input_tokens(&[], &system, &packs["automation"], &[]);
+    assert!(
+        automation < coding,
+        "fewer schema bytes must reduce the repository estimate"
+    );
+}
+
+#[test]
+fn capability_profiles_intersect_tool_and_effect_grants() {
+    let grant = Grant {
+        tools: vec![
+            "list_tools".into(),
+            "fs_read".into(),
+            "process_exec".into(),
+            "spawn_subagent".into(),
+        ],
+        effect_ceiling: vec![EffectClass::FsRead],
+    };
+    let config = capability_profile_config(ToolCapabilityProfile::Automation, Some(&grant));
+    assert_eq!(
+        config
+            .tool_definitions()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["list_tools", "fs_read"]
+    );
+    let grant = Grant {
+        tools: vec!["plan".into()],
+        effect_ceiling: Vec::new(),
+    };
+    let config = capability_profile_config(ToolCapabilityProfile::Discovery, Some(&grant));
+    assert_eq!(
+        config
+            .tool_definitions()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["plan"]
+    );
+}
+
+#[test]
+fn capability_profile_configuration_composes_with_explicit_exposure() {
+    for profile_first in [false, true] {
+        let dependencies = DaemonDependencies::default();
+        let dependencies = if profile_first {
+            dependencies
+                .with_tool_capability_profile(ToolCapabilityProfile::Automation)
+                .with_tool_exposure(Some(vec!["monitor".into()]))
+        } else {
+            dependencies
+                .with_tool_exposure(Some(vec!["monitor".into()]))
+                .with_tool_capability_profile(ToolCapabilityProfile::Automation)
+        };
+        assert_eq!(
+            dependencies.tool_factory.tool_capability_profile(),
+            ToolCapabilityProfile::Automation
+        );
+        assert_eq!(
+            dependencies.tool_factory.initial_tool_exposure(),
+            Some(vec!["monitor".into()])
+        );
+    }
+    let dependencies = DaemonDependencies::default()
+        .with_tool_exposure(None)
+        .with_tool_capability_profile(ToolCapabilityProfile::Discovery);
+    assert!(dependencies.tool_factory.initial_tool_exposure().is_none());
+}
+
+struct ProfileFixtureDispatcher;
+
+#[async_trait]
+impl ToolDispatcher for ProfileFixtureDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        call_id: &str,
+        name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        assert_eq!(name, "process_exec");
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: format!(
+                "NEEDLE:{call_id}:path=a/b;digest=0123456789;ordinal=17;Unicode=\u{062d}\u{0642}\n"
+            ),
+            truncated: false,
+            truncation: None,
+            effects: Vec::new(),
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        }))
+    }
+}
+
+/// Replays the economy fixture's seven tool batches (17 results), followed
+/// by its eighth/final request. The dispatcher is synthetic; the separate
+/// CLI economy capture verifies real process and filesystem effects.
+#[tokio::test]
+async fn capability_profiles_keep_eight_request_economy_shape_and_committed_needles() {
+    use haider_provider::{FakeProvider, FakeStep};
+    let mut previous_messages = None;
+    for profile in [
+        ToolCapabilityProfile::Coding,
+        ToolCapabilityProfile::Automation,
+    ] {
+        let mut steps = Vec::new();
+        let mut expected_results = std::collections::BTreeMap::new();
+        for (batch, count) in [5, 5, 3, 1, 1, 1, 1].into_iter().enumerate() {
+            for index in 0..count {
+                let call_id = format!("economy-{batch}-{index}");
+                expected_results.insert(call_id.clone(), format!("NEEDLE:{call_id}:path=a/b;digest=0123456789;ordinal=17;Unicode=\u{062d}\u{0642}\n"));
+                steps.push(FakeStep::EmitToolCall {
+                    call_id,
+                    name: "process_exec".into(),
+                    args: serde_json::json!({"command": "fixture"}),
+                });
+            }
+            steps.push(FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            });
+        }
+        steps.push(FakeStep::EmitText {
+            text: "done".into(),
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        });
+        let provider = Arc::new(FakeProvider::new(steps));
+        let store = Arc::new(haider_core::MemoryStore::new());
+        let (actor, handle) = HarnessActor::new_with_dispatcher(
+            capability_profile_config(profile, None),
+            provider.clone(),
+            store.clone(),
+            Some(Arc::new(ProfileFixtureDispatcher)),
+        );
+        let task = tokio::spawn(actor.run());
+        let turn = handle
+            .submit_turn(haider_core::SubmitTurn::new("run the economy fixture"))
+            .await
+            .expect("submit");
+        assert_eq!(turn.wait().await.expect("terminal").state, RunState::Done);
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            8,
+            "profiles must not add discovery/repair requests"
+        );
+        let final_results = requests[7]
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                haider_protocol::provider::Block::ToolResult {
+                    call_id, preview, ..
+                } => Some((call_id.clone(), preview.clone())),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            final_results, expected_results,
+            "every committed result survives byte-exactly in tool role"
+        );
+        let committed = store
+            .events(&SessionId::new("profile"))
+            .await
+            .into_iter()
+            .filter_map(|event| match event.payload.decode_event() {
+                Ok(EventPayload::ToolResult { call_id, result }) => Some((call_id, result.preview)),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(committed, expected_results);
+        let messages = requests
+            .iter()
+            .map(|request| request.messages.clone())
+            .collect::<Vec<_>>();
+        if let Some(previous) = &previous_messages {
+            assert_eq!(
+                &messages, previous,
+                "only schemas may change across profiles"
+            );
+        }
+        previous_messages = Some(messages);
+        handle.stop().await.expect("stop actor");
+        task.await.expect("join actor");
+    }
 }

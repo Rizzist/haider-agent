@@ -41,6 +41,11 @@ mod peer_prompt_tests;
 
 #[path = "tool_exposure.rs"]
 mod tool_exposure;
+pub use tool_exposure::ToolCapabilityProfile;
+
+#[path = "task_outcome.rs"]
+mod task_outcome;
+use task_outcome::{CompletedTool, ToolSettlement};
 
 use crate::{
     ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
@@ -3669,6 +3674,7 @@ impl HarnessActor {
         // retry of the same logical request. Starting above zero preserves
         // the restored logical count and freezes wfcont's volatile provider
         // view; the durable physical attempt ordinal still advances below.
+        let mut operation_idle = haider_provider::ProviderIdleDeadline::default();
         let mut provider_attempt = usize::from(
             route_wait.is_some()
                 || (self.config.recovery_request_local_usage && provider_request_count > 0),
@@ -3694,7 +3700,7 @@ impl HarnessActor {
         let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
         if route_wait.is_some() {
             match self
-                .wait_for_provider_route(&run_id, &cancel, &provider)
+                .wait_for_provider_route(&run_id, &cancel, &provider, &operation_idle)
                 .await
             {
                 Ok(()) => thinking_pending = false,
@@ -4599,12 +4605,16 @@ impl HarnessActor {
                 .as_ref()
                 .map(TurnTraceContext::now_us_from_accept);
             let trusts_default_route_absence = attempt_provider.trusts_default_route_absence();
+            let reports_raw_progress = attempt_provider.reports_raw_progress();
             let opening_provider = Arc::clone(&attempt_provider);
             let provider_deadline_state = Arc::clone(&self.provider_deadline_state);
             let provider_request_ref = &provider_request;
             let request_metadata_body_support = opening_provider.request_metadata_body_support();
             let auxiliary_recorder = self.config.provider_request_attempt_recorder.clone();
             let opening_correlation = request_correlation.clone();
+            // The same clock survives every attempt and its retry wait.
+            operation_idle.begin_attempt(provider.idle_timeout());
+            let opening_idle = operation_idle.clone();
             let mut opening = Box::pin(before_provider_request_deadline(
                 self.config.provider_deadline,
                 async move {
@@ -4612,8 +4622,9 @@ impl HarnessActor {
                     // after the next request has positive deadline admission.
                     // Until then, a prior retry remains in its admission state.
                     provider_deadline_state.begin_provider_request();
-                    let open =
-                        opening_provider.stream_prepared_turn_ref(provider_request_ref, prepared);
+                    let open = opening_idle.scope(
+                        opening_provider.stream_prepared_turn_ref(provider_request_ref, prepared),
+                    );
                     match auxiliary_recorder {
                         Some(recorder) => {
                             haider_provider::scope_provider_request_with_recorder(
@@ -4697,6 +4708,7 @@ impl HarnessActor {
                         }
                         continue;
                     }
+                    error = operation_idle.wait() => Err(error),
                     opened = &mut opening => opened,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
@@ -4920,8 +4932,9 @@ impl HarnessActor {
                                 .await;
                         }
                         replay.capture(&message, &reasoning, &refusal_reason);
+                        operation_idle.record_error(&error);
                         match self
-                            .wait_for_provider_route(&run_id, &cancel, &provider)
+                            .wait_for_provider_route(&run_id, &cancel, &provider, &operation_idle)
                             .await
                         {
                             Ok(()) => thinking_pending = false,
@@ -4955,6 +4968,7 @@ impl HarnessActor {
                                 ProviderRetryContext {
                                     run_id: &run_id,
                                     cancel: &cancel,
+                                    idle: &operation_idle,
                                 },
                                 &mut provider_attempt,
                                 &mut provider,
@@ -5117,6 +5131,7 @@ impl HarnessActor {
                         }
                         continue;
                     }
+                    error = operation_idle.wait() => Some(Err(error)),
                     item = stream.recv() => item,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
@@ -5193,6 +5208,16 @@ impl HarnessActor {
                     }
                     }
                 };
+
+                if !reports_raw_progress
+                    && let Some(Ok(event)) = &next
+                    && !matches!(
+                        event,
+                        StreamEvent::NetworkUnavailable | StreamEvent::NetworkRestored
+                    )
+                {
+                    operation_idle.observe_progress();
+                }
 
                 // The session writer arbitrates this boundary against retract
                 // acceptance. Do this before the cancellation check: a response
@@ -5418,8 +5443,9 @@ impl HarnessActor {
                                 .await;
                         }
                         replay.capture(&message, &reasoning, &refusal_reason);
+                        operation_idle.record_error(&error);
                         match self
-                            .wait_for_provider_route(&run_id, &cancel, &provider)
+                            .wait_for_provider_route(&run_id, &cancel, &provider, &operation_idle)
                             .await
                         {
                             Ok(()) => thinking_pending = false,
@@ -5473,6 +5499,7 @@ impl HarnessActor {
                                 ProviderRetryContext {
                                     run_id: &run_id,
                                     cancel: &cancel,
+                                    idle: &operation_idle,
                                 },
                                 &mut provider_attempt,
                                 &mut provider,
@@ -6006,14 +6033,70 @@ impl HarnessActor {
                                     tool_results.clear();
                                     continue 'requests;
                                 }
-                                self.complete_tool(
-                                    &run_id,
-                                    &mut tools,
-                                    &mut deferred,
-                                    &call_id,
-                                    &cancel,
-                                )
-                                .await
+                                match self
+                                    .complete_tool(
+                                        &run_id,
+                                        &mut tools,
+                                        &mut deferred,
+                                        &call_id,
+                                        &cancel,
+                                    )
+                                    .await
+                                {
+                                    Ok(CompletedTool::Continue(message)) => Ok(message),
+                                    Ok(CompletedTool::TaskOutcome(tool, outcome)) => {
+                                        // Keep the open call available to ordinary error/cancel
+                                        // cleanup until its acceptance and terminal are durable.
+                                        tools.push(tool);
+                                        let preparation = async {
+                                            self.commit_pending_usage(
+                                                &run_id,
+                                                &mut pending_usage_commit,
+                                            )
+                                            .await?;
+                                            self.complete_text(&run_id, &mut message, false)
+                                                .await?;
+                                            self.complete_text(&run_id, &mut reasoning, true)
+                                                .await?;
+                                            release_provider_budget_request(
+                                                self.config.provider_budget_guard.as_ref(),
+                                                &run_id,
+                                                &self.config.usage_scope.provider,
+                                                &self.config.model,
+                                                request_usage.is_some(),
+                                                &mut provider_budget_permit,
+                                            )
+                                            .await?;
+                                            if let Some(error) =
+                                                self.latched_terminal_failure().await
+                                            {
+                                                return Err(DriveError::Store(error));
+                                            }
+                                            if cancel.is_cancelled() {
+                                                return Err(DriveError::Cancelled);
+                                            }
+                                            self.finish_task_outcome(
+                                                &run_id, &tools[0], &outcome, &cancel,
+                                            )
+                                            .await
+                                        }
+                                        .await;
+                                        return match preparation {
+                                            Ok(outcome) => outcome,
+                                            Err(error) => {
+                                                self.drive_error_outcome_with_items(
+                                                    &run_id,
+                                                    &mut message,
+                                                    &mut reasoning,
+                                                    &mut tools,
+                                                    error,
+                                                )
+                                                .await
+                                            }
+                                        };
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             Err(DriveError::Provider(error))
                                 if error.presentation.subcode.as_str()
@@ -6254,6 +6337,9 @@ impl HarnessActor {
                         }
                     }
                     StreamEvent::Finish { reason } => {
+                        // Tool execution and the next logical request get their
+                        // own idle interval; transport retries above do not.
+                        operation_idle = haider_provider::ProviderIdleDeadline::default();
                         self.provider_finish_reason = Some(reason);
                         if let (Some(trace), Some(started)) =
                             (&self.config.turn_trace, provider_stream_started)
@@ -7116,6 +7202,7 @@ impl HarnessActor {
         run_id: &RunId,
         cancel: &CancelToken,
         provider: &Arc<dyn Provider>,
+        idle: &haider_provider::ProviderIdleDeadline,
     ) -> Result<(), DriveError> {
         self.flush_pending_item_delta()
             .await
@@ -7155,6 +7242,7 @@ impl HarnessActor {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                error = idle.wait() => return Err(DriveError::Provider(error)),
                 () = &mut deadline => {
                     return Err(DriveError::Provider(deadline_exhausted_error(
                         budget,
@@ -7266,6 +7354,10 @@ impl HarnessActor {
         thinking_pending: &mut bool,
         mut error: ProviderError,
     ) -> Result<(), DriveError> {
+        context.idle.record_error(&error);
+        if let Some(idle_error) = context.idle.expired() {
+            return Err(DriveError::Provider(idle_error));
+        }
         // A deadline that was already produced by an active request keeps its
         // in-flight classification. Every other pre-first-event failure enters
         // retry admission before resolver and backoff policy are consulted.
@@ -7284,6 +7376,7 @@ impl HarnessActor {
             let resolution = tokio::select! {
                 biased;
                 () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                error = context.idle.wait() => return Err(DriveError::Provider(error)),
                 resolution = resolver.resolve(&current_account, &error) => resolution,
             }
             .map_err(DriveError::Account)?;
@@ -7387,6 +7480,7 @@ impl HarnessActor {
                         let fallback = tokio::select! {
                             biased;
                             () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                            error = context.idle.wait() => return Err(DriveError::Provider(error)),
                             resolution = resolver.resolve_fallback(&current_account, &error) => resolution,
                         }
                         .map_err(DriveError::Account)?;
@@ -7423,6 +7517,7 @@ impl HarnessActor {
                 context.cancel,
                 *provider_attempt,
                 &error,
+                context.idle,
             )
             .await?;
             *thinking_pending = true;
@@ -7436,6 +7531,7 @@ impl HarnessActor {
             let fallback = tokio::select! {
                 biased;
                 () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                error = context.idle.wait() => return Err(DriveError::Provider(error)),
                 resolution = resolver.resolve_fallback(&current_account, &error) => resolution,
             }
             .map_err(DriveError::Account)?;
@@ -8012,6 +8108,7 @@ impl HarnessActor {
         cancel: &CancelToken,
         failed_attempt: usize,
         error: &ProviderError,
+        idle: &haider_provider::ProviderIdleDeadline,
     ) -> Result<(), DriveError> {
         if error
             .retry_after_ms
@@ -8029,6 +8126,7 @@ impl HarnessActor {
                 opened_within_ms: error.opened_within_ms,
                 budget_ms: error.budget_ms,
                 timeout_reason: error.timeout_reason,
+                idle_timeout: error.idle_timeout.clone(),
                 presentation: error.presentation.clone(),
             };
             return Err(DriveError::Provider(capped));
@@ -8089,6 +8187,7 @@ impl HarnessActor {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break Err(DriveError::Cancelled),
+                error = idle.wait() => break Err(DriveError::Provider(error)),
                 () = retry_wake.fired(&retrying_event_id) => break Ok(()),
                 // L1: a Stop (or a closed command channel) during a long
                 // Retry-After backoff must not block shutdown for the full
@@ -8470,7 +8569,7 @@ impl HarnessActor {
         deferred: &mut Vec<DeferredAccumulator>,
         call_id: &str,
         cancel: &CancelToken,
-    ) -> Result<Option<Message>, DriveError> {
+    ) -> Result<CompletedTool, DriveError> {
         let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
             return Err(DriveError::Provider(provider_protocol_error(format!(
                 "provider ended unknown tool call `{call_id}`",
@@ -8530,25 +8629,34 @@ impl HarnessActor {
             self.commit_tool_result_and_completion(run_id, &tools[index], &result)
                 .await?;
             tools.remove(index);
-            return Ok(Some(Message::tool_result(call_id, result.preview, false)));
+            return Ok(CompletedTool::Continue(Some(Message::tool_result(
+                call_id,
+                result.preview,
+                false,
+            ))));
+        }
+        if tools[index].name == "task_outcome" {
+            return self
+                .prepare_task_outcome(run_id, tools, deferred, index)
+                .await;
         }
         if tools[index].name == "request_input" || tools[index].name == "plan" {
             return self
                 .complete_request_input(run_id, tools, index, cancel)
                 .await
-                .map(Some);
+                .map(|message| CompletedTool::Continue(Some(message)));
         }
         if tools[index].name == "todo_write" {
             return self
                 .complete_todo_write(run_id, tools, index)
                 .await
-                .map(Some);
+                .map(|message| CompletedTool::Continue(Some(message)));
         }
         if tools[index].name == "list_tools" {
             return self
                 .complete_list_tools(run_id, tools, index)
                 .await
-                .map(Some);
+                .map(|message| CompletedTool::Continue(Some(message)));
         }
         if let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) {
             let args = parse_tool_args(&tools[index])?;
@@ -8596,7 +8704,7 @@ impl HarnessActor {
                     self.commit_state(run_id, RunState::Streaming)
                         .await
                         .map_err(DriveError::Store)?;
-                    return Ok(None);
+                    return Ok(CompletedTool::Continue(None));
                 }
             };
             let result = tools[index].correct_result(result);
@@ -8610,17 +8718,19 @@ impl HarnessActor {
                 .map_err(DriveError::Store)?;
             let projection = model_tool_result_projection(&tools[index].name, &result);
             tools.remove(index);
-            return Ok(Some(Message::tool_result_with_images(
-                call_id,
-                projection.preview,
-                projection.truncated,
-                result.images,
+            return Ok(CompletedTool::Continue(Some(
+                Message::tool_result_with_images(
+                    call_id,
+                    projection.preview,
+                    projection.truncated,
+                    result.images,
+                ),
             )));
         }
         self.commit_tool_completed(run_id, &tools[index], ToolStatus::Pending)
             .await?;
         tools.remove(index);
-        Ok(None)
+        Ok(CompletedTool::Continue(None))
     }
 
     async fn execute_general_tool(
@@ -10264,7 +10374,7 @@ impl HarnessActor {
             Some(result),
             Some(result),
             result.status.item_status(),
-            false,
+            ToolSettlement::Continue,
         )
         .await
     }
@@ -10284,7 +10394,7 @@ impl HarnessActor {
             Some(result),
             Some(result),
             result.status.item_status(),
-            true,
+            ToolSettlement::Streaming,
         )
         .await
     }
@@ -10295,7 +10405,7 @@ impl HarnessActor {
         tool: &ToolAccumulator,
         status: ToolStatus,
     ) -> Result<(), DriveError> {
-        self.commit_tool_settlement(run_id, tool, None, None, status, true)
+        self.commit_tool_settlement(run_id, tool, None, None, status, ToolSettlement::Streaming)
             .await
     }
 
@@ -10308,8 +10418,15 @@ impl HarnessActor {
         result: &BoundedResult,
         status: ToolStatus,
     ) -> Result<(), DriveError> {
-        self.commit_tool_settlement(run_id, tool, None, Some(result), status, false)
-            .await
+        self.commit_tool_settlement(
+            run_id,
+            tool,
+            None,
+            Some(result),
+            status,
+            ToolSettlement::Continue,
+        )
+        .await
     }
 
     async fn commit_tool_settlement(
@@ -10319,8 +10436,9 @@ impl HarnessActor {
         result: Option<&BoundedResult>,
         savings_source: Option<&BoundedResult>,
         status: ToolStatus,
-        resume_streaming: bool,
+        settlement: ToolSettlement<'_>,
     ) -> Result<(), DriveError> {
+        let resume_streaming = matches!(settlement, ToolSettlement::Streaming);
         let args = if matches!(status, ToolStatus::Failed | ToolStatus::Cancelled) {
             tool_args_or_raw(tool)
         } else {
@@ -10444,6 +10562,15 @@ impl HarnessActor {
                 .map_err(DriveError::Store)?,
             );
         }
+        if let ToolSettlement::TaskFailure(outcome, cancel) = settlement {
+            if cancel.is_cancelled() {
+                return Err(DriveError::Cancelled);
+            }
+            envelopes.extend(
+                self.task_failure_envelopes(run_id, outcome)
+                    .map_err(DriveError::Store)?,
+            );
+        }
         self.append_and_publish_owned(envelopes)
             .await
             .map_err(DriveError::Store)?;
@@ -10455,13 +10582,17 @@ impl HarnessActor {
                 .map_err(DriveError::Store)?;
         }
         self.tree_head = Some(node.node);
+        if matches!(settlement, ToolSettlement::TaskFailure(..)) {
+            self.state.send_replace(Some(RunState::Errored));
+        }
         if resume_streaming {
             self.state.send_replace(Some(RunState::Streaming));
         }
         Ok(())
     }
 
-    /// Maps the provider's finish reason onto the terminal run state.
+    /// Ordinary provider completion is runtime success. Assistant text,
+    /// including JSON containing FAILURE, never selects a task terminal.
     async fn finish_outcome(&mut self, run_id: &RunId, reason: FinishReason) -> TurnOutcome {
         match self.commit_state(run_id, RunState::Done).await {
             Ok(()) => TurnOutcome {
@@ -10689,6 +10820,22 @@ impl HarnessActor {
         let mut envelopes = Vec::new();
         // The hard checkpoint and the named terminal share the same append:
         // recovery never sees a hard-bound handle without its terminal state.
+        if error.code == ErrorCode::IdleTimeout
+            && let Some(data) = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("idle_timeout"))
+        {
+            // Preserve the typed cause and timing through replay and CLI
+            // observation, atomically with RunFailed/Errored. Older peers
+            // already carry unknown extensions without changing RPC methods.
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                "haider.provider.idle_timeout.v1",
+                data.clone(),
+                prompt_omit_render(),
+            )?);
+        }
         if error.code == ErrorCode::RequestBudgetExceeded {
             let data = error.details.clone().ok_or_else(|| {
                 HaiderError::new(
@@ -11909,6 +12056,7 @@ impl From<ContextCompactionError> for DriveError {
 struct ProviderRetryContext<'a> {
     run_id: &'a RunId,
     cancel: &'a CancelToken,
+    idle: &'a haider_provider::ProviderIdleDeadline,
 }
 
 /// One in-flight text or reasoning item (started, not yet completed).
@@ -12684,7 +12832,9 @@ fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
-    let code = if provider_error.presentation.subcode.as_str() == "provider-timeout" {
+    let code = if provider_error.timeout_reason == Some(ProviderTimeoutReason::IdleTimeout) {
+        ErrorCode::IdleTimeout
+    } else if provider_error.presentation.subcode.as_str() == "provider-timeout" {
         ErrorCode::ProviderTimeout
     } else {
         ErrorCode::ProviderError
@@ -12697,6 +12847,14 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
         "budget_ms": provider_error.budget_ms,
         "reason": provider_error.timeout_reason,
     }));
+    if let Some(idle) = provider_error.idle_timeout
+        && let Some(details) = error
+            .details
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        details.insert("idle_timeout".into(), serde_json::json!(idle));
+    }
     error.presentation = Some(provider_error.presentation);
     error
 }

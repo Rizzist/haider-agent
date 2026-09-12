@@ -2851,6 +2851,64 @@ fn run_jsonl_exits_65_when_fake_provider_errors() {
 }
 
 #[test]
+fn task_outcome_real_cli_distinguishes_typed_failure_from_failure_text() {
+    let cases = [
+        (
+            r#"[{"step":"emit_text","text":"{\"status\":\"FAILURE\",\"category\":\"scripted\"}"},{"step":"finish","reason":"end_turn"}]"#,
+            0,
+        ),
+        (
+            r#"[{"step":"emit_tool_call","call_id":"outcome-1","name":"task_outcome","args":{"status":"failure","reason":"Required input is unavailable"}},{"step":"finish","reason":"tool_use"}]"#,
+            1,
+        ),
+    ];
+    for (script, exit) in cases {
+        let out = haider_with_boot_retry(
+            &["run", "--provider", "fake", "--jsonl", "report result"],
+            &[("HAIDER_TEST_FAKE_PROVIDER", script)],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(exit),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let envelopes = parse_jsonl(&out.stdout);
+        let terminal = envelopes.last().expect("durable terminal");
+        eprintln!(
+            "task outcome CLI exit {exit}; terminal: {}",
+            terminal.payload
+        );
+        assert_eq!(envelopes.iter().filter(|event| matches!(typed(event), Some(EventPayload::RunState(state)) if state.is_terminal())).count(), 1);
+        if exit == 1 {
+            assert_eq!(
+                typed(terminal),
+                Some(EventPayload::RunState(RunState::Errored))
+            );
+            assert!(matches!(
+                typed(&envelopes[envelopes.len() - 2]),
+                Some(EventPayload::RunFailed {
+                    code: ErrorCode::TaskFailed,
+                    retryable: false,
+                    ..
+                })
+            ));
+            assert_eq!(
+                terminal.payload["task_outcome"],
+                serde_json::json!({"status":"failure", "reason":"Required input is unavailable"})
+            );
+            assert_eq!(terminal.payload["task_outcome_version"], 1);
+        } else {
+            assert_eq!(
+                typed(terminal),
+                Some(EventPayload::RunState(RunState::Done))
+            );
+            assert!(terminal.payload.get("task_outcome").is_none());
+        }
+    }
+}
+
+#[test]
 fn run_jsonl_bounded_rate_limit_exhaustion_is_one_provider_terminal() {
     const RUN_BUDGET_MS: u64 = 10_000;
     const RETRY_AFTER_MS: u64 = 15_000;
@@ -4218,6 +4276,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
     assert_eq!(
         parse_run_options(&["hello".into()]),
         Ok(RunOptions {
+            session_id: None,
             prompt: "hello".into(),
             prompt_stdin: false,
             resume_run_id: None,
@@ -4450,10 +4509,11 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     write_final(&mut json, RunOutput::Json, &done).expect("json");
     assert_eq!(
         String::from_utf8(json.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"turn_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&json).expect("v1 JSON");
-    assert_eq!(value.as_object().expect("object").len(), 16);
+    assert_eq!(value.as_object().expect("object").len(), 17);
+    assert_eq!(value["turn_id"], value["run_id"]);
     assert_eq!(value["provider"], "fake");
     assert_eq!(value["model"], "fake-model");
     assert!(value["usage"].is_null());
@@ -4591,11 +4651,12 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
         assert_eq!(
             String::from_utf8(bytes.clone()).expect("failure utf8"),
             format!(
-                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{error}}}\n"
+                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"turn_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{error}}}\n"
             )
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("failure object");
-        assert_eq!(value.as_object().expect("object").len(), 16);
+        assert_eq!(value.as_object().expect("object").len(), 17);
+        assert_eq!(value["turn_id"], value["run_id"]);
         assert!(value["response"].is_null());
         assert_eq!(
             value["error"].is_null(),
@@ -4706,7 +4767,7 @@ fn run_json_reports_attachments_additively() {
     write_final(&mut bytes, RunOutput::Json, &attached).expect("attachment JSON");
     assert_eq!(
         String::from_utf8(bytes.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"turn_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("attachment object");
     assert_eq!(value["attachments"]["count"], 2);
@@ -4836,4 +4897,261 @@ fn tui_rejects_bad_theme() {
         .output()
         .expect("binary runs");
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn ordinary_session_submit_cli_and_stdin_alias_keep_one_native_session() {
+    let fixture = haider();
+    let profile = fixture.profile.clone();
+    let workspace = profile.parent().expect("profile parent").join("workspace");
+    let run = |args: &[&str], input: Option<&[u8]>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+        configure_test_home(&mut command, &profile);
+        command
+            .current_dir(&workspace)
+            .env("HAIDER_PROFILE_DIR", &profile)
+            .env("HAIDER_DISCOVERY_DISABLED", "1")
+            .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
+            .env_remove("HAIDER_MODEL")
+            .args(args);
+        let output = bounded_output(&mut command, input);
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("run JSON")
+    };
+    let first = run(
+        &[
+            "run",
+            "--provider",
+            "fake",
+            "--output",
+            "json",
+            "first prompt",
+        ],
+        None,
+    );
+    let id = first["session_id"].as_str().expect("native session");
+    let second = run(
+        &["run", "--session", id, "--output", "json", "second prompt"],
+        None,
+    );
+    let third = run(
+        &["session", "submit", id, "--output", "json", "-"],
+        Some(b"third prompt\n"),
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    let mut last_seq = 0;
+    for result in [&first, &second, &third] {
+        assert_eq!(result["session_id"], id);
+        assert_eq!(result["outcome"], "done");
+        assert_eq!(result["turn_id"], result["run_id"]);
+        assert!(ids.insert(result["run_id"].as_str().expect("run id")));
+        let events = result["events"].as_array().expect("events");
+        assert!(
+            events.first().expect("first event")["seq"]
+                .as_u64()
+                .expect("seq")
+                > last_seq
+        );
+        last_seq = events.last().expect("last event")["seq"]
+            .as_u64()
+            .expect("seq");
+    }
+    assert!(
+        third["events"].to_string().contains("third prompt"),
+        "stdin text reached the journal"
+    );
+}
+
+#[test]
+fn ordinary_session_submission_is_separate_from_budget_resume() {
+    let parsed = parse_run_options(&[
+        "--session".into(),
+        "native-id".into(),
+        "--output".into(),
+        "json".into(),
+        "-".into(),
+    ])
+    .expect("session stdin");
+    assert_eq!(parsed.session_id, Some(SessionId::new("native-id")));
+    assert!(parsed.prompt_stdin);
+    assert_eq!(parsed.resume_run_id, None);
+    assert_eq!(parsed.output, RunOutput::Json);
+    for flags in [
+        vec!["--resume", "run-id"],
+        vec!["--start"],
+        vec!["--provider", "fake"],
+        vec!["--model", "another"],
+        vec!["--read-only"],
+        vec!["--allow-exec"],
+        vec!["--max-tokens", "10"],
+        vec!["--seed", "42"],
+        vec!["--session", "duplicate"],
+    ] {
+        let mut args = vec!["--session".into(), "native-id".into(), "prompt".into()];
+        args.extend(flags.into_iter().map(String::from));
+        assert!(parse_run_options(&args).is_err(), "{args:?}");
+    }
+    for args in [
+        vec!["--session"],
+        vec!["--session", ""],
+        vec!["--session", "--json"],
+        vec!["--session", "native-id"],
+    ] {
+        assert!(
+            parse_run_options(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
+        );
+    }
+}
+
+#[test]
+fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
+    let limit = haider_protocol::request_budget::RequestBudgetV1::default().hard_cap;
+    let mut script = Vec::new();
+    for ordinal in 1..=limit {
+        if ordinal > 1 {
+            script.push(serde_json::json!({
+                "step": "expect_tool_result", "call_id": format!("ceiling-{}", ordinal - 1)
+            }));
+        }
+        script.push(serde_json::json!({
+            "step": "emit_tool_call", "call_id": format!("ceiling-{ordinal}"),
+            "name": "fs_read", "args": {"path": "continuity.txt"}
+        }));
+        script.push(serde_json::json!({"step": "finish", "reason": "tool_use"}));
+    }
+    script.push(serde_json::json!({"step": "emit_text", "text": "UNREACHABLE_REQUEST"}));
+    script.push(serde_json::json!({"step": "finish", "reason": "end_turn"}));
+    let ceiling_script = serde_json::to_string(&script).expect("fake ceiling script");
+
+    for output_mode in ["json", "jsonl"] {
+        let fixture = haider();
+        let profile = fixture.profile.clone();
+        let workspace = profile.parent().expect("profile parent").join("workspace");
+        std::fs::write(workspace.join("continuity.txt"), "retained fixture history")
+            .expect("workspace input");
+        let invoke = |args: &[&str], script: &str, input: Option<&[u8]>, expected: i32| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+            configure_test_home(&mut command, &profile);
+            command
+                .current_dir(&workspace)
+                .env("HAIDER_PROFILE_DIR", &profile)
+                .env("HAIDER_DISCOVERY_DISABLED", "1")
+                // Restart each owned daemon so every phase has its own exact
+                // provider script and the advertised continuation is durable.
+                .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
+                .env("HAIDER_TEST_FAKE_PROVIDER", script)
+                .env_remove("HAIDER_MODEL")
+                .args(args);
+            let output = bounded_output(&mut command, input);
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let first = invoke(
+            &[
+                "run",
+                "--provider",
+                "fake",
+                "--read-only",
+                "--output",
+                "json",
+                "--timeout",
+                "30s",
+                "initial turn",
+            ],
+            DEFAULT_FAKE_SCRIPT,
+            None,
+            0,
+        );
+        let first: serde_json::Value = serde_json::from_slice(&first.stdout).expect("initial JSON");
+        let session_id = first["session_id"].as_str().expect("native session");
+        let capped = invoke(
+            &[
+                "run",
+                "--session",
+                session_id,
+                "--output",
+                output_mode,
+                "--timeout",
+                "30s",
+                "reach the ordinary ceiling",
+            ],
+            &ceiling_script,
+            None,
+            78,
+        );
+        let stderr = String::from_utf8(capped.stderr).expect("failure stderr");
+        let advertised = stderr
+            .split('`')
+            .find(|part| part.starts_with("haider session submit "))
+            .expect("ordinary failure advertises a session command");
+        assert!(!stderr.contains("--resume"), "{stderr}");
+        let records: Vec<serde_json::Value> = if output_mode == "json" {
+            let capped: serde_json::Value =
+                serde_json::from_slice(&capped.stdout).expect("ceiling JSON");
+            assert_eq!(capped["error"]["code"], "request_budget_exceeded");
+            for field in [
+                &capped["error"]["message"],
+                &capped["error"]["presentation"]["detail"],
+            ] {
+                let message = field.as_str().expect("failure guidance");
+                assert!(message.contains(advertised), "{message}");
+                assert!(!message.contains("--resume"), "{message}");
+            }
+            capped["events"].as_array().expect("journal").clone()
+        } else {
+            String::from_utf8(capped.stdout)
+                .expect("JSONL")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("JSONL record"))
+                .collect()
+        };
+        let hard_bound = records
+            .iter()
+            .find_map(|record| {
+                let payload = &record["payload"];
+                (payload["event"] == "completed"
+                    && payload["item"]["kind"] == "provider_request_budget_v1"
+                    && payload["item"]["data"]["phase"] == "hard_bound")
+                    .then_some(&payload["item"]["data"])
+            })
+            .expect("original durable ceiling evidence");
+        assert_eq!(hard_bound["used"], limit);
+        assert_eq!(hard_bound["budget"]["hard_cap"], limit);
+        assert!(
+            !serde_json::to_string(&records)
+                .expect("records")
+                .contains("UNREACHABLE_REQUEST")
+        );
+
+        // Execute the command extracted from the actual CLI error, including
+        // its stdin door, instead of merely comparing an expected hint string.
+        let mut args: Vec<_> = advertised.split_whitespace().skip(1).collect();
+        args.extend(["--output", "json", "--timeout", "30s"]);
+        let continued = invoke(
+            &args,
+            DEFAULT_FAKE_SCRIPT,
+            Some(b"continue with a fresh turn\n"),
+            0,
+        );
+        let continued: serde_json::Value =
+            serde_json::from_slice(&continued.stdout).expect("continued JSON");
+        assert_eq!(continued["session_id"], session_id);
+        assert_eq!(continued["outcome"], "done");
+        assert_eq!(continued["run_id"], continued["turn_id"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.get("run_id") != Some(&continued["run_id"]))
+        );
+    }
 }

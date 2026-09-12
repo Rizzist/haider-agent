@@ -526,7 +526,11 @@ fn agent_wait_timeout_observes_without_cancelling_then_cancel_is_terminal() {
 
 #[test]
 fn agent_headless_input_is_rejected_and_provider_continues_to_child_result() {
+    // Discover request_input so this pin reaches the typed headless-input policy.
     let profile = Profile::new(json!([
+        {"step":"emit_tool_call","call_id":"agentcli-discover-input","name":"list_tools","args":{"filter":"request_input"}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"agentcli-discover-input"},
         {"step":"emit_request_input","call_id":"agentcli-input","kind":"question","title":"Need operator input"},
         {"step":"finish","reason":"tool_use"},
         {"step":"expect_tool_result","call_id":"agentcli-input"},

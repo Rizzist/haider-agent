@@ -503,6 +503,9 @@ async fn replay_range(
     cancel: &mut watch::Receiver<bool>,
 ) -> ReplayStep {
     while *last_sent_seq < high_water {
+        if *cancel.borrow() || cancel.has_changed().is_err() {
+            return ReplayStep::Cancelled;
+        }
         // Byte-budgeted page (NOW-2): bounds the transient envelopes one page
         // may materialize; a short page just resumes from `last_sent_seq`.
         let read = hub.inner.store.read_page(
@@ -511,37 +514,36 @@ async fn replay_range(
             REPLAY_PAGE_SIZE,
             hub.inner.config.replay_page_byte_budget,
         );
-        // A closed lag watch (actor gone, graceful drain) is not a lag: the
-        // store replay keeps streaming its range (§6.6 final broadcast) and
-        // the later phases exit on the closed channel.
-        let lag_open = lagged.has_changed().is_ok();
-        let page = tokio::select! {
-            biased;
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() {
-                    hub.inner.metrics.discarded_store_pages.fetch_add(1, Ordering::Relaxed);
-                    return ReplayStep::Cancelled;
-                }
-                continue;
-            }
-            changed = lagged.changed(), if lag_open => {
-                if changed.is_ok() && lagged.borrow().is_some() {
-                    hub.inner.metrics.discarded_store_pages.fetch_add(1, Ordering::Relaxed);
-                    return ReplayStep::ReceiverLagged;
-                }
-                continue;
-            }
-            result = read => match result {
-                Ok(page) => page,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        attachment_id = %attachment_id,
-                        error = ?error,
-                        "attachment replay store read failed"
-                    );
-                    return ReplayStep::ReadFailed(error.message);
-                }
+        // SQLite runs this page in spawn_blocking; dropping its async read
+        // cannot stop that operation. Retain it through completion so joining
+        // the replay also joins its submitted I/O. Detach still releases RPC
+        // ownership immediately; native close waits for this task's barrier.
+        let page = read.await;
+        if *cancel.borrow() || cancel.has_changed().is_err() {
+            hub.inner
+                .metrics
+                .discarded_store_pages
+                .fetch_add(1, Ordering::Relaxed);
+            return ReplayStep::Cancelled;
+        }
+        // A closed lag watch means graceful actor drain, not receiver lag.
+        if lagged.has_changed().is_ok() && lagged.borrow().is_some() {
+            hub.inner
+                .metrics
+                .discarded_store_pages
+                .fetch_add(1, Ordering::Relaxed);
+            return ReplayStep::ReceiverLagged;
+        }
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    attachment_id = %attachment_id,
+                    error = ?error,
+                    "attachment replay store read failed"
+                );
+                return ReplayStep::ReadFailed(error.message);
             }
         };
         if page.is_empty() {

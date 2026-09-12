@@ -969,6 +969,7 @@ pub fn request_body_for_features(
         },
         LiveCommand::Detach { attachment } => RequestBody::SessionDetach {
             attachment_id: attachment,
+            close_session: false,
         },
         LiveCommand::SessionDiagnostic {
             command_id,
@@ -1850,7 +1851,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             worker_generation: attach_state.worker_generation,
             replay_through_seq: attach_state.replay_through_seq,
         }],
-        ResponseBody::SessionDetach { attachment_id } => vec![LiveReply::Detached {
+        ResponseBody::SessionDetach { attachment_id, .. } => vec![LiveReply::Detached {
             attachment: attachment_id,
         }],
         ResponseBody::SessionSurfaceWatching {

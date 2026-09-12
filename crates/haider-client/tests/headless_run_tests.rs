@@ -1678,6 +1678,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
             detach_request,
             ResponseBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                closed_session_id: None,
             },
         )
         .await;
@@ -1811,6 +1812,7 @@ async fn lagged_pressure_recovers_every_durable_sequence() {
             detach_request,
             ResponseBody::SessionDetach {
                 attachment_id: attachment_id.clone(),
+                closed_session_id: None,
             },
         )
         .await;
@@ -1910,7 +1912,10 @@ async fn withheld_recovery_barrier_cannot_defeat_run_and_grace_deadlines() {
         assert!(matches!(detach, RequestBody::SessionDetach { .. }));
         peer.respond(
             detach_request,
-            ResponseBody::SessionDetach { attachment_id },
+            ResponseBody::SessionDetach {
+                attachment_id,
+                closed_session_id: None,
+            },
         )
         .await;
         let (attach_request, attach) = peer.request().await;
@@ -3391,4 +3396,50 @@ async fn resume_budget_checkpoint_submits_new_turn_in_original_session() {
     assert_eq!(result.outcome, HeadlessOutcome::Done);
     assert_eq!(result.provider, "fake");
     assert_eq!(result.model, "original-model");
+}
+
+#[tokio::test]
+async fn ordinary_submit_preserves_typed_unknown_and_closed_session_errors() {
+    for (wire_code, expected) in [
+        (haider_rpc::ERROR_CODE_NOT_FOUND, "session_not_found"),
+        ("session_closed", "session_closed"),
+    ] {
+        let (_root, profile) = profile();
+        let peer = spawn_peer(&profile, move |mut peer| async move {
+            let (request_id, body) = peer.request().await;
+            assert!(
+                matches!(body, RequestBody::SessionRead { .. }),
+                "lookup precedes any session mutation"
+            );
+            peer.respond(
+                request_id,
+                ResponseBody::Error {
+                    code: wire_code.into(),
+                    message: "session unavailable".into(),
+                    retryable: false,
+                    data: None,
+                },
+            )
+            .await;
+        });
+        let mut run = request(None);
+        run.provider = None;
+        run.model = None;
+        let (sender, _receiver) = mpsc::channel(4);
+        let result = haider_client::submit_headless_with_event_mode_and_interrupts(
+            &profile,
+            EnsureOptions::default(),
+            run,
+            SessionId::new("unavailable"),
+            sender,
+            haider_client::HeadlessEventMode::FullRecordSet,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(HeadlessRunError::Rpc { ref code, retryable: false, .. }) if code == expected),
+            "{result:?}"
+        );
+        peer.await.expect("error peer");
+    }
 }
