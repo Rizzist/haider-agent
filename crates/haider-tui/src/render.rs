@@ -15407,7 +15407,7 @@ fn item_lines<'a>(
                     |profile| format!("↗ remote · {profile} · {name}"),
                 ),
                 name_tone: crate::toolfold::Tone::Name,
-                args: crate::toolfold::arg_summary(args),
+                args: crate::toolfold::semantic_summary(name, args),
                 glyph: status_glyph(*status),
                 glyph_tone: status_tone(*status),
                 // The protocol carries NO exit code on a generic tool call;
