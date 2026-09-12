@@ -16,6 +16,7 @@ blake3.workspace = true
 haider-accounts = { path = "../haider-accounts" }
 haider-platform = { path = "../haider-platform" }
 haider-protocol = { path = "../haider-protocol" }
+haider-webextract = { path = "../haider-webextract" }
 httpdate.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

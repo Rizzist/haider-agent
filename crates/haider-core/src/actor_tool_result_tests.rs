@@ -618,6 +618,18 @@ fn typed_large_tool_results_keep_legacy_model_prefix_suffix_cap_and_replay_bytes
     }
 }
 
+#[test]
+fn untruncated_oversize_results_are_projected_at_model_boundary() {
+    let source = format!("HEAD\n{}\nTAIL", "x".repeat(32 * 1024));
+    let durable = result(source.clone());
+    let projection = super::model_tool_result_projection("web_fetch", &durable);
+    assert!(projection.truncated);
+    assert!(projection.preview.len() <= 16 * 1024 + 256);
+    assert!(projection.preview.starts_with("HEAD\n"));
+    assert!(projection.preview.ends_with("\nTAIL"));
+    assert_eq!(durable.payload_text(), source);
+}
+
 /// Upstream tool-name repair must transform only the payload, then redeclare
 /// the original provenance outside its JSON wrapper with the new byte count.
 #[test]
