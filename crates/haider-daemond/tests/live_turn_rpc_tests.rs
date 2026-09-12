@@ -2259,9 +2259,11 @@ fn restart_exec_command() -> String {
 
 #[cfg(unix)]
 fn cancellable_exec_command() -> String {
+    // The daemon's output redactor publishes complete lines. The newline lets
+    // the observer see the child before cancellation while the loop runs.
     concat!(
         "(sleep 0.35; printf survived > descendant-survived.log) & ",
-        "printf x >> heartbeat.log; printf started; ",
+        "printf x >> heartbeat.log; printf 'started\\n'; ",
         "while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done"
     )
     .into()
