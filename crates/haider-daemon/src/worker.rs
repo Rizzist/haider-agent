@@ -7690,9 +7690,9 @@ async fn perform_shell_exec(
         run_id.clone(),
         pending.accepted.item_id.clone(),
         pending.command_id,
-        // Interactive shell bytes remain visible in the UI but never enter a
-        // later model prompt; tool-loop process calls expose only the bounded
-        // deterministic result adapter.
+        // Raw deltas are durable/UI-only. The prompt compiler consumes this
+        // same redacted journal stream through UserCommandOutput when the
+        // completed item becomes a bounded, labeled user-role record.
         PromptRender::Omit,
         Some(Arc::clone(&user_command_output)),
     );
@@ -7768,7 +7768,7 @@ async fn perform_shell_exec(
     let mut cancellation_channel_open = true;
     let mut drain_channel_open = true;
     let mut shell_close_channel_open = true;
-    let result = loop {
+    let mut result = loop {
         tokio::select! {
             biased;
             changed = shell_close.changed(), if shell_close_channel_open => {
@@ -7787,7 +7787,7 @@ async fn perform_shell_exec(
                     )
                     .await?;
                     process_cancel.cancel();
-                    let _ = wait.await;
+                    let mut cancelled_result = wait.await.ok();
                     if let Err(error) = broker.cancel().await {
                         tracing::warn!(
                             %run_id,
@@ -7796,6 +7796,9 @@ async fn perform_shell_exec(
                         );
                     }
                     let _ = shell.exited(None);
+                    if let Some(result) = cancelled_result.as_mut() {
+                        output_context.record_user_command_capture(&run_id, result).await?;
+                    }
                     return cancel_shell_exec(
                         lease,
                         device_id,
@@ -7824,7 +7827,7 @@ async fn perform_shell_exec(
                     )
                     .await?;
                     process_cancel.cancel();
-                    let _ = wait.await;
+                    let mut cancelled_result = wait.await.ok();
                     if let Err(error) = broker.cancel().await {
                         tracing::warn!(
                             %run_id,
@@ -7833,6 +7836,9 @@ async fn perform_shell_exec(
                         );
                     }
                     let _ = shell.exited(None);
+                    if let Some(result) = cancelled_result.as_mut() {
+                        output_context.record_user_command_capture(&run_id, result).await?;
+                    }
                     return cancel_shell_exec(
                         lease,
                         device_id,
@@ -7851,7 +7857,7 @@ async fn perform_shell_exec(
                 }
                 if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
                     process_cancel.cancel();
-                    let _ = wait.await;
+                    let mut cancelled_result = wait.await.ok();
                     if let Err(error) = broker.cancel().await {
                         tracing::warn!(
                             %run_id,
@@ -7860,6 +7866,9 @@ async fn perform_shell_exec(
                         );
                     }
                     let _ = shell.exited(None);
+                    if let Some(result) = cancelled_result.as_mut() {
+                        output_context.record_user_command_capture(&run_id, result).await?;
+                    }
                     return cancel_shell_exec(
                         lease,
                         device_id,
@@ -7911,6 +7920,9 @@ async fn perform_shell_exec(
         )
         .await;
     }
+    output_context
+        .record_user_command_capture(&run_id, &mut result)
+        .await?;
     if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
         let _ = shell.exited(result.exit_code);
         return cancel_shell_exec(
@@ -7923,9 +7935,6 @@ async fn perform_shell_exec(
         )
         .await;
     }
-    output_context
-        .record_process_signal(&run_id, &result)
-        .await?;
     shell
         .add_output(result.output_bytes)
         .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
@@ -12067,9 +12076,9 @@ fn budget_exhausted_error(exhausted: &RunBudgetExhaustedV1) -> HaiderError {
 }
 
 /// Commits the terminal direct-command item as prompt-visible immediately
-/// before the ordinary omitted `Done` state. Output deltas use the same
-/// visibility, so the prompt compiler can reconstruct exactly one bounded
-/// user-command record without making model-initiated process output visible.
+/// before the ordinary omitted `Done` state. Output deltas remain omitted as
+/// standalone prompt content; the compiler joins them through the durable
+/// user-command origin into exactly one bounded user-role record.
 struct ShellCompletionRequest<'a> {
     run_id: &'a RunId,
     branch_id: Option<&'a BranchId>,
@@ -22460,11 +22469,13 @@ fn process_capture_preview(result: &ProcessResult, output: &str) -> String {
     if result.artifact.is_none() {
         return output.to_owned();
     }
-    let handle = format!("capture:{}", result.effect);
-    let args = serde_json::json!({ "task_id": handle, "cursor": 0 });
     format!(
-        "{output}\n[Capture: {} bytes retained; at least {} source bytes unavailable. Page the full secret-redacted capture with task_output({args}); follow next_cursor until exhausted.]",
-        result.output_bytes, result.source_output_elided_bytes_at_least
+        "{output}\n{}",
+        haider_tools::foreground_capture_hint(
+            &result.effect,
+            result.output_bytes as u64,
+            result.source_output_elided_bytes_at_least as u64,
+        )
     )
 }
 
@@ -22793,6 +22804,21 @@ impl HubCommandOutputContext {
             .map_err(|error| ToolError::Runtime {
                 message: error.message,
             })?;
+        Ok(())
+    }
+
+    /// Share retention/redaction/paging with model process results, including
+    /// cancellation. The existing signal owns the handle after session resume.
+    async fn record_user_command_capture(
+        &self,
+        run_id: &RunId,
+        result: &mut ProcessResult,
+    ) -> Result<(), HaiderError> {
+        crate::tasks::TaskFacade::new(self.store.hub().clone())
+            .retain_foreground_capture(self.store.session_id(), result)
+            .await
+            .map_err(tool_error)?;
+        self.record_process_signal(run_id, result).await?;
         Ok(())
     }
 

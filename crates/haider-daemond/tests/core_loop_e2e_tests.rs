@@ -4,6 +4,9 @@
 
 #![allow(clippy::expect_used)]
 
+#[path = "core_loop/bang_context_e2e.rs"]
+mod bang_context;
+
 #[path = "core_loop/completion_http_e2e.rs"]
 mod completion_http;
 #[path = "support/process_fixture.rs"]

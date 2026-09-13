@@ -4070,6 +4070,7 @@ struct JournalFacts {
     continued_partial_items: HashSet<haider_protocol::ids::ItemId>,
     user_command_origins: HashMap<haider_protocol::ids::ItemId, UserCommandOriginV1>,
     user_command_savings: HashMap<haider_protocol::ids::ItemId, OutputSavings>,
+    process_captures: HashMap<(RunId, String), haider_protocol::ids::EffectId>,
     retracted_prompts: HashSet<u64>,
 }
 
@@ -4086,6 +4087,7 @@ impl JournalFactsIndex {
                     .saturating_add(state.facts.continued_partial_items.len())
                     .saturating_add(state.facts.user_command_origins.len())
                     .saturating_add(state.facts.user_command_savings.len())
+                    .saturating_add(state.facts.process_captures.len())
                     .saturating_add(state.facts.retracted_prompts.len())
             })
             .fold(0_usize, usize::saturating_add)
@@ -4207,6 +4209,12 @@ impl JournalFacts {
                 {
                     self.continued_partial_items.insert(item_id.clone());
                 }
+            }
+            EventPayload::ProcessSignalRecorded(signal) if signal.artifact.is_some() => {
+                self.process_captures.insert(
+                    (signal.run_id.clone(), signal.call_id.clone()),
+                    signal.effect_id.clone(),
+                );
             }
             EventPayload::Item(ItemEvent::Completed { item, .. }) => {
                 if let Some(event) =
@@ -4418,11 +4426,19 @@ fn render_journal_with_facts(
                         .unwrap_or(0);
                     let source_complete =
                         recorded_savings.is_none_or(|savings| savings.omitted_bytes_exact);
-                    let output =
+                    let mut output =
                         output.finish(failed, source_omitted_bytes_at_least, source_complete);
+                    if let Some(effect) = facts.process_captures.get(&(run_id.clone(), call_id.clone())) {
+                        output.output_preview.push('\n');
+                        output.output_preview.push_str(&haider_tools::foreground_capture_hint(
+                            effect,
+                            output.output_bytes,
+                            source_omitted_bytes_at_least,
+                        ));
+                    }
                     messages.push(Message::user_command(UserCommandRecord {
                         call_id,
-                        command,
+                        command: haider_tools::redact_output_text(&command),
                         status,
                         exit_code,
                         output_preview: output.output_preview,

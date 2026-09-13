@@ -75,6 +75,7 @@ impl TaskFacade {
         let effect = handle.strip_prefix("capture:").unwrap_or_default();
         let mut cursor = 0;
         let mut signal = None;
+        let mut user_commands = std::collections::HashSet::new();
         loop {
             let page = self
                 .hub
@@ -90,9 +91,31 @@ impl TaskFacade {
                     continue;
                 };
                 match event {
+                    haider_protocol::EventPayload::Item(
+                        haider_protocol::item::ItemEvent::Completed { item, .. },
+                    ) => {
+                        if let Some(origin) =
+                            haider_protocol::item::UserCommandOriginV1::from_extension_item(&item)
+                            && let Some(run) = envelope.run_id
+                        {
+                            user_commands.insert((run, origin.call_id));
+                        }
+                    }
                     haider_protocol::EventPayload::ProcessSignalRecorded(record)
                         if record.effect_id.as_str() == effect =>
                     {
+                        // Direct commands have no ToolResult. Their daemon-minted
+                        // origin and terminal process signal own the same capture.
+                        if user_commands.contains(&(record.run_id.clone(), record.call_id.clone()))
+                            && let Some(artifact) = record.artifact
+                        {
+                            self.hub.task_registry().retain_capture(
+                                session,
+                                handle.to_owned(),
+                                artifact.clone(),
+                            );
+                            return Ok(artifact);
+                        }
                         signal = Some((record.run_id, record.call_id));
                     }
                     haider_protocol::EventPayload::ToolResult { call_id, result }

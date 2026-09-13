@@ -5511,6 +5511,10 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
         .last()
         .expect("next provider turn contains the cancelled shell record");
     assert!(command_record.contains("origin: user_command"));
+    assert!(
+        command_record.contains("task_output("),
+        "cancelled output remains pageable"
+    );
     #[cfg(not(windows))]
     assert!(command_record.contains("status: cancelled"));
     #[cfg(windows)]

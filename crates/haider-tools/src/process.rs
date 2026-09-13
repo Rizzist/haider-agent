@@ -52,6 +52,19 @@ type DirectoryIdentity = haider_platform::WindowsFileIdentity;
 
 /// Maximum raw payload retained by one pipe-read chunk.
 pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+/// The shared provider-facing pointer to a session-scoped, redacted capture.
+#[must_use]
+pub fn foreground_capture_hint(
+    effect: &haider_protocol::ids::EffectId,
+    retained_bytes: u64,
+    omitted_bytes_at_least: u64,
+) -> String {
+    let args = serde_json::json!({ "task_id": format!("capture:{effect}"), "cursor": 0 });
+    format!(
+        "[Capture: {retained_bytes} bytes retained; at least {omitted_bytes_at_least} source bytes unavailable. Page the full secret-redacted capture with task_output({args}); follow next_cursor until exhausted.]"
+    )
+}
+
 /// Process-output termination threshold. The read that first crosses this
 /// threshold is retained whole in the journal and CAS, so accepted output may
 /// exceed the threshold by at most one [`PROCESS_OUTPUT_CHUNK_BYTES`] read.

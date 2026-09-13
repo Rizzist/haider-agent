@@ -515,7 +515,7 @@ async fn user_command_and_output_reach_the_next_turn_as_one_labeled_record() {
                 item_id: command_item,
                 item: TurnItem::CommandExecution {
                     call_id: "shell-command".into(),
-                    command: "printf héllo; printf warning >&2".into(),
+                    command: "printf héllo; printf warning >&2 # sk-abcdefghijklmnopQRSTUV".into(),
                     status: ToolStatus::Completed,
                     exit_code: Some(0),
                 },
@@ -555,6 +555,7 @@ async fn user_command_and_output_reach_the_next_turn_as_one_labeled_record() {
     };
     assert!(text.contains("origin: user_command"));
     assert!(text.contains("printf héllo; printf warning >&2"));
+    assert!(!text.contains("sk-abcdefghijklmnopQRSTUV"));
     assert!(text.contains("[stdout]\\nhéllo\\n\\n[stderr]\\nwarning\\n"));
     assert!(text.contains("status: completed"));
     assert!(text.contains("exit_code: 0"));
