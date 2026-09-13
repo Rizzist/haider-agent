@@ -1,5 +1,8 @@
 //! Anthropic Messages wire types and the incremental SSE state machine.
 
+#[cfg(test)]
+mod ordering_tests;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use haider_protocol::ids::CredentialAlias;
@@ -1110,6 +1113,7 @@ struct StreamState {
     started: bool,
     open_blocks: BTreeMap<usize, OpenBlock>,
     seen_blocks: BTreeSet<usize>,
+    implicitly_closed_blocks: BTreeSet<usize>,
     message_delta_seen: bool,
     input: InputUsage,
     stop_reason: Option<FinishReason>,
@@ -1123,6 +1127,7 @@ impl StreamState {
             started: false,
             open_blocks: BTreeMap::new(),
             seen_blocks: BTreeSet::new(),
+            implicitly_closed_blocks: BTreeSet::new(),
             message_delta_seen: false,
             input: InputUsage::default(),
             stop_reason: None,
@@ -1334,198 +1339,14 @@ impl StreamState {
             }
             WireEvent::ContentBlockStop { index } => {
                 self.require_started("content_block_stop")?;
-                self.require_before_message_delta("content_block_stop")?;
-                match self.open_blocks.remove(&index) {
-                    Some(OpenBlock::Tool {
-                        call_id,
-                        native_computer: false,
-                        ..
-                    }) => Ok(vec![StreamEvent::ToolCallEnd { call_id }]),
-                    Some(OpenBlock::Tool {
-                        call_id,
-                        native_computer: true,
-                        input_json,
-                    }) => {
-                        let input = serde_json::from_str(&input_json).map_err(|error| {
-                            malformed(format!(
-                                "Anthropic computer tool input is not valid JSON: {error}"
-                            ))
-                        })?;
-                        let neutral = anthropic_computer_input_to_neutral(&input)?;
-                        let args_fragment = serde_json::to_string(&neutral).map_err(|error| {
-                            malformed(format!(
-                                "normalized Anthropic computer input could not serialize: {error}"
-                            ))
-                        })?;
-                        Ok(vec![
-                            StreamEvent::ToolCallArgsDelta {
-                                call_id: call_id.clone(),
-                                args_fragment,
-                            },
-                            StreamEvent::ToolCallEnd { call_id },
-                        ])
-                    }
-                    // W-B (LW2): the finished server tool call is captured
-                    // VERBATIM — id, name, streamed input, and every unknown
-                    // sibling field — for the API's mandatory echo, then
-                    // surfaced as a display row.
-                    Some(OpenBlock::ServerTool {
-                        id,
-                        name,
-                        input,
-                        input_json,
-                        extra,
-                    }) => {
-                        let input = if input_json.is_empty() {
-                            input
-                        } else {
-                            serde_json::from_str(&input_json).map_err(|error| {
-                                malformed(format!(
-                                    "Anthropic server tool input is not valid JSON: {error}"
-                                ))
-                            })?
-                        };
-                        let mut raw = serde_json::Map::new();
-                        raw.insert("type".into(), serde_json::json!("server_tool_use"));
-                        raw.insert("id".into(), serde_json::Value::String(id.clone()));
-                        raw.insert("name".into(), serde_json::Value::String(name.clone()));
-                        raw.insert("input".into(), input.clone());
-                        raw.extend(extra);
-                        Ok(vec![
-                            StreamEvent::ProviderOpaque {
-                                provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                                data: serde_json::Value::Object(raw).into(),
-                            },
-                            StreamEvent::ServerToolUse {
-                                call_id: id,
-                                name,
-                                args: input,
-                            },
-                        ])
-                    }
-                    // W-B (LW2/LW3): the result block — encrypted_content and
-                    // all — replays verbatim; the display row decodes the
-                    // content TOLERANTLY (error content is an OBJECT with an
-                    // error_code, search success is a LIST, fetch success is
-                    // a web_fetch_result object; an empty list is zero
-                    // results, not an error).
-                    Some(OpenBlock::ServerResult {
-                        kind,
-                        tool_use_id,
-                        content,
-                        extra,
-                    }) => {
-                        let (preview, is_error) = server_result_preview(&content);
-                        let mut raw = serde_json::Map::new();
-                        raw.insert("type".into(), serde_json::json!(kind));
-                        raw.insert(
-                            "tool_use_id".into(),
-                            serde_json::Value::String(tool_use_id.clone()),
-                        );
-                        raw.insert("content".into(), content);
-                        raw.extend(extra);
-                        Ok(vec![
-                            StreamEvent::ProviderOpaque {
-                                provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                                data: serde_json::Value::Object(raw).into(),
-                            },
-                            StreamEvent::ServerToolResult {
-                                call_id: tool_use_id,
-                                preview,
-                                is_error,
-                            },
-                        ])
-                    }
-                    // G3 (LT1): a SIGNED thinking block becomes a
-                    // provider-opaque fact carrying the EXACT wire shape the
-                    // Messages API requires replayed verbatim within a
-                    // tool-use turn. An unsigned block (display-only
-                    // thinking) is not replayable and captures nothing —
-                    // today's behavior.
-                    Some(OpenBlock::Thinking {
-                        thinking,
-                        signature,
-                    }) => {
-                        let thinking = thinking.seal();
-                        if signature.is_empty() {
-                            return Ok(Vec::new());
-                        }
-                        let data = ProviderOpaqueData::with_reply(
-                            serde_json::json!({
-                                "type": "thinking",
-                                "thinking": "__haider_anthropic_thinking_reply__",
-                                "signature": signature,
-                            }),
-                            "__haider_anthropic_thinking_reply__",
-                            thinking,
-                        )
-                        .ok_or_else(|| {
-                            malformed("Anthropic thinking template lost its reply marker")
-                        })?;
-                        Ok(vec![StreamEvent::ProviderOpaque {
-                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                            data,
-                        }])
-                    }
-                    // redacted_thinking replays as-is; the classic bug this
-                    // pins against is filtering `type == "thinking"` and
-                    // dropping these (a live 400).
-                    Some(OpenBlock::Redacted { data }) => Ok((!data.is_empty())
-                        .then(|| StreamEvent::ProviderOpaque {
-                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                            data: serde_json::json!({
-                                "type": "redacted_thinking",
-                                "data": data,
-                            })
-                            .into(),
-                        })
-                        .into_iter()
-                        .collect()),
-                    // W-B: a citation-carrying text block is captured with
-                    // its citations (every encrypted_index included) so the
-                    // follow-up request can echo it verbatim; the sources it
-                    // cites surface for display. A plain text block captures
-                    // nothing — today's behavior.
-                    Some(OpenBlock::Text { text, citations }) => {
-                        let text = text.seal();
-                        if citations.is_empty() {
-                            return Ok(Vec::new());
-                        }
-                        let sources = citation_sources(&citations);
-                        let data = ProviderOpaqueData::with_reply(
-                            serde_json::json!({
-                                "type": "text",
-                                "text": "__haider_anthropic_text_reply__",
-                                "citations": citations,
-                            }),
-                            "__haider_anthropic_text_reply__",
-                            text,
-                        )
-                        .ok_or_else(|| {
-                            malformed("Anthropic citation template lost its reply marker")
-                        })?;
-                        let mut events = vec![StreamEvent::ProviderOpaque {
-                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                            data,
-                        }];
-                        if !sources.is_empty() {
-                            events.push(StreamEvent::WebSources { sources });
-                        }
-                        Ok(events)
-                    }
-                    Some(OpenBlock::Opaque) => Ok(Vec::new()),
-                    None => Err(malformed(format!(
-                        "Anthropic stop references unopened content block index {index}"
-                    ))),
+                if self.implicitly_closed_blocks.remove(&index) {
+                    return Ok(Vec::new());
                 }
+                self.require_before_message_delta("content_block_stop")?;
+                self.close_block(index)
             }
             WireEvent::MessageDelta { delta, usage } => {
                 self.require_started("message_delta")?;
-                if !self.open_blocks.is_empty() {
-                    return Err(malformed(
-                        "Anthropic message_delta arrived while a content block was open",
-                    ));
-                }
                 if let Some(stop_reason) = delta.stop_reason {
                     let normalized = normalize_stop_reason(&stop_reason)?;
                     if self
@@ -1538,9 +1359,17 @@ impl StreamState {
                     }
                     self.stop_reason = Some(normalized);
                 }
+                // A message-level delta ends the content phase even when the
+                // provider omits or delays a block stop. Finalize normally so
+                // tool ends, signed thinking, and citations are not lost.
+                let mut events = Vec::new();
+                while let Some((&index, _)) = self.open_blocks.first_key_value() {
+                    events.extend(self.close_block(index)?);
+                    self.implicitly_closed_blocks.insert(index);
+                }
                 self.message_delta_seen = true;
                 let Some(usage) = usage else {
-                    return Ok(Vec::new());
+                    return Ok(events);
                 };
                 self.input.update(&usage)?;
                 let input = self
@@ -1550,7 +1379,7 @@ impl StreamState {
                     .checked_add(self.input.cache_creation_input_tokens.unwrap_or(0))
                     .ok_or_else(|| malformed("Anthropic input usage counter overflowed u64"))?;
                 let normalized = self.input.normalized(usage.output_tokens.unwrap_or(0))?;
-                Ok(vec![StreamEvent::UsageUpdate(Usage {
+                events.push(StreamEvent::UsageUpdate(Usage {
                     input,
                     output: usage.output_tokens.unwrap_or(0),
                     reasoning: 0,
@@ -1562,7 +1391,8 @@ impl StreamState {
                     scope: None,
                     cache_cost: None,
                     request: None,
-                })])
+                }));
+                Ok(events)
             }
             WireEvent::MessageStop => {
                 self.require_started("message_stop")?;
@@ -1578,6 +1408,188 @@ impl StreamState {
             }
             WireEvent::Ping | WireEvent::Unknown => Ok(Vec::new()),
             WireEvent::Error { error } => Err(api_error(error)),
+        }
+    }
+
+    fn close_block(&mut self, index: usize) -> Result<Vec<StreamEvent>, ProviderError> {
+        match self.open_blocks.remove(&index) {
+            Some(OpenBlock::Tool {
+                call_id,
+                native_computer: false,
+                ..
+            }) => Ok(vec![StreamEvent::ToolCallEnd { call_id }]),
+            Some(OpenBlock::Tool {
+                call_id,
+                native_computer: true,
+                input_json,
+            }) => {
+                let input = serde_json::from_str(&input_json).map_err(|error| {
+                    malformed(format!(
+                        "Anthropic computer tool input is not valid JSON: {error}"
+                    ))
+                })?;
+                let neutral = anthropic_computer_input_to_neutral(&input)?;
+                let args_fragment = serde_json::to_string(&neutral).map_err(|error| {
+                    malformed(format!(
+                        "normalized Anthropic computer input could not serialize: {error}"
+                    ))
+                })?;
+                Ok(vec![
+                    StreamEvent::ToolCallArgsDelta {
+                        call_id: call_id.clone(),
+                        args_fragment,
+                    },
+                    StreamEvent::ToolCallEnd { call_id },
+                ])
+            }
+            // W-B (LW2): the finished server tool call is captured
+            // VERBATIM — id, name, streamed input, and every unknown
+            // sibling field — for the API's mandatory echo, then
+            // surfaced as a display row.
+            Some(OpenBlock::ServerTool {
+                id,
+                name,
+                input,
+                input_json,
+                extra,
+            }) => {
+                let input = if input_json.is_empty() {
+                    input
+                } else {
+                    serde_json::from_str(&input_json).map_err(|error| {
+                        malformed(format!(
+                            "Anthropic server tool input is not valid JSON: {error}"
+                        ))
+                    })?
+                };
+                let mut raw = serde_json::Map::new();
+                raw.insert("type".into(), serde_json::json!("server_tool_use"));
+                raw.insert("id".into(), serde_json::Value::String(id.clone()));
+                raw.insert("name".into(), serde_json::Value::String(name.clone()));
+                raw.insert("input".into(), input.clone());
+                raw.extend(extra);
+                Ok(vec![
+                    StreamEvent::ProviderOpaque {
+                        provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                        data: serde_json::Value::Object(raw).into(),
+                    },
+                    StreamEvent::ServerToolUse {
+                        call_id: id,
+                        name,
+                        args: input,
+                    },
+                ])
+            }
+            // W-B (LW2/LW3): the result block — encrypted_content and
+            // all — replays verbatim; the display row decodes the
+            // content TOLERANTLY (error content is an OBJECT with an
+            // error_code, search success is a LIST, fetch success is
+            // a web_fetch_result object; an empty list is zero
+            // results, not an error).
+            Some(OpenBlock::ServerResult {
+                kind,
+                tool_use_id,
+                content,
+                extra,
+            }) => {
+                let (preview, is_error) = server_result_preview(&content);
+                let mut raw = serde_json::Map::new();
+                raw.insert("type".into(), serde_json::json!(kind));
+                raw.insert(
+                    "tool_use_id".into(),
+                    serde_json::Value::String(tool_use_id.clone()),
+                );
+                raw.insert("content".into(), content);
+                raw.extend(extra);
+                Ok(vec![
+                    StreamEvent::ProviderOpaque {
+                        provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                        data: serde_json::Value::Object(raw).into(),
+                    },
+                    StreamEvent::ServerToolResult {
+                        call_id: tool_use_id,
+                        preview,
+                        is_error,
+                    },
+                ])
+            }
+            // G3 (LT1): a SIGNED thinking block becomes a
+            // provider-opaque fact carrying the EXACT wire shape the
+            // Messages API requires replayed verbatim within a
+            // tool-use turn. An unsigned block (display-only
+            // thinking) is not replayable and captures nothing —
+            // today's behavior.
+            Some(OpenBlock::Thinking {
+                thinking,
+                signature,
+            }) => {
+                let thinking = thinking.seal();
+                if signature.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let data = ProviderOpaqueData::with_reply(
+                    serde_json::json!({
+                        "type": "thinking",
+                        "thinking": "__haider_anthropic_thinking_reply__",
+                        "signature": signature,
+                    }),
+                    "__haider_anthropic_thinking_reply__",
+                    thinking,
+                )
+                .ok_or_else(|| malformed("Anthropic thinking template lost its reply marker"))?;
+                Ok(vec![StreamEvent::ProviderOpaque {
+                    provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                    data,
+                }])
+            }
+            // redacted_thinking replays as-is; the classic bug this
+            // pins against is filtering `type == "thinking"` and
+            // dropping these (a live 400).
+            Some(OpenBlock::Redacted { data }) => Ok((!data.is_empty())
+                .then(|| StreamEvent::ProviderOpaque {
+                    provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                    data: serde_json::json!({
+                        "type": "redacted_thinking",
+                        "data": data,
+                    })
+                    .into(),
+                })
+                .into_iter()
+                .collect()),
+            // W-B: a citation-carrying text block is captured with
+            // its citations (every encrypted_index included) so the
+            // follow-up request can echo it verbatim; the sources it
+            // cites surface for display. A plain text block captures
+            // nothing — today's behavior.
+            Some(OpenBlock::Text { text, citations }) => {
+                let text = text.seal();
+                if citations.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let sources = citation_sources(&citations);
+                let data = ProviderOpaqueData::with_reply(
+                    serde_json::json!({
+                        "type": "text",
+                        "text": "__haider_anthropic_text_reply__",
+                        "citations": citations,
+                    }),
+                    "__haider_anthropic_text_reply__",
+                    text,
+                )
+                .ok_or_else(|| malformed("Anthropic citation template lost its reply marker"))?;
+                let mut events = vec![StreamEvent::ProviderOpaque {
+                    provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                    data,
+                }];
+                if !sources.is_empty() {
+                    events.push(StreamEvent::WebSources { sources });
+                }
+                Ok(events)
+            }
+            Some(OpenBlock::Opaque) => Ok(Vec::new()),
+            None => Err(malformed(format!(
+                "Anthropic stop references unopened content block index {index}"
+            ))),
         }
     }
 
