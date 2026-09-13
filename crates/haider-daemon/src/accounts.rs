@@ -91,8 +91,9 @@ use crate::oauth::{
 };
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
-    ProviderConfigureInput, ProviderEndpointValidator, ProviderModelSourceLike, ProviderProvenance,
-    ProviderRegistry, ProviderRegistryStoreLike, ProviderTargetV1, initial_provider_profiles,
+    ProviderConfigureInput, ProviderEndpointValidator, ProviderInventory, ProviderModelSourceLike,
+    ProviderProvenance, ProviderRegistry, ProviderRegistryStoreLike, ProviderTargetV1,
+    initial_provider_profiles,
 };
 use crate::session_hub::FrameSink;
 
@@ -965,7 +966,14 @@ impl ManagementSnapshot {
     }
 
     pub(crate) fn read(&self) -> Option<ManagementView> {
-        self.inner.lock().ok().map(|view| view.clone())
+        self.inner.lock().ok().map(|view| {
+            let mut view = view.clone();
+            let now = unix_ms_after(Duration::ZERO);
+            for provider in &mut view.providers {
+                provider.inventory = provider.inventory.clone().at_time(now);
+            }
+            view
+        })
     }
 
     pub(crate) fn inspect<T>(&self, read: impl FnOnce(&ManagementView) -> T) -> Option<T> {
@@ -2241,6 +2249,7 @@ async fn run_account_actor(
                     completed,
                 )
                 .await;
+                publish_inventory_states(&store, management.as_ref(), &accounts, &providers).await;
             }
             AccountCommand::ProviderModelsRefreshCompleted {
                 provider,
@@ -2262,6 +2271,7 @@ async fn run_account_actor(
                     result,
                 )
                 .await;
+                publish_inventory_states(&store, management.as_ref(), &accounts, &providers).await;
             }
             AccountCommand::BeginOAuthRefresh {
                 descriptor,
@@ -2744,25 +2754,16 @@ async fn begin_provider_models_refresh(
         ProviderAuthRequirementWire::OAuth => Some(AuthMethod::OAuth),
         ProviderAuthRequirementWire::ApiKey => Some(AuthMethod::ApiKey),
         ProviderAuthRequirementWire::None => None,
-        ProviderAuthRequirementWire::Unknown => {
-            respond_provider_models_unavailable(
-                &completed,
-                &provider,
-                "provider model discovery has an unsupported authentication requirement",
-            );
-            return;
-        }
         _ => {
-            respond_provider_models_unavailable(
-                &completed,
-                &provider,
-                "provider model discovery has an unsupported authentication requirement",
-            );
+            let reason = "provider model discovery has an unsupported authentication requirement";
+            providers.models_unavailable(&provider, reason.to_owned());
+            respond_provider_models_unavailable(&completed, &provider, reason);
             return;
         }
     };
     let descriptor = if let Some(expected_auth) = expected_auth {
         let Some(descriptor) = accounts.active_for_provider(&provider).cloned() else {
+            providers.models_unavailable(&provider, "provider has no active credential".to_owned());
             respond_model_refresh_error(
                 &completed,
                 ERROR_CODE_CREDENTIAL_MISSING,
@@ -2778,6 +2779,7 @@ async fn begin_provider_models_refresh(
             } else {
                 "provider model discovery requires an active API-key credential"
             };
+            providers.models_unavailable(&provider, reason.to_owned());
             respond_provider_models_unavailable(&completed, &provider, reason);
             return;
         }
@@ -2792,6 +2794,7 @@ async fn begin_provider_models_refresh(
             } else {
                 "credential broker is unavailable"
             };
+            providers.models_unavailable(&provider, message.to_owned());
             respond_model_refresh_error(
                 &completed,
                 ERROR_CODE_CREDENTIAL_MISSING,
@@ -2808,6 +2811,7 @@ async fn begin_provider_models_refresh(
     let cached = match store.provider_models(provider.clone()).await {
         Ok(cached) => cached,
         Err(error) => {
+            providers.models_unavailable(&provider, error.message.clone());
             respond_model_refresh_error(
                 &completed,
                 ERROR_CODE_PROVIDER_ERROR,
@@ -2892,6 +2896,16 @@ async fn finish_provider_models_refresh(
         providers,
         completed,
     } = context;
+    let failure_reason = match &result {
+        ProviderModelsRefreshResult::Discovery(Ok(_))
+        | ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => None,
+        ProviderModelsRefreshResult::Discovery(Err(error)) => Some(error.to_string()),
+        ProviderModelsRefreshResult::Credential(error) => Some(error.message.clone()),
+    };
+    if let Some(reason) = failure_reason {
+        providers.models_unavailable(&provider, reason);
+        publish_inventory_states(store, management, accounts, providers).await;
+    }
     match result {
         ProviderModelsRefreshResult::Discovery(Ok(catalog)) => {
             let models_json = match serde_json::to_string(&catalog.models) {
@@ -2929,7 +2943,7 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
-            providers.replace_models(provider.clone(), catalog.models, Some(fetched_at_ms));
+            providers.replace_discovered_models(provider.clone(), catalog.models, fetched_at_ms);
             let summaries = providers.summaries(&provider_has_credential(accounts));
             let Some(summary) = summaries
                 .iter()
@@ -3102,6 +3116,29 @@ async fn finish_provider_models_refresh(
     }
 }
 
+/// Publish failed discovery independently of credential status. Successful
+/// fetches already published their durable revision; avoid another write.
+async fn publish_inventory_states(
+    store: &SqliteStoreHandle,
+    management: Option<&ManagementSnapshot>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) {
+    let Some(management) = management else {
+        return;
+    };
+    let summaries = providers.summaries(&provider_has_credential(accounts));
+    if management
+        .read()
+        .is_some_and(|view| view.providers == summaries)
+    {
+        return;
+    }
+    if let Ok(revision) = store.advance_management_revision().await {
+        management.publish(revision, accounts.list().to_vec(), summaries);
+    }
+}
+
 fn custom_probe_error_data(
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     provider: &str,
@@ -3120,35 +3157,15 @@ fn catalog_source(
     provider: &str,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Option<(CatalogSource, ProviderAuthRequirementWire)> {
-    match provider {
-        OPENAI_OAUTH_PROVIDER_NAME => Some((
-            CatalogSource::OpenAiSubscription,
-            ProviderAuthRequirementWire::OAuth,
-        )),
-        ANTHROPIC_OAUTH_PROVIDER_NAME => Some((
-            CatalogSource::AnthropicSubscription,
-            ProviderAuthRequirementWire::OAuth,
-        )),
-        KIMI_OAUTH_PROVIDER_NAME => {
-            Some((CatalogSource::KimiOAuth, ProviderAuthRequirementWire::OAuth))
+    match haider_provider::provider_catalog_definition(provider) {
+        haider_provider::ProviderCatalogDefinition::Public { source } => {
+            Some((source, ProviderAuthRequirementWire::None))
         }
-        GROK_OAUTH_PROVIDER_NAME => {
-            Some((CatalogSource::GrokOAuth, ProviderAuthRequirementWire::OAuth))
+        haider_provider::ProviderCatalogDefinition::Authenticated { source } => {
+            Some((source, providers.get(provider)?.auth_requirement))
         }
-        DEEPSEEK_PROVIDER_NAME => Some((
-            CatalogSource::DeepSeekApi,
-            ProviderAuthRequirementWire::ApiKey,
-        )),
-        HAIDER_CODE_PROVIDER_NAME => Some((
-            CatalogSource::HaiderCodeApi,
-            ProviderAuthRequirementWire::ApiKey,
-        )),
-        XAI_PROVIDER_NAME => Some((CatalogSource::XaiApi, ProviderAuthRequirementWire::ApiKey)),
-        GEMINI_PROVIDER_NAME => Some((
-            CatalogSource::GeminiApiKey,
-            ProviderAuthRequirementWire::ApiKey,
-        )),
-        _ => {
+        haider_provider::ProviderCatalogDefinition::Offline { .. } => None,
+        haider_provider::ProviderCatalogDefinition::Adapter => {
             let profile = providers.get(provider)?;
             if profile.provenance != ProviderProvenance::Custom
                 || !matches!(
@@ -5305,10 +5322,10 @@ async fn handle_provider_configure(
             );
             return;
         }
-        providers.replace_models(
+        providers.replace_discovered_models(
             profile.provider_id.clone(),
             catalog.models,
-            Some(fetched_at_ms),
+            fetched_at_ms,
         );
     }
     let Some(provider) =
@@ -11270,10 +11287,10 @@ async fn reconcile_provider_receipts(
                     fetched_at_ms,
                 )
                 .await?;
-            providers.replace_models(
+            providers.replace_discovered_models(
                 profile.provider_id.clone(),
                 catalog.models,
-                Some(fetched_at_ms),
+                fetched_at_ms,
             );
         }
         let summary = providers
@@ -11933,7 +11950,13 @@ impl AccountsRuntime {
                             false,
                         )
                     })?;
-                    model_source.replace(provider.clone(), models, Some(cached.fetched_at_ms));
+                    model_source.replace(
+                        provider.clone(),
+                        ProviderInventory::Fetched {
+                            models,
+                            fetched_at_ms: cached.fetched_at_ms,
+                        },
+                    );
                 }
             }
         }

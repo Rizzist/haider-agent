@@ -93,7 +93,11 @@ fn add_api_provider(model: &mut AppModel, fixture: ApiProviderFixture<'_>) {
         ProviderAvailabilityWire::Unavailable
     };
     summary.availability_reason = fixture.reason.map(str::to_owned);
-    summary.inventory_fetched_at_ms = fixture.fetched_at_ms;
+    summary.inventory = fixture
+        .fetched_at_ms
+        .map_or(haider_rpc::ModelInventoryWire::Static, |fetched_at_ms| {
+            haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms }
+        });
     summary.trust = if fixture.lockdown {
         ProviderTrustWire::Lockdown
     } else {
@@ -1064,4 +1068,73 @@ fn clicking_a_row_selects_its_carried_pair() {
     assert!(model.model_picker.is_none(), "the click selects");
     assert_eq!(model.identity.provider, "gemini");
     assert_eq!(model.identity.model_short, "gemini-3");
+}
+
+#[test]
+fn never_fetched_picker_has_no_invented_model_and_enter_fetches() {
+    let mut model = seeded_launcher();
+    let mut summary = model.providers.providers[0].clone();
+    summary.provider = "haider-code".into();
+    // Legacy flat rows cannot override the explicit never-fetched state.
+    summary.models = vec!["Go".into()];
+    summary.model_details.clear();
+    summary.default_model = Some("Go".into());
+    summary.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+    summary.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
+    summary.auth_methods = vec![AuthMethod::ApiKey];
+    summary.availability = ProviderAvailabilityWire::Unavailable;
+    model.providers.providers = vec![summary];
+    model.open_model_picker(String::new());
+    let rows = model.model_picker_rows();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].model.is_empty());
+    assert!(!rows[0].selectable);
+    assert!(
+        rows[0]
+            .reason
+            .as_deref()
+            .expect("fetch affordance")
+            .contains("never fetched")
+    );
+    assert!(
+        rows[0]
+            .reason
+            .as_deref()
+            .expect("fetch affordance")
+            .contains("Enter to fetch")
+    );
+    model.requests.clear();
+    model.handle(key(KeyCode::Enter));
+    assert!(model.requests.iter().any(|request| matches!(request, AppRequest::ProviderModelsRefresh { provider } if provider == "haider-code")));
+    let count = model.requests.len();
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(
+        model.requests.len(),
+        count,
+        "in-flight fetch does not duplicate"
+    );
+    let mut discovered = model.providers.providers[0].clone();
+    discovered.models = vec!["deepseek-v4-flash".into()];
+    discovered.default_model = Some("deepseek-v4-flash".into());
+    discovered.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    discovered.availability = ProviderAvailabilityWire::Available;
+    let mut driver = LiveDriver::new("test");
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ProviderModelsRefreshed {
+            provider: discovered,
+            revision: 2,
+        }),
+        std::time::Instant::now(),
+    );
+    let picker = model.model_picker.as_ref().expect("picker stays open");
+    assert!(picker.catalog_fetch.is_none());
+    assert!(picker.error.is_none());
+    assert!(
+        model
+            .model_picker_rows()
+            .iter()
+            .any(|row| row.model == "deepseek-v4-flash")
+    );
 }

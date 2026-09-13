@@ -910,11 +910,12 @@ fn fresh_daemon_reconciles_seeded_lockdown_quota_before_its_first_command() {
 }
 
 /// The built-in provider catalog a fresh profile exposes through `models
-/// --json` is a golden (ids, families, endpoints, auth methods, seeded
-/// inventories, default models). `provider list --json` names the same ids.
+/// --json` is a golden (ids, families, endpoints, auth methods, inventory
+/// provenance, offline rows and defaults). `provider list --json` names the
+/// same ids. Remote catalogs start never-fetched with no invented default.
 ///
 /// MUTATION CHECK: dropping a built-in, changing its family/endpoint, or
-/// losing a seeded model row changes the golden.
+/// inventing a remote model row changes the golden.
 #[test]
 fn fresh_profile_models_catalog_matches_the_golden() {
     let profile = Profile::new();

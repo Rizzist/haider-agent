@@ -1265,7 +1265,8 @@ or metadata-only digest.
 | provider configure `default_model` | no declared default/clear according to mutation validation; never choose one client-side |
 | provider configure `response_open_timeout_ms` | on update, preserve the stored response-header budget; on create, select the documented 60,000 ms compatible-transport default. A present value must be greater than zero |
 | provider configure `probe_vault_reference` | probe without a newly staged key; never substitute an empty key or a stored reference |
-| provider summary `inventory_fetched_at_ms` | the inventory has no known live-fetch time; never decode it as zero or fresh |
+| provider summary `inventory` | legacy peer: treat as `never_fetched`; flat model rows do not prove discovery |
+| provider summary `catalog` | catalog access is unknown; never infer public discovery from inference authentication |
 | provider summary `inventory_authority` | authority is unknown; never infer advisory admission from absence |
 | `ModelUnknown.inventory_age` | the consulted inventory has no known live-fetch time; never decode it as age zero |
 | menu answer `input` | option needs no free-form value |
@@ -3207,13 +3208,26 @@ Successful CLI output reports the exact count and every usable
 reachability, elapsed latency, model count, and whether authentication is
 keyed or absent.
 
-The durable provider-model cache records `inventory_fetched_at_ms` for each
-live inventory. `haider.models.v1` projects it as `fetched_at` plus an
-`inventory_age` calculated at the read; both are millisecond integers, and
-absence means seeded/configured or legacy inventory, never age zero. The
-documented freshness TTL is 15 minutes. The TUI model picker shows the same
-per-provider age and refreshes a stale selected-provider inventory on entry.
-An explicit `haider models --refresh [<alias>]` refreshes immediately. When an
+Provider summaries carry a tagged `inventory` state: `never_fetched`, `static`,
+`configured`, `fetched` with `fetched_at_ms`, `stale` with `fetched_at_ms` and
+`reason`, or `unavailable` with `reason`. Flat model/default fields are
+compatibility projections, never independent evidence of discovery. The
+former optional summary field `inventory_fetched_at_ms` is replaced by these
+states. `haider.models.v1` retains `fetched_at` and `inventory_age` millisecond
+projections for fetched/stale states; absence is never age zero. The freshness
+TTL is 15 minutes, and expired fetched inventories project as stale.
+
+The separate `catalog` kind is `offline`, `public`, `authenticated`, `custom`,
+`adapter`, or `unknown`. Only offline definitions ship static catalog rows.
+Haider Code has a public catalog: discovery neither resolves nor sends a
+credential, even though inference requires one. Its never-fetched state has no
+rows or default; a default can be published only from the discovered IDs.
+The picker renders a never-fetched row with an explicit Enter-to-fetch action,
+and refresh triggers switch on inventory state. An explicit
+`haider models --refresh [<alias>]` refreshes immediately. Listing reports each
+provider's failure on its own inventory while retaining other providers' rows;
+a failed refetch retains prior discovered rows as stale with the failure reason.
+When an
 explicit `<alias>/<model>` is absent from a known cached inventory, the daemon
 refreshes that provider once. Built-in provider inventories are authoritative:
 if the refreshed inventory still omits the id, the daemon returns typed

@@ -59,7 +59,8 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
                 supports_vision: None,
             },
         ],
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: ProviderAvailabilityWire::Available,
@@ -145,22 +146,31 @@ fn provider_summary_inventory_fetch_time_and_authority_are_additive_and_pinned()
         "enabled": true
     }))
     .expect("legacy provider summary");
-    assert_eq!(summary.inventory_fetched_at_ms, None);
+    assert_eq!(summary.inventory.fetched_at_ms(), None);
     assert_eq!(
         summary.inventory_authority,
         haider_rpc::ModelInventoryAuthorityWire::Unknown
     );
-    summary.inventory_fetched_at_ms = Some(1_753_500_000_000);
+    summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: 1_753_500_000_000,
+    };
     let encoded = serde_json::to_value(&summary).expect("encode fetch timestamp");
     assert_eq!(
-        encoded["inventory_fetched_at_ms"],
+        encoded["inventory"]["fetched_at_ms"],
         serde_json::json!(1_753_500_000_000_u64)
     );
-    summary.inventory_fetched_at_ms = None;
+    summary.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
     let encoded = serde_json::to_value(&summary).expect("encode absent fetch timestamp");
     assert!(encoded.get("inventory_fetched_at_ms").is_none());
     assert!(encoded.get("inventory_authority").is_none());
 
+    assert_eq!(
+        summary.model_inventory_status("passthrough-model"),
+        haider_rpc::ModelInventoryStatusWire::Unknown
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: 1_753_500_000_000,
+    };
     summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
     assert_eq!(
         summary.model_inventory_status("passthrough-model"),
@@ -169,4 +179,45 @@ fn provider_summary_inventory_fetch_time_and_authority_are_additive_and_pinned()
     assert_eq!(summary.models, ["model-a"]);
     let encoded = serde_json::to_value(&summary).expect("encode advisory authority");
     assert_eq!(encoded["inventory_authority"], "advisory");
+}
+
+#[test]
+fn provenance_refresh_is_a_state_check_even_for_an_empty_successful_catalog() {
+    use haider_rpc::ModelInventoryWire;
+    assert!(ModelInventoryWire::NeverFetched.needs_refresh());
+    assert!(!ModelInventoryWire::Fetched { fetched_at_ms: 10 }.needs_refresh());
+    assert!(!ModelInventoryWire::Static.needs_refresh());
+    assert!(
+        !ModelInventoryWire::Unavailable {
+            reason: "credential missing".into()
+        }
+        .needs_refresh()
+    );
+    assert!(
+        !ModelInventoryWire::Fetched { fetched_at_ms: 10 }
+            .at_time(10 + haider_rpc::MODEL_INVENTORY_TTL_MS - 1)
+            .needs_refresh()
+    );
+    assert!(
+        ModelInventoryWire::Fetched { fetched_at_ms: 10 }
+            .at_time(10 + haider_rpc::MODEL_INVENTORY_TTL_MS)
+            .needs_refresh()
+    );
+    for state in [
+        ModelInventoryWire::NeverFetched,
+        ModelInventoryWire::Fetched { fetched_at_ms: 42 },
+        ModelInventoryWire::Stale {
+            fetched_at_ms: 42,
+            reason: "offline".into(),
+        },
+        ModelInventoryWire::Unavailable {
+            reason: "bad OAuth credential".into(),
+        },
+    ] {
+        let encoded = serde_json::to_value(&state).expect("encode provenance");
+        assert_eq!(
+            serde_json::from_value::<ModelInventoryWire>(encoded).expect("decode provenance"),
+            state
+        );
+    }
 }

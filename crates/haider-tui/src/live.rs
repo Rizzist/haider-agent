@@ -3790,7 +3790,22 @@ impl LiveDriver {
                     if summary.provider == provider {
                         summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
                         summary.availability_reason = Some(message.clone());
+                        summary.inventory = match summary.inventory.fetched_at_ms() {
+                            Some(fetched_at_ms) => haider_rpc::ModelInventoryWire::Stale {
+                                fetched_at_ms,
+                                reason: message.clone(),
+                            },
+                            None => haider_rpc::ModelInventoryWire::Unavailable {
+                                reason: message.clone(),
+                            },
+                        };
                     }
+                }
+                if let Some(picker) = model.model_picker.as_mut()
+                    && picker.catalog_fetch.as_deref() == Some(provider.as_str())
+                {
+                    picker.catalog_fetch = None;
+                    picker.error = Some(format!("{provider}: {message}"));
                 }
                 model.dirty = true;
                 Vec::new()
@@ -4334,6 +4349,12 @@ impl LiveDriver {
             }
             LiveReply::ProviderModelsRefreshed { provider, revision } => {
                 self.models_requested.remove(&provider.provider);
+                if let Some(picker) = model.model_picker.as_mut()
+                    && picker.catalog_fetch.as_deref() == Some(provider.provider.as_str())
+                {
+                    picker.catalog_fetch = None;
+                    picker.error = None;
+                }
                 if model.providers.apply_models_refresh(provider, revision) {
                     // The catalog is here: NOW the bootstrap can adopt the
                     // provider's real default model (W5f-2d).
@@ -6266,18 +6287,7 @@ impl LiveDriver {
                 .providers
                 .iter()
                 .find(|summary| summary.provider == row.provider);
-            let needs_refresh = summary.is_none_or(|summary| {
-                summary.models.is_empty()
-                    || summary.inventory_fetched_at_ms.is_some_and(|fetched_at| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-                            .is_some_and(|now| {
-                                now.saturating_sub(fetched_at) >= haider_rpc::MODEL_INVENTORY_TTL_MS
-                            })
-                    })
-            });
+            let needs_refresh = summary.is_none_or(|summary| summary.inventory.needs_refresh());
             if !needs_refresh || self.models_requested.contains(&row.provider) {
                 continue;
             }
@@ -6299,7 +6309,7 @@ impl LiveDriver {
                 && summary.auth_methods.is_empty()
                 && summary.enabled;
             if !keyless
-                || !summary.models.is_empty()
+                || !summary.inventory.needs_refresh()
                 || self.models_requested.contains(&summary.provider)
             {
                 continue;

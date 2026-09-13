@@ -20,10 +20,10 @@
 //! its last-known cache or say "unavailable" — this module never invents a
 //! model that the provider did not name.
 //!
-//! Every request here is CREDENTIAL-BEARING to a fixed origin, so it takes
-//! the same W5a discipline as the token endpoints: resolve-validate-pin
-//! through [`FixedOriginGuard`], proxies off, redirects refused, bounded
-//! body.
+//! Requests use fixed origins and the same W5a discipline as the token
+//! endpoints: resolve-validate-pin through [`FixedOriginGuard`], proxies
+//! off, redirects refused, bounded body. Public catalogs never send a
+//! credential; authenticated catalogs use the provider's declared method.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,10 +152,71 @@ pub enum CatalogSource {
     AnthropicCompatible { origin: String },
     /// DeepSeek's fixed OpenAI-compatible API-key catalog.
     DeepSeekApi,
-    /// Haider Code's fixed OpenAI-compatible API-key catalog.
+    /// Haider Code's public, unauthenticated OpenAI-compatible catalog.
     HaiderCodeApi,
     /// xAI's fixed OpenAI-compatible API-key catalog.
     XaiApi,
+}
+
+/// Release-owned catalog taxonomy. Remote definitions cannot contain a
+/// fallback list. Offline model IDs are the catalog itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCatalogDefinition {
+    Offline { models: &'static [&'static str] },
+    Public { source: CatalogSource },
+    Authenticated { source: CatalogSource },
+    Adapter,
+}
+
+/// Public catalog coverage list used by the credential-free nightly probe.
+pub const PUBLIC_CATALOG_PROVIDERS: &[&str] = &[crate::HAIDER_CODE_PROVIDER_NAME];
+
+impl ProviderCatalogDefinition {
+    #[must_use]
+    pub fn static_models(&self) -> &'static [&'static str] {
+        match self {
+            Self::Offline { models } => models,
+            Self::Public { .. } | Self::Authenticated { .. } | Self::Adapter => &[],
+        }
+    }
+}
+
+#[must_use]
+pub fn provider_catalog_definition(provider: &str) -> ProviderCatalogDefinition {
+    use ProviderCatalogDefinition::{Adapter, Authenticated, Offline, Public};
+    match provider {
+        crate::BEDROCK_PROVIDER_NAME => Offline {
+            models: &crate::BEDROCK_SEED_MODELS,
+        },
+        crate::VERTEX_PROVIDER_NAME => Offline {
+            models: &crate::VERTEX_SEED_MODELS,
+        },
+        crate::HAIDER_CODE_PROVIDER_NAME => Public {
+            source: CatalogSource::HaiderCodeApi,
+        },
+        crate::DEEPSEEK_PROVIDER_NAME => Authenticated {
+            source: CatalogSource::DeepSeekApi,
+        },
+        crate::XAI_PROVIDER_NAME => Authenticated {
+            source: CatalogSource::XaiApi,
+        },
+        crate::OPENAI_OAUTH_PROVIDER_NAME => Authenticated {
+            source: CatalogSource::OpenAiSubscription,
+        },
+        crate::ANTHROPIC_OAUTH_PROVIDER_NAME => Authenticated {
+            source: CatalogSource::AnthropicSubscription,
+        },
+        crate::KIMI_OAUTH_PROVIDER_NAME => Authenticated {
+            source: CatalogSource::KimiOAuth,
+        },
+        crate::GROK_OAUTH_PROVIDER_NAME => Authenticated {
+            source: CatalogSource::GrokOAuth,
+        },
+        crate::GEMINI_PROVIDER_NAME => Authenticated {
+            source: CatalogSource::GeminiApiKey,
+        },
+        _ => Adapter,
+    }
 }
 
 /// The final request URL for a source's model catalog.
@@ -293,6 +354,11 @@ pub async fn discover_models_with_resolver(
     etag: Option<&str>,
     resolver: Arc<dyn FixedDnsResolver>,
 ) -> Result<DiscoveredCatalog, CatalogError> {
+    let access_token = if matches!(source, CatalogSource::HaiderCodeApi) {
+        None
+    } else {
+        access_token
+    };
     let (endpoint, guard, custom_client) = match &source {
         CatalogSource::OpenAiCompatible { origin }
         | CatalogSource::AnthropicCompatible { origin } => {
@@ -775,6 +841,9 @@ pub(crate) fn apply_catalog_credential(
     source: &CatalogSource,
     credential: Option<&str>,
 ) -> Result<reqwest::RequestBuilder, CatalogError> {
+    if matches!(source, CatalogSource::HaiderCodeApi) {
+        return Ok(request);
+    }
     let Some(credential) = credential else {
         return Ok(request);
     };

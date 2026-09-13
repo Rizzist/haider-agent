@@ -11,14 +11,13 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_provider::{
     ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
     ANTHROPIC_PROVIDER_NAME, BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME,
-    BEDROCK_SEED_MODELS, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
-    DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME, GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
+    BEDROCK_SEED_MODELS, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DiscoveredModel,
+    GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME, GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
     GROK_OAUTH_BASE_URL, GROK_OAUTH_PROVIDER_NAME, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
-    HAIDER_CODE_SEED_MODELS, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME,
-    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL, ProviderErrorKind,
-    VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS, XAI_BASE_URL, XAI_PROVIDER_NAME,
-    XAI_SEED_MODEL_CONTEXT_WINDOWS, XAI_SEED_MODELS, azure_openai_origin, pickable,
+    KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME,
+    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
+    OPENAI_SUBSCRIPTION_RESPONSES_URL, ProviderErrorKind, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS,
+    XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS, azure_openai_origin, pickable,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -370,78 +369,168 @@ impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
     }
 }
 
+/// One atomic inventory value. A missing fetch cannot carry model rows.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ProviderInventory {
+    #[default]
+    NeverFetched,
+    Fetched {
+        models: Vec<DiscoveredModel>,
+        fetched_at_ms: u64,
+    },
+    Stale {
+        models: Vec<DiscoveredModel>,
+        fetched_at_ms: u64,
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+    /// Test fixtures state their provenance explicitly without inventing a fetch time.
+    #[cfg(test)]
+    Configured {
+        models: Vec<DiscoveredModel>,
+    },
+}
+
+impl ProviderInventory {
+    fn models(&self) -> Option<Vec<DiscoveredModel>> {
+        match self {
+            Self::Fetched { models, .. } | Self::Stale { models, .. } => Some(models.clone()),
+            #[cfg(test)]
+            Self::Configured { models } => Some(models.clone()),
+            Self::NeverFetched | Self::Unavailable { .. } => None,
+        }
+    }
+
+    fn provenance(&self) -> haider_rpc::ModelInventoryWire {
+        use haider_rpc::ModelInventoryWire;
+        match self {
+            Self::NeverFetched => ModelInventoryWire::NeverFetched,
+            Self::Fetched { fetched_at_ms, .. } => ModelInventoryWire::Fetched {
+                fetched_at_ms: *fetched_at_ms,
+            },
+            Self::Stale {
+                fetched_at_ms,
+                reason,
+                ..
+            } => ModelInventoryWire::Stale {
+                fetched_at_ms: *fetched_at_ms,
+                reason: reason.clone(),
+            },
+            Self::Unavailable { reason } => ModelInventoryWire::Unavailable {
+                reason: reason.clone(),
+            },
+            #[cfg(test)]
+            Self::Configured { .. } => ModelInventoryWire::Configured,
+        }
+    }
+}
+
 pub(crate) trait ProviderModelSourceLike: Send + Sync {
-    fn models(&self, provider: &str) -> Option<Vec<DiscoveredModel>>;
-    fn fetched_at_ms(&self, provider: &str) -> Option<u64>;
-    fn replace(&self, provider: String, models: Vec<DiscoveredModel>, fetched_at_ms: Option<u64>);
+    fn inventory(&self, provider: &str) -> ProviderInventory;
+    fn models(&self, provider: &str) -> Option<Vec<DiscoveredModel>> {
+        self.inventory(provider).models()
+    }
+    fn replace(&self, provider: String, inventory: ProviderInventory);
+    fn unavailable(&self, provider: &str, reason: String);
     fn touch(&self, provider: &str, fetched_at_ms: u64);
     fn remove(&self, provider: &str);
 }
 
-/// Typed, in-memory projection of the durable provider-model cache.
-///
-/// Production hydrates this before publishing the first management snapshot
-/// and the account actor replaces entries only after the corresponding
-/// SQLite write succeeds.
+/// Model rows and their provenance are updated under the same lock.
 #[derive(Default)]
 pub(crate) struct CachedProviderModelSource {
-    models: std::sync::Mutex<HashMap<String, Vec<DiscoveredModel>>>,
-    fetched_at_ms: std::sync::Mutex<HashMap<String, u64>>,
+    inventories: std::sync::Mutex<HashMap<String, ProviderInventory>>,
 }
 
 impl ProviderModelSourceLike for CachedProviderModelSource {
-    fn models(&self, provider: &str) -> Option<Vec<DiscoveredModel>> {
-        self.models
+    fn inventory(&self, provider: &str) -> ProviderInventory {
+        let mut inventory = self
+            .inventories
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(provider)
             .cloned()
+            .unwrap_or_default();
+        if let ProviderInventory::Fetched {
+            models,
+            fetched_at_ms,
+        } = &inventory
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                });
+            if now.saturating_sub(*fetched_at_ms) >= haider_rpc::MODEL_INVENTORY_TTL_MS {
+                inventory = ProviderInventory::Stale {
+                    models: models.clone(),
+                    fetched_at_ms: *fetched_at_ms,
+                    reason: "catalog refresh due".to_owned(),
+                };
+            }
+        }
+        inventory
     }
 
-    fn fetched_at_ms(&self, provider: &str) -> Option<u64> {
-        self.fetched_at_ms
+    fn replace(&self, provider: String, inventory: ProviderInventory) {
+        self.inventories
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(provider)
-            .copied()
+            .insert(provider, inventory);
     }
 
-    fn replace(&self, provider: String, models: Vec<DiscoveredModel>, fetched_at_ms: Option<u64>) {
-        self.models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(provider.clone(), models);
-        let mut fetched = self
-            .fetched_at_ms
+    fn unavailable(&self, provider: &str, reason: String) {
+        let mut inventories = self
+            .inventories
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(fetched_at_ms) = fetched_at_ms {
-            fetched.insert(provider, fetched_at_ms);
-        } else {
-            fetched.remove(&provider);
-        }
+        let inventory = match inventories.remove(provider).unwrap_or_default() {
+            ProviderInventory::Fetched {
+                models,
+                fetched_at_ms,
+            }
+            | ProviderInventory::Stale {
+                models,
+                fetched_at_ms,
+                ..
+            } => ProviderInventory::Stale {
+                models,
+                fetched_at_ms,
+                reason,
+            },
+            ProviderInventory::NeverFetched | ProviderInventory::Unavailable { .. } => {
+                ProviderInventory::Unavailable { reason }
+            }
+            #[cfg(test)]
+            ProviderInventory::Configured { .. } => ProviderInventory::Unavailable { reason },
+        };
+        inventories.insert(provider.to_owned(), inventory);
     }
 
     fn touch(&self, provider: &str, fetched_at_ms: u64) {
-        if self
-            .models
+        let mut inventories = self
+            .inventories
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(provider)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(
+            ProviderInventory::Fetched { models, .. } | ProviderInventory::Stale { models, .. },
+        ) = inventories.get(provider)
         {
-            self.fetched_at_ms
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(provider.to_owned(), fetched_at_ms);
+            let models = models.clone();
+            inventories.insert(
+                provider.to_owned(),
+                ProviderInventory::Fetched {
+                    models,
+                    fetched_at_ms,
+                },
+            );
         }
     }
 
     fn remove(&self, provider: &str) {
-        self.models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(provider);
-        self.fetched_at_ms
+        self.inventories
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(provider);
@@ -482,6 +571,25 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 }
             }
             validate_profiles(&profiles)?;
+        }
+        for profile in &mut profiles {
+            if matches!(profile.provenance, ProviderProvenance::BuiltIn)
+                && matches!(
+                    haider_provider::provider_catalog_definition(&profile.provider_id),
+                    haider_provider::ProviderCatalogDefinition::Public { .. }
+                        | haider_provider::ProviderCatalogDefinition::Authenticated { .. }
+                )
+            {
+                profile.configured_models.clear();
+                if profile.provider_id == HAIDER_CODE_PROVIDER_NAME
+                    && profile
+                        .default_model
+                        .as_deref()
+                        .is_some_and(|id| matches!(id, "Go" | "Go Max"))
+                {
+                    profile.default_model = None;
+                }
+            }
         }
         let fallback_chain = resolve_fallback_chain(
             &document.fallback_chain,
@@ -562,13 +670,23 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .map(|profile| self.summary_profile(profile, has_credential))
     }
 
-    pub(crate) fn replace_models(
+    pub(crate) fn replace_discovered_models(
         &self,
         provider: String,
         models: Vec<DiscoveredModel>,
-        fetched_at_ms: Option<u64>,
+        fetched_at_ms: u64,
     ) {
-        self.model_source.replace(provider, models, fetched_at_ms);
+        self.model_source.replace(
+            provider,
+            ProviderInventory::Fetched {
+                models,
+                fetched_at_ms,
+            },
+        );
+    }
+
+    pub(crate) fn models_unavailable(&self, provider: &str, reason: String) {
+        self.model_source.unavailable(provider, reason);
     }
 
     pub(crate) fn touch_models(&self, provider: &str, fetched_at_ms: u64) {
@@ -965,15 +1083,13 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .collect()
     }
 
-    /// The slugs a default-model selection validates against: discovery
-    /// stays authoritative once it has run; a SEEDED-inventory profile
-    /// (bedrock/vertex, azure-origin customs — G4b) falls back to its
-    /// configured list, which IS its inventory until discovery speaks.
+    /// Selection accepts only known catalog entries: fetched remote rows or
+    /// an offline provider's authoritative static/configured catalog.
     fn selectable_slugs(&self, provider: &str) -> Vec<String> {
         let discovered = self.discovered_slugs(provider);
         if discovered.is_empty()
             && let Some(profile) = self.get(provider)
-            && seeded_inventory(profile)
+            && offline_inventory(profile)
         {
             return profile.configured_models.clone();
         }
@@ -992,20 +1108,23 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         profile: &ProviderProfileV1,
         has_credential: &dyn Fn(&str) -> bool,
     ) -> ProviderSummaryWire {
-        let discovered = self.discovered_details(&profile.provider_id);
-        // Seeded-inventory fallback: with nothing discovered, a seeded-list
-        // profile's configured models ARE its inventory. DeepSeek uses this
-        // only until authenticated `/models` speaks; enterprise and Azure
-        // profiles retain their documented/manual fallback behavior.
-        let seeded_fallback = discovered.is_empty() && seeded_inventory(profile);
-        let model_details = if seeded_fallback {
+        let inventory = self.model_source.inventory(&profile.provider_id);
+        let discovered = inventory
+            .models()
+            .map(|models| pickable(&models))
+            .unwrap_or_default();
+        // Offline catalogs are authoritative without a network request.
+        // An empty remote result never falls back to configured rows.
+        let offline_catalog =
+            matches!(inventory, ProviderInventory::NeverFetched) && offline_inventory(profile);
+        let model_details = if offline_catalog {
             profile
                 .configured_models
                 .iter()
                 .map(|slug| {
                     model_detail_wire(
                         &profile.provider_id,
-                        seeded_model(&profile.provider_id, slug),
+                        offline_model(&profile.provider_id, slug),
                     )
                 })
                 .collect()
@@ -1018,50 +1137,34 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         provider_summary(
             profile,
             model_details,
-            seeded_fallback,
+            offline_catalog,
             has_credential(&profile.provider_id),
-            self.model_source.fetched_at_ms(&profile.provider_id),
+            if offline_catalog {
+                haider_rpc::ModelInventoryWire::Static
+            } else {
+                inventory.provenance()
+            },
         )
     }
 }
 
-/// Whether this profile's CONFIGURED model list may serve as its inventory
-/// when discovery has nothing: DeepSeek keeps its documented aliases only
-/// until authenticated discovery succeeds; the two enterprise builtins seed
-/// documented sets because they expose no models API; and an Azure-origin
-/// custom keeps manually entered deployments. Every OTHER custom keeps the
-/// G4a rule: discovery is the only inventory truth.
-fn seeded_inventory(profile: &ProviderProfileV1) -> bool {
-    if profile.configured_models.is_empty() {
-        return false;
-    }
-    match profile.provider_id.as_str() {
-        BEDROCK_PROVIDER_NAME
-        | VERTEX_PROVIDER_NAME
-        | DEEPSEEK_PROVIDER_NAME
-        | HAIDER_CODE_PROVIDER_NAME
-        | XAI_PROVIDER_NAME => true,
-        _ => {
-            matches!(profile.provenance, ProviderProvenance::Custom)
-                && profile.base_url.as_deref().is_some_and(azure_openai_origin)
-        }
-    }
+/// Only offline catalogs and explicitly configured Azure deployments can
+/// provide rows without a fetch. Remote definitions contain no static list.
+fn offline_inventory(profile: &ProviderProfileV1) -> bool {
+    matches!(
+        haider_provider::provider_catalog_definition(&profile.provider_id),
+        haider_provider::ProviderCatalogDefinition::Offline { .. }
+    ) || (matches!(profile.provenance, ProviderProvenance::Custom)
+        && profile.base_url.as_deref().is_some_and(azure_openai_origin))
 }
 
-/// A discovered-model row for one release-owned seed. Most builtins have no
-/// static window; xAI's published Grok seeds retain their pinned windows.
-fn seeded_model(provider: &str, slug: &str) -> DiscoveredModel {
-    let context_windows: &[(&str, u64)] = match provider {
-        XAI_PROVIDER_NAME => &XAI_SEED_MODEL_CONTEXT_WINDOWS,
-        _ => &[],
-    };
-    let context_window = context_windows
-        .iter()
-        .find_map(|(model, window)| (*model == slug).then_some(*window));
+/// Metadata for an offline catalog entry. Its name is catalog truth, not a
+/// manufactured discovery response.
+fn offline_model(_provider: &str, slug: &str) -> DiscoveredModel {
     DiscoveredModel {
         slug: slug.to_owned(),
         display_name: slug.to_owned(),
-        context_window,
+        context_window: None,
         description: None,
         default_effort: None,
         supported_efforts: Vec::new(),
@@ -1124,9 +1227,17 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
         Vec::new()
     };
     ModelDetailWire {
-        name: model.slug,
+        name: model.slug.clone(),
         display_name: Some(model.display_name),
-        context_window: model.context_window,
+        context_window: model.context_window.or_else(|| {
+            (provider == XAI_PROVIDER_NAME)
+                .then(|| {
+                    XAI_SEED_MODEL_CONTEXT_WINDOWS
+                        .iter()
+                        .find_map(|(slug, window)| (*slug == model.slug).then_some(*window))
+                })
+                .flatten()
+        }),
         supported_efforts,
         default_effort,
         supported_speeds,
@@ -1183,9 +1294,9 @@ pub(crate) fn initial_provider_profiles(
 fn provider_summary(
     profile: &ProviderProfileV1,
     model_details: Vec<ModelDetailWire>,
-    seeded_fallback: bool,
+    offline_catalog: bool,
     credentialed: bool,
-    inventory_fetched_at_ms: Option<u64>,
+    inventory: haider_rpc::ModelInventoryWire,
 ) -> ProviderSummaryWire {
     let discovered_models = model_details
         .iter()
@@ -1201,11 +1312,11 @@ fn provider_summary(
     // endpoint answers — there is no discovery for these surfaces — so it
     // lights Available only once a credential exists AND the profile has an
     // endpoint to serve from (vertex seeds without one until its card runs).
-    let seeded_ready = !seeded_fallback || (credentialed && profile.base_url.is_some());
+    let offline_ready = !offline_catalog || (credentialed && profile.base_url.is_some());
     let available = profile.enabled
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && !discovered_models.is_empty()
-        && seeded_ready;
+        && offline_ready;
     let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
         && matches!(
             profile.api_family,
@@ -1221,6 +1332,14 @@ fn provider_summary(
             .as_ref()
             .filter(|default| discovered_models.iter().any(|model| model == *default))
             .cloned()
+            .or_else(|| {
+                matches!(
+                    haider_provider::provider_catalog_definition(&profile.provider_id),
+                    haider_provider::ProviderCatalogDefinition::Public { .. }
+                )
+                .then(|| discovered_models.first().cloned())
+                .flatten()
+            })
     };
     ProviderSummaryWire {
         provider: profile.provider_id.clone(),
@@ -1231,7 +1350,26 @@ fn provider_summary(
         semantic_progress_timeout_ms: profile.semantic_progress_timeout_ms,
         models: discovered_models,
         model_details,
-        inventory_fetched_at_ms,
+        inventory,
+        catalog: match haider_provider::provider_catalog_definition(&profile.provider_id) {
+            haider_provider::ProviderCatalogDefinition::Public { .. } => {
+                haider_rpc::ProviderCatalogKindWire::Public
+            }
+            haider_provider::ProviderCatalogDefinition::Authenticated { .. } => {
+                haider_rpc::ProviderCatalogKindWire::Authenticated
+            }
+            haider_provider::ProviderCatalogDefinition::Offline { .. } => {
+                haider_rpc::ProviderCatalogKindWire::Offline
+            }
+            haider_provider::ProviderCatalogDefinition::Adapter
+                if matches!(profile.provenance, ProviderProvenance::Custom) =>
+            {
+                haider_rpc::ProviderCatalogKindWire::Custom
+            }
+            haider_provider::ProviderCatalogDefinition::Adapter => {
+                haider_rpc::ProviderCatalogKindWire::Adapter
+            }
+        },
         inventory_authority: match profile.provenance {
             ProviderProvenance::BuiltIn => haider_rpc::ModelInventoryAuthorityWire::Authoritative,
             ProviderProvenance::Custom => haider_rpc::ModelInventoryAuthorityWire::Advisory,
@@ -1250,9 +1388,9 @@ fn provider_summary(
                 "provider is disabled".to_owned()
             } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
                 "provider API family is unavailable".to_owned()
-            } else if seeded_fallback && profile.base_url.is_none() {
+            } else if offline_catalog && profile.base_url.is_none() {
                 "provider endpoint is not configured".to_owned()
-            } else if seeded_fallback && !credentialed {
+            } else if offline_catalog && !credentialed {
                 "provider has no credential".to_owned()
             } else {
                 "provider model inventory is unavailable".to_owned()
@@ -1323,11 +1461,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
-            configured_models: DEEPSEEK_SEED_MODELS
-                .iter()
-                .map(|slug| (*slug).to_owned())
-                .collect(),
-            default_model: Some(DEEPSEEK_SEED_MODELS[0].to_owned()),
+            configured_models: Vec::new(),
+            default_model: None,
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
             trust: ProviderTrustWire::Full,
@@ -1344,11 +1479,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
-            configured_models: XAI_SEED_MODELS
-                .iter()
-                .map(|slug| (*slug).to_owned())
-                .collect(),
-            default_model: Some(XAI_SEED_MODELS[0].to_owned()),
+            configured_models: Vec::new(),
+            default_model: None,
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
             trust: ProviderTrustWire::Full,
@@ -1365,11 +1497,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
-            configured_models: HAIDER_CODE_SEED_MODELS
-                .iter()
-                .map(|slug| (*slug).to_owned())
-                .collect(),
-            default_model: Some(HAIDER_CODE_SEED_MODELS[0].to_owned()),
+            configured_models: Vec::new(),
+            default_model: None,
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
             trust: ProviderTrustWire::Full,

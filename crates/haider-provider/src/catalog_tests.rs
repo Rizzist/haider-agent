@@ -74,7 +74,6 @@ fn catalog_auth_mode_is_source_specific_and_existing_sources_are_identical() {
         CatalogSource::KimiOAuth,
         CatalogSource::GrokOAuth,
         CatalogSource::DeepSeekApi,
-        CatalogSource::HaiderCodeApi,
         CatalogSource::XaiApi,
         CatalogSource::OpenAiCompatible {
             origin: "https://models.example.invalid/v1".into(),
@@ -360,26 +359,17 @@ fn wh3_deepseek_catalog_source_builds_fixed_models_get() {
     assert!(authorization.is_sensitive());
 }
 
-/// MUTATION CHECK: route Haider Code discovery through a custom origin or
-/// drop bearer auth. Expected runtime failure: the fixed endpoint or exact
-/// sensitive Authorization header assertion changes.
+/// MUTATION CHECK: change the fixed public endpoint or attach any credential.
+/// Even a malformed key must not affect public catalog discovery.
 #[test]
-fn haider_code_catalog_source_builds_fixed_bearer_models_get() {
-    let request = request(
-        &CatalogSource::HaiderCodeApi,
-        Some("HAIDER_CODE_CATALOG_KEY_SENTINEL_f184"),
-    );
-    assert_eq!(request.method(), reqwest::Method::GET);
-    assert_eq!(request.url().as_str(), "https://haidercode.ai/v1/models");
-    let authorization = request
-        .headers()
-        .get(AUTHORIZATION)
-        .expect("Haider Code catalog Bearer");
-    assert_eq!(
-        authorization.as_bytes(),
-        b"Bearer HAIDER_CODE_CATALOG_KEY_SENTINEL_f184"
-    );
-    assert!(authorization.is_sensitive());
+fn haider_code_catalog_source_never_sends_credentials() {
+    for credential in [None, Some("broken-key"), Some("invalid\nheader")] {
+        let request = request(&CatalogSource::HaiderCodeApi, credential);
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(request.url().as_str(), "https://haidercode.ai/v1/models");
+        assert!(!request.headers().contains_key(AUTHORIZATION));
+        assert!(!request.headers().contains_key("x-api-key"));
+    }
 }
 
 /// MUTATION CHECK: treating the proxy catalog as a generic OpenAI list loses

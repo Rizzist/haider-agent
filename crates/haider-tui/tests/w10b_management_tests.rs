@@ -54,7 +54,8 @@ fn provider_summary(name: &str) -> haider_rpc::ProviderSummaryWire {
         semantic_progress_timeout_ms: None,
         models: vec!["m-1".into()],
         model_details: Vec::new(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
         auth_methods: vec![haider_protocol::credential::AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -407,6 +408,9 @@ fn models_refresh_failure_lands_on_the_provider_row_never_the_flash() {
         .iter()
         .find(|summary| summary.provider == "probefix")
         .expect("row");
+    assert!(
+        matches!(&row.inventory, haider_rpc::ModelInventoryWire::Unavailable { reason } if reason.contains("subscription model catalog"))
+    );
     assert_eq!(
         row.availability,
         haider_rpc::ProviderAvailabilityWire::Unavailable

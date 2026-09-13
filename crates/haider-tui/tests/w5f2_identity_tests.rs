@@ -62,7 +62,8 @@ fn provider_summary(
                 supports_vision: None,
             })
             .collect(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -386,4 +387,29 @@ fn a_refreshed_catalog_completes_the_bootstrap() {
     );
     assert_eq!(model.identity.provider, "openai-oauth");
     assert_eq!(model.identity.model_short, "gpt-5.6-sol");
+}
+
+#[test]
+fn never_fetched_state_refreshes_even_when_legacy_rows_are_nonempty() {
+    let mut model = live_model();
+    let mut summary = provider_summary("openai-oauth", &["legacy-seed"], "legacy-seed");
+    summary.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
+    model.providers.apply_snapshot(vec![summary], 1);
+    let before = model.identity.model_short.clone();
+    let mut driver = LiveDriver::new("test");
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Accounts {
+            descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
+            revision: Some(1),
+            sources: Vec::new(),
+        }),
+        std::time::Instant::now(),
+    );
+    assert!(pass.commands.iter().any(|command| matches!(command, LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth")));
+    assert_eq!(
+        model.identity.model_short, before,
+        "never adopt a legacy seed before discovery"
+    );
 }

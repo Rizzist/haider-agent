@@ -59,7 +59,8 @@ fn windowed_summary(
                 supports_vision: None,
             })
             .collect(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,

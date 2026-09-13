@@ -27,7 +27,8 @@ fn summary(
         semantic_progress_timeout_ms: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: ModelInventoryAuthorityWire::Authoritative,
         auth_methods: Vec::new(),
         availability,
@@ -181,7 +182,7 @@ fn model_unknown_carries_inventory_age_when_fetch_time_is_known() {
         &["known-model"],
         ProviderAvailabilityWire::Available,
     );
-    fetched.inventory_fetched_at_ms = Some(1);
+    fetched.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
     let authority = authority(&["openai", "custom-router"], vec![fetched]);
     let refusal = authority
         .validate_selection("openai", Some("custom-router"), "new-model")
@@ -277,7 +278,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
         &["glm-4.7-flashx", "glm-4.7-air"],
         ProviderAvailabilityWire::Available,
     );
-    first.inventory_fetched_at_ms = Some(900);
+    first.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 900 };
     first.model_details = vec![
         ModelDetailWire {
             name: "glm-4.7-flashx".into(),
@@ -728,4 +729,42 @@ fn le_bedrock_and_vertex_pairs_validate_effort_but_refuse_fast() {
     authority
         .validate_fast("anthropic", "anthropic.claude-opus-5", true)
         .expect("normalization admits the enterprise spelling ON the claude api");
+}
+
+#[test]
+fn remote_inventory_cannot_admit_an_unresolved_model_after_failed_discovery() {
+    for inventory in [
+        haider_rpc::ModelInventoryWire::NeverFetched,
+        haider_rpc::ModelInventoryWire::Unavailable {
+            reason: "offline".into(),
+        },
+    ] {
+        let mut remote = summary("haider-code", &[], ProviderAvailabilityWire::Unavailable);
+        remote.inventory = inventory;
+        remote.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+        let authority = authority(&["haider-code"], vec![remote]);
+        assert!(matches!(
+            authority.validate_selection("haider-code", None, "Go"),
+            Err(SelectionRefusal::ProviderUnavailable { .. })
+        ));
+    }
+    let mut remote = summary(
+        "haider-code",
+        &["deepseek-v4-flash"],
+        ProviderAvailabilityWire::Available,
+    );
+    remote.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+    remote.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    let authority = authority(&["haider-code"], vec![remote]);
+    assert!(
+        authority
+            .validate_selection("haider-code", None, "Go")
+            .is_err()
+    );
+    assert_eq!(
+        authority
+            .validate_selection("haider-code", None, "deepseek-v4-flash")
+            .expect("real ID"),
+        ("haider-code".into(), "deepseek-v4-flash".into())
+    );
 }

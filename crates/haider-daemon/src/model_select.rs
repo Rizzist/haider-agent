@@ -303,7 +303,8 @@ impl ModelSelectionAuthority {
             .summaries
             .iter()
             .find(|summary| summary.provider == provider)?
-            .inventory_fetched_at_ms?;
+            .inventory
+            .fetched_at_ms()?;
         Some(unix_time_ms().saturating_sub(fetched_at_ms))
     }
 
@@ -323,7 +324,8 @@ impl ModelSelectionAuthority {
         let mut truncated = false;
         'providers: for summary in &self.summaries {
             let inventory_age_ms = summary
-                .inventory_fetched_at_ms
+                .inventory
+                .fetched_at_ms()
                 .map(|fetched_at_ms| now_ms.saturating_sub(fetched_at_ms));
             for model in &summary.models {
                 let detail = summary
@@ -456,6 +458,21 @@ impl ModelSelectionAuthority {
             .summaries
             .iter()
             .find(|summary| summary.provider == provider);
+        if summary.is_some_and(|summary| {
+            matches!(
+                summary.catalog,
+                haider_rpc::ProviderCatalogKindWire::Public
+                    | haider_rpc::ProviderCatalogKindWire::Authenticated
+            ) && matches!(
+                summary.inventory,
+                haider_rpc::ModelInventoryWire::NeverFetched
+                    | haider_rpc::ModelInventoryWire::Unavailable { .. }
+            )
+        }) {
+            return Err(SelectionRefusal::ProviderUnavailable {
+                provider: provider.to_owned(),
+            });
+        }
         let resolved_model = summary
             .and_then(|summary| {
                 summary

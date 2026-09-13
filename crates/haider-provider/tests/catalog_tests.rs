@@ -415,8 +415,8 @@ fn endpoints_are_the_vendor_paths() {
 #[test]
 fn haider_code_catalog_preserves_only_discovered_model_facts() {
     let payload = serde_json::json!({"data": [
-        {"id": "Go", "object": "model", "future": true},
-        {"id": "Go Max", "object": "model"}
+        {"id": "deepseek-v4-flash", "object": "model", "future": true},
+        {"id": "deepseek-v4-pro", "object": "model"}
     ]});
     let models =
         parse_catalog(CatalogSource::HaiderCodeApi, &payload).expect("Haider Code catalog parses");
@@ -425,7 +425,7 @@ fn haider_code_catalog_preserves_only_discovered_model_facts() {
             .iter()
             .map(|model| model.slug.as_str())
             .collect::<Vec<_>>(),
-        ["Go", "Go Max"]
+        ["deepseek-v4-flash", "deepseek-v4-pro"]
     );
     assert!(models.iter().all(|model| {
         model.display_name == model.slug

@@ -53,7 +53,10 @@ fn model_source(
 ) -> Arc<CachedProviderModelSource> {
     let source = Arc::new(CachedProviderModelSource::default());
     for (provider, models) in entries {
-        source.replace(provider.to_owned(), models, None);
+        source.replace(
+            provider.to_owned(),
+            ProviderInventory::Configured { models },
+        );
     }
     source
 }
@@ -1174,7 +1177,7 @@ fn wh1_deepseek_registry_is_builtin_chat_completions_api_key() {
         .get(DEEPSEEK_PROVIDER_NAME)
         .expect("DeepSeek profile");
     assert_eq!(profile.provenance, ProviderProvenance::BuiltIn);
-    assert_eq!(profile.configured_models, DEEPSEEK_SEED_MODELS);
+    assert!(profile.configured_models.is_empty());
 
     let signed_out = registry
         .summary(DEEPSEEK_PROVIDER_NAME, &|_| false)
@@ -1186,7 +1189,7 @@ fn wh1_deepseek_registry_is_builtin_chat_completions_api_key() {
     );
     assert_eq!(signed_out.endpoint.as_deref(), Some(DEEPSEEK_BASE_URL));
     assert_eq!(signed_out.auth_methods, vec![AuthMethod::ApiKey]);
-    assert_eq!(signed_out.models, DEEPSEEK_SEED_MODELS);
+    assert!(signed_out.models.is_empty());
     assert_eq!(
         signed_out.availability,
         ProviderAvailabilityWire::Unavailable
@@ -1204,13 +1207,12 @@ fn wh1_deepseek_registry_is_builtin_chat_completions_api_key() {
         .expect("credentialed DeepSeek summary");
     assert_eq!(
         credentialed.availability,
-        ProviderAvailabilityWire::Available
+        ProviderAvailabilityWire::Unavailable
     );
 }
 
-/// MUTATION CHECK: remove the Haider Code seeded inventory row or change its
-/// auth/API-family fields. Expected runtime failure: provider listings lose
-/// the two first-party model aliases or advertise the wrong credential flow.
+/// Public catalogs never manufacture models on a fresh install. The auth
+/// requirement below belongs to inference, not catalog discovery.
 #[test]
 fn haider_code_registry_is_builtin_chat_completions_api_key() {
     let registry = ProviderRegistry::new(
@@ -1226,7 +1228,7 @@ fn haider_code_registry_is_builtin_chat_completions_api_key() {
         .get(HAIDER_CODE_PROVIDER_NAME)
         .expect("Haider Code profile");
     assert_eq!(profile.provenance, ProviderProvenance::BuiltIn);
-    assert_eq!(profile.configured_models, HAIDER_CODE_SEED_MODELS);
+    assert!(profile.configured_models.is_empty());
 
     let summary = registry
         .summary(HAIDER_CODE_PROVIDER_NAME, &|provider| {
@@ -1240,9 +1242,20 @@ fn haider_code_registry_is_builtin_chat_completions_api_key() {
     );
     assert_eq!(summary.endpoint.as_deref(), Some(HAIDER_CODE_BASE_URL));
     assert_eq!(summary.auth_methods, vec![AuthMethod::ApiKey]);
-    assert_eq!(summary.models, HAIDER_CODE_SEED_MODELS);
-    assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
-    assert_eq!(profile.default_model.as_deref(), Some("Go"));
+    assert!(summary.models.is_empty());
+    assert_eq!(
+        summary.inventory,
+        haider_rpc::ModelInventoryWire::NeverFetched
+    );
+    assert!(summary.inventory.needs_refresh());
+    assert!(summary.default_model.is_none());
+    assert!(
+        registry
+            .validate_default_model(HAIDER_CODE_PROVIDER_NAME, "Go")
+            .is_err()
+    );
+    assert_eq!(summary.availability, ProviderAvailabilityWire::Unavailable);
+    assert!(profile.default_model.is_none());
 }
 
 /// MUTATION CHECK: xAI and Grok OAuth must remain two distinct release-owned
@@ -1267,20 +1280,11 @@ fn xai_and_grok_oauth_registry_profiles_pin_lane_boundaries() {
     assert_eq!(xai.api_family, ProviderApiFamilyWire::OpenAiChatCompletions);
     assert_eq!(xai.endpoint.as_deref(), Some(XAI_BASE_URL));
     assert_eq!(xai.auth_methods, vec![AuthMethod::ApiKey]);
-    assert_eq!(xai.models, XAI_SEED_MODELS);
-    assert_eq!(
-        xai.model_details
-            .iter()
-            .map(|detail| (detail.name.as_str(), detail.context_window))
-            .collect::<Vec<_>>(),
-        vec![
-            ("grok-4.6", Some(500_000)),
-            ("grok-4.5", Some(500_000)),
-            ("grok-4.3", Some(1_000_000)),
-            ("grok-build-0.1", Some(256_000)),
-        ]
-    );
-    assert_eq!(xai.availability, ProviderAvailabilityWire::Available);
+    assert!(xai.models.is_empty());
+    assert!(xai.model_details.is_empty());
+    assert_eq!(xai.inventory, haider_rpc::ModelInventoryWire::NeverFetched);
+    assert!(xai.default_model.is_none());
+    assert_eq!(xai.availability, ProviderAvailabilityWire::Unavailable);
 
     let grok = registry
         .summary(GROK_OAUTH_PROVIDER_NAME, &|provider| {
@@ -1806,4 +1810,97 @@ async fn production_endpoint_validator_keeps_transport_failure_distinct_from_bad
         .expect_err("public plain HTTP is invalid");
     assert_eq!(invalid.code, ErrorCode::InvalidArgument);
     assert!(!invalid.retryable);
+}
+
+#[test]
+fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
+    let source = model_source([]);
+    let mut registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([HAIDER_CODE_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        source.clone(),
+    )
+    .expect("registry");
+    let current = || {
+        registry
+            .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
+            .expect("summary")
+    };
+    assert_eq!(
+        current().inventory,
+        haider_rpc::ModelInventoryWire::NeverFetched
+    );
+    source.unavailable(HAIDER_CODE_PROVIDER_NAME, "catalog transport failed".into());
+    assert!(matches!(
+        current().inventory,
+        haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ));
+    assert!(current().default_model.is_none());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    source.replace(
+        HAIDER_CODE_PROVIDER_NAME.to_owned(),
+        ProviderInventory::Fetched {
+            models: vec![discovered("deepseek-v4-flash", true, None)],
+            fetched_at_ms: now,
+        },
+    );
+    assert!(matches!(
+        current().inventory,
+        haider_rpc::ModelInventoryWire::Fetched { .. }
+    ));
+    assert_eq!(
+        current().default_model.as_deref(),
+        Some("deepseek-v4-flash")
+    );
+    source.unavailable(HAIDER_CODE_PROVIDER_NAME, "temporary outage".into());
+    assert!(matches!(
+        current().inventory,
+        haider_rpc::ModelInventoryWire::Stale { .. }
+    ));
+    assert_eq!(current().models, ["deepseek-v4-flash"]);
+    source.replace(
+        HAIDER_CODE_PROVIDER_NAME.to_owned(),
+        ProviderInventory::Fetched {
+            models: Vec::new(),
+            fetched_at_ms: now,
+        },
+    );
+    assert!(matches!(
+        current().inventory,
+        haider_rpc::ModelInventoryWire::Fetched { .. }
+    ));
+    assert!(!current().inventory.needs_refresh());
+    assert!(current().default_model.is_none());
+    assert!(
+        registry
+            .set_default_model(HAIDER_CODE_PROVIDER_NAME, "Go")
+            .is_err()
+    );
+}
+
+#[test]
+fn upgrade_removes_persisted_public_seed_without_creating_aliases() {
+    let mut old = builtin_or_unknown(HAIDER_CODE_PROVIDER_NAME, "unused");
+    old.configured_models = vec!["Go".into(), "Go Max".into()];
+    old.default_model = Some("Go".into());
+    let store = MemoryProviderStore {
+        profiles: std::sync::Mutex::new(vec![old]),
+    };
+    let registry = ProviderRegistry::new(store, Vec::new(), model_source([])).expect("upgrade");
+    let profile = registry.get(HAIDER_CODE_PROVIDER_NAME).expect("profile");
+    assert!(profile.configured_models.is_empty());
+    assert!(profile.default_model.is_none());
+    assert_eq!(
+        registry
+            .summary(HAIDER_CODE_PROVIDER_NAME, &|_| true)
+            .expect("summary")
+            .inventory,
+        haider_rpc::ModelInventoryWire::NeverFetched
+    );
 }

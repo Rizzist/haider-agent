@@ -53,6 +53,8 @@ struct ProviderView {
     fetched_at_ms: Option<u64>,
     #[serde(rename = "inventory_age")]
     inventory_age_ms: Option<u64>,
+    inventory: haider_rpc::ModelInventoryWire,
+    catalog: haider_rpc::ProviderCatalogKindWire,
     models: Vec<ModelView>,
 }
 
@@ -191,23 +193,42 @@ async fn read_document_with_refresh(
     if targets.is_empty() {
         return Ok(document);
     }
+    let mut failures = BTreeMap::new();
     for provider in targets {
-        if let Err(error) = refresh_provider(client, provider).await {
-            if requested.is_none()
-                && matches!(
-                    &error,
-                    ModelsError::Rpc {
-                        retryable: true,
-                        ..
-                    }
-                )
-            {
-                continue;
-            }
-            return Err(error);
+        if let Err(error) = refresh_provider(client, provider.clone()).await {
+            failures.insert(provider, error.to_string());
         }
     }
-    read_document(client).await
+    let mut document = read_document(client).await?;
+    apply_refresh_failures(&mut document, failures)?;
+    Ok(document)
+}
+
+fn apply_refresh_failures(
+    document: &mut ModelsDocument,
+    mut failures: BTreeMap<String, String>,
+) -> Result<(), ModelsError> {
+    for provider in &mut document.providers {
+        if let Some(reason) = failures.remove(&provider.provider) {
+            provider.inventory = match provider.inventory.fetched_at_ms() {
+                Some(fetched_at_ms) => haider_rpc::ModelInventoryWire::Stale {
+                    fetched_at_ms,
+                    reason,
+                },
+                None => haider_rpc::ModelInventoryWire::Unavailable { reason },
+            };
+        }
+    }
+    // An explicit typo is a command error, never a failure attributed to a
+    // different registered provider. Real provider failures stay on their row.
+    if let Some((provider, reason)) = failures.into_iter().next() {
+        return Err(ModelsError::Rpc {
+            code: "provider_not_found".to_owned(),
+            message: format!("{provider}: {reason}"),
+            retryable: false,
+        });
+    }
+    Ok(())
 }
 
 async fn read_document(client: &haider_client::RpcClient) -> Result<ModelsDocument, ModelsError> {
@@ -244,9 +265,10 @@ fn refresh_targets(document: &ModelsDocument, requested: Option<&ModelsRefresh>)
             .providers
             .iter()
             .filter(|provider| {
-                provider
-                    .inventory_age_ms
-                    .is_some_and(|age| age >= haider_rpc::MODEL_INVENTORY_TTL_MS)
+                matches!(
+                    provider.inventory,
+                    haider_rpc::ModelInventoryWire::Stale { .. }
+                )
             })
             .map(|provider| provider.provider.clone())
             .collect(),
@@ -254,22 +276,7 @@ fn refresh_targets(document: &ModelsDocument, requested: Option<&ModelsRefresh>)
 }
 
 fn provider_supports_live_discovery(provider: &ProviderView) -> bool {
-    if provider.fetched_at_ms.is_some() {
-        return true;
-    }
-    match provider.provider.as_str() {
-        "openai-oauth" | "anthropic-oauth" | "kimi-oauth" | "grok-oauth" | "deepseek"
-        | "haider-code" | "xai" | "gemini" => true,
-        "openai" | "anthropic" | "bedrock" | "vertex" | "fake" | "openai-compatible" => false,
-        _ => {
-            provider.endpoint.is_some()
-                && matches!(
-                    provider.api_family,
-                    ProviderApiFamilyWire::OpenAiChatCompletions
-                        | ProviderApiFamilyWire::AnthropicMessages
-                )
-        }
-    }
+    provider.catalog.supports_discovery()
 }
 
 async fn refresh_provider(
@@ -367,6 +374,18 @@ fn provider_view(
     descriptors: &[CredentialDescriptor],
     now_ms: u64,
 ) -> ProviderView {
+    let mut provider = provider;
+    provider.inventory = provider.inventory.at_time(now_ms);
+    if matches!(
+        provider.inventory,
+        haider_rpc::ModelInventoryWire::NeverFetched
+            | haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ) {
+        provider.models.clear();
+        provider.model_details.clear();
+        provider.default_model = None;
+        provider.availability = ProviderAvailabilityWire::Unavailable;
+    }
     let auth_state = auth_state(&provider, descriptors);
     let has_credential = descriptors
         .iter()
@@ -386,7 +405,7 @@ fn provider_view(
         })
         .collect::<Vec<_>>();
     models.extend(details.into_values().map(model_detail_view));
-    let fetched_at_ms = provider.inventory_fetched_at_ms;
+    let fetched_at_ms = provider.inventory.fetched_at_ms();
     ProviderView {
         provider: provider.provider,
         api_family: provider.api_family,
@@ -400,6 +419,8 @@ fn provider_view(
         default_model: provider.default_model,
         fetched_at_ms,
         inventory_age_ms: fetched_at_ms.map(|fetched_at_ms| now_ms.saturating_sub(fetched_at_ms)),
+        inventory: provider.inventory,
+        catalog: provider.catalog,
         models,
     }
 }
@@ -489,6 +510,11 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
             provider
                 .inventory_age_ms
                 .map_or_else(|| "n/a".to_owned(), |age| age.to_string())
+        ));
+        text.push_str(&format!(
+            "  inventory: {} (haider models --refresh {})\n",
+            provider.inventory.description(),
+            provider.provider
         ));
         for model in &provider.models {
             let context = model

@@ -44,18 +44,12 @@ pub const KIMI_OAUTH_PROVIDER_NAME: &str = "kimi-oauth";
 pub const KIMI_OAUTH_BASE_URL: &str = "https://api.kimi.com/coding/v1";
 pub const DEEPSEEK_PROVIDER_NAME: &str = "deepseek";
 pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
-/// Documented compatibility aliases used only until authenticated discovery
-/// returns the live inventory. V4 slugs deliberately come from `/models`
-/// rather than this fallback.
-pub const DEEPSEEK_SEED_MODELS: [&str; 2] = ["deepseek-chat", "deepseek-reasoner"];
 pub const HAIDER_CODE_PROVIDER_NAME: &str = "haider-code";
 pub const HAIDER_CODE_BASE_URL: &str = "https://haidercode.ai/v1";
 pub const HAIDER_CODE_ACCOUNT_URL: &str = "https://haidercode.ai/v1/account";
-pub const HAIDER_CODE_SEED_MODELS: [&str; 2] = ["Go", "Go Max"];
 pub const XAI_PROVIDER_NAME: &str = "xai";
 pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const XAI_CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
-pub const XAI_SEED_MODELS: [&str; 4] = ["grok-4.6", "grok-4.5", "grok-4.3", "grok-build-0.1"];
 pub const XAI_SEED_MODEL_CONTEXT_WINDOWS: [(&str, u64); 4] = [
     ("grok-4.6", 500_000),
     ("grok-4.5", 500_000),
