@@ -3020,6 +3020,8 @@ impl StoreOwner {
         &self,
         operation: impl FnOnce(&Store) -> Result<T, HaiderError>,
     ) -> Result<T, HaiderError> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StoreAccess);
         let store = self.store.lock().map_err(|_| owner_lock_error())?;
         let store = store.as_ref().ok_or_else(closed_error)?;
         let result = operation(store);
@@ -3038,6 +3040,8 @@ impl StoreOwner {
         failed_write_ids: Vec<String>,
         operation: impl FnOnce(&Store) -> Result<T, HaiderError>,
     ) -> Result<T, HaiderError> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StoreJournal);
         #[cfg(test)]
         if let Some(error) = self
             .injected_profile_write_error

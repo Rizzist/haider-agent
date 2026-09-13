@@ -4897,13 +4897,16 @@ async fn run_supervisor(
                             run_id.clone(),
                             branch_id.clone(),
                         );
-                        let start = start_turn(
-                            &dependencies,
-                            &fresh,
-                            &lease,
-                            &device_id,
-                            Arc::clone(&event_ids),
-                            pending,
+                        let start = haider_platform::phase_trace::measure_active(
+                            haider_platform::phase_trace::Phase::TurnSetup,
+                            start_turn(
+                                &dependencies,
+                                &fresh,
+                                &lease,
+                                &device_id,
+                                Arc::clone(&event_ids),
+                                pending,
+                            ),
                         );
                         tokio::pin!(startup_budget);
                         tokio::pin!(start);
@@ -6093,114 +6096,120 @@ async fn durable_runs(
     )>,
     HaiderError,
 > {
-    if let Some(checkpoint) = store
-        .projection_checkpoint(store.session_id(), RUN_HEADS_PROJECTION, RUN_HEADS_TIMELINE)
-        .await?
-        && let Ok(projection) =
-            rmp_serde::from_slice::<DurableRunHeadsProjection>(&checkpoint.payload)
-        && projection.version == RUN_HEADS_PAYLOAD_VERSION
-    {
-        let mut runs = projection
-            .heads
-            .into_iter()
-            .map(|head| {
-                (
-                    RunId::new(head.run_id),
-                    head.state,
-                    head.accepted_seq,
-                    head.branch_id.map(BranchId::new),
-                    head.prompt_run_id.map(RunId::new),
-                )
-            })
-            .collect::<Vec<_>>();
-        runs.sort_by_key(|(_, _, accepted, _, _)| accepted.unwrap_or(u64::MAX));
-        return Ok(runs);
-    }
-
-    let mut cursor = 0;
-    let mut runs =
-        HashMap::<RunId, (RunState, Option<u64>, Option<BranchId>, Option<RunId>)>::new();
-    loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        for envelope in page {
-            let Some(run_id) = envelope.run_id else {
-                continue;
-            };
-            if let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
-                RunRetryEventPayload::from_payload_value(envelope.payload.to_json_value())
+    haider_platform::phase_trace::measure(
+        haider_platform::phase_trace::Phase::ProjectionDigest,
+        async {
+            if let Some(checkpoint) = store
+                .projection_checkpoint(store.session_id(), RUN_HEADS_PROJECTION, RUN_HEADS_TIMELINE)
+                .await?
+                && let Ok(projection) =
+                    rmp_serde::from_slice::<DurableRunHeadsProjection>(&checkpoint.payload)
+                && projection.version == RUN_HEADS_PAYLOAD_VERSION
             {
-                let (state, branch_id) = runs.get(&run_id).map_or(
-                    (RunState::Queued, envelope.branch_id.clone()),
-                    |(state, _, branch_id, _)| (state.clone(), branch_id.clone()),
-                );
-                if branch_id != envelope.branch_id {
-                    return Err(HaiderError::new(
-                        ErrorCode::StoreCorrupt,
-                        format!("run {run_id} crosses branch scopes"),
-                        false,
-                    ));
-                }
-                runs.insert(
-                    run_id,
-                    (state, Some(envelope.seq), branch_id, Some(prompt_run_id)),
-                );
-                continue;
+                let mut runs = projection
+                    .heads
+                    .into_iter()
+                    .map(|head| {
+                        (
+                            RunId::new(head.run_id),
+                            head.state,
+                            head.accepted_seq,
+                            head.branch_id.map(BranchId::new),
+                            head.prompt_run_id.map(RunId::new),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                runs.sort_by_key(|(_, _, accepted, _, _)| accepted.unwrap_or(u64::MAX));
+                return Ok(runs);
             }
-            let Ok(payload) = envelope.payload.decode_event() else {
-                continue;
-            };
-            match payload {
-                EventPayload::RunState(state) => {
-                    let (accepted, branch_id, prompt_run_id) = runs.get(&run_id).map_or(
-                        (None, envelope.branch_id.clone(), None),
-                        |(_, seq, branch_id, prompt_run_id)| {
-                            (*seq, branch_id.clone(), prompt_run_id.clone())
-                        },
-                    );
-                    if branch_id != envelope.branch_id {
-                        return Err(HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!("run {run_id} crosses branch scopes"),
-                            false,
-                        ));
-                    }
-                    runs.insert(run_id, (state, accepted, branch_id, prompt_run_id));
+
+            let mut cursor = 0;
+            let mut runs =
+                HashMap::<RunId, (RunState, Option<u64>, Option<BranchId>, Option<RunId>)>::new();
+            loop {
+                let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+                if page.is_empty() {
+                    break;
                 }
-                EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_) => {
-                    let (state, branch_id, prompt_run_id) = runs.get(&run_id).map_or(
-                        (RunState::Queued, envelope.branch_id.clone(), None),
-                        |(state, _, branch_id, prompt_run_id)| {
-                            (state.clone(), branch_id.clone(), prompt_run_id.clone())
-                        },
-                    );
-                    if branch_id != envelope.branch_id {
-                        return Err(HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!("run {run_id} crosses branch scopes"),
-                            false,
-                        ));
+                cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+                for envelope in page {
+                    let Some(run_id) = envelope.run_id else {
+                        continue;
+                    };
+                    if let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
+                        RunRetryEventPayload::from_payload_value(envelope.payload.to_json_value())
+                    {
+                        let (state, branch_id) = runs.get(&run_id).map_or(
+                            (RunState::Queued, envelope.branch_id.clone()),
+                            |(state, _, branch_id, _)| (state.clone(), branch_id.clone()),
+                        );
+                        if branch_id != envelope.branch_id {
+                            return Err(HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("run {run_id} crosses branch scopes"),
+                                false,
+                            ));
+                        }
+                        runs.insert(
+                            run_id,
+                            (state, Some(envelope.seq), branch_id, Some(prompt_run_id)),
+                        );
+                        continue;
                     }
-                    runs.insert(
-                        run_id,
-                        (state, Some(envelope.seq), branch_id, prompt_run_id),
-                    );
+                    let Ok(payload) = envelope.payload.decode_event() else {
+                        continue;
+                    };
+                    match payload {
+                        EventPayload::RunState(state) => {
+                            let (accepted, branch_id, prompt_run_id) = runs.get(&run_id).map_or(
+                                (None, envelope.branch_id.clone(), None),
+                                |(_, seq, branch_id, prompt_run_id)| {
+                                    (*seq, branch_id.clone(), prompt_run_id.clone())
+                                },
+                            );
+                            if branch_id != envelope.branch_id {
+                                return Err(HaiderError::new(
+                                    ErrorCode::StoreCorrupt,
+                                    format!("run {run_id} crosses branch scopes"),
+                                    false,
+                                ));
+                            }
+                            runs.insert(run_id, (state, accepted, branch_id, prompt_run_id));
+                        }
+                        EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_) => {
+                            let (state, branch_id, prompt_run_id) = runs.get(&run_id).map_or(
+                                (RunState::Queued, envelope.branch_id.clone(), None),
+                                |(state, _, branch_id, prompt_run_id)| {
+                                    (state.clone(), branch_id.clone(), prompt_run_id.clone())
+                                },
+                            );
+                            if branch_id != envelope.branch_id {
+                                return Err(HaiderError::new(
+                                    ErrorCode::StoreCorrupt,
+                                    format!("run {run_id} crosses branch scopes"),
+                                    false,
+                                ));
+                            }
+                            runs.insert(
+                                run_id,
+                                (state, Some(envelope.seq), branch_id, prompt_run_id),
+                            );
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
-        }
-    }
-    let mut runs = runs
-        .into_iter()
-        .map(|(run_id, (state, accepted, branch_id, prompt_run_id))| {
-            (run_id, state, accepted, branch_id, prompt_run_id)
-        })
-        .collect::<Vec<_>>();
-    runs.sort_by_key(|(_, _, accepted, _, _)| accepted.unwrap_or(u64::MAX));
-    Ok(runs)
+            let mut runs = runs
+                .into_iter()
+                .map(|(run_id, (state, accepted, branch_id, prompt_run_id))| {
+                    (run_id, state, accepted, branch_id, prompt_run_id)
+                })
+                .collect::<Vec<_>>();
+            runs.sort_by_key(|(_, _, accepted, _, _)| accepted.unwrap_or(u64::MAX));
+            Ok(runs)
+        },
+    )
+    .await
 }
 
 /// Returns the daemon-minted prompt scope for a direct user command run.
@@ -11245,27 +11254,33 @@ async fn run_budget_usage(
     fallback_model: &str,
     elapsed_ms: u64,
 ) -> Result<HeadlessRunUsageV1, HaiderError> {
-    let mut cursor = 0_u64;
-    let mut chunks = BudgetUsageChunks::new();
-    loop {
-        let page = store.read(store.session_id(), cursor, 256).await?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len();
-        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        let _ = collect_budget_usage(
-            &mut chunks,
-            store.session_id(),
-            run_id,
-            fallback_model,
-            page,
-        );
-        if page_len < 256 {
-            break;
-        }
-    }
-    Ok(finish_budget_usage(chunks, elapsed_ms))
+    haider_platform::phase_trace::measure(
+        haider_platform::phase_trace::Phase::ProjectionDigest,
+        async {
+            let mut cursor = 0_u64;
+            let mut chunks = BudgetUsageChunks::new();
+            loop {
+                let page = store.read(store.session_id(), cursor, 256).await?;
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+                let _ = collect_budget_usage(
+                    &mut chunks,
+                    store.session_id(),
+                    run_id,
+                    fallback_model,
+                    page,
+                );
+                if page_len < 256 {
+                    break;
+                }
+            }
+            Ok(finish_budget_usage(chunks, elapsed_ms))
+        },
+    )
+    .await
 }
 
 async fn run_budget_usage_for_context(
@@ -13866,6 +13881,8 @@ fn initial_tool_exposure_for_turn(
 /// this process-wide immutable catalog. Legacy aliases intentionally live only
 /// in `registered_tool_route` and can never be advertised.
 fn registered_tool_catalog() -> &'static RegisteredToolCatalog {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::CapabilityCatalog);
     static CATALOG: OnceLock<RegisteredToolCatalog> = OnceLock::new();
     CATALOG.get_or_init(|| {
         let tools: Arc<[RegisteredTool]> = build_registered_tools()
@@ -14992,6 +15009,8 @@ fn cached_turn_tool_packs(
 }
 
 fn build_turn_tool_packs(inputs: &TurnToolPackInputs<'_>) -> SharedToolPacks {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::CapabilityCatalog);
     let provider_tool_base = lockdown_tool_definition_pack(
         authorized_tool_definition_pack_for_registry(
             Arc::clone(&inputs.registry_revision),

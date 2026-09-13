@@ -682,6 +682,7 @@ fn spawn_daemon(
     profile: &ResolvedProfile,
     options: &EnsureOptions,
 ) -> Result<SpawnedCandidate, EnsureError> {
+    let _phase = haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::Spawn);
     let binary = daemon_binary(options)?;
     let log_path =
         haider_platform::allocate_daemon_log_path(&profile.store_dir).map_err(|error| {

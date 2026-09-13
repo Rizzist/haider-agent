@@ -1801,6 +1801,9 @@ fn adapt_events_to_with_clock(
     let mut turn_trace = None::<(u64, Instant)>;
     let mut next_event = events.blocking_recv();
     while let Some(event) = next_event {
+        let render_phase = haider_platform::phase_trace::scope(
+            haider_platform::phase_trace::Phase::CompletionRender,
+        );
         let mut flush_stdout = false;
         match event {
             HeadlessEvent::Accepted {
@@ -1932,6 +1935,7 @@ fn adapt_events_to_with_clock(
             last_stdout_flush = now();
         }
 
+        drop(render_phase);
         next_event = match events.try_recv() {
             Ok(event) => Some(event),
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -2057,6 +2061,8 @@ pub(crate) fn write_final(
     mode: RunOutput,
     result: &HeadlessRunResult,
 ) -> io::Result<()> {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::CompletionRender);
     match mode {
         RunOutput::Print => {
             if result.outcome == HeadlessOutcome::Started {

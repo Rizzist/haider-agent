@@ -2101,6 +2101,8 @@ fn trim_to_latest<T>(rows: &mut Vec<T>, limit: usize) {
 impl Store {
     /// Acquires the profile lifetime lock without opening its durable store.
     pub fn acquire_profile(root: impl AsRef<Path>) -> StoreResult<ProfileLease> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::DirectoryPrep);
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|error| {
             store_error(
@@ -2123,6 +2125,8 @@ impl Store {
         lease: ProfileLease,
         synchronous: StoreSynchronous,
     ) -> StoreResult<Self> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StoreOpen);
         let ProfileLease {
             root,
             lock: profile_lock,
@@ -7690,6 +7694,8 @@ impl Store {
         &self,
         batches: &mut [JournalAppendBatch],
     ) -> StoreResult<Vec<StoreResult<CommittedSeqRange>>> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StoreJournal);
         if batches.is_empty() {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -7830,6 +7836,8 @@ impl Store {
         &self,
         batch: &mut JournalCommitBatch,
     ) -> StoreResult<JournalCommitOutcome> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StoreJournal);
         match batch {
             JournalCommitBatch::Append(batch) => append_owned_envelopes(
                 self,
@@ -18239,6 +18247,8 @@ fn update_run_head_projection_after_append(
     session_id: &SessionId,
     envelopes: &[RawEnvelope],
 ) -> StoreResult<()> {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::ProjectionDigest);
     let Some(last) = envelopes.last() else {
         return Ok(());
     };

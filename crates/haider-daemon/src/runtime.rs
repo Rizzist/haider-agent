@@ -2187,48 +2187,51 @@ async fn finalize(
     shutdown: &mut watch::Receiver<ShutdownRequest>,
     forced: &mut bool,
 ) -> Option<DaemonError> {
-    let flush_error = barrier_step(
-        store.flush(),
-        Some("store_flush"),
-        StepFailure::SuppressedWhenForced,
-        deadline,
-        shutdown,
-        forced,
-    )
-    .await;
-    // Socket removal happens even when the flush overran: an abandoned
-    // rendezvous node is worse than a large WAL.
-    let cleanup_error = barrier_step(
-        std::future::ready(endpoint.cleanup()),
-        None,
-        StepFailure::AlwaysReported,
-        deadline,
-        shutdown,
-        forced,
-    )
-    .await;
-    let runtime_error = barrier_step(
-        std::future::ready(endpoint.cleanup_runtime()),
-        None,
-        StepFailure::AlwaysReported,
-        deadline,
-        shutdown,
-        forced,
-    )
-    .await;
-    let close_error = barrier_step(
-        store.close(),
-        Some("store_close"),
-        StepFailure::SuppressedWhenForced,
-        deadline,
-        shutdown,
-        forced,
-    )
-    .await;
-    flush_error
-        .or(cleanup_error)
-        .or(runtime_error)
-        .or(close_error)
+    haider_platform::phase_trace::measure(haider_platform::phase_trace::Phase::Teardown, async {
+        let flush_error = barrier_step(
+            store.flush(),
+            Some("store_flush"),
+            StepFailure::SuppressedWhenForced,
+            deadline,
+            shutdown,
+            forced,
+        )
+        .await;
+        // Socket removal happens even when the flush overran: an abandoned
+        // rendezvous node is worse than a large WAL.
+        let cleanup_error = barrier_step(
+            std::future::ready(endpoint.cleanup()),
+            None,
+            StepFailure::AlwaysReported,
+            deadline,
+            shutdown,
+            forced,
+        )
+        .await;
+        let runtime_error = barrier_step(
+            std::future::ready(endpoint.cleanup_runtime()),
+            None,
+            StepFailure::AlwaysReported,
+            deadline,
+            shutdown,
+            forced,
+        )
+        .await;
+        let close_error = barrier_step(
+            store.close(),
+            Some("store_close"),
+            StepFailure::SuppressedWhenForced,
+            deadline,
+            shutdown,
+            forced,
+        )
+        .await;
+        flush_error
+            .or(cleanup_error)
+            .or(runtime_error)
+            .or(close_error)
+    })
+    .await
 }
 
 /// What a barrier step's failure means once the barrier has been breached.

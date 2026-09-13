@@ -3083,7 +3083,11 @@ impl HarnessActor {
                         continue;
                     }
                     self.promoted_steers.begin_turn();
-                    let outcome = self.drive_turn(request, cancel).await;
+                    let outcome = haider_platform::phase_trace::measure_active(
+                        haider_platform::phase_trace::Phase::TurnControl,
+                        self.drive_turn(request, cancel),
+                    )
+                    .await;
                     self.promoted_steers.close_turn();
                     let _ = outcome_sender.send(outcome);
                 }
@@ -4285,11 +4289,16 @@ impl HarnessActor {
                         &provider_request.attachments,
                     )
                 });
-            let mut prepared = if let Some(tools) = shared_request_tools.as_ref() {
-                provider.prepare_turn_with_tools_owned(&mut provider_request, tools)
-            } else {
-                provider.prepare_turn_owned(&mut provider_request)
-            };
+            let mut prepared = haider_platform::phase_trace::sync(
+                haider_platform::phase_trace::Phase::ProviderAssembly,
+                || {
+                    if let Some(tools) = shared_request_tools.as_ref() {
+                        provider.prepare_turn_with_tools_owned(&mut provider_request, tools)
+                    } else {
+                        provider.prepare_turn_owned(&mut provider_request)
+                    }
+                },
+            );
             if let (Some(prepared), Some(trace)) =
                 (prepared.as_mut(), self.config.turn_trace.as_ref())
             {
@@ -8753,13 +8762,16 @@ impl HarnessActor {
         dispatcher: &Arc<dyn ToolDispatcher>,
     ) -> Result<GeneralToolOutcome, DriveError> {
         loop {
-            let execution = dispatcher.execute_shared(
-                run_id,
-                &tool.item_id,
-                &tool.call_id,
-                &tool.name,
-                Arc::clone(&args),
-                cancel,
+            let execution = haider_platform::phase_trace::measure(
+                haider_platform::phase_trace::Phase::ToolDispatch,
+                dispatcher.execute_shared(
+                    run_id,
+                    &tool.item_id,
+                    &tool.call_id,
+                    &tool.name,
+                    Arc::clone(&args),
+                    cancel,
+                ),
             );
             let result = tokio::select! {
                 biased;
@@ -13589,6 +13601,8 @@ fn prompt_cache_metadata(
     account_scope: Option<&CredentialAlias>,
     volatile_context_epoch: Option<&str>,
 ) -> PromptCacheMetadata {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::ProjectionDigest);
     let PromptCacheBoundaries {
         stable_history_end,
         cacheable_history_end,

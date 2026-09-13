@@ -21,6 +21,7 @@ mod directory;
 mod file_lock;
 pub mod fs;
 mod ipc;
+pub mod phase_trace;
 mod process;
 mod reachability;
 mod shutdown;

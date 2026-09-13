@@ -289,67 +289,74 @@ pub struct PeerCredentials {
 
 /// Dials the endpoint and completes the `Hello`/`Welcome` handshake.
 pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, ConnectError> {
-    let mut stream = match haider_platform::connect(path).await {
-        Ok(stream) => stream,
-        Err(error) => return Err(classify_connect_error(error)),
-    };
-    // Capture before `RpcClient::start` consumes the stream and splits it.
-    // The peer credentials are the update signal authority; the lock-file
-    // PID is deliberately never consulted.
-    let peer_credentials = haider_platform::peer_credentials(&stream)
-        .map(|credentials| PeerCredentials {
-            pid: credentials.pid,
-            uid: credentials.uid,
-            gid: credentials.gid,
-        })
-        .unwrap_or(PeerCredentials {
-            pid: None,
-            uid: u32::MAX,
-            gid: u32::MAX,
-        });
-    let hello = WireFrame::Hello(Hello {
-        protocol_min: WIRE_PROTOCOL_VERSION,
-        protocol_max: WIRE_PROTOCOL_VERSION,
-        client_name: config.client_name.clone(),
-        client_version: config.client_version.clone(),
-        client_instance_id: config.client_instance_id.clone(),
-        client_kind: config.client_kind,
-        capabilities_requested: config.capabilities.clone(),
-        max_receive_frame: u32::try_from(config.frame_limit).unwrap_or(u32::MAX),
-        encodings: (std::env::var("HAIDER_WIRE_MSGPACK").as_deref() == Ok("1"))
-            .then(|| "msgpack".to_owned())
-            .into_iter()
-            .collect(),
-    });
-    let bytes = uds_codec::encode(&hello, config.frame_limit).map_err(ConnectError::Frame)?;
-    let handshake = async {
-        stream.write_all(&bytes).await.map_err(ConnectError::Io)?;
-        read_handshake(&mut stream, config.frame_limit).await
-    };
-    let (welcome, decoder, leftovers) =
-        match tokio::time::timeout(config.handshake_timeout, handshake).await {
-            Ok(result) => result?,
-            Err(_) => return Err(ConnectError::HandshakeTimeout),
-        };
-    let encoding = match welcome.encoding.as_deref() {
-        Some("msgpack") => WireEncoding::MessagePack,
-        _ => WireEncoding::Json,
-    };
-    let client = RpcClient::start(
-        stream,
-        decoder,
-        leftovers,
-        &config,
-        &welcome,
-        encoding,
-        peer_credentials,
+    haider_platform::phase_trace::measure(
+        haider_platform::phase_trace::Phase::SocketHandshake,
+        async {
+            let mut stream = match haider_platform::connect(path).await {
+                Ok(stream) => stream,
+                Err(error) => return Err(classify_connect_error(error)),
+            };
+            // Capture before `RpcClient::start` consumes the stream and splits it.
+            // The peer credentials are the update signal authority; the lock-file
+            // PID is deliberately never consulted.
+            let peer_credentials = haider_platform::peer_credentials(&stream)
+                .map(|credentials| PeerCredentials {
+                    pid: credentials.pid,
+                    uid: credentials.uid,
+                    gid: credentials.gid,
+                })
+                .unwrap_or(PeerCredentials {
+                    pid: None,
+                    uid: u32::MAX,
+                    gid: u32::MAX,
+                });
+            let hello = WireFrame::Hello(Hello {
+                protocol_min: WIRE_PROTOCOL_VERSION,
+                protocol_max: WIRE_PROTOCOL_VERSION,
+                client_name: config.client_name.clone(),
+                client_version: config.client_version.clone(),
+                client_instance_id: config.client_instance_id.clone(),
+                client_kind: config.client_kind,
+                capabilities_requested: config.capabilities.clone(),
+                max_receive_frame: u32::try_from(config.frame_limit).unwrap_or(u32::MAX),
+                encodings: (std::env::var("HAIDER_WIRE_MSGPACK").as_deref() == Ok("1"))
+                    .then(|| "msgpack".to_owned())
+                    .into_iter()
+                    .collect(),
+            });
+            let bytes =
+                uds_codec::encode(&hello, config.frame_limit).map_err(ConnectError::Frame)?;
+            let handshake = async {
+                stream.write_all(&bytes).await.map_err(ConnectError::Io)?;
+                read_handshake(&mut stream, config.frame_limit).await
+            };
+            let (welcome, decoder, leftovers) =
+                match tokio::time::timeout(config.handshake_timeout, handshake).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(ConnectError::HandshakeTimeout),
+                };
+            let encoding = match welcome.encoding.as_deref() {
+                Some("msgpack") => WireEncoding::MessagePack,
+                _ => WireEncoding::Json,
+            };
+            let client = RpcClient::start(
+                stream,
+                decoder,
+                leftovers,
+                &config,
+                &welcome,
+                encoding,
+                peer_credentials,
+            )
+            .map_err(ConnectError::Io)?;
+            Ok(Connected {
+                client,
+                welcome,
+                peer_credentials,
+            })
+        },
     )
-    .map_err(ConnectError::Io)?;
-    Ok(Connected {
-        client,
-        welcome,
-        peer_credentials,
-    })
+    .await
 }
 
 /// Reads exactly the always-JSON handshake frame, preserving any bytes from
@@ -753,7 +760,10 @@ impl RpcClient {
     /// copy is how the pending-lock ordering below silently drifts back to
     /// the orphaning shape it was fixed out of.
     pub async fn request(&self, body: RequestBody) -> Result<ResponseBody, ClientError> {
-        self.begin_request(body).await?.wait().await
+        haider_platform::phase_trace::measure(haider_platform::phase_trace::Phase::Rpc, async {
+            self.begin_request(body).await?.wait().await
+        })
+        .await
     }
 
     /// Sends the same receipted durable menu-answer frame used by interactive
@@ -789,13 +799,16 @@ impl RpcClient {
     /// race to `outbound.send`, and the daemon then sees the attach first and
     /// rejects it at `max_attachments_per_connection` (review W3c3 P1-3).
     pub async fn begin_request(&self, body: RequestBody) -> Result<PendingResponse, ClientError> {
-        if let Some(feature) = body.additive_shape_feature()
-            && !self.welcome.features.contains(feature)
-        {
-            return Err(ClientError::MissingFeature(feature));
-        }
-        self.begin_correlated_frame(|request_id| WireFrame::Request { request_id, body })
-            .await
+        haider_platform::phase_trace::measure(haider_platform::phase_trace::Phase::Submit, async {
+            if let Some(feature) = body.additive_shape_feature()
+                && !self.welcome.features.contains(feature)
+            {
+                return Err(ClientError::MissingFeature(feature));
+            }
+            self.begin_correlated_frame(|request_id| WireFrame::Request { request_id, body })
+                .await
+        })
+        .await
     }
 
     /// Sends one `artifact.put` from a stable private base64 snapshot. The
