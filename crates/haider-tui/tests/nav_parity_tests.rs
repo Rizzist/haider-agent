@@ -235,6 +235,21 @@ fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
         "completion remains bounded"
     );
 
+    // Query every distinct file in this unchanged directory. Regardless of
+    // readdir order, a scan that samples only 256 raw entries must miss some
+    // of these 300 matches. A single chosen filename can hide that bug on
+    // filesystems that happen to enumerate it early.
+    for index in 0..300 {
+        let filename = format!("file-{index:03}.txt");
+        model.composer.set_text(format!("@file-{index:03}.tx"));
+        model.handle(common::key(KeyCode::Char('t')));
+        assert_eq!(
+            model.mention_completion.as_ref().unwrap().candidates,
+            vec![filename],
+            "every matching file must be reachable, regardless of directory order"
+        );
+    }
+
     model.handle(common::key(KeyCode::Esc));
     model.composer.set_text("");
     model.handle(common::key(KeyCode::Char('@')));
