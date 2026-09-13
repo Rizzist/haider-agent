@@ -54,7 +54,7 @@ impl EncryptedFileVault {
         let directory = File::from(
             rustix::fs::openat(&parent, name, DIRECTORY, Mode::empty()).map_err(io_error)?,
         );
-        validate(&directory, true)?;
+        validate(&directory, EntryKind::Directory)?;
         Ok(Self {
             root: directory,
             dek,
@@ -105,7 +105,7 @@ impl EncryptedFileVault {
                 }
             })?,
         );
-        validate(&file, false)?;
+        validate(&file, EntryKind::Credential)?;
         Ok(file)
     }
 
@@ -249,7 +249,7 @@ impl Vault for EncryptedFileVault {
             )
             .map_err(io_error)?,
         );
-        validate(&file, false)?;
+        validate(&file, EntryKind::RefreshLock)?;
         match haider_platform::try_lock_file_exclusive(&file) {
             Ok(()) => Ok(Some(VaultRefreshLock::new(move || drop(file)))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -258,18 +258,27 @@ impl Vault for EncryptedFileVault {
     }
 }
 
-fn validate(file: &File, directory: bool) -> AccountsResult<()> {
+enum EntryKind {
+    Directory,
+    Credential,
+    RefreshLock,
+}
+
+fn validate(file: &File, kind: EntryKind) -> AccountsResult<()> {
     let stat = rustix::fs::fstat(file).map_err(io_error)?;
-    let expected_type = if directory {
-        FileType::Directory
-    } else {
-        FileType::RegularFile
+    let (expected_type, expected_mode, invalid_links) = match kind {
+        EntryKind::Directory => (FileType::Directory, 0o700, false),
+        // A replacement can unlink an already-open old record before fstat.
+        // Its descriptor still pins the complete immutable ciphertext, which
+        // resolve authenticates before release. Multiple links remain forbidden.
+        EntryKind::Credential => (FileType::RegularFile, 0o600, stat.st_nlink > 1),
+        // A refresh lock must still name the inode other lockers will open.
+        EntryKind::RefreshLock => (FileType::RegularFile, 0o600, stat.st_nlink != 1),
     };
-    let expected_mode = if directory { 0o700 } else { 0o600 };
     if FileType::from_raw_mode(stat.st_mode) != expected_type
         || stat.st_uid != rustix::process::geteuid().as_raw()
         || stat.st_mode & 0o777 != expected_mode
-        || (!directory && stat.st_nlink != 1)
+        || invalid_links
     {
         return Err(corrupt());
     }

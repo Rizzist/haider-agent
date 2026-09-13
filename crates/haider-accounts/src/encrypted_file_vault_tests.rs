@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 
 use zeroize::Zeroizing;
 
@@ -159,6 +160,100 @@ fn hav1_atomic_replace_has_private_ciphertext_and_fresh_nonces() {
             );
         }
     });
+}
+
+#[test]
+fn hav1_concurrent_replacements_preserve_complete_authenticated_records() {
+    const WRITERS: usize = 4;
+    const READERS: usize = 4;
+    let (dir, vault, alias) = fixture();
+    let records: Vec<Vec<u8>> = (0..WRITERS)
+        .map(|writer| vec![writer as u8; 1024 + writer * 4096])
+        .collect();
+    vault.put(&alias, &records[0]).unwrap();
+    // Independent vault instances must work without a process-local writer lock.
+    let vaults: Vec<_> = (0..WRITERS + READERS)
+        .map(|_| {
+            EncryptedFileVault::new(
+                dir.path().canonicalize().unwrap().join("vault"),
+                Zeroizing::new([7; 32]),
+            )
+            .unwrap()
+        })
+        .collect();
+    let start = Barrier::new(WRITERS + READERS);
+    let writing = AtomicUsize::new(WRITERS);
+    std::thread::scope(|scope| {
+        for (writer, vault) in vaults[..WRITERS].iter().enumerate() {
+            let (start, writing, alias, records) = (&start, &writing, &alias, &records);
+            scope.spawn(move || {
+                start.wait();
+                let result = (0..250).try_for_each(|iteration| {
+                    vault.put(alias, &records[(writer + iteration) % WRITERS])
+                });
+                // Readers must finish even when a writer reports a regression.
+                writing.fetch_sub(1, Ordering::Release);
+                result.unwrap();
+            });
+        }
+        for vault in &vaults[WRITERS..] {
+            let (start, writing, alias, records) = (&start, &writing, &alias, &records);
+            scope.spawn(move || {
+                start.wait();
+                let mut reads = 0;
+                while reads < 2000 || writing.load(Ordering::Acquire) != 0 {
+                    let secret = vault.resolve(alias).unwrap();
+                    assert!(
+                        records
+                            .iter()
+                            .any(|record| record == secret.expose_secret())
+                    );
+                    reads += 1;
+                }
+            });
+        }
+    });
+    assert_eq!(vault.list().unwrap(), vec![alias.clone()]);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("vault")).unwrap().count(),
+        1
+    );
+    let secret = vault.resolve(&alias).unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record == secret.expose_secret())
+    );
+}
+
+#[test]
+fn hav1_reads_existing_release_record_without_format_migration() {
+    let (dir, vault, alias) = fixture();
+    // Produced by the unmodified writer at release candidate 0095d17a, using
+    // this fixture's synthetic alias and [7; 32] key. Never regenerate via put.
+    let record = hex::decode(concat!(
+        "4841563151eb1b636e2ad8f2784721eb529a682e95edc766055fd11ca6ba301a1fb1",
+        "6de689d3f0a343da6ba2b91b7a4a2ad8c8076f7109cf6713c99bb30a51c0334c16",
+        "33bfc0ee57f79984"
+    ))
+    .unwrap();
+    let entry = path(&dir, &alias);
+    std::fs::write(&entry, &record).unwrap();
+    std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o600)).unwrap();
+    vault.authenticate_existing().unwrap();
+    assert_eq!(
+        vault.resolve(&alias).unwrap().expose_secret(),
+        b"HAV1 release 0095d17a compatibility fixture"
+    );
+    assert_eq!(std::fs::read(&entry).unwrap(), record);
+    vault.put(&alias, b"replacement").unwrap();
+    let replaced = std::fs::read(&entry).unwrap();
+    assert_eq!(&replaced[..4], b"HAV1");
+    assert_eq!(replaced.len(), 32 + b"replacement".len());
+    assert_eq!(
+        vault.resolve(&alias).unwrap().expose_secret(),
+        b"replacement"
+    );
 }
 
 #[test]
