@@ -4109,6 +4109,8 @@ impl TranscriptSearch {
 /// included; this index contains workspace paths only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MentionCompletion {
+    /// The workspace exceeded the raw-entry safety ceiling; results are partial.
+    pub scan_truncated: bool,
     pub start: usize,
     pub query: String,
     pub candidates: Vec<String>,
@@ -7170,41 +7172,43 @@ impl AppModel {
         self.dirty = true;
     }
 
-    fn workspace_mention_candidates(&self) -> Vec<String> {
+    fn workspace_mention_candidates(&self, needle: &str) -> (Vec<String>, bool) {
+        const RESULT_LIMIT: usize = 64;
+        // Separate the popup's result bound from a last-resort traversal bound.
+        // Ordinary large directories must be searched, not randomly sampled.
+        const SCAN_LIMIT: usize = 16_384;
+        let mut matches = BTreeSet::new();
+        let mut consider = |candidate: String| {
+            if candidate.to_lowercase().contains(needle) {
+                matches.insert(candidate);
+                if matches.len() > RESULT_LIMIT {
+                    matches.pop_last();
+                }
+            }
+        };
         let cwd = self
             .session_workspace_cwd
             .as_deref()
             .or_else(|| (!self.session_dir.is_empty()).then_some(self.session_dir.as_str()));
         let real_cwd = cwd.filter(|path| std::path::Path::new(path).is_dir());
-        // A live workspace index must never be polluted by the demo VFS. The
-        // latter is only a fallback for the local demo, where no real cwd is
-        // attached and shell paths are intentionally synthetic.
-        let mut out = if real_cwd.is_some() {
-            Vec::new()
-        } else {
-            self.vfs
-                .values()
-                .flat_map(|entries| {
-                    entries
-                        .iter()
-                        .filter(|entry| !entry.ends_with('/'))
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        };
+        let mut scan_truncated = false;
         if let Some(cwd) = real_cwd {
             let root = std::path::Path::new(cwd);
             let mut stack = vec![root.to_path_buf()];
             let mut visited = 0usize;
-            while let Some(dir) = stack.pop() {
+            'scan: while let Some(dir) = stack.pop() {
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     continue;
                 };
-                for entry in entries.flatten() {
-                    if visited >= 256 {
-                        break;
+                for entry in entries {
+                    if visited == SCAN_LIMIT {
+                        scan_truncated = true;
+                        break 'scan;
                     }
                     visited += 1;
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
                     let path = entry.path();
                     if path
                         .file_name()
@@ -7215,17 +7219,25 @@ impl AppModel {
                     if path.is_dir() {
                         stack.push(path);
                     } else if let Ok(rel) = path.strip_prefix(root) {
-                        out.push(
+                        consider(
                             rel.to_string_lossy()
                                 .replace(std::path::MAIN_SEPARATOR, "/"),
                         );
                     }
                 }
             }
+        } else {
+            // A live workspace must never be polluted by the demo VFS. Use
+            // synthetic paths only when no real workspace is attached.
+            for entry in self.vfs.values().flatten() {
+                if !entry.ends_with('/') {
+                    consider(entry.clone());
+                }
+            }
         }
-        out.sort_unstable();
-        out.dedup();
-        out
+        // Retain the lexical first 64 matches, independent of readdir order,
+        // without accumulating every matching path in a huge workspace.
+        (matches.into_iter().collect(), scan_truncated)
     }
 
     fn refresh_mention_completion(&mut self) {
@@ -7251,18 +7263,14 @@ impl AppModel {
             return;
         }
         let needle = query.to_lowercase();
-        let candidates: Vec<String> = self
-            .workspace_mention_candidates()
-            .into_iter()
-            .filter(|candidate| candidate.to_lowercase().contains(&needle))
-            .take(64)
-            .collect();
+        let (candidates, scan_truncated) = self.workspace_mention_candidates(&needle);
         let selected = self
             .mention_completion
             .as_ref()
             .map_or(0, |completion| completion.selected)
             .min(candidates.len().saturating_sub(1));
         self.mention_completion = Some(MentionCompletion {
+            scan_truncated,
             start: at,
             query: query.to_owned(),
             candidates,

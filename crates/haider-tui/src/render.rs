@@ -12709,14 +12709,14 @@ fn render_composer(
         row_area,
     );
     if let Some(completion) = &model.mention_completion
-        && !completion.candidates.is_empty()
+        && (!completion.candidates.is_empty() || completion.scan_truncated)
         && row_area.height > 0
     {
         let visible = completion.candidates.len().min(4);
         let start = completion
             .selected
             .saturating_sub(visible.saturating_sub(1));
-        let popup_lines = completion
+        let mut popup_lines = completion
             .candidates
             .iter()
             .enumerate()
@@ -12738,6 +12738,12 @@ fn render_composer(
                 )
             })
             .collect::<Vec<_>>();
+        if completion.scan_truncated {
+            popup_lines.insert(
+                0,
+                Line::styled(" … Workspace scan truncated", theme.dim_style()),
+            );
+        }
         let popup_height = u16::try_from(popup_lines.len())
             .unwrap_or(row_area.height)
             .min(row_area.height);

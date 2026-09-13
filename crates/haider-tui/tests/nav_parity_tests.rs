@@ -235,6 +235,17 @@ fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
         "completion remains bounded"
     );
 
+    assert!(!completion.scan_truncated);
+    let mut expected = (0..300)
+        .map(|index| format!("file-{index:03}.txt"))
+        .collect::<Vec<_>>();
+    if non_utf8_created {
+        expected.push(non_utf8.to_string_lossy().into_owned());
+    }
+    expected.sort();
+    expected.truncate(64);
+    assert_eq!(completion.candidates, expected, "lexical first 64 paths");
+
     // Query every distinct file in this unchanged directory. Regardless of
     // readdir order, a scan that samples only 256 raw entries must miss some
     // of these 300 matches. A single chosen filename can hide that bug on
@@ -270,6 +281,58 @@ fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
     } else {
         assert!(non_utf8.to_string_lossy().contains('�'));
     }
+}
+
+#[test]
+fn mention_scan_ceiling_is_reported_even_without_matches() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    // Pin the safety ceiling separately from the 64-result popup bound.
+    for index in 0..16_384 {
+        fs::write(root.path().join(format!("file-{index:05}.txt")), "").expect("file");
+    }
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.session_workspace_cwd = Some(root.path().to_string_lossy().into_owned());
+    model.composer.set_text("@absen");
+    model.handle(common::key(KeyCode::Char('t')));
+    let completion = model.mention_completion.as_ref().expect("completion");
+    assert!(completion.candidates.is_empty());
+    assert!(
+        !completion.scan_truncated,
+        "exactly at the ceiling is complete"
+    );
+
+    fs::write(root.path().join("one-more.txt"), "").expect("file past ceiling");
+    model.handle(common::key(KeyCode::Char('x')));
+    let completion = model.mention_completion.as_ref().expect("completion");
+    assert!(completion.candidates.is_empty());
+    assert!(
+        completion.scan_truncated,
+        "incomplete scan must be disclosed"
+    );
+
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            haider_tui::render::render(&model, frame);
+        })
+        .expect("render");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("Workspace scan truncated"));
+
+    model.handle(common::key(KeyCode::Tab));
+    assert_eq!(
+        model.composer.text(),
+        "@absentx",
+        "marker is not a candidate"
+    );
 }
 
 #[test]
