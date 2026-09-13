@@ -5636,11 +5636,16 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    /// Records a result from an already-leased worker, including its final
+    /// capture during drain. Keep reaching that worker's existing actor while
+    /// actor_for fences external admission and new leases.
     pub(crate) async fn record_process_signal(
         &self,
         command: ProcessSignalCommand,
     ) -> Result<ProcessSignalOutcome, SessionHubError> {
-        let actor = self.actor_for(command.session_id.clone()).await?;
+        let actor = self
+            .existing_actor(&command.session_id)?
+            .ok_or(SessionHubError::Closed)?;
         let (completed, result) = oneshot::channel();
         actor
             .commands

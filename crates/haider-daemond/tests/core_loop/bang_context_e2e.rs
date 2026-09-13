@@ -11,6 +11,22 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
         "user_shell_context_and_secret_safe_capture_pages_survive_restart",
     )
     .await;
+    assert_user_shell_capture_survives_restart(false).await;
+}
+
+/// MUTATION: route the worker process signal through actor_for instead of
+/// existing_actor. Drain then loses the durable pointer before restart/paging.
+#[tokio::test]
+async fn draining_in_flight_user_shell_retains_capture_pages_after_restart() {
+    #[cfg(windows)]
+    let _windows_process_test = windows_real_process_test_guard(
+        "draining_in_flight_user_shell_retains_capture_pages_after_restart",
+    )
+    .await;
+    assert_user_shell_capture_survives_restart(true).await;
+}
+
+async fn assert_user_shell_capture_survives_restart(drain_in_flight: bool) {
     for lines in [1, 6000] {
         let root = test_root("bang-context-");
         let workspace = root.path().join("workspace");
@@ -49,9 +65,17 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
         )
         .await;
         #[cfg(unix)]
-        let command = "cat capture.txt";
+        let command = if drain_in_flight {
+            "cat capture.txt; sleep 45"
+        } else {
+            "cat capture.txt"
+        };
         #[cfg(windows)]
-        let command = "[Console]::Out.Write([IO.File]::ReadAllText('capture.txt'))";
+        let command = if drain_in_flight {
+            "[Console]::Out.Write([IO.File]::ReadAllText('capture.txt')); [Console]::Out.Flush(); Start-Sleep -Seconds 45"
+        } else {
+            "[Console]::Out.Write([IO.File]::ReadAllText('capture.txt'))"
+        };
         send_request(
             &mut client,
             &config,
@@ -75,7 +99,46 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
             } => run,
             other => panic!("shell receipt: {other:?}"),
         };
-        let events = events_until_terminal(&mut client, &run).await;
+        let mut events = Vec::new();
+        if drain_in_flight {
+            // Gate shutdown on observed output from the live process. The
+            // final newline flushes the shared streaming redactor before EOF.
+            tokio::time::timeout(support::DEADLINE, async {
+                while stdout_bytes(&events).len() < safe.len() {
+                    let WireFrame::Event { envelope, .. } = client.next().await else {
+                        continue;
+                    };
+                    if envelope.run_id.as_ref() != Some(&run) {
+                        continue;
+                    }
+                    let payload = envelope.payload.decode_event().expect("shell event");
+                    assert!(
+                        !matches!(&payload, EventPayload::RunState(state) if state.is_terminal()),
+                        "direct command must still be running when drain starts"
+                    );
+                    events.push(payload);
+                }
+            })
+            .await
+            .expect("live direct-command output before drain");
+            first_task
+                .shutdown_handle()
+                .request("drain in-flight direct command");
+            let (state, failure, terminal_events) =
+                events_until_any_terminal(&mut client, &run).await;
+            assert_eq!(
+                state,
+                RunState::Cancelled,
+                "drain cancellation: {failure:?}"
+            );
+            events.extend(terminal_events);
+        } else {
+            events = events_until_terminal(&mut client, &run).await;
+            first_task.shutdown_handle().request("restart");
+        }
+        drop(client);
+        let outcome = first_task.join().await.expect("first daemon joins");
+        assert_eq!(outcome, haider_daemon::ShutdownOutcome::Graceful);
         assert_eq!(stdout_bytes(&events), safe.as_bytes());
         assert!(
             first_fake.requests().is_empty(),
@@ -99,9 +162,6 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
             "small and spilled captures are both durable"
         );
         let handle = format!("capture:{}", signal.effect_id);
-        drop(client);
-        first_task.shutdown_handle().request("restart");
-        first_task.join().await.expect("first daemon joins");
 
         // The fake asks for every page via the real task_output tool after
         // restart. It never supplies page content; CAS + the shared redactor do.
@@ -150,6 +210,13 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
         )
         .await;
         let replay = attach_existing(&mut client, &config, session.clone(), "resume").await;
+        assert!(
+            replay.iter().any(|envelope| matches!(
+                envelope.payload.decode_event(),
+                Ok(EventPayload::ProcessSignalRecorded(replayed)) if &replayed == signal
+            )),
+            "capture pointer survives durable replay"
+        );
         let generation = replay.last().expect("replayed events").worker_generation;
         // Replayed envelopes retain their original generation; session.list
         // supplies the current daemon generation used by the next submission.
@@ -208,6 +275,9 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
         let record = &records[0].1;
         assert!(record.contains(command));
         assert!(record.contains("origin: user_command"));
+        if drain_in_flight {
+            assert!(record.contains("status: cancelled"));
+        }
         assert!(record.contains("HEAD") && record.contains("TAIL"));
         assert!(record.contains(&handle) && record.contains("task_output("));
         assert!(!record.contains("sk-abcdefghijklmnopQRSTUV"));
@@ -227,6 +297,10 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
                         .as_str()
                         .unwrap_or_else(|| panic!("capture page: {page}")),
                 );
+                assert_eq!(page["task_id"], handle);
+                assert_eq!(page["output_bytes"], safe.len());
+                assert_eq!(page["next_cursor"], reconstructed.len());
+                assert_eq!(page["exhausted"], reconstructed.len() == safe.len());
             }
         }
         assert_eq!(
@@ -234,7 +308,7 @@ async fn user_shell_context_and_secret_safe_capture_pages_survive_restart() {
             "all pages use the complete safe capture"
         );
         eprintln!(
-            "bang context restart: raw_bytes={} safe_bytes={} provider_record_bytes={} capture_pages={pages}",
+            "bang context restart: drain_in_flight={drain_in_flight} raw_bytes={} safe_bytes={} provider_record_bytes={} capture_pages={pages}",
             raw.len(),
             safe.len(),
             record.len()
