@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+from functools import cache
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -939,40 +940,46 @@ def process_rss_kib(pid: int) -> int:
 
 
 def process_cpu_ms(pid: int) -> float:
-    native = _process_usage(pid)
-    if native is not None:
-        return native[0]
-    try:
-        result = subprocess.run(
-            ["ps", "-o", "time=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=2,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return 0.0
-    value = result.stdout.strip()
-    try:
-        day_split = value.split("-", 1)
-        days = int(day_split[0]) if len(day_split) == 2 else 0
-        clock = day_split[-1].split(":")
-        if len(clock) == 3:
-            hours, minutes, seconds = int(clock[0]), int(clock[1]), float(clock[2])
-        elif len(clock) == 2:
-            hours, minutes, seconds = 0, int(clock[0]), float(clock[1])
-        else:
-            return 0.0
-        return ((days * 24 + hours) * 3_600 + minutes * 60 + seconds) * 1_000
-    except ValueError:
-        return 0.0
+    return process_cpu_times(pid).self_ms
 
 
 def process_peak_rss_kib(pid: int) -> int:
     native = _process_usage(pid)
     return native[2] if native is not None else 0
+
+
+@dataclass(frozen=True)
+class ProcessCpuTimes:
+    self_ms: float
+    reaped_children_ms: float
+
+    def delta(self, before: ProcessCpuTimes) -> ProcessCpuTimes:
+        own = self.self_ms - before.self_ms
+        children = self.reaped_children_ms - before.reaped_children_ms
+        if own < 0 or children < 0:
+            raise ProofError("CPU counters regressed; refusing a partial/zero CPU sample")
+        return ProcessCpuTimes(own, children)
+
+
+def mach_ticks_to_ns(ticks: int, numer: int, denom: int) -> int:
+    """Convert absolute Mach ticks using the host ratio, with integer precision."""
+    if ticks < 0 or numer <= 0 or denom <= 0:
+        raise ValueError("Mach ticks must be nonnegative and timebase must be positive")
+    return ticks * numer // denom
+
+
+@cache
+def darwin_timebase() -> tuple[int, int]:
+    class Timebase(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+    library = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    library.mach_timebase_info.argtypes = [ctypes.POINTER(Timebase)]
+    library.mach_timebase_info.restype = ctypes.c_int
+    info = Timebase()
+    if library.mach_timebase_info(ctypes.byref(info)) != 0 or not info.numer or not info.denom:
+        raise ProofError("Mach CPU timebase unavailable; refusing CPU measurement")
+    return info.numer, info.denom
 
 
 class _DarwinRusageInfoV2(ctypes.Structure):
@@ -1021,20 +1028,81 @@ class _DarwinRusageInfoV4(ctypes.Structure):
     ]
 
 
+def _darwin_rusage(pid: int) -> _DarwinRusageInfoV4:
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    library.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    library.proc_pid_rusage.restype = ctypes.c_int
+    info = _DarwinRusageInfoV4()
+    if library.proc_pid_rusage(pid, 4, ctypes.byref(info)) != 0:
+        raise OSError(ctypes.get_errno(), f"proc_pid_rusage({pid}) failed")
+    return info
+
+
+def _darwin_cpu_times(info: _DarwinRusageInfoV4, timebase: tuple[int, int]) -> ProcessCpuTimes:
+    # XNU accumulates child self + descendant absolute times when reaping.
+    return ProcessCpuTimes(
+        mach_ticks_to_ns(info.ri_user_time + info.ri_system_time, *timebase) / 1_000_000,
+        mach_ticks_to_ns(info.ri_child_user_time + info.ri_child_system_time, *timebase) / 1_000_000,
+    )
+
+
+def process_cpu_times(pid: int) -> ProcessCpuTimes:
+    """Strict CPU accounting; unavailable counters must never become zero CPU."""
+    try:
+        if sys.platform == "darwin":
+            return _darwin_cpu_times(_darwin_rusage(pid), darwin_timebase())
+        # comm (field 2) may itself contain spaces/parentheses. utime through
+        # cstime are fields 14..17; child counters include waited-for children.
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        ticks_per_second = os.sysconf("SC_CLK_TCK")
+        return ProcessCpuTimes(
+            (int(fields[11]) + int(fields[12])) * 1_000 / ticks_per_second,
+            (int(fields[13]) + int(fields[14])) * 1_000 / ticks_per_second,
+        )
+    except (AttributeError, OSError, ValueError, IndexError) as error:
+        raise ProofError(f"CPU accounting unavailable for pid={pid}: {error}") from error
+
+
+def cpu_accounting_self_check() -> dict[str, Any]:
+    """Reject unit regressions before a harness collects any turn samples."""
+    info = _DarwinRusageInfoV4()
+    info.ri_user_time, info.ri_system_time = 6_000_000, 3_000_000
+    info.ri_child_user_time, info.ri_child_system_time = 3_000_000, 6_000_000
+    if _darwin_cpu_times(info, (7, 3)) != ProcessCpuTimes(21.0, 21.0):
+        raise ProofError("CPU accounting self-check failed: Mach ticks treated as nanoseconds")
+    evidence: dict[str, Any] = {"synthetic_timebase_check": "passed"}
+    if sys.platform != "darwin":
+        return evidence
+    if resource is None:
+        raise ProofError("CPU accounting self-check requires getrusage")
+    numer, denom = darwin_timebase()
+    # Ensure enough accumulated CPU to expose tick-as-ns even in a fresh
+    # interpreter. This is an API consistency check, not a speed benchmark;
+    # no wall-time bound, host-load requirement, or performance claim.
+    target = time.process_time() + 0.025
+    while time.process_time() < target:
+        pass
+    before = resource.getrusage(resource.RUSAGE_SELF)
+    native = _process_usage(os.getpid())
+    cpu = process_cpu_times(os.getpid())
+    after = resource.getrusage(resource.RUSAGE_SELF)
+    low = (before.ru_utime + before.ru_stime) * 1_000 - 2
+    high = (after.ru_utime + after.ru_stime) * 1_000 + 2
+    if native is None or not low <= native[0] <= high or not low <= cpu.self_ms <= high:
+        raise ProofError(
+            f"CPU accounting self-check failed: proc_pid_rusage/getrusage disagree "
+            f"timebase={numer}/{denom}, native={native}, cpu={cpu}, bounds_ms={low, high}"
+        )
+    evidence.update(timebase={"numer": numer, "denom": denom},
+                    native_self_ms=cpu.self_ms, getrusage_bounds_ms=[low, high])
+    return evidence
+
+
 def _process_usage(pid: int) -> tuple[float, int, int] | None:
     if sys.platform == "darwin":
         try:
-            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            library.proc_pid_rusage.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_void_p,
-            ]
-            library.proc_pid_rusage.restype = ctypes.c_int
-            info = _DarwinRusageInfoV4()
-            if library.proc_pid_rusage(pid, 4, ctypes.byref(info)) != 0:
-                return None
-            cpu_ms = (info.ri_user_time + info.ri_system_time) / 1_000_000
+            info = _darwin_rusage(pid)
+            cpu_ms = _darwin_cpu_times(info, darwin_timebase()).self_ms
             # `phys_footprint` and `lifetime_max_phys_footprint` are accounting
             # metrics, not resident-set size. Return current resident bytes in
             # both slots on Darwin; the 2 ms live sampler owns the per-command
