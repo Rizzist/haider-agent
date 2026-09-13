@@ -2830,6 +2830,9 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         WireFrame::ShellOpened { shell }
         | WireFrame::ShellState { shell }
         | WireFrame::ShellClosed { shell } => vec![LiveReply::ShellChanged { shell }],
+        // This TUI tracks the individual lifecycle frames above. The
+        // coalesced absolute-count notification is redundant, not a fault.
+        WireFrame::ShellInventoryChanged { .. } => Vec::new(),
         WireFrame::ShellOutput { id, chunk_b64, .. } => {
             vec![LiveReply::SshShellOutput { id, chunk_b64 }]
         }

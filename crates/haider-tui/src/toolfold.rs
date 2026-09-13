@@ -814,7 +814,7 @@ pub fn fold_noun(name: &str, count: usize) -> String {
     let plural = count != 1;
     if matches!(
         name,
-        "bash" | "shell" | "sh" | "zsh" | "process_exec" | "ssh_shell" | "command"
+        "bash" | "shell" | "sh" | "zsh" | "process_exec" | "ssh_shell" | "command" | "user_command"
     ) {
         return if plural {
             "shell commands".to_owned()

@@ -68,6 +68,8 @@ impl<'a> LayoutCtx<'a> {
 /// hit map lives in.
 #[derive(Debug, Default, Clone, Copy)]
 struct EntryMarks {
+    /// Index of the visible tool summary, after any entry spacing.
+    summary: Option<usize>,
     /// Index, in the produced `lines`, of the `⏎ show all` affordance.
     show_all: Option<usize>,
 }
@@ -119,6 +121,7 @@ struct CachedTranscriptEntry {
     /// rows backwards from the entry's height put the mouse target a row
     /// below the line the reader clicked.
     show_all_row: Option<u64>,
+    summary_row: Option<u64>,
 }
 
 impl TranscriptLayoutCache {
@@ -387,6 +390,10 @@ fn cache_transcript_entry_window(
         .show_all
         .and_then(|index| lines.get(..index))
         .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
+    let summary_row = marks
+        .summary
+        .and_then(|index| lines.get(..index))
+        .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
     let dynamic = matches!(
         entry,
         TranscriptEntry::Item(ItemBlock {
@@ -406,6 +413,7 @@ fn cache_transcript_entry_window(
         dynamic,
         windowed: false,
         show_all_row,
+        summary_row,
     }
 }
 
@@ -522,6 +530,7 @@ fn cache_extreme_agent_entry(
             height,
             dynamic: false,
             show_all_row: None,
+            summary_row: None,
             windowed: true,
         };
     }
@@ -572,6 +581,7 @@ fn cache_extreme_agent_entry(
             height: estimated_height,
             dynamic: false,
             show_all_row: None,
+            summary_row: None,
             windowed: true,
         };
     };
@@ -636,6 +646,7 @@ fn cache_extreme_agent_entry(
         height: estimated_height.max(line_start.saturating_add(retained_height)),
         dynamic: false,
         show_all_row: None,
+        summary_row: None,
         windowed: true,
     }
 }
@@ -715,15 +726,20 @@ pub fn foldable_runs(
             {
                 Some(name.clone())
             }
-            // A `!`/model shell execution folds under the reference's own
-            // noun; `toolfold::fold_noun` maps it to "shell commands".
+            // Keep user actions separate from model calls, including when
+            // folded; both use the established "shell commands" noun.
             TurnItem::CommandExecution {
                 status,
                 exit_code: Some(0),
                 ..
-            } if *status == haider_protocol::item::ToolStatus::Completed => {
-                Some("command".to_owned())
-            }
+            } if *status == haider_protocol::item::ToolStatus::Completed => Some(
+                if block.user_command {
+                    "user_command"
+                } else {
+                    "command"
+                }
+                .to_owned(),
+            ),
             _ => None,
         }
     });
@@ -15113,6 +15129,15 @@ fn tool_disclosure_lines<'a>(
     let theme = ctx.theme;
     let cells = ctx.width as usize;
     let item_id = block.item_id.as_str();
+    if matches!(ctx.role(index), FoldRole::Member) {
+        return;
+    }
+    // Direct user actions get the same breathing row as User and Shell
+    // entries. Hidden fold members contribute neither content nor spacing.
+    if block.user_command {
+        lines.push(Line::default());
+    }
+    marks.summary = Some(lines.len());
     match ctx.role(index) {
         // The head speaks for the whole run; every member renders NOTHING,
         // and its zero measured height flows through the layout cache's
@@ -15280,7 +15305,9 @@ fn tool_row_hits(
         {
             hits.push((rect, Hit::ToolShowAll(item_id.clone())));
         }
-        if let Some(rect) = row_rect(start) {
+        if let Some(offset) = entry.summary_row
+            && let Some(rect) = row_rect(start.saturating_add(offset))
+        {
             hits.push((
                 rect,
                 if matches!(ctx.role(index), FoldRole::Head(_)) {
