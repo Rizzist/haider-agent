@@ -12518,13 +12518,12 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // the band — the same shared-predicate discipline as the chip row, so
     // the geometry and the paint can never disagree.
     let notice = u16::from(model.composer_notice.is_some());
-    let completion = model
-        .mention_completion
-        .as_ref()
-        .filter(|completion| !completion.candidates.is_empty())
-        .map_or(0, |completion| {
-            u16::try_from(completion.candidates.len().min(4)).unwrap_or(4)
-        });
+    let completion = model.mention_completion.as_ref().map_or(0, |completion| {
+        // The truncation disclosure is painted above the candidates, even
+        // when none match. Reserve its row so it cannot cover the draft.
+        u16::try_from(completion.candidates.len().min(4)).unwrap_or(4)
+            + u16::from(completion.scan_truncated)
+    });
     u16::try_from(rows)
         .unwrap_or(1)
         .saturating_add(chips)

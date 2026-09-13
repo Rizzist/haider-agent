@@ -9,7 +9,7 @@ use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::ids::ItemId;
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem};
-use haider_tui::app::{AppEvent, AppModel, Screen};
+use haider_tui::app::{AppEvent, AppModel, MentionCompletion, Screen};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod common;
@@ -333,6 +333,91 @@ fn mention_scan_ceiling_is_reported_even_without_matches() {
         "@absentx",
         "marker is not a candidate"
     );
+}
+
+#[test]
+fn truncated_mentions_render_query_and_marker_without_matches() {
+    let mut model = session_model();
+    model.composer.set_text("@absentx");
+    model.mention_completion = Some(MentionCompletion {
+        query: "absentx".to_owned(),
+        scan_truncated: true,
+        ..MentionCompletion::default()
+    });
+
+    assert_truncated_completion_rows(&model, "@absentx", &[]);
+}
+
+#[test]
+fn truncated_mentions_render_query_marker_and_candidate_window() {
+    let mut model = session_model();
+    model.composer.set_text("@file-");
+    model.mention_completion = Some(MentionCompletion {
+        query: "file-".to_owned(),
+        candidates: (0..5).map(|index| format!("file-{index:03}.txt")).collect(),
+        scan_truncated: true,
+        ..MentionCompletion::default()
+    });
+
+    assert_truncated_completion_rows(
+        &model,
+        "@file-",
+        &[
+            "▸ @file-000.txt",
+            "@file-001.txt",
+            "@file-002.txt",
+            "@file-003.txt",
+        ],
+    );
+    for _ in 0..4 {
+        model.handle(common::key(KeyCode::Down));
+    }
+    assert_truncated_completion_rows(
+        &model,
+        "@file-",
+        &[
+            "@file-001.txt",
+            "@file-002.txt",
+            "@file-003.txt",
+            "▸ @file-004.txt",
+        ],
+    );
+}
+
+fn assert_truncated_completion_rows(model: &AppModel, query: &str, candidates: &[&str]) {
+    for (width, height) in [(100, 30), (40, 20)] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal
+            .draw(|frame| {
+                haider_tui::render::render(model, frame);
+            })
+            .expect("render");
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        // Match the composer sigil with the query, so a candidate containing
+        // the same prefix cannot stand in for a visible draft.
+        let query_row = rows
+            .iter()
+            .position(|row| row.contains(&format!("❯ {query}")))
+            .unwrap_or_else(|| panic!("query hidden at {width}x{height}:\n{}", rows.join("\n")));
+        assert_eq!(rows[query_row + 1], "… Workspace scan truncated");
+        for (offset, candidate) in candidates.iter().enumerate() {
+            assert_eq!(&rows[query_row + 2 + offset], candidate);
+        }
+    }
 }
 
 #[test]
