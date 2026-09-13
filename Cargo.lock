@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "haider-android"
-version = "0.0.970"
+version = "0.0.971"
 dependencies = [
  "async-trait",
  "haider-accounts",
