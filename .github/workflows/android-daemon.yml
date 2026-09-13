@@ -23,6 +23,8 @@ permissions:
 jobs:
   native:
     runs-on: ubuntu-24.04
+    # Version bumps rebuild workspace crates; allow cold two-ABI fat-LTO builds.
+    timeout-minutes: 75
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'

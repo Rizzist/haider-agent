@@ -19,6 +19,8 @@ permissions:
 jobs:
   build-apk:
     runs-on: ubuntu-24.04
+    # Version bumps rebuild workspace crates; allow cold two-ABI fat-LTO builds.
+    timeout-minutes: 75
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
@@ -205,6 +207,7 @@ jobs:
     continue-on-error: true
     needs: build-apk
     runs-on: ubuntu-24.04
+    # Downloads prebuilt APKs; no cold native compilation needs extra time here.
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -239,6 +242,7 @@ jobs:
     continue-on-error: true
     needs: build-apk
     runs-on: ubuntu-24.04
+    # Both tiers download prebuilt APKs; retain the existing runtime-test budget.
     timeout-minutes: 55
     strategy:
       fail-fast: false
