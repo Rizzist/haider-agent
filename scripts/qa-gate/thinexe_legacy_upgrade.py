@@ -616,7 +616,7 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path, default=Path("/private/tmp/thinexe-before"))
     parser.add_argument("--candidate", type=Path, default=Path("target/release"))
     parser.add_argument("--compat", type=Path, default=Path("target/release/haider-compat"))
-    parser.add_argument("--version", default="0.0.970")
+    parser.add_argument("--version", default="0.0.971")
     parser.add_argument("--repository", default="Rizzist/haider-agent")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--keep-scratch", action="store_true")

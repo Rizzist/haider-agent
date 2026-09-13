@@ -63,7 +63,7 @@ fn live_model(vision: Option<bool>) -> AppModel {
     model.daemon_features = [haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned()]
         .into_iter()
         .collect();
-    model.daemon_version = Some("0.0.970".to_owned());
+    model.daemon_version = Some("0.0.971".to_owned());
     model
         .providers
         .apply_snapshot(summaries_declaring_vision(vision), 1);

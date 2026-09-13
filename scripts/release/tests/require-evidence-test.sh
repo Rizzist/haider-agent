@@ -7,7 +7,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/fixtures"
 export GH_STUB_ROOT="$tmp"
 export GH_STUB_SHA=0123456789abcdef0123456789abcdef01234567
-export GITHUB_SHA="$GH_STUB_SHA" GITHUB_REF_NAME=v0.0.970 GITHUB_REPOSITORY=owner/repo
+export GITHUB_SHA="$GH_STUB_SHA" GITHUB_REF_NAME=v0.0.971 GITHUB_REPOSITORY=owner/repo
 export REQUIRE_EVIDENCE_ATTEMPTS=4 REQUIRE_EVIDENCE_INTERVAL=0
 export PATH="$tmp/bin:$PATH"
 

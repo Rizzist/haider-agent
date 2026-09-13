@@ -56,7 +56,7 @@ def render(payload: Path, manifest: Path, version: str, target: str,
 
 def compile_fixture(work: Path) -> None:
     """Use the release archive/manifest pipeline, with bytes never meant to execute."""
-    version = "0.0.970"
+    version = "0.0.971"
     work.mkdir(parents=True, exist_ok=True)
     archive = work / f"haider-v{version}-{TARGET}.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
