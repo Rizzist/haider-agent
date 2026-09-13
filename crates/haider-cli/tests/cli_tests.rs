@@ -5155,3 +5155,80 @@ fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
         );
     }
 }
+
+/// Real 0.0.971 session/journal rows, read by the candidate daemon. No account
+/// exists: model admission must precede credential resolution on an old turn.
+#[test]
+fn preupgrade_go_session_cli_refuses_before_any_provider_round() {
+    let mut command = haider();
+    let workspace = command
+        .get_current_dir()
+        .expect("isolated workspace")
+        .to_path_buf();
+    {
+        let store = haider_store::Store::open(&command.profile).expect("upgrade profile");
+        store.put_provider_models(
+            "haider-code",
+            r#"[{"slug":"deepseek-v4-flash","display_name":"DeepSeek V4 Flash","supported_efforts":[],"visible":true}]"#,
+            None,
+            1,
+        ).expect("published post-upgrade catalog");
+        let connection = rusqlite::Connection::open(command.profile.join("store.sqlite"))
+            .expect("fixture database");
+        let sql = include_str!("fixtures/preupgrade-go-session.sql").replace(
+            "/private/tmp/h972-preupgrade-8vnw1rvt/workspace",
+            &workspace
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('\'', "''"),
+        );
+        connection
+            .execute_batch(&sql)
+            .expect("import actual release session and journal");
+    }
+    // Production account resolution, with no ambient credentials or fake
+    // provider injection inherited from the host test process.
+    command.env_clear();
+    for name in ["PATH", "SYSTEMROOT", "WINDIR", "PATHEXT"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let profile = command.profile.clone();
+    configure_test_home(&mut command, &profile);
+    command
+        .env("HAIDER_PROFILE_DIR", &profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env("HAIDER_NO_UPDATE_CHECK", "1")
+        .env("RUST_MIN_STACK", "8388608");
+    let output = command
+        .args([
+            "run",
+            "--session",
+            "session-6d3a6a6c6fd8bfdfdae2ee6a71694a4a",
+            "-p",
+            "Reply with OK.",
+            "--json",
+        ])
+        .output()
+        .expect("run the actual candidate CLI and daemon");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)));
+    assert!(!output.status.success(), "{result}");
+    assert_eq!(
+        result["model"], "Go",
+        "never silently substitute the old selection"
+    );
+    assert_eq!(
+        result["provider_rounds"].as_array().expect("rounds").len(),
+        0,
+        "{result}"
+    );
+    assert_eq!(result["error"]["code"], "invalid_argument", "{result}");
+    let message = result["error"]["message"]
+        .as_str()
+        .expect("actionable refusal");
+    assert!(message.contains("explicitly reselect"), "{message}");
+    assert!(message.contains("haider models --refresh"), "{message}");
+    terminate_daemon_checked(&command.profile).expect("stop owned upgrade daemon");
+}

@@ -17,6 +17,12 @@ picker row requests discovery. Public discovery never resolves or sends a
 credential, including when a caller supplies an invalid key. After discovery,
 Haider Code's automatic default is selected from the returned pickable IDs.
 Persisted Go/Go Max defaults are cleared on upgrade. They are not aliases.
+Ordinary and resumed turns recheck persisted session models against the same
+selection authority before resolving credentials. Adapter construction and
+attempt resolution also enforce admission for refresh, rotation and retries.
+An obsolete saved selection receives a nonretryable refusal with refresh and
+explicit reselection instructions; it is never silently replaced by a default
+or normalized alias. A stale remote catalog can still admit its listed IDs.
 Offline catalogs and explicitly user-configured custom advisory routes retain
 their separate semantics; a user-owned passthrough ID is not advertised as a
 discovered model.
@@ -50,3 +56,11 @@ and a private `HAIDER_RUNTIME_DIR`: first `haider provider list` and
 The first view must show never-fetched/no default; the second must contain
 actual public IDs. Explicit Go selection must refuse. Stop only that profile's
 daemon afterward with `haider daemon stop`.
+
+The repair regression imports actual session/journal rows created by the
+installed 0.0.971 CLI into a fresh store and resumes them through the candidate
+CLI. The paired credentialed recording-provider test uses the same release
+metadata and asserts zero provider rounds for ordinary and resumed turns.
+Its mutation removes persisted-model admission and must send Go to the
+recording provider. Fixture provenance and release hashes are recorded in
+`crates/haider-cli/tests/fixtures/preupgrade-go-session.md`.

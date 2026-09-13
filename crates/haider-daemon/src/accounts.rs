@@ -9323,8 +9323,9 @@ impl AccountsProviderFactory {
     }
 
     /// Shares the daemon's typed durable-catalog projection with per-turn
-    /// adapters. This is capability metadata only: the session's pinned
-    /// model remains authoritative even when no matching record exists.
+    /// adapters for capability enrichment. Turn admission separately reads
+    /// the live management snapshot; a persisted selection is not proof that
+    /// an authoritative remote catalog still serves that model.
     pub(crate) fn with_model_source(
         mut self,
         model_source: Arc<CachedProviderModelSource>,
@@ -9340,6 +9341,81 @@ impl AccountsProviderFactory {
             .providers
             .into_iter()
             .find(|profile| profile.provider == provider)
+    }
+
+    /// Persistence is not catalog admission. This is shared by ordinary /
+    /// recovered turns and attempt resolution, including retries that reuse
+    /// an adapter. Only authoritative remote catalogs revoke a saved model;
+    /// offline and custom/advisory passthrough behavior stays unchanged. Never
+    /// silently canonicalize or replace the session's pinned selection.
+    fn admit_persisted_model(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> Result<(), HaiderError> {
+        let summaries = match &self.management {
+            Some(management) => {
+                management
+                    .read()
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::ProviderError,
+                            "model inventory snapshot is unavailable",
+                            true,
+                        )
+                    })?
+                    .providers
+            }
+            // Test/injected factories may have no management authority.
+            None => Vec::new(),
+        };
+        let remote_authority = summaries.iter().any(|summary| {
+            summary.provider == metadata.provider
+                && matches!(
+                    summary.catalog,
+                    haider_rpc::ProviderCatalogKindWire::Public
+                        | haider_rpc::ProviderCatalogKindWire::Authenticated
+                )
+                && summary.inventory_authority
+                    == haider_rpc::ModelInventoryAuthorityWire::Authoritative
+        });
+        if !remote_authority {
+            return Ok(());
+        }
+        let authority = crate::model_select::ModelSelectionAuthority::new(None, summaries);
+        let selection = authority
+            .validate_selection_with_status(&metadata.provider, None, &metadata.model)
+            .and_then(|selection| {
+                if selection.model == metadata.model {
+                    Ok(selection)
+                } else {
+                    Err(crate::model_select::SelectionRefusal::ModelUnknown {
+                        provider: metadata.provider.clone(),
+                        model: metadata.model.clone(),
+                        inventory_age_ms: None,
+                        suggestions: vec![selection.model],
+                    })
+                }
+            });
+        selection.map(|_| ()).map_err(|refusal| {
+            let mut details = refusal.details();
+            details["model"] = serde_json::json!(metadata.model);
+            details["requires_model_reselection"] = serde_json::json!(true);
+            let mut error = HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "Saved model `{}` for provider `{}` cannot be used: {}. \
+                     Run `haider models --refresh {}`, then explicitly reselect a model \
+                     with `/model` or `haider run --session <session-id> --model <model-id>`.",
+                    metadata.model,
+                    metadata.provider,
+                    refusal.message(),
+                    metadata.provider,
+                ),
+                false,
+            );
+            error.details = Some(details);
+            error
+        })
     }
 
     fn model_context_window(&self, provider: &str, model: &str) -> Option<u64> {
@@ -9454,6 +9530,7 @@ impl AccountsProviderFactory {
         metadata: &haider_protocol::session::SessionMetadataV1,
         tuning: &ProviderTuning,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
+        self.admit_persisted_model(metadata)?;
         let mut profile = self.provider_profile(&descriptor.provider);
         let mut routed_descriptor;
         let descriptor = if let Some(base_url) = metadata.provider_base_url.as_ref() {
@@ -9706,6 +9783,7 @@ impl AccountsProviderFactory {
         descriptor: &CredentialDescriptor,
         metadata: &haider_protocol::session::SessionMetadataV1,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
+        self.admit_persisted_model(metadata)?;
         // Releasing a removed alias's supervised child is scoped by the LIVE
         // account list, so logging one Google account out drops exactly that
         // account's agent and lease and leaves every other alias's session
@@ -9751,6 +9829,7 @@ impl AccountsProviderFactory {
         metadata: &haider_protocol::session::SessionMetadataV1,
         tuning: &ProviderTuning,
     ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>, bool), HaiderError> {
+        self.admit_persisted_model(metadata)?;
         let selected = match metadata.account_alias.as_deref() {
             Some(alias) => self.resolve_selected_account(&metadata.provider, alias),
             None => self.resolve_account(&metadata.provider, None).await,
@@ -10032,6 +10111,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
         current_account: &CredentialAlias,
         error: &haider_provider::ProviderError,
     ) -> Result<haider_core::ProviderAttemptDecision, HaiderError> {
+        self.factory.admit_persisted_model(&self.metadata)?;
         if error.presentation.subcode.as_str() == "provider-web-tool-rejected"
             && self.tuning.web_tools
             && matches!(
@@ -12164,6 +12244,10 @@ impl AccountsRuntime {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "accounts_persisted_model_tests.rs"]
+mod persisted_model_tests;
 
 #[cfg(test)]
 #[path = "accounts_tests.rs"]
