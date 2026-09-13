@@ -135,6 +135,9 @@ class FleetScreenshotTest {
     private fun capturePanelEmpty(name: String, dark: Boolean) {
         val service = FakeDaemonService(FakeScenario.Populated)
         val panel = runBlocking { mapOf("s-nav" to service.fleet("s-nav")) }
+        // Snapshot outside composition, as `capturePanel` does: a bare `.value`
+        // read inside `setContent` is StateFlowValueCalledInComposition.
+        val sessions = service.sessions.value
         rule.setContent {
             ForgeTheme(dark = dark) {
                 Box(
@@ -145,7 +148,7 @@ class FleetScreenshotTest {
                 ) {
                     FleetPanelContent(
                         panel = panel,
-                        sessions = service.sessions.value,
+                        sessions = sessions,
                         loading = false,
                         onJump = {},
                         onOpenChild = { _, _, _ -> },

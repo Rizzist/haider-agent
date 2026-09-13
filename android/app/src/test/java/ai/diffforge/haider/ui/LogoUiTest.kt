@@ -19,6 +19,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.test.assertIsNotSelected
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -106,9 +108,8 @@ class LogoUiTest {
         assertOnly(dark = true)
     }
 
-    @Test
-    fun `the Settings chips re-render the mark live`() {
-        val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
+    /** The dark-themed app with a live, mutable style choice, opened on Settings. */
+    private fun openSettingsWithLiveStyle(service: FakeDaemonService) {
         val viewModel = ChatViewModel(service, searchDebounceMs = 0)
         val accounts = FakeAccountsRepository()
         rule.setContent {
@@ -131,6 +132,12 @@ class LogoUiTest {
         }
         viewModel.openOverlay(Overlay.Settings)
         rule.waitForIdle()
+    }
+
+    @Test
+    fun `the Settings chips re-render the mark live`() {
+        val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
+        openSettingsWithLiveStyle(service)
         // Auto on the dark theme: the preview is the dark variant.
         assertOnly(dark = true)
         rule.onNodeWithText("Light").performClick()
@@ -139,6 +146,22 @@ class LogoUiTest {
         rule.onNodeWithText("Auto").performClick()
         rule.waitForIdle()
         assertOnly(dark = true)
+    }
+
+    @Test
+    fun `the Settings chips expose their selection to accessibility`() {
+        val service = ComposeHost.install(FakeScenario.EmptyRosterReady)
+        openSettingsWithLiveStyle(service)
+        // The accent wash is not just paint: the chip in force says selected
+        // on its semantics node, and the other two say not selected.
+        rule.onNodeWithText("Auto").assertIsSelected()
+        rule.onNodeWithText("Light").assertIsNotSelected()
+        rule.onNodeWithText("Dark").assertIsNotSelected()
+        rule.onNodeWithText("Light").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithText("Light").assertIsSelected()
+        rule.onNodeWithText("Auto").assertIsNotSelected()
+        rule.onNodeWithText("Dark").assertIsNotSelected()
     }
 
     @Test

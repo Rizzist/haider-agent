@@ -222,8 +222,9 @@ private fun CardNote(text: String, color: androidx.compose.ui.graphics.Color) {
 }
 
 /**
- * A labelled row of chips. The chips carry `selected` semantics so TalkBack
- * says which one is in force, rather than reading four buttons with no state.
+ * A labelled row of chips. `ForgeChip` derives `selected` semantics from its
+ * `selected` parameter, so TalkBack says which one is in force rather than
+ * reading four buttons with no state.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -249,7 +250,6 @@ private fun <T> ChoiceRow(
                     selected = isSelected,
                     enabled = enabled,
                     contentDescription = text,
-                    modifier = Modifier.semantics { this.selected = isSelected },
                 ) {
                     Text(
                         text,

@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 
@@ -31,13 +32,19 @@ import androidx.compose.ui.unit.Dp
  * `heightIn(min = 48.dp)` on a chip looks like accessibility and is not: it
  * inflates the visual box and is what made the 970 composer eat 100 dp of the
  * short axis (UI-SPEC 4.1, D5, trap 6.6.1).
+ *
+ * [selected] is tri-state so the accent wash is never just paint: `true`/`false`
+ * mean the chip is one option in a selection group, and the same value drives
+ * both the styling and `selected` semantics, so a screen reader announces the
+ * state a sighted user sees. `null` (the default) means the chip is a plain
+ * button — a chip that merely *opens* something must not say "not selected".
  */
 @Composable
 fun ForgeChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     height: Dp = ForgeSize.chip,
-    selected: Boolean = false,
+    selected: Boolean? = null,
     borderColor: Color? = null,
     backgroundColor: Color? = null,
     enabled: Boolean = true,
@@ -45,8 +52,8 @@ fun ForgeChip(
     content: @Composable () -> Unit,
 ) {
     val colors = Forge.colors
-    val fill = backgroundColor ?: if (selected) colors.accentWash else colors.surfaceControl
-    val outline = borderColor ?: if (selected) colors.accent else colors.border
+    val fill = backgroundColor ?: if (selected == true) colors.accentWash else colors.surfaceControl
+    val outline = borderColor ?: if (selected == true) colors.accent else colors.border
     // The clickable parent IS the target: 48 x 48 minimum, with the small
     // visual chip centred inside it. `minimumInteractiveComponentSize` grows
     // only the platform's touch delegate, so the node a sweep (or a screen
@@ -59,6 +66,7 @@ fun ForgeChip(
             .clickable(enabled = enabled, onClick = onClick)
             .semantics {
                 this.role = Role.Button
+                if (selected != null) this.selected = selected
                 if (contentDescription != null) this.contentDescription = contentDescription
             },
         contentAlignment = Alignment.Center,
