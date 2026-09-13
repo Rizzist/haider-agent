@@ -320,6 +320,13 @@ fn item_reply_text_mut(item: &mut TurnItem) -> Option<&mut haider_protocol::repl
     }
 }
 
+fn is_foldable_tool_item(item: &TurnItem) -> bool {
+    matches!(
+        item,
+        TurnItem::ToolCall { .. } | TurnItem::CommandExecution { .. }
+    )
+}
+
 /// Session display state, reduced from the envelope stream.
 #[derive(Debug, Default)]
 pub struct SessionProjection {
@@ -343,6 +350,9 @@ pub struct SessionProjection {
     workspace_unavailable: Option<WorkspaceUnavailable>,
     interrupted: bool,
     entries: Vec<TranscriptEntry>,
+    /// Ingest-time fast path for render's fold scan. Long transcripts that
+    /// contain no tool rows can skip disclosure analysis entirely.
+    has_tool_entries: bool,
     /// Entry ordinals for user prompts. This is raw-transcript metadata,
     /// maintained at ingest beside `entries`, so sticky-origin lookup never
     /// scans an arbitrarily large transcript on the frame path.
@@ -522,10 +532,14 @@ impl SessionProjection {
                 _ => None,
             })
             .collect();
+        let has_tool_entries = entries.iter().any(|entry| {
+            matches!(entry, TranscriptEntry::Item(block) if is_foldable_tool_item(&block.item))
+        });
         Self {
             entries,
             user_entries,
             screen_control_items,
+            has_tool_entries,
             menu,
             todos,
             usage,
@@ -1412,6 +1426,7 @@ impl SessionProjection {
         }
         match event {
             ItemEvent::Started { item_id, item } => {
+                self.has_tool_entries |= is_foldable_tool_item(item);
                 // Idempotency: a closed id never restarts, an open id never
                 // doubles (replay/re-delivery under fresh seqs). Active plans
                 // live in `todos`, not `entries` — a stale plan Started must
@@ -1453,6 +1468,7 @@ impl SessionProjection {
             }
             ItemEvent::Delta { item_id, delta } => self.apply_delta(item_id, delta),
             ItemEvent::Completed { item_id, item } => {
+                self.has_tool_entries |= is_foldable_tool_item(item);
                 if self.finished_items.contains(item_id) {
                     self.duplicate_items += 1;
                     return;
@@ -2200,6 +2216,11 @@ impl SessionProjection {
     #[must_use]
     pub(crate) const fn entry_mutation_revision(&self) -> u64 {
         self.entry_mutation_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn has_tool_entries(&self) -> bool {
+        self.has_tool_entries
     }
 
     /// Raw prompt-entry ordinals, in transcript order. Rendering uses this
