@@ -25,7 +25,7 @@ class MacOSPackageGateTests(unittest.TestCase):
         (self.root / 'usr/local/bin').mkdir(parents=True)
         (self.root / 'usr/local/share/haider').mkdir(parents=True)
         data = b'fixture binary\n'
-        self.manifest = {'version': '0.0.970', 'target': 'aarch64-apple-darwin',
+        self.manifest = {'version': '0.0.971', 'target': 'aarch64-apple-darwin',
                          'members': {'haider': hashlib.sha256(data).hexdigest()}}
         (self.source / 'manifest.json').write_text(json.dumps(self.manifest))
         (self.source / 'uninstall-haider.sh').write_bytes(b'#!/bin/sh\n')
@@ -39,10 +39,10 @@ class MacOSPackageGateTests(unittest.TestCase):
                       self.root / 'usr/local/bin/uninstall-haider.sh': 0o755}
         model_modes(self, self.modes)
         (self.expanded / 'PackageInfo').write_text(
-            '<pkg-info identifier="ai.haidercode.haider" version="0.0.970" install-location="/"/>')
+            '<pkg-info identifier="ai.haidercode.haider" version="0.0.971" install-location="/"/>')
 
     def check(self):
-        macos.verify(self.expanded, self.source, '0.0.970', 'aarch64-apple-darwin')
+        macos.verify(self.expanded, self.source, '0.0.971', 'aarch64-apple-darwin')
 
     def test_valid_payload(self):
         self.check()
@@ -59,7 +59,7 @@ class MacOSPackageGateTests(unittest.TestCase):
 
     def test_stale_package_version_rejected(self):
         p = self.expanded / 'PackageInfo'
-        p.write_text(p.read_text().replace('0.0.970', '0.0.969'))
+        p.write_text(p.read_text().replace('0.0.971', '0.0.969'))
         with self.assertRaisesRegex(ValueError, 'identifier/version'):
             self.check()
 

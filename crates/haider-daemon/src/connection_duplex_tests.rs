@@ -22,6 +22,10 @@ use std::collections::VecDeque;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 
 const FRAME_LIMIT: usize = 1024 * 1024;
+// Process creation is observed through the command-output event below. This
+// is only a runaway-test safeguard; startup is never declared successful by
+// elapsed time alone (Windows runners may be heavily loaded).
+const SHELL_START_SAFETY_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[cfg(unix)]
 const CANCELLABLE_COMMAND: &str = "printf started; sleep 30";
@@ -248,46 +252,41 @@ async fn shell_cancel_settles_and_keeps_the_duplex_connection_open() {
             },
         )
         .await;
-    let (run_id, item_id) = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        async {
-            let mut accepted = None;
-            let mut started = false;
-            loop {
-                match client.next().await.expect("shell start keeps connection open") {
-                    WireFrame::Response {
-                        body:
-                            ResponseBody::ShellExec {
-                                run_id: Some(run_id),
-                                item_id,
+    let (run_id, item_id) = tokio::time::timeout(SHELL_START_SAFETY_BOUND, async {
+        let mut accepted = None;
+        let mut started = false;
+        loop {
+            match client.next().await.expect("shell start keeps connection open") {
+                WireFrame::Response {
+                    body:
+                        ResponseBody::ShellExec {
+                            run_id: Some(run_id),
+                            item_id,
+                            ..
+                        },
+                    ..
+                } => accepted = Some((run_id, item_id)),
+                WireFrame::Event { envelope, .. }
+                    if envelope.payload.decode_event().is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            EventPayload::Item(ItemEvent::Delta {
+                                delta: ItemDelta::CommandOutput { chunk_b64, .. },
                                 ..
-                            },
-                        ..
-                    } => accepted = Some((run_id, item_id)),
-                    WireFrame::Event { envelope, .. }
-                        if envelope.payload.decode_event().is_ok_and(
-                            |payload| {
-                                matches!(
-                                    payload,
-                                    EventPayload::Item(ItemEvent::Delta {
-                                        delta: ItemDelta::CommandOutput { chunk_b64, .. },
-                                        ..
-                                    }) if base64::engine::general_purpose::STANDARD
-                                        .decode(chunk_b64.as_bytes())
-                                        .is_ok_and(|bytes| bytes.windows(7).any(|window| window == b"started"))
-                                )
-                            },
-                        ) => started = true,
-                    _ => {}
-                }
-                if started && let Some(accepted) = accepted {
-                    break accepted;
-                }
+                            }) if base64::engine::general_purpose::STANDARD
+                                .decode(chunk_b64.as_bytes())
+                                .is_ok_and(|bytes| bytes.windows(7).any(|window| window == b"started"))
+                        )
+                    }) => started = true,
+                _ => {}
             }
-        },
-    )
+            if started && let Some(accepted) = accepted {
+                break accepted;
+            }
+        }
+    })
     .await
-    .expect("shell process starts within the Windows-honest bound");
+    .expect("shell process emits its started marker within the safety bound");
 
     client
         .request(

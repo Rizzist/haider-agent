@@ -20,6 +20,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const TRANSCRIPT_OVERSCAN_ROWS: u64 = 2;
 const TRANSCRIPT_CACHE_ENTRIES: usize = 96;
@@ -83,6 +84,16 @@ pub(crate) struct TranscriptLayoutCache {
     source_ptr: usize,
     source_len: usize,
     phase: u8,
+    /// Fold runs depend only on transcript/fold revisions, not on the
+    /// animation phase. Keep them beside the viewport geometry so cached
+    /// frames do not rescan the full transcript just to rebuild unchanged
+    /// disclosure metadata.
+    runs: Arc<[crate::toolfold::FoldRun]>,
+    runs_revision: u64,
+    runs_entry_mutation_revision: u64,
+    runs_fold_revision: u64,
+    runs_source_ptr: usize,
+    runs_source_len: usize,
     entries: BTreeMap<usize, CachedTranscriptEntry>,
     corrections: BTreeMap<usize, i64>,
     default_height: u64,
@@ -111,6 +122,29 @@ struct CachedTranscriptEntry {
 }
 
 impl TranscriptLayoutCache {
+    fn cached_runs(
+        &mut self,
+        projection: &SessionProjection,
+        fold: &crate::toolfold::ToolFold,
+    ) -> Arc<[crate::toolfold::FoldRun]> {
+        let source = projection.entries();
+        let source_ptr = source.as_ptr() as usize;
+        let stale = self.runs_revision != projection.render_revision()
+            || self.runs_entry_mutation_revision != projection.entry_mutation_revision()
+            || self.runs_fold_revision != fold.revision()
+            || self.runs_source_ptr != source_ptr
+            || self.runs_source_len != source.len();
+        if stale {
+            self.runs = foldable_runs(projection, fold).into();
+            self.runs_revision = projection.render_revision();
+            self.runs_entry_mutation_revision = projection.entry_mutation_revision();
+            self.runs_fold_revision = fold.revision();
+            self.runs_source_ptr = source_ptr;
+            self.runs_source_len = source.len();
+        }
+        Arc::clone(&self.runs)
+    }
+
     fn reconcile(&mut self, projection: &SessionProjection, ctx: LayoutCtx<'_>) {
         let (theme_key, width, phase) = (ctx.theme.key, ctx.width, ctx.phase);
         // A disclosure change is a LAYOUT change: a collapsed row is two
@@ -652,7 +686,7 @@ pub fn foldable_runs(
     projection: &SessionProjection,
     fold: &crate::toolfold::ToolFold,
 ) -> Vec<crate::toolfold::FoldRun> {
-    if fold.verbosity().opens_rows() || fold.all_expanded() {
+    if !projection.has_tool_entries() || fold.verbosity().opens_rows() || fold.all_expanded() {
         return Vec::new();
     }
     let entries = projection.entries();
@@ -6279,7 +6313,7 @@ fn render_session(
     // window plus bounded overscan, while every scroll/jump coordinate stays
     // in the same global wrapped-row space as before.
     let mut transcript_cache = model.transcript_layout.borrow_mut();
-    let transcript_runs = foldable_runs(&model.projection, &model.toolfold);
+    let transcript_runs = transcript_cache.cached_runs(&model.projection, &model.toolfold);
     let layout_ctx = LayoutCtx {
         theme,
         width: transcript_area.width,
@@ -6287,7 +6321,7 @@ fn render_session(
         fold: &model.toolfold,
         timings: &model.tool_timings,
         now_ms: model.clock_ms,
-        runs: &transcript_runs,
+        runs: transcript_runs.as_ref(),
     };
     transcript_cache.reconcile(&model.projection, layout_ctx);
     let mut tail: Vec<Line<'static>> = Vec::new();
@@ -10770,7 +10804,7 @@ fn render_subagent(
         prefix.push(Line::default());
     }
     let mut transcript_cache = chip.transcript_layout.borrow_mut();
-    let transcript_runs = foldable_runs(&chip.transcript, &model.toolfold);
+    let transcript_runs = transcript_cache.cached_runs(&chip.transcript, &model.toolfold);
     let layout_ctx = LayoutCtx {
         theme,
         width: transcript_area.width,
@@ -10778,7 +10812,7 @@ fn render_subagent(
         fold: &model.toolfold,
         timings: &model.tool_timings,
         now_ms: model.clock_ms,
-        runs: &transcript_runs,
+        runs: transcript_runs.as_ref(),
     };
     transcript_cache.reconcile(&chip.transcript, layout_ctx);
     let mut tail: Vec<Line<'static>> = Vec::new();
@@ -12484,13 +12518,12 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // the band — the same shared-predicate discipline as the chip row, so
     // the geometry and the paint can never disagree.
     let notice = u16::from(model.composer_notice.is_some());
-    let completion = model
-        .mention_completion
-        .as_ref()
-        .filter(|completion| !completion.candidates.is_empty())
-        .map_or(0, |completion| {
-            u16::try_from(completion.candidates.len().min(4)).unwrap_or(4)
-        });
+    let completion = model.mention_completion.as_ref().map_or(0, |completion| {
+        // The truncation disclosure is painted above the candidates, even
+        // when none match. Reserve its row so it cannot cover the draft.
+        u16::try_from(completion.candidates.len().min(4)).unwrap_or(4)
+            + u16::from(completion.scan_truncated)
+    });
     u16::try_from(rows)
         .unwrap_or(1)
         .saturating_add(chips)
@@ -12675,14 +12708,14 @@ fn render_composer(
         row_area,
     );
     if let Some(completion) = &model.mention_completion
-        && !completion.candidates.is_empty()
+        && (!completion.candidates.is_empty() || completion.scan_truncated)
         && row_area.height > 0
     {
         let visible = completion.candidates.len().min(4);
         let start = completion
             .selected
             .saturating_sub(visible.saturating_sub(1));
-        let popup_lines = completion
+        let mut popup_lines = completion
             .candidates
             .iter()
             .enumerate()
@@ -12704,6 +12737,12 @@ fn render_composer(
                 )
             })
             .collect::<Vec<_>>();
+        if completion.scan_truncated {
+            popup_lines.insert(
+                0,
+                Line::styled(" … Workspace scan truncated", theme.dim_style()),
+            );
+        }
         let popup_height = u16::try_from(popup_lines.len())
             .unwrap_or(row_area.height)
             .min(row_area.height);

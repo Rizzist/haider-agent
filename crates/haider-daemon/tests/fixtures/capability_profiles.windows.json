@@ -262,7 +262,7 @@
     },
     {
       "name": "process_exec",
-      "description": "run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM \u2192 2 s grace \u2192 KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable",
+      "description": "run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -639,7 +639,7 @@
     },
     {
       "name": "process_exec",
-      "description": "run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM \u2192 2 s grace \u2192 KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable",
+      "description": "run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable",
       "input_schema": {
         "additionalProperties": false,
         "properties": {

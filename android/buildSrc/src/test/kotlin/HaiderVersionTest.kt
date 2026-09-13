@@ -8,7 +8,7 @@ import kotlin.test.assertTrue
 class HaiderVersionTest {
     @Test
     fun `wave version maps directly to its monotonic Android code`() {
-        assertEquals(HaiderVersion("0.0.962", 962), HaiderVersion.parse("0.0.962"))
+        assertEquals(HaiderVersion("0.0.971", 971), HaiderVersion.parse("0.0.971"))
     }
 
     @Test
@@ -28,14 +28,14 @@ class HaiderVersionTest {
             version = "9.9.9"
 
             [workspace.package]
-            version = "0.0.962"
+            version = "0.0.971"
             edition = "2024"
 
             [workspace.dependencies]
             version = "1"
         """.trimIndent()
 
-        assertEquals(HaiderVersion("0.0.962", 962), HaiderVersion.fromWorkspaceManifest(manifest))
+        assertEquals(HaiderVersion("0.0.971", 971), HaiderVersion.fromWorkspaceManifest(manifest))
     }
 
     @Test

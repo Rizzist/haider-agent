@@ -24,10 +24,10 @@ class HistoricalUpgradeFixtureTests(unittest.TestCase):
             for negative in (False, True):
                 selected = sources if negative else {key: sources[key] for key in ("haider", "haiderd")}
                 path = root / f"archive-{negative}.xz"
-                legacy.make_archive(path, "haider-v0.0.970-fixture", selected)
+                legacy.make_archive(path, "haider-v0.0.971-fixture", selected)
                 with tarfile.open(path, "r:xz") as archive:
-                    self.assertEqual(archive.getnames(), ["haider-v0.0.970-fixture"] +
-                                     ["haider-v0.0.970-fixture/" + name for name in selected])
+                    self.assertEqual(archive.getnames(), ["haider-v0.0.971-fixture"] +
+                                     ["haider-v0.0.971-fixture/" + name for name in selected])
                     self.assertTrue(all(member.isfile() and member.mode & 0o100
                                         for member in archive.getmembers()[1:]))
 
@@ -58,7 +58,7 @@ class HistoricalUpgradeFixtureTests(unittest.TestCase):
             archive.write_bytes(b"fixture archive")
             cert, key = legacy.create_certificate(root)
             checked = []
-            fixture = legacy.Fixture("0.0.970", "aarch64-apple-darwin", "owner/repo", archive,
+            fixture = legacy.Fixture("0.0.971", "aarch64-apple-darwin", "owner/repo", archive,
                                      lambda: checked.append(True))
             with legacy.proxy(fixture, cert, key) as address:
                 env = legacy.child_environment(root / "child", address, cert)
@@ -68,7 +68,7 @@ class HistoricalUpgradeFixtureTests(unittest.TestCase):
                                         capture_output=True, timeout=legacy.VERSION_QUERY.seconds)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 release = json.loads(result.stdout)[0]
-                self.assertEqual(release["tag_name"], "v0.0.970")
+                self.assertEqual(release["tag_name"], "v0.0.971")
                 for asset in release["assets"]:
                     result = subprocess.run([legacy.CURL, "--fail", "--silent", "--show-error",
                                              "--max-time", "15", asset["browser_download_url"]],
@@ -82,7 +82,7 @@ class HistoricalUpgradeFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             archive = Path(scratch) / "fixture"
             archive.write_bytes(b"fixture")
-            fixture = legacy.Fixture("0.0.970", "test", "owner/repo", archive)
+            fixture = legacy.Fixture("0.0.971", "test", "owner/repo", archive)
             with self.assertRaisesRegex(legacy.ProofError, "unexpected fixture request"):
                 fixture.response("unrelated.example", "/")
 
