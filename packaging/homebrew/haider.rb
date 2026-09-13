@@ -2,25 +2,25 @@ class Haider < Formula
   desc "Provider-agnostic coding-agent TUI and runtime"
   homepage "https://github.com/Rizzist/haider-agent"
   license "LicenseRef-KOA-P-1.0"
-  version "0.0.970"
+  version "0.0.971"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin-split.tar.xz"
-      sha256 "af491b0ff35a3308cef7740e964bc5477dbe302ad1b9fe777d81180e8c0ba1b4"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-aarch64-apple-darwin-split.tar.xz"
+      sha256 "aa2e7d4f497ff19bff7c8669a4af853fcfb2086499290416149962bcd611c598"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-x86_64-apple-darwin-split.tar.xz"
-      sha256 "054e21356fadff577a2e2d99622dd41ea3ca62ee3ff8ede23151ea3d7f28a5ba"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-x86_64-apple-darwin-split.tar.xz"
+      sha256 "6e005e938ced1f5db7ffb87f776ac715feac51a1419da07cb862e169282bd06b"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-unknown-linux-gnu-split.tar.xz"
-      sha256 "cc32f8d1dbe9be0ee13b765187b90db1c6cc81f65620b8a6c5e95992b8e703fc"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-aarch64-unknown-linux-gnu-split.tar.xz"
+      sha256 "7ca151b99295446eb0aa2672d2bf5c079d8c78cc39edff139dfa56368dc24da6"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-x86_64-unknown-linux-gnu-split.tar.xz"
-      sha256 "c2130890836f85a09266579521be8339e673ce47eb7678c78033df751e3bce44"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-x86_64-unknown-linux-gnu-split.tar.xz"
+      sha256 "51a1aa61913f92a1c3d1d575e5b0d6e03baa44a6a881d206bfef73c8f9b85ae6"
     end
   end
 
