@@ -12,6 +12,7 @@ import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.scaffold.HaiderApp
 import ai.diffforge.haider.ui.scaffold.InMemoryBannerDismissals
 import ai.diffforge.haider.ui.scaffold.SystemAction
+import ai.diffforge.haider.ui.theme.LogoStyle
 import ai.diffforge.haider.ui.theme.ThemeMode
 import androidx.compose.ui.test.junit4.ComposeContentTestRule
 
@@ -43,6 +44,8 @@ fun ComposeContentTestRule.setHaiderApp(
     oauth: OAuthAttemptController? = null,
     dark: Boolean = true,
     themeMode: ThemeMode = ThemeMode.Dark,
+    logoStyle: LogoStyle = LogoStyle.Auto,
+    onLogoStyle: (LogoStyle) -> Unit = {},
     onSystemAction: (SystemAction) -> Unit = {},
     onOpenUrl: (String) -> Unit = {},
 ): ChatViewModel {
@@ -57,6 +60,8 @@ fun ComposeContentTestRule.setHaiderApp(
             appVersion = "0.0.970",
             themeMode = themeMode,
             onThemeMode = {},
+            logoStyle = logoStyle,
+            onLogoStyle = onLogoStyle,
             onSystemAction = onSystemAction,
             onOpenUrl = onOpenUrl,
             dismissals = InMemoryBannerDismissals(),

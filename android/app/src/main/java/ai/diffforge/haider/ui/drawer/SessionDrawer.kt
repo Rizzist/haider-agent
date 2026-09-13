@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui.drawer
 
 import ai.diffforge.haider.R
 import ai.diffforge.haider.ui.components.ForgeIconButton
+import ai.diffforge.haider.ui.components.HaiderLogo
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.ModelNames
 import ai.diffforge.haider.ui.state.SessionFilter
@@ -13,6 +14,7 @@ import ai.diffforge.haider.ui.theme.ForgeMotion
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
+import ai.diffforge.haider.ui.theme.LogoStyle
 import ai.diffforge.haider.ui.theme.ThemeMode
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -89,6 +91,7 @@ const val DRAWER_HEAD_TAG = "drawer_head"
 fun SessionDrawer(
     state: AppUiState,
     themeMode: ThemeMode,
+    logoStyle: LogoStyle = LogoStyle.Auto,
     appVersion: String,
     /** False while the drawer is shut: its rows must not animate (O5). */
     open: Boolean = true,
@@ -181,6 +184,13 @@ fun SessionDrawer(
             .background(colors.surface)
             .padding(horizontal = ForgeSpace.lg),
     ) {
+        // Identity: the Haider Code wordmark (owner request 2026-09-13),
+        // above the control row and outside every touch target.
+        HaiderLogo(
+            style = logoStyle,
+            width = ForgeSize.logoDrawer,
+            modifier = Modifier.padding(top = ForgeSpace.lg, start = ForgeSpace.xs),
+        )
         // One row for both: the daemon's state on the left, New chat and the
         // collapse chevron on the right. Round 9 spent three full rows here —
         // a chevron alone, a status line, and a New chat row — which is the

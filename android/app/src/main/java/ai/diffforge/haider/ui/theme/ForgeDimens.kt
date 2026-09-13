@@ -108,6 +108,18 @@ object ForgeSize {
     val activityDot = 5.dp
     /** The 24x24 viewport every ported vendor mark is drawn on. */
     val markViewport = 24.dp
+
+    // ---------- Haider Code wordmark (lane 971-ui-logo) ----------
+
+    /** The 64x23 pixel grid the wordmark is drawn on (haidercode-web logo.svg). */
+    val logoViewportWidth = 64.dp
+    val logoViewportHeight = 23.dp
+    /** The wordmark at the top of the start surface. */
+    val logoStart = 128.dp
+    /** The wordmark in the drawer's identity row. */
+    val logoDrawer = 96.dp
+    /** The wordmark preview beside the Settings logo-style choice. */
+    val logoSettings = 112.dp
     /** An attachment thumbnail in the transcript or the composer strip. */
     val thumbnail = 56.dp
     /** The name column inside a file tile. */

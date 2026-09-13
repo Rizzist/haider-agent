@@ -212,6 +212,8 @@
     <string name="settings_section_accounts">Accounts</string>
     <string name="settings_section_permissions">Permissions</string>
     <string name="settings_section_appearance">Appearance</string>
+    <string name="settings_logo_style">Logo style</string>
+    <string name="logo_style_auto">Auto</string>
     <string name="settings_section_updates">Updates</string>
     <string name="settings_section_about">About</string>
     <string name="permission_granted">Granted</string>
