@@ -6,12 +6,14 @@ import ai.diffforge.haider.ui.components.ForgeButton
 import ai.diffforge.haider.ui.components.ForgeButtonKind
 import ai.diffforge.haider.ui.components.ForgeChip
 import ai.diffforge.haider.ui.components.ForgeIconButton
+import ai.diffforge.haider.ui.components.HaiderLogo
 import ai.diffforge.haider.ui.drawer.resourceLine
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
+import ai.diffforge.haider.ui.theme.LogoStyle
 import ai.diffforge.haider.ui.theme.ThemeMode
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -78,6 +80,8 @@ fun SettingsScreen(
     appVersion: String,
     accountsSummary: String,
     elapsedRealtimeMs: Long,
+    logoStyle: LogoStyle = LogoStyle.Auto,
+    onLogoStyle: (LogoStyle) -> Unit = {},
     onBack: () -> Unit,
     onThemeMode: (ThemeMode) -> Unit,
     onOpenAccounts: () -> Unit,
@@ -205,6 +209,23 @@ fun SettingsScreen(
                 icon = Icons.Rounded.AccountTree,
             )
 
+            SectionLabel(R.string.settings_section_appearance)
+            // The wordmark previews the choice right here: the surfaces that
+            // wear it (drawer, start) are not visible from Settings.
+            Card {
+                HaiderLogo(style = logoStyle, width = ForgeSize.logoSettings)
+                Text(
+                    stringResource(R.string.settings_logo_style),
+                    style = type.sessionTitle,
+                    color = colors.text,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(ForgeSpace.md)) {
+                    LogoStyleChip(LogoStyle.Auto, R.string.logo_style_auto, logoStyle, onLogoStyle)
+                    LogoStyleChip(LogoStyle.Light, R.string.appearance_light, logoStyle, onLogoStyle)
+                    LogoStyleChip(LogoStyle.Dark, R.string.appearance_dark, logoStyle, onLogoStyle)
+                }
+            }
+
             SectionLabel(R.string.settings_section_permissions)
             // Rows, not paragraphs: title, one-line status, chevron. The
             // explanation and the action live on the row's detail sheet
@@ -324,6 +345,28 @@ private fun standing(value: PermissionStanding): String = stringResource(
         PermissionStanding.Unknown -> R.string.permission_unknown
     },
 )
+
+/** One of the three logo colourway choices, in the app's chip idiom. */
+@Composable
+private fun LogoStyleChip(
+    value: LogoStyle,
+    labelRes: Int,
+    current: LogoStyle,
+    onSelect: (LogoStyle) -> Unit,
+) {
+    val selected = value == current
+    ForgeChip(
+        onClick = { onSelect(value) },
+        selected = selected,
+        contentDescription = stringResource(labelRes),
+    ) {
+        Text(
+            stringResource(labelRes),
+            style = Forge.type.chip,
+            color = if (selected) Forge.colors.text else Forge.colors.textMuted,
+        )
+    }
+}
 
 /** The explanation and the action, on the row that asked for them. */
 @OptIn(ExperimentalMaterial3Api::class)

@@ -1,6 +1,7 @@
 package ai.diffforge.haider.ui.start
 
 import ai.diffforge.haider.R
+import ai.diffforge.haider.ui.components.HaiderLogo
 import ai.diffforge.haider.ui.daemon.DaemonStatus
 import ai.diffforge.haider.ui.drawer.SessionRowAction
 import ai.diffforge.haider.ui.drawer.SessionRowItem
@@ -13,6 +14,7 @@ import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
+import ai.diffforge.haider.ui.theme.LogoStyle
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -64,6 +66,7 @@ fun StartSurface(
     onGrant: (AutonomyGrant) -> Unit,
     onSelectSession: (String) -> Unit,
     onSeeAllSessions: () -> Unit,
+    logoStyle: LogoStyle = LogoStyle.Auto,
     modifier: Modifier = Modifier,
 ) {
     val colors = Forge.colors
@@ -79,16 +82,20 @@ fun StartSurface(
             .padding(top = ForgeSize.startFirstChildInset, bottom = ForgeSpace.xxl),
         verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
     ) {
-        // No hero: the logo, the version line and "Ready. Ask for anything on
-        // this phone." were three ways of filling a screen whose content is
-        // either the checklist or the suggestions (addition F, F1/S7). The
-        // version lives in Settings.
+        // The wordmark, alone — the owner asked the site's calligraphy back
+        // onto this header (2026-09-13), superseding F1 for the mark itself.
+        // The version line and the "Ready." sentence stay gone.
+        // Boxed so the surface's first-child tag and the logo's own variant
+        // tag stay two nodes: two testTags on one chain and the outer eats
+        // the inner.
+        Box(Modifier.testTag(START_FIRST_CHILD_TAG)) {
+            HaiderLogo(style = logoStyle, width = ForgeSize.logoStart)
+        }
         if (!setup.complete) {
             Text(
                 stringResource(R.string.start_title),
                 style = type.h1,
                 color = colors.text,
-                modifier = Modifier.testTag(START_FIRST_CHILD_TAG),
             )
             Column(
                 Modifier
@@ -127,7 +134,7 @@ fun StartSurface(
         if (!setup.complete) {
             Unit
         } else if (state.sessions.size <= 1) {
-            EmptySessionBlock(modifier = Modifier.testTag(START_FIRST_CHILD_TAG))
+            EmptySessionBlock()
         } else {
             RecentSessions(
                 state = state,

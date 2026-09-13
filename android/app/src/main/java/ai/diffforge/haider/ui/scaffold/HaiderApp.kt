@@ -57,6 +57,7 @@ import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
 import ai.diffforge.haider.ui.theme.ForgeTheme
+import ai.diffforge.haider.ui.theme.LogoStyle
 import ai.diffforge.haider.ui.theme.ThemeMode
 import ai.diffforge.haider.update.UpdateUiState
 import androidx.activity.compose.BackHandler
@@ -117,6 +118,8 @@ fun HaiderApp(
     appVersion: String,
     themeMode: ThemeMode,
     onThemeMode: (ThemeMode) -> Unit,
+    logoStyle: LogoStyle = LogoStyle.Auto,
+    onLogoStyle: (LogoStyle) -> Unit = {},
     updateState: UpdateUiState = UpdateUiState.Hidden,
     onUpdateAction: () -> Unit = {},
     onOpenUrl: (String) -> Unit = {},
@@ -289,6 +292,8 @@ fun HaiderApp(
                     appVersion = appVersion,
                     accountsSummary = accountsSummary,
                     elapsedRealtimeMs = elapsedRealtimeProvider(),
+                    logoStyle = logoStyle,
+                    onLogoStyle = onLogoStyle,
                     onBack = viewModel::closeOverlay,
                     onThemeMode = onThemeMode,
                     onOpenAccounts = { viewModel.openOverlay(Overlay.Accounts) },
@@ -361,6 +366,7 @@ fun HaiderApp(
                         open = drawerState.isOpen,
                         state = state,
                         themeMode = themeMode,
+                        logoStyle = logoStyle,
                         appVersion = appVersion,
                         onClose = { scope.launch { drawerState.close() } },
                         onNewSession = {
@@ -482,6 +488,7 @@ fun HaiderApp(
                         StartSurface(
                             state = state,
                             appVersion = appVersion,
+                            logoStyle = logoStyle,
                             nowMs = nowMs,
                             elapsedRealtimeMs = elapsedRealtimeProvider(),
                             onStepAction = { step ->

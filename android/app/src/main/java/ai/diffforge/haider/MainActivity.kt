@@ -16,6 +16,7 @@ import ai.diffforge.haider.service.ScreenConsentActivity
 import ai.diffforge.haider.ui.state.PermissionSnapshot
 import ai.diffforge.haider.ui.state.PermissionStanding
 import ai.diffforge.haider.ui.state.PermissionClassifier
+import ai.diffforge.haider.ui.theme.LogoPreferences
 import ai.diffforge.haider.ui.theme.ThemeMode
 import ai.diffforge.haider.ui.theme.ThemePreferences
 import ai.diffforge.haider.update.ApkUpdateCoordinator
@@ -255,6 +256,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             var themeMode by rememberSaveable { mutableStateOf(ThemePreferences.load(themeStore)) }
+            var logoStyle by rememberSaveable { mutableStateOf(LogoPreferences.load(themeStore)) }
             val updateState by ApkUpdateCoordinator.state.collectAsState()
             val dismissals = remember { SharedPreferencesBannerDismissals(bannerPreferences) }
             val view = LocalView.current
@@ -282,6 +284,11 @@ class MainActivity : ComponentActivity() {
                 onThemeMode = { mode ->
                     themeMode = mode
                     ThemePreferences.save(themeStore, mode)
+                },
+                logoStyle = logoStyle,
+                onLogoStyle = { style ->
+                    logoStyle = style
+                    LogoPreferences.save(themeStore, style)
                 },
                 updateState = updateState,
                 onUpdateAction = { ApkUpdateCoordinator.onAffordanceTapped(this) },

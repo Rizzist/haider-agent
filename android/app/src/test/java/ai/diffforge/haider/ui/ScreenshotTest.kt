@@ -2,14 +2,17 @@ package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.components.BrandMarkOnly
+import ai.diffforge.haider.ui.components.HaiderLogo
 import ai.diffforge.haider.ui.components.SessionGlyph
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.loom.LoomAuthorKind
 import ai.diffforge.haider.ui.state.Overlay
 import ai.diffforge.haider.ui.theme.Forge
+import ai.diffforge.haider.ui.theme.ForgeSize
 import ai.diffforge.haider.ui.theme.ForgeSpace
 import ai.diffforge.haider.ui.theme.ForgeTheme
+import ai.diffforge.haider.ui.theme.LogoStyle
 import ai.diffforge.haider.ui.theme.ThemeMode
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -386,4 +389,47 @@ class BrandMarkScreenshotTest {
 
     @Test fun `provider marks dark`() = captureMarks("provider-marks-dark", dark = true)
     @Test fun `provider marks light`() = captureMarks("provider-marks-light", dark = false)
+}
+
+/**
+ * The Haider Code wordmark, one golden per colourway (lane 971-ui-logo): the
+ * geometry is 65 ported pixel-grid subpaths, and a regression in one rect or
+ * one orange is invisible in any assertion. The surface goldens above show the
+ * mark in place on the start surface and the drawer.
+ */
+@RunWith(AndroidJUnit4::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+@Config(sdk = [34], qualifiers = "w412dp-h915dp-xhdpi")
+class HaiderLogoScreenshotTest {
+
+    init {
+        ComposeHost.install()
+    }
+
+    @get:Rule
+    val rule = createAndroidComposeRule<MainActivity>()
+
+    private fun captureLogo(name: String, dark: Boolean) {
+        rule.setContent {
+            ForgeTheme(dark = dark) {
+                Column(
+                    Modifier
+                        .background(Forge.colors.bg)
+                        .padding(ForgeSpace.xl),
+                    verticalArrangement = Arrangement.spacedBy(ForgeSpace.lg),
+                ) {
+                    // Auto resolves per theme; the explicit pair pins that an
+                    // override renders its own palette on the "wrong" ground.
+                    HaiderLogo(style = LogoStyle.Auto, width = ForgeSize.logoStart)
+                    HaiderLogo(style = LogoStyle.Light, width = ForgeSize.logoDrawer)
+                    HaiderLogo(style = LogoStyle.Dark, width = ForgeSize.logoDrawer)
+                }
+            }
+        }
+        rule.waitForIdle()
+        rule.onRoot().captureRoboImage("src/test/screenshots/$name.png")
+    }
+
+    @Test fun `logo variants dark`() = captureLogo("logo-variants-dark", dark = true)
+    @Test fun `logo variants light`() = captureLogo("logo-variants-light", dark = false)
 }
