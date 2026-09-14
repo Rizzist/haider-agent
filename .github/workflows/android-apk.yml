@@ -166,17 +166,17 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: haider-android-native-build-*
-          path: android/app/build/generated/haiderNative
+          path: dist-android-native
           merge-multiple: true
       - name: verify both native artifacts against this checkout before signing
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --verify-only
+        run: python3 scripts/android/build-native.py --output dist-android-native --version "$VERSION" --verify-only
       - name: archive unstripped native symbols by ELF build ID
         uses: actions/upload-artifact@v4
         with:
           name: haider-android-native-symbols
-          path: android/app/build/generated/haiderNative/symbols/**
+          path: dist-android-native/symbols/**
           if-no-files-found: error
           overwrite: true
 

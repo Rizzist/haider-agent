@@ -13,15 +13,30 @@ abstract class HaiderNative @Inject constructor(private val exec: ExecOperations
     abstract val sources: ConfigurableFileCollection
     @get:Internal abstract val repository: DirectoryProperty
     @get:Input abstract val version: Property<String>
-    @get:Input abstract val verifyOnly: Property<Boolean>
     @get:OutputDirectory abstract val outputDirectory: DirectoryProperty
     @TaskAction fun build() {
         exec.exec {
             workingDir(repository.get().asFile)
             val command = mutableListOf("python3", "scripts/android/build-native.py", "--output",
                 outputDirectory.get().asFile.absolutePath, "--version", version.get())
-            if (verifyOnly.get()) command.add("--verify-only")
             commandLine(command)
+        }
+    }
+}
+
+// Restored CI artifacts are inputs. Declaring them as outputs lets Gradle's
+// stale-output cleanup remove the checkpoint before its verification runs.
+abstract class VerifyHaiderNative @Inject constructor(private val exec: ExecOperations) : DefaultTask() {
+    @get:Internal abstract val repository: DirectoryProperty
+    @get:Input abstract val version: Property<String>
+    @get:InputDirectory @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val nativeDirectory: DirectoryProperty
+
+    @TaskAction fun verify() {
+        exec.exec {
+            workingDir(repository.get().asFile)
+            commandLine("python3", "scripts/android/build-native.py", "--output",
+                nativeDirectory.get().asFile.absolutePath, "--version", version.get(), "--verify-only")
         }
     }
 }

@@ -22,3 +22,4 @@ target-linux/
 
 # Generated Kotlin compiler session state
 /android/.kotlin/
+/android/buildSrc/.kotlin/

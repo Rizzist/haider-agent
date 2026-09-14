@@ -110,8 +110,10 @@ The digest includes Cargo manifests/lockfile, all crate inputs, `.cargo`, the to
 native scripts, buildSrc, the workflow recipe and the root provider bundle. Kotlin UI
 changes alone can reuse native output; a Rust or recipe change cannot.
 
-The packaging job downloads both artifacts into `app/build/generated/haiderNative` and
-passes `-PhaiderNativePrebuilt=true`. This runs the same ELF/ABI/16 KiB/RELRO/DT_NEEDED/JNI
+The packaging job downloads both artifacts into the checkout's `dist-android-native/` and
+passes `-PhaiderNativePrebuilt=true`. Its verification task declares these files as inputs,
+separate from the native producer's build directory; Gradle cannot clean the restored
+checkpoint as stale task output. Generated buildSrc Kotlin session state is ignored. This runs the same ELF/ABI/16 KiB/RELRO/DT_NEEDED/JNI
 checks plus source/version/toolchain and output checksums before signing. Missing or stale
 output fails; this mode never falls back to Cargo. Ordinary local Gradle builds still build
 both ABIs. APK version, ZIP alignment (`zipalign -P 16`) and v2/v3 signing checks remain

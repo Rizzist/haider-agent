@@ -1,6 +1,7 @@
 import ai.diffforge.haider.build.HaiderVersion
 import ai.diffforge.haider.build.HaiderNative
 import ai.diffforge.haider.build.HaiderJniLibs
+import ai.diffforge.haider.build.VerifyHaiderNative
 
 plugins {
     id("com.android.application")
@@ -126,17 +127,31 @@ android {
     }
 }
 
-val nativeBuild = tasks.register<HaiderNative>("buildHaiderNative") {
-    repository.set(rootProject.layout.projectDirectory.dir(".."))
-    version.set(workspaceVersion.name)
-    verifyOnly.set(providers.gradleProperty("haiderNativePrebuilt").map(String::toBoolean).orElse(false))
-    // Downloaded output must be checked even if Gradle has previous task history.
-    outputs.upToDateWhen { !verifyOnly.get() }
-    sources.from(fileTree(rootProject.projectDir.parentFile) {
-        include("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "crates/**", "scripts/android/**", "android/buildSrc/**", ".github/workflows/android-apk.yml", "customprov.bundle")
-        exclude("**/target/**", "**/__pycache__/**", "android/buildSrc/build/**", "android/buildSrc/.gradle/**")
-    })
-    outputDirectory.set(layout.buildDirectory.dir("generated/haiderNative"))
+val usePrebuiltNative = providers.gradleProperty("haiderNativePrebuilt").map(String::toBoolean).orElse(false).get()
+val nativeOutput = if (usePrebuiltNative) {
+    // Separate from producer outputs, including history from local native builds.
+    rootProject.layout.projectDirectory.dir("../dist-android-native")
+} else {
+    layout.buildDirectory.dir("generated/haiderNative").get()
+}
+val nativeBuild = if (usePrebuiltNative) {
+    tasks.register<VerifyHaiderNative>("buildHaiderNative") {
+        repository.set(rootProject.layout.projectDirectory.dir(".."))
+        version.set(workspaceVersion.name)
+        nativeDirectory.set(nativeOutput)
+    }
+} else {
+    tasks.register<HaiderNative>("buildHaiderNative") {
+        repository.set(rootProject.layout.projectDirectory.dir(".."))
+        version.set(workspaceVersion.name)
+        sources.from(fileTree(rootProject.projectDir.parentFile) {
+            include("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "crates/**",
+                "scripts/android/**", "android/buildSrc/**", ".github/workflows/android-apk.yml", "customprov.bundle")
+            exclude("**/target/**", "**/__pycache__/**", "android/buildSrc/build/**",
+                "android/buildSrc/.gradle/**", "android/buildSrc/.kotlin/**")
+        })
+        outputDirectory.set(nativeOutput)
+    }
 }
 androidComponents {
     beforeVariants(selector().withBuildType("release")) { variant ->
@@ -144,7 +159,8 @@ androidComponents {
     }
     onVariants { variant ->
         val jni = tasks.register<HaiderJniLibs>("prepare${variant.name.replaceFirstChar { it.uppercaseChar() }}HaiderJniLibs") {
-            nativeDirectory.set(nativeBuild.flatMap { it.outputDirectory })
+            dependsOn(nativeBuild)
+            nativeDirectory.set(nativeOutput)
             abi.set(if (variant.productFlavors.any { it.second == "emulator" }) "x86_64" else "arm64-v8a")
             outputDirectory.set(layout.buildDirectory.dir("generated/haiderJniLibs/${variant.name}"))
         }
