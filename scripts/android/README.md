@@ -98,3 +98,33 @@ The CI emulator jobs are advisory per registry #80 until a real first green is r
 On the Mac use only one owned `Haider_API35` emulator, after checking `adb devices -l`, and stop
 it afterward. The Mac's emulator is ARM64; x86_64 execution and nightly image coverage belong to
 CI. Do not install another lane's spike as if it were this candidate's native build.
+
+## Durable release stages and native checkpoints
+
+`android-apk.yml` runs host tests and one native job per ABI independently. Each native
+job uses the same release profile (fat LTO), cargo-ndk/NDK/Rust pins and API 26 floor.
+It verifies the output, saves an exact source/ABI cache immediately, then uploads
+`haider-android-native-build-<abi>`. The artifacts include stripped JNI inputs, unstripped
+ELFs, packed `.dwp` companions and per-file checksums. No signing inputs enter this cache.
+The digest includes Cargo manifests/lockfile, all crate inputs, `.cargo`, the toolchain,
+native scripts, buildSrc, the workflow recipe and the root provider bundle. Kotlin UI
+changes alone can reuse native output; a Rust or recipe change cannot.
+
+The packaging job downloads both artifacts into the checkout's `dist-android-native/` and
+passes `-PhaiderNativePrebuilt=true`. Its verification task declares these files as inputs,
+separate from the native producer's build directory; Gradle cannot clean the restored
+checkpoint as stale task output. Generated buildSrc Kotlin session state is ignored. This runs the same ELF/ABI/16 KiB/RELRO/DT_NEEDED/JNI
+checks plus source/version/toolchain and output checksums before signing. Missing or stale
+output fails; this mode never falls back to Cargo. Ordinary local Gradle builds still build
+both ABIs. APK version, ZIP alignment (`zipalign -P 16`) and v2/v3 signing checks remain
+mandatory. Tag runs fail if the existing release signing key is unavailable.
+
+For an eviction, rerun **failed jobs** (`gh run rerun RUN_ID --failed`): successful native
+jobs remain available to packaging. If all jobs are deliberately rerun, each ABI restores
+only its exact verified output cache. Native artifacts are retained 30 days; after expiry
+rerun the producing jobs as well. Cache loss can cause a rebuild, never an unchecked APK.
+The per-ABI symbols are checkpointed before packaging; the combined symbols artifact keeps
+its existing name. See GitHub's [rerun semantics](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs).
+
+Release completion additionally requires the live asset query documented in
+[`docs/release-chain.md`](../../docs/release-chain.md), even when all workflow badges are green.
