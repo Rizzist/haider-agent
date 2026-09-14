@@ -5156,15 +5156,21 @@ fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
     }
 }
 
-/// Real 0.0.971 session/journal rows, read by the candidate daemon. No account
-/// exists: model admission must precede credential resolution on an old turn.
+/// Real 0.0.971 session/journal rows, read by the candidate daemon. Execute
+/// its recovery command, verify the durable selection, and send the next turn
+/// through the production HTTP adapter to a recording loopback provider.
+/// MUTATION: restore the `run --session --model` hint. The advertised command
+/// must then fail at runtime with usage exit 2, before any reselection.
 #[test]
-fn preupgrade_go_session_cli_refuses_before_any_provider_round() {
+fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
+    const SESSION: &str = "session-6d3a6a6c6fd8bfdfdae2ee6a71694a4a";
+    const MODEL: &str = "deepseek-v4-flash";
     let mut command = haider();
     let workspace = command
         .get_current_dir()
         .expect("isolated workspace")
-        .to_path_buf();
+        .canonicalize()
+        .expect("canonical fixture workspace");
     {
         let store = haider_store::Store::open(&command.profile).expect("upgrade profile");
         store.put_provider_models(
@@ -5201,20 +5207,34 @@ fn preupgrade_go_session_cli_refuses_before_any_provider_round() {
         .env("HAIDER_DISCOVERY_DISABLED", "1")
         .env("HAIDER_NO_UPDATE_CHECK", "1")
         .env("RUST_MIN_STACK", "8388608");
-    let output = command
-        .args([
-            "run",
-            "--session",
-            "session-6d3a6a6c6fd8bfdfdae2ee6a71694a4a",
-            "-p",
-            "Reply with OK.",
-            "--json",
-        ])
-        .output()
-        .expect("run the actual candidate CLI and daemon");
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)));
-    assert!(!output.status.success(), "{result}");
+    let invoke = |args: &[&str], expected: i32| {
+        let mut child = Command::new(command.get_program());
+        child.env_clear().current_dir(&workspace).args(args);
+        for (name, value) in command.get_envs() {
+            if let Some(value) = value {
+                child.env(name, value);
+            }
+        }
+        let output = bounded_output(&mut child, None);
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{args:?}: stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let turn_args = [
+        "run",
+        "--session",
+        SESSION,
+        "-p",
+        "Reply with OK.",
+        "--json",
+    ];
+    let output = invoke(&turn_args, 70);
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("refusal JSON");
     assert_eq!(
         result["model"], "Go",
         "never silently substitute the old selection"
@@ -5228,7 +5248,99 @@ fn preupgrade_go_session_cli_refuses_before_any_provider_round() {
     let message = result["error"]["message"]
         .as_str()
         .expect("actionable refusal");
-    assert!(message.contains("explicitly reselect"), "{message}");
-    assert!(message.contains("haider models --refresh"), "{message}");
+    let advertised = message
+        .split('`')
+        .find(|part| part.starts_with("haider ") && part.contains("--model "))
+        .expect("refusal advertises a CLI model-selection command");
+    let reselect = |provider: &str| {
+        let selector = format!("{provider}/{MODEL}");
+        // Fill only the advertised placeholders. Do not reconstruct, fix up,
+        // or add arguments to the command being tested.
+        let recovery = advertised
+            .replace("<session-id>", SESSION)
+            .replace("<provider/model>", &selector)
+            .replace("<model-id>", &selector);
+        invoke(&recovery.split_whitespace().skip(1).collect::<Vec<_>>(), 0);
+        let output = invoke(&["session", SESSION, "config", "--json"], 0);
+        let selected: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("persisted configuration JSON");
+        assert_eq!(selected["session_id"], SESSION);
+        assert_eq!(selected["provider"], provider);
+        assert_eq!(selected["model"], MODEL);
+        let connection = rusqlite::Connection::open(profile.join("store.sqlite"))
+            .expect("read durable session selection");
+        let metadata: String = connection
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [SESSION],
+                |row| row.get(0),
+            )
+            .expect("session metadata");
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).expect("metadata JSON");
+        assert_eq!(metadata["provider"], provider);
+        assert_eq!(metadata["model"], MODEL);
+    };
+
+    // Same-provider recovery uses the real discovered ID. With no account,
+    // its next turn now reaches credential resolution instead of admission.
+    reselect("haider-code");
+    let output = invoke(&turn_args, 65);
+    let admitted: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("admitted JSON");
+    assert_eq!(admitted["model"], MODEL);
+    assert_eq!(admitted["error"]["code"], "credential_missing");
+    assert_eq!(
+        admitted["provider_rounds"]
+            .as_array()
+            .expect("rounds")
+            .len(),
+        0
+    );
+
+    // Complete the flow without real credentials or fake-factory injection:
+    // the same advertised command can select a configured compatible server.
+    let (origin, captured, _, proxy) = spawn_compatible_proxy(Some(
+        br#"{"object":"list","data":[{"id":"deepseek-v4-flash","object":"model"}]}"#,
+    ));
+    invoke(
+        &[
+            "provider",
+            "add",
+            "recovery-proxy",
+            "--base-url",
+            &origin,
+            "--api-family",
+            "openai",
+            "--no-auth",
+        ],
+        0,
+    );
+    assert!(matches!(
+        captured.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    reselect("recovery-proxy");
+    assert!(matches!(
+        captured.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    let output = invoke(&turn_args, 0);
+    let completed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("turn JSON");
+    assert_eq!(completed["session_id"], SESSION);
+    assert_eq!(completed["provider"], "recovery-proxy");
+    assert_eq!(completed["model"], MODEL);
+    assert_eq!(completed["outcome"], "done");
+    assert_eq!(
+        completed["provider_rounds"]
+            .as_array()
+            .expect("rounds")
+            .len(),
+        1
+    );
+    let request = captured
+        .recv_timeout(Duration::from_secs(10))
+        .expect("actual HTTP request");
+    assert_eq!(request["model"], MODEL);
+    proxy.join().expect("recording proxy exits");
     terminate_daemon_checked(&command.profile).expect("stop owned upgrade daemon");
 }

@@ -9405,7 +9405,8 @@ impl AccountsProviderFactory {
                 format!(
                     "Saved model `{}` for provider `{}` cannot be used: {}. \
                      Run `haider models --refresh {}`, then explicitly reselect a model \
-                     with `/model` or `haider run --session <session-id> --model <model-id>`.",
+                     with `haider session <session-id> config --model <provider/model>` \
+                     or `/model` in the TUI.",
                     metadata.model,
                     metadata.provider,
                     refusal.message(),
