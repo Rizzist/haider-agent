@@ -129,9 +129,12 @@ android {
 val nativeBuild = tasks.register<HaiderNative>("buildHaiderNative") {
     repository.set(rootProject.layout.projectDirectory.dir(".."))
     version.set(workspaceVersion.name)
+    verifyOnly.set(providers.gradleProperty("haiderNativePrebuilt").map(String::toBoolean).orElse(false))
+    // Downloaded output must be checked even if Gradle has previous task history.
+    outputs.upToDateWhen { !verifyOnly.get() }
     sources.from(fileTree(rootProject.projectDir.parentFile) {
-        include("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "crates/**", "scripts/android/**")
-        exclude("**/target/**", "**/__pycache__/**")
+        include("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "crates/**", "scripts/android/**", "android/buildSrc/**", ".github/workflows/android-apk.yml", "customprov.bundle")
+        exclude("**/target/**", "**/__pycache__/**", "android/buildSrc/build/**", "android/buildSrc/.gradle/**")
     })
     outputDirectory.set(layout.buildDirectory.dir("generated/haiderNative"))
 }

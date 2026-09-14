@@ -4,7 +4,7 @@ on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: ['android/**', 'crates/**', 'scripts/android/**', 'Cargo.*', '.cargo/config.toml', '.github/workflows/android-apk.yml']
+    paths: ['android/**', 'crates/**', 'scripts/android/**', 'Cargo.*', 'rust-toolchain.toml', 'customprov.bundle', '.cargo/config.toml', '.github/workflows/android-apk.yml']
   schedule:
     - cron: '21 2 * * *'
   workflow_dispatch:
@@ -17,48 +17,13 @@ permissions:
   contents: read
 
 jobs:
-  build-apk:
+  prepare:
     runs-on: ubuntu-24.04
-    # Version bumps rebuild workspace crates; allow cold two-ABI fat-LTO builds.
-    timeout-minutes: 75
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_INCREMENTAL: '0'
-      RUST_MIN_STACK: '8388608'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      source: ${{ steps.source.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-      - name: unsafe-count gate
-        shell: bash
-        run: bash scripts/check-unsafe-counts.sh
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - uses: android-actions/setup-android@v3
-
-      - name: install pinned SDK and NDK
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;28.2.13676358"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.95.0'
-          targets: aarch64-linux-android,x86_64-linux-android
-      - uses: Swatinem/rust-cache@v2
-      - name: install pinned cargo-ndk
-        run: cargo install cargo-ndk --version 4.1.2 --locked
-
-      - name: host embedding, policy, vault, RPC and lifecycle tests
-        run: cargo test --locked -p haider-android -p haider-rpc -p haider-accounts -p haider-daemon -p haider-platform
-
-      - name: native verification script tests
-        run: python3 -m unittest discover -s scripts/android -p 'test_*.py'
-
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
-
       - name: resolve release version
         id: version
         shell: bash
@@ -86,16 +51,134 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: build and verify both native libraries from this checkout
-        working-directory: android
-        run: gradle :app:buildHaiderNative --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2
+      - name: digest Rust inputs and native build recipe
+        id: source
+        run: echo "digest=$(python3 scripts/android/build-native.py --source-digest)" >> "$GITHUB_OUTPUT"
 
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      RUST_MIN_STACK: '8388608'
+    steps:
+      - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        run: bash scripts/check-unsafe-counts.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-host-tests
+      - name: host embedding, policy, vault, RPC and lifecycle tests
+        run: cargo test --locked -p haider-android -p haider-rpc -p haider-accounts -p haider-daemon -p haider-platform
+
+  native:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      # A reclaimed runner must not cancel the other ABI's durable checkpoint.
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+          - abi: x86_64
+            target: x86_64-linux-android
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      RUST_MIN_STACK: '8388608'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: install pinned NDK
+        run: sdkmanager "ndk;28.2.13676358"
+      - name: native verification script tests
+        run: python3 -m unittest discover -s scripts/android -p 'test_*.py'
+      - name: restore verified native output (exact source and ABI only)
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: android/app/build/generated/haiderNative
+          key: android-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.abi }}-${{ needs.prepare.outputs.source }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        with:
+          shared-key: android-native-${{ matrix.abi }}
+      - name: install pinned cargo-ndk
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: build native cdylib with release fat LTO and API 26
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ABI: ${{ matrix.abi }}
+        run: python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --abi "$ABI"
+      - name: verify built or restored native output and debug companions
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ABI: ${{ matrix.abi }}
+        run: python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --abi "$ABI" --verify-only
+      # Save now, not in a post-job hook after packaging or unrelated tests.
+      - uses: actions/cache/save@v4
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        with:
+          path: android/app/build/generated/haiderNative
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
+      - name: pass verified JNI libraries and unstripped symbols by ELF build ID
+        uses: actions/upload-artifact@v4
+        with:
+          name: haider-android-native-build-${{ matrix.abi }}
+          path: android/app/build/generated/haiderNative/**
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  build-apk:
+    needs: [prepare, host-tests, native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: install pinned SDK and NDK for verification
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;28.2.13676358"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: haider-android-native-build-*
+          path: android/app/build/generated/haiderNative
+          merge-multiple: true
+      - name: verify both native artifacts against this checkout before signing
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --verify-only
       - name: archive unstripped native symbols by ELF build ID
         uses: actions/upload-artifact@v4
         with:
           name: haider-android-native-symbols
           path: android/app/build/generated/haiderNative/symbols/**
           if-no-files-found: error
+          overwrite: true
 
       - name: test and assemble release APK
         id: assemble
@@ -123,12 +206,17 @@ jobs:
           else
             echo "::notice::signing skipped: secrets absent"
           fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$SIGNING_READY" != true ]; then
+            echo "::error::tag release requires the existing Android release signing key"
+            exit 1
+          fi
           unset ANDROID_KEYSTORE_B64
 
           export ANDROID_KEYSTORE_PATH="$KEYSTORE"
           gradle -p buildSrc test --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 --stacktrace
           gradle :app:testPhoneReleaseUnitTest :app:testEmulatorDebugUnitTest :app:assemblePhoneRelease :app:assembleEmulatorDebug :app:assembleEmulatorDebugAndroidTest \
-            -PhaiderVersion="${{ steps.version.outputs.version }}" \
+            -PhaiderNativePrebuilt=true \
+            -PhaiderVersion="${{ needs.prepare.outputs.version }}" \
             --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 --stacktrace
 
           if [ "$SIGNING_READY" = true ]; then
@@ -155,7 +243,7 @@ jobs:
       - name: verify APK version, native ABI contents and 16 KiB ZIP alignment
         shell: bash
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           LLVM="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -176,12 +264,13 @@ jobs:
             android/app/build/outputs/apk/emulator/debug/*.apk
             android/app/build/outputs/apk/androidTest/emulator/debug/*.apk
           if-no-files-found: error
+          overwrite: true
 
       - name: stage APK and checksum
         if: steps.assemble.outputs.signed == 'true'
         shell: bash
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           mapfile -t APKS < <(find android/app/build/outputs/apk/phone/release -maxdepth 1 -type f -name '*.apk' -print)
@@ -201,6 +290,7 @@ jobs:
           name: haider-android-release
           path: dist-android/*
           if-no-files-found: error
+          overwrite: true
 
   emulator-pr:
     # Registry #80: advisory until the first recorded green GitHub runner execution.
