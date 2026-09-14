@@ -34,4 +34,6 @@ For an already published release missing Android assets, preserve the tag and al
 assets. Prefer the signed Actions artifact from that tag; add only the missing APK/sidecar,
 without `--clobber`, then repeat the live gate. A permitted local fallback must disclose
 source tag/SHA, builder, date and hashes in release notes/evidence and use the existing key
-outside all worktrees. Never inspect, print, copy, export, modify, or replace signing material.
+outside all worktrees. Give the tag checkout its own Cargo target directory: shared targets
+can reuse workspace outputs when checkout mtimes predate cached compiles. If a target was
+shared, discard the affected target outputs and rebuild before claiming tag provenance. Never inspect, print, copy, export, modify, or replace signing material.
