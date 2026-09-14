@@ -54,6 +54,8 @@ jobs:
         run: python3 -m unittest scripts/tests/test_release_packaging.py
       - name: release evidence policy regression tests
         run: bash scripts/release/tests/require-evidence-test.sh
+      - name: Android release attachment policy regression tests
+        run: python3 -m unittest scripts/tests/test_android_release_asset.py
       - name: pipeline reuse, artifact integrity and shard regression tests
         run: python3 -m unittest scripts/tests/test_find_evidence.py scripts/tests/test_macos_build_artifact.py scripts/tests/test_ci_test_shards.py
       - name: self-test
@@ -111,7 +113,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev xvfb xauth
       - name: real screenshot, pixel, pointer, click, type, and key round trip
         run: >-
-          HAIDER_CU_E2E=1 XDG_SESSION_TYPE=x11 WAYLAND_DISPLAY= xvfb-run --auto-servernum
+          HAIDER_CU_E2E=1 XDG_SESSION_TYPE=x11 WAYLAND_DISPLAY='' xvfb-run --auto-servernum
           --server-args="-screen 0 320x240x24 -nolisten tcp"
           cargo test -p haider-tools --test linux_computer_e2e --locked --
           --ignored --test-threads=1

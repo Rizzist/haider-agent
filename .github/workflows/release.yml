@@ -391,10 +391,10 @@ jobs:
           WBIN=target/${{ matrix.target }}/release/haider-wayland-portal
           REF="${GITHUB_REF_NAME:-manual}"
           NAME=haider-${REF}-${{ matrix.target }}-split
-          mkdir -p dist/$NAME
+          mkdir -p "dist/$NAME"
           # All runtime siblings belong to the same versioned split bundle.
-          cp "$BIN" "$TBIN" "$DBIN" dist/$NAME/
-          if [ "$RUNNER_OS" = "Linux" ]; then cp "$WBIN" dist/$NAME/; fi
+          cp "$BIN" "$TBIN" "$DBIN" "dist/$NAME/"
+          if [ "$RUNNER_OS" = "Linux" ]; then cp "$WBIN" "dist/$NAME/"; fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             # haider.exe is a CONSOLE binary. Double-clicked from Explorer,
             # Windows destroys the console the instant the process exits and
@@ -455,7 +455,7 @@ jobs:
             (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
             (cd dist && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
           else
-            tar -C dist -cJf dist/$NAME.tar.xz $NAME
+            tar -C dist -cJf "dist/$NAME.tar.xz" "$NAME"
             (cd dist && shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256")
           fi
       - name: verify complete split archive and checksum
@@ -603,6 +603,8 @@ jobs:
           if-no-files-found: error
 
   publish:
+    # Desktop jobs and Android run concurrently; allow a cold native stage to finish.
+    timeout-minutes: 135
     needs: [build, installers]
     if: always() && !cancelled() && needs.build.result == 'success' && needs.installers.result == 'success' && github.event_name == 'push'   # only tag pushes cut a release
     runs-on: ubuntu-latest
@@ -621,22 +623,20 @@ jobs:
           pattern: installers-*
           path: dist
           merge-multiple: true
-      - name: download Android APK artifact when available
-        continue-on-error: true
+      - name: require verified Android APK artifact before publication
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -u
+          set -euo pipefail
           RUN_ID=""
           MISSING_ATTEMPTS=0
           RUNNING_ATTEMPTS=0
-          while [ "$RUNNING_ATTEMPTS" -lt 120 ]; do
+          while [ "$RUNNING_ATTEMPTS" -lt 480 ]; do
             RUNS="$(gh api \
               "/repos/$GITHUB_REPOSITORY/actions/workflows/android-apk.yml/runs?event=push&head_sha=$GITHUB_SHA&per_page=20" \
               2>/dev/null || true)"
             RUN_ID="$(jq -r --arg ref "$GITHUB_REF_NAME" '
-              [.workflow_runs[]?] as $all
-              | ([$all[] | select(.head_branch == $ref)] | if length > 0 then . else $all end)
+              [.workflow_runs[]? | select(.head_branch == $ref)]
               | sort_by(.run_number) | last | .id // empty
             ' <<< "$RUNS" 2>/dev/null || true)"
             if [ -n "$RUN_ID" ]; then
@@ -660,31 +660,33 @@ jobs:
                        (cd "$APK_STAGE" && sha256sum --check "$APK_NAME.sha256"); then
                       if mv "$APK_STAGE/$APK_NAME" "$APK_STAGE/$APK_NAME.sha256" dist/; then
                         echo "Downloaded Android release artifact from workflow run $RUN_ID"
+                        exit 0
                       else
                         rm -f "dist/$APK_NAME" "dist/$APK_NAME.sha256"
-                        echo "::warning::Android artifact could not be moved into the release directory"
+                        echo "::error::Android artifact could not be moved into the release directory"
                       fi
                     else
-                      echo "::warning::Android artifact was incomplete or failed checksum verification"
+                      echo "::error::Android artifact was incomplete or failed checksum verification"
                     fi
                   else
-                    echo "::warning::Android workflow succeeded, but its APK artifact was unavailable"
+                    echo "::error::Android workflow succeeded, but its APK artifact was unavailable"
                   fi
                 else
-                  echo "::warning::Android APK workflow concluded '$CONCLUSION'; publishing native assets only"
+                  echo "::error::Android APK workflow concluded '$CONCLUSION'; release blocked"
                 fi
-                exit 0
+                exit 1
               fi
             else
               MISSING_ATTEMPTS=$((MISSING_ATTEMPTS + 1))
               if [ "$MISSING_ATTEMPTS" -ge 8 ]; then
-                echo "::warning::Android APK workflow run was absent; publishing native assets only"
-                exit 0
+                echo "::error::Android APK workflow run was absent; release blocked"
+                exit 1
               fi
             fi
             sleep 15
           done
-          echo "::warning::Android APK workflow was still running after 30 minutes; publishing native assets only"
+          echo "::error::Android APK workflow was still running after 120 minutes; release blocked"
+          exit 1
       - name: create or update release (prerelease until v0.1.0)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -698,6 +700,10 @@ jobs:
               --prerelease \
               --notes "$NOTES"
           fi
+      - name: require Android assets actually attached to this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/require-android-asset.py "$GITHUB_REF_NAME" "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
 
   npm:
     name: Publish npm
