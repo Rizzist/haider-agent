@@ -359,6 +359,78 @@ fn named_public_carriers_survive_standard_output_but_secret_context_wins() {
     ));
 }
 
+/// 972 identifier false-positive corpus (AX-1 experience report, finding F2):
+/// released 0.0.971 replaced ordinary `unittest -v` identifiers with
+/// `[REDACTED:high_entropy]` in both process output and `fs_read`. Valid
+/// code-identifier shapes survive standard redaction; random tokens,
+/// credential contexts, and the lockdown classifier are unchanged.
+#[test]
+fn identifier_false_positive_corpus_survives_standard_redaction() {
+    let paths = super::ExplicitReadPaths::new(Path::new("testrun.txt"));
+    let mut failures = Vec::new();
+    for value in [
+        // The exact identifier shapes finding F2 observed inside 0.0.971.
+        "test_unreadable_file_exit_code",
+        "test_tie_break_alphabetical",
+        "test_wordfreq.OrderingTests",
+        "test_unreadable_file_exit_code (test_wordfreq.OrderingTests) ... ok",
+        "test_wordfreq.OrderingTests.test_tie_break_alphabetical",
+        // Broader identifier families at candidate length.
+        "test_unreadable_file_exit_code_path",
+        "haider_tools::redact::redact_output_text",
+        "HAIDER_MAX_PROCESS_OUTPUT_BYTES",
+        "lane-972-redaction-precision",
+        "assertRaisesRegexMessageMatches",
+        "com.example.wordfreq.CliSmokeTests",
+        "process_exec_output_redaction_v2",
+        "normalize_URLs_and_paths_helper",
+    ] {
+        for (mode, output) in [
+            ("standard", super::redact_output_text(value)),
+            ("fs_read", redact_private_key_lines(value).text),
+            (
+                "explicit",
+                paths.redact(Path::new("testrun.txt"), value).text,
+            ),
+        ] {
+            if output != value {
+                failures.push(format!("{mode}: {value:?} -> {output:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    // Identifier shape never exempts random tokens: interleaved case/digit
+    // runs, single-word noise, and encoded credentials all still redact.
+    for value in [
+        "aB3d_E5fG7_hI9jK1mN3pQ5rS7tU9vW1",
+        "qwertyuiopasdfghjklzxcvbnmqw",
+        "Ab1Cd2Ef3Gh4Ij5Kl6Mn7Pq8St9Uv0",
+        "test-aB3dE5fG7hI9jK1mN3pQ5rS7tU9",
+        "c2stYWJjZGVmZ2hpamtsbW5vcFFSU1RVVg",
+    ] {
+        assert_eq!(
+            redact_text(value).text,
+            "[REDACTED:high_entropy]",
+            "{value}"
+        );
+    }
+    // Credential context still wins over identifier shape.
+    for input in [
+        "password=test_unreadable_file_exit_code",
+        "Bearer test_unreadable_file_exit_code",
+        "api_key: test_wordfreq.OrderingTests",
+    ] {
+        let output = redact_text(input).text;
+        assert!(!output.contains("test_"), "{input}");
+        assert!(output.contains("[REDACTED:secret_value]"), "{input}");
+    }
+    assert_ne!(
+        super::redact_lockdown_text("test_unreadable_file_exit_code_path"),
+        "test_unreadable_file_exit_code_path",
+        "lockdown keeps its historical classifier"
+    );
+}
+
 #[test]
 fn multiline_quoted_values_preserve_lines_and_hide_every_secret_fragment() {
     let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));
