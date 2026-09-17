@@ -205,7 +205,7 @@ fn label(body: &RequestBody) -> String {
         RequestBody::SessionDetach { attachment_id, .. } => {
             format!("detach:{}", attachment_id.as_str())
         }
-        RequestBody::SessionAttach { session_id, .. } => {
+        RequestBody::SessionAttachWithOrigin { session_id, .. } => {
             format!("attach:{}", session_id.as_str())
         }
         other => format!("other:{other:?}"),
@@ -248,7 +248,7 @@ async fn attach_response_precedes_events_that_overtook_it_on_the_wire() {
                     }
                     WireFrame::Request {
                         request_id,
-                        body: RequestBody::SessionAttach { session_id, .. },
+                        body: RequestBody::SessionAttachWithOrigin { session_id, .. },
                     } => {
                         let att = attachment(1);
                         let mut batch = Vec::new();
@@ -385,7 +385,7 @@ async fn detach_then_attach_reaches_the_wire_in_that_order() {
                                     closed_session_id: None,
                                 }
                             }
-                            RequestBody::SessionAttach { session_id, .. } => {
+                            RequestBody::SessionAttachWithOrigin { session_id, .. } => {
                                 ResponseBody::SessionAttach {
             launch_origin: None,
                                     attachment_id: AttachmentId::new(format!(

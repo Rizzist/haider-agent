@@ -179,11 +179,14 @@ pub fn transcript() -> Vec<WireFrame> {
         },
         WireFrame::Request {
             request_id: RequestId::new("request-attach"),
-            body: RequestBody::SessionAttach {
+            // The decode-normal form: absent `launch_origin` keeps the
+            // legacy `session.attach` bytes, so round-trip is identity.
+            body: RequestBody::SessionAttachWithOrigin {
                 session_id: session_id.clone(),
                 after_seq: 4,
                 mode: AttachMode::View,
                 sealed_replay: false,
+                launch_origin: None,
             },
         },
         WireFrame::Request {
