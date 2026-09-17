@@ -324,6 +324,8 @@ pub(super) async fn mobile_dispatcher_fixture_with_grant(
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                launch_origin: None,
+                workspace_allocation: None,
                 provider_base_url: None,
                 provider_rebind_id: None,
                 cwd,

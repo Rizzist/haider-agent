@@ -1906,6 +1906,10 @@ enum ActorCommand {
         command: SessionSeenCommand,
         completed: oneshot::Sender<Result<SessionSeenOutcome, HaiderError>>,
     },
+    RegisterLaunchOrigin {
+        command: haider_core::SessionLaunchOriginCommand,
+        completed: oneshot::Sender<Result<haider_core::SessionLaunchOriginOutcome, HaiderError>>,
+    },
     PinGraph {
         command: GraphPinCommand,
         expected_digest: Option<String>,
@@ -5291,6 +5295,55 @@ impl SessionHub {
         result
             .await
             .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_launch_origin_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<haider_protocol::session::LaunchOriginV1>, SessionHubError> {
+        self.inner
+            .store
+            .session_launch_origin_receipt(
+                command_id.to_owned(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Origin registration shares the serialized session actor with every
+    /// other session-config write: the metadata projection, additive
+    /// config fact, and receipt commit in one transaction, and only the
+    /// committed fact is published to attachments.
+    pub(crate) async fn register_session_launch_origin(
+        &self,
+        command: haider_core::SessionLaunchOriginCommand,
+    ) -> Result<haider_core::SessionLaunchOriginOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RegisterLaunchOrigin { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn latest_launch_origin(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<haider_protocol::session::LaunchOriginV1>, SessionHubError> {
+        self.inner
+            .store
+            .latest_launch_origin(session_id)
+            .await
             .map_err(Into::into)
     }
 

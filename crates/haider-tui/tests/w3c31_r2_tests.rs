@@ -139,6 +139,7 @@ fn attached_session(driver: &mut LiveDriver, model: &mut AppModel) {
         driver,
         model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: att(0),
             worker_generation: 7,
@@ -173,6 +174,7 @@ impl Responder {
                 } else {
                     self.next_att += 1;
                     self.replies.push(LiveReply::Attached {
+            launch_origin: None,
                         session,
                         attachment: att(self.next_att),
                         worker_generation: 7,

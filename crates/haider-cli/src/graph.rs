@@ -186,6 +186,7 @@ async fn control_attachment(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            ..
         } => Ok((attachment_id, attach_state.worker_generation)),
         ResponseBody::Error { code, message, .. } => Err(format!("{code}: {message}")),
         _ => Err("session.attach response method mismatch".into()),

@@ -189,6 +189,7 @@ async fn drive_turns(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            ..
         } => (attachment_id, attach_state.worker_generation),
         ResponseBody::Error { code, message, .. } => {
             return Err(protocol_error(format!("session.attach failed: {code}: {message}")).into());

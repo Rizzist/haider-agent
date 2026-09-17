@@ -551,6 +551,7 @@ fn trust_revision_event_refreshes_the_summary_workspace() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(),
             attachment: attachment.clone(),
             worker_generation: 7,

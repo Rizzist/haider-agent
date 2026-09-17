@@ -21,6 +21,24 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.972 — session launch-origin registration
+
+New supplemental kind: `session_config:session_launch_origin_selected`
+(dated-workspace addendum, `docs/design/dated-workspace-v1.md` §4). The
+fact records one committed foreground-open registration: the subject
+session id, client open id, monotonic revision, sanitised origin path
+(`home_relative`/`absolute`/`redacted`/`unavailable` + optional bounded
+display), daemon commit time, and optional `workspace_materialized`. It
+is session config only — no conversation node, run, cache-epoch, or
+seen/activity movement — and every accepted registration stays in raw
+history; "replaced" refers to the current context slot. `session.attach`
+gains an optional `launch_origin` registration field and an optional
+current-snapshot response field under additive feature
+`session_launch_origin_v1`; absent fields keep pre-feature bytes.
+`SessionMetadataV1` gains optional `launch_origin` and
+`workspace_allocation`. The RPC method pin remains 136;
+`schema_version` remains 1.
+
 ### v0.0.971 — pending follow-up obligations
 
 Additive raw payload kinds: `payload:completion_attempt`,

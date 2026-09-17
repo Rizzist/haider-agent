@@ -1845,11 +1845,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            launch_origin,
         } => vec![LiveReply::Attached {
             session: attach_state.session_id,
             attachment: attachment_id,
             worker_generation: attach_state.worker_generation,
             replay_through_seq: attach_state.replay_through_seq,
+            launch_origin,
         }],
         ResponseBody::SessionDetach { attachment_id, .. } => vec![LiveReply::Detached {
             attachment: attachment_id,

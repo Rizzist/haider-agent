@@ -4197,6 +4197,7 @@ async fn attach_buffered_once(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            ..
         } if attach_state.session_id == reducer.session_id => (attachment_id, attach_state),
         ResponseBody::Error {
             code,
@@ -4311,6 +4312,7 @@ async fn attach_once(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            ..
         } if attach_state.session_id == reducer.session_id => (attachment_id, attach_state),
         ResponseBody::Error {
             code,

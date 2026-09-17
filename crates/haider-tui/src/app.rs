@@ -5100,6 +5100,12 @@ pub struct AppModel {
     /// is the explicit confirmation that opens a new epoch.
     pub pending_cache_change: Option<PendingCacheChange>,
     pub identity: IdentityLine,
+    /// One replaceable launch-origin context slot (dated-workspace
+    /// addendum O5/O7): `(revision, sanitised display)` of the LATEST
+    /// committed registration for the active session. Replay folds by
+    /// revision — the latest wins in place; origin facts never append
+    /// per-event transcript rows and never touch unread/turn counters.
+    pub launch_origin: Option<(u64, String)>,
     /// The user EXPLICITLY chose a provider/model/account this run
     /// (`/model`, `/provider`, or clicking an account). Once pinned, the
     /// daemon-truth bootstrap below never overwrites their choice; until
@@ -5798,6 +5804,7 @@ impl Default for AppModel {
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             pending_cache_change: None,
             identity: IdentityLine::default(),
+            launch_origin: None,
             identity_pinned: false,
             composer: crate::composer::Composer::new(),
             mirrored_input_attachments: None,

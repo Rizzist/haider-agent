@@ -96,6 +96,8 @@ pub fn transcript() -> Vec<WireFrame> {
         end_seq: 9,
     };
     let fork_metadata = SessionMetadataV1 {
+        launch_origin: None,
+        workspace_allocation: None,
         provider_base_url: None,
         provider_rebind_id: None,
         cwd: "/tmp/workspace".into(),
@@ -283,6 +285,7 @@ pub fn transcript() -> Vec<WireFrame> {
         WireFrame::Response {
             request_id: RequestId::new("request-attach"),
             body: ResponseBody::SessionAttach {
+                launch_origin: None,
                 attachment_id: attachment_id.clone(),
                 attach_state: AttachState {
                     session_id: session_id.clone(),
@@ -411,6 +414,8 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 1,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    launch_origin: None,
+                    workspace_allocation: None,
                     provider_base_url: None,
                     provider_rebind_id: None,
                     cwd: "/tmp/workspace".into(),

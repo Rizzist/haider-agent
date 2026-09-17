@@ -334,6 +334,7 @@ fn checkin_values_beat_stale_summaries() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,

@@ -151,6 +151,7 @@ session_config_kinds! {
     SessionConfigEventPayload::FastModeSelected(_) => "fast_mode_selected",
     SessionConfigEventPayload::SessionProviderRebound(_) => "session_provider_rebound",
     SessionConfigEventPayload::AgentTypeSelected(_) => "agent_type_selected",
+    SessionConfigEventPayload::SessionLaunchOriginSelected(_) => "session_launch_origin_selected",
 }
 
 fn terminal_kinds() -> Vec<String> {

@@ -131,6 +131,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
         WireFrame::Response {
             body:
                 ResponseBody::SessionAttach {
+                    launch_origin: _,
                     attachment_id,
                     attach_state,
                 },

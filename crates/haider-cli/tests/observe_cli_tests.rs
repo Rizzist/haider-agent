@@ -88,6 +88,8 @@ fn digest(
         head_seq: 12,
         worker_generation: 7,
         metadata: Some(SessionMetadataV1 {
+            launch_origin: None,
+            workspace_allocation: None,
             provider_base_url: None,
             provider_rebind_id: None,
             cwd: format!("/tmp/{id}"),

@@ -445,6 +445,7 @@ fn agent_type_fact_moves_identity_and_a_clearing_fact_reverts() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(),
             attachment: attachment.clone(),
             worker_generation: 7,

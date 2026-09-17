@@ -3292,6 +3292,7 @@ fn attachment_from(frame: WireFrame) -> (AttachmentId, u64) {
     let WireFrame::Response {
         body:
             ResponseBody::SessionAttach {
+                launch_origin: _,
                 attachment_id,
                 attach_state,
             },

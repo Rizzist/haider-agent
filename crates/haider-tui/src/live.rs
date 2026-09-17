@@ -1327,6 +1327,11 @@ pub enum LiveReply {
         attachment: AttachmentId,
         worker_generation: u64,
         replay_through_seq: u64,
+        /// Current origin snapshot at the attach watermark (dated-workspace
+        /// addendum O5). Partial replay cannot assume the origin event
+        /// appears after `after_seq`; this snapshot hydrates the slot and
+        /// replay ignores lower/equal revisions.
+        launch_origin: Option<haider_protocol::session::LaunchOriginV1>,
     },
     Detached {
         attachment: AttachmentId,
@@ -3226,9 +3231,24 @@ impl LiveDriver {
                 attachment,
                 worker_generation,
                 replay_through_seq,
+                launch_origin,
             } => {
                 self.binding_worker_generation = Some(worker_generation);
                 self.cold.remove(&session);
+                // Hydrate the one replaceable origin slot from the attach
+                // snapshot at its watermark (addendum O5); replayed origin
+                // facts with lower/equal revisions are ignored in place.
+                if model.active_session.as_ref() == Some(&session)
+                    && let Some(origin) = launch_origin
+                    && let Some(display) = origin.path.display
+                    && model
+                        .launch_origin
+                        .as_ref()
+                        .is_none_or(|(revision, _)| origin.revision > *revision)
+                {
+                    model.launch_origin = Some((origin.revision, display));
+                    model.dirty = true;
+                }
                 // THE STRICT GAP LAW COVERS THE FIRST ENVELOPE (review
                 // W3c3 P1-1). Continuity used to be checked only once
                 // `last_seq` was set, so a fresh attach at cursor 0 that
@@ -6182,6 +6202,21 @@ impl LiveDriver {
                 if model.identity.provider != rebound.provider {
                     model.identity.provider = rebound.provider;
                     model.refresh_context_window();
+                    model.dirty = true;
+                }
+            }
+            // Dated-workspace addendum O5/O7: ONE replaceable context slot.
+            // Replay folds by revision (the latest wins in place); no
+            // per-event transcript rows, no unread/turn-count movement.
+            haider_protocol::session::SessionConfigEventPayload::SessionLaunchOriginSelected(
+                selected,
+            ) => {
+                let newer = model
+                    .launch_origin
+                    .as_ref()
+                    .is_none_or(|(revision, _)| selected.revision > *revision);
+                if newer && let Some(display) = selected.path.display {
+                    model.launch_origin = Some((selected.revision, display));
                     model.dirty = true;
                 }
             }

@@ -121,6 +121,7 @@ async fn execute(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            ..
         } => (attachment_id, attach_state.worker_generation),
         ResponseBody::Error { code, message, .. } => return Err(format!("{code}: {message}")),
         _ => return Err("unexpected session.attach response".into()),

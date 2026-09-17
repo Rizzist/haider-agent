@@ -930,6 +930,8 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        launch_origin: None,
+        workspace_allocation: None,
         provider_base_url: None,
         provider_rebind_id: None,
         cwd,
@@ -1384,6 +1386,8 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    launch_origin: None,
+                    workspace_allocation: None,
                     provider_base_url: None,
                     provider_rebind_id: None,
                     cwd: workspace_text.clone(),
@@ -1637,6 +1641,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    launch_origin: None,
+                    workspace_allocation: None,
                     provider_base_url: None,
                     provider_rebind_id: None,
                     cwd: workspace.clone(),
@@ -1689,6 +1695,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                launch_origin: None,
+                workspace_allocation: None,
                 provider_base_url: None,
                 provider_rebind_id: None,
                 cwd: workspace,
@@ -1900,6 +1908,8 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    launch_origin: None,
+                    workspace_allocation: None,
                     provider_base_url: None,
                     provider_rebind_id: None,
                     cwd: workspace.clone(),
@@ -2081,6 +2091,8 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    launch_origin: None,
+                    workspace_allocation: None,
                     provider_base_url: None,
                     provider_rebind_id: None,
                     cwd: workspace,
@@ -5638,6 +5650,8 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        launch_origin: None,
+        workspace_allocation: None,
         cwd,
         provider: "fake".into(),
         account_alias: None,
