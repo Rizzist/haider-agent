@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Documents-convention tests (`docs/design/dated-workspace-v1.md` §2, W6).
 
 use std::path::{Path, PathBuf};

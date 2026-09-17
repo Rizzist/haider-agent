@@ -91,15 +91,15 @@ pub fn sanitize_origin_path(
         });
     };
 
-    if let Some(home) = home {
-        if let Ok(relative) = path.strip_prefix(home) {
-            let display = if relative.as_os_str().is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{}", escape_display(&path_to_display(relative)))
-            };
-            return bounded(OriginPathKind::HomeRelative, display);
-        }
+    if let Some(home) = home
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        let display = if relative.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", escape_display(&path_to_display(relative)))
+        };
+        return bounded(OriginPathKind::HomeRelative, display);
     }
 
     if let Some(masked) = mask_other_user_home(path) {

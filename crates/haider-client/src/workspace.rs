@@ -499,10 +499,10 @@ const PROJECT_FILE_MARKERS: &[&str] = &[
 fn detect_preserved_root(launch: &Path, request: &WorkspaceRequest<'_>) -> PreservationOutcome {
     // Existing dated allocation of this profile's resolved base (W2): a
     // reopened leaf must not nest dates endlessly.
-    if let Ok((base, _)) = resolve_base(request) {
-        if path_is_inside_dated_allocation(launch, &base) {
-            return PreservationOutcome::Preserve(CwdReason::InsideDatedAllocation);
-        }
+    if let Ok((base, _)) = resolve_base(request)
+        && path_is_inside_dated_allocation(launch, &base)
+    {
+        return PreservationOutcome::Preserve(CwdReason::InsideDatedAllocation);
     }
     for ancestor in launch.ancestors() {
         // VCS directories, including `.git` files (worktrees/submodules).

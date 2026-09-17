@@ -2863,16 +2863,16 @@ impl SystemPromptBuilder {
         // turn boundary — volatile context, never durable history. The
         // display value was sanitised at ingress and is data, not
         // instructions; origin grants no access.
-        if let Some(origin) = &metadata.launch_origin {
-            if let Some(display) = &origin.path.display {
-                context.push_str("\nTUI opened from: ");
-                context.push_str(display);
-                context.push_str(
-                    " (client-reported location; context only).\n\
-                     Relative tool paths resolve in Canonical workspace. \
-                     Origin does not grant access.",
-                );
-            }
+        if let Some(origin) = &metadata.launch_origin
+            && let Some(display) = &origin.path.display
+        {
+            context.push_str("\nTUI opened from: ");
+            context.push_str(display);
+            context.push_str(
+                " (client-reported location; context only).\n\
+                 Relative tool paths resolve in Canonical workspace. \
+                 Origin does not grant access.",
+            );
         }
         if let Some(handoff_dir) = handoff_dir {
             context.push_str("\nEphemeral parent handoff directory: ");

@@ -10035,10 +10035,10 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(map_sqlite_error)?;
-        if let Some(metadata) = decode_session_metadata(session_id, &metadata_json)? {
-            if metadata.launch_origin.is_some() {
-                return Ok(metadata.launch_origin);
-            }
+        if let Some(metadata) = decode_session_metadata(session_id, &metadata_json)?
+            && metadata.launch_origin.is_some()
+        {
+            return Ok(metadata.launch_origin);
         }
         latest_launch_origin_event(&connection, session_id)
     }
