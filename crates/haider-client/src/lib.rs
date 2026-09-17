@@ -27,6 +27,8 @@ pub mod display;
 pub mod fleet;
 pub mod graph;
 pub mod headless;
+pub mod hijri;
+pub mod launch_origin;
 pub mod lockdown;
 pub mod notify;
 pub mod observe;
@@ -46,6 +48,7 @@ pub mod surface;
 pub mod transcription;
 pub mod workflow_graph;
 pub mod workflow_graph_rpc;
+pub mod workspace;
 
 pub use checkpoint::{CheckpointClientError, checkpoints, redo, rollback_turn, undo};
 pub use client::{
@@ -147,6 +150,9 @@ pub use workflow_graph_rpc::{WorkflowGraphRpcAdapter, WorkflowGraphRpcAdapterErr
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-client";
 
+#[cfg(test)]
+#[path = "hijri_tests.rs"]
+mod hijri_tests;
 #[cfg(test)]
 #[path = "lockdown_tests.rs"]
 mod lockdown_tests;

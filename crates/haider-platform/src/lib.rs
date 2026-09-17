@@ -21,12 +21,14 @@ mod directory;
 mod file_lock;
 pub mod fs;
 mod ipc;
+mod local_date;
 mod process;
 mod reachability;
 mod shutdown;
 mod spawn;
 mod system;
 mod user;
+mod user_directories;
 
 pub use bounded_wait::{BoundedWait, WaitTimeout, bounded_wait};
 #[cfg(windows)]
@@ -92,7 +94,15 @@ pub use spawn::{
     spawn_daemon_with_readiness_and_liveness,
     spawn_daemon_with_readiness_and_liveness_and_idle_ttl,
 };
+pub use local_date::{
+    CivilDateError, CivilDateSample, civil_from_unix_days, sample_local_civil_date,
+    sample_utc_civil_date, sample_with_offset,
+};
 pub use system::local_device_name;
+pub use user_directories::{
+    DocumentsFallbackReason, DocumentsLookup, documents_directory, linux_documents_directory,
+    parse_xdg_documents_dir,
+};
 pub use user::{effective_user_id, is_owner_private_directory, owner_scoped_runtime_directory};
 
 /// Compatibility boundary for unchanged callers; new side-file code should
