@@ -631,9 +631,8 @@ pub(super) async fn run_session_actor(
                 // committed fact is publishable. The serialized arm keeps
                 // the revision CAS honest against concurrent config writes.
                 let result = store.register_session_launch_origin(command).await;
-                if let Ok(haider_core::SessionLaunchOriginOutcome::Committed {
-                    envelope, ..
-                }) = &result
+                if let Ok(haider_core::SessionLaunchOriginOutcome::Committed { envelope, .. }) =
+                    &result
                 {
                     head = envelope.seq;
                     authority_epoch = envelope.authority_epoch;

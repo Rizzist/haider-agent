@@ -25,7 +25,10 @@ read's journal head; later reads may see new events in an active session. Neithe
 interface attaches, resumes, or changes the source session.
 
 The projection uses completed items as TUI replay does; it omits advisory deltas
-and duplicate history nodes. It shows user and assistant text, incomplete answers,
+and duplicate history nodes. Session-config facts — including the additive
+`session_launch_origin_selected` registration (dated-workspace addendum) —
+stay intentionally omitted from this compact page; raw `session.read`/event
+export remains the audit route for them. It shows user and assistant text, incomplete answers,
 completed tool calls, separate tool result summaries, command exit statuses, and
 run terminals. Tool arguments and results use the shared InstructPipe preview
 helpers. Each row retains its sequence and branch/run/agent coordinates. A result

@@ -330,7 +330,7 @@ fn issuance_travels_the_exact_prompt_cut_to_the_wire() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
-        launch_origin: None,
+            launch_origin: None,
             session: sid("source"),
             attachment: AttachmentId::new("att-0"),
             worker_generation: 7,

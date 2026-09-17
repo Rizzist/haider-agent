@@ -65,6 +65,10 @@ pub use ipc::{
     shutdown_handle, split, sweep_stale_endpoints, validate_runtime_artifact_basename,
     validate_unix_socket_path, write_immediate,
 };
+pub use local_date::{
+    CivilDateError, CivilDateSample, civil_from_unix_days, sample_local_civil_date,
+    sample_utc_civil_date, sample_with_offset,
+};
 #[cfg(target_os = "macos")]
 pub use process::process_group_contains_only_leader;
 pub use process::program_on_path;
@@ -94,16 +98,12 @@ pub use spawn::{
     spawn_daemon_with_readiness_and_liveness,
     spawn_daemon_with_readiness_and_liveness_and_idle_ttl,
 };
-pub use local_date::{
-    CivilDateError, CivilDateSample, civil_from_unix_days, sample_local_civil_date,
-    sample_utc_civil_date, sample_with_offset,
-};
 pub use system::local_device_name;
+pub use user::{effective_user_id, is_owner_private_directory, owner_scoped_runtime_directory};
 pub use user_directories::{
     DocumentsFallbackReason, DocumentsLookup, documents_directory, linux_documents_directory,
     parse_xdg_documents_dir,
 };
-pub use user::{effective_user_id, is_owner_private_directory, owner_scoped_runtime_directory};
 
 /// Compatibility boundary for unchanged callers; new side-file code should
 /// select its durability contract through [`fs::sync_directory`].

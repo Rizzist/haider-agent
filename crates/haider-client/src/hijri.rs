@@ -113,9 +113,7 @@ fn hijri_month_length(year: i64, month: u8) -> i64 {
 /// Days from the civil epoch to 1 Muharram of AH `year`:
 /// `354*(y-1) + floor((3 + 11*y)/30)`.
 fn hijri_year_start(year: i64) -> Result<i64, HijriError> {
-    let base = 354i64
-        .checked_mul(year - 1)
-        .ok_or(HijriError::Overflow)?;
+    let base = 354i64.checked_mul(year - 1).ok_or(HijriError::Overflow)?;
     let leap = 11i64
         .checked_mul(year)
         .and_then(|v| v.checked_add(3))
@@ -126,7 +124,9 @@ fn hijri_year_start(year: i64) -> Result<i64, HijriError> {
 
 /// Julian day number of a proleptic-Gregorian date, validated first.
 fn gregorian_to_jdn(year: i32, month: u8, day: u8) -> Result<i64, HijriError> {
-    if !(1..=12).contains(&month) || day == 0 || i64::from(day) > gregorian_month_length(year, month)
+    if !(1..=12).contains(&month)
+        || day == 0
+        || i64::from(day) > gregorian_month_length(year, month)
     {
         return Err(HijriError::InvalidGregorian);
     }
@@ -162,7 +162,9 @@ fn gregorian_month_length(year: i32, month: u8) -> i64 {
 /// Converts a proleptic-Gregorian civil date to the islamic-civil date.
 pub fn hijri_from_gregorian(year: i32, month: u8, day: u8) -> Result<HijriDate, HijriError> {
     let jdn = gregorian_to_jdn(year, month, day)?;
-    let days = jdn.checked_sub(CIVIL_EPOCH_JDN).ok_or(HijriError::Overflow)?;
+    let days = jdn
+        .checked_sub(CIVIL_EPOCH_JDN)
+        .ok_or(HijriError::Overflow)?;
     hijri_from_epoch_days(days)
 }
 

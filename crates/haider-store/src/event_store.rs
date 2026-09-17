@@ -14614,11 +14614,9 @@ fn latest_launch_origin_event(
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let envelope = decode_envelope_column(connection, row, 0)
             .map_err(|error| corrupt(format!("invalid launch-origin fact: {error}")))?;
-        let Some(fact) =
-            haider_protocol::session::SessionLaunchOriginSelected::from_payload_value(
-                &envelope.payload,
-            )
-        else {
+        let Some(fact) = haider_protocol::session::SessionLaunchOriginSelected::from_payload_value(
+            &envelope.payload,
+        ) else {
             continue;
         };
         if fact.subject_session_id != session_id.as_str() {

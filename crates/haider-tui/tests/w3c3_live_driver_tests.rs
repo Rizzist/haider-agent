@@ -123,7 +123,7 @@ fn attach_all(driver: &mut LiveDriver, model: &mut AppModel, count: usize) {
         driver.apply(
             model,
             LiveReply::Attached {
-            launch_origin: None,
+                launch_origin: None,
                 session: sid(n),
                 attachment: attachment(n),
                 worker_generation: 7,

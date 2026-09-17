@@ -266,7 +266,7 @@ async fn attach_response_precedes_events_that_overtook_it_on_the_wire() {
                         batch.extend(encoded(&WireFrame::Response {
                             request_id,
                             body: ResponseBody::SessionAttach {
-            launch_origin: None,
+                                launch_origin: None,
                                 attachment_id: att,
                                 attach_state: attach_state(&session_id, 2),
                             },
@@ -387,7 +387,7 @@ async fn detach_then_attach_reaches_the_wire_in_that_order() {
                             }
                             RequestBody::SessionAttachWithOrigin { session_id, .. } => {
                                 ResponseBody::SessionAttach {
-            launch_origin: None,
+                                    launch_origin: None,
                                     attachment_id: AttachmentId::new(format!(
                                         "live-{}",
                                         session_id.as_str()
@@ -709,7 +709,7 @@ fn map_response_interprets_attach_outcomes_through_their_context() {
         map_response(
             &context,
             ResponseBody::SessionAttach {
-            launch_origin: None,
+                launch_origin: None,
                 attachment_id: attachment(5),
                 attach_state: attach_state(&session(5), 30),
             },

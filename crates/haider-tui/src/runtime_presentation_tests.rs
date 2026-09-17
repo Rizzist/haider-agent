@@ -90,7 +90,7 @@ fn live_presentation_gate_accelerates_only_live_first_content_and_terminal_edges
     assert_eq!(
         gate.observe(
             &LiveReply::Attached {
-            launch_origin: None,
+                launch_origin: None,
                 session: session.clone(),
                 attachment: attachment.clone(),
                 worker_generation: 1,
@@ -230,7 +230,7 @@ fn live_presentation_gate_rejects_missing_catchup_duplicates_and_gaps() {
     let run = RunId::new("sequence-run");
     let mut gate = LivePresentationGate::default();
     let attached = LiveReply::Attached {
-            launch_origin: None,
+        launch_origin: None,
         session: session.clone(),
         attachment: attachment.clone(),
         worker_generation: 1,
@@ -302,7 +302,7 @@ fn live_presentation_gate_opens_after_a_raised_catchup_high_water() {
     assert_eq!(
         gate.observe(
             &LiveReply::Attached {
-            launch_origin: None,
+                launch_origin: None,
                 session: session.clone(),
                 attachment: attachment.clone(),
                 worker_generation: 1,
@@ -366,7 +366,7 @@ fn live_presentation_gate_matches_visible_and_hidden_extension_rows() {
     assert_eq!(
         gate.observe(
             &LiveReply::Attached {
-            launch_origin: None,
+                launch_origin: None,
                 session: session.clone(),
                 attachment: attachment.clone(),
                 worker_generation: 1,

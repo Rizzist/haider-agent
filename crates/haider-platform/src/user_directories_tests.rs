@@ -111,8 +111,7 @@ fn absolute_xdg_config_home_is_used() {
 
 #[test]
 fn last_matching_line_wins_and_lookup_path_helper() {
-    let content =
-        "XDG_DOCUMENTS_DIR=\"$HOME/Old\"\nXDG_DOCUMENTS_DIR=\"$HOME/New\"\n".to_string();
+    let content = "XDG_DOCUMENTS_DIR=\"$HOME/Old\"\nXDG_DOCUMENTS_DIR=\"$HOME/New\"\n".to_string();
     let parsed = parse_xdg_documents_dir(&content, &home()).unwrap();
     assert_eq!(parsed.path(), home().join("New").as_path());
 }

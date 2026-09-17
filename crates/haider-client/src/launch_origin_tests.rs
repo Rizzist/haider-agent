@@ -29,9 +29,11 @@ fn own_home_becomes_tilde() {
     assert_eq!(sanitized.kind, OriginPathKind::HomeRelative);
     assert_eq!(sanitized.display.as_deref(), Some("~"));
 
-    let sanitized =
-        sanitize_origin_path(Some(Path::new("/Users/alice/Documents/x")), Some(own_home()))
-            .unwrap();
+    let sanitized = sanitize_origin_path(
+        Some(Path::new("/Users/alice/Documents/x")),
+        Some(own_home()),
+    )
+    .unwrap();
     assert_eq!(sanitized.kind, OriginPathKind::HomeRelative);
     assert_eq!(sanitized.display.as_deref(), Some("~/Documents/x"));
 }
@@ -52,8 +54,7 @@ fn other_user_homes_are_masked() {
         ("/home/carol", "/home/<user>"),
         ("/home/carol/deep/dir", "/home/<user>/deep/dir"),
     ] {
-        let sanitized =
-            sanitize_origin_path(Some(Path::new(input)), Some(own_home())).unwrap();
+        let sanitized = sanitize_origin_path(Some(Path::new(input)), Some(own_home())).unwrap();
         assert_eq!(sanitized.kind, OriginPathKind::Redacted, "for {input}");
         assert_eq!(sanitized.display.as_deref(), Some(expected), "for {input}");
     }
@@ -70,8 +71,7 @@ fn non_home_absolute_paths_stay_absolute() {
 #[test]
 fn control_and_bidi_characters_are_escaped() {
     let tricky = "/opt/a\u{202e}b\nc\u{1b}[31m";
-    let sanitized =
-        sanitize_origin_path(Some(Path::new(tricky)), Some(own_home())).unwrap();
+    let sanitized = sanitize_origin_path(Some(Path::new(tricky)), Some(own_home())).unwrap();
     let display = sanitized.display.unwrap();
     assert!(!display.contains('\u{202e}'), "bidi control leaked");
     assert!(!display.contains('\n'), "newline leaked");

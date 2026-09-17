@@ -174,7 +174,7 @@ impl Responder {
                 } else {
                     self.next_att += 1;
                     self.replies.push(LiveReply::Attached {
-            launch_origin: None,
+                        launch_origin: None,
                         session,
                         attachment: att(self.next_att),
                         worker_generation: 7,

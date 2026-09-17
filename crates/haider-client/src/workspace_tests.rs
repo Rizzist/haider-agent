@@ -13,8 +13,7 @@ use super::{
 };
 
 const ENTROPY: [u8; 16] = [
-    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
-    0xef,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
 ];
 
 fn reference_sample() -> CivilDateSample {
@@ -193,6 +192,35 @@ fn materialize_leaf_is_first_write_only_and_private() {
         let mode = std::fs::metadata(&plan.leaf).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "leaf must be owner-private");
     }
+}
+
+/// L5 specified, not accidental: once materialisation has returned
+/// success, a leaf that then receives no writes (or whose writes were all
+/// reverted) REMAINS on disk — there is no automatic cleanup API at all.
+#[test]
+fn materialised_then_empty_leaf_remains_by_specification() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    let environment = environment_with_base(&base);
+    let config = WorkspaceConfig::default();
+    let WorkspaceSelection::Dated(plan) = resolve_workspace(&request(
+        WorkspaceInvocation::Interactive,
+        Some(temp.path()),
+        &environment,
+        &config,
+        temp.path(),
+    ))
+    .unwrap() else {
+        panic!("expected dated");
+    };
+    let materialized = materialize_leaf(&plan).unwrap();
+    // Session lifetime passes: every write failed or was reverted, so the
+    // leaf is still empty at exit.
+    assert_eq!(std::fs::read_dir(&materialized.leaf).unwrap().count(), 0);
+    // The leaf deliberately persists; nothing in this module can remove a
+    // successfully materialised directory.
+    assert!(materialized.leaf.is_dir());
 }
 
 #[test]
@@ -571,7 +599,10 @@ fn reopened_allocation_leaf_is_preserved_not_nested() {
         }
     );
     assert!(path_is_inside_dated_allocation(&leaf, &base));
-    assert!(!path_is_inside_dated_allocation(&base.join("Haider"), &base));
+    assert!(!path_is_inside_dated_allocation(
+        &base.join("Haider"),
+        &base
+    ));
     assert!(!path_is_inside_dated_allocation(
         &base.join("Haider").join("not-a-date").join("x"),
         &base
@@ -738,8 +769,7 @@ fn relative_explicit_workspace_resolves_against_launch_cwd() {
         temp.path(),
     );
     explicit.explicit_workspace = Some("child");
-    let WorkspaceSelection::LaunchCwd { path, reason } =
-        resolve_workspace(&explicit).unwrap()
+    let WorkspaceSelection::LaunchCwd { path, reason } = resolve_workspace(&explicit).unwrap()
     else {
         panic!("expected explicit path");
     };

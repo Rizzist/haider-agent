@@ -73,10 +73,7 @@ pub fn parse_xdg_documents_dir(content: &str, home: &Path) -> Option<DocumentsLo
         };
         let value = value.trim();
         // The format requires a double-quoted value.
-        let Some(inner) = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-        else {
+        let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
             result = Some(DocumentsLookup::HomeFallback {
                 home: home.to_path_buf(),
                 reason: DocumentsFallbackReason::InvalidValue,
@@ -166,7 +163,9 @@ pub fn documents_directory(home: &Path) -> DocumentsLookup {
     {
         linux_documents_directory(
             home,
-            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).as_deref(),
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .as_deref(),
             |path| std::fs::read_to_string(path).ok(),
         )
     }
@@ -199,9 +198,8 @@ fn windows_documents_directory(home: &Path) -> DocumentsLookup {
     // SAFETY: the API contract is an out-pointer that, on success, owns a
     // COM allocation which must be released with `CoTaskMemFree` on every
     // path once consumed.
-    let result = unsafe {
-        SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut buffer)
-    };
+    let result =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut buffer) };
     if result != 0 || buffer.is_null() {
         return DocumentsLookup::HomeFallback {
             home: home.to_path_buf(),

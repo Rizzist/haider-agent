@@ -9,8 +9,7 @@ use haider_protocol::session::{
     LaunchOriginPathKindV1, LaunchOriginPathV1, SessionLaunchOriginSelected,
 };
 use haider_store::{
-    EventStore, SessionCreateCommand, SessionLaunchOriginCommand, SessionLaunchOriginOutcome,
-    Store,
+    EventStore, SessionCreateCommand, SessionLaunchOriginCommand, SessionLaunchOriginOutcome, Store,
 };
 use serde_json::json;
 use std::fmt::Debug;
@@ -41,9 +40,8 @@ fn origin_command(
     expected_revision: u64,
     path: LaunchOriginPathV1,
 ) -> SessionLaunchOriginCommand {
-    let request_json = format!(
-        "{{\"open_id\":{open_id:?},\"expected_revision\":{expected_revision}}}"
-    );
+    let request_json =
+        format!("{{\"open_id\":{open_id:?},\"expected_revision\":{expected_revision}}}");
     SessionLaunchOriginCommand {
         command_id: command_id.into(),
         request_digest: format!("digest-{command_id}"),
@@ -117,13 +115,19 @@ fn origin_registers_once_and_identical_retry_replays_receipt() {
     seed_legacy_session(&store, &session);
     let seq_before = must(store.latest_seq(&session));
 
-    let command = origin_command(&store, "origin-1", &session, "open-a", 0, home_path("~/dev"));
+    let command = origin_command(
+        &store,
+        "origin-1",
+        &session,
+        "open-a",
+        0,
+        home_path("~/dev"),
+    );
     let first = match must(store.register_session_launch_origin(&command)) {
         SessionLaunchOriginOutcome::Committed { origin, envelope } => {
-            let fact = SessionLaunchOriginSelected::from_payload_value(
-                &envelope.payload.to_json_value(),
-            )
-            .expect("committed envelope is a launch-origin fact");
+            let fact =
+                SessionLaunchOriginSelected::from_payload_value(&envelope.payload.to_json_value())
+                    .expect("committed envelope is a launch-origin fact");
             assert_eq!(fact.revision, 1);
             assert_eq!(fact.open_id, "open-a");
             assert_eq!(fact.subject_session_id, session.as_str());
@@ -163,18 +167,39 @@ fn origin_replacement_is_cas_guarded_and_history_immutable() {
     let session = SessionId::new("session-origin-cas");
     seed_legacy_session(&store, &session);
 
-    let first = origin_command(&store, "origin-a", &session, "open-a", 0, home_path("~/one"));
+    let first = origin_command(
+        &store,
+        "origin-a",
+        &session,
+        "open-a",
+        0,
+        home_path("~/one"),
+    );
     must(store.register_session_launch_origin(&first));
 
     // A second open that still believes revision 0 must conflict.
-    let stale = origin_command(&store, "origin-b", &session, "open-b", 0, home_path("~/two"));
+    let stale = origin_command(
+        &store,
+        "origin-b",
+        &session,
+        "open-b",
+        0,
+        home_path("~/two"),
+    );
     let error = store
         .register_session_launch_origin(&stale)
         .expect_err("stale CAS must conflict");
     assert_eq!(error.code, ErrorCode::RevisionConflict);
 
     // The deliberate reopen with the CURRENT revision replaces the slot.
-    let fresh = origin_command(&store, "origin-c", &session, "open-b", 1, home_path("~/two"));
+    let fresh = origin_command(
+        &store,
+        "origin-c",
+        &session,
+        "open-b",
+        1,
+        home_path("~/two"),
+    );
     let replaced = match must(store.register_session_launch_origin(&fresh)) {
         SessionLaunchOriginOutcome::Committed { origin, .. } => origin,
         other => panic!("expected committed replacement, got {other:?}"),
@@ -204,7 +229,10 @@ fn origin_replacement_is_cas_guarded_and_history_immutable() {
     };
     assert_eq!(replayed.revision, 1);
     let latest = must(store.latest_launch_origin(&session)).expect("origin snapshot");
-    assert_eq!(latest.revision, 2, "receipt replay must not restore old origin");
+    assert_eq!(
+        latest.revision, 2,
+        "receipt replay must not restore old origin"
+    );
 }
 
 /// O4: legacy `{}` metadata stays `{}`; the event alone carries origin and
@@ -311,7 +339,14 @@ fn unsanitised_ingress_is_refused_without_claiming_the_receipt() {
 
     // The refused command id was never claimed; a clean registration with
     // the same id succeeds (no corrupted session, no stuck receipt).
-    let clean = origin_command(&store, "origin-dirty", &session, "open-d", 0, home_path("~"));
+    let clean = origin_command(
+        &store,
+        "origin-dirty",
+        &session,
+        "open-d",
+        0,
+        home_path("~"),
+    );
     let outcome = must(store.register_session_launch_origin(&clean));
     assert!(matches!(
         outcome,
@@ -340,8 +375,7 @@ fn stale_generation_is_refused() {
     let store = must(Store::open(root.path()));
     let session = SessionId::new("session-origin-stale");
     seed_legacy_session(&store, &session);
-    let mut command =
-        origin_command(&store, "origin-s", &session, "open-s", 0, home_path("~"));
+    let mut command = origin_command(&store, "origin-s", &session, "open-s", 0, home_path("~"));
     command.worker_generation += 1;
     let error = store
         .register_session_launch_origin(&command)

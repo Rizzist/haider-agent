@@ -89,9 +89,15 @@ fn absent_registration_keeps_legacy_attach_bytes() {
         sealed_replay: false,
         launch_origin: None,
     }));
-    assert_eq!(legacy, absent, "absent-field bytes must be pre-feature bytes");
+    assert_eq!(
+        legacy, absent,
+        "absent-field bytes must be pre-feature bytes"
+    );
     let body = String::from_utf8(legacy[4..].to_vec()).expect("utf8 frame");
-    assert!(!body.contains("launch_origin"), "no vestigial field: {body}");
+    assert!(
+        !body.contains("launch_origin"),
+        "no vestigial field: {body}"
+    );
 }
 
 /// A pre-feature attach decodes into the normal form with no registration.

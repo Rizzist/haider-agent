@@ -976,6 +976,19 @@ stdin to answer a child menu.
 
 ## Additive changelog
 
+### 2026-09-17 — v0.0.972 session launch-origin registration
+
+- `session.attach` accepts an optional receipt-backed `launch_origin`
+  registration (control attaches only) and returns an optional current
+  origin snapshot, under additive feature `session_launch_origin_v1`.
+  Absent fields keep pre-feature bytes; the RPC method count stays 136.
+- New supplemental session-config kind `session_launch_origin_selected`;
+  `SessionMetadataV1` gains optional `launch_origin` and
+  `workspace_allocation`. Raw history retains every accepted
+  registration; only the current context slot is replaced. Headless
+  `haider run` semantics are unchanged. See
+  `docs/design/dated-workspace-v1.md`.
+
 ### 2026-09-05 — v0.0.970 public agent/workflow CLI
 
 - Added the eight documented verbs, singleton JSON envelopes and exit codes

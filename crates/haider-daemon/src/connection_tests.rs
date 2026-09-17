@@ -362,8 +362,9 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        120,
-        "native session close adds one feature to the existing 119-feature set"
+        121,
+        "session launch-origin registration adds one feature to the \
+         existing 120-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -422,6 +423,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CLOSE_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1.to_owned(),

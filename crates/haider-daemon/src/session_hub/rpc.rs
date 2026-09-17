@@ -18046,12 +18046,8 @@ impl HubConnection {
                     };
                     match self.hub.register_session_launch_origin(command).await {
                         Ok(
-                            haider_core::SessionLaunchOriginOutcome::Committed {
-                                origin, ..
-                            }
-                            | haider_core::SessionLaunchOriginOutcome::IdempotentReplay {
-                                origin,
-                            },
+                            haider_core::SessionLaunchOriginOutcome::Committed { origin, .. }
+                            | haider_core::SessionLaunchOriginOutcome::IdempotentReplay { origin },
                         ) => registered_origin = Some(origin),
                         Err(SessionHubError::Store(error)) => {
                             // O3: a stale CAS or store refusal fails this
@@ -18104,7 +18100,10 @@ impl HubConnection {
         // off the wire so pre-feature response bytes are unchanged.
         let current_origin = match registered_origin {
             Some(origin) => Some(origin),
-            None => match metadata.as_ref().and_then(|meta| meta.launch_origin.clone()) {
+            None => match metadata
+                .as_ref()
+                .and_then(|meta| meta.launch_origin.clone())
+            {
                 Some(origin) => Some(origin),
                 None => {
                     self.hub

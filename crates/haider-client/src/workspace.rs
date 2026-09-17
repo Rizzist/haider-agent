@@ -229,7 +229,10 @@ pub enum CwdReason {
     HeadlessDefault,
     CiDefault,
     /// A project marker matched at this ancestor.
-    ProjectDetected { marker: String, boundary: PathBuf },
+    ProjectDetected {
+        marker: String,
+        boundary: PathBuf,
+    },
     /// Launch cwd is inside an existing `<base>/Haider/<date>` allocation.
     InsideDatedAllocation,
     /// Ancestor inspection failed; conservatively preserve readable cwd.
@@ -311,9 +314,9 @@ impl std::fmt::Display for WorkspaceError {
             Self::ConflictingSelectors => {
                 f.write_str("--workspace and --workspace-mode are mutually exclusive")
             }
-            Self::AmbiguousEnvironment => f.write_str(
-                "HAIDER_WORKSPACE and HAIDER_WORKSPACE_MODE are both set; unset one",
-            ),
+            Self::AmbiguousEnvironment => {
+                f.write_str("HAIDER_WORKSPACE and HAIDER_WORKSPACE_MODE are both set; unset one")
+            }
             Self::EmptySelector(name) => write!(f, "{name} is set but empty"),
             Self::EnvWorkspaceInvalid(path) => write!(
                 f,
@@ -361,7 +364,9 @@ pub fn sample_civil_date(
 /// Resolves the workspace selection for one NEW local desktop session.
 /// Read-only: performs no directory creation (L1). Existing sessions never
 /// call this (their stored workspace is authoritative).
-pub fn resolve_workspace(request: &WorkspaceRequest<'_>) -> Result<WorkspaceSelection, WorkspaceError> {
+pub fn resolve_workspace(
+    request: &WorkspaceRequest<'_>,
+) -> Result<WorkspaceSelection, WorkspaceError> {
     if request.explicit_workspace.is_some() && request.explicit_mode.is_some() {
         return Err(WorkspaceError::ConflictingSelectors);
     }
@@ -571,10 +576,7 @@ pub fn path_is_inside_dated_allocation(path: &Path, base: &Path) -> bool {
     let Some(Component::Normal(label)) = components.next() else {
         return false;
     };
-    label
-        .to_str()
-        .map(is_date_label_like)
-        .unwrap_or(false)
+    label.to_str().map(is_date_label_like).unwrap_or(false)
 }
 
 fn is_date_label_like(label: &str) -> bool {
@@ -624,9 +626,7 @@ fn resolve_base(
     };
     match documents_directory(home) {
         DocumentsLookup::Documents(path) => Ok((path, WorkspaceBaseSource::PlatformDocuments)),
-        DocumentsLookup::HomeFallback { home, .. } => {
-            Ok((home, WorkspaceBaseSource::HomeFallback))
-        }
+        DocumentsLookup::HomeFallback { home, .. } => Ok((home, WorkspaceBaseSource::HomeFallback)),
     }
 }
 
@@ -635,10 +635,7 @@ fn dated_plan(request: &WorkspaceRequest<'_>) -> Result<DatedWorkspacePlan, Work
     let sample = request.sample;
     let hijri = hijri_from_gregorian(sample.year, sample.month, sample.day)?;
     let hijri_label = hijri.label();
-    let gregorian_label = format!(
-        "{:04}-{:02}-{:02}",
-        sample.year, sample.month, sample.day
-    );
+    let gregorian_label = format!("{:04}-{:02}-{:02}", sample.year, sample.month, sample.day);
     let allocation_id = hex_lower(&request.allocation_entropy);
     let daily_root = base.join("Haider").join(&hijri_label);
     let leaf = daily_root.join(format!("s-{allocation_id}"));
@@ -691,7 +688,11 @@ impl std::fmt::Display for MaterializeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BaseUnavailable(path, error) => {
-                write!(f, "workspace base unavailable at {}: {error}", path.display())
+                write!(
+                    f,
+                    "workspace base unavailable at {}: {error}",
+                    path.display()
+                )
             }
             Self::Io(path, error) => write!(f, "cannot create {}: {error}", path.display()),
             Self::CollisionRetriesExhausted => {
@@ -775,7 +776,10 @@ pub fn materialize_leaf(plan: &DatedWorkspacePlan) -> Result<MaterializedLeaf, M
 #[cfg(unix)]
 fn create_dir_private_all(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 #[cfg(not(unix))]
