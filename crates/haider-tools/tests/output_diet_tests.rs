@@ -234,6 +234,49 @@ fn fixture_token_estimates_cover_listing_grep_cargo_and_three_kib_read() {
     assert!(reduced.text.contains("\"haider_elision_v1\""));
 }
 
+/// 972-ax-digest: the background-task completion digest is the reduced
+/// inline view from the shared consumer, byte-capped to the notice budget
+/// with the shared head/tail elision — deterministic, honest about the cap,
+/// and empty input produces no digest at all.
+#[test]
+fn task_completion_digest_is_the_capped_inline_reduction() {
+    use haider_protocol::task::TASK_TAIL_BYTES;
+    use haider_tools::task_completion_digest;
+
+    assert_eq!(task_completion_digest(b"", false), None);
+
+    // Sub-cap reduced view: the digest IS the inline reduction, byte-exact.
+    let output = "alpha\nbeta\n";
+    let (digest, complete) =
+        task_completion_digest(output.as_bytes(), false).expect("digest for non-empty output");
+    assert_eq!(
+        digest,
+        reduce_tool_output("process_exec", output, false).text
+    );
+    assert_eq!(digest, output);
+    assert!(complete, "the whole output is displayed");
+
+    // A reduced view over the notice budget keeps a deterministic head/tail
+    // window with the shared cap marker; two invocations agree bytewise.
+    let large = (0..400)
+        .map(|index| format!("unique-line-{index:04} with some distinct payload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (first, first_complete) =
+        task_completion_digest(large.as_bytes(), false).expect("digest for large output");
+    let (second, _) =
+        task_completion_digest(large.as_bytes(), false).expect("digest for large output");
+    assert_eq!(first, second, "reapplication is byte-identical");
+    assert!(!first_complete);
+    assert!(first.len() <= TASK_TAIL_BYTES);
+    assert_eq!(
+        marker(&first)["haider_elision_v1"]["scope"],
+        "background_task_digest_byte_cap"
+    );
+    assert!(first.starts_with("unique-line-0000"), "head retained");
+    assert!(first.ends_with("distinct payload"), "tail retained");
+}
+
 /// AX-1 F3 REGRESSION: a passing test log in a summary format the Test
 /// reducer does not recognize (for example Python `unittest -v`) selects
 /// nothing, which used to elide the whole output (retained head/tail of zero)

@@ -66,8 +66,34 @@ pub fn capture_paging_hint(
     captured_bytes: u64,
     source_unavailable_bytes_at_least: u64,
 ) -> String {
+    paging_hint(
+        &format!("cap:{call_id}"),
+        captured_bytes,
+        source_unavailable_bytes_at_least,
+    )
+}
+
+/// The same deterministic pointer for a completed background task, naming
+/// the durable task id (conversation-stable and journal-replayable, so it
+/// may appear in provider-facing content like the completion notice).
+#[must_use]
+pub fn task_paging_hint(
+    task_id: &str,
+    captured_bytes: u64,
+    source_unavailable_bytes_at_least: u64,
+) -> String {
+    paging_hint(task_id, captured_bytes, source_unavailable_bytes_at_least)
+}
+
+/// Single wording source for every paging pointer, so the capture alias and
+/// the background-task handle can never drift apart.
+fn paging_hint(
+    handle: &str,
+    captured_bytes: u64,
+    source_unavailable_bytes_at_least: u64,
+) -> String {
     use std::fmt::Write as _;
-    let args = serde_json::json!({ "task_id": format!("cap:{call_id}"), "cursor": 0 });
+    let args = serde_json::json!({ "task_id": handle, "cursor": 0 });
     let mut hint = format!(
         "[Shown above is a reduced view; the {captured_bytes}-byte secret-redacted capture is retained. Page it with task_output({args}); follow next_cursor until exhausted."
     );

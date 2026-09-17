@@ -94,6 +94,21 @@ pub struct TaskCompleted {
     pub output_sha256: Option<String>,
     /// Bounded output tail preview (last [`TASK_TAIL_BYTES`], lossy UTF-8).
     pub tail: String,
+    /// Bounded deterministic digest of the secret-redacted retained output:
+    /// the SAME reduced inline view a foreground `process_exec` result would
+    /// show for these bytes (single reduction path), byte-capped to
+    /// [`TASK_TAIL_BYTES`] with the shared head/tail elision. The completion
+    /// event arrives with this digest so the model can decide without a
+    /// wake-up read. Absent on legacy facts journaled before the digest and
+    /// on tasks that produced no retained output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_digest: Option<String>,
+    /// True when `output_digest` displays the complete secret-redacted
+    /// retained output and nothing was dropped beyond the retention cap.
+    /// A complete display earns no paging pointer (row-63 policy: pointers
+    /// are earned only by an incomplete display).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_digest_complete: bool,
     /// Full bounded output (cap [`TASK_OUTPUT_RETAIN_BYTES`]) in the CAS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,

@@ -916,6 +916,207 @@ async fn e1a_background_nonzero_exit_is_failed() {
     store.close().await.expect("store close");
 }
 
+/// 972-ax-digest regression (cross-report finding #1): a background-task
+/// completion event must ARRIVE with a digest — outcome, a bounded
+/// deterministic reduced view of the secret-redacted output, byte counts,
+/// and the paging handle — instead of a bare pointer that costs the model a
+/// wake-up read before any decision (report A's `tail`-first pattern,
+/// report B's forced `task_output` round trip).
+#[tokio::test]
+async fn completion_event_arrives_with_digest_and_paging_handle() {
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = create_task_session(&hub, "task-digest-session", &cwd).await;
+    let run_id = RunId::new("task-digest-tool-run");
+    prepare_tool_run(&hub, &session_id, &run_id, "task-digest").await;
+    let dispatcher = task_dispatcher(&hub, &session_id, &cwd, "task-digest", &run_id).await;
+
+    let receipt = dispatch(
+        &dispatcher,
+        &run_id,
+        "task-digest-spawn",
+        "process_exec",
+        serde_json::json!({
+            "command": "i=0; while [ $i -lt 60 ]; do echo repeated-line; i=$((i+1)); done; \
+                        echo done-marker",
+            "background": true,
+            "name": "digested",
+        }),
+    )
+    .await;
+    let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
+    terminalize_tool_run(&hub, &session_id, &run_id, "task-digest").await;
+    let (_envelope, completed) = wait_for_completed(&store, &session_id, &task).await;
+    assert_eq!(
+        completed.state,
+        TaskTerminalState::Completed { exit_code: Some(0) }
+    );
+
+    // The completion event the model sees: the queued fact renders through
+    // this exact function and the steer path injects the same text.
+    let notice =
+        haider_core::task_event_notice(&TaskEventPayload::TaskCompleted(completed.clone()));
+    assert!(
+        notice.contains("exited with code 0"),
+        "outcome arrives with the event: {notice}"
+    );
+    assert!(
+        notice.contains("852 output bytes"),
+        "byte count arrives with the event: {notice}"
+    );
+    // The digest is the SAME reduced inline view a foreground process_exec
+    // result would show for these bytes (single reduction path — here the
+    // generic adapter collapses the repeated lines), never a bare pointer.
+    assert!(
+        notice.contains("output digest:"),
+        "digest section arrives with the event: {notice}"
+    );
+    assert!(
+        notice.contains("repeated-line [repeated 60×]"),
+        "reduced view arrives with the event: {notice}"
+    );
+    assert!(
+        notice.contains("done-marker"),
+        "causal ending arrives with the event: {notice}"
+    );
+    // The paging handle arrives IN the event (reduced view ⇒ pointer earned)
+    // and resolves without a preparatory status read.
+    let hint = format!(
+        "task_output({{\"cursor\":0,\"task_id\":\"{}\"}})",
+        task.as_str()
+    );
+    assert!(
+        notice.contains(&hint),
+        "paging handle arrives with the event: {notice}"
+    );
+    let page = dispatch(
+        &dispatcher,
+        &run_id,
+        "task-digest-page",
+        "task_output",
+        serde_json::json!({"task_id": task.as_str(), "cursor": 0}),
+    )
+    .await;
+    let artifact_bytes = store
+        .get(&completed.artifact.clone().expect("completion artifact"))
+        .await
+        .expect("read completion artifact");
+    assert_eq!(
+        page["chunk"],
+        String::from_utf8_lossy(&artifact_bytes).into_owned(),
+        "the event's handle pages the full secret-redacted capture"
+    );
+    assert_eq!(page["exhausted"], true);
+
+    dispatcher.close().await.expect("dispatcher close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// Runs one background task to its journaled completion in a fresh session
+/// and returns the completed fact plus its CAS artifact bytes.
+async fn run_task_to_completion(label: &str, command: &str) -> (TaskCompleted, Vec<u8>) {
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = create_task_session(&hub, &format!("{label}-session"), &cwd).await;
+    let run_id = RunId::new(format!("{label}-tool-run"));
+    prepare_tool_run(&hub, &session_id, &run_id, label).await;
+    let dispatcher = task_dispatcher(&hub, &session_id, &cwd, label, &run_id).await;
+    let receipt = dispatch(
+        &dispatcher,
+        &run_id,
+        &format!("{label}-spawn"),
+        "process_exec",
+        serde_json::json!({
+            "command": command,
+            "background": true,
+            "name": "digest-probe",
+        }),
+    )
+    .await;
+    let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
+    terminalize_tool_run(&hub, &session_id, &run_id, label).await;
+    let (_envelope, completed) = wait_for_completed(&store, &session_id, &task).await;
+    let bytes = match completed.artifact.as_ref() {
+        Some(artifact) => store.get(artifact).await.expect("artifact bytes"),
+        None => Vec::new(),
+    };
+    dispatcher.close().await.expect("dispatcher close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+    (completed, bytes)
+}
+
+/// 972-ax-digest regressions: the digest is byte-identical across identical
+/// runs in different sessions (no volatile ids or timestamps in digest
+/// content), it is EXACTLY the single-consumer inline reduction of the
+/// secret-redacted capture bytes (never a second reduction path), and a
+/// completely displayed output earns no paging pointer (row-63 policy).
+#[tokio::test]
+async fn completion_digest_is_deterministic_and_matches_the_inline_reduction() {
+    let command =
+        "i=0; while [ $i -lt 60 ]; do echo repeated-line; i=$((i+1)); done; echo done-marker";
+    let (first, first_bytes) = run_task_to_completion("task-digest-a", command).await;
+    let (second, _) = run_task_to_completion("task-digest-b", command).await;
+    assert_ne!(
+        first.task, second.task,
+        "distinct sessions produce distinct task handles"
+    );
+    let digest = first.output_digest.clone().expect("digest journaled");
+    assert_eq!(
+        Some(digest.as_str()),
+        second.output_digest.as_deref(),
+        "digest content is byte-identical across identical runs"
+    );
+    assert!(
+        !digest.contains("effect-session-"),
+        "no volatile effect handle inside digest content: {digest}"
+    );
+    // Consistency: the digest is exactly what the reduced inline view would
+    // show for the same secret-redacted bytes — the shared consumer, with
+    // its adapter marker, not a second reduction path.
+    let expected = haider_tools::reduce_tool_output(
+        "process_exec",
+        &String::from_utf8_lossy(&first_bytes),
+        false,
+    )
+    .text;
+    assert_eq!(digest, expected, "digest == inline reduction");
+    assert!(
+        digest.contains("\"scope\":\"process_output_adapter:generic\""),
+        "the shared adapter accounting marker is present: {digest}"
+    );
+    assert!(
+        !first.output_digest_complete,
+        "a reduced view is not a complete display"
+    );
+
+    // A sub-window unique output is displayed whole: digest == the entire
+    // secret-redacted capture, and the notice carries no paging pointer.
+    let (complete, complete_bytes) =
+        run_task_to_completion("task-digest-c", "printf 'alpha\\nbeta\\n'").await;
+    let complete_digest = complete.output_digest.clone().expect("digest journaled");
+    assert_eq!(complete_digest.as_bytes(), complete_bytes.as_slice());
+    assert!(complete.output_digest_complete);
+    let notice = haider_core::task_event_notice(&TaskEventPayload::TaskCompleted(complete.clone()));
+    assert!(
+        notice.contains("output digest:\nalpha\nbeta\n"),
+        "complete output arrives whole with the event: {notice}"
+    );
+    assert!(
+        !notice.contains("task_output("),
+        "a complete display earns no paging pointer: {notice}"
+    );
+}
+
 /// MUTATION CHECK (LT2 + LT3 daemon halves): drop the CAS artifact, stop
 /// marking truncation, or journal the idle completion with `Omit`. Expected
 /// RUNTIME failure: the completed fact loses its artifact/tail/truncation
