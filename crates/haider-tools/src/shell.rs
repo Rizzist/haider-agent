@@ -19,6 +19,13 @@ use std::path::{Path, PathBuf};
 pub const REDACTED_ENV_VALUE: &str = "•redacted";
 /// Maximum first-send bytes emitted by any deterministic output adapter.
 pub const REDUCED_TOOL_OUTPUT_MAX_BYTES: usize = crate::ORCHESTRATION_PREVIEW_MAX_BYTES;
+/// Bounded inline head/tail window guaranteed to survive semantic reduction.
+/// An adapter whose selection is empty (for example a fully passing test log
+/// in a summary format the reducer does not recognize) must not elide the
+/// entire output behind a capture handle: output at or under this size stays
+/// whole, and larger output keeps a deterministic head/tail window inline, so
+/// only genuinely large output requires a paging round-trip.
+pub const PROCESS_INLINE_RETENTION_BYTES: usize = 2 * 1024;
 
 /// Deterministic, first-send-only process output reducers. The raw transcript
 /// remains the artifact authority; these values are prompt-facing diet facts.
@@ -167,16 +174,43 @@ pub fn reduce_tool_output(tool: &str, output: &str, failed: bool) -> ReducedTool
         OutputAdapter::Directory => reduce_directory_output(&stripped),
         OutputAdapter::Generic => reduce_generic_output(&stripped, failed),
     };
+    // Inline retention floor: an empty semantic selection used to elide the
+    // whole output (retained head/tail of zero) and force a paging round-trip
+    // even for sub-KiB results. Output within the retention window stays whole
+    // inline; larger output keeps a bounded, deterministic head/tail window.
+    let retention_window = selected.trim().is_empty() && !stripped.trim().is_empty();
+    let selected = if retention_window && stripped.len() <= PROCESS_INLINE_RETENTION_BYTES {
+        stripped.clone()
+    } else {
+        selected
+    };
     let semantic_elision = (selected != stripped).then(|| {
-        let scope = format!("process_output_adapter:{}", output_adapter_name(adapter));
-        account_elision(
-            output,
-            &selected,
-            REDUCED_TOOL_OUTPUT_MAX_BYTES,
-            &scope,
-            false,
-            false,
-        )
+        if retention_window {
+            // The window is a verbatim head/tail subset, so the omitted byte
+            // count is exact.
+            let scope = format!(
+                "process_output_retention_window:{}",
+                output_adapter_name(adapter)
+            );
+            account_elision(
+                output,
+                &stripped,
+                PROCESS_INLINE_RETENTION_BYTES,
+                &scope,
+                true,
+                true,
+            )
+        } else {
+            let scope = format!("process_output_adapter:{}", output_adapter_name(adapter));
+            account_elision(
+                output,
+                &selected,
+                REDUCED_TOOL_OUTPUT_MAX_BYTES,
+                &scope,
+                false,
+                false,
+            )
+        }
     });
     // A semantic adapter is optional: if its required marker would make the
     // model view no smaller, retain the stripped source instead. ANSI removal

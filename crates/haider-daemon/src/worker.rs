@@ -22340,8 +22340,17 @@ fn process_result_with_signal(
     let model_output = hard_limit_elision
         .as_ref()
         .map_or_else(|| reduced.text.clone(), |elided| elided.text.clone());
-    let baseline_preview =
-        process_result_preview_json(&result, signal, reduced.adapter, &raw_output, None);
+    let baseline_complete = output_elided_bytes_at_least == 0 && result.limit_reached.is_none();
+    let baseline_preview = process_result_preview_json(
+        &result,
+        signal,
+        reduced.adapter,
+        PresentedProcessOutput {
+            text: &raw_output,
+            displayed_complete: baseline_complete,
+        },
+        None,
+    );
     let baseline_source_bytes = baseline_preview
         .len()
         .saturating_add(output_elided_bytes_at_least);
@@ -22354,13 +22363,24 @@ fn process_result_with_signal(
             .savings
             .as_ref()
             .is_none_or(|savings| savings.omitted_bytes_exact);
+    // The paging pointer is earned only by an incomplete display: when the
+    // model already received the entire secret-redacted output (accounting for
+    // adapter reduction, not just a truncation flag), appending it would put
+    // volatile bytes into otherwise deterministic provider content for no
+    // capability gain (AHRB row 63).
+    let displayed_complete = |output: &str| {
+        output == raw_output && output_elided_bytes_at_least == 0 && result.limit_reached.is_none()
+    };
     let mut presented_output = model_output.clone();
     let mut preview = if truncated {
         process_result_preview_with_savings(
             &result,
             signal,
             reduced.adapter,
-            &presented_output,
+            PresentedProcessOutput {
+                text: &presented_output,
+                displayed_complete: displayed_complete(&presented_output),
+            },
             baseline_input_bytes,
             baseline_source_bytes,
             omitted_bytes_exact,
@@ -22385,7 +22405,10 @@ fn process_result_with_signal(
             &result,
             signal,
             reduced.adapter,
-            &presented_output,
+            PresentedProcessOutput {
+                text: &presented_output,
+                displayed_complete: displayed_complete(&presented_output),
+            },
             baseline_input_bytes,
             baseline_source_bytes,
             omitted_bytes_exact,
@@ -22465,18 +22488,43 @@ fn process_result_with_signal(
     bounded
 }
 
-fn process_capture_preview(result: &ProcessResult, output: &str) -> String {
-    if result.artifact.is_none() {
-        return output.to_owned();
+/// One model-facing output candidate plus whether it displays the entire
+/// secret-redacted capture (accounting for adapter reduction, not just a
+/// truncation flag).
+#[derive(Clone, Copy)]
+struct PresentedProcessOutput<'a> {
+    text: &'a str,
+    displayed_complete: bool,
+}
+
+/// Appends the deterministic paging pointer to an incomplete model-facing
+/// output. A complete display gets no pointer: the model holds every byte, and
+/// provider content must stay byte-identical across sessions (AHRB row 63).
+/// The volatile `capture:<effect>` handle stays in the durable envelope's
+/// `capture` field for the UI/surface projection.
+fn process_capture_preview(result: &ProcessResult, output: PresentedProcessOutput<'_>) -> String {
+    if result.artifact.is_none() || output.displayed_complete {
+        return output.text.to_owned();
     }
     format!(
-        "{output}\n{}",
-        haider_tools::foreground_capture_hint(
-            &result.effect,
+        "{}\n{}",
+        output.text,
+        haider_tools::capture_paging_hint(
+            &result.call_id,
             result.output_bytes as u64,
             result.source_output_elided_bytes_at_least as u64,
         )
     )
+}
+
+/// Names the session-scoped capture handle in the durable/surface projection.
+/// The actor's provider projection extracts only `output`, so this volatile
+/// identity never reaches provider content.
+fn surface_capture_handle(result: &ProcessResult) -> Option<String> {
+    result
+        .artifact
+        .as_ref()
+        .map(|_| format!("capture:{}", result.effect))
 }
 
 fn process_result_minimal_preview_json(
@@ -22493,8 +22541,12 @@ fn process_result_minimal_preview_json(
         "command_arg_digest": result.command_arg_digest,
         "transcript_digest": result.transcript_digest,
         "artifact": result.artifact,
+        "capture": surface_capture_handle(result),
         "output_adapter": output_adapter,
-        "output": process_capture_preview(result, output),
+        "output": process_capture_preview(result, PresentedProcessOutput {
+            text: output,
+            displayed_complete: false,
+        }),
         "context_savings_detail": context_savings_detail,
     })
     .to_string()
@@ -22504,7 +22556,7 @@ fn process_result_preview_json(
     result: &ProcessResult,
     signal: Option<&ProcessSignalRecorded>,
     output_adapter: haider_tools::OutputAdapter,
-    output: &str,
+    output: PresentedProcessOutput<'_>,
     context_savings_detail: Option<&OutputSavings>,
 ) -> String {
     let mut value = serde_json::json!({
@@ -22525,6 +22577,7 @@ fn process_result_preview_json(
         "output": process_capture_preview(result, output),
         "output_adapter": output_adapter,
         "artifact": result.artifact,
+        "capture": surface_capture_handle(result),
         "limit_reached": result.limit_reached,
         "limits": {
             "wall_timeout_ms": result.wall_timeout_ms,
@@ -22547,7 +22600,7 @@ fn process_result_preview_with_savings(
     result: &ProcessResult,
     signal: Option<&ProcessSignalRecorded>,
     output_adapter: haider_tools::OutputAdapter,
-    output: &str,
+    output: PresentedProcessOutput<'_>,
     baseline_input_bytes: usize,
     baseline_source_bytes: usize,
     omitted_bytes_exact: bool,

@@ -121,14 +121,14 @@ pub use process::{
     PROCESS_MAX_OUTPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, PreparedMonitorProcess, ProcessBounds,
     ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,
     ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
-    ProcessSignal, foreground_capture_hint, monitor_process_command,
+    ProcessSignal, capture_paging_hint, monitor_process_command,
 };
 pub use redact::{redact_lockdown_text, redact_output_text};
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{
-    BuiltinResult, ComposerSubmission, EnvViewEntry, OutputAdapter, REDACTED_ENV_VALUE,
-    REDUCED_TOOL_OUTPUT_MAX_BYTES, ReducedToolOutput, ShellSession, UserProcessExec,
-    estimated_text_tokens, estimated_tokens, reduce_tool_output,
+    BuiltinResult, ComposerSubmission, EnvViewEntry, OutputAdapter, PROCESS_INLINE_RETENTION_BYTES,
+    REDACTED_ENV_VALUE, REDUCED_TOOL_OUTPUT_MAX_BYTES, ReducedToolOutput, ShellSession,
+    UserProcessExec, estimated_text_tokens, estimated_tokens, reduce_tool_output,
 };
 pub use spawn_subagent::{SpawnSubagent, spawn_subagent_manifest};
 pub use task_outcome::{TASK_OUTCOME_REASON_MAX_BYTES, parse_task_outcome, task_outcome_manifest};

@@ -150,7 +150,8 @@ impl TaskRegistry {
         let mut sessions = self.lock();
         let session = sessions.entry(session_id.clone()).or_default();
         session.captures.retain(|(existing, _)| existing != &handle);
-        // Four complete 64-request turns; only references are retained.
+        // Two complete 64-request turns even with an alias entry per capture;
+        // only references are retained.
         if session.captures.len() >= 256 {
             session.captures.pop_front();
         }
@@ -979,7 +980,7 @@ impl TaskFacade {
         task_id: &str,
         cursor: Option<u64>,
     ) -> ToolResult<BoundedResult> {
-        if task_id.starts_with("capture:") {
+        if task_id.starts_with("capture:") || task_id.starts_with("cap:") {
             return self
                 .foreground_capture_page(session_id, task_id, cursor)
                 .await;

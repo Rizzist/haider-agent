@@ -1640,15 +1640,16 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
                     .len()
         })
         .sum();
-    // Union full-pack pin: 971 redaction (+98) plus 972 task_outcome (+515).
+    // Union full-pack pin: 971 redaction (+98), 972 task_outcome (+515), and
+    // 972 output-ergonomics task_output capture-alias wording (+47).
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_616;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_663;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_567;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_614;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_566;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_613;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_561;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_608;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

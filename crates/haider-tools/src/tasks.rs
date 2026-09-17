@@ -1195,7 +1195,7 @@ pub fn task_output_manifest() -> haider_protocol::tool::ToolManifest {
                 "task_id": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Task id or capture handle returned by process_exec"
+                    "description": "Task id, or a capture alias/handle from a process_exec result (cap:<call_id> or capture:<effect>)"
                 },
                 "cursor": {
                     "type": "integer",

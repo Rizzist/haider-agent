@@ -589,6 +589,82 @@ fn process_accounting_fixture(
     }
 }
 
+/// ROW-63 REGRESSION: two executions of the same tool call in different
+/// sessions mint different effect handles (session hash + broker start time).
+/// Provider-facing `output` must stay byte-identical anyway: volatile capture
+/// identity belongs to the durable envelope (`capture`/`effect_id`/`artifact`),
+/// never to provider content, or identical conversations produce
+/// nondeterministic requests and poisoned prompt-cache prefixes (AHRB row 63,
+/// origin 752dfaa7).
+#[test]
+fn process_provider_output_is_byte_identical_across_sessions() {
+    let fixture = |effect: &str, output: &str| {
+        let mut result = process_accounting_fixture("row63", output, false);
+        result.effect = haider_protocol::ids::EffectId::new(effect);
+        result.artifact = Some(haider_protocol::ids::ArtifactRef::new("blake3:row63"));
+        result
+    };
+    let provider_output = |result: &haider_protocol::tool::BoundedResult| {
+        serde_json::from_str::<serde_json::Value>(result.payload_text()).expect("preview JSON")
+            ["output"]
+            .as_str()
+            .expect("output text")
+            .to_owned()
+    };
+
+    // Complete tiny output (the AHRB row-63 shape): the model already holds
+    // every byte, so no paging pointer belongs in provider content at all.
+    let first = crate::worker::process_result(fixture(
+        "effect-session-742d2fda4783bd4f9d8243d8e1294700-1-1789323782886-1",
+        "A",
+    ));
+    let second = crate::worker::process_result(fixture(
+        "effect-session-452cd6428c00931eafe737cc106eb4aa-1-1789323783065-1",
+        "A",
+    ));
+    let (first_out, second_out) = (provider_output(&first), provider_output(&second));
+    assert_eq!(
+        first_out, second_out,
+        "provider content must not embed volatile capture identity"
+    );
+    assert!(!first_out.contains("effect-session-"), "{first_out:?}");
+
+    // Reduced output still offers paging, through the deterministic
+    // conversation-local `cap:<call_id>` alias with non-alarming framing.
+    let large = (0..3_000)
+        .map(|index| format!("unique diagnostic line {index}\n"))
+        .collect::<String>();
+    let first = crate::worker::process_result(fixture(
+        "effect-session-742d2fda4783bd4f9d8243d8e1294700-1-1789323782886-2",
+        &large,
+    ));
+    let second = crate::worker::process_result(fixture(
+        "effect-session-452cd6428c00931eafe737cc106eb4aa-1-1789323783065-2",
+        &large,
+    ));
+    let (first_out, second_out) = (provider_output(&first), provider_output(&second));
+    assert_eq!(
+        first_out, second_out,
+        "paging pointer must be deterministic across sessions"
+    );
+    assert!(first_out.contains("task_output"), "{first_out:?}");
+    assert!(first_out.contains("cap:fixture-row63"), "{first_out:?}");
+    assert!(!first_out.contains("effect-session-"), "{first_out:?}");
+    // Softened framing: everything was captured, so nothing may read as lost.
+    assert!(!first_out.contains("unavailable"), "{first_out:?}");
+    // The volatile handle stays reachable in the durable surface envelope.
+    let value: serde_json::Value =
+        serde_json::from_str(first.payload_text()).expect("preview JSON");
+    assert!(
+        value["capture"]
+            .as_str()
+            .expect("surface capture handle")
+            .starts_with("capture:effect-session-"),
+        "{:?}",
+        value["capture"]
+    );
+}
+
 /// Measures the complete serialized process-result projection, including JSON
 /// escaping and marker/accounting overhead, rather than only reducer payloads.
 #[test]
@@ -680,11 +756,14 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
     assert!(total_net > 0);
     let saved_per_million_input_tokens = total_net.saturating_mul(1_000_000)
         / i64::try_from(total_before).expect("fixture tokens fit i64");
+    // 972 output-ergonomics: the durable `capture` field (null here — no
+    // artifact in these fixtures) adds 16 bytes to each serialized preview;
+    // the net savings are unchanged.
     assert_eq!(
         (total_before, total_after, total_net),
-        (2_787, 1_041, 1_746)
+        (2_803, 1_057, 1_746)
     );
-    assert_eq!(saved_per_million_input_tokens, 626_480);
+    assert_eq!(saved_per_million_input_tokens, 622_904);
     eprintln!(
         "process-boundary cumulative measurement=provider_request_bytes_div_four_v1 before_tokens_estimate={total_before} after_tokens_estimate={total_after} net_tokens_saved_estimate={total_net} saved_per_1m_input_tokens_estimate={saved_per_million_input_tokens}"
     );

@@ -53,16 +53,32 @@ type DirectoryIdentity = haider_platform::WindowsFileIdentity;
 /// Maximum raw payload retained by one pipe-read chunk.
 pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 /// The shared provider-facing pointer to a session-scoped, redacted capture.
+///
+/// Provider-bound bytes must be deterministic across sessions (AHRB row 63):
+/// the pointer names the conversation-local `cap:<call_id>` alias, never the
+/// volatile `capture:<effect>` handle, whose session hash and broker start
+/// time change between otherwise identical conversations. The framing states
+/// that the capture is retained and pageable; bytes are described as missing
+/// only when some were truly never captured.
 #[must_use]
-pub fn foreground_capture_hint(
-    effect: &haider_protocol::ids::EffectId,
-    retained_bytes: u64,
-    omitted_bytes_at_least: u64,
+pub fn capture_paging_hint(
+    call_id: &str,
+    captured_bytes: u64,
+    source_unavailable_bytes_at_least: u64,
 ) -> String {
-    let args = serde_json::json!({ "task_id": format!("capture:{effect}"), "cursor": 0 });
-    format!(
-        "[Capture: {retained_bytes} bytes retained; at least {omitted_bytes_at_least} source bytes unavailable. Page the full secret-redacted capture with task_output({args}); follow next_cursor until exhausted.]"
-    )
+    use std::fmt::Write as _;
+    let args = serde_json::json!({ "task_id": format!("cap:{call_id}"), "cursor": 0 });
+    let mut hint = format!(
+        "[Shown above is a reduced view; the {captured_bytes}-byte secret-redacted capture is retained. Page it with task_output({args}); follow next_cursor until exhausted."
+    );
+    if source_unavailable_bytes_at_least > 0 {
+        let _ = write!(
+            hint,
+            " At least {source_unavailable_bytes_at_least} further bytes arrived after the output limit and are not in the capture."
+        );
+    }
+    hint.push(']');
+    hint
 }
 
 /// Process-output termination threshold. The read that first crosses this
