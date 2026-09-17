@@ -665,6 +665,95 @@ fn process_provider_output_is_byte_identical_across_sessions() {
     );
 }
 
+/// ROW-63 PARITY for `test_run`: the summarized result is provider-facing
+/// content too, so two executions in different sessions (different effect
+/// handles) must produce byte-identical provider output, with counts and
+/// verbatim failures intact and the volatile handle confined to the durable
+/// `capture` field.
+#[test]
+fn test_run_provider_output_is_byte_identical_across_sessions() {
+    let padding = (0..120)
+        .map(|index| format!("test tests::pad_{index:03} ... ok\n"))
+        .collect::<String>();
+    let transcript = format!(
+        "running 121 tests\n{padding}test tests::boom ... FAILED\n\nfailures:\n\n---- tests::boom stdout ----\nassertion `left == right` failed\n  left: 1\n right: 2\n\nfailures:\n    tests::boom\n\ntest result: FAILED. 120 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s\n"
+    );
+    assert!(transcript.len() > 2_048, "must exceed the inline window");
+    let fixture = |effect: &str| {
+        let mut result = process_accounting_fixture("testrun63", &transcript, true);
+        result.effect = haider_protocol::ids::EffectId::new(effect);
+        result.artifact = Some(haider_protocol::ids::ArtifactRef::new("blake3:testrun63"));
+        result
+    };
+    let first = crate::worker::test_run_result(fixture(
+        "effect-session-742d2fda4783bd4f9d8243d8e1294700-1-1789323782886-1",
+    ));
+    let second = crate::worker::test_run_result(fixture(
+        "effect-session-452cd6428c00931eafe737cc106eb4aa-1-1789323783065-1",
+    ));
+    let provider_output = |result: &haider_protocol::tool::BoundedResult| {
+        serde_json::from_str::<serde_json::Value>(result.payload_text()).expect("preview JSON")
+            ["output"]
+            .as_str()
+            .expect("output text")
+            .to_owned()
+    };
+    let (first_out, second_out) = (provider_output(&first), provider_output(&second));
+    assert_eq!(
+        first_out, second_out,
+        "test_run provider content must not embed volatile capture identity"
+    );
+    assert!(!first_out.contains("effect-session-"), "{first_out:?}");
+    assert!(
+        first_out.contains("test_run summary (format=cargo_test): 120 passed, 1 failed, 0 ignored"),
+        "{first_out:?}"
+    );
+    assert!(first_out.contains("--- tests::boom ---"));
+    assert!(first_out.contains("assertion `left == right` failed"));
+    assert!(first_out.contains("cap:fixture-testrun63"), "{first_out:?}");
+    let value: serde_json::Value =
+        serde_json::from_str(first.payload_text()).expect("preview JSON");
+    assert!(
+        value["capture"]
+            .as_str()
+            .expect("surface capture handle")
+            .starts_with("capture:effect-session-"),
+        "{:?}",
+        value["capture"]
+    );
+    assert_eq!(value["test_summary"]["format"], "cargo_test");
+    assert_eq!(value["test_summary"]["counts"]["failed"], 1);
+    assert_eq!(value["test_summary"]["failing_tests"][0], "tests::boom");
+    assert_eq!(
+        first.status,
+        haider_protocol::tool::ToolResultStatus::Failed
+    );
+    assert_eq!(
+        first.reason.as_deref(),
+        Some("process exited with code 1"),
+        "same failure semantics as process_exec"
+    );
+}
+
+/// Honesty floor: unrecognized output must degrade to `unknown` with no
+/// counts, and a sub-window transcript embeds whole with no paging pointer.
+#[test]
+fn test_run_unknown_output_and_small_runs_stay_honest() {
+    let unknown = crate::worker::test_run_result(process_accounting_fixture(
+        "testrun-unknown",
+        "make: *** [check] Error 2\nsomething custom failed\n",
+        true,
+    ));
+    let value: serde_json::Value =
+        serde_json::from_str(unknown.payload_text()).expect("preview JSON");
+    let output = value["output"].as_str().expect("output text");
+    assert!(output.contains("format=unknown"), "{output:?}");
+    assert!(output.contains("counts unavailable (never inferred)"));
+    assert_eq!(value["test_summary"]["counts"], serde_json::Value::Null);
+    assert!(output.contains("full output (complete):"), "{output:?}");
+    assert!(!output.contains("task_output("), "{output:?}");
+}
+
 /// Measures the complete serialized process-result projection, including JSON
 /// escaping and marker/accounting overhead, rather than only reducer payloads.
 #[test]

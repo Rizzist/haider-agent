@@ -1,0 +1,14 @@
+   Compiling fixture-zero v0.1.0 (/private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/cargo_zero)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (/private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/target/debug/deps/fixture_zero-0f5269efac228544)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests fixture_zero
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

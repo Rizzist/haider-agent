@@ -13350,6 +13350,7 @@ pub(crate) enum RegisteredToolRoute {
     FsEdit,
     FsPath,
     ProcessExec,
+    TestRun,
     WorkflowAuthor,
     SpawnSubagent,
     MessageSubagent,
@@ -13726,6 +13727,17 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             DispatchMode::Await,
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::ProcessExec,
+        ),
+        // AX-1 wishlist #4: run-tests-and-summarize. NOT a second execution
+        // path — the same ProcessExec broker/policy/capture/redaction
+        // consumers run the command; only the result presentation differs.
+        // Local-only (no RemoteExecution), same interactive Ask default.
+        registered_tool(
+            test_run_definition(),
+            vec![EffectClass::ProcessExec],
+            DispatchMode::Await,
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::TestRun,
         ),
         {
             let manifest = haider_tools::spawn_subagent_manifest();
@@ -14746,6 +14758,9 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "process_exec" => {
             "process_exec(command, cwd?, background?, name?, profile?) — run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable"
+        }
+        "test_run" => {
+            "test_run(command, cwd?) — run one local test command under process_exec policy (600 s / 2 MiB, foreground) and return deterministic pass/fail/ignored counts plus failing tests verbatim (cargo test, pytest, python unittest, Gradle/JUnit recognized); unrecognized output degrades to exit code + bounded tail, never invented counts; page the full capture with task_output(cap:<call_id>)"
         }
         "task_output" => {
             "task_output(task_id, cursor?) — page background output or a foreground capture handle; foreground cursors count secret-redacted UTF-8 bytes; follow next_cursor until exhausted"
@@ -16146,6 +16161,7 @@ fn route_uses_cached_tool_operation(route: RegisteredToolRoute) -> bool {
             | RegisteredToolRoute::FsEdit
             | RegisteredToolRoute::FsPath
             | RegisteredToolRoute::ProcessExec
+            | RegisteredToolRoute::TestRun
             | RegisteredToolRoute::SpawnSubagent
             | RegisteredToolRoute::TaskKill
             | RegisteredToolRoute::WebFetch
@@ -17271,6 +17287,24 @@ impl BrokerToolDispatcher {
                     background,
                     name,
                     remote_profile,
+                })
+            }
+            // The summarizing variant reuses the ProcessExec operation shape
+            // wholesale: foreground, local, no display name. The dispatch arm
+            // distinguishes presentation by ROUTE, never by a second parser.
+            RegisteredToolRoute::TestRun => {
+                let command = required_string(args, "command")?;
+                let requested_cwd = optional_string(args, "cwd")?;
+                let mut operation = ProcessExec::new(call_id, command);
+                if let Some(cwd) = requested_cwd.as_ref() {
+                    operation = operation.with_cwd(cwd);
+                }
+                Ok(ParsedToolOperation::ProcessExec {
+                    operation,
+                    requested_cwd,
+                    background: false,
+                    name: None,
+                    remote_profile: None,
                 })
             }
             RegisteredToolRoute::SpawnSubagent => SpawnSubagent::from_tool_args(args.clone())
@@ -19365,7 +19399,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .fs_glob(operation, &policy, &mut *cas, ResultBounds::default())
                     .await
             }
-            RegisteredToolRoute::ProcessExec => {
+            // TestRun is process_exec plus a structured summarizer on the
+            // captured output: one shared broker/capture/redaction path, with
+            // the presentation chosen by route at the very end.
+            RegisteredToolRoute::ProcessExec | RegisteredToolRoute::TestRun => {
+                let summarize_tests = route == RegisteredToolRoute::TestRun;
+                // The parsed-operation destructure below shadows `name` with
+                // the background display name; keep the tool identity first.
+                let tool_name = if summarize_tests {
+                    "test_run"
+                } else {
+                    "process_exec"
+                };
                 #[cfg(windows)]
                 // Core durably commits RunningTool before dispatch enters this
                 // exec arm, so reaching this boundary confirms its publication.
@@ -19393,7 +19438,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 {
                     self.clear_cached_operation(&operation_key);
                     return Ok(ToolDispatchResult::Completed(grant_ceiling_result(
-                        "process_exec",
+                        tool_name,
                     )));
                 }
                 if let Some(profile) = remote_profile {
@@ -19500,8 +19545,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         None,
                     );
                     let started = SystemTime::now();
+                    // Wider wall/output bounds are the ONLY execution-side
+                    // difference for test_run: real suites outlive the
+                    // 60-second interactive default. Same broker, same
+                    // policy, same capture pipeline.
+                    let bounds = if summarize_tests {
+                        haider_tools::test_run_process_bounds()
+                    } else {
+                        ProcessBounds::default()
+                    };
                     match broker
-                        .process_exec(operation, &policy, cas, output, ProcessBounds::default())
+                        .process_exec(operation, &policy, cas, output, bounds)
                         .await
                     {
                         Ok(execution) => {
@@ -19570,7 +19624,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                                     .emit_created_images(CreatedImageScan {
                                                         run_id,
                                                         call_id,
-                                                        tool: "process_exec",
+                                                        tool: tool_name,
                                                         command: &operation.command,
                                                         output_preview: &preview,
                                                         cwd: &effective_cwd,
@@ -19582,7 +19636,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                                     return Err(tool_error(error));
                                                 }
                                             }
-                                            Ok(process_result_with_signal(result, Some(&signal), Some(safe_output)))
+                                            if summarize_tests {
+                                                Ok(test_run_result_with_signal(
+                                                    result,
+                                                    Some(&signal),
+                                                    Some(safe_output),
+                                                ))
+                                            } else {
+                                                Ok(process_result_with_signal(
+                                                    result,
+                                                    Some(&signal),
+                                                    Some(safe_output),
+                                                ))
+                                            }
                                         }
                                         Err(error) => Err(ToolError::Runtime {
                                             message: error.message,
@@ -22126,6 +22192,47 @@ fn process_exec_definition() -> ToolDefinition {
     }
 }
 
+/// AX-1 wishlist #4 — the run-tests-and-summarize affordance. Executes
+/// through the SAME process broker as `process_exec` (same Ask/Auto
+/// permission class, workspace cwd resolution, capture/journal/redaction
+/// consumers); only the result presentation differs. The schema is
+/// deliberately platform-invariant: the command rides the same platform
+/// shell `process_exec` documents.
+fn test_run_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "test_run".into(),
+        description: "Run one local non-interactive test command inside the session workspace \
+                      and return a deterministic summary in a single call: pass/fail/ignored \
+                      counts parsed from recognized console formats (cargo test, pytest, \
+                      python unittest, Gradle/JUnit) plus each failing test's output VERBATIM. \
+                      Unrecognized output degrades honestly to the exit code and a bounded \
+                      tail (format \"unknown\"); counts are never inferred. Execution follows \
+                      the process_exec permission policy with a 600-second wall limit and a \
+                      2 MiB output limit, foreground and local only; the complete \
+                      secret-redacted capture stays pageable with \
+                      task_output({\"task_id\":\"cap:<call_id>\"})."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8192,
+                    "description": "Exact test command, passed to the same platform shell as process_exec"
+                },
+                "cwd": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional workspace-relative working directory"
+                }
+            },
+            "required": ["command"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
 fn required_string(args: &serde_json::Value, field: &str) -> ToolResult<String> {
     args.get(field)
         .and_then(serde_json::Value::as_str)
@@ -22265,6 +22372,11 @@ fn parse_fs_file_glob(value: Option<&serde_json::Value>) -> ToolResult<FsFileGlo
 #[cfg(test)]
 pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
     process_result_with_signal(result, None, None)
+}
+
+#[cfg(test)]
+pub(crate) fn test_run_result(result: ProcessResult) -> BoundedResult {
+    test_run_result_with_signal(result, None, None)
 }
 
 fn command_cwd(workspace: &str, requested: Option<&str>) -> PathBuf {
@@ -22507,6 +22619,118 @@ fn process_result_with_signal(
         });
     }
     bounded
+}
+
+/// Builds the `test_run` result: the same durable process envelope as
+/// `process_exec` (status/effect/digests/capture for surfaces and replay)
+/// with the provider-facing `output` replaced by the deterministic test
+/// summary — counts, verbatim failing tests, honest unknown/limit
+/// degradation, and the `cap:<call_id>` paging alias only (AHRB row 63).
+/// The summarizer consumes the COMPLETE secret-redacted capture produced by
+/// the one shared redaction consumer; nothing here re-reads raw bytes.
+fn test_run_result_with_signal(
+    result: ProcessResult,
+    signal: Option<&ProcessSignalRecorded>,
+    complete_safe_output: Option<String>,
+) -> BoundedResult {
+    let artifact = result.artifact.clone();
+    let output_elided_bytes_at_least = if complete_safe_output.is_some() {
+        result.source_output_elided_bytes_at_least
+    } else {
+        result.output_elided_bytes_at_least
+    };
+    let safe_output = complete_safe_output.unwrap_or_else(|| {
+        if result.output_elided_bytes_at_least > result.source_output_elided_bytes_at_least {
+            "[REDACTED:incomplete_process_capture]".into()
+        } else {
+            haider_tools::redact_process_output(&result.inline_output)
+                .unwrap_or_else(|_| "[REDACTED:invalid_process_capture]".into())
+        }
+    });
+    let limit_label = result.limit_reached.map(|limit| match limit {
+        haider_tools::ProcessLimit::WallTimeout => "wall_timeout",
+        haider_tools::ProcessLimit::OutputCap => "output_cap",
+    });
+    // A cut-off transcript must not be parsed into confident counts.
+    let summary = if limit_label.is_some() {
+        haider_tools::TestRunSummary::unknown()
+    } else {
+        haider_tools::summarize_test_output(&safe_output)
+    };
+    let output = haider_tools::render_test_run_output(
+        &summary,
+        &safe_output,
+        &haider_tools::TestRunRenderContext {
+            call_id: &result.call_id,
+            exit_code: result.exit_code,
+            output_bytes: result.output_bytes as u64,
+            source_unavailable_bytes_at_least: output_elided_bytes_at_least as u64,
+            capture_retained: result.artifact.is_some(),
+            limit_reached: limit_label,
+        },
+    );
+    let preview = serde_json::json!({
+        "status": result.status,
+        "effect_id": result.effect,
+        "exit_code": result.exit_code,
+        "signal": result.signal,
+        "output_bytes": result.output_bytes,
+        "command_arg_digest": result.command_arg_digest,
+        "transcript_digest": result.transcript_digest,
+        "workspace_revision": signal.and_then(|signal| signal.workspace_revision.as_ref()),
+        "subject_digest": signal.map(|signal| signal.subject_digest.as_str()),
+        "process_signal": signal.map(|signal| ProcessSignalRef {
+            run_id: signal.run_id.clone(),
+            call_id: signal.call_id.clone(),
+            effect_id: signal.effect_id.clone(),
+        }),
+        "output": output,
+        "output_adapter": summary.format,
+        "test_summary": {
+            "format": summary.format,
+            "counts": summary.counts,
+            "failing_tests": summary
+                .failures
+                .iter()
+                .map(|failure| failure.name.as_str())
+                .collect::<Vec<_>>(),
+        },
+        "artifact": result.artifact,
+        "capture": surface_capture_handle(&result),
+        "limit_reached": result.limit_reached,
+        "limits": {
+            "wall_timeout_ms": result.wall_timeout_ms,
+            "max_output_bytes": result.max_output_bytes,
+        },
+        "escalation_note": result.escalation_note,
+    })
+    .to_string();
+    let reason = process_failure_reason(&result);
+    BoundedResult {
+        preview,
+        // The summary IS the complete intended result page; the full
+        // transcript stays pageable through the durable capture instead of
+        // riding a truncation footer.
+        truncated: false,
+        truncation: None,
+        effects: Vec::new(),
+        data: None,
+        artifact,
+        images: Vec::new(),
+        cursor: None,
+        status: match result.status {
+            haider_protocol::item::ToolStatus::Completed => ToolResultStatus::Completed,
+            haider_protocol::item::ToolStatus::Rejected => ToolResultStatus::Rejected,
+            haider_protocol::item::ToolStatus::Conflict => ToolResultStatus::Conflict,
+            haider_protocol::item::ToolStatus::Failed => ToolResultStatus::Failed,
+            haider_protocol::item::ToolStatus::Cancelled => ToolResultStatus::Cancelled,
+            haider_protocol::item::ToolStatus::Unknown
+            | haider_protocol::item::ToolStatus::Pending
+            | haider_protocol::item::ToolStatus::InProgress => ToolResultStatus::Unknown,
+        },
+        reason,
+        presentation: None,
+    }
 }
 
 /// One model-facing output candidate plus whether it displays the entire

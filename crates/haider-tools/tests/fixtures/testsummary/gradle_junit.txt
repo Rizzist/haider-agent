@@ -1,0 +1,29 @@
+Starting a Gradle Daemon (subsequent builds will be faster)
+> Task :compileJava NO-SOURCE
+> Task :processResources NO-SOURCE
+> Task :classes UP-TO-DATE
+> Task :compileTestJava
+> Task :processTestResources NO-SOURCE
+> Task :testClasses
+
+> Task :test FAILED
+
+LedgerTest > overdraftDetected() FAILED
+    org.opentest4j.AssertionFailedError at LedgerTest.java:27
+
+LedgerTest > withdrawalIsWrongHere() FAILED
+    org.opentest4j.AssertionFailedError at LedgerTest.java:22
+
+5 tests completed, 2 failed, 1 skipped
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':test'.
+> There were failing tests. See the report at: file:///private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/gradlep/build/reports/tests/test/index.html
+
+* Try:
+> Run with --scan to get full insights.
+
+BUILD FAILED in 13s
+2 actionable tasks: 2 executed

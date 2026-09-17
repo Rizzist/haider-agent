@@ -1,0 +1,29 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
+rootdir: /private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/py
+collected 5 items
+
+test_orders.py ..FFs                                                     [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_discount_is_wrong_here __________________________
+
+    def test_discount_is_wrong_here():
+>       assert apply_discount(200.0, 10) == 190.0, "ten percent off 200 should be 180"
+E       AssertionError: ten percent off 200 should be 180
+E       assert 180.0 == 190.0
+E        +  where 180.0 = apply_discount(200.0, 10)
+
+test_orders.py:17: AssertionError
+__________________________ test_negative_total_raises __________________________
+
+    def test_negative_total_raises():
+        with pytest.raises(ValueError):
+>           apply_discount(-5.0, 10)
+E           Failed: DID NOT RAISE <class 'ValueError'>
+
+test_orders.py:22: Failed
+=========================== short test summary info ============================
+FAILED test_orders.py::test_discount_is_wrong_here - AssertionError: ten perc...
+FAILED test_orders.py::test_negative_total_raises - Failed: DID NOT RAISE <cl...
+==================== 2 failed, 2 passed, 1 skipped in 0.02s ====================

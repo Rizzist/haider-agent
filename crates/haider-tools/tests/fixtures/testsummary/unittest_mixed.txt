@@ -1,0 +1,26 @@
+test_append_grows_list (test_inventory.InventoryTests) ... ok
+test_count_starts_at_zero (test_inventory.InventoryTests) ... ok
+test_hardware_scanner (test_inventory.InventoryTests) ... skipped 'requires warehouse hardware'
+test_lookup_missing_sku_fails (test_inventory.InventoryTests) ... ERROR
+test_price_rounding_is_wrong_here (test_inventory.InventoryTests) ... FAIL
+
+======================================================================
+ERROR: test_lookup_missing_sku_fails (test_inventory.InventoryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/py/test_inventory.py", line 15, in test_lookup_missing_sku_fails
+    self.assertEqual(catalog["sku-2"], "gadget")
+KeyError: 'sku-2'
+
+======================================================================
+FAIL: test_price_rounding_is_wrong_here (test_inventory.InventoryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/py/test_inventory.py", line 18, in test_price_rounding_is_wrong_here
+    self.assertAlmostEqual(round(2.675, 2), 2.68, msg="banker's rounding strikes")
+AssertionError: 2.67 != 2.68 within 7 places (0.010000000000000231 difference) : banker's rounding strikes
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.000s
+
+FAILED (failures=1, errors=1, skipped=1)

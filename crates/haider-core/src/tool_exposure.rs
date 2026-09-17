@@ -10,6 +10,10 @@ const CODING_TOOLS: &[&str] = &[
     "fs_edit",
     "fs_write",
     "process_exec",
+    // `test_run` (AX-1 wishlist #4) is deliberately NOT in the initial pack:
+    // the default instruct-pipe byte ratchet (permissions_core_tests) has
+    // zero headroom, so the affordance stays one `list_tools` promotion away
+    // until the owner re-baselines that budget.
     // Delegation must be callable on the first request, including by
     // headless clients. This remains an intersection with the granted pack.
     "spawn_subagent",
