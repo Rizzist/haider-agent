@@ -5613,6 +5613,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "edit",
             "fs_path",
             "process_exec",
+            "test_run",
             "spawn_subagent",
             "message_subagent",
             // W-A: the background-task pack — output reads are effect-free
