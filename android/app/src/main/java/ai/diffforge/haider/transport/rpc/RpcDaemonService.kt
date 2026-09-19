@@ -108,7 +108,7 @@ class RpcDaemonService(
         ready = { roster.isReady() && control.snapshots.value?.phase == DaemonPhase.Ready },
         invalidations = merge(
             combine(selected, roster.sessions, accountSource.providerRevision, client.connectionEpochs, targets) { _, _, _, _, _ -> Unit },
-            client.state.map { Unit }, replay.revision.map { Unit },
+            client.state.map { Unit },
         ), scope = owner)
     override val shell = shellRepository.shell
     override val shellExecutions = shellRepository.executions

@@ -52,6 +52,12 @@ internal class ShellRepository(
                     state == RpcConnectionState.CONNECTED && id in caught) }
             }.collect { history.value = it }
         }
+        // Output chunks revise history without changing admission. Re-observe only
+        // when the selected session's newest execution changes lifecycle state.
+        scope.launch {
+            combine(history, selected) { executions, id -> id to id?.let { executions[it]?.lastOrNull()?.status } }
+                .distinctUntilChanged().drop(1).collect { refreshes.trySend(Unit) }
+        }
     }
 
     suspend fun refresh() = refreshMutex.withLock {
@@ -88,6 +94,15 @@ internal class ShellRepository(
         previous?.receipt?.let { return@withLock it }
         if (!ready()) throw IOException("disconnected")
         val pending = previous ?: run {
+            if (submissions.size >= 128) {
+                val projected = history.value
+                submissions.entries.removeAll { (_, prior) ->
+                    val receipt = prior.receipt ?: return@removeAll false
+                    projected[receipt.sessionId].orEmpty().any {
+                        it.ref == receipt && it.status !in setOf(ShellExecutionStatus.Running, ShellExecutionStatus.Reconnecting)
+                    }
+                }
+            }
             if (submissions.size >= 128) throw IOException("shell_submission_limit")
             val capability = capability(session)
             if (!capability.available) throw IOException(capability.reason ?: "shell_unavailable")
