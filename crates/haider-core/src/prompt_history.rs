@@ -4430,14 +4430,19 @@ fn render_journal_with_facts(
                         recorded_savings.is_none_or(|savings| savings.omitted_bytes_exact);
                     let mut output =
                         output.finish(failed, source_omitted_bytes_at_least, source_complete);
-                    // A completely displayed capture earns no paging pointer,
-                    // and an incomplete one points at the deterministic
-                    // conversation-local `cap:<call_id>` alias — the volatile
-                    // effect handle must not enter provider content (row 63).
+                    // A successfully completed capture that is displayed in
+                    // full earns no paging pointer. Cancelled commands retain
+                    // one even when their observed prefix fits inline: their
+                    // interrupted output remains explicitly pageable. Every
+                    // pointer uses the deterministic conversation-local
+                    // `cap:<call_id>` alias — the volatile effect handle must
+                    // not enter provider content (row 63).
                     if facts
                         .process_captures
                         .contains_key(&(run_id.clone(), call_id.clone()))
-                        && (output.output_truncated || source_omitted_bytes_at_least > 0)
+                        && (status == haider_protocol::item::ToolStatus::Cancelled
+                            || output.output_truncated
+                            || source_omitted_bytes_at_least > 0)
                     {
                         output.output_preview.push('\n');
                         output.output_preview.push_str(&haider_tools::capture_paging_hint(
