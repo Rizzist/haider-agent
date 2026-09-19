@@ -982,22 +982,20 @@ fn custom_provider_delta_survives_daemon_restart_beside_the_builtin_catalog() {
     let catalog =
         CatalogServer::start(r#"{"object":"list","data":[{"id":"delta-model","object":"model"}]}"#);
     let origin = format!("http://{}/v1", catalog.address);
+    let mut add = profile.one_shot();
+    // This case verifies persistence of an automatically discovered catalog;
+    // the shared one-shot fixture disables automatic discovery by default.
+    add.env_remove("HAIDER_DISCOVERY_DISABLED").args([
+        "provider",
+        "add",
+        "delta-proxy",
+        "--base-url",
+        &origin,
+        "--no-auth",
+        "--json",
+    ]);
 
-    let added = json_document(
-        &bounded_output(
-            profile.one_shot().args([
-                "provider",
-                "add",
-                "delta-proxy",
-                "--base-url",
-                &origin,
-                "--no-auth",
-                "--json",
-            ]),
-            "provider add",
-        ),
-        "provider add",
-    );
+    let added = json_document(&bounded_output(&mut add, "provider add"), "provider add");
     assert_eq!(added["schema"], "haider.account.custom.v1");
     assert_eq!(added["alias"], "delta-proxy");
     assert_eq!(added["reachable"], false);

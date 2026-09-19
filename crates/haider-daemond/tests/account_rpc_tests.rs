@@ -965,31 +965,33 @@ async fn production_wire_path_advertises_builtin_providers_but_never_fake() {
         "fake is never creatable in production"
     );
 
-    // Creation succeeds before credential resolution for all shipped adapter
-    // classes; the account-backed factory resolves on the logical turn.
-    for (provider, model) in [
-        ("anthropic", "claude-test"),
-        ("openai", "gpt-5-test"),
-        ("openai-compatible", "llama-test"),
-        ("gemini", "gemini-2.5-flash"),
-    ] {
-        let accepted = request(
-            &mut client,
-            &format!("req-prod-{provider}"),
-            RequestBody::SessionCreate {
-                command_id: CommandId::new(format!("command-prod-{provider}")),
-                cwd: workspace_text.clone(),
-                provider: provider.into(),
-                model: model.into(),
-                max_tokens: 64,
-            },
-        )
-        .await;
+    // Remote catalog providers now start honestly NeverFetched: an arbitrary
+    // model id cannot double as proof that a built-in is advertised. Inspect
+    // the passive production registry instead, which is the actual roster
+    // contract and never opens a provider connection.
+    let advertised = request(
+        &mut client,
+        "req-prod-providers",
+        RequestBody::ProviderList { provider: None },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = advertised else {
+        panic!("production provider roster must be readable: {advertised:?}");
+    };
+    let advertised = providers
+        .iter()
+        .map(|provider| provider.provider.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for provider in haider_provider::BUILTIN_PROVIDER_NAMES {
         assert!(
-            matches!(accepted, ResponseBody::SessionCreate { .. }),
-            "{provider} must be creatable on the production path"
+            advertised.contains(provider),
+            "built-in provider {provider} must be advertised"
         );
     }
+    assert!(
+        !advertised.contains("fake"),
+        "fake must never be advertised"
+    );
 
     task.shutdown_handle().request("test complete");
     let _ = task.join().await;
@@ -1005,6 +1007,29 @@ async fn session_create_accepts_gemini_when_account_active() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
     let config = DaemonConfig::new("profile-gemini", root.path().join("store"), root.path());
+    // Authenticated remote catalogs no longer fabricate built-in model rows.
+    // Seed an actually fetched fixture so this test remains about the active
+    // account/session-create wire path, not live Google catalog availability.
+    {
+        let store = haider_store::Store::open(&config.store_dir)
+            .unwrap_or_else(|error| panic!("seed Gemini catalog: {error:?}"));
+        let models = vec![haider_provider::DiscoveredModel {
+            slug: "gemini-2.5-flash".into(),
+            display_name: "Gemini 2.5 Flash".into(),
+            context_window: Some(1_048_576),
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            extensions: None,
+        }];
+        let models_json = serde_json::to_string(&models)
+            .unwrap_or_else(|error| panic!("serialize Gemini catalog: {error}"));
+        store
+            .put_provider_models("gemini", &models_json, None, 1)
+            .unwrap_or_else(|error| panic!("write Gemini catalog: {error:?}"));
+    }
     let fixture = AccountFixture::for_provider("gemini", Vec::new());
     let task = ready_with_dependencies(&config, fixture.dependencies()).await;
     let mut client = control_client(&config).await;

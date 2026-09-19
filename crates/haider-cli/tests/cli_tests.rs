@@ -327,6 +327,12 @@ fn configure_isolated_runtime(command: &mut HaiderCommand) -> PathBuf {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    // A nonblocking listener may yield a nonblocking accepted socket on some
+    // platforms. Request fixtures need a bounded blocking read, not a race
+    // with the client's first write.
+    stream
+        .set_nonblocking(false)
+        .expect("blocking proxy request reads");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("request read timeout");
@@ -712,6 +718,9 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
     let mut owner = haider();
     owner
         .env_remove("HAIDER_TEST_FAKE_PROVIDER")
+        // This regression exercises automatic catalog discovery, while the
+        // shared CLI fixture disables all automatic discovery by default.
+        .env_remove("HAIDER_DISCOVERY_DISABLED")
         .env("HAIDER_NO_UPDATE_CHECK", "1");
     let initial = owner
         .args(["provider", "list", "--json"])
