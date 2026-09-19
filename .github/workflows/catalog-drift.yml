@@ -1,0 +1,21 @@
+name: public catalog drift
+on:
+  schedule:
+    - cron: '31 3 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  public-catalogs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      # No secrets: public discovery must work on a fresh signed-out profile.
+      # Network availability/catalog changes belong to nightly, not PR gates.
+      - run: cargo test -p haider-provider --test public_catalog_drift --locked -- --ignored --nocapture

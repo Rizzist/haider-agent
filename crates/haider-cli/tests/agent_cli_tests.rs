@@ -833,9 +833,71 @@ fn agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs() {
 #[test]
 fn agent_spawn_provider_only_resolves_model_through_daemon_session_authority() {
     let profile = Profile::new(report_script("DAEMON_RESOLVED_MODEL_REPORT"));
-    // The injected daemon factory routes every built-in provider to the fake
-    // script. xai supplies a real published default in the native catalog;
-    // the ad hoc `fake` provider deliberately has no default model.
+    // Publish a discovered catalog before startup; xAI has no seeded default.
+    // The injected daemon factory routes the published pair to the fake script.
+    {
+        let store = haider_store::Store::open(&profile.profile).expect("catalog store");
+        store
+            .put_provider_models(
+                "xai",
+                r#"[{"slug":"grok-4","display_name":"Grok 4","supported_efforts":[],"visible":true}]"#,
+                None,
+                u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("catalog fetch time")
+                        .as_millis(),
+                )
+                .expect("fetch timestamp fits u64"),
+            )
+            .expect("publish discovered xAI model");
+    }
+    // Authenticated catalogs do not auto-pick a default. Publish the choice
+    // through the daemon's validated management RPC against this inventory.
+    assert!(
+        profile
+            .run(&["provider", "list", "--json"])
+            .status
+            .success()
+    );
+    let status = profile.run(&["status", "--json", "--no-spawn"]);
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).expect("daemon endpoint");
+    let endpoint = PathBuf::from(field(&status["daemon"], "socket_path"));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("default publication runtime")
+        .block_on(async {
+            let connection =
+                haider_client::connect(&endpoint, haider_client::ClientConfig::default())
+                    .await
+                    .expect("default publication connection");
+            let listed = connection
+                .client
+                .request(haider_rpc::RequestBody::ProviderList { provider: None })
+                .await
+                .expect("current catalog revision");
+            let haider_rpc::ResponseBody::ProviderList { revision, .. } = listed else {
+                panic!("provider inventory: {listed:?}");
+            };
+            let published = connection
+                .client
+                .request(haider_rpc::RequestBody::AccountSetDefaultModel {
+                    command_id: haider_rpc::CommandId("fixture-publish-xai-default".into()),
+                    provider: "xai".into(),
+                    model: "grok-4".into(),
+                    expected_revision: revision,
+                })
+                .await
+                .expect("publish validated discovered default");
+            let haider_rpc::ResponseBody::AccountSetDefaultModel { provider, .. } = published
+            else {
+                panic!("default publication: {published:?}");
+            };
+            assert_eq!(provider.default_model.as_deref(), Some("grok-4"));
+            let _ = connection.client.close();
+        });
     let spawned = profile.json(
         &[
             "agent",
@@ -849,6 +911,7 @@ fn agent_spawn_provider_only_resolves_model_through_daemon_session_authority() {
         0,
     )["result"]
         .clone();
+    assert_eq!(spawned["manifest"]["model_profile"], "grok-4");
     let waited = profile.wait(&spawned, 0);
     assert_eq!(
         waited["result"]["report"]["summary"],

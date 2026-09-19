@@ -401,7 +401,8 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
                 supports_vision: None,
             })
             .collect(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
         auth_methods: auth.to_vec(),
         availability,

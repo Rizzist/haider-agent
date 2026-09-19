@@ -1134,6 +1134,41 @@ pub struct ProvidersState {
     pub follow_cursor: std::cell::Cell<bool>,
 }
 
+/// Normalize wire compatibility projections at the client snapshot boundary.
+/// Old flat rows cannot supply provenance or a default of their own.
+fn normalize_provider_inventory(
+    mut summary: haider_rpc::ProviderSummaryWire,
+) -> haider_rpc::ProviderSummaryWire {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    summary.inventory = summary.inventory.at_time(now);
+    if matches!(
+        summary.inventory,
+        haider_rpc::ModelInventoryWire::NeverFetched
+            | haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ) {
+        summary.models.clear();
+        summary.model_details.clear();
+        summary.default_model = None;
+        summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+    }
+    summary
+}
+
+fn provider_inventory_can_fetch(summary: &haider_rpc::ProviderSummaryWire) -> bool {
+    summary.catalog.supports_discovery()
+        || matches!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::NeverFetched
+                | haider_rpc::ModelInventoryWire::Fetched { .. }
+                | haider_rpc::ModelInventoryWire::Stale { .. }
+                | haider_rpc::ModelInventoryWire::Unavailable { .. }
+        )
+}
+
 impl ProvidersState {
     /// Applies a `provider.list` snapshot, gated on revision monotonicity.
     pub fn apply_snapshot(
@@ -1146,7 +1181,10 @@ impl ProvidersState {
         {
             return false;
         }
-        self.providers = providers;
+        self.providers = providers
+            .into_iter()
+            .map(normalize_provider_inventory)
+            .collect();
         self.revision = Some(revision);
         if self.cursor >= self.providers.len() {
             self.cursor = self.providers.len().saturating_sub(1);
@@ -1160,6 +1198,7 @@ impl ProvidersState {
         summary: haider_rpc::ProviderSummaryWire,
         revision: u64,
     ) -> bool {
+        let summary = normalize_provider_inventory(summary);
         if self
             .pending_default
             .as_ref()
@@ -1191,6 +1230,7 @@ impl ProvidersState {
         summary: haider_rpc::ProviderSummaryWire,
         revision: u64,
     ) -> bool {
+        let summary = normalize_provider_inventory(summary);
         if let Some(current) = self.revision
             && revision < current
         {
@@ -4890,6 +4930,8 @@ pub struct ModelPicker {
     /// In-flight `session.select_model`: the REQUESTED pair. The picker
     /// renders it pulsing; the identity moves only on the resolved reply.
     pub pending: Option<(String, String)>,
+    /// Provider whose empty inventory row requested discovery.
+    pub catalog_fetch: Option<String>,
     /// Honest inline error — a typed refusal or an unavailability reason.
     pub error: Option<String>,
     /// Present only while choosing which API provider serves a collapsed
@@ -11654,7 +11696,13 @@ impl AppModel {
             .providers
             .iter()
             .find(|summary| summary.provider == provider)
-            .is_some_and(|summary| summary.default_model.is_some() || !summary.models.is_empty());
+            .is_some_and(|summary| {
+                !matches!(
+                    summary.inventory,
+                    haider_rpc::ModelInventoryWire::NeverFetched
+                        | haider_rpc::ModelInventoryWire::Unavailable { .. }
+                ) && (summary.default_model.is_some() || !summary.models.is_empty())
+            });
         if !model_known {
             return;
         }
@@ -19704,16 +19752,22 @@ impl AppModel {
             if !summary.enabled {
                 continue;
             }
-            let available = matches!(
-                summary.availability,
-                haider_rpc::ProviderAvailabilityWire::Available
+            let known_inventory = !matches!(
+                summary.inventory,
+                haider_rpc::ModelInventoryWire::NeverFetched
+                    | haider_rpc::ModelInventoryWire::Unavailable { .. }
             );
+            let available = known_inventory
+                && matches!(
+                    summary.availability,
+                    haider_rpc::ProviderAvailabilityWire::Available
+                );
             let reason = summary
                 .availability_reason
                 .clone()
                 .or_else(|| (!available).then(|| "provider unavailable".to_owned()));
             let inventory_age_ms = now_ms
-                .zip(summary.inventory_fetched_at_ms)
+                .zip(summary.inventory.fetched_at_ms())
                 .map(|(now, fetched_at)| now.saturating_sub(fetched_at));
             // Auth flavor: the provider key's own encoding, the selected
             // account's method, then a single declared method — the same
@@ -19740,7 +19794,7 @@ impl AppModel {
                     _ => "api",
                 }
             };
-            if summary.models.is_empty() {
+            if !known_inventory || summary.models.is_empty() {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
                     providers: vec![summary.provider.clone()],
@@ -19758,7 +19812,20 @@ impl AppModel {
                     context_window: None,
                     inventory_age_ms,
                     available,
-                    reason: Some(reason.unwrap_or_else(|| "no discovered models".to_owned())),
+                    reason: Some(
+                        if matches!(
+                            summary.inventory,
+                            haider_rpc::ModelInventoryWire::NeverFetched
+                        ) {
+                            "never fetched — Enter to fetch".to_owned()
+                        } else if provider_inventory_can_fetch(summary) {
+                            format!("{} — Enter to fetch", summary.inventory.description())
+                        } else {
+                            reason
+                                .clone()
+                                .unwrap_or_else(|| "no catalog entries".to_owned())
+                        },
+                    ),
                     is_default: false,
                     is_current: false,
                     selectable: false,
@@ -20084,6 +20151,27 @@ impl AppModel {
     /// Act on the highlighted visible row without ever sending an aggregate
     /// provider identity to the existing pair-selection authority.
     fn activate_model_picker_row(&mut self, row: &ModelPickerRow) {
+        if row.model.is_empty()
+            && self.providers.providers.iter().any(|summary| {
+                summary.provider == row.provider && provider_inventory_can_fetch(summary)
+            })
+        {
+            if self
+                .model_picker
+                .as_ref()
+                .is_some_and(|picker| picker.catalog_fetch.is_some())
+            {
+                return;
+            }
+            self.requests.push(AppRequest::ProviderModelsRefresh {
+                provider: row.provider.clone(),
+            });
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.catalog_fetch = Some(row.provider.clone());
+                picker.error = Some(format!("fetching {} models…", row.provider));
+            }
+            return;
+        }
         let is_top_api = self
             .model_picker
             .as_ref()

@@ -21,7 +21,7 @@
 /// Published monthly subscription price for one Haider Code plan.
 ///
 /// These are deliberately separate from [`ModelRate`]: `Go` and `Go Max`
-/// are subscription/router choices, not token-rate families, so treating
+/// are subscription plans, not model IDs or token-rate families, so treating
 /// 40/200 USD per month as a per-million-token rate would fabricate cost.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HaiderCodePlanPrice {

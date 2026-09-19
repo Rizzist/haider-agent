@@ -910,11 +910,12 @@ fn fresh_daemon_reconciles_seeded_lockdown_quota_before_its_first_command() {
 }
 
 /// The built-in provider catalog a fresh profile exposes through `models
-/// --json` is a golden (ids, families, endpoints, auth methods, seeded
-/// inventories, default models). `provider list --json` names the same ids.
+/// --json` is a golden (ids, families, endpoints, auth methods, inventory
+/// provenance, offline rows and defaults). `provider list --json` names the
+/// same ids. Remote catalogs start never-fetched with no invented default.
 ///
 /// MUTATION CHECK: dropping a built-in, changing its family/endpoint, or
-/// losing a seeded model row changes the golden.
+/// inventing a remote model row changes the golden.
 #[test]
 fn fresh_profile_models_catalog_matches_the_golden() {
     let profile = Profile::new();
@@ -999,11 +1000,8 @@ fn custom_provider_delta_survives_daemon_restart_beside_the_builtin_catalog() {
     );
     assert_eq!(added["schema"], "haider.account.custom.v1");
     assert_eq!(added["alias"], "delta-proxy");
-    assert_eq!(added["reachable"], true);
-    assert_eq!(
-        added["models"],
-        serde_json::json!(["delta-proxy/delta-model"])
-    );
+    assert_eq!(added["reachable"], false);
+    assert_eq!(added["models"], serde_json::json!([]));
     wait_for_daemon_gone(&profile.profile);
 
     let status = json_document(

@@ -414,21 +414,22 @@ fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLik
     ] {
         model_source.replace(
             provider.to_owned(),
-            ["claude-test", "gpt-test", "model-a", "model-b", "unused"]
-                .into_iter()
-                .map(|slug| haider_provider::DiscoveredModel {
-                    slug: slug.to_owned(),
-                    display_name: format!("Fixture {slug}"),
-                    context_window: None,
-                    description: Some("provider-owned test fixture".to_owned()),
-                    default_effort: None,
-                    supported_efforts: Vec::new(),
-                    visible: true,
-                    priority: None,
-                    extensions: None,
-                })
-                .collect(),
-            None,
+            ProviderInventory::Configured {
+                models: ["claude-test", "gpt-test", "model-a", "model-b", "unused"]
+                    .into_iter()
+                    .map(|slug| haider_provider::DiscoveredModel {
+                        slug: slug.to_owned(),
+                        display_name: format!("Fixture {slug}"),
+                        context_window: None,
+                        description: Some("provider-owned test fixture".to_owned()),
+                        default_effort: None,
+                        supported_efforts: Vec::new(),
+                        visible: true,
+                        priority: None,
+                        extensions: None,
+                    })
+                    .collect(),
+            },
         );
     }
     ProviderRegistry::new(
@@ -703,7 +704,8 @@ pub(super) fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderS
         semantic_progress_timeout_ms: None,
         models: vec!["adapter-cache-model".to_owned()],
         model_details: Vec::new(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -1047,7 +1049,8 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
                 supports_vision: None,
             },
         ],
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -1157,7 +1160,8 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
                 supports_vision: None,
             },
         ],
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -1283,7 +1287,8 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
             supports_thinking_type: None,
             supports_vision: None,
         }],
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -1603,7 +1608,11 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
         .await
         .expect("credential-free mock discovery");
     server.await.expect("mock server served one request");
-    providers.replace_models("ollama".to_owned(), catalog.models, Some(1));
+    providers.replace_discovered_models(
+        "ollama".to_owned(),
+        catalog.models,
+        unix_ms_after(Duration::ZERO),
+    );
 
     let after = providers
         .summary("ollama", &|_| false)
@@ -2840,11 +2849,11 @@ fn provider_probe_failures_map_to_typed_secret_free_error_data() {
     );
 }
 
-/// A newly configured no-auth provider is not committed until discovery has
-/// supplied its live inventory; the same inventory reaches the durable cache
-/// and the response summary.
+/// A newly configured no-auth provider commits before discovery. The actor
+/// queue owns the subsequent catalog flight, so this handler publishes no
+/// invented rows and writes no empty successful cache entry.
 #[tokio::test]
-async fn custom_provider_configure_discovers_before_successful_commit() {
+async fn custom_provider_configure_commits_then_enqueues_discovery() {
     struct CanonicalEndpoint;
 
     #[async_trait::async_trait]
@@ -2896,6 +2905,7 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
     let discoverer = ImmediateDiscovery;
+    let mut pending_catalog_discoveries = HashSet::new();
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -2904,6 +2914,7 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
+            pending_catalog_discoveries: &mut pending_catalog_discoveries,
             endpoint_validator: Arc::new(CanonicalEndpoint),
             model_discoverer: &discoverer,
         },
@@ -2939,18 +2950,24 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
         } => {
             assert_eq!(revision, 1);
             assert_eq!(provider.provider, "router");
-            assert_eq!(provider.models, vec!["live-model".to_owned()]);
-            assert_eq!(provider.default_model.as_deref(), Some("live-model"));
+            assert!(provider.models.is_empty());
+            assert!(provider.default_model.is_none());
             assert!(provider.auth_methods.is_empty());
         }
         other => panic!("unexpected configure response: {other:?}"),
     }
-    let cached = store
-        .provider_models("router".into())
-        .await
-        .expect("read provider cache")
-        .expect("provider cache row");
-    assert!(cached.models_json.contains("live-model"));
+    assert!(
+        store
+            .provider_models("router".into())
+            .await
+            .expect("read provider cache")
+            .is_none(),
+        "configuration must not fabricate an empty fetched cache"
+    );
+    assert_eq!(
+        pending_catalog_discoveries,
+        HashSet::from(["router".to_owned()])
+    );
     store.close().await.expect("close store");
 }
 
@@ -2989,6 +3006,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let discoverer = UnusedDiscovery;
+    let mut pending_catalog_discoveries = HashSet::new();
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -2997,6 +3015,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
             vault: &vault,
             management: None,
             providers: &mut providers,
+            pending_catalog_discoveries: &mut pending_catalog_discoveries,
             endpoint_validator: Arc::new(TransportFailureEndpoint),
             model_discoverer: &discoverer,
         },
@@ -3758,6 +3777,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
+        &mut HashSet::new(),
         &HashSet::new(),
         login_job("command-ttl", "req-1", Some(b"sk-retained"), &sink),
     )
@@ -3789,6 +3809,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
+        &mut HashSet::new(),
         &HashSet::new(),
         login_job("command-ttl", "req-2", None, &sink),
     )
@@ -6348,18 +6369,19 @@ fn endpoint_edit_registry(
     for provider in provider_names {
         model_source.replace(
             (*provider).to_owned(),
-            vec![haider_provider::DiscoveredModel {
-                slug: "model-a".to_owned(),
-                display_name: "Model A".to_owned(),
-                context_window: None,
-                description: Some("endpoint-edit fixture".to_owned()),
-                default_effort: None,
-                supported_efforts: Vec::new(),
-                visible: true,
-                priority: None,
-                extensions: None,
-            }],
-            None,
+            ProviderInventory::Configured {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "model-a".to_owned(),
+                    display_name: "Model A".to_owned(),
+                    context_window: None,
+                    description: Some("endpoint-edit fixture".to_owned()),
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    extensions: None,
+                }],
+            },
         );
     }
     let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(provider_store);
@@ -7322,7 +7344,7 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
         .expect("recovered summary");
     assert_eq!(summary.models, vec!["recovered-model"]);
     assert_eq!(summary.model_details[0].context_window, Some(128_000));
-    assert!(summary.inventory_fetched_at_ms.is_some());
+    assert!(summary.inventory.fetched_at_ms().is_some());
     let cached = store
         .provider_models("recovered-router".into())
         .await
@@ -7365,7 +7387,7 @@ enum ModelDiscoveryFixture {
 /// failure: first-class model refresh cannot select its fixed authenticated
 /// provider catalog.
 #[test]
-fn haider_code_catalog_source_is_first_class_and_api_key_authenticated() {
+fn haider_code_catalog_source_is_public_without_an_account() {
     let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
     let providers = ProviderRegistry::new(
         provider_store,
@@ -7380,7 +7402,7 @@ fn haider_code_catalog_source_is_first_class_and_api_key_authenticated() {
         catalog_source(HAIDER_CODE_PROVIDER_NAME, &providers).expect("Haider Code catalog source");
     assert_eq!(source, CatalogSource::HaiderCodeApi);
     assert_eq!(source.endpoint(), "https://haidercode.ai/v1/models");
-    assert_eq!(auth, ProviderAuthRequirementWire::ApiKey);
+    assert_eq!(auth, ProviderAuthRequirementWire::None);
 }
 
 /// WH3 registry/refresh projection half — the named source resolves to the
@@ -7458,10 +7480,10 @@ async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
             None,
         )]
     );
-    providers.replace_models(
+    providers.replace_discovered_models(
         DEEPSEEK_PROVIDER_NAME.to_owned(),
         discovered.models,
-        Some(1),
+        unix_ms_after(Duration::ZERO),
     );
     let after = providers
         .summary(DEEPSEEK_PROVIDER_NAME, &|provider| {
@@ -8066,7 +8088,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
         .expect("refreshed provider");
     assert_eq!(summary.models, vec!["frontier-refresh"]);
-    assert_eq!(summary.inventory_fetched_at_ms, Some(cached.fetched_at_ms));
+    assert_eq!(
+        summary.inventory.fetched_at_ms(),
+        Some(cached.fetched_at_ms)
+    );
 
     tokio::time::sleep(Duration::from_millis(2)).await;
     let (sink, mut not_modified_frames) = channel_sink();
@@ -8114,7 +8139,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
         .expect("touched provider summary");
     assert_eq!(
-        touched_summary.inventory_fetched_at_ms,
+        touched_summary.inventory.fetched_at_ms(),
         Some(touched.fetched_at_ms),
         "304 refresh must republish the cache timestamp without a revision bump"
     );
@@ -8174,7 +8199,16 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("cache remains"),
         before_unavailable
     );
-    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    assert_eq!(store.management_revision().await.expect("revision"), 2);
+    let failed_view = management.read().expect("failure snapshot");
+    let failed_provider = failed_view
+        .providers
+        .iter()
+        .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
+        .expect("provider");
+    assert!(
+        matches!(&failed_provider.inventory, haider_rpc::ModelInventoryWire::Stale { reason, .. } if reason == "fixture catalog is unavailable")
+    );
 
     let (sink, mut panic_frames) = channel_sink();
     actor
@@ -8231,7 +8265,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("post-panic response deadline")
             .expect("post-panic response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
             ..
         }
     ));
@@ -8268,7 +8302,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("draining response deadline")
             .expect("draining response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
             ..
         }
     ));
@@ -9508,6 +9542,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         &snapshot,
         Some(&management),
         &providers,
+        &mut HashSet::new(),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         Arc::new(UnreachableGcloud),
@@ -10046,16 +10081,18 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
         })))
         .await
         .expect("activate manual OAuth");
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
-            .await
-            .expect("set active deadline")
-            .expect("set active response"),
+    let active_revision = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("set active deadline")
+        .expect("set active response")
+    {
         WireFrame::Response {
-            body: ResponseBody::AccountSetActive { revision: 3, .. },
+            body: ResponseBody::AccountSetActive { revision, .. },
             ..
-        }
-    ));
+        } => revision,
+        other => panic!("unexpected set-active response: {other:?}"),
+    };
+    assert!(active_revision >= 3);
 
     std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_2).expect("write Codex fixture 2");
     send_oauth_import(&commands, Arc::clone(&sink), "import-codex-second", "codex").await;
@@ -10068,10 +10105,13 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
             body:
                 ResponseBody::AccountOAuthImport {
                     descriptor,
-                    revision: 4,
+                    revision,
                 },
             ..
-        } => descriptor,
+        } => {
+            assert!(revision > active_revision);
+            descriptor
+        }
         other => panic!("unexpected second import response: {other:?}"),
     };
     assert_eq!(
@@ -10324,7 +10364,12 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
     let mut initial = builtin_profiles.clone();
     initial.push(custom.clone());
     let source = Arc::new(CachedProviderModelSource::default());
-    source.replace("custom-lab".to_owned(), vec![model], None);
+    source.replace(
+        "custom-lab".to_owned(),
+        ProviderInventory::Configured {
+            models: vec![model],
+        },
+    );
     let provider_store: Box<dyn ProviderRegistryStoreLike> =
         Box::new(JsonProviderRegistryStore::new(dir.path()));
     let providers = ProviderRegistry::new(provider_store, initial, source)
@@ -10658,7 +10703,8 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 semantic_progress_timeout_ms: None,
                 models: vec!["llama3.1:8b".to_owned()],
                 model_details: Vec::new(),
-                inventory_fetched_at_ms: None,
+                catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+                inventory: haider_rpc::ModelInventoryWire::Static,
                 inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
                 auth_methods: Vec::new(),
                 availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -10676,7 +10722,8 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 semantic_progress_timeout_ms: None,
                 models: Vec::new(),
                 model_details: Vec::new(),
-                inventory_fetched_at_ms: None,
+                catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+                inventory: haider_rpc::ModelInventoryWire::Static,
                 inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
                 auth_methods: Vec::new(),
                 availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -10694,7 +10741,8 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 semantic_progress_timeout_ms: None,
                 models: vec!["claude-private".to_owned()],
                 model_details: Vec::new(),
-                inventory_fetched_at_ms: None,
+                catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+                inventory: haider_rpc::ModelInventoryWire::Static,
                 inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
                 auth_methods: vec![AuthMethod::ApiKey],
                 availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -10712,7 +10760,8 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 semantic_progress_timeout_ms: None,
                 models: vec!["my-gpt-deployment".to_owned()],
                 model_details: Vec::new(),
-                inventory_fetched_at_ms: None,
+                catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+                inventory: haider_rpc::ModelInventoryWire::Static,
                 inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
                 auth_methods: vec![AuthMethod::ApiKey],
                 availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -10730,7 +10779,8 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 semantic_progress_timeout_ms: None,
                 models: vec!["claude-fable-5".to_owned()],
                 model_details: Vec::new(),
-                inventory_fetched_at_ms: None,
+                catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+                inventory: haider_rpc::ModelInventoryWire::Static,
                 inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
                 auth_methods: vec![AuthMethod::ApiKey],
                 availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -10756,17 +10806,15 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 response_open_timeout_ms: None,
                 chunk_idle_timeout_ms: None,
                 semantic_progress_timeout_ms: None,
-                models: haider_provider::DEEPSEEK_SEED_MODELS
-                    .iter()
-                    .map(|model| (*model).to_owned())
-                    .collect(),
+                models: Vec::new(),
                 model_details: Vec::new(),
-                inventory_fetched_at_ms: None,
+                catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+                inventory: haider_rpc::ModelInventoryWire::Static,
                 inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
                 auth_methods: vec![AuthMethod::ApiKey],
                 availability: haider_rpc::ProviderAvailabilityWire::Unavailable,
                 availability_reason: Some("provider has no credential".to_owned()),
-                default_model: Some(haider_provider::DEEPSEEK_SEED_MODELS[0].to_owned()),
+                default_model: None,
                 enabled: true,
                 trust: haider_rpc::ProviderTrustWire::Full,
             },
@@ -11110,21 +11158,23 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
         &kimi_candidate,
     )
     .await;
-    let kimi_descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("Kimi device import deadline")
-        .expect("Kimi device import response")
-    {
-        WireFrame::Response {
-            body:
-                ResponseBody::AccountImportDevice {
-                    descriptor,
-                    revision: 2,
-                },
-            ..
-        } => descriptor,
-        other => panic!("unexpected Kimi device import response: {other:?}"),
-    };
+    let (kimi_descriptor, kimi_revision) =
+        match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("Kimi device import deadline")
+            .expect("Kimi device import response")
+        {
+            WireFrame::Response {
+                body:
+                    ResponseBody::AccountImportDevice {
+                        descriptor,
+                        revision,
+                    },
+                ..
+            } => (descriptor, revision),
+            other => panic!("unexpected Kimi device import response: {other:?}"),
+        };
+    assert!(kimi_revision >= 2);
     assert_eq!(kimi_descriptor.alias.as_str(), KIMI_OAUTH_PROVIDER_NAME);
     assert_eq!(kimi_descriptor.provider, KIMI_OAUTH_PROVIDER_NAME);
     assert_eq!(
@@ -11154,7 +11204,7 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
     );
 
     assert_eq!(snapshot.lock().expect("snapshot").len(), 2);
-    assert_eq!(management.read().expect("management").revision, 2);
+    assert!(management.read().expect("management").revision >= kimi_revision);
 
     let receipts = store.account_add_receipts().await.expect("import receipts");
     let receipt_for = |command_id: &str| {
@@ -11468,7 +11518,8 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
                 supports_vision: None,
             },
         ],
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -11533,7 +11584,8 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
         semantic_progress_timeout_ms: None,
         models: models.clone(),
         model_details: Vec::new(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -11908,6 +11960,7 @@ async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_mod
         "profile-bedrock",
         "claude-global-default",
         &mut pending,
+        &mut HashSet::new(),
         &HashSet::new(),
         LoginJob {
             command_id: "bedrock-login".to_owned(),
@@ -12096,6 +12149,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
+        &mut HashSet::new(),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -12145,6 +12199,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
+        &mut HashSet::new(),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -12466,7 +12521,8 @@ async fn each_turn_resolves_the_currently_active_account() {
             supports_thinking_type: None,
             supports_vision: None,
         }],
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -13372,7 +13428,8 @@ fn antigravity_summary(models: &[&str], default_model: Option<&str>) -> Provider
         semantic_progress_timeout_ms: None,
         models: models.iter().map(|slug| (*slug).to_owned()).collect(),
         model_details: Vec::new(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -14077,6 +14134,7 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
     let vault = MemoryVault::new();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
+    let mut pending_catalog_discoveries = HashSet::new();
     for (revision, ids, selected) in [
         (0, vec!["server-default", "other-model"], "other-model"),
         (1, vec!["manual-id"], "manual-id"),
@@ -14089,6 +14147,7 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
                 vault: &vault,
                 management: Some(&management),
                 providers: &mut providers,
+                pending_catalog_discoveries: &mut pending_catalog_discoveries,
                 endpoint_validator: Arc::new(CustomprovCanonicalEndpoint),
                 model_discoverer: &CustomprovNoSecondDiscovery,
             },
@@ -14251,6 +14310,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut pending_catalog_discoveries = HashSet::new();
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -14259,6 +14319,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
+            pending_catalog_discoveries: &mut pending_catalog_discoveries,
             endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
             model_discoverer: &CustomprovNoSecondDiscovery,
         },
@@ -14294,6 +14355,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
         "customprov-offline-profile",
         "unused-global-model",
         &mut pending,
+        &mut pending_catalog_discoveries,
         &HashSet::new(),
         LoginJob {
             command_id: "customprov-offline-login".into(),
@@ -14333,6 +14395,10 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
         other => panic!("manual key login must complete: {other:?}"),
     }
     assert_eq!(accounts.list().len(), 1);
+    assert_eq!(
+        pending_catalog_discoveries,
+        HashSet::from(["customprov-offline".to_owned()])
+    );
     store.close().await.expect("close offline store");
 }
 
@@ -14554,5 +14620,228 @@ async fn provider_trust_second_session_append_failure_rolls_back_events_receipt_
         ProviderTrustWire::Full
     );
     assert_eq!(store.management_revision().await.expect("revision"), 0);
+    store.close().await.expect("close");
+}
+
+/// The production refresh entrypoint must reach public discovery with no
+/// account and no broker, even after another provider fails credentials.
+#[tokio::test]
+async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures_local() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let accounts = memory_accounts();
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let providers = ProviderRegistry::new(
+        provider_store,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([
+                HAIDER_CODE_PROVIDER_NAME.to_owned(),
+                OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            ]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("providers");
+    let discoverer = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
+                models: vec![DiscoveredModel {
+                    slug: "deepseek-v4-flash".into(),
+                    display_name: "deepseek-v4-flash".into(),
+                    context_window: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    extensions: None,
+                }],
+                etag: None,
+            })),
+        ])),
+    });
+    let discoverer_trait: Arc<dyn ProviderModelDiscoverer> = discoverer.clone();
+    let (commands, mut received) = mpsc::channel(8);
+    let mut tasks = JoinSet::new();
+    let mut routes = HashMap::new();
+    let mut refreshing = HashSet::new();
+    let (failed_sink, mut failed_frames) = channel_sink();
+    begin_provider_models_refresh(
+        &store,
+        &accounts,
+        &providers,
+        None,
+        &discoverer_trait,
+        &commands,
+        &mut tasks,
+        &mut routes,
+        &mut refreshing,
+        OPENAI_OAUTH_PROVIDER_NAME.into(),
+        ProviderModelsRefreshCompletion::Wire(LoginRoute {
+            request_id: RequestId::new("missing-oauth"),
+            sink: failed_sink,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        failed_frames.recv().await,
+        Some(WireFrame::Response {
+            body: ResponseBody::Error { .. },
+            ..
+        })
+    ));
+    let failed = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| false)
+        .expect("failed provider");
+    assert!(matches!(
+        failed.inventory,
+        haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ));
+    assert_eq!(
+        providers
+            .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
+            .expect("public")
+            .inventory,
+        haider_rpc::ModelInventoryWire::NeverFetched
+    );
+    let (sink, mut frames) = channel_sink();
+    begin_provider_models_refresh(
+        &store,
+        &accounts,
+        &providers,
+        None,
+        &discoverer_trait,
+        &commands,
+        &mut tasks,
+        &mut routes,
+        &mut refreshing,
+        HAIDER_CODE_PROVIDER_NAME.into(),
+        ProviderModelsRefreshCompletion::Wire(LoginRoute {
+            request_id: RequestId::new("public"),
+            sink,
+        }),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("public discovery started without broker");
+    discoverer.release.notify_one();
+    let completion = tokio::time::timeout(Duration::from_secs(2), received.recv())
+        .await
+        .expect("completion deadline")
+        .expect("completion");
+    let AccountCommand::ProviderModelsRefreshCompleted {
+        provider,
+        cached,
+        result,
+        completed,
+    } = completion
+    else {
+        panic!("refresh completion");
+    };
+    finish_provider_models_refresh(
+        ProviderModelsRefreshContext {
+            store: &store,
+            accounts: &accounts,
+            management: None,
+            providers: &providers,
+            completed: &completed,
+        },
+        provider,
+        cached,
+        result,
+    )
+    .await;
+    assert!(matches!(
+        frames.recv().await,
+        Some(WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { .. },
+            ..
+        })
+    ));
+    assert_eq!(
+        discoverer.seen.lock().expect("seen").as_slice(),
+        [(CatalogSource::HaiderCodeApi, None, None)]
+    );
+    let public = providers
+        .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
+        .expect("public");
+    assert_eq!(public.models, ["deepseek-v4-flash"]);
+    assert_eq!(public.default_model.as_deref(), Some("deepseek-v4-flash"));
+    assert_eq!(
+        providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| false)
+            .expect("failed")
+            .inventory,
+        failed.inventory
+    );
+    for (auth_method, reason) in [
+        (
+            AuthMethod::ApiKey,
+            "provider model discovery requires an active OAuth credential",
+        ),
+        (AuthMethod::OAuth, "OAuth credential broker is unavailable"),
+    ] {
+        let mut invalid_accounts = memory_accounts();
+        invalid_accounts
+            .add(CredentialDescriptor {
+                alias: CredentialAlias::new("catalog-test-account"),
+                provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+                base_url: None,
+                auth_method,
+                identity: "catalog test account".into(),
+                status: CredentialStatus::Ok,
+                active: true,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            })
+            .expect("test descriptor without secret");
+        let (sink, mut frames) = channel_sink();
+        begin_provider_models_refresh(
+            &store,
+            &invalid_accounts,
+            &providers,
+            None,
+            &discoverer_trait,
+            &commands,
+            &mut tasks,
+            &mut routes,
+            &mut refreshing,
+            OPENAI_OAUTH_PROVIDER_NAME.into(),
+            ProviderModelsRefreshCompletion::Wire(LoginRoute {
+                request_id: RequestId::new("credential-preflight"),
+                sink,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            frames.recv().await,
+            Some(WireFrame::Response {
+                body: ResponseBody::Error { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            providers
+                .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+                .expect("credential failure")
+                .inventory,
+            haider_rpc::ModelInventoryWire::Unavailable {
+                reason: reason.into(),
+            }
+        );
+        assert_eq!(
+            providers
+                .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
+                .expect("public catalog remains intact"),
+            public
+        );
+    }
+    while tasks.join_next().await.is_some() {}
     store.close().await.expect("close");
 }

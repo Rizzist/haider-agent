@@ -1223,8 +1223,9 @@ pub use cache::{
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
-    catalog_request_url, compatible_model_id_is_display_safe, discover_models,
-    discover_models_with_resolver, openai_compatible_catalog_endpoint, parse_catalog, pickable,
+    PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition, catalog_request_url,
+    compatible_model_id_is_display_safe, discover_models, discover_models_with_resolver,
+    openai_compatible_catalog_endpoint, parse_catalog, pickable, provider_catalog_definition,
 };
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
@@ -1238,26 +1239,24 @@ pub use gemini::{
     replay_gemini_http_error, replay_gemini_sse, replay_gemini_sse_for_request,
 };
 pub use openai::{
-    CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
-    GROK_OAUTH_BASE_URL, GROK_OAUTH_PROVIDER_NAME, GROK_SHELL_CLIENT_IDENTIFIER,
-    GROK_SHELL_CLIENT_MODE, GROK_SHELL_CLIENT_VERSION, GROK_XAI_TOKEN_AUTH,
-    HAIDER_CODE_ACCOUNT_URL, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
-    HAIDER_CODE_SEED_MODELS, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig,
+    CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, GROK_OAUTH_BASE_URL,
+    GROK_OAUTH_PROVIDER_NAME, GROK_SHELL_CLIENT_IDENTIFIER, GROK_SHELL_CLIENT_MODE,
+    GROK_SHELL_CLIENT_VERSION, GROK_XAI_TOKEN_AUTH, HAIDER_CODE_ACCOUNT_URL, HAIDER_CODE_BASE_URL,
+    HAIDER_CODE_PROVIDER_NAME, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig,
     KimiThinkingType, OPENAI_ALPHA_SEARCH_URL, OPENAI_CODEX_RESPONSES_LITE_HEADER,
     OPENAI_CODEX_RESPONSES_LITE_VALUE, OPENAI_COMPATIBLE_PROVIDER_NAME,
     OPENAI_DEFAULT_TRANSPORT_CONFIG, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
     OpenAiTransportConfig, XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS,
-    XAI_SEED_MODELS, azure_openai_origin, codex_alpha_search_request_body,
-    codex_alpha_search_response_text, codex_alpha_search_url, grok_client_version,
-    openai_http_client_build_count, replay_deepseek_chat_sse, replay_deepseek_models_response,
-    replay_grok_chat_sse, replay_grok_models_response, replay_haider_code_chat_sse,
-    replay_haider_code_models_response, replay_kimi_chat_sse, replay_kimi_models_response,
-    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
-    replay_openai_native_computer_sse, replay_openai_responses_sse, replay_xai_chat_sse,
-    replay_xai_models_response, validate_openai_compatible_endpoint,
-    validate_openai_compatible_origin,
+    azure_openai_origin, codex_alpha_search_request_body, codex_alpha_search_response_text,
+    codex_alpha_search_url, grok_client_version, openai_http_client_build_count,
+    replay_deepseek_chat_sse, replay_deepseek_models_response, replay_grok_chat_sse,
+    replay_grok_models_response, replay_haider_code_chat_sse, replay_haider_code_models_response,
+    replay_kimi_chat_sse, replay_kimi_models_response, replay_openai_chat_sse,
+    replay_openai_http_error, replay_openai_models_response, replay_openai_native_computer_sse,
+    replay_openai_responses_sse, replay_xai_chat_sse, replay_xai_models_response,
+    validate_openai_compatible_endpoint, validate_openai_compatible_origin,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{
@@ -1353,7 +1352,7 @@ pub fn pdf_document_capability(provider: &str) -> FeatureResolve {
 /// | `gemini` | `Native` | `gemini.rs` `capabilities` |
 /// | `grok-oauth` | `Native` | `openai.rs` `grok_capabilities_from_model` |
 /// | `kimi-oauth` | per-model, else UNDECLARED | `openai.rs` `kimi_capabilities_from_model` |
-/// | `deepseek` | `Unsupported` | text-only catalog (`DEEPSEEK_SEED_MODELS`) |
+/// | `deepseek` | `Unsupported` | text-only catalog (provider catalog) |
 /// | `google-antigravity` | `Unsupported` | `acp/antigravity.rs` `prompt_blocks` sends text only |
 /// | `openai-compatible`, `haider-code`, `xai`, custom profiles | UNDECLARED | `openai.rs` `compatible_capabilities` |
 ///

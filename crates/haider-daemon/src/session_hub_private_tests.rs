@@ -35,15 +35,15 @@ use haider_store::{
 /// MUTATION CHECK: requiring a fetch timestamp before considering a known
 /// inventory miss skips refresh-on-miss for legacy cached inventories.
 #[test]
-fn model_inventory_miss_refreshes_even_without_a_fetch_timestamp() {
+fn never_fetched_inventory_refreshes_even_if_legacy_rows_are_present() {
     let mut summary = provider_summary("openai-oauth");
     summary.models = vec!["known-model".to_owned()];
-    summary.inventory_fetched_at_ms = None;
+    summary.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
     assert!(super::rpc::provider_inventory_needs_refresh(
         &summary,
         "new-model"
     ));
-    assert!(!super::rpc::provider_inventory_needs_refresh(
+    assert!(super::rpc::provider_inventory_needs_refresh(
         &summary,
         "known-model"
     ));
@@ -80,7 +80,8 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         semantic_progress_timeout_ms: None,
         models: Vec::new(),
         model_details: Vec::new(),
-        inventory_fetched_at_ms: None,
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Static,
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Unknown,

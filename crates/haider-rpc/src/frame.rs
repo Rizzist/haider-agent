@@ -1362,6 +1362,102 @@ pub struct LockdownStatusWire {
     pub quota_limit: u64,
 }
 
+/// Catalog access is independent of inference authentication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCatalogKindWire {
+    Offline,
+    Public,
+    Authenticated,
+    Custom,
+    Adapter,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProviderCatalogKindWire {
+    #[must_use]
+    pub fn supports_discovery(self) -> bool {
+        match self {
+            Self::Public | Self::Authenticated | Self::Custom => true,
+            Self::Offline | Self::Adapter | Self::Unknown => false,
+        }
+    }
+}
+
+/// Provenance of the inventory projection. Empty successful discovery is a
+/// fetched catalog, never an excuse to restore a seed. Unknown old peers
+/// deserialize as NeverFetched and must be explicitly refreshed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ModelInventoryWire {
+    #[default]
+    NeverFetched,
+    Static,
+    Configured,
+    Fetched {
+        fetched_at_ms: u64,
+    },
+    Stale {
+        fetched_at_ms: u64,
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl ModelInventoryWire {
+    /// Age changes are projected once at the snapshot boundary. Refresh
+    /// consumers switch on the resulting state, not list length or age.
+    #[must_use]
+    pub fn at_time(self, now_ms: u64) -> Self {
+        match self {
+            Self::Fetched { fetched_at_ms }
+                if now_ms.saturating_sub(fetched_at_ms) >= MODEL_INVENTORY_TTL_MS =>
+            {
+                Self::Stale {
+                    fetched_at_ms,
+                    reason: "catalog refresh due".to_owned(),
+                }
+            }
+            state => state,
+        }
+    }
+
+    #[must_use]
+    pub fn fetched_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::Fetched { fetched_at_ms } | Self::Stale { fetched_at_ms, .. } => {
+                Some(*fetched_at_ms)
+            }
+            Self::NeverFetched | Self::Static | Self::Configured | Self::Unavailable { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn needs_refresh(&self) -> bool {
+        match self {
+            Self::NeverFetched | Self::Stale { .. } => true,
+            Self::Fetched { .. } | Self::Static | Self::Configured | Self::Unavailable { .. } => {
+                false
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn description(&self) -> &str {
+        match self {
+            Self::NeverFetched => "never fetched — fetch models",
+            Self::Static => "static catalog",
+            Self::Configured => "configured inventory",
+            Self::Fetched { .. } => "fetched",
+            Self::Stale { reason, .. } | Self::Unavailable { reason } => reason,
+        }
+    }
+}
+
 /// One provider's read-only management projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSummaryWire {
@@ -1385,11 +1481,12 @@ pub struct ProviderSummaryWire {
     pub models: Vec<String>,
     #[serde(default)]
     pub model_details: Vec<ModelDetailWire>,
-    /// Unix time when the daemon last completed live discovery for this
-    /// provider. Absent means the published rows are seeded/configured facts
-    /// or no live inventory has been cached yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inventory_fetched_at_ms: Option<u64>,
+    /// Inventory provenance. Flat model/default fields are compatibility
+    /// projections of the daemon's typed inventory, not discovery evidence.
+    #[serde(default)]
+    pub inventory: ModelInventoryWire,
+    #[serde(default)]
+    pub catalog: ProviderCatalogKindWire,
     /// Whether a known inventory miss may veto inference. Absent on an older
     /// daemon means unknown, never advisory.
     #[serde(default, skip_serializing_if = "is_default")]
@@ -1414,7 +1511,10 @@ impl ProviderSummaryWire {
     /// `models` or fabricated as an available [`ModelDetailWire`] row.
     #[must_use]
     pub fn model_inventory_status(&self, model: &str) -> ModelInventoryStatusWire {
-        if self.models.is_empty() {
+        if matches!(
+            self.inventory,
+            ModelInventoryWire::NeverFetched | ModelInventoryWire::Unavailable { .. }
+        ) {
             ModelInventoryStatusWire::Unknown
         } else if self.models.iter().any(|known| known == model) {
             ModelInventoryStatusWire::Listed

@@ -102,10 +102,14 @@ fn model_picker_aggregate_uses_freshest_available_inventory_age() {
         .iter_mut()
         .find(|summary| summary.provider == "gemini")
         .expect("gemini summary");
-    gemini.inventory_fetched_at_ms = Some(now.saturating_sub(42_000));
+    gemini.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: now.saturating_sub(42_000),
+    };
     let mut mirror = gemini.clone();
     mirror.provider = "gemini-mirror".to_owned();
-    mirror.inventory_fetched_at_ms = Some(now.saturating_sub(12_000));
+    mirror.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: now.saturating_sub(12_000),
+    };
     model.providers.providers.push(mirror);
 
     let aggregate = model
@@ -138,7 +142,7 @@ fn opening_model_picker_refreshes_a_stale_selected_provider() {
         .iter_mut()
         .find(|summary| summary.provider == "openai")
         .expect("openai summary");
-    openai.inventory_fetched_at_ms = Some(1);
+    openai.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
     let provider_snapshot = model.providers.providers.clone();
     let mut driver = LiveDriver::new("picker-refresh");
 

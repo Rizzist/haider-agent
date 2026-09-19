@@ -93,7 +93,10 @@ fn existing_provider() -> haider_rpc::ProviderSummaryWire {
         semantic_progress_timeout_ms: None,
         models: vec!["llama3.1:8b".to_owned()],
         model_details: Vec::new(),
-        inventory_fetched_at_ms: Some(1_725_000_000_000),
+        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        inventory: haider_rpc::ModelInventoryWire::Fetched {
+            fetched_at_ms: 1_725_000_000_000,
+        },
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,

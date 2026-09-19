@@ -1190,14 +1190,12 @@ fn fleet_now_ms() -> u64 {
 }
 
 pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, model: &str) -> bool {
-    let misses_known_inventory =
-        !summary.models.is_empty() && !summary.models.iter().any(|known| known == model);
-    misses_known_inventory
-        || summary
-            .inventory_fetched_at_ms
-            .is_some_and(|fetched_at_ms| {
-                fleet_now_ms().saturating_sub(fetched_at_ms) >= haider_rpc::MODEL_INVENTORY_TTL_MS
-            })
+    summary.inventory.needs_refresh()
+        || matches!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::Fetched { .. }
+                | haider_rpc::ModelInventoryWire::Stale { .. }
+        ) && !summary.models.iter().any(|known| known == model)
 }
 
 /// Projects one replayed truth into the summary's additive wire fields.

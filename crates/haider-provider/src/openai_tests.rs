@@ -4058,14 +4058,14 @@ async fn haider_code_request_uses_fixed_chat_completions_bearer_and_model() {
     ))]]));
     let provider = OpenAiCompatibleProvider::new_haider_code_api_with_dns_resolver(
         vault.resolve(&alias).expect("resolve Haider Code key"),
-        "Go Max",
+        "deepseek-v4-pro",
         HAIDER_CODE_BASE_URL,
         resolver,
     )
     .expect("construct Haider Code adapter");
     let request = TurnRequest {
         messages: vec![crate::Message::user_text("hello")],
-        model: "Go Max".to_owned(),
+        model: "deepseek-v4-pro".to_owned(),
         max_tokens: 17,
         system_prompt: None,
         tools: Vec::new(),
@@ -4075,7 +4075,7 @@ async fn haider_code_request_uses_fixed_chat_completions_bearer_and_model() {
     let payload = provider
         .request_payload(&request)
         .expect("Haider Code request payload");
-    assert_eq!(payload["model"], "Go Max");
+    assert_eq!(payload["model"], "deepseek-v4-pro");
     assert_eq!(payload["stream"], true);
 
     let outbound = provider

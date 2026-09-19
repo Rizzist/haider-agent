@@ -8,11 +8,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "adapter",
       "default_model": null,
       "enabled": true,
       "endpoint": "https://api.anthropic.com/v1/messages",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "anthropic"
@@ -25,11 +29,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "authenticated",
       "default_model": null,
       "enabled": true,
       "endpoint": "https://api.anthropic.com",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "anthropic-oauth"
@@ -42,11 +50,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider has no credential",
+      "catalog": "offline",
       "default_model": "anthropic.claude-fable-5",
       "enabled": true,
       "endpoint": "https://bedrock-mantle.us-east-1.api.aws/anthropic",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "static"
+      },
       "inventory_age": "<volatile>",
       "models": [
         {
@@ -137,31 +149,18 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider has no credential",
-      "default_model": "deepseek-chat",
+      "availability_reason": "provider model inventory is unavailable",
+      "catalog": "authenticated",
+      "default_model": null,
       "enabled": true,
       "endpoint": "https://api.deepseek.com",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
-      "models": [
-        {
-          "context_window": null,
-          "default_effort": null,
-          "model": "deepseek-chat",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        },
-        {
-          "context_window": null,
-          "default_effort": null,
-          "model": "deepseek-reasoner",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        }
-      ],
+      "models": [],
       "provider": "deepseek"
     },
     {
@@ -172,11 +171,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "authenticated",
       "default_model": null,
       "enabled": true,
       "endpoint": "https://generativelanguage.googleapis.com/v1beta",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "gemini"
@@ -189,11 +192,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "adapter",
       "default_model": null,
       "enabled": true,
       "endpoint": null,
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "google-antigravity"
@@ -206,11 +213,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "authenticated",
       "default_model": null,
       "enabled": true,
       "endpoint": "https://cli-chat-proxy.grok.com/v1",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "grok-oauth"
@@ -222,31 +233,18 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider has no credential",
-      "default_model": "Go",
+      "availability_reason": "provider model inventory is unavailable",
+      "catalog": "public",
+      "default_model": null,
       "enabled": true,
       "endpoint": "https://haidercode.ai/v1",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
-      "models": [
-        {
-          "context_window": null,
-          "default_effort": null,
-          "model": "Go",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        },
-        {
-          "context_window": null,
-          "default_effort": null,
-          "model": "Go Max",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        }
-      ],
+      "models": [],
       "provider": "haider-code"
     },
     {
@@ -257,11 +255,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "authenticated",
       "default_model": null,
       "enabled": true,
       "endpoint": "https://api.kimi.com/coding/v1",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "kimi-oauth"
@@ -274,11 +276,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "adapter",
       "default_model": null,
       "enabled": true,
       "endpoint": "https://api.openai.com/v1/responses",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "openai"
@@ -291,11 +297,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider is disabled",
+      "catalog": "adapter",
       "default_model": null,
       "enabled": false,
       "endpoint": null,
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "openai-compatible"
@@ -308,11 +318,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider model inventory is unavailable",
+      "catalog": "authenticated",
       "default_model": null,
       "enabled": true,
       "endpoint": "https://chatgpt.com/backend-api/codex/responses",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
       "models": [],
       "provider": "openai-oauth"
@@ -325,11 +339,15 @@
       "auth_state": "missing",
       "availability": "unavailable",
       "availability_reason": "provider endpoint is not configured",
+      "catalog": "offline",
       "default_model": "claude-fable-5",
       "enabled": true,
       "endpoint": null,
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "static"
+      },
       "inventory_age": "<volatile>",
       "models": [
         {
@@ -400,47 +418,18 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider has no credential",
-      "default_model": "grok-4.6",
+      "availability_reason": "provider model inventory is unavailable",
+      "catalog": "authenticated",
+      "default_model": null,
       "enabled": true,
       "endpoint": "https://api.x.ai/v1",
       "fetched_at": "<volatile>",
       "has_credential": false,
+      "inventory": {
+        "state": "never_fetched"
+      },
       "inventory_age": "<volatile>",
-      "models": [
-        {
-          "context_window": 500000,
-          "default_effort": null,
-          "model": "grok-4.6",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        },
-        {
-          "context_window": 500000,
-          "default_effort": null,
-          "model": "grok-4.5",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        },
-        {
-          "context_window": 1000000,
-          "default_effort": null,
-          "model": "grok-4.3",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        },
-        {
-          "context_window": 256000,
-          "default_effort": null,
-          "model": "grok-build-0.1",
-          "supported_efforts": [],
-          "supported_speeds": [],
-          "supports_thinking_type": null
-        }
-      ],
+      "models": [],
       "provider": "xai"
     }
   ],

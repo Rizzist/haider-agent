@@ -188,14 +188,15 @@ async fn execute(
                     .map_err(|error| error.to_string())?
                 );
             } else {
-                println!("PROVIDER\tTRUST\tENABLED\tDEFAULT MODEL");
+                println!("PROVIDER\tTRUST\tENABLED\tDEFAULT MODEL\tINVENTORY");
                 for provider in providers {
                     println!(
-                        "{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}",
                         provider.provider,
                         trust_name(provider.trust),
                         provider.enabled,
-                        provider.default_model.as_deref().unwrap_or("-")
+                        provider.default_model.as_deref().unwrap_or("-"),
+                        provider.inventory.description()
                     );
                 }
             }

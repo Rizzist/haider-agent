@@ -1048,15 +1048,15 @@ async fn execute_custom(
             origin: options.base_url.clone(),
             auth_requirement,
             enabled: existing.is_none_or(|provider| provider.enabled),
-            // Empty means "discover now" at this door. Every add/update
-            // success therefore proves current reachability and returns the
-            // live inventory instead of relabelling stale cached rows.
+            // Empty commits a remote provider with no invented inventory.
+            // The durable credential commit below schedules discovery in the
+            // daemon; this mutation never waits for `/models`.
             models: Vec::new(),
             default_model: existing.and_then(|provider| provider.default_model.clone()),
             response_open_timeout_ms: options.response_open_timeout_ms,
             chunk_idle_timeout_ms: options.chunk_idle_timeout_ms,
             semantic_progress_timeout_ms: options.semantic_progress_timeout_ms,
-            probe_vault_reference: vault_reference.clone(),
+            probe_vault_reference: None,
             trust: options.trust,
             expected_revision: revision,
         })
@@ -1227,6 +1227,10 @@ fn custom_document(
         .iter()
         .map(|model| format!("{alias}/{model}"))
         .collect::<Vec<_>>();
+    let reachable = matches!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
     CustomAccountDocument {
         schema: "haider.account.custom.v1",
         operation,
@@ -1234,7 +1238,7 @@ fn custom_document(
         base_url: provider.endpoint,
         api_family,
         auth_state,
-        reachable: true,
+        reachable,
         latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
         model_count: models.len(),
         models,
