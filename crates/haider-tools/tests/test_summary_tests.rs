@@ -209,6 +209,33 @@ fn pytest_mixed_run_counts_and_failure_blocks() {
 }
 
 #[test]
+fn pytest_quiet_run_counts_and_failure_blocks_without_guessing() {
+    let output = fixture("pytest_quiet_mixed.txt");
+    let summary = summarize_test_output(&output);
+    assert_eq!(summary.format, TestOutputFormat::Pytest);
+    assert_eq!(
+        summary.counts,
+        Some(TestCounts {
+            passed: 2,
+            failed: 1,
+            ignored: 1
+        })
+    );
+    assert_eq!(summary.failures.len(), 1);
+    assert_eq!(summary.failures[0].name, "test_unreadable_file_exit_code");
+    assert!(
+        summary.failures[0]
+            .detail
+            .contains("AssertionError: expected an unreadable file to return exit code 2")
+    );
+
+    // A coincidental English tally is not enough to classify arbitrary output
+    // as pytest: quiet mode still requires a pytest-specific marker.
+    let unrelated = "benchmark result\n1 failed, 2 passed in 0.03s\n";
+    assert_eq!(summarize_test_output(unrelated), TestRunSummary::unknown());
+}
+
+#[test]
 fn gradle_junit_console_counts_and_failed_tests() {
     let output = fixture("gradle_junit.txt");
     let summary = summarize_test_output(&output);

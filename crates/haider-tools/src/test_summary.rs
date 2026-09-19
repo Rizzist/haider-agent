@@ -259,49 +259,33 @@ fn parse_cargo(output: &str) -> Option<ParsedTestOutput> {
 // -------------------------------------------------------------------- pytest
 
 fn detect_pytest(output: &str) -> bool {
-    output
+    if output
         .lines()
         .any(|line| line.starts_with('=') && line.contains("test session starts"))
+    {
+        return true;
+    }
+    let has_quiet_marker = output.lines().any(|line| {
+        let line = line.trim();
+        (line.starts_with('=')
+            && line.ends_with('=')
+            && matches!(
+                line.trim_matches('=').trim(),
+                "FAILURES" | "ERRORS" | "short test summary info"
+            ))
+            || line.ends_with("[100%]")
+            || line.starts_with("FAILED ")
+            || line.starts_with("ERROR ")
+    });
+    has_quiet_marker
+        && output
+            .lines()
+            .rev()
+            .any(|line| pytest_summary_counts(line).is_some())
 }
 
 fn parse_pytest(output: &str) -> Option<ParsedTestOutput> {
-    let summary_line = output.lines().rev().find(|line| {
-        line.starts_with('=')
-            && line.ends_with('=')
-            && !line.contains("test session starts")
-            && (line.contains(" in ") || line.contains("no tests ran"))
-    })?;
-    let inner = summary_line.trim_matches('=').trim();
-    let mut counts = TestCounts::default();
-    let mut recognized = inner.starts_with("no tests ran");
-    if !recognized {
-        for token in inner.split(", ") {
-            // The duration rides the final token: "1 skipped in 0.02s".
-            let token = token.split(" in ").next().unwrap_or(token);
-            let mut words = token.split_whitespace();
-            let Some(count) = words.next().and_then(|word| word.parse::<u64>().ok()) else {
-                continue;
-            };
-            match words.next() {
-                Some("passed" | "xpassed") => {
-                    counts.passed = counts.passed.saturating_add(count);
-                    recognized = true;
-                }
-                Some("failed" | "error" | "errors") => {
-                    counts.failed = counts.failed.saturating_add(count);
-                    recognized = true;
-                }
-                Some("skipped" | "deselected" | "xfailed") => {
-                    counts.ignored = counts.ignored.saturating_add(count);
-                    recognized = true;
-                }
-                _ => {}
-            }
-        }
-    }
-    if !recognized {
-        return None;
-    }
+    let counts = output.lines().rev().find_map(pytest_summary_counts)?;
     let mut failures = Vec::new();
     let mut in_failure_section = false;
     let mut current: Option<(String, Vec<&str>)> = None;
@@ -350,6 +334,51 @@ fn parse_pytest(output: &str) -> Option<ParsedTestOutput> {
         counts: Some(counts),
         failures,
     })
+}
+
+/// Parse only pytest's exact terminal tally grammar. Quiet mode omits the
+/// surrounding `====` rule, so detection additionally requires a pytest-only
+/// marker before accepting this line.
+fn pytest_summary_counts(line: &str) -> Option<TestCounts> {
+    let line = line.trim();
+    let inner = if line.starts_with('=') && line.ends_with('=') {
+        line.trim_matches('=').trim()
+    } else {
+        line
+    };
+    let (tallies, duration) = inner.rsplit_once(" in ")?;
+    let seconds = duration.split_whitespace().next()?.strip_suffix('s')?;
+    seconds.trim_start_matches('<').parse::<f64>().ok()?;
+    if tallies == "no tests ran" {
+        return Some(TestCounts::default());
+    }
+    let mut counts = TestCounts::default();
+    let mut recognized_test_count = false;
+    for token in tallies.split(", ") {
+        let mut words = token.split_whitespace();
+        let count = words.next()?.parse::<u64>().ok()?;
+        let label = words.next()?;
+        if words.next().is_some() {
+            return None;
+        }
+        match label {
+            "passed" | "xpassed" => {
+                counts.passed = counts.passed.saturating_add(count);
+                recognized_test_count = true;
+            }
+            "failed" | "error" | "errors" => {
+                counts.failed = counts.failed.saturating_add(count);
+                recognized_test_count = true;
+            }
+            "skipped" | "deselected" | "xfailed" => {
+                counts.ignored = counts.ignored.saturating_add(count);
+                recognized_test_count = true;
+            }
+            "warning" | "warnings" | "rerun" | "reruns" => {}
+            _ => return None,
+        }
+    }
+    recognized_test_count.then_some(counts)
 }
 
 // ---------------------------------------------------------- python unittest

@@ -88,7 +88,7 @@ and redaction pipeline as `process_exec` (same Ask/Auto permission class,
 foreground and local only) with a 600-second wall limit and the 2 MiB output
 ceiling. Its result replaces the raw transcript with a deterministic summary:
 pass/fail/ignored counts parsed from recognized console formats (`cargo test`,
-pytest, `python -m unittest`, Gradle/JUnit console) and each failing test's
+pytest including `-q`, `python -m unittest`, Gradle/JUnit console) and each failing test's
 secret-redacted output verbatim within a 12 KiB budget. Unrecognized output —
 including a compilation failure before any test ran or a run cut off by an
 execution limit — reports `format=unknown` with the exit code and a bounded
