@@ -402,7 +402,7 @@ impl crate::gcloud::GcloudAccessTokenSource for UnreachableGcloud {
     }
 }
 
-fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
+pub(super) fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
     let store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
     let model_source = Arc::new(CachedProviderModelSource::default());
     for provider in [

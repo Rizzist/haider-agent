@@ -1,0 +1,740 @@
+{
+  "binary": {
+    "path": "/Users/rizzist/.local/bin/haider",
+    "sha256": "e4713237b94140e06cf15e0f0cfd3cab236bbc01ec90351b9fded8ae9590a145",
+    "version": "0.0.970",
+    "version_output": "haider 0.0.970"
+  },
+  "checks": [
+    {
+      "area": "daemon",
+      "artefacts": [],
+      "budget": {
+        "parts": [
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "continuous hanging-turn arming deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 300000,
+            "name": "session recover five-request path",
+            "source": "5 * crates/haider-client/src/client.rs:43-46 REQUEST_TIMEOUT; crates/haider-cli/src/session_recover.rs:266-374,455-520"
+          },
+          {
+            "milliseconds": 5000,
+            "name": "explicit headless resume wait",
+            "source": "haider resume <id> --json --timeout 5s; crates/haider-cli/src/automation.rs:204-240"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "terminal cancellation grace",
+            "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "qa attached run --timeout",
+            "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "terminal cancellation grace",
+            "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          }
+        ],
+        "total_ms": 751000
+      },
+      "evidence": [
+        {
+          "artefacts": [],
+          "evidence_line": "midturn=true state=streaming session_id=session-0f50f2db62b68957414eb4877ada7ea3 killed_pid=31561 respawn_pid=31573 generation=1->2; recover=probe resulting_state=effect_unknown; resume_outcome=recovery_required finite=true; fresh_run=done sentinel=true stop=stopped_cleanly orphan=false",
+          "label": "kill9_midturn",
+          "status": "PASS"
+        },
+        {
+          "artefacts": [],
+          "evidence_line": "no_orphan_daemons pids=31561,31573 stop=not_running alive_after=false",
+          "label": "no_orphan_daemons",
+          "status": "PASS"
+        }
+      ],
+      "expected_fail_until": null,
+      "id": "t1.daemon.kill9_midturn",
+      "measurement_accepted": true,
+      "segments": 2,
+      "status": "PASS",
+      "timed": true,
+      "turns_expected": 2,
+      "wall_ms": 223
+    },
+    {
+      "area": "daemon",
+      "artefacts": [],
+      "budget": {
+        "parts": [
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 1000,
+            "name": "requested run-daemon idle TTL",
+            "source": "HAIDER_RUN_DAEMON_IDLE_TTL_MS=1000; crates/haider-cli/src/run.rs:488-512"
+          },
+          {
+            "milliseconds": 5000,
+            "name": "daemon graceful drain deadline",
+            "source": "crates/haider-daemon/src/config.rs:108 DaemonConfig::new drain_timeout"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          }
+        ],
+        "total_ms": 298000
+      },
+      "evidence": [
+        {
+          "artefacts": [],
+          "evidence_line": "autospawn_pid=31581 generation=1; idle_exit=true window=8000ms (1000ms TTL + 5000ms drain + 2000ms grace); respawn_pid=31583 generation=2; stop=stopped_cleanly process_exited=true pid_gone=true",
+          "label": "lifecycle_triad",
+          "status": "PASS"
+        },
+        {
+          "artefacts": [],
+          "evidence_line": "no_orphan_daemons pids=31581,31583 stop=not_running alive_after=false",
+          "label": "no_orphan_daemons",
+          "status": "PASS"
+        }
+      ],
+      "expected_fail_until": null,
+      "id": "t1.daemon.lifecycle_triad",
+      "measurement_accepted": true,
+      "segments": 1,
+      "status": "PASS",
+      "timed": true,
+      "turns_expected": 0,
+      "wall_ms": 1147
+    },
+    {
+      "area": "install",
+      "artefacts": [],
+      "budget": {
+        "parts": [
+          {
+            "milliseconds": 30000,
+            "name": "cold binary version query",
+            "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+          },
+          {
+            "milliseconds": 316000,
+            "name": "parallel archive and sidecar fetch, two attempts each",
+            "source": "install.sh/npm: 2 * (30s connection + ceil(128MiB archive / 1MiB/s)) = 316s; concurrent checksum is smaller; retries retain independent attempt deadlines"
+          },
+          {
+            "milliseconds": 1024000,
+            "name": "seven complete member SHA-256 passes and old-prefix digest",
+            "source": "update/staging.rs source/copy/freeze/immutable; transaction.rs immutable/installed/finalize plus old-prefix digest"
+          },
+          {
+            "milliseconds": 512000,
+            "name": "archive, extraction, copies and durable publication IO",
+            "source": "harness 16 MiB/s IO service floor over eight complete member-byte passes"
+          },
+          {
+            "milliseconds": 240000,
+            "name": "staged and installed member version probes",
+            "source": "two version probes per runtime member; shared VERSION_QUERY allowance"
+          },
+          {
+            "milliseconds": 120000,
+            "name": "member quarantine/signature work",
+            "source": "aggregate harness policy per member for xattr/sign/verify work, not an enforced per-command deadline"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "staged CLI offline self-test",
+            "source": "one shared cold-query allowance for the staged CLI offline self-test"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "cold binary version query",
+            "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "cold binary version query",
+            "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "cold binary version query",
+            "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          }
+        ],
+        "total_ms": 2560000
+      },
+      "evidence": [
+        {
+          "artefacts": [],
+          "evidence_line": "installer_exit=0 scratch_home=true prefix=/private/tmp/haider-probe-qa-oj6lftso/install-prefix/bin pair_present=true version=0.0.970 ready_exit=0 status_ready=true daemon_pid=31701 stop=stopped_cleanly pid_gone=true",
+          "label": "install_paths",
+          "status": "PASS"
+        },
+        {
+          "artefacts": [],
+          "evidence_line": "no_orphan_daemons pids=31701 stop=not_running alive_after=false",
+          "label": "no_orphan_daemons",
+          "status": "PASS"
+        }
+      ],
+      "expected_fail_until": null,
+      "id": "t1.install.paths",
+      "measurement_accepted": true,
+      "segments": 1,
+      "status": "PASS",
+      "timed": true,
+      "turns_expected": 0,
+      "wall_ms": 11023
+    },
+    {
+      "area": "store",
+      "artefacts": [
+        "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz",
+        "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.json",
+        "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.sha256"
+      ],
+      "budget": {
+        "parts": [
+          {
+            "milliseconds": 60000,
+            "name": "one pinned GitHub release fetch",
+            "source": "curl --max-time 60 for the pinned archive or checksum sidecar"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "one pinned GitHub release fetch",
+            "source": "curl --max-time 60 for the pinned archive or checksum sidecar"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "release archive verification and XZ extraction",
+            "source": "stdlib SHA-256 plus traversal-checked tarfile r:xz extraction"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "cold binary version query",
+            "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "cold binary version query",
+            "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "qa attached run --timeout",
+            "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "terminal cancellation grace",
+            "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "qa attached run --timeout",
+            "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "terminal cancellation grace",
+            "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 10000,
+            "name": "v0.0.966 PID-file executable identity",
+            "source": "one bounded lsof/procfs identity proof for the legacy status-derived PID file"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 5000,
+            "name": "daemon graceful drain deadline",
+            "source": "crates/haider-daemon/src/config.rs:108 DaemonConfig::new drain_timeout"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "qa attached run --timeout",
+            "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "terminal cancellation grace",
+            "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "daemon startup deadline",
+            "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 30000,
+            "name": "SQLite inspection and next-release fixture capture",
+            "source": "read-only PRAGMA/sqlite_master comparison plus stopped-profile XZ capture"
+          },
+          {
+            "milliseconds": 60000,
+            "name": "client request timeout",
+            "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+          },
+          {
+            "milliseconds": 20000,
+            "name": "daemon stop timeout",
+            "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          },
+          {
+            "milliseconds": 2000,
+            "name": "post-stop process-exit observation grace",
+            "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+          }
+        ],
+        "total_ms": 901000
+      },
+      "evidence": [
+        {
+          "artefacts": [
+            "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz",
+            "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.sha256",
+            "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.json"
+          ],
+          "evidence_line": "source=v0.0.966 sha256=69735f821cb4406f12baad5d2e10981182a260edf1e52d35081d1e964b30dd6e old_user_version=27 old_sessions=2 listed_after_upgrade=true current_turn=done new_user_version=28 fresh_user_version=28 sqlite_master_equal=true schema_sha256=8480a1a1a2727166c89bdb158b9bd9909b530a822e8e0d7552c39386c3591054 fixture=next-release-profile-v0.0.970-from-v0.0.966.tar.xz",
+          "label": "previous_release_upgrade",
+          "status": "PASS"
+        },
+        {
+          "artefacts": [],
+          "evidence_line": "no_orphan_daemons pids=31716,31782,31787 stop=not_running alive_after=false",
+          "label": "no_orphan_daemons",
+          "status": "PASS"
+        }
+      ],
+      "expected_fail_until": null,
+      "id": "t1.store.previous_release_upgrade",
+      "measurement_accepted": true,
+      "segments": 3,
+      "status": "PASS",
+      "timed": true,
+      "turns_expected": 3,
+      "wall_ms": 30844
+    },
+    {
+      "area": "performance",
+      "artefacts": [
+        "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.turn.one_shot_budget/turn-one-shot-report.json"
+      ],
+      "budget": {
+        "parts": [
+          {
+            "milliseconds": 2132000,
+            "name": "twenty-six bounded fresh-profile turns",
+            "source": "26 * 82s turn_wall_harness.one_case command timeout"
+          },
+          {
+            "milliseconds": 312000,
+            "name": "twenty-six provider and no-spawn proofs",
+            "source": "26 * (2s provider settle + 10s status --no-spawn)"
+          },
+          {
+            "milliseconds": 936000,
+            "name": "twenty-six exact-profile cleanup fallbacks",
+            "source": "26 * (30s exact stop + 2s stop wait + 2s SIGTERM wait + 2s SIGKILL wait)"
+          },
+          {
+            "milliseconds": 4000,
+            "name": "provider and provenance finalization",
+            "source": "2s provider thread join + 2s git commit query"
+          }
+        ],
+        "total_ms": 3384000
+      },
+      "evidence": [
+        {
+          "artefacts": [
+            "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.turn.one_shot_budget/turn-one-shot-report.json"
+          ],
+          "evidence_line": "wall=84.687875ms/124.0ms cpu21=719.0740000000001ms/1059.0ms peak=40352KiB/52428.8KiB load={'start': 1.0830078125, 'mid': 1.0830078125, 'end': 1.0830078125} measured=21 fresh_profiles=true",
+          "label": "turn_one_shot_budget",
+          "status": "PASS"
+        },
+        {
+          "artefacts": [],
+          "evidence_line": "no_orphan_daemons spawn=none",
+          "label": "no_orphan_daemons",
+          "status": "PASS"
+        }
+      ],
+      "expected_fail_until": null,
+      "id": "t1.turn.one_shot_budget",
+      "measurement_accepted": true,
+      "segments": 0,
+      "status": "PASS",
+      "timed": true,
+      "turns_expected": 0,
+      "wall_ms": 2948
+    },
+    {
+      "area": "performance",
+      "artefacts": [
+        "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.turn.wall_budget/turn-wall-report.json"
+      ],
+      "budget": {
+        "parts": [
+          {
+            "milliseconds": 4920000,
+            "name": "sixty bounded attached turns",
+            "source": "60 * (20s headless timeout + 60s request ceiling + 2s terminal grace); turnperf_support.run_arguments and turn_wall_harness.one_case"
+          },
+          {
+            "milliseconds": 1020000,
+            "name": "sixty durable-idle/provider/PID gates",
+            "source": "60 * (5s durable Idle + 2s provider settle + 10s status identity)"
+          },
+          {
+            "milliseconds": 202000,
+            "name": "harness and runner daemon lifecycle",
+            "source": "60s ready + 10s initial status + 10s final status + 30s exact stop + runner cleanup (60s status + 20s stop + 2s PID observation)"
+          }
+        ],
+        "total_ms": 6142000
+      },
+      "evidence": [
+        {
+          "artefacts": [
+            "/Users/rizzist/Developer/haiderharness/haider-agent/docs/testing/v0.0.970/qa-gate-t1-Rizzists-Mac-mini.local-20260908T000837Z.artefacts/t1.turn.wall_budget/turn-wall-report.json"
+          ],
+          "evidence_line": "single:wall=38.65575ms/56.7ms cpu=4.0086799999997655ms peak=56544KiB tool:wall=53.515ms/78.0ms cpu=4.741722999999881ms peak=56944KiB load={'start': 1.236328125, 'mid': 1.236328125, 'end': 1.236328125} pid=31876 same_generation=true cleanup=stopped_cleanly",
+          "label": "turn_wall_budget",
+          "status": "PASS"
+        },
+        {
+          "artefacts": [],
+          "evidence_line": "no_orphan_daemons spawn=none",
+          "label": "no_orphan_daemons",
+          "status": "PASS"
+        }
+      ],
+      "expected_fail_until": null,
+      "id": "t1.turn.wall_budget",
+      "measurement_accepted": true,
+      "segments": 0,
+      "status": "PASS",
+      "timed": true,
+      "turns_expected": 0,
+      "wall_ms": 4658
+    }
+  ],
+  "created_at_utc": "2026-09-08T00:08:37Z",
+  "daemon_binary": {
+    "path": "/Users/rizzist/.local/bin/haiderd",
+    "sha256": "4ae60bfc14363418159cdd44bdf4c878dfe9d9c3d695293f53e7db86bba91e51",
+    "version": "0.0.970",
+    "version_output": "haiderd 0.0.970"
+  },
+  "daemon_version": "0.0.966|0.0.970",
+  "host": {
+    "hostname": "Rizzists-Mac-mini.local",
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "python": "3.12.14"
+  },
+  "load": {
+    "logical_cpus": 10,
+    "one_minute": 1.138671875
+  },
+  "measurement_accepted": true,
+  "measurement_reasons": [],
+  "schema": "haider.qa-gate.v1",
+  "summary": {
+    "env_blocked": 0,
+    "fail": 0,
+    "pass": 6,
+    "skip": 0,
+    "total": 6
+  },
+  "tier": "t1",
+  "warmup": {
+    "accepted": true,
+    "evidence_line": "warmup ready_exit=0 timed_out=false no_orphan_daemons pids=31557 stop=stopped_cleanly alive_after=false",
+    "wall_ms": 79
+  }
+}

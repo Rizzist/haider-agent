@@ -75,10 +75,14 @@
       "name": "request_input"
     },
     {
-      "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+      "description": "read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "column": {
+            "minimum": 1,
+            "type": "integer"
+          },
           "limit": {
             "minimum": 1,
             "type": "integer"
@@ -574,6 +578,26 @@
             },
             "type": "object"
           },
+          "attempt": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "completion_action": {
+            "enum": [
+              "claim",
+              "handled",
+              "dismiss",
+              "resume"
+            ],
+            "type": "string"
+          },
+          "evidence_event_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
           "filter": {
             "properties": {
               "case_sensitive": {
@@ -628,6 +652,9 @@
           "monitor_id": {
             "type": "string"
           },
+          "obligation_id": {
+            "type": "string"
+          },
           "occurrence": {
             "enum": [
               "once",
@@ -643,7 +670,8 @@
               "pause",
               "resume",
               "trigger",
-              "remove"
+              "remove",
+              "follow_up"
             ],
             "type": "string"
           },
@@ -1051,7 +1079,7 @@
       {
         "default": "allow",
         "manifest": {
-          "description": "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes",
+          "description": "Read up to 64 KiB / 2,000 numbered lines; offset/limit are one-based line paging, column continues a long line. Explicit paths preserve identifiers; secret patterns remain redacted",
           "dispatch": "await",
           "effects": [
             {
@@ -1061,6 +1089,10 @@
           "input_schema": {
             "additionalProperties": false,
             "properties": {
+              "column": {
+                "minimum": 1,
+                "type": "integer"
+              },
               "limit": {
                 "minimum": 1,
                 "type": "integer"
@@ -1774,6 +1806,26 @@
                 },
                 "type": "object"
               },
+              "attempt": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "completion_action": {
+                "enum": [
+                  "claim",
+                  "handled",
+                  "dismiss",
+                  "resume"
+                ],
+                "type": "string"
+              },
+              "evidence_event_ids": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
               "filter": {
                 "properties": {
                   "case_sensitive": {
@@ -1828,6 +1880,9 @@
               "monitor_id": {
                 "type": "string"
               },
+              "obligation_id": {
+                "type": "string"
+              },
               "occurrence": {
                 "enum": [
                   "once",
@@ -1843,7 +1898,8 @@
                   "pause",
                   "resume",
                   "trigger",
-                  "remove"
+                  "remove",
+                  "follow_up"
                 ],
                 "type": "string"
               },
@@ -2263,7 +2319,7 @@
       {
         "default": "allow",
         "manifest": {
-          "description": "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes",
+          "description": "Read up to 64 KiB / 2,000 numbered lines; offset/limit are one-based line paging, column continues a long line. Explicit paths preserve identifiers; secret patterns remain redacted",
           "dispatch": "await",
           "effects": [
             {
@@ -2273,6 +2329,10 @@
           "input_schema": {
             "additionalProperties": false,
             "properties": {
+              "column": {
+                "minimum": 1,
+                "type": "integer"
+              },
               "limit": {
                 "minimum": 1,
                 "type": "integer"
@@ -2865,6 +2925,26 @@
                 },
                 "type": "object"
               },
+              "attempt": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "completion_action": {
+                "enum": [
+                  "claim",
+                  "handled",
+                  "dismiss",
+                  "resume"
+                ],
+                "type": "string"
+              },
+              "evidence_event_ids": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
               "filter": {
                 "properties": {
                   "case_sensitive": {
@@ -2919,6 +2999,9 @@
               "monitor_id": {
                 "type": "string"
               },
+              "obligation_id": {
+                "type": "string"
+              },
               "occurrence": {
                 "enum": [
                   "once",
@@ -2934,7 +3017,8 @@
                   "pause",
                   "resume",
                   "trigger",
-                  "remove"
+                  "remove",
+                  "follow_up"
                 ],
                 "type": "string"
               },
