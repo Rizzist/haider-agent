@@ -161,7 +161,8 @@ async fn assert_user_shell_capture_survives_restart(drain_in_flight: bool) {
             signal.artifact.is_some(),
             "small and spilled captures are both durable"
         );
-        let handle = format!("capture:{}", signal.effect_id);
+        let effect_handle = format!("capture:{}", signal.effect_id);
+        let alias = format!("cap:{}", signal.call_id);
 
         // The fake asks for every page via the real task_output tool after
         // restart. It never supplies page content; CAS + the shared redactor do.
@@ -184,7 +185,7 @@ async fn assert_user_shell_capture_survives_restart(drain_in_flight: bool) {
             script.push(FakeStep::EmitToolCall {
                 call_id: format!("page-{page}"),
                 name: "task_output".into(),
-                args: serde_json::json!({"task_id": handle, "cursor": page * page_bytes}),
+                args: serde_json::json!({"task_id": alias, "cursor": page * page_bytes}),
             });
             script.push(FakeStep::Finish {
                 reason: FinishReason::ToolUse,
@@ -279,7 +280,21 @@ async fn assert_user_shell_capture_survives_restart(drain_in_flight: bool) {
             assert!(record.contains("status: cancelled"));
         }
         assert!(record.contains("HEAD") && record.contains("TAIL"));
-        assert!(record.contains(&handle) && record.contains("task_output("));
+        assert!(
+            !record.contains(&effect_handle),
+            "provider content must not expose the volatile effect handle"
+        );
+        if drain_in_flight || lines > 1 {
+            assert!(
+                record.contains(&alias) && record.contains("task_output("),
+                "cancelled or reduced output remains pageable by deterministic alias"
+            );
+        } else {
+            assert!(
+                !record.contains(&alias) && !record.contains("task_output("),
+                "a fully displayed successful capture needs no paging footer"
+            );
+        }
         assert!(!record.contains("sk-abcdefghijklmnopQRSTUV"));
         assert!(record.len() < haider_core::USER_COMMAND_OUTPUT_PREVIEW_BYTES + 2048);
         if lines > 1 {
@@ -297,7 +312,7 @@ async fn assert_user_shell_capture_survives_restart(drain_in_flight: bool) {
                         .as_str()
                         .unwrap_or_else(|| panic!("capture page: {page}")),
                 );
-                assert_eq!(page["task_id"], handle);
+                assert_eq!(page["task_id"], alias);
                 assert_eq!(page["output_bytes"], safe.len());
                 assert_eq!(page["next_cursor"], reconstructed.len());
                 assert_eq!(page["exhausted"], reconstructed.len() == safe.len());

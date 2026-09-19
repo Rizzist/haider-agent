@@ -5275,6 +5275,8 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
         start.expect("direct shell process tree starts"),
         ProcessStartObservation::Started
     );
+    #[cfg(not(windows))]
+    let shell_attempt_command_id = "shell-cancel-command";
     #[cfg(windows)]
     let retry_start = !matches!(start, Ok(ProcessStartObservation::Started));
     #[cfg(windows)]
@@ -5512,8 +5514,9 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
         .expect("next provider turn contains the cancelled shell record");
     assert!(command_record.contains("origin: user_command"));
     assert!(
-        command_record.contains("task_output("),
-        "cancelled output remains pageable"
+        command_record.contains("task_output(")
+            && command_record.contains(&format!("cap:{shell_attempt_command_id}")),
+        "cancelled output remains pageable by deterministic alias"
     );
     #[cfg(not(windows))]
     assert!(command_record.contains("status: cancelled"));

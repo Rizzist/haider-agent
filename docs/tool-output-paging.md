@@ -41,17 +41,20 @@ can therefore be retrieved in 16 pages, using at most half the default
 32-request soft tranche. Neither the 64-request turn ceiling nor the process
 execution limit is increased.
 
-A completely displayed process result carries no paging pointer: the inline
-output already is the whole secret-redacted capture, and provider-facing
-content stays byte-identical across identical conversations. An adapter
-reduction that would select nothing keeps a bounded inline head/tail window
-(2 KiB) instead of eliding everything, so small results never force paging.
+A completely displayed, successfully completed process result carries no
+paging pointer: the inline output already is the whole secret-redacted capture,
+and provider-facing content stays byte-identical across identical
+conversations. Cancelled direct-shell output remains pageable even when its
+observed prefix fits inline. An adapter reduction that would select nothing
+keeps a bounded inline head/tail window (2 KiB) instead of eliding everything,
+so small successful results never force paging.
 
-When the inline view is reduced, the model-facing result appends a
-deterministic conversation-local alias, `cap:<call_id>`; the durable result
-envelope also names the session-scoped `capture:<effect>` handle in its
-`capture` field for surfaces. Call `task_output(task_id="cap:…", cursor=0)`
-(or the `capture:…` form) and follow `next_cursor` until `exhausted` is true.
+When the inline view is reduced, or a direct-shell command is cancelled, the
+model-facing result appends a deterministic conversation-local alias,
+`cap:<call_id>`; the durable result envelope also names the session-scoped
+`capture:<effect>` handle in its `capture` field for surfaces. Call
+`task_output(task_id="cap:…", cursor=0)` (or the `capture:…` form) and follow
+`next_cursor` until `exhausted` is true.
 A reused call id re-points its alias at the most recent capture; effect
 handles stay unique. Cursors count bytes in the stable secret-redacted UTF-8
 capture. Invalid UTF-8 boundaries are rejected. Handles are scoped to the
