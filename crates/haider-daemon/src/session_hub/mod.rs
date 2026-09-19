@@ -102,6 +102,7 @@ mod peer_injection_tests;
 mod peer_store_rt_tests;
 
 mod actor;
+mod android_shell;
 mod close;
 mod descendant_stream;
 mod replay;

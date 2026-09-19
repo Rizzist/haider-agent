@@ -230,17 +230,12 @@ data class ProviderInventory(
     }
 }
 
-/**
- * Whether the session's shell view can do anything.
- *
- * The android-standalone tool policy disables `ProcessExec` outright
- * (contracts-v1 C4), so on this platform the Shell tab has nothing to drive
- * until a later lane ships an on-device shell. It says so, with the daemon's
- * own reason, rather than presenting an inert terminal.
- */
+/** Daemon-observed eligibility for an explicit user command in one session. */
 data class ShellAvailability(
     val available: Boolean = false,
     val reason: String? = null,
+    val sessionId: String? = null,
+    val workerGeneration: Long? = null,
 )
 
 /** Roster page state, so the drawer can scroll hundreds of sessions honestly. */
@@ -379,8 +374,14 @@ interface DaemonService : WorkflowDaemon, LoomDaemon {
     val supportedPermissionModes: Set<PermissionMode> get() = PermissionMode.entries.toSet()
     suspend fun setPermissionMode(mode: PermissionMode)
 
-    /** Platform shell availability. Standalone C4 excludes local process execution. */
+    /** Current selected session capability, revoked while unknown/disconnected. */
     val shell: StateFlow<ShellAvailability>
+    /** Bounded recent command history for observed sessions, reconstructed from redacted replay. */
+    val shellExecutions: StateFlow<Map<String, List<ShellExecution>>>
+    suspend fun refreshShell()
+    /** submissionId is a caller-retained UUID; reuse it only to retry the SAME submission. */
+    suspend fun startShell(sessionId: String, submissionId: String, command: String, cwd: String? = null): ShellExecutionRef
+    suspend fun cancelShell(execution: ShellExecutionRef)
     val catalogError: StateFlow<String?>
 
     /** When the catalog request went out; drives the model chip's 6 s deadline. */

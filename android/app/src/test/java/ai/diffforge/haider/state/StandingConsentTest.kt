@@ -46,6 +46,13 @@ class StandingConsentTest {
     }
 
     @Test
+    fun `process execution never spends Android standing consent`() {
+        for (title in listOf("Allow process_exec?", "Allow ProcessExec: sh -c true?", "Allow exec?", "Allow shell.exec?")) {
+            assertNull(StandingConsent.choice(PermissionMode.Auto, card(title = title)))
+        }
+    }
+
+    @Test
     fun `ask never answers anything`() {
         assertNull(StandingConsent.choice(PermissionMode.Ask, card()))
         assertFalse(StandingConsent.answers(PermissionMode.Ask, card()))

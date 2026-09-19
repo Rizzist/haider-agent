@@ -89,6 +89,7 @@ class RpcFacadeTest {
     private fun response(body: JsonObject): JsonObject {
         val method = body.string("method")
         return when (method) {
+            "tools.inventory" -> obj("method" to method, "session_id" to body.string("session_id"), "inventory" to obj())
             "session.list_watch", "account.list_watch" -> obj("method" to method, "accepted" to true)
             "session.list" -> obj("method" to method, "sessions" to JsonArray(listOf(summary(), summary("child"))))
             "provider.list" -> obj("method" to method, "providers" to JsonArray(listOf(provider())), "revision" to 12)
@@ -168,7 +169,7 @@ class RpcFacadeTest {
             ui.activate("s")
             withTimeout(5000) { ui.models.first { it != null } }
             assertFalse(ui.shell.value.available)
-            assertEquals("process_exec_disabled", ui.shell.value.reason)
+            withTimeout(5000) { ui.shell.first { it.reason == "capability_unknown" } }
             // Existing sessions start on Ask, and BOTH modes are offered: Auto
             // is this client's standing consent, not a daemon setting, so it is
             // available without a wire door (971-V F3).
@@ -576,7 +577,7 @@ class RpcFacadeTest {
             val rendered = service.transcriptUpdates("s").stateIn(owner, SharingStarted.Eagerly, TranscriptLoad.Unavailable("pending"))
             withTimeout(3000) { rendered.first { it is TranscriptLoad.Complete } }
             service.send("s", "next")
-            val calls = daemon.requests.size
+            val calls = daemon.requests.count { it.string("method") != "tools.inventory" }
             fun push(seq: Long, payload: JsonObject) = daemon.push(obj("v" to 1, "kind" to "event", "attachment_id" to "attachment-s", "session_id" to "s",
                 "envelope" to obj("seq" to seq, "session_id" to "s", "render" to obj("ui" to true), "payload" to payload)))
             delay(50)
@@ -586,7 +587,8 @@ class RpcFacadeTest {
             push(4, obj("type" to "item", "event" to "completed", "item_id" to "live", "item" to obj("item" to "agent_message", "text" to "final after submit")))
             withTimeout(3000) { rendered.first { it.messages.lastOrNull()?.text == "final after submit" } }
             assertFalse(rendered.value.messages.last().streaming)
-            assertEquals(calls, daemon.requests.size)
+            // Capability refresh may observe the new head; replay needs no new attachment/read.
+            assertEquals(calls, daemon.requests.count { it.string("method") != "tools.inventory" })
         } finally { service.close(); daemon.close(); owner.cancel(); directory.deleteRecursively() }
     }
 
@@ -764,4 +766,49 @@ class RpcFacadeTest {
             assertEquals(ModelInventoryAuthority.Advisory, ui.providers.value.single().inventoryAuthority)
         } finally { adapter.close(); source.close(); client.close(); daemon.close(); owner.cancel() }
     }
+    @Test fun shellCapabilityTracksDaemonTruthAndCancellationUsesAcceptedRun() = runBlocking<Unit> {
+        val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val reason = MutableStateFlow<String?>(null)
+        val daemon = Daemon(owner) { body -> when (body.string("method")) {
+            "tools.inventory" -> obj("method" to "tools.inventory", "session_id" to body.string("session_id"),
+                "inventory" to obj(), "shell" to obj("available" to (reason.value == null), "reason" to reason.value,
+                    "worker_generation" to 7))
+            "shell.exec" -> obj("method" to "shell.exec", "session_id" to body.string("session_id"),
+                "run_id" to "accepted-shell-run", "item_id" to "accepted-shell-item", "worker_generation" to 7, "accepted_seq" to 3)
+            else -> response(body)
+        } }
+        val client = RpcClient(owner, daemon::socket)
+        val directory = Files.createTempDirectory("shell-facade").toFile()
+        val binder = object : RpcControlPlane {
+            override val snapshots = MutableStateFlow<DaemonServiceSnapshot?>(snapshot())
+            override suspend fun start() = Unit
+            override suspend fun stop() = Unit
+            override suspend fun restart() = Unit
+            override suspend fun reportNotificationPermission(granted: Boolean, permanentlyDenied: Boolean) = Unit
+        }
+        val service = RpcDaemonService(owner, binder, directory, "/private/workspaces", "p", "m", 4096, client)
+        try {
+            withTimeout(5000) { service.rosterReady.first { it } }
+            service.activate("s")
+            service.refreshShell()
+            withTimeout(5000) { service.shell.first { it.available && it.sessionId == "s" } }
+            val ref = service.startShell("s", "submission-1", "printf fixture")
+            assertEquals(ref, service.startShell("s", "submission-1", "printf fixture"))
+            assertEquals(1, daemon.requests.count { it.string("method") == "shell.exec" })
+            service.cancelShell(ref)
+            val cancel = daemon.requests.last { it.string("method") == "turn.cancel" }
+            assertEquals("accepted-shell-run", cancel.string("run_id"))
+            assertEquals(7L, cancel.number("worker_generation"))
+            reason.value = "lockdown"
+            service.refreshShell()
+            assertFalse(service.shell.value.available)
+            assertEquals("lockdown", service.shell.value.reason)
+            try { service.startShell("s", "submission-2", "true"); fail("must refuse") }
+            catch (error: IOException) { assertEquals("lockdown", error.message) }
+            binder.snapshots.value = null
+            withTimeout(5000) { service.shell.first { !it.available && it.reason == "disconnected" } }
+            assertEquals(1, daemon.requests.count { it.string("method") == "shell.exec" })
+        } finally { service.close(); daemon.close(); owner.cancel(); directory.deleteRecursively() }
+    }
+
 }

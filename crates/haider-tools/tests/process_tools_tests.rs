@@ -1970,3 +1970,126 @@ fn env_view_redacts_secret_names_and_preserves_non_secret_values() {
         Some("/visible/test/home")
     );
 }
+
+/// Android differs from desktop: normal completion must sweep ordinary descendants
+/// while the unreaped leader still pins group identity.
+#[cfg(feature = "android-standalone")]
+#[tokio::test]
+async fn android_normal_exit_sweeps_descendants_before_reap() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (mut broker, journal) = broker(workspace.path());
+    let result = broker.process_exec(
+        &ProcessExec::new("android-exit", concat!(
+            "/bin/sh -c 'trap \"\" TERM; echo ready > ready; sleep 1; echo survived > survived' & ",
+            "while [ ! -f ready ]; do sleep 0.01; done; printf android-ok; exit 7"
+        )), &process_policy(), RecordingCas::default(), RecordingOutput::default(),
+        ProcessBounds { kill_grace: Duration::from_millis(30), ..ProcessBounds::default() },
+    ).await.expect("execution").wait().await.expect("swept result");
+    assert_eq!(result.exit_code, Some(7));
+    assert!(
+        !result
+            .lifecycle_events
+            .contains(&ProcessLifecycleEvent::NormalCompletionDetached)
+    );
+    let sweep = result
+        .lifecycle_events
+        .iter()
+        .position(|event| *event == ProcessLifecycleEvent::GroupSweepCompleted)
+        .expect("sweep");
+    let reap = result
+        .lifecycle_events
+        .iter()
+        .position(|event| *event == ProcessLifecycleEvent::LeaderReaped)
+        .expect("reap");
+    assert!(sweep < reap);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!workspace.path().join("survived").exists());
+    assert!(phases(&journal).iter().any(|event| matches!(
+        event,
+        EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::Allow,
+            ..
+        }
+    )));
+    broker.close().await.expect("close");
+}
+
+#[cfg(feature = "android-standalone")]
+#[tokio::test]
+async fn android_environment_and_reserved_cwd_are_fail_closed() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (mut broker, _) = broker(workspace.path());
+    assert!(
+        broker
+            .normalize(&ProcessExec::new("env", "true").with_env_allowlist(vec!["PATH".into()]))
+            .await
+            .is_err()
+    );
+    fs::create_dir(workspace.path().join(".haider-lockdown")).expect("reserved fixture");
+    assert!(
+        broker
+            .normalize(&ProcessExec::new("cwd", "true").with_cwd(".haider-lockdown"))
+            .await
+            .is_err()
+    );
+    let output = RecordingOutput::default();
+    let observer = output.observer();
+    broker
+        .process_exec(
+            &ProcessExec::new("fixed-env", "printf '%s|%s' \"$HOME\" \"$LANG\""),
+            &process_policy(),
+            RecordingCas::default(),
+            output,
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("start")
+        .wait()
+        .await
+        .expect("finish");
+    assert_eq!(
+        String::from_utf8(output_bytes(&observer.lock().expect("output"))).expect("utf8"),
+        format!(
+            "{}|C",
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical")
+                .display()
+        )
+    );
+    broker.close().await.expect("close");
+}
+
+#[cfg(feature = "android-standalone")]
+#[test]
+fn android_runtime_teardown_drops_supervisor_and_kills_its_pinned_group() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (mut broker, _) = broker(workspace.path());
+    let execution = runtime.block_on(async {
+        let execution = broker.process_exec(&ProcessExec::new("android-runtime-drop", concat!(
+            "/bin/sh -c 'trap \"\" TERM; echo ready > ready; sleep 1; echo escaped > survived' & ",
+            "while :; do sleep 1; done"
+        )), &process_policy(), RecordingCas::default(), RecordingOutput::default(), ProcessBounds::default())
+            .await.expect("start");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !workspace.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("real descendant ready");
+        execution
+    });
+    // Keep caller and broker alive: only runtime abort drops the supervisor here.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(
+        !workspace.path().join("survived").exists(),
+        "supervisor abort detached a live group"
+    );
+    drop(execution);
+    drop(broker);
+}

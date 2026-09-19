@@ -248,6 +248,16 @@ pub(super) async fn mobile_dispatcher_fixture_with_grant(
     backend: Arc<dyn MobileBackend>,
     grant: Option<Grant>,
 ) -> MobileDispatcherFixture {
+    mobile_dispatcher_fixture_with_policy(label, user_text, backend, grant, true).await
+}
+
+pub(super) async fn mobile_dispatcher_fixture_with_policy(
+    label: &str,
+    user_text: &str,
+    backend: Arc<dyn MobileBackend>,
+    grant: Option<Grant>,
+    auto_allow: bool,
+) -> MobileDispatcherFixture {
     let profile = tempfile::tempdir().expect("profile");
     #[cfg(not(feature = "android-standalone"))]
     let workspace = tempfile::tempdir().expect("workspace");
@@ -269,7 +279,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_grant(
         allow_writes: false,
         allow_exec: false,
         allow_mobile: false,
-        auto_allow: true,
+        auto_allow,
     });
     hub.create_internal_session(SessionCreateCommand {
         command_id: format!("create-{label}"),

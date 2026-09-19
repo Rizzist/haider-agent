@@ -4,7 +4,8 @@
 //! pipe read through protocol `CommandOutput` delta (base64 is only the wire
 //! encoding). Cancellation, bounds, and explicit teardown are supervised as
 //! TERM → grace → KILL; normal leader completion relinquishes the group without
-//! terminating descendants. The broker owns the supervisor finalizer, so every
+//! terminating descendants on desktop. Android standalone sweeps the group on
+//! normal completion too (docs/android/process-exec-c4.md). The broker owns the supervisor finalizer, so every
 //! dispatched execution reaches its one terminal claim even if the caller
 //! drops its wait future.
 //!
@@ -142,6 +143,19 @@ impl ProcessExec {
                 "process cwd is not a directory: {}",
                 cwd.display()
             )));
+        }
+        if cfg!(feature = "android-standalone") {
+            if !self.env_allowlist.is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "Android ProcessExec does not inherit ambient environment",
+                ));
+            }
+            if cwd
+                .components()
+                .any(|part| part.as_os_str() == ".haider-lockdown")
+            {
+                return Err(ToolError::invalid_argument("reserved Android cwd"));
+            }
         }
         let mut env_allowlist = self.env_allowlist.clone();
         env_allowlist.sort();
@@ -385,6 +399,7 @@ pub enum ProcessLifecycleEvent {
     GroupSweepCompleted,
     LeaderReaped,
     NormalCompletionDetached,
+    NormalCompletionSweeping,
     RegistryRemoved,
 }
 
@@ -759,6 +774,22 @@ impl EffectBroker {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         haider_platform::configure_process_environment(&mut command);
+        if cfg!(feature = "android-standalone") {
+            // Host feature tests exercise lifecycle without pretending /system exists.
+            command
+                .env(
+                    "PATH",
+                    if cfg!(target_os = "android") {
+                        "/system/bin"
+                    } else {
+                        "/usr/bin:/bin"
+                    },
+                )
+                .env("LANG", "C")
+                .env("HOME", self.workspace_root())
+                .env("TMPDIR", &operation.cwd)
+                .kill_on_drop(true);
+        }
         for name in &operation.env_allowlist {
             if let Some(value) = env::var_os(name) {
                 command.env(name, value);
@@ -1015,6 +1046,17 @@ struct Supervisor {
     process_trace: bool,
 }
 
+struct AbortProcessGroup {
+    group: Option<ProcessGroup>,
+}
+impl Drop for AbortProcessGroup {
+    fn drop(&mut self) {
+        if let Some(group) = self.group.take() {
+            let _ = haider_platform::signal_process_group(group, Signal::KILL);
+        }
+    }
+}
+
 struct SupervisorCompletion {
     result: ToolResult<ProcessResult>,
     cancelled: bool,
@@ -1172,6 +1214,11 @@ async fn supervise_process_with_exit_observation(
         #[cfg(windows)]
         process_trace,
     } = supervisor;
+    // Declared after Child: abort drops this guard before the unreaped child,
+    // while its PGID is still pinned. Never retain numeric authority after reap.
+    let mut abort_group = AbortProcessGroup {
+        group: cfg!(feature = "android-standalone").then_some(group),
+    };
     let (captured_sender, mut captured) = mpsc::channel(1);
     let (output_stop, stdout_stop) = watch::channel(false);
     let (stdout_ready_sender, stdout_ready) = oneshot::channel();
@@ -1475,6 +1522,13 @@ async fn supervise_process_with_exit_observation(
                         false
                     }
                 };
+                if cfg!(feature = "android-standalone") && !group_termination_started {
+                    natural_completion_won = true;
+                    group_termination_started = true;
+                    lifecycle_events.push(ProcessLifecycleEvent::NormalCompletionSweeping);
+                    begin_group_termination(group, pid, leader_is_zombie, bounds.kill_grace,
+                        &mut kill_deadline, &mut fatal, &mut escalation_notes, &mut lifecycle_events);
+                }
                 if kill_deadline.is_none() {
                     if !group_termination_started {
                         // `tokio::select!` is biased toward cancellation. If
@@ -1493,6 +1547,10 @@ async fn supervise_process_with_exit_observation(
                         live.store(false, Ordering::Release);
                         drop(control);
                     }
+                    let control = control_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    live.store(false, Ordering::Release);
+                    drop(control);
+                    abort_group.group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -1587,6 +1645,10 @@ async fn supervise_process_with_exit_observation(
                     }
                 }
                 if kill_deadline.is_none() && leader_exit_observed && !leader_reaped {
+                    let control = control_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    live.store(false, Ordering::Release);
+                    drop(control);
+                    abort_group.group = None;
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -1955,23 +2017,16 @@ fn sweep_permission_means_only_zombie(
     leader_is_zombie: bool,
     error: &std::io::Error,
 ) -> bool {
-    if !haider_platform::process_error_is_permission(error) {
-        return false;
-    }
-    if leader_is_zombie {
-        return true;
-    }
-    // Darwin can report EPERM for a group containing only our unreaped zombie
-    // before the independently delivered kqueue notification reaches this
-    // supervisor. Confirm waitable state synchronously; EPERM for a live group
-    // remains an error and no other platform widens its permission handling.
+    // EPERM for an unreaped zombie is a Darwin convention, not an Android
+    // containment witness. Never turn an Android/Linux signal denial into success.
     #[cfg(target_os = "macos")]
     {
-        haider_platform::process_leader_exited(pid).unwrap_or(false)
+        haider_platform::process_error_is_permission(error)
+            && (leader_is_zombie || haider_platform::process_leader_exited(pid).unwrap_or(false))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = pid;
+        let _ = (pid, leader_is_zombie, error);
         false
     }
 }
@@ -2212,6 +2267,9 @@ pub(crate) fn shell_command(script: &str) -> Command {
 
 #[cfg(unix)]
 pub(crate) fn monitor_shell_argv(script: &str) -> Vec<String> {
+    #[cfg(all(target_os = "android", feature = "android-standalone"))]
+    return vec!["/system/bin/sh".into(), "-c".into(), script.into()];
+    #[cfg(not(all(target_os = "android", feature = "android-standalone")))]
     vec![
         unix_shell_executable(env::var_os("SHELL"), is_executable_file)
             .to_string_lossy()
@@ -2221,7 +2279,7 @@ pub(crate) fn monitor_shell_argv(script: &str) -> Vec<String> {
     ]
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(all(target_os = "android", feature = "android-standalone"))))]
 fn unix_shell_executable(
     configured_shell: Option<std::ffi::OsString>,
     is_executable: impl Fn(&Path) -> bool,
@@ -2239,7 +2297,7 @@ fn unix_shell_executable(
     std::ffi::OsString::from("sh")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(all(target_os = "android", feature = "android-standalone"))))]
 fn trustworthy_posix_shell(shell: &Path, is_executable: &impl Fn(&Path) -> bool) -> bool {
     shell.is_absolute()
         && matches!(
@@ -2247,6 +2305,24 @@ fn trustworthy_posix_shell(shell: &Path, is_executable: &impl Fn(&Path) -> bool)
             Some("sh" | "ash" | "bash" | "dash" | "ksh" | "mksh")
         )
         && is_executable(shell)
+}
+
+/// Whether the fixed Android system interpreter is actually present/executable.
+/// Host standalone tests use the same host shell resolver as process execution.
+#[must_use]
+pub fn android_shell_available() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        is_executable_file(Path::new("/system/bin/sh"))
+    }
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        is_executable_file(Path::new(&unix_shell_executable(None, is_executable_file)))
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(unix)]

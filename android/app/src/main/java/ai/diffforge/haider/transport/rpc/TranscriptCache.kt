@@ -89,10 +89,12 @@ class TranscriptCache(private val directory: File) {
             if ((envelope["render"] as? JsonObject)?.get("ui") != JsonPrimitive(true)) return obj("type" to "hidden")
             val payload = envelope.objectAt("payload")
             return when (payload.optionalString("type")) {
+                "run_state" -> obj("type" to "shell_run_state", "run_id" to envelope.optionalString("run_id"),
+                    "state" to payload.optionalString("state"))
                 "user_message" -> obj("type" to "user_message", "text" to payload.optionalString("text"))
                 // These describe roster/lifecycle state, not transcript content.
                 // Do not persist their arbitrary additive fields in the display cache.
-                "session_state", "run_state", "session_seen", "session_renamed" -> obj("type" to "metadata")
+                "session_state", "session_seen", "session_renamed" -> obj("type" to "metadata")
                 // The canonical terminal cause (`EventPayload::RunFailed`,
                 // haider-protocol/lib.rs:75). It was projected as `unrendered`,
                 // so an errored session showed an error icon, no explanation at
@@ -104,7 +106,7 @@ class TranscriptCache(private val directory: File) {
                 // un-allowlisted and is still never cached.
                 "run_failed" -> {
                     val presentation = payload["presentation"] as? JsonObject
-                    obj("type" to "run_failed", "code" to payload.optionalString("code"),
+                    obj("type" to "run_failed", "run_id" to envelope.optionalString("run_id"), "code" to payload.optionalString("code"),
                         "title" to presentation?.optionalString("title"),
                         "detail" to presentation?.optionalString("detail"),
                         "retryable" to (payload["retryable"] == JsonPrimitive(true)))
@@ -122,6 +124,22 @@ class TranscriptCache(private val directory: File) {
                     val item = payload["item"] as? JsonObject
                     val delta = payload["delta"] as? JsonObject
                     val kind = item?.optionalString("item")
+                    if (kind == "command_execution" || delta?.optionalString("delta") == "command_output") {
+                        val safeItem = item?.let { obj("call_id" to it.string("call_id"), "command" to it.string("command"),
+                            "status" to it.string("status"), "exit_code" to it.optionalNumber("exit_code")) }
+                        val safeOutput = delta?.let {
+                            val stream = it.string("stream")
+                            if (stream !in setOf("stdout", "stderr")) throw RpcProtocolException("invalid_shell_stream")
+                            val encoded = it.string("chunk_b64")
+                            // The daemon's negotiated frame bound applies before this allocation.
+                            try { java.util.Base64.getDecoder().decode(encoded) }
+                            catch (_: IllegalArgumentException) { throw RpcProtocolException("invalid_shell_output") }
+                            obj("stream" to stream, "chunk_b64" to encoded)
+                        }
+                        return obj("type" to "shell_item", "item_id" to payload.string("item_id"),
+                            "run_id" to envelope.optionalString("run_id"), "worker_generation" to envelope.number("worker_generation"),
+                            "event" to payload.string("event"), "item" to safeItem, "output" to safeOutput)
+                    }
                     // Known counters have no message body. Keep unknown extensions,
                     // budget interruptions and tool records visibly partial.
                     if (item != null && kind == "extension" && delta == null && payload.optionalString("event") in setOf("started", "completed")) {

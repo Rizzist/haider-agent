@@ -84,8 +84,8 @@ Each command is owned by its session supervisor within the `:daemon` foreground
 service. Closing a screen, switching sessions, losing RPC, or UI-process death
 does not cancel it. Reattachment replays committed redacted output and results;
 it never automatically resubmits a command. Cancel uses the accepted run ID and
-worker generation with `turn.cancel`. Session close and daemon drain cancel
-owned executions. Cancellation/time/output limits send TERM, wait the existing
+worker generation with `turn.cancel`. Session close refuses while a run is active (cancel first); worker/session
+teardown and daemon drain cancel owned executions. Cancellation/time/output limits send TERM, wait the existing
 2 s grace, then KILL to the process group, retaining the unreaped leader until
 the sweep to prevent recycled-PGID signals.
 

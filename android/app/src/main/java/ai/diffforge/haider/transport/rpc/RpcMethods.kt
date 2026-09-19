@@ -48,6 +48,9 @@ object RpcMethods {
         is Attachment.Pdf -> obj("kind" to "pdf", "artifact" to block.artifact, "name" to block.name, "pages" to block.pages)
         is Attachment.Unsupported -> throw RpcProtocolException("unsupported_attachment_kind")
     }
+    fun shellInventory(session: String) = obj("method" to "tools.inventory", "session_id" to session)
+    fun shellExec(id: String, at: SessionCoordinate, text: String, cwd: String?) =
+        command("shell.exec", id, at, "command" to text, "cwd" to cwd)
     fun cancel(command: String, at: SessionCoordinate, run: String) =
         command("turn.cancel", command, at, "run_id" to run)
     fun rename(command: String, at: SessionCoordinate, title: String?) = command("session.rename", command, at, "title" to title)

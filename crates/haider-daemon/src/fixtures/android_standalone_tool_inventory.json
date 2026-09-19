@@ -75,10 +75,14 @@
       "name": "request_input"
     },
     {
-      "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+      "description": "read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "column": {
+            "minimum": 1,
+            "type": "integer"
+          },
           "limit": {
             "minimum": 1,
             "type": "integer"
@@ -407,6 +411,25 @@
       "name": "fs_path"
     },
     {
+      "description": "foreground Android system shell, Ask by default; app-UID authority, not workspace confinement; 60 s / 1 MiB; process-group cleanup on exit/cancel, escaped descendants and abrupt death are residual risks",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "process_exec"
+    },
+    {
       "description": "delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)",
       "input_schema": {
         "additionalProperties": false,
@@ -574,6 +597,26 @@
             },
             "type": "object"
           },
+          "attempt": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "completion_action": {
+            "enum": [
+              "claim",
+              "handled",
+              "dismiss",
+              "resume"
+            ],
+            "type": "string"
+          },
+          "evidence_event_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
           "filter": {
             "properties": {
               "case_sensitive": {
@@ -628,6 +671,9 @@
           "monitor_id": {
             "type": "string"
           },
+          "obligation_id": {
+            "type": "string"
+          },
           "occurrence": {
             "enum": [
               "once",
@@ -643,7 +689,8 @@
               "pause",
               "resume",
               "trigger",
-              "remove"
+              "remove",
+              "follow_up"
             ],
             "type": "string"
           },
@@ -1051,7 +1098,7 @@
       {
         "default": "allow",
         "manifest": {
-          "description": "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes",
+          "description": "Read up to 64 KiB / 2,000 numbered lines; offset/limit are one-based line paging, column continues a long line. Explicit paths preserve identifiers; secret patterns remain redacted",
           "dispatch": "await",
           "effects": [
             {
@@ -1061,6 +1108,10 @@
           "input_schema": {
             "additionalProperties": false,
             "properties": {
+              "column": {
+                "minimum": 1,
+                "type": "integer"
+              },
               "limit": {
                 "minimum": 1,
                 "type": "integer"
@@ -1453,6 +1504,34 @@
         }
       },
       {
+        "default": "ask",
+        "manifest": {
+          "description": "Run a foreground command with the Android system shell under ProcessExec policy (Ask by default). Executes as the app UID: cwd is workspace-contained, filesystem/network access is NOT workspace-confined. 60 s / 1 MiB limits; normal exit and cancellation sweep the process group; escaped descendants and abrupt daemon death remain containment risks. No remote or background mode.",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "process_exec"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "cwd": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          },
+          "name": "process_exec"
+        }
+      },
+      {
         "default": "allow",
         "manifest": {
           "description": "Delegate one bounded task to a depth-capped local child under AgentSpawn policy; waits for the child report before returning its tool result. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
@@ -1774,6 +1853,26 @@
                 },
                 "type": "object"
               },
+              "attempt": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "completion_action": {
+                "enum": [
+                  "claim",
+                  "handled",
+                  "dismiss",
+                  "resume"
+                ],
+                "type": "string"
+              },
+              "evidence_event_ids": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
               "filter": {
                 "properties": {
                   "case_sensitive": {
@@ -1828,6 +1927,9 @@
               "monitor_id": {
                 "type": "string"
               },
+              "obligation_id": {
+                "type": "string"
+              },
               "occurrence": {
                 "enum": [
                   "once",
@@ -1843,7 +1945,8 @@
                   "pause",
                   "resume",
                   "trigger",
-                  "remove"
+                  "remove",
+                  "follow_up"
                 ],
                 "type": "string"
               },
@@ -2263,7 +2366,7 @@
       {
         "default": "allow",
         "manifest": {
-          "description": "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes",
+          "description": "Read up to 64 KiB / 2,000 numbered lines; offset/limit are one-based line paging, column continues a long line. Explicit paths preserve identifiers; secret patterns remain redacted",
           "dispatch": "await",
           "effects": [
             {
@@ -2273,6 +2376,10 @@
           "input_schema": {
             "additionalProperties": false,
             "properties": {
+              "column": {
+                "minimum": 1,
+                "type": "integer"
+              },
               "limit": {
                 "minimum": 1,
                 "type": "integer"
@@ -2665,6 +2772,34 @@
         }
       },
       {
+        "default": "ask",
+        "manifest": {
+          "description": "Run a foreground command with the Android system shell under ProcessExec policy (Ask by default). Executes as the app UID: cwd is workspace-contained, filesystem/network access is NOT workspace-confined. 60 s / 1 MiB limits; normal exit and cancellation sweep the process group; escaped descendants and abrupt daemon death remain containment risks. No remote or background mode.",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "process_exec"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "cwd": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          },
+          "name": "process_exec"
+        }
+      },
+      {
         "default": "allow",
         "manifest": {
           "description": "Delegate one bounded task to a depth-capped local child under AgentSpawn policy; waits for the child report before returning its tool result. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
@@ -2865,6 +3000,26 @@
                 },
                 "type": "object"
               },
+              "attempt": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "completion_action": {
+                "enum": [
+                  "claim",
+                  "handled",
+                  "dismiss",
+                  "resume"
+                ],
+                "type": "string"
+              },
+              "evidence_event_ids": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
               "filter": {
                 "properties": {
                   "case_sensitive": {
@@ -2919,6 +3074,9 @@
               "monitor_id": {
                 "type": "string"
               },
+              "obligation_id": {
+                "type": "string"
+              },
               "occurrence": {
                 "enum": [
                   "once",
@@ -2934,7 +3092,8 @@
                   "pause",
                   "resume",
                   "trigger",
-                  "remove"
+                  "remove",
+                  "follow_up"
                 ],
                 "type": "string"
               },

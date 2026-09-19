@@ -2045,6 +2045,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::ToolsInventory {
             session_id,
             inventory,
+            ..
         } => vec![LiveReply::ToolsInventory {
             session: session_id,
             snapshot: Box::new(inventory),

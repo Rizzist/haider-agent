@@ -154,7 +154,6 @@ async fn android_runtime_full_rpc_recovery_metadata_inventory_and_force() {
     std::fs::create_dir(&store).expect("store");
     let mut config = DaemonConfig::new("android-contract", &store, root.join("r"));
     config.android_workspace_dir = Some(crate::android_workspace::test_root().into());
-    config.lockdown_root_override = Some(store.join("lockdown"));
     config.store_synchronous = Some(haider_protocol::runtime::StoreSynchronous::Normal);
     config.discovery_disabled = true;
     config.frame_limit = 8_388_608;
@@ -165,7 +164,7 @@ async fn android_runtime_full_rpc_recovery_metadata_inventory_and_force() {
         FakeProvider::new(vec![
             FakeStep::EmitToolCall {
                 call_id: "excluded".into(),
-                name: "exec".into(),
+                name: "task_output".into(),
                 args: json!({"command":"touch forbidden"}),
             },
             FakeStep::Finish {
@@ -269,7 +268,7 @@ async fn android_runtime_full_rpc_recovery_metadata_inventory_and_force() {
     };
     assert!(!inventory.tools.iter().any(|entry| matches!(
         entry.manifest.name.as_str(),
-        "process_exec" | "exec" | "computer" | "peer_list" | "ssh_shell"
+        "exec" | "computer" | "peer_list" | "ssh_shell"
     )));
     let outside = client
         .request(
@@ -330,7 +329,7 @@ async fn android_runtime_full_rpc_recovery_metadata_inventory_and_force() {
         fake.requests()
             .iter()
             .flat_map(|request| &request.messages)
-            .any(|message| format!("{message:?}").contains("unsupported tool `exec`"))
+            .any(|message| format!("{message:?}").contains("unsupported tool `task_output`"))
     );
     let providers = client.request(json!({"method":"provider.list"})).await;
     let ResponseBody::ProviderList { revision, .. } = providers else {
@@ -606,4 +605,159 @@ async fn exercise_recovered_checkpoint_rpc(
             );
         }
     }
+}
+
+/// Real UDS, control attachment, capability truth and brokered local command.
+/// Host standalone execution proves plumbing; Android /system/bin/sh is a later device gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn android_shell_rpc_capability_execution_replay_and_denials() {
+    use base64::Engine as _;
+    use haider_protocol::{
+        effect::{AuthorizationVerdict, EffectPhase},
+        item::{ItemDelta, ItemEvent},
+        state::RunState,
+    };
+    let root = tempfile::Builder::new()
+        .prefix("s972")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root_path = root.path().canonicalize().expect("canonical fixture root");
+    let mut config = DaemonConfig::new(
+        "shell-contract",
+        root_path.join("store"),
+        root_path.join("r"),
+    );
+    config.android_workspace_dir = Some(crate::android_workspace::test_root().into());
+    config.discovery_disabled = true;
+    let fake = Arc::new(FakeProvider::new(vec![]));
+    let vault = haider_accounts::EncryptedFileVault::new(
+        root_path.join("vault"),
+        zeroize::Zeroizing::new([72; 32]),
+    )
+    .expect("synthetic encrypted vault");
+    let dependencies = DaemonDependencies {
+        provider_factory: ProviderFactoryConfig::injected(Arc::new(Factory(fake))),
+        accounts: AccountsDependencies {
+            vault: VaultProvision::Available(Arc::new(vault)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let task = ready(config.clone(), dependencies).await;
+    let endpoint = task
+        .diagnostics()
+        .snapshot()
+        .bootstrap
+        .unwrap()
+        .endpoint_path;
+    let mut client = Client::new(&endpoint).await;
+    assert!(matches!(client.hello(1).await, WireFrame::Welcome(_)));
+    let ResponseBody::SessionCreate { session_id, worker_generation, .. } = client.request(json!({
+        "method":"session.create", "command_id":"shell-create", "cwd":config.android_workspace_dir,
+        "provider":"fake", "model":"fake-model", "max_tokens":4096
+    })).await else { panic!("session creation"); };
+    let ResponseBody::ProviderList { revision, .. } =
+        client.request(json!({"method":"provider.list"})).await
+    else {
+        panic!("providers");
+    };
+    let trust = client.request(json!({"method":"provider.set_trust", "command_id":"shell-full", "name":"fake", "trust":"full", "expected_revision":revision})).await;
+    assert!(
+        matches!(trust, ResponseBody::ProviderSetTrust { .. }),
+        "{trust:?}"
+    );
+    let inventory = client
+        .request(json!({"method":"tools.inventory", "session_id":session_id}))
+        .await;
+    assert!(
+        matches!(inventory, ResponseBody::ToolsInventory { shell:Some(ref shell), .. }
+        if !shell.available && shell.reason.as_deref() == Some("control_attachment_required")),
+        "{inventory:?}"
+    );
+    let command = json!({"method":"shell.exec", "command_id":"shell-once", "session_id":session_id,
+        "worker_generation":worker_generation, "command":"printf 'shell-ok\\n'; printf 'err-ok\\n' >&2"});
+    assert!(
+        matches!(client.request(command.clone()).await, ResponseBody::Error { code, .. } if code == "capability_denied")
+    );
+    assert!(matches!(client.request(json!({"method":"session.attach", "session_id":session_id,"after_seq":0,"mode":"control"})).await, ResponseBody::SessionAttach {..}));
+    let inventory = client
+        .request(json!({"method":"tools.inventory", "session_id":session_id}))
+        .await;
+    assert!(
+        matches!(inventory, ResponseBody::ToolsInventory { shell:Some(ref shell), .. } if shell.available),
+        "{inventory:?}"
+    );
+    let accepted = client.request(command.clone()).await;
+    let ResponseBody::ShellExec { ref run_id, .. } = accepted else {
+        panic!("accepted: {accepted:?}");
+    };
+    let run = run_id.clone().unwrap();
+    let mut output = Vec::new();
+    let mut authorized = false;
+    loop {
+        let event = client.event().await;
+        if event.run_id.as_ref() != Some(&run) {
+            continue;
+        }
+        match event.payload.decode_event().unwrap() {
+            EventPayload::Item(ItemEvent::Delta {
+                delta: ItemDelta::CommandOutput { chunk_b64, .. },
+                ..
+            }) => {
+                output.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(chunk_b64)
+                        .unwrap(),
+                );
+            }
+            EventPayload::Effect(EffectPhase::Authorized {
+                verdict:
+                    AuthorizationVerdict::PreAuthorized {
+                        source: haider_protocol::effect::AuthorizationSource::UserTyped,
+                    },
+                ..
+            }) => authorized = true,
+            EventPayload::RunState(RunState::Done) => break,
+            EventPayload::RunState(RunState::Errored) => panic!("shell run errored"),
+            _ => (),
+        }
+    }
+    assert!(authorized);
+    let output = String::from_utf8(output).unwrap();
+    assert!(
+        output.contains("shell-ok") && output.contains("err-ok"),
+        "{output}"
+    );
+    assert_eq!(
+        client.request(command).await,
+        accepted,
+        "same command replays receipt without another process"
+    );
+    let scoped = client.request(json!({"method":"shell.exec", "branch_id":"branch", "command_id":"scoped", "session_id":session_id,
+        "worker_generation":worker_generation, "command":"true"})).await;
+    assert!(matches!(scoped, ResponseBody::Error { code, .. } if code == "capability_denied"));
+    let ResponseBody::ProviderList { revision, .. } =
+        client.request(json!({"method":"provider.list"})).await
+    else {
+        panic!("providers");
+    };
+    assert!(matches!(client.request(json!({"method":"provider.set_trust", "command_id":"shell-lock", "name":"fake", "trust":"lockdown", "expected_revision":revision})).await, ResponseBody::ProviderSetTrust { .. }));
+    let inventory = client
+        .request(json!({"method":"tools.inventory", "session_id":session_id}))
+        .await;
+    assert!(
+        matches!(inventory, ResponseBody::ToolsInventory { shell:Some(ref shell), .. }
+        if !shell.available && shell.reason.as_deref() == Some("lockdown")),
+        "{inventory:?}"
+    );
+    assert!(
+        matches!(client.request(json!({"method":"shell.exec", "command_id":"shell-lock-refused", "session_id":session_id,
+        "worker_generation":worker_generation, "command":"true"})).await, ResponseBody::Error { code, .. } if code == "permission_denied")
+    );
+    task.shutdown_handle().request_graceful();
+    drop(client);
+    assert!(matches!(
+        task.join().await.unwrap(),
+        ShutdownOutcome::Graceful
+    ));
 }

@@ -1007,6 +1007,7 @@ pub fn transcript() -> Vec<WireFrame> {
         WireFrame::Response {
             request_id: RequestId::new("request-tools-inventory"),
             body: ResponseBody::ToolsInventory {
+                shell: None,
                 session_id: SessionId::new("session-1"),
                 inventory: ToolInventorySnapshot {
                     tools: vec![ToolInventoryEntry {
