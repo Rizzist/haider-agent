@@ -154,9 +154,10 @@ impl WorkspaceConfig {
             None => None,
             Some(serde_json::Value::String(text)) => {
                 let path = PathBuf::from(text);
-                if text.trim().is_empty() || !path.is_absolute() {
+                if text.trim().is_empty() || !path.is_absolute() || has_parent_component(&path) {
                     return Err(WorkspaceError::InvalidConfig(
-                        "`workspace.base` must be a nonempty absolute path".to_string(),
+                        "`workspace.base` must be a nonempty absolute path without `..`"
+                            .to_string(),
                     ));
                 }
                 Some(path)
@@ -603,14 +604,11 @@ fn resolve_base(
             return Err(WorkspaceError::EmptySelector(WORKSPACE_BASE_ENV));
         }
         let path = PathBuf::from(base);
-        if !path.is_absolute() {
-            return Err(WorkspaceError::InvalidBase(format!(
-                "{WORKSPACE_BASE_ENV} must be absolute: {base}"
-            )));
-        }
+        validate_selected_base(&path, WORKSPACE_BASE_ENV)?;
         return Ok((path, WorkspaceBaseSource::EnvBase));
     }
     if let Some(base) = request.config.base.as_deref() {
+        validate_selected_base(base, "workspace.base")?;
         return Ok((base.to_path_buf(), WorkspaceBaseSource::ConfigBase));
     }
     if request.environment.explicit_profile_dir {
@@ -628,6 +626,27 @@ fn resolve_base(
         DocumentsLookup::Documents(path) => Ok((path, WorkspaceBaseSource::PlatformDocuments)),
         DocumentsLookup::HomeFallback { home, .. } => Ok((home, WorkspaceBaseSource::HomeFallback)),
     }
+}
+
+fn validate_selected_base(path: &Path, source: &str) -> Result<(), WorkspaceError> {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(WorkspaceError::InvalidBase(format!(
+            "{source} must be a nonempty absolute path: {}",
+            path.display()
+        )));
+    }
+    if has_parent_component(path) {
+        return Err(WorkspaceError::InvalidBase(format!(
+            "{source} must not contain `..`: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| component == Component::ParentDir)
 }
 
 fn dated_plan(request: &WorkspaceRequest<'_>) -> Result<DatedWorkspacePlan, WorkspaceError> {
@@ -676,6 +695,11 @@ pub enum MaterializeError {
     /// The validated base does not exist or is not a directory; no silent
     /// fallback (W6).
     BaseUnavailable(PathBuf, std::io::Error),
+    /// A public plan was inconsistent or could escape its selected base.
+    InvalidPlan(String),
+    /// An existing child below the anchored base was a symlink, reparse
+    /// point, regular file, or otherwise not a real directory.
+    UnsafeComponent(PathBuf),
     /// Creating the organizing root or leaf failed.
     Io(PathBuf, std::io::Error),
     /// Eight fresh ids all collided — something is replaying entropy.
@@ -694,6 +718,12 @@ impl std::fmt::Display for MaterializeError {
                     path.display()
                 )
             }
+            Self::InvalidPlan(reason) => write!(f, "invalid workspace plan: {reason}"),
+            Self::UnsafeComponent(path) => write!(
+                f,
+                "workspace path component is not a real directory: {}",
+                path.display()
+            ),
             Self::Io(path, error) => write!(f, "cannot create {}: {error}", path.display()),
             Self::CollisionRetriesExhausted => {
                 f.write_str("workspace leaf collision retries exhausted")
@@ -711,18 +741,7 @@ impl std::error::Error for MaterializeError {}
 /// carve-out (L2). The base itself must already exist; its absence is a
 /// visible error, never a fallback. Idempotent.
 pub fn materialize_daily_root(plan: &DatedWorkspacePlan) -> Result<PathBuf, MaterializeError> {
-    match std::fs::metadata(&plan.base) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => {
-            return Err(MaterializeError::BaseUnavailable(
-                plan.base.clone(),
-                std::io::Error::new(std::io::ErrorKind::NotADirectory, "base is not a directory"),
-            ));
-        }
-        Err(error) => return Err(MaterializeError::BaseUnavailable(plan.base.clone(), error)),
-    }
-    create_dir_private_all(&plan.daily_root)
-        .map_err(|error| MaterializeError::Io(plan.daily_root.clone(), error))?;
+    materialize_daily_root_directory(plan)?;
     Ok(plan.daily_root.clone())
 }
 
@@ -742,58 +761,227 @@ pub struct MaterializedLeaf {
 /// leaf (L5); once this function returns success, no later automatic
 /// cleanup ever happens.
 pub fn materialize_leaf(plan: &DatedWorkspacePlan) -> Result<MaterializedLeaf, MaterializeError> {
-    materialize_daily_root(plan)?;
+    let daily_root = materialize_daily_root_directory(plan)?;
     let mut allocation_id = plan.allocation_id.clone();
     for retry in 0u8..8 {
         let leaf = plan.daily_root.join(format!("s-{allocation_id}"));
-        match create_dir_private_new(&leaf) {
+        let name = leaf
+            .file_name()
+            .ok_or_else(|| MaterializeError::InvalidPlan("leaf has no filename".into()))?;
+        match create_private_leaf(&daily_root, name, &leaf) {
             Ok(()) => {
-                // Reject symlink/reparse substitution of the new leaf.
-                let valid = std::fs::symlink_metadata(&leaf)
-                    .map(|metadata| metadata.is_dir())
-                    .unwrap_or(false);
-                if !valid {
-                    let _ = std::fs::remove_dir(&leaf);
-                    return Err(MaterializeError::LeafValidationFailed(leaf));
-                }
                 return Ok(MaterializedLeaf {
                     leaf,
                     allocation_id,
                     retries: retry,
                 });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(PrivateLeafError::AlreadyExists) => {
                 let entropy = allocation_entropy()
                     .map_err(|_| MaterializeError::CollisionRetriesExhausted)?;
                 allocation_id = hex_lower(&entropy);
             }
-            Err(error) => return Err(MaterializeError::Io(leaf, error)),
+            Err(PrivateLeafError::Materialize(error)) => return Err(error),
         }
     }
     Err(MaterializeError::CollisionRetriesExhausted)
 }
 
+fn validate_materialization_plan(plan: &DatedWorkspacePlan) -> Result<(), MaterializeError> {
+    if !plan.base.is_absolute() || has_parent_component(&plan.base) {
+        return Err(MaterializeError::InvalidPlan(
+            "base must be absolute and contain no `..`".into(),
+        ));
+    }
+    if !is_date_label_like(&plan.hijri_label)
+        || !matches!(
+            Path::new(&plan.hijri_label)
+                .components()
+                .collect::<Vec<_>>()[..],
+            [Component::Normal(_)]
+        )
+    {
+        return Err(MaterializeError::InvalidPlan(
+            "Hijri label must be one date component".into(),
+        ));
+    }
+    if plan.allocation_id.len() != 32
+        || !plan
+            .allocation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(MaterializeError::InvalidPlan(
+            "allocation id must be 32 lowercase hexadecimal characters".into(),
+        ));
+    }
+    let expected_daily_root = plan.base.join("Haider").join(&plan.hijri_label);
+    if plan.daily_root != expected_daily_root {
+        return Err(MaterializeError::InvalidPlan(
+            "daily root is not the selected base's Haider/date child".into(),
+        ));
+    }
+    if plan.leaf != expected_daily_root.join(format!("s-{}", plan.allocation_id)) {
+        return Err(MaterializeError::InvalidPlan(
+            "leaf is not the daily root's allocation child".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_daily_root_directory(
+    plan: &DatedWorkspacePlan,
+) -> Result<haider_platform::WorkspaceDirectory, MaterializeError> {
+    validate_materialization_plan(plan)?;
+    let mut directory = haider_platform::open_workspace_directory(&plan.base).map_err(|error| {
+        MaterializeError::BaseUnavailable(plan.base.clone(), workspace_directory_error_to_io(error))
+    })?;
+    let haider = plan.base.join("Haider");
+    directory =
+        create_or_open_private_directory(directory, std::ffi::OsStr::new("Haider"), &haider)?;
+    create_or_open_private_directory(
+        directory,
+        std::ffi::OsStr::new(&plan.hijri_label),
+        &plan.daily_root,
+    )
+}
+
 #[cfg(unix)]
-fn create_dir_private_all(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
+fn workspace_directory_error_to_io(
+    error: haider_platform::WorkspaceDirectoryError,
+) -> std::io::Error {
+    error.into()
 }
 
-#[cfg(not(unix))]
-fn create_dir_private_all(path: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new().recursive(true).create(path)
+#[cfg(windows)]
+fn workspace_directory_error_to_io(
+    error: haider_platform::WorkspaceDirectoryError,
+) -> std::io::Error {
+    error
 }
 
 #[cfg(unix)]
-fn create_dir_private_new(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(path)
+fn create_or_open_private_directory(
+    directory: haider_platform::WorkspaceDirectory,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<haider_platform::WorkspaceDirectory, MaterializeError> {
+    use rustix::fs::{Mode, OFlags};
+
+    match rustix::fs::mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(MaterializeError::Io(path.to_path_buf(), error.into())),
+    }
+    rustix::fs::openat(
+        &directory,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+            MaterializeError::UnsafeComponent(path.to_path_buf())
+        }
+        _ => MaterializeError::Io(path.to_path_buf(), error.into()),
+    })
 }
 
-#[cfg(not(unix))]
-fn create_dir_private_new(path: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new().create(path)
+#[cfg(windows)]
+fn create_or_open_private_directory(
+    directory: haider_platform::WorkspaceDirectory,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<haider_platform::WorkspaceDirectory, MaterializeError> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    haider_platform::open_workspace_subdirectory(directory, Path::new(name), true).map_err(
+        |error| match std::fs::symlink_metadata(path) {
+            Ok(metadata)
+                if !metadata.is_dir()
+                    || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
+            {
+                MaterializeError::UnsafeComponent(path.to_path_buf())
+            }
+            _ => MaterializeError::Io(path.to_path_buf(), error),
+        },
+    )
+}
+
+enum PrivateLeafError {
+    AlreadyExists,
+    Materialize(MaterializeError),
+}
+
+#[cfg(unix)]
+fn create_private_leaf(
+    daily_root: &haider_platform::WorkspaceDirectory,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<(), PrivateLeafError> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    match rustix::fs::mkdirat(daily_root, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => return Err(PrivateLeafError::AlreadyExists),
+        Err(error) => {
+            return Err(PrivateLeafError::Materialize(MaterializeError::Io(
+                path.to_path_buf(),
+                error.into(),
+            )));
+        }
+    }
+    match rustix::fs::openat(
+        daily_root,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => {
+            drop(directory);
+            Ok(())
+        }
+        Err(_) => {
+            let _ = rustix::fs::unlinkat(daily_root, name, AtFlags::REMOVEDIR);
+            Err(PrivateLeafError::Materialize(
+                MaterializeError::LeafValidationFailed(path.to_path_buf()),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_private_leaf(
+    daily_root: &haider_platform::WorkspaceDirectory,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<(), PrivateLeafError> {
+    let leaf = daily_root.path().join(name);
+    match std::fs::create_dir(&leaf) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(PrivateLeafError::AlreadyExists);
+        }
+        Err(error) => {
+            return Err(PrivateLeafError::Materialize(MaterializeError::Io(
+                path.to_path_buf(),
+                error,
+            )));
+        }
+    }
+    let parent = haider_platform::duplicate_workspace_directory(daily_root).map_err(|error| {
+        PrivateLeafError::Materialize(MaterializeError::Io(path.to_path_buf(), error))
+    })?;
+    match haider_platform::open_workspace_subdirectory(parent, Path::new(name), false) {
+        Ok(directory) => {
+            drop(directory);
+            Ok(())
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir(&leaf);
+            Err(PrivateLeafError::Materialize(
+                MaterializeError::LeafValidationFailed(path.to_path_buf()),
+            ))
+        }
+    }
 }

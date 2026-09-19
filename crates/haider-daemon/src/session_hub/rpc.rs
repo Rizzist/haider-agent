@@ -8142,6 +8142,7 @@ impl HubConnection {
                 hub: self.hub.clone(),
                 connection_id: self.connection_id.clone(),
                 capabilities: self.capabilities.clone(),
+                client_kind: self.client_kind,
                 sink,
                 transport: self.transport,
                 runtime_paths: None,
@@ -17972,12 +17973,24 @@ impl HubConnection {
         // BEFORE the attach replay boundary is captured, so the accepted
         // fact is part of the replayed durable history and the returned
         // snapshot is consistent with the attach watermark.
-        let mut registered_origin = None;
         if let Some(origin_request) = launch_origin {
-            // O8: only a local interactive CONTROL attach may register; a
-            // view-mode request fails without mutation. Client-name strings
-            // are never authorization — the Control capability and
-            // attachment mode were validated by dispatch.
+            // O8: client-name strings and a generic Control grant are not
+            // sufficient. Registration additionally requires the negotiated
+            // interactive TUI class over the peer-UID-authenticated local
+            // transport. Remote/mobile/fleet/peer and local CLI/headless
+            // control clients fail before any receipt or session mutation.
+            if self.client_kind != ClientKind::Tui
+                || self.transport != crate::accounts::ConnectionTransport::LocalSameUid
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_CAPABILITY_DENIED,
+                    "origin registration requires an authenticated local TUI connection",
+                    false,
+                    None,
+                );
+            }
+            // A view-mode request also fails without mutation.
             if mode != AttachMode::Control {
                 return self.respond_error(
                     request_id,
@@ -18029,7 +18042,7 @@ impl HubConnection {
                 )
                 .await
             {
-                Ok(Some(origin)) => registered_origin = Some(origin),
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     let command = haider_core::SessionLaunchOriginCommand {
                         command_id: origin_request.command_id.clone(),
@@ -18046,9 +18059,9 @@ impl HubConnection {
                     };
                     match self.hub.register_session_launch_origin(command).await {
                         Ok(
-                            haider_core::SessionLaunchOriginOutcome::Committed { origin, .. }
-                            | haider_core::SessionLaunchOriginOutcome::IdempotentReplay { origin },
-                        ) => registered_origin = Some(origin),
+                            haider_core::SessionLaunchOriginOutcome::Committed { .. }
+                            | haider_core::SessionLaunchOriginOutcome::IdempotentReplay { .. },
+                        ) => {}
                         Err(SessionHubError::Store(error)) => {
                             // O3: a stale CAS or store refusal fails this
                             // attach precisely; the client may reattach
@@ -18094,23 +18107,21 @@ impl HubConnection {
             .store
             .session_metadata(&attach_state.session_id)
             .await?;
-        // O5: the response snapshot is the CURRENT origin at this attach
-        // boundary — the one registered above, the typed projection, or
-        // the event reconstruction for legacy `{}` rows. Absence stays
+        // O5: the response snapshot is always the durable CURRENT origin,
+        // never the original response carried by a replayed, superseded
+        // receipt. Typed projection is authoritative when present; legacy
+        // `{}` rows reconstruct from immutable origin events. Absence stays
         // off the wire so pre-feature response bytes are unchanged.
-        let current_origin = match registered_origin {
+        let current_origin = match metadata
+            .as_ref()
+            .and_then(|meta| meta.launch_origin.clone())
+        {
             Some(origin) => Some(origin),
-            None => match metadata
-                .as_ref()
-                .and_then(|meta| meta.launch_origin.clone())
-            {
-                Some(origin) => Some(origin),
-                None => {
-                    self.hub
-                        .latest_launch_origin(&attach_state.session_id)
-                        .await?
-                }
-            },
+            None => {
+                self.hub
+                    .latest_launch_origin(&attach_state.session_id)
+                    .await?
+            }
         };
         let workspace_unavailable = metadata.and_then(|metadata| {
             crate::workspace::unavailable(std::path::Path::new(&metadata.cwd))

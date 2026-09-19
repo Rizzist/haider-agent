@@ -42,14 +42,16 @@ use haider_protocol::provider::{
     CacheStatAvailability, FinishReason, NormalizedUsage, Usage, UsageRequestKind, UsageScope,
     UsageSource,
 };
-use haider_protocol::session::ModelSelected;
+use haider_protocol::session::{
+    LaunchOriginPathKindV1, LaunchOriginPathV1, LaunchOriginRegistrationV1, ModelSelected,
+};
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
 use haider_rpc::{
-    ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachmentId, Capability, CapabilitySet, CommandId,
-    ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
+    ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind,
+    CommandId, ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
     ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
     ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE, ERROR_CODE_PDF_TOO_MANY_PAGES,
@@ -876,6 +878,279 @@ fn delta_pipe_event(session_id: &SessionId, event_id: &str, worker_generation: u
 
 fn capabilities() -> CapabilitySet {
     CapabilitySet::from([Capability::View, Capability::Control])
+}
+
+fn launch_origin_registration(
+    command_id: &str,
+    open_id: &str,
+    worker_generation: u64,
+    expected_revision: u64,
+    display: &str,
+) -> LaunchOriginRegistrationV1 {
+    LaunchOriginRegistrationV1 {
+        command_id: command_id.into(),
+        open_id: open_id.into(),
+        worker_generation,
+        expected_revision,
+        path: LaunchOriginPathV1 {
+            kind: LaunchOriginPathKindV1::HomeRelative,
+            display: Some(display.into()),
+        },
+        workspace_materialized: Some(false),
+    }
+}
+
+async fn attach_with_origin_response(
+    connection: &HubConnection,
+    sink: &CollectSink,
+    request_id: &str,
+    session_id: &SessionId,
+    after_seq: u64,
+    registration: LaunchOriginRegistrationV1,
+) -> ResponseBody {
+    connection
+        .request(
+            RequestId::new(request_id),
+            RequestBody::SessionAttachWithOrigin {
+                session_id: session_id.clone(),
+                after_seq,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+                launch_origin: Some(registration),
+            },
+        )
+        .await
+        .expect("origin attach routes");
+    loop {
+        if let WireFrame::Response {
+            request_id: response_id,
+            body,
+        } = sink.next().await
+            && response_id.as_str() == request_id
+        {
+            return body;
+        }
+    }
+}
+
+async fn assert_origin_registration_refused_without_mutation(
+    label: &str,
+    client_kind: ClientKind,
+    transport: ConnectionTransport,
+) {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session = SessionId::new(format!("origin-refused-{label}"));
+    create_typed_session(&store, &session, "fake").await;
+    let generation = store.worker_generation();
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection_with_client_kind(capabilities(), sink.clone(), client_kind, transport)
+        .expect("connection");
+
+    let response = attach_with_origin_response(
+        &connection,
+        &sink,
+        &format!("attach-{label}"),
+        &session,
+        1,
+        launch_origin_registration(
+            &format!("origin-{label}"),
+            &format!("open-{label}"),
+            generation,
+            0,
+            "~/refused",
+        ),
+    )
+    .await;
+    assert!(matches!(
+        response,
+        ResponseBody::Error { ref code, .. } if code == ERROR_CODE_CAPABILITY_DENIED
+    ));
+    assert!(
+        store
+            .latest_launch_origin(&session)
+            .await
+            .expect("origin lookup")
+            .is_none(),
+        "a refused {label} registration must not mutate current origin"
+    );
+    assert_eq!(
+        store.latest_seq(&session).await.expect("session head"),
+        1,
+        "a refused {label} registration must append no event"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+#[tokio::test]
+async fn headless_control_origin_registration_is_refused_without_mutation() {
+    assert_origin_registration_refused_without_mutation(
+        "headless",
+        ClientKind::Headless,
+        ConnectionTransport::LocalSameUid,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn manual_cli_control_origin_registration_is_refused_without_mutation() {
+    assert_origin_registration_refused_without_mutation(
+        "manual-cli",
+        ClientKind::Cli,
+        ConnectionTransport::LocalSameUid,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn remote_mobile_origin_registration_is_refused_without_mutation() {
+    assert_origin_registration_refused_without_mutation(
+        "remote-mobile",
+        ClientKind::Gui,
+        ConnectionTransport::Remote,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn remote_fleet_peer_origin_registration_is_refused_without_mutation() {
+    assert_origin_registration_refused_without_mutation(
+        "remote-fleet-peer",
+        ClientKind::Unknown,
+        ConnectionTransport::Remote,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn headless_legacy_attach_without_origin_remains_allowed() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session = SessionId::new("headless-legacy-attach");
+    create_typed_session(&store, &session, "fake").await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection_with_client_kind(
+            capabilities(),
+            sink.clone(),
+            ClientKind::Headless,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+
+    connection
+        .request(
+            RequestId::new("legacy-attach"),
+            RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: 1,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("legacy attach routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionAttach {
+                launch_origin: None,
+                ..
+            },
+            ..
+        }
+    ));
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// O2/O5 regression: retrying A after B replaced it acknowledges A's receipt,
+/// but the attach snapshot always reports durable CURRENT origin B.
+#[tokio::test]
+async fn replayed_superseded_origin_receipt_returns_current_attach_snapshot() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session = SessionId::new("origin-replay-current-snapshot");
+    create_typed_session(&store, &session, "fake").await;
+    let generation = store.worker_generation();
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection_with_client_kind(
+            capabilities(),
+            sink.clone(),
+            ClientKind::Tui,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+
+    let registration_a = launch_origin_registration("origin-a", "open-a", generation, 0, "~/one");
+    let first = attach_with_origin_response(
+        &connection,
+        &sink,
+        "attach-a",
+        &session,
+        1,
+        registration_a.clone(),
+    )
+    .await;
+    assert!(matches!(
+        first,
+        ResponseBody::SessionAttach {
+            launch_origin: Some(ref origin),
+            ..
+        } if origin.revision == 1 && origin.open_id == "open-a"
+    ));
+
+    let second = attach_with_origin_response(
+        &connection,
+        &sink,
+        "attach-b",
+        &session,
+        2,
+        launch_origin_registration("origin-b", "open-b", generation, 1, "~/two"),
+    )
+    .await;
+    assert!(matches!(
+        second,
+        ResponseBody::SessionAttach {
+            launch_origin: Some(ref origin),
+            ..
+        } if origin.revision == 2 && origin.open_id == "open-b"
+    ));
+
+    let replay = attach_with_origin_response(
+        &connection,
+        &sink,
+        "attach-a-replay",
+        &session,
+        3,
+        registration_a,
+    )
+    .await;
+    let ResponseBody::SessionAttach {
+        launch_origin: Some(snapshot),
+        ..
+    } = replay
+    else {
+        panic!("expected attach snapshot, got {replay:?}");
+    };
+    assert_eq!(snapshot.revision, 2);
+    assert_eq!(snapshot.open_id, "open-b");
+    assert_eq!(snapshot.path.display.as_deref(), Some("~/two"));
+
+    let durable = store
+        .latest_launch_origin(&session)
+        .await
+        .expect("current origin")
+        .expect("origin present");
+    assert_eq!(snapshot, durable);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
 }
 
 async fn upload_bytes(

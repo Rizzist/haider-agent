@@ -164,6 +164,40 @@ fn materialize_daily_root_creates_only_the_carveout() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn materialize_daily_root_rejects_symlinked_organizing_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    symlink(&outside, base.join("Haider")).unwrap();
+    let environment = environment_with_base(&base);
+    let config = WorkspaceConfig::default();
+    let WorkspaceSelection::Dated(plan) = resolve_workspace(&request(
+        WorkspaceInvocation::Interactive,
+        Some(temp.path()),
+        &environment,
+        &config,
+        temp.path(),
+    ))
+    .unwrap() else {
+        panic!("expected dated");
+    };
+
+    assert!(matches!(
+        materialize_daily_root(&plan),
+        Err(MaterializeError::UnsafeComponent(ref path)) if path == &base.join("Haider")
+    ));
+    assert!(
+        !outside.join("1448-03-30").exists(),
+        "materialisation must create nothing outside the selected base"
+    );
+}
+
 #[test]
 fn materialize_leaf_is_first_write_only_and_private() {
     let temp = tempfile::tempdir().unwrap();
@@ -755,6 +789,43 @@ fn base_precedence_env_config_profile_store() {
 }
 
 #[test]
+fn env_and_config_bases_reject_parent_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("store");
+    std::fs::create_dir(&store).unwrap();
+    let no_config = WorkspaceConfig::default();
+    let environment = WorkspaceEnvironment {
+        base: Some(format!("{}/safe/../escape", temp.path().display())),
+        ..WorkspaceEnvironment::default()
+    };
+    assert!(matches!(
+        resolve_workspace(&request(
+            WorkspaceInvocation::Interactive,
+            Some(temp.path()),
+            &environment,
+            &no_config,
+            &store,
+        )),
+        Err(WorkspaceError::InvalidBase(_))
+    ));
+
+    let config = WorkspaceConfig {
+        base: Some(temp.path().join("safe").join("..").join("escape")),
+        ..WorkspaceConfig::default()
+    };
+    assert!(matches!(
+        resolve_workspace(&request(
+            WorkspaceInvocation::Interactive,
+            Some(temp.path()),
+            &WorkspaceEnvironment::default(),
+            &config,
+            &store,
+        )),
+        Err(WorkspaceError::InvalidBase(_))
+    ));
+}
+
+#[test]
 fn relative_explicit_workspace_resolves_against_launch_cwd() {
     let temp = tempfile::tempdir().unwrap();
     let child = temp.path().join("child");
@@ -812,6 +883,7 @@ fn workspace_config_parses_and_rejects() {
     for invalid in [
         serde_json::json!({"workspace": {"mode": "sometimes"}}),
         serde_json::json!({"workspace": {"base": "relative"}}),
+        serde_json::json!({"workspace": {"base": "/safe/../escape"}}),
         serde_json::json!({"workspace": {"timezone": "utc"}}),
         serde_json::json!({"workspace": "auto"}),
     ] {

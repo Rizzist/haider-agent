@@ -92,12 +92,12 @@ pub fn sanitize_origin_path(
     };
 
     if let Some(home) = home
-        && let Ok(relative) = path.strip_prefix(home)
+        && let Some(relative) = relative_to_own_home(path, home)
     {
         let display = if relative.as_os_str().is_empty() {
             "~".to_string()
         } else {
-            format!("~/{}", escape_display(&path_to_display(relative)))
+            format!("~/{}", escape_display(&path_to_display(&relative)))
         };
         return bounded(OriginPathKind::HomeRelative, display);
     }
@@ -110,6 +110,21 @@ pub fn sanitize_origin_path(
         OriginPathKind::Absolute,
         escape_display(&path_to_display(path)),
     )
+}
+
+/// Returns the component-relative own-home suffix using the caller's lexical
+/// spelling first, then canonical identities. The latter covers a symlinked
+/// HOME whose captured cwd has already been canonicalized by the OS/client.
+fn relative_to_own_home(path: &Path, home: &Path) -> Option<std::path::PathBuf> {
+    if let Ok(relative) = path.strip_prefix(home) {
+        return Some(relative.to_path_buf());
+    }
+    let canonical_home = home.canonicalize().ok()?;
+    let canonical_path = path.canonicalize().ok()?;
+    canonical_path
+        .strip_prefix(canonical_home)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 fn bounded(
@@ -211,7 +226,7 @@ fn escape_display(text: &str) -> String {
         let code = character as u32;
         let is_bidi = matches!(
             code,
-            0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
+            0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
         );
         if character.is_control() || is_bidi || character == '\\' {
             use std::fmt::Write;

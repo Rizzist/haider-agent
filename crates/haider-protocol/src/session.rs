@@ -128,7 +128,7 @@ impl LaunchOriginPathV1 {
                 character.is_control()
                     || matches!(
                         character as u32,
-                        0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
+                        0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
                     )
             }) {
                 return Err("origin display contains unescaped control text".to_string());

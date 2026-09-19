@@ -22,8 +22,9 @@ use haider_protocol::state::RunState;
 use haider_protocol::tool::ToolResultStatus;
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_rpc::{
-    AttachMode, Capability, CapabilitySet, CommandId, ModelDetailWire, ProviderAvailabilityWire,
-    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SnapshotAvailabilityWire, WireFrame,
+    AttachMode, Capability, CapabilitySet, ClientKind, CommandId, ModelDetailWire,
+    ProviderAvailabilityWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
+    SnapshotAvailabilityWire, WireFrame,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,9 +105,10 @@ impl DaemonMobileChatBridge {
         });
         let connection = self
             .hub
-            .open_connection(
+            .open_connection_with_client_kind(
                 CapabilitySet::from([Capability::View, Capability::Control]),
                 sink.clone(),
+                ClientKind::Gui,
                 crate::accounts::ConnectionTransport::Remote,
             )
             .map_err(MobileChatError::daemon)?;

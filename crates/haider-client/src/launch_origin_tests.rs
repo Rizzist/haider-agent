@@ -45,6 +45,32 @@ fn sibling_user_prefix_is_not_own_home() {
         sanitize_origin_path(Some(Path::new("/Users/alice2/notes")), Some(own_home())).unwrap();
     assert_eq!(sanitized.kind, OriginPathKind::Redacted);
     assert_eq!(sanitized.display.as_deref(), Some("/Users/<user>/notes"));
+
+    let homoglyph = sanitize_origin_path(
+        Some(Path::new("/Users/\u{430}lice/notes")),
+        Some(own_home()),
+    )
+    .unwrap();
+    assert_eq!(homoglyph.kind, OriginPathKind::Redacted);
+    assert_eq!(homoglyph.display.as_deref(), Some("/Users/<user>/notes"));
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_path_beneath_symlinked_own_home_stays_home_relative() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_home = temp.path().join("real-home");
+    let real_project = real_home.join("projects").join("haider");
+    std::fs::create_dir_all(&real_project).unwrap();
+    let linked_home = temp.path().join("linked-home");
+    symlink(&real_home, &linked_home).unwrap();
+    let captured = real_project.canonicalize().unwrap();
+
+    let sanitized = sanitize_origin_path(Some(&captured), Some(&linked_home)).unwrap();
+    assert_eq!(sanitized.kind, OriginPathKind::HomeRelative);
+    assert_eq!(sanitized.display.as_deref(), Some("~/projects/haider"));
 }
 
 #[test]
@@ -70,13 +96,15 @@ fn non_home_absolute_paths_stay_absolute() {
 
 #[test]
 fn control_and_bidi_characters_are_escaped() {
-    let tricky = "/opt/a\u{202e}b\nc\u{1b}[31m";
+    let tricky = "/opt/a\u{061c}b\u{202e}c\nd\u{1b}[31m";
     let sanitized = sanitize_origin_path(Some(Path::new(tricky)), Some(own_home())).unwrap();
     let display = sanitized.display.unwrap();
     assert!(!display.contains('\u{202e}'), "bidi control leaked");
+    assert!(!display.contains('\u{061c}'), "Arabic Letter Mark leaked");
     assert!(!display.contains('\n'), "newline leaked");
     assert!(!display.contains('\u{1b}'), "escape leaked");
     assert!(display.contains("\\u{202e}"));
+    assert!(display.contains("\\u{061c}"));
     assert!(display.contains("\\u{001b}"));
 }
 
