@@ -23,7 +23,9 @@ use haider_protocol::pipe::TranscriptProjector;
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
 use haider_protocol::state::RunState;
-use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState};
+use haider_protocol::task::{
+    TASK_OUTPUT_RETAIN_BYTES, TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState,
+};
 use haider_protocol::tool::{AttachmentBlock, BoundedResult};
 use haider_provider::{Message, MessageRole, UserCommandRecord};
 use serde::{Deserialize, Serialize};
@@ -4615,6 +4617,61 @@ pub fn task_event_notice(event: &TaskEventPayload) -> String {
                 TaskTerminalState::Failed { reason } => format!("failed: {reason}"),
                 TaskTerminalState::Killed => "was killed".into(),
             };
+            // A fact journaled with a digest renders it: the event arrives
+            // with outcome + the single-consumer reduced view + byte counts
+            // + the paging handle (972 cross-report finding #1). Legacy
+            // digest-less facts keep their historical tail rendering
+            // byte-identically for replay.
+            if let Some(digest) = completed.output_digest.as_deref() {
+                let digest = haider_tools::elide_text_head_tail(
+                    digest,
+                    TASK_TAIL_BYTES,
+                    "background_task_digest_byte_cap",
+                )
+                .map_or_else(|| digest.to_owned(), |elided| elided.text);
+                let availability = if completed.full_output_unavailable {
+                    " (full output unavailable; bounded digest retained below)"
+                } else {
+                    ""
+                };
+                let digest_section = if digest.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\noutput digest:\n{digest}")
+                };
+                // The paging pointer is earned only by an incomplete display
+                // with durable backing (row-63 policy). The retained byte
+                // count is exact: a truncated capture filled the retention
+                // cap; an untruncated one retained every output byte.
+                let paging = if completed.output_digest_complete || completed.artifact.is_none() {
+                    String::new()
+                } else {
+                    let captured = if completed.truncated {
+                        u64::try_from(TASK_OUTPUT_RETAIN_BYTES).unwrap_or(u64::MAX)
+                    } else {
+                        completed.output_bytes
+                    };
+                    format!(
+                        "\n{}",
+                        haider_tools::task_paging_hint(
+                            completed.task.as_str(),
+                            captured,
+                            completed.output_bytes.saturating_sub(captured),
+                        )
+                    )
+                };
+                return format!(
+                    "[background task finished] {} ({}) {} after {}s — {} output bytes{}{}{}",
+                    completed.name,
+                    completed.task,
+                    disposition,
+                    completed.elapsed_ms / 1000,
+                    completed.output_bytes,
+                    availability,
+                    digest_section,
+                    paging,
+                );
+            }
             let availability = if completed.full_output_unavailable {
                 " (full output unavailable; bounded tail retained below)"
             } else if completed.truncated {

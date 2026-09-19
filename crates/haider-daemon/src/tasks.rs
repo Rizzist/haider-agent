@@ -588,6 +588,9 @@ impl TaskFacade {
                 output_bytes: 0,
                 output_sha256: None,
                 tail: String::new(),
+                // An orphaned start has no observed output to digest.
+                output_digest: None,
+                output_digest_complete: false,
                 artifact: None,
                 truncated: false,
                 full_output_unavailable: false,
@@ -875,6 +878,18 @@ impl TaskFacade {
                 buffer.retained().to_vec(),
             )
         };
+        // The completion event ARRIVES with its digest: the SAME reduced
+        // inline view a foreground process_exec result would show for the
+        // secret-redacted retained bytes (single reduction path), so the
+        // model can decide without a wake-up read. A digest displays the
+        // complete output only when nothing was dropped beyond the
+        // retention cap either.
+        let failed = !matches!(state, TaskTerminalState::Completed { .. });
+        let (output_digest, output_digest_complete) =
+            haider_tools::task_completion_digest(&retained, failed)
+                .map_or((None, false), |(digest, complete)| {
+                    (Some(digest), complete && !truncated)
+                });
         let (artifact, full_output_unavailable) = if retained.is_empty() {
             (None, false)
         } else {
@@ -895,6 +910,8 @@ impl TaskFacade {
             output_bytes,
             output_sha256: Some(output_sha256),
             tail,
+            output_digest,
+            output_digest_complete,
             artifact,
             truncated,
             full_output_unavailable,
@@ -1002,13 +1019,17 @@ impl TaskFacade {
         let state = task_state_value(&entry.state);
         let (preview, result_cursor, truncated, provenance) = match cursor {
             None => {
-                let (output_bytes, truncated, tail, output_sha256) =
+                // A terminal status read carries the completion digest, so
+                // "where a result exists" the status ARRIVES with it (972
+                // cross-report finding #1); a running task has no digest yet.
+                let (output_bytes, truncated, tail, output_sha256, digest) =
                     if let Some(fact) = terminal_fact.as_ref() {
                         (
                             fact.output_bytes,
                             fact.truncated,
                             fact.tail.clone(),
                             fact.output_sha256.clone(),
+                            fact.output_digest.clone(),
                         )
                     } else {
                         let Some(output) = entry.output.as_ref() else {
@@ -1020,6 +1041,7 @@ impl TaskFacade {
                             buffer.truncated(),
                             buffer.tail_lossy(),
                             Some(buffer.output_sha256()),
+                            None,
                         )
                     };
                 (
@@ -1030,6 +1052,7 @@ impl TaskFacade {
                         "output_bytes": output_bytes,
                         "truncated": truncated,
                         "tail": tail,
+                        "digest": digest,
                     }),
                     None,
                     truncated,

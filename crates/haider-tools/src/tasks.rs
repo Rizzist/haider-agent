@@ -368,6 +368,31 @@ impl EffectBroker {
     }
 }
 
+/// Deterministic completion digest for one background task: the SAME
+/// reduced inline view a foreground `process_exec` result would show for
+/// these secret-redacted retained bytes ([`crate::reduce_tool_output`] is
+/// the single reduction path — no second reducer), then byte-capped to the
+/// notice tail budget with the shared head/tail elision. The boolean reports
+/// whether the digest displays the complete retained output; only an
+/// incomplete display earns a paging pointer (row-63 policy). Reapplying to
+/// the same bytes always produces byte-identical output.
+#[must_use]
+pub fn task_completion_digest(retained: &[u8], failed: bool) -> Option<(String, bool)> {
+    if retained.is_empty() {
+        return None;
+    }
+    let output = String::from_utf8_lossy(retained).into_owned();
+    let reduced = crate::reduce_tool_output("process_exec", &output, failed);
+    let digest = haider_protocol::context::elide_text_head_tail(
+        &reduced.text,
+        haider_protocol::task::TASK_TAIL_BYTES,
+        "background_task_digest_byte_cap",
+    )
+    .map_or(reduced.text, |elided| elided.text);
+    let complete = digest == output;
+    Some((digest, complete))
+}
+
 /// Bounded combined stdout+stderr for one background task: a retained head
 /// (cap [`haider_protocol::task::TASK_OUTPUT_RETAIN_BYTES`]) for cursor
 /// reads and the completion artifact, a rolling tail preview, and a total

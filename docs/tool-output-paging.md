@@ -70,6 +70,16 @@ unfinished lines so prompts without newlines remain visible. A running
 snapshot can change as those lines grow; stable full paging is available after
 completion.
 
+A background-task completion event arrives with a digest: the outcome, the
+byte count, and the same reduced inline view a foreground result would show
+for the secret-redacted retained bytes (the single shared reducer, then a
+4 KiB head/tail cap marked as `background_task_digest_byte_cap`). When the
+digest is a reduced view, the notice appends the deterministic
+`task_output(task_id="task-…", cursor=0)` pointer; a completely displayed
+output carries no pointer. Terminal `task_output` status reads return the
+same digest. Historical completion facts without a digest keep their
+tail-only replay format.
+
 Raw captures remain in the existing owner-authorized CAS. They are not used
 as model pages. Complete lines are redacted before live command output enters
 the journal, including credentials split across OS read chunks. Terminal control

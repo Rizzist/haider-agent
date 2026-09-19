@@ -207,6 +207,8 @@ fn durable_staging_keeps_running_tasks_killable() {
         output_bytes: 6,
         output_sha256: None,
         tail: "abcdef".into(),
+        output_digest: None,
+        output_digest_complete: false,
         artifact: Some(haider_protocol::ids::ArtifactRef::new("blake3:buffer-test")),
         full_output_unavailable: false,
         truncated: false,
@@ -344,7 +346,25 @@ async fn toolshape_task_output_original_hash_survives_completion_eviction_and_ad
             .as_object_mut()
             .expect("terminal object")
             .remove("state");
-        assert_eq!(before, after, "only lifecycle state changes at completion");
+        // 972-ax-digest: completion also DELIVERS the digest on the
+        // no-cursor status read (null while running, the reduced view once
+        // terminal); cursor pages carry no digest in either state.
+        let live_digest = before
+            .as_object_mut()
+            .expect("live object")
+            .remove("digest");
+        let terminal_digest = after
+            .as_object_mut()
+            .expect("terminal object")
+            .remove("digest");
+        match (&live_digest, &terminal_digest) {
+            (Some(serde_json::Value::Null), Some(serde_json::Value::String(_))) | (None, None) => {}
+            transition => panic!("the digest arrives exactly at completion: {transition:?}"),
+        }
+        assert_eq!(
+            before, after,
+            "only lifecycle state and the arriving digest change at completion"
+        );
         terminal.push(result);
     }
     registry.remove_session(&session);

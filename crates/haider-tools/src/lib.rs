@@ -121,7 +121,7 @@ pub use process::{
     PROCESS_MAX_OUTPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, PreparedMonitorProcess, ProcessBounds,
     ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,
     ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
-    ProcessSignal, capture_paging_hint, monitor_process_command,
+    ProcessSignal, capture_paging_hint, monitor_process_command, task_paging_hint,
 };
 pub use redact::{redact_lockdown_text, redact_output_text};
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
@@ -137,7 +137,7 @@ pub use tasks::{
     EvidencePidLiveness, MAX_TASK_NAME_CHARS, OrphanReap, PidLiveness, SharedTaskOutput,
     TaskKillHandle, TaskOutputBuffer, default_task_name, lock_task_output, probe_group_liveness,
     probe_group_liveness_evidence, reap_orphan_group, shared_task_output, supervise_background,
-    task_kill_channel, task_kill_manifest, task_output_manifest,
+    task_completion_digest, task_kill_channel, task_kill_manifest, task_output_manifest,
 };
 pub use todo_write::{MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TodoWrite, todo_write_manifest};
 pub use webfetch::{

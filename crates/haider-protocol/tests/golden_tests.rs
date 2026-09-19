@@ -815,6 +815,8 @@ fn golden_additive_task_facts_and_unknown_kind_tolerance() {
         output_bytes: 700_000,
         output_sha256: None,
         tail: "test result: ok\n".into(),
+        output_digest: None,
+        output_digest_complete: false,
         artifact: Some(ArtifactRef::new(
             "blake3:9c1185a5c5e9fc54612808977ee8f548b2258d31",
         )),

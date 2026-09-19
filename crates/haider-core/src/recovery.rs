@@ -981,6 +981,8 @@ mod reducer_filter_tests {
             output_bytes: 0,
             output_sha256: None,
             tail: String::new(),
+            output_digest: None,
+            output_digest_complete: false,
             artifact: None,
             full_output_unavailable: false,
             truncated: false,
