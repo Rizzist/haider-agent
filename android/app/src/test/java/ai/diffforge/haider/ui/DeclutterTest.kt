@@ -2,6 +2,7 @@ package ai.diffforge.haider.ui
 
 import ai.diffforge.haider.MainActivity
 import ai.diffforge.haider.ui.scaffold.SESSION_VIEW_HEADER_TAG
+import ai.diffforge.haider.ui.chat.SHELL_INPUT_TAG
 import ai.diffforge.haider.ui.chat.SHELL_VIEW_TAG
 import ai.diffforge.haider.ui.daemon.FakeScenario
 import ai.diffforge.haider.ui.daemon.ShellAvailability
@@ -133,7 +134,9 @@ class DeclutterTest {
         service.setShell(ShellAvailability(available = true))
         viewModel.selectViewTab(SessionViewTab.Shell)
         rule.waitForIdle()
-        rule.onNodeWithText("Shell is ready.").assertIsDisplayed()
+        // The real terminal, not a readiness label: a command line to type
+        // into (lane 972-android-shell).
+        rule.onNodeWithTag(SHELL_INPUT_TAG).assertIsDisplayed()
         assertEquals(0, rule.onAllNodesWithTextSafe("No shell on this device"))
     }
 

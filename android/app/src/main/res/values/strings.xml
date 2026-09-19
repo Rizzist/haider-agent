@@ -156,9 +156,23 @@
     <!-- Composer -->
     <string name="tab_chat">Chat</string>
     <string name="tab_shell">Shell</string>
-    <string name="shell_ready">Shell is ready.</string>
     <string name="shell_unavailable_title">No shell on this device</string>
     <string name="shell_unavailable_body">Haider runs its tools in-app, and the on-device policy does not allow it to start processes. Use a computer for a shell until this ships.</string>
+    <string name="shell_empty">No commands yet.</string>
+    <string name="shell_placeholder">Run a command…</string>
+    <string name="cd_shell_input">Command line</string>
+    <string name="cd_shell_run">Run this command</string>
+    <string name="cd_shell_stop">Stop this command</string>
+    <string name="shell_status_running">running</string>
+    <string name="shell_status_reconnecting">Reconnecting — replaying output…</string>
+    <string name="shell_status_cancelled">cancelled</string>
+    <string name="shell_status_exit">exit %1$s</string>
+    <string name="shell_status_error">error — %1$s</string>
+    <string name="shell_output_truncated">Output truncated — showing the first 256 KiB.</string>
+    <string name="shell_uncertain_notice">The daemon may not have received this command.</string>
+    <string name="shell_retry">Retry</string>
+    <string name="shell_discard">Discard</string>
+    <string name="cd_dismiss_shell_notice">Dismiss shell notice</string>
     <string name="picker_provider_title">Provider</string>
     <string name="picker_model_title">Model</string>
     <string name="picker_effort_title">Effort</string>

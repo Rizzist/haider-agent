@@ -126,7 +126,19 @@ class FakeDaemonService(
     private val _shellExecutions = MutableStateFlow<Map<String, List<ShellExecution>>>(emptyMap())
     override val shellExecutions = _shellExecutions.asStateFlow()
     override suspend fun refreshShell() = Unit
+    /**
+     * Set to make the next [startShell] throw before anything is recorded —
+     * what a lost RPC response looks like from the UI: whether the daemon
+     * accepted is unknown, and only an explicit retry with the SAME submission
+     * id may resubmit (FACADE-SHELL.md).
+     */
+    var nextShellFailure: Exception? = null
+
     override suspend fun startShell(sessionId: String, submissionId: String, command: String, cwd: String?): ShellExecutionRef {
+        nextShellFailure?.let { failure ->
+            nextShellFailure = null
+            throw failure
+        }
         val existing = _shellExecutions.value.values.flatten().firstOrNull { it.ref.commandId == submissionId }
         if (existing != null) {
             require(existing.ref.sessionId == sessionId && existing.command == command)
@@ -138,12 +150,14 @@ class FakeDaemonService(
         val session = _sessions.value.firstOrNull { it.id == sessionId } ?: error("session_unavailable")
         val history = _shellExecutions.value[sessionId].orEmpty()
         check(history.none { it.status == ShellExecutionStatus.Running }) { "session_busy" }
+        calls += "shell.exec:$sessionId:$submissionId"
         val ref = ShellExecutionRef(sessionId, submissionId, "shell-run-$submissionId", "shell-item-$submissionId",
             session.workerGeneration ?: 1)
         _shellExecutions.value = _shellExecutions.value + (sessionId to (history + ShellExecution(ref, command, ShellExecutionStatus.Running)).takeLast(64))
         return ref
     }
     override suspend fun cancelShell(execution: ShellExecutionRef) {
+        calls += "shell.cancel:${execution.commandId}"
         setShellResult(execution, ShellExecutionStatus.Cancelled)
     }
     /** Deterministic UI fixture controls: no actual shell or auto-generated success. */
@@ -154,6 +168,10 @@ class FakeDaemonService(
     }
     fun setShellResult(execution: ShellExecutionRef, status: ShellExecutionStatus, exitCode: Int? = null, error: String? = null) {
         updateShell(execution) { it.copy(status = status, exitCode = exitCode, error = error) }
+    }
+    /** Marks the 256 KiB per-command UI projection bound reached (FACADE-SHELL.md). */
+    fun setShellTruncated(execution: ShellExecutionRef, truncated: Boolean = true) {
+        updateShell(execution) { it.copy(outputTruncated = truncated) }
     }
     private fun updateShell(execution: ShellExecutionRef, update: (ShellExecution) -> ShellExecution) {
         val history = _shellExecutions.value[execution.sessionId].orEmpty()
