@@ -2,8 +2,9 @@
 
 use haider_protocol::context::ContextSavingsMeasurement;
 use haider_tools::{
-    OutputAdapter, REDUCED_TOOL_OUTPUT_MAX_BYTES, elide_text_head_tail, estimated_text_tokens,
-    provider_request_text_projection_bytes, reduce_tool_output,
+    OutputAdapter, PROCESS_INLINE_RETENTION_BYTES, REDUCED_TOOL_OUTPUT_MAX_BYTES,
+    elide_text_head_tail, estimated_text_tokens, provider_request_text_projection_bytes,
+    reduce_tool_output,
 };
 
 fn marker(text: &str) -> serde_json::Value {
@@ -231,6 +232,49 @@ fn fixture_token_estimates_cover_listing_grep_cargo_and_three_kib_read() {
     let reduced = reduce_tool_output("process_exec", &unique, false);
     assert!(reduced.text.len() <= REDUCED_TOOL_OUTPUT_MAX_BYTES);
     assert!(reduced.text.contains("\"haider_elision_v1\""));
+}
+
+/// AX-1 F3 REGRESSION: a passing test log in a summary format the Test
+/// reducer does not recognize (for example Python `unittest -v`) selects
+/// nothing, which used to elide the whole output (retained head/tail of zero)
+/// and force a paging round-trip even for sub-KiB results. The inline
+/// retention floor keeps small output whole and larger output as a bounded,
+/// deterministic head/tail window.
+#[test]
+fn empty_semantic_selection_keeps_a_bounded_inline_window() {
+    let passing = |cases: usize| {
+        format!(
+            "{}Ran {cases} tests in 0.004s\n\nOK\n",
+            (0..cases)
+                .map(|index| format!("test_case_{index:03} (suite.OrderingTests) ... ok\n"))
+                .collect::<String>()
+        )
+    };
+
+    let small = passing(12);
+    assert!(small.len() <= PROCESS_INLINE_RETENTION_BYTES);
+    let reduced = reduce_tool_output("process_exec", &small, false);
+    assert_eq!(reduced.adapter, OutputAdapter::Test);
+    assert_eq!(
+        reduced.text, small,
+        "sub-window passing output stays whole inline"
+    );
+    assert!(reduced.savings.is_none());
+
+    let large = passing(400);
+    assert!(large.len() > PROCESS_INLINE_RETENTION_BYTES);
+    let first = reduce_tool_output("process_exec", &large, false);
+    let second = reduce_tool_output("process_exec", &large, false);
+    assert_eq!(first.text, second.text, "window must be deterministic");
+    assert!(first.text.len() <= PROCESS_INLINE_RETENTION_BYTES);
+    assert!(first.text.starts_with("test_case_000"));
+    assert!(first.text.ends_with("OK\n"), "tail keeps the verdict");
+    let payload = marker(&first.text);
+    let elision = &payload["haider_elision_v1"];
+    assert_eq!(elision["scope"], "process_output_retention_window:test");
+    assert_eq!(elision["omitted_bytes_exact"], true);
+    assert!(elision["retained_head_bytes"].as_u64().expect("head") > 0);
+    assert!(elision["retained_tail_bytes"].as_u64().expect("tail") > 0);
 }
 
 #[test]

@@ -41,13 +41,24 @@ can therefore be retrieved in 16 pages, using at most half the default
 32-request soft tranche. Neither the 64-request turn ceiling nor the process
 execution limit is increased.
 
-A process result supplies a `capture:…` handle. Call
-`task_output(task_id="capture:…", cursor=0)` and follow `next_cursor` until
-`exhausted` is true. Cursors count bytes in the stable secret-redacted UTF-8
+A completely displayed process result carries no paging pointer: the inline
+output already is the whole secret-redacted capture, and provider-facing
+content stays byte-identical across identical conversations. An adapter
+reduction that would select nothing keeps a bounded inline head/tail window
+(2 KiB) instead of eliding everything, so small results never force paging.
+
+When the inline view is reduced, the model-facing result appends a
+deterministic conversation-local alias, `cap:<call_id>`; the durable result
+envelope also names the session-scoped `capture:<effect>` handle in its
+`capture` field for surfaces. Call `task_output(task_id="cap:…", cursor=0)`
+(or the `capture:…` form) and follow `next_cursor` until `exhausted` is true.
+A reused call id re-points its alias at the most recent capture; effect
+handles stay unique. Cursors count bytes in the stable secret-redacted UTF-8
 capture. Invalid UTF-8 boundaries are rejected. Handles are scoped to the
 session, with durable lookup through the recorded process signal and tool
 result after restart. A process terminated by an output or time bound can
-have uncaptured output; the execution result discloses that limit separately.
+have uncaptured output; the execution result and its paging hint disclose
+that limit separately.
 `exhausted` means the retained capture has been read. Cursor pages from
 `task_output` reach the model intact even when the source stream was truncated;
 the cursor never advances past content removed by a second preview reducer.

@@ -4428,10 +4428,18 @@ fn render_journal_with_facts(
                         recorded_savings.is_none_or(|savings| savings.omitted_bytes_exact);
                     let mut output =
                         output.finish(failed, source_omitted_bytes_at_least, source_complete);
-                    if let Some(effect) = facts.process_captures.get(&(run_id.clone(), call_id.clone())) {
+                    // A completely displayed capture earns no paging pointer,
+                    // and an incomplete one points at the deterministic
+                    // conversation-local `cap:<call_id>` alias — the volatile
+                    // effect handle must not enter provider content (row 63).
+                    if facts
+                        .process_captures
+                        .contains_key(&(run_id.clone(), call_id.clone()))
+                        && (output.output_truncated || source_omitted_bytes_at_least > 0)
+                    {
                         output.output_preview.push('\n');
-                        output.output_preview.push_str(&haider_tools::foreground_capture_hint(
-                            effect,
+                        output.output_preview.push_str(&haider_tools::capture_paging_hint(
+                            &call_id,
                             output.output_bytes,
                             source_omitted_bytes_at_least,
                         ));

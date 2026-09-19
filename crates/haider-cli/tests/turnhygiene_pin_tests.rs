@@ -822,9 +822,19 @@ fn run_jsonl_tool_turn_matches_the_normalized_golden() {
     .expect("preview JSON");
     assert_eq!(preview["exit_code"], 3);
     let preview_output = preview["output"].as_str().expect("preview output");
+    // ROW-63: a completely displayed capture carries no paging pointer, so
+    // provider-facing output holds no volatile capture identity. The
+    // session-scoped handle stays visible in the durable `capture` field.
+    assert_eq!(
+        preview_output, "golden",
+        "complete output must reach the model bare"
+    );
     assert!(
-        preview_output.starts_with("golden\n[Capture: 6 bytes retained; at least 0 source bytes unavailable. Page the full secret-redacted capture with task_output("),
-        "capture handle preview must remain visible: {preview_output:?}"
+        preview["capture"]
+            .as_str()
+            .is_some_and(|handle| handle.starts_with("capture:")),
+        "durable capture handle must remain visible: {:?}",
+        preview["capture"]
     );
     assert_eq!(preview["output_bytes"], 6);
     assert_eq!(preview["status"], "failed");

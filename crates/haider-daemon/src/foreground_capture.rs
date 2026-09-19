@@ -37,11 +37,18 @@ impl TaskFacade {
                 haider_tools::redact_process_output(&result.inline_output)?,
             )
         };
-        self.hub.task_registry().retain_capture(
+        let registry = self.hub.task_registry();
+        registry.retain_capture(
             session,
             format!("capture:{}", result.effect),
             artifact.clone(),
         );
+        // Conversation-local alias: deterministic across sessions (the caller
+        // chose the call id), so the provider-facing paging pointer can name
+        // it without leaking volatile effect identity. A repeated call id
+        // re-points its alias at the most recent capture; the effect handle
+        // above stays unique.
+        registry.retain_capture(session, format!("cap:{}", result.call_id), artifact.clone());
         result.artifact = Some(artifact);
         Ok(safe)
     }
@@ -72,11 +79,21 @@ impl TaskFacade {
         session: &SessionId,
         handle: &str,
     ) -> ToolResult<haider_protocol::ids::ArtifactRef> {
+        // `capture:<effect>` names exactly one execution; `cap:<call_id>` is
+        // the conversation-local alias, which a repeated call id re-points at
+        // the most recent matching capture, mirroring in-memory registration.
+        let alias_call = handle.strip_prefix("cap:");
         let effect = handle.strip_prefix("capture:").unwrap_or_default();
+        let matches_handle = |record: &haider_protocol::graph::ProcessSignalRecorded| {
+            alias_call.map_or(record.effect_id.as_str() == effect, |call| {
+                record.call_id == call
+            })
+        };
         let mut cursor = 0;
         let mut signal = None;
+        let mut latest = None;
         let mut user_commands = std::collections::HashSet::new();
-        loop {
+        'scan: loop {
             let page = self
                 .hub
                 .read_internal_session(session, cursor, 256)
@@ -102,21 +119,18 @@ impl TaskFacade {
                         }
                     }
                     haider_protocol::EventPayload::ProcessSignalRecorded(record)
-                        if record.effect_id.as_str() == effect =>
+                        if matches_handle(&record) =>
                     {
                         // Direct commands have no ToolResult. Their daemon-minted
                         // origin and terminal process signal own the same capture.
                         if user_commands.contains(&(record.run_id.clone(), record.call_id.clone()))
                             && let Some(artifact) = record.artifact
                         {
-                            self.hub.task_registry().retain_capture(
-                                session,
-                                handle.to_owned(),
-                                artifact.clone(),
-                            );
-                            return Ok(artifact);
+                            latest = Some(artifact);
+                            signal = None;
+                        } else {
+                            signal = Some((record.run_id, record.call_id));
                         }
-                        signal = Some((record.run_id, record.call_id));
                     }
                     haider_protocol::EventPayload::ToolResult { call_id, result }
                         if signal.as_ref().is_some_and(|(run, call)| {
@@ -124,17 +138,24 @@ impl TaskFacade {
                         }) =>
                     {
                         if let Some(artifact) = result.artifact {
-                            self.hub.task_registry().retain_capture(
-                                session,
-                                handle.to_owned(),
-                                artifact.clone(),
-                            );
-                            return Ok(artifact);
+                            latest = Some(artifact);
+                            signal = None;
                         }
                     }
                     _ => {}
                 }
+                // An effect handle has one owner; only an alias keeps scanning
+                // for a more recent capture under the same call id.
+                if alias_call.is_none() && latest.is_some() {
+                    break 'scan;
+                }
             }
+        }
+        if let Some(artifact) = latest {
+            self.hub
+                .task_registry()
+                .retain_capture(session, handle.to_owned(), artifact.clone());
+            return Ok(artifact);
         }
         Err(ToolError::invalid_argument(
             "unknown capture in this session",

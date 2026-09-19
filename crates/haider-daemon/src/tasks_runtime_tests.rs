@@ -1777,8 +1777,9 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     use base64::Engine as _;
     let profile = tempfile::tempdir().expect("profile");
     let (_workspace, cwd) = workspace();
+    let api_key = "api_key=sk-abcdefghijklmnopQRSTUV";
     let original = format!(
-        "{}\napi=sk-abcdefghijklmnopQRSTUV\n-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\nlast line\n",
+        "{}\n{api_key}\n-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\nlast line\n",
         (0..6000)
             .map(|i| format!("line {i}: orchestration evidence\n"))
             .collect::<String>()
@@ -1827,18 +1828,21 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     assert_repair_secrets_absent(&result.to_string());
     assert_repair_carriers_present(result["output"].as_str().expect("preview"));
     let handle = format!("capture:{}", result["effect_id"].as_str().expect("effect"));
+    let preview_output = result["output"].as_str().expect("output");
+    assert!(preview_output.contains("task_output("));
+    assert!(preview_output.contains("omitted_bytes"));
+    // ROW-63: the provider-facing paging pointer names the deterministic
+    // conversation-local alias; the volatile effect handle stays only in the
+    // durable envelope's `capture` field.
     assert!(
-        result["output"]
-            .as_str()
-            .expect("output")
-            .contains("task_output(")
+        preview_output.contains("cap:capture-call"),
+        "{preview_output:?}"
     );
     assert!(
-        result["output"]
-            .as_str()
-            .expect("output")
-            .contains("omitted_bytes")
+        !preview_output.contains("capture:effect"),
+        "{preview_output:?}"
     );
+    assert_eq!(result["capture"].as_str(), Some(handle.as_str()));
     let mut cursor = 0;
     let mut full = String::new();
     let mut pages = 0;
@@ -1862,16 +1866,54 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     }
     assert!(pages >= 3);
     assert_eq!(full, haider_tools::redact_output_text(&original));
+    assert!(full.contains("api_key=[REDACTED:api_key]"));
+    assert_ne!(
+        original.len(),
+        full.len(),
+        "fixture must prove byte accounting across a length-changing redaction"
+    );
+    let footer_suffix = "-byte secret-redacted capture is retained";
+    let footer_end = preview_output
+        .find(footer_suffix)
+        .expect("capture-size footer");
+    let advertised_bytes = preview_output[..footer_end]
+        .rsplit_once("the ")
+        .expect("capture-size prefix")
+        .1
+        .parse::<usize>()
+        .expect("numeric capture size");
+    assert_eq!(
+        advertised_bytes,
+        full.len(),
+        "footer byte count must equal the redacted bytes paged to exhaustion"
+    );
     assert!(!full.contains("sk-"));
     assert!(!full.contains("AA=="));
     assert_repair_secrets_absent(&full);
     assert_repair_carriers_present(&full);
+    // The deterministic `cap:<call_id>` alias pages the same capture bytes.
+    let alias_page = dispatch(
+        &dispatcher,
+        &run,
+        "capture-alias-page",
+        "task_output",
+        serde_json::json!({"task_id": "cap:capture-call", "cursor": 0}),
+    )
+    .await;
+    assert_eq!(alias_page["task_id"], "cap:capture-call");
+    assert!(full.starts_with(alias_page["chunk"].as_str().expect("alias chunk")));
     let facade = TaskFacade::new(hub.clone());
     let restored = facade
         .restore_foreground_capture(&session, &handle)
         .await
         .expect("journal capture lookup");
     assert_eq!(Some(restored.as_str()), result["artifact"].as_str());
+    // The alias also survives restart through the journal scan.
+    let restored_alias = facade
+        .restore_foreground_capture(&session, "cap:capture-call")
+        .await
+        .expect("journal alias lookup");
+    assert_eq!(restored_alias, restored);
     eprintln!(
         "foreground capture: raw_bytes={} redacted_bytes={} pages={pages}; preview and journal secrets absent; durable lookup succeeded",
         original.len(),
@@ -1883,6 +1925,13 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
             .foreground_capture_page(&foreign, &handle, Some(0))
             .await
             .is_err()
+    );
+    assert!(
+        TaskFacade::new(hub.clone())
+            .foreground_capture_page(&foreign, "cap:capture-call", Some(0))
+            .await
+            .is_err(),
+        "alias must stay session-scoped"
     );
     for envelope in read_all(&store, &session).await {
         assert_repair_secrets_absent(&serde_json::to_string(&envelope).expect("journal"));
