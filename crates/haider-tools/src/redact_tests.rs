@@ -359,6 +359,162 @@ fn named_public_carriers_survive_standard_output_but_secret_context_wins() {
     ));
 }
 
+/// 972 identifier false-positive corpus (AX-1 experience report, finding F2):
+/// released 0.0.971 replaced ordinary `unittest -v` identifiers with
+/// `[REDACTED:high_entropy]` in both process output and `fs_read`. Valid
+/// code-identifier shapes survive standard redaction; random tokens,
+/// credential contexts, and the lockdown classifier are unchanged.
+#[test]
+fn identifier_false_positive_corpus_survives_standard_redaction() {
+    let paths = super::ExplicitReadPaths::new(Path::new("testrun.txt"));
+    let mut failures = Vec::new();
+    for value in [
+        // The exact identifier shapes finding F2 observed inside 0.0.971.
+        "test_unreadable_file_exit_code",
+        "test_tie_break_alphabetical",
+        "test_wordfreq.OrderingTests",
+        "test_unreadable_file_exit_code (test_wordfreq.OrderingTests) ... ok",
+        "test_wordfreq.OrderingTests.test_tie_break_alphabetical",
+        // Broader identifier families at candidate length.
+        "test_unreadable_file_exit_code_path",
+        "haider_tools::redact::redact_output_text",
+        "HAIDER_MAX_PROCESS_OUTPUT_BYTES",
+        "lane-972-redaction-precision",
+        "assertRaisesRegexMessageMatches",
+        "com.example.wordfreq.CliSmokeTests",
+        "process_exec_output_redaction_v2",
+        "normalize_URLs_and_paths_helper",
+    ] {
+        for (mode, output) in [
+            ("standard", super::redact_output_text(value)),
+            ("fs_read", redact_private_key_lines(value).text),
+            (
+                "explicit",
+                paths.redact(Path::new("testrun.txt"), value).text,
+            ),
+        ] {
+            if output != value {
+                failures.push(format!("{mode}: {value:?} -> {output:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    // Identifier shape never exempts random tokens: interleaved case/digit
+    // runs, single-word noise, and encoded credentials all still redact.
+    for value in [
+        "aB3d_E5fG7_hI9jK1mN3pQ5rS7tU9vW1",
+        "qwertyuiopasdfghjklzxcvbnmqw",
+        "Ab1Cd2Ef3Gh4Ij5Kl6Mn7Pq8St9Uv0",
+        "test-aB3dE5fG7hI9jK1mN3pQ5rS7tU9",
+        "c2stYWJjZGVmZ2hpamtsbW5vcFFSU1RVVg",
+    ] {
+        assert_eq!(
+            redact_text(value).text,
+            "[REDACTED:high_entropy]",
+            "{value}"
+        );
+    }
+    // Vendor-prefix bypass corpus from independent verification. Known-format
+    // precedence may choose a more specific marker than generic entropy.
+    for value in verifier_bypass_fixtures() {
+        let value = value.as_str();
+        let output = redact_text(value).text;
+        assert_ne!(output, value, "{value}");
+        assert!(!output.contains(value), "{value}: {output}");
+    }
+    // Credential context still wins over identifier shape.
+    for input in [
+        "password=test_unreadable_file_exit_code",
+        "Bearer test_unreadable_file_exit_code",
+        "api_key: test_wordfreq.OrderingTests",
+    ] {
+        let output = redact_text(input).text;
+        assert!(!output.contains("test_"), "{input}");
+        assert!(output.contains("[REDACTED:secret_value]"), "{input}");
+    }
+    assert_ne!(
+        super::redact_lockdown_text("test_unreadable_file_exit_code_path"),
+        "test_unreadable_file_exit_code_path",
+        "lockdown keeps its historical classifier"
+    );
+}
+
+/// Builds a synthetic vendor-format fixture at runtime so the scanner-shaped
+/// literal never exists at rest (GitHub push protection and similar scanners
+/// match file contents; the runtime bytes are asserted by length/prefix).
+fn vendor_fixture(prefix_parts: &[&str], payload: &str) -> String {
+    let mut value: String = prefix_parts.concat();
+    value.push_str(payload);
+    value
+}
+
+const VENDOR_PAYLOAD_20: &str = "QWERTYUIOPASDFGHJKLZ";
+const VENDOR_PAYLOAD_26: &str = "QWERTYUIOPASDFGHJKLZXCVBNM";
+const VENDOR_PAYLOAD_35: &str = "QWERTYUIOPASDFGHJKLZXCVBNMQWERTYUIO";
+const VENDOR_PAYLOAD_36: &str = "QWERTYUIOPASDFGHJKLZXCVBNMQWERTYUIOP";
+
+fn verifier_bypass_fixtures() -> [String; 4] {
+    [
+        vendor_fixture(&["glpat", "-"], VENDOR_PAYLOAD_20),
+        vendor_fixture(&["npm", "_"], VENDOR_PAYLOAD_36),
+        vendor_fixture(&["sk", "_live", "_"], VENDOR_PAYLOAD_26),
+        vendor_fixture(&["AI", "za"], VENDOR_PAYLOAD_35),
+    ]
+}
+
+/// Permanent regressions for vendor-prefixed secrets that previously looked
+/// like two code-identifier words: a lowercase prefix and one long acronym.
+#[test]
+fn vendor_secret_formats_precede_identifier_exemption() {
+    let paths = super::ExplicitReadPaths::new(Path::new("testrun.txt"));
+    let verifier_bypasses = verifier_bypass_fixtures();
+    for value in verifier_bypasses.iter().map(String::as_str) {
+        let known = super::extended_secret_regex()
+            .and_then(|regex| regex.find(value))
+            .map(|found| found.as_str());
+        assert_eq!(known, Some(value), "known-format span: {value}");
+        for output in [
+            super::redact_output_text(value),
+            paths.redact(Path::new("testrun.txt"), value).text,
+        ] {
+            assert_ne!(output, value, "{value}");
+            assert!(!output.contains(value), "{value}: {output}");
+        }
+    }
+    let gitlab_siblings = [
+        "gloas", "gldt", "glrt", "glrtr", "glcbt", "glptt", "glft", "glimt", "glagent", "glwt",
+        "glsoat", "glffct",
+    ]
+    .map(|prefix| vendor_fixture(&[prefix, "-"], VENDOR_PAYLOAD_20));
+    let stripe_siblings = [
+        ["pk", "_live", "_"],
+        ["sk", "_test", "_"],
+        ["rk", "_live", "_"],
+    ]
+    .map(|parts| vendor_fixture(&parts, VENDOR_PAYLOAD_26));
+    for value in gitlab_siblings
+        .iter()
+        .chain(stripe_siblings.iter())
+        .map(String::as_str)
+    {
+        let known = super::extended_secret_regex()
+            .and_then(|regex| regex.find(value))
+            .map(|found| found.as_str());
+        assert_eq!(known, Some(value), "known-format span: {value}");
+    }
+}
+
+#[test]
+fn long_uppercase_payload_is_not_a_code_identifier_word() {
+    let value = "vendor_QWERTYUIOPASDFGHJKLZ";
+    assert!(!super::is_code_identifier(value));
+    assert_eq!(redact_text(value).text, "[REDACTED:high_entropy]");
+
+    for identifier in ["HTTPServer", "parse_JSON_value", "SQLX_query_builder"] {
+        assert!(super::is_code_identifier(identifier), "{identifier}");
+    }
+}
+
 #[test]
 fn multiline_quoted_values_preserve_lines_and_hide_every_secret_fragment() {
     let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));

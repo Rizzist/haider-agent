@@ -533,7 +533,7 @@ fn known_kind(value: &str) -> &'static str {
 fn extended_secret_regex() -> Option<&'static Regex> {
     static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(
-        r"(?:AKIA|ASIA)[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,}|(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}|xox[a-z]+-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+        r"(?:AKIA|ASIA)[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,}|(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}|xox[a-z]+-[A-Za-z0-9-]{10,}|(?:glpat|gloas|gldt|glrt|glrtr|glcbt|glptt|glft|glimt|glagent|glwt|glsoat|glffct)-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{36}|(?:sk_live_|pk_live_|sk_test_|rk_live_)[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{35}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
     ).ok()).as_ref()
 }
 
@@ -622,7 +622,7 @@ fn identifier_candidate_regex() -> Option<&'static Regex> {
 
 fn is_non_secret_carrier(value: &str, policy: RedactionPolicy) -> bool {
     let value = value.trim_end_matches(['.', ':']);
-    if is_identifier(value) || is_file_path(value) {
+    if is_identifier(value) || is_code_identifier(value) || is_file_path(value) {
         return true;
     }
     // The exact explicit pointer additionally permits conventional tagged
@@ -684,6 +684,95 @@ fn is_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte.to_ascii_uppercase()))
+}
+
+/// Ordinary source-code identifiers — snake_case, CamelCase, SCREAMING_CASE,
+/// kebab-case, and dotted/`::`-joined paths of those — are not secrets even at
+/// high entropy (972 precision fix: `unittest -v` names such as
+/// `test_unreadable_file_exit_code (test_wordfreq.OrderingTests)`).
+/// Word shape is the discriminator: identifiers spell words, while random
+/// tokens interleave case and digit runs. Requiring at least two words keeps
+/// every single opaque blob (hex, base58, base64, lowercase noise) redacted,
+/// and credential context, known secret patterns, PEM state, and the lockdown
+/// classifier all still win before this exemption is consulted.
+fn is_code_identifier(value: &str) -> bool {
+    if value.len() > 128
+        || !value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b':'))
+    {
+        return false;
+    }
+    let mut words = 0usize;
+    for segment in value.split(['_', '.', '-', ':']) {
+        let bytes = segment.as_bytes();
+        // Skip trivial components: `__`/`::` separators, single letters, and
+        // short version/index atoms ("v2", "972"). They count as no words.
+        if bytes.len() <= 1
+            || (bytes.len() <= 5
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[1..].iter().all(u8::is_ascii_digit))
+        {
+            continue;
+        }
+        match segment_camel_words(segment) {
+            Some(count) => words = words.saturating_add(count),
+            None => return false,
+        }
+    }
+    words >= 2
+}
+
+/// One separator-free identifier segment. Camel humps need a real lowercase
+/// tail after a single capital, acronym runs need two capitals, and digits
+/// may appear only as one short trailing run ("Tests", "wordfreq",
+/// "HTTPServer", "URLs", "sha256"). Returns the number of words spelled, or
+/// `None` when the segment does not scan as words.
+fn segment_camel_words(segment: &str) -> Option<usize> {
+    // Uppercase words in the regression corpus top out at seven bytes
+    // (`PROCESS`). Runs of twelve or more are much more likely to be opaque
+    // payloads than source-code acronyms, including when followed by digits.
+    const MAX_ACRONYM_WORD_BYTES: usize = 11;
+
+    let bytes = segment.as_bytes();
+    let mut words = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_digit() {
+            let trailing =
+                bytes[index..].iter().all(u8::is_ascii_digit) && bytes.len() - index <= 4;
+            return (index > 0 && trailing).then_some(words);
+        }
+        let upper = bytes[index..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_uppercase())
+            .count();
+        let lower = bytes[index + upper..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_lowercase())
+            .count();
+        let digits = bytes[index + upper + lower..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if lower == 0 && upper.saturating_add(digits) > MAX_ACRONYM_WORD_BYTES {
+            return None;
+        }
+        words = words.saturating_add(match (upper, lower) {
+            (2..=MAX_ACRONYM_WORD_BYTES, tail) if tail >= 2 => 2,
+            (2..=MAX_ACRONYM_WORD_BYTES, _) => 1,
+            (0 | 1, tail) if tail >= 2 => 1,
+            // A single trailing capital ("optionA"), never a leading one.
+            (1, 0) if index > 0 && index + 1 == bytes.len() => 1,
+            _ => return None,
+        });
+        index += upper + lower;
+    }
+    Some(words)
 }
 
 fn is_uuid(value: &str) -> bool {
