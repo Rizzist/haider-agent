@@ -22321,6 +22321,7 @@ fn process_result_with_signal(
                 .unwrap_or_else(|_| "[REDACTED:invalid_process_capture]".into())
         }
     });
+    let redacted_capture_bytes = raw_output.len();
     let failed = result.status != haider_protocol::item::ToolStatus::Completed;
     let reduced = haider_tools::reduce_tool_output("process_exec", &raw_output, failed);
     let mut truncated = result.limit_reached.is_some()
@@ -22348,6 +22349,7 @@ fn process_result_with_signal(
         PresentedProcessOutput {
             text: &raw_output,
             displayed_complete: baseline_complete,
+            capture_bytes: redacted_capture_bytes,
         },
         None,
     );
@@ -22380,6 +22382,7 @@ fn process_result_with_signal(
             PresentedProcessOutput {
                 text: &presented_output,
                 displayed_complete: displayed_complete(&presented_output),
+                capture_bytes: redacted_capture_bytes,
             },
             baseline_input_bytes,
             baseline_source_bytes,
@@ -22408,6 +22411,7 @@ fn process_result_with_signal(
             PresentedProcessOutput {
                 text: &presented_output,
                 displayed_complete: displayed_complete(&presented_output),
+                capture_bytes: redacted_capture_bytes,
             },
             baseline_input_bytes,
             baseline_source_bytes,
@@ -22437,6 +22441,7 @@ fn process_result_with_signal(
                 &result,
                 reduced.adapter,
                 &bounded_output,
+                redacted_capture_bytes,
                 &savings,
             );
             let next = OutputSavings::from_provider_request_bytes(
@@ -22495,6 +22500,9 @@ fn process_result_with_signal(
 struct PresentedProcessOutput<'a> {
     text: &'a str,
     displayed_complete: bool,
+    /// Exact byte length of the complete secret-redacted string retained for
+    /// `task_output`; this can differ from the raw process byte count.
+    capture_bytes: usize,
 }
 
 /// Appends the deterministic paging pointer to an incomplete model-facing
@@ -22511,7 +22519,7 @@ fn process_capture_preview(result: &ProcessResult, output: PresentedProcessOutpu
         output.text,
         haider_tools::capture_paging_hint(
             &result.call_id,
-            result.output_bytes as u64,
+            u64::try_from(output.capture_bytes).unwrap_or(u64::MAX),
             result.source_output_elided_bytes_at_least as u64,
         )
     )
@@ -22531,6 +22539,7 @@ fn process_result_minimal_preview_json(
     result: &ProcessResult,
     output_adapter: haider_tools::OutputAdapter,
     output: &str,
+    capture_bytes: usize,
     context_savings_detail: &OutputSavings,
 ) -> String {
     serde_json::json!({
@@ -22546,6 +22555,7 @@ fn process_result_minimal_preview_json(
         "output": process_capture_preview(result, PresentedProcessOutput {
             text: output,
             displayed_complete: false,
+            capture_bytes,
         }),
         "context_savings_detail": context_savings_detail,
     })

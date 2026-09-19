@@ -1777,8 +1777,9 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     use base64::Engine as _;
     let profile = tempfile::tempdir().expect("profile");
     let (_workspace, cwd) = workspace();
+    let api_key = "api_key=sk-abcdefghijklmnopQRSTUV";
     let original = format!(
-        "{}\napi=sk-abcdefghijklmnopQRSTUV\n-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\nlast line\n",
+        "{}\n{api_key}\n-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\nlast line\n",
         (0..6000)
             .map(|i| format!("line {i}: orchestration evidence\n"))
             .collect::<String>()
@@ -1865,6 +1866,27 @@ async fn foreground_capture_pages_are_complete_secret_safe_and_session_scoped() 
     }
     assert!(pages >= 3);
     assert_eq!(full, haider_tools::redact_output_text(&original));
+    assert!(full.contains("api_key=[REDACTED:api_key]"));
+    assert_ne!(
+        original.len(),
+        full.len(),
+        "fixture must prove byte accounting across a length-changing redaction"
+    );
+    let footer_suffix = "-byte secret-redacted capture is retained";
+    let footer_end = preview_output
+        .find(footer_suffix)
+        .expect("capture-size footer");
+    let advertised_bytes = preview_output[..footer_end]
+        .rsplit_once("the ")
+        .expect("capture-size prefix")
+        .1
+        .parse::<usize>()
+        .expect("numeric capture size");
+    assert_eq!(
+        advertised_bytes,
+        full.len(),
+        "footer byte count must equal the redacted bytes paged to exhaustion"
+    );
     assert!(!full.contains("sk-"));
     assert!(!full.contains("AA=="));
     assert_repair_secrets_absent(&full);
