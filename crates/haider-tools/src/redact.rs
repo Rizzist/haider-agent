@@ -533,7 +533,7 @@ fn known_kind(value: &str) -> &'static str {
 fn extended_secret_regex() -> Option<&'static Regex> {
     static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(
-        r"(?:AKIA|ASIA)[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,}|(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}|xox[a-z]+-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+        r"(?:AKIA|ASIA)[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,}|(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}|xox[a-z]+-[A-Za-z0-9-]{10,}|(?:glpat|gloas|gldt|glrt|glrtr|glcbt|glptt|glft|glimt|glagent|glwt|glsoat|glffct)-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{36}|(?:sk_live_|pk_live_|sk_test_|rk_live_)[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{35}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
     ).ok()).as_ref()
 }
 
@@ -733,6 +733,11 @@ fn is_code_identifier(value: &str) -> bool {
 /// "HTTPServer", "URLs", "sha256"). Returns the number of words spelled, or
 /// `None` when the segment does not scan as words.
 fn segment_camel_words(segment: &str) -> Option<usize> {
+    // Uppercase words in the regression corpus top out at seven bytes
+    // (`PROCESS`). Runs of twelve or more are much more likely to be opaque
+    // payloads than source-code acronyms, including when followed by digits.
+    const MAX_ACRONYM_WORD_BYTES: usize = 11;
+
     let bytes = segment.as_bytes();
     let mut words = 0usize;
     let mut index = 0usize;
@@ -750,9 +755,16 @@ fn segment_camel_words(segment: &str) -> Option<usize> {
             .iter()
             .take_while(|byte| byte.is_ascii_lowercase())
             .count();
+        let digits = bytes[index + upper + lower..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if lower == 0 && upper.saturating_add(digits) > MAX_ACRONYM_WORD_BYTES {
+            return None;
+        }
         words = words.saturating_add(match (upper, lower) {
-            (acronym, tail) if acronym >= 2 && tail >= 2 => 2,
-            (acronym, _) if acronym >= 2 => 1,
+            (2..=MAX_ACRONYM_WORD_BYTES, tail) if tail >= 2 => 2,
+            (2..=MAX_ACRONYM_WORD_BYTES, _) => 1,
             (0 | 1, tail) if tail >= 2 => 1,
             // A single trailing capital ("optionA"), never a leading one.
             (1, 0) if index > 0 && index + 1 == bytes.len() => 1,
