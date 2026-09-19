@@ -495,14 +495,15 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
                 models,
                 fetched_at_ms,
                 ..
-            } => ProviderInventory::Stale {
+            } if !models.is_empty() => ProviderInventory::Stale {
                 models,
                 fetched_at_ms,
                 reason,
             },
-            ProviderInventory::NeverFetched | ProviderInventory::Unavailable { .. } => {
-                ProviderInventory::Unavailable { reason }
-            }
+            ProviderInventory::NeverFetched
+            | ProviderInventory::Unavailable { .. }
+            | ProviderInventory::Fetched { .. }
+            | ProviderInventory::Stale { .. } => ProviderInventory::Unavailable { reason },
             #[cfg(test)]
             ProviderInventory::Configured { .. } => ProviderInventory::Unavailable { reason },
         };
@@ -970,7 +971,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             next.push(profile.clone());
             profile
         };
-        if profile.enabled && (discovered_models.is_empty() || profile.default_model.is_none()) {
+        // A custom compatible endpoint's catalog is advisory and arrives
+        // after configuration/credential commit. It may therefore be empty,
+        // or have rows while the user has not selected a default yet.
+        let custom_catalog_is_advisory = matches!(profile.provenance, ProviderProvenance::Custom);
+        if profile.enabled
+            && (discovered_models.is_empty() || profile.default_model.is_none())
+            && !custom_catalog_is_advisory
+        {
             return Err(invalid(
                 "an enabled provider requires a discovered model inventory and a default model",
             ));
@@ -1313,10 +1321,17 @@ fn provider_summary(
     // lights Available only once a credential exists AND the profile has an
     // endpoint to serve from (vertex seeds without one until its card runs).
     let offline_ready = !offline_catalog || (credentialed && profile.base_url.is_some());
+    let inventory_is_current = matches!(
+        &inventory,
+        haider_rpc::ModelInventoryWire::Static
+            | haider_rpc::ModelInventoryWire::Configured
+            | haider_rpc::ModelInventoryWire::Fetched { .. }
+    );
     let available = profile.enabled
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && !discovered_models.is_empty()
-        && offline_ready;
+        && offline_ready
+        && inventory_is_current;
     let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
         && matches!(
             profile.api_family,
@@ -1324,8 +1339,13 @@ fn provider_summary(
         ) {
         // A custom compatible endpoint owns its wire model vocabulary.
         // Discovery remains advisory inventory for pickers and availability;
-        // it cannot rewrite or erase the configured passthrough id.
-        profile.default_model.clone()
+        // it cannot rewrite or erase a configured passthrough id. When the
+        // user has not selected one yet, the durable discovered order gives
+        // the same first-row default the former synchronous create returned.
+        profile
+            .default_model
+            .clone()
+            .or_else(|| discovered_models.first().cloned())
     } else {
         profile
             .default_model
@@ -1341,6 +1361,25 @@ fn provider_summary(
                 .flatten()
             })
     };
+    let availability_reason = (!available).then(|| {
+        if matches!(profile.provenance, ProviderProvenance::Unknown) {
+            "provider adapter is not registered".to_owned()
+        } else if !profile.enabled {
+            "provider is disabled".to_owned()
+        } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
+            "provider API family is unavailable".to_owned()
+        } else if offline_catalog && profile.base_url.is_none() {
+            "provider endpoint is not configured".to_owned()
+        } else if offline_catalog && !credentialed {
+            "provider has no credential".to_owned()
+        } else if let haider_rpc::ModelInventoryWire::Stale { reason, .. }
+        | haider_rpc::ModelInventoryWire::Unavailable { reason } = &inventory
+        {
+            reason.clone()
+        } else {
+            "provider model inventory is unavailable".to_owned()
+        }
+    });
     ProviderSummaryWire {
         provider: profile.provider_id.clone(),
         api_family: profile.api_family,
@@ -1381,21 +1420,7 @@ fn provider_summary(
         } else {
             ProviderAvailabilityWire::Unavailable
         },
-        availability_reason: (!available).then(|| {
-            if matches!(profile.provenance, ProviderProvenance::Unknown) {
-                "provider adapter is not registered".to_owned()
-            } else if !profile.enabled {
-                "provider is disabled".to_owned()
-            } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
-                "provider API family is unavailable".to_owned()
-            } else if offline_catalog && profile.base_url.is_none() {
-                "provider endpoint is not configured".to_owned()
-            } else if offline_catalog && !credentialed {
-                "provider has no credential".to_owned()
-            } else {
-                "provider model inventory is unavailable".to_owned()
-            }
-        }),
+        availability_reason,
         default_model,
         enabled: profile.enabled,
         trust: profile.trust,

@@ -1000,11 +1000,8 @@ fn custom_provider_delta_survives_daemon_restart_beside_the_builtin_catalog() {
     );
     assert_eq!(added["schema"], "haider.account.custom.v1");
     assert_eq!(added["alias"], "delta-proxy");
-    assert_eq!(added["reachable"], true);
-    assert_eq!(
-        added["models"],
-        serde_json::json!(["delta-proxy/delta-model"])
-    );
+    assert_eq!(added["reachable"], false);
+    assert_eq!(added["models"], serde_json::json!([]));
     wait_for_daemon_gone(&profile.profile);
 
     let status = json_document(

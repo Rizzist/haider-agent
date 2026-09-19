@@ -1834,11 +1834,35 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
         haider_rpc::ModelInventoryWire::NeverFetched
     );
     source.unavailable(HAIDER_CODE_PROVIDER_NAME, "catalog transport failed".into());
+    let unavailable = current();
+    assert!(matches!(
+        unavailable.inventory,
+        haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ));
+    assert_eq!(
+        unavailable.availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable
+    );
+    assert_eq!(
+        unavailable.availability_reason.as_deref(),
+        Some("catalog transport failed")
+    );
+    assert!(unavailable.default_model.is_none());
+    source.replace(
+        HAIDER_CODE_PROVIDER_NAME.to_owned(),
+        ProviderInventory::Fetched {
+            models: Vec::new(),
+            fetched_at_ms: 1,
+        },
+    );
+    source.unavailable(
+        HAIDER_CODE_PROVIDER_NAME,
+        "empty cache is not prior inventory".into(),
+    );
     assert!(matches!(
         current().inventory,
         haider_rpc::ModelInventoryWire::Unavailable { .. }
     ));
-    assert!(current().default_model.is_none());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -1859,11 +1883,20 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
         Some("deepseek-v4-flash")
     );
     source.unavailable(HAIDER_CODE_PROVIDER_NAME, "temporary outage".into());
+    let stale = current();
     assert!(matches!(
-        current().inventory,
+        stale.inventory,
         haider_rpc::ModelInventoryWire::Stale { .. }
     ));
-    assert_eq!(current().models, ["deepseek-v4-flash"]);
+    assert_eq!(stale.models, ["deepseek-v4-flash"]);
+    assert_eq!(
+        stale.availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable
+    );
+    assert_eq!(
+        stale.availability_reason.as_deref(),
+        Some("temporary outage")
+    );
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {

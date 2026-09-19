@@ -187,10 +187,10 @@ fn update_accepts_auth_mode_changes_but_rejects_api_family_changes() {
     assert!(family.contains("does not change --api-family"));
 }
 
-/// MUTATION CHECK: dropping `probe_vault_reference`, consuming the stage at
-/// configure time, or skipping login changes this exact request sequence.
+/// MUTATION CHECK: sending the stage to configure re-couples credential
+/// mutation to `/models`; consuming it there or skipping login loses the key.
 #[tokio::test]
-async fn keyed_add_reuses_one_stage_for_discovery_and_login() {
+async fn keyed_add_reserves_one_stage_for_the_durable_login() {
     let client = FakeClient::new([
         ResponseBody::ProviderList {
             providers: Vec::new(),
@@ -236,10 +236,10 @@ async fn keyed_add_reuses_one_stage_for_discovery_and_login() {
         &requests[2],
         RequestBody::ProviderConfigure {
             models,
-            probe_vault_reference: Some(reference),
+            probe_vault_reference: None,
             expected_revision: 8,
             ..
-        } if models.is_empty() && reference == "vaultref-one"
+        } if models.is_empty()
     ));
     assert!(matches!(
         &requests[3],
@@ -367,7 +367,7 @@ async fn probe_preserves_the_typed_failure_class() {
 }
 
 /// MUTATION CHECK: a replacement key explicitly selects API-key mode while
-/// immutable family stays absent, then the staged key is consumed by login.
+/// immutable family stays absent, and configure cannot borrow the login stage.
 #[tokio::test]
 async fn update_base_key_and_timeout_preserves_immutable_shape() {
     let mut updated = provider();
@@ -424,12 +424,11 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
             chunk_idle_timeout_ms: Some(120_000),
             semantic_progress_timeout_ms: Some(360_000),
             models,
-            probe_vault_reference: Some(reference),
+            probe_vault_reference: None,
             expected_revision: 20,
             ..
         } if origin == "https://router.example.test/v1"
             && models.is_empty()
-            && reference == "update-vault-ref"
     ));
     assert!(matches!(
         &requests[3],

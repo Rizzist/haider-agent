@@ -19,7 +19,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -427,6 +427,535 @@ fn spawn_compatible_proxy(
         }
     });
     (origin, receiver, model_list_requests, task)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum CredentialCatalogMode {
+    Fabricated,
+    Current,
+    HeldCurrent,
+    HeldNotFound,
+    NotFound,
+}
+
+#[cfg(unix)]
+impl CredentialCatalogMode {
+    const fn value(self) -> usize {
+        match self {
+            Self::Fabricated => 0,
+            Self::Current => 1,
+            Self::HeldCurrent => 2,
+            Self::HeldNotFound => 3,
+            Self::NotFound => 4,
+        }
+    }
+
+    const fn from_value(value: usize) -> Self {
+        match value {
+            0 => Self::Fabricated,
+            1 => Self::Current,
+            2 => Self::HeldCurrent,
+            3 => Self::HeldNotFound,
+            _ => Self::NotFound,
+        }
+    }
+}
+
+/// Mutable recording endpoint for the credential-triggered catalog law. The
+/// held modes prove the account process exits before discovery is released;
+/// the request counter proves two overlapping replacements share one flight.
+#[cfg(unix)]
+struct CredentialCatalogProxy {
+    origin: String,
+    mode: Arc<AtomicUsize>,
+    model_requests: Arc<AtomicUsize>,
+    held_started: std::sync::mpsc::Receiver<()>,
+    held_release: Arc<AtomicUsize>,
+    chats: std::sync::mpsc::Receiver<serde_json::Value>,
+    stop: Arc<AtomicBool>,
+    task: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl CredentialCatalogProxy {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind credential catalog proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking credential catalog proxy");
+        let origin = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("credential proxy address")
+        );
+        let mode = Arc::new(AtomicUsize::new(CredentialCatalogMode::Fabricated.value()));
+        let model_requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (held_started_tx, held_started) = std::sync::mpsc::channel();
+        let held_release = Arc::new(AtomicUsize::new(0));
+        let (chat_tx, chats) = std::sync::mpsc::channel();
+        let observed_mode = Arc::clone(&mode);
+        let observed_requests = Arc::clone(&model_requests);
+        let observed_release = Arc::clone(&held_release);
+        let observed_stop = Arc::clone(&stop);
+        let task = thread::spawn(move || {
+            while !observed_stop.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(incoming) => incoming,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("credential proxy accept failed: {error}"),
+                };
+                let (request_line, body) = read_http_request(&mut stream);
+                if request_line.starts_with("POST ") && request_line.contains("/chat/completions") {
+                    chat_tx
+                        .send(serde_json::from_slice(&body).expect("chat request JSON"))
+                        .expect("capture production adapter request");
+                    let sse = concat!(
+                        "data: {\"id\":\"chatcmpl-catalog\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"catalog turn ok\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"chatcmpl-catalog\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"id\":\"chatcmpl-catalog\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    write_http_response(&mut stream, "200 OK", "text/event-stream", sse.as_bytes());
+                    continue;
+                }
+                if request_line.contains("/models") {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    let mode =
+                        CredentialCatalogMode::from_value(observed_mode.load(Ordering::SeqCst));
+                    if matches!(
+                        mode,
+                        CredentialCatalogMode::HeldCurrent | CredentialCatalogMode::HeldNotFound
+                    ) {
+                        let release_generation = observed_release.load(Ordering::SeqCst);
+                        held_started_tx.send(()).expect("publish held request");
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while observed_release.load(Ordering::SeqCst) == release_generation
+                            && Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    match mode {
+                        CredentialCatalogMode::Fabricated => write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            br#"{"object":"list","data":[{"id":"fabricated-old","object":"model"}]}"#,
+                        ),
+                        CredentialCatalogMode::Current | CredentialCatalogMode::HeldCurrent => {
+                            write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                br#"{"object":"list","data":[{"id":"real-current","object":"model"}]}"#,
+                            )
+                        }
+                        CredentialCatalogMode::HeldNotFound
+                        | CredentialCatalogMode::NotFound => write_http_response(
+                            &mut stream,
+                            "404 Not Found",
+                            "application/json",
+                            br#"{"error":"catalog unavailable"}"#,
+                        ),
+                    }
+                } else {
+                    write_http_response(&mut stream, "200 OK", "application/json", b"{}");
+                }
+            }
+        });
+        Self {
+            origin,
+            mode,
+            model_requests,
+            held_started,
+            held_release,
+            chats,
+            stop,
+            task: Some(task),
+        }
+    }
+
+    fn set_mode(&self, mode: CredentialCatalogMode) {
+        self.mode.store(mode.value(), Ordering::SeqCst);
+    }
+
+    fn release_held(&self) {
+        self.held_release.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CredentialCatalogProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.release_held();
+        if let Some(task) = self.task.take() {
+            task.join().expect("credential catalog proxy joins");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn attached_haider(profile: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut command, profile);
+    command
+        .current_dir(profile.parent().expect("profile parent").join("workspace"))
+        .env("HAIDER_PROFILE_DIR", profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env("HAIDER_NO_UPDATE_CHECK", "1")
+        .env_remove("HAIDER_TEST_FAKE_PROVIDER");
+    command
+}
+
+#[cfg(unix)]
+fn spawn_keyed_account_command(
+    profile: &Path,
+    operation: &str,
+    alias: &str,
+    origin: Option<&str>,
+    key: &str,
+) -> std::process::Child {
+    let mut command = attached_haider(profile);
+    command.args(["account", operation, alias]);
+    if let Some(origin) = origin {
+        command.args(["--base-url", origin]);
+    }
+    command
+        .args(["--api-key-stdin", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn keyed account command");
+    child
+        .stdin
+        .take()
+        .expect("account stdin")
+        .write_all(key.as_bytes())
+        .expect("write fixture key");
+    child
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(child: &mut std::process::Child, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if child.try_wait().expect("poll account child").is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn attached_json(profile: &Path, args: &[&str]) -> serde_json::Value {
+    let output = attached_haider(profile)
+        .args(args)
+        .output()
+        .expect("attached JSON command exits");
+    assert!(
+        output.status.success(),
+        "attached command {args:?} failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("attached command JSON")
+}
+
+#[cfg(unix)]
+fn provider_snapshot_json(profile: &Path, provider: &str) -> serde_json::Value {
+    let document = attached_json(profile, &["provider", "list", "--json"]);
+    document["providers"]
+        .as_array()
+        .expect("provider rows")
+        .iter()
+        .find(|row| row["provider"] == provider)
+        .unwrap_or_else(|| panic!("provider {provider} is absent from {document}"))
+        .clone()
+}
+
+#[cfg(unix)]
+fn wait_for_provider_snapshot(
+    profile: &Path,
+    provider: &str,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = provider_snapshot_json(profile, provider);
+        if ready(&row) {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider {provider} did not reach the expected state; last row: {row}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// End-to-end credential/catalog law through the real CLI, daemon actor,
+/// durable vault/store, production compatible adapter, and recording HTTP
+/// endpoint. MUTATION CHECK: restoring synchronous configure/login discovery
+/// blocks the held 404 add; dropping the post-commit edge leaves NeverFetched;
+/// dropping per-provider dedupe opens a second held `/models` request.
+#[cfg(unix)]
+#[test]
+fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon() {
+    let mut owner = haider();
+    owner
+        .env_remove("HAIDER_TEST_FAKE_PROVIDER")
+        .env("HAIDER_NO_UPDATE_CHECK", "1");
+    let initial = owner
+        .args(["provider", "list", "--json"])
+        .output()
+        .expect("initial provider snapshot exits");
+    assert!(
+        initial.status.success(),
+        "initial snapshot failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let initial: serde_json::Value =
+        serde_json::from_slice(&initial.stdout).expect("initial provider JSON");
+    let haider_code = initial["providers"]
+        .as_array()
+        .expect("initial provider rows")
+        .iter()
+        .find(|row| row["provider"] == "haider-code")
+        .expect("Haider Code provider row");
+    assert_eq!(haider_code["inventory"]["state"], "never_fetched");
+    let daemon = wait_for_daemon_pid(&owner.profile);
+    let proxy = CredentialCatalogProxy::start();
+
+    // A held request that eventually 404s cannot sit on the mutation path.
+    // The credential response must land while the catalog socket is held.
+    proxy.set_mode(CredentialCatalogMode::HeldNotFound);
+    let slow_started_at = Instant::now();
+    let mut slow_add = spawn_keyed_account_command(
+        &owner.profile,
+        "add",
+        "catalog-failure",
+        Some(&proxy.origin),
+        "fixture-slow-key",
+    );
+    proxy
+        .held_started
+        .recv_timeout(Duration::from_secs(3))
+        .expect("slow catalog request starts");
+    let exited_before_release = wait_for_child_exit(&mut slow_add, Duration::from_secs(2));
+    proxy.release_held();
+    // The old path issues an unauthenticated endpoint probe before its
+    // authenticated discovery. Release that second request too so the red
+    // proof exits promptly instead of consuming the server's safety timeout.
+    if proxy
+        .held_started
+        .recv_timeout(Duration::from_millis(300))
+        .is_ok()
+    {
+        proxy.release_held();
+    }
+    let slow_output = slow_add.wait_with_output().expect("slow add exits");
+    assert!(
+        exited_before_release,
+        "credential add waited for discovery; elapsed={:?}; stdout: {}; stderr: {}",
+        slow_started_at.elapsed(),
+        String::from_utf8_lossy(&slow_output.stdout),
+        String::from_utf8_lossy(&slow_output.stderr)
+    );
+    assert!(
+        slow_output.status.success(),
+        "404 discovery failed credential add; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&slow_output.stdout),
+        String::from_utf8_lossy(&slow_output.stderr)
+    );
+    let unavailable = wait_for_provider_snapshot(&owner.profile, "catalog-failure", |row| {
+        row["inventory"]["state"] == "unavailable"
+    });
+    assert_eq!(unavailable["availability"], "unavailable");
+    assert!(unavailable["models"].as_array().is_some_and(Vec::is_empty));
+    assert!(
+        unavailable["inventory"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("404")),
+        "failure reason is not published: {unavailable}"
+    );
+    let accounts = attached_json(&owner.profile, &["account", "list", "--json"]);
+    assert!(
+        accounts["accounts"]
+            .as_array()
+            .expect("account rows")
+            .iter()
+            .any(|account| account["alias"] == "catalog-failure")
+    );
+    assert_eq!(daemon_pid(&owner.profile), Some(daemon));
+
+    // Start the second case with a deliberately fabricated catalog, then
+    // replace the credential while the endpoint 404s. The old row may remain
+    // honestly Stale, but it must not remain fresh or Available.
+    proxy.set_mode(CredentialCatalogMode::Fabricated);
+    let fabricated_before = proxy.model_requests.load(Ordering::SeqCst);
+    let fabricated = spawn_keyed_account_command(
+        &owner.profile,
+        "add",
+        "catalog-main",
+        Some(&proxy.origin),
+        "fixture-main-key",
+    )
+    .wait_with_output()
+    .expect("fabricated add exits");
+    assert!(
+        fabricated.status.success(),
+        "fabricated setup add failed: {}",
+        String::from_utf8_lossy(&fabricated.stderr)
+    );
+    let fabricated_row = wait_for_provider_snapshot(&owner.profile, "catalog-main", |row| {
+        row["inventory"]["state"] == "fetched"
+            && row["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model == "fabricated-old"))
+    });
+    assert_eq!(fabricated_row["availability"], "available");
+    assert_eq!(
+        proxy.model_requests.load(Ordering::SeqCst),
+        fabricated_before + 1,
+        "credential commit must enqueue one discovery, not a configure probe plus refresh"
+    );
+
+    proxy.set_mode(CredentialCatalogMode::NotFound);
+    let stale = spawn_keyed_account_command(
+        &owner.profile,
+        "update",
+        "catalog-main",
+        None,
+        "fixture-replacement-key",
+    )
+    .wait_with_output()
+    .expect("404 replacement exits");
+    assert!(
+        stale.status.success(),
+        "404 discovery failed replacement; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&stale.stdout),
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    let stale_row = wait_for_provider_snapshot(&owner.profile, "catalog-main", |row| {
+        row["inventory"]["state"] == "stale"
+    });
+    assert_eq!(stale_row["availability"], "unavailable");
+    assert!(
+        stale_row["inventory"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("404"))
+    );
+    assert!(
+        stale_row["models"]
+            .as_array()
+            .is_some_and(|models| models.iter().any(|model| model == "fabricated-old"))
+    );
+
+    // Hold the corrected catalog in flight, replace the same credential a
+    // second time through another real client, and prove both mutations exit
+    // while only one per-provider discovery is open.
+    proxy.set_mode(CredentialCatalogMode::HeldCurrent);
+    let concurrent_before = proxy.model_requests.load(Ordering::SeqCst);
+    let mut first = spawn_keyed_account_command(
+        &owner.profile,
+        "update",
+        "catalog-main",
+        None,
+        "fixture-concurrent-key",
+    );
+    proxy
+        .held_started
+        .recv_timeout(Duration::from_secs(3))
+        .expect("corrected catalog flight starts");
+    assert!(
+        wait_for_child_exit(&mut first, Duration::from_secs(2)),
+        "first replacement waited for its catalog flight"
+    );
+    let mut second = spawn_keyed_account_command(
+        &owner.profile,
+        "update",
+        "catalog-main",
+        None,
+        "fixture-concurrent-key",
+    );
+    assert!(
+        wait_for_child_exit(&mut second, Duration::from_secs(2)),
+        "concurrent replacement waited for another credential's catalog flight"
+    );
+    assert_eq!(
+        proxy.model_requests.load(Ordering::SeqCst),
+        concurrent_before + 1,
+        "overlapping credential adds opened more than one discovery flight"
+    );
+    let first = first.wait_with_output().expect("first replacement output");
+    let second = second
+        .wait_with_output()
+        .expect("second replacement output");
+    assert!(first.status.success(), "first replacement failed");
+    assert!(second.status.success(), "second replacement failed");
+    proxy.release_held();
+    let current = wait_for_provider_snapshot(&owner.profile, "catalog-main", |row| {
+        row["inventory"]["state"] == "fetched"
+            && row["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model == "real-current"))
+    });
+    assert_eq!(current["availability"], "available");
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        proxy.model_requests.load(Ordering::SeqCst),
+        concurrent_before + 1,
+        "a duplicate discovery started after the shared flight completed"
+    );
+    assert_eq!(daemon_pid(&owner.profile), Some(daemon));
+
+    // The discovered id is selectable immediately and the next turn uses the
+    // production OpenAI-compatible adapter, not HAIDER_TEST_FAKE_PROVIDER.
+    proxy.set_mode(CredentialCatalogMode::Current);
+    let turn = attached_haider(&owner.profile)
+        .args([
+            "run",
+            "--provider",
+            "catalog-main",
+            "--model",
+            "real-current",
+            "--jsonl",
+            "use the discovered catalog",
+        ])
+        .output()
+        .expect("production adapter turn exits");
+    assert!(
+        turn.status.success(),
+        "production adapter turn failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&turn.stdout),
+        String::from_utf8_lossy(&turn.stderr)
+    );
+    let envelopes = parse_jsonl(&turn.stdout);
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(Some(EventPayload::RunState(RunState::Done)))
+    );
+    assert!(envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        Some(EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::AgentMessage { ref text },
+            ..
+        })) if text.to_owned_string() == "catalog turn ok"
+    )));
+    let request = proxy
+        .chats
+        .recv_timeout(Duration::from_secs(3))
+        .expect("production adapter HTTP request");
+    assert_eq!(request["model"], "real-current");
+    assert_eq!(daemon_pid(&owner.profile), Some(daemon));
 }
 
 fn run_custom_model_wire_case(

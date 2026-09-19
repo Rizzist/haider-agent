@@ -102,6 +102,9 @@ pub(crate) const SECRET_TTL: Duration = Duration::from_secs(300);
 
 /// Bounded account-actor admission; overflow answers typed `busy`.
 const ACTOR_CAPACITY: usize = 8;
+/// One catalog flight has a hard wall-clock bound even when an injected
+/// discoverer or a future transport forgets to impose its own request limit.
+const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Outer bound for file-backed device discovery and its already-shorter native
 /// credential lookup. This is one continuous worker deadline; timing out a
 /// phase never grants the next phase a fresh budget.
@@ -546,9 +549,9 @@ fn accept_configured_custom_key(
     })
 }
 
-/// Authenticates a custom provider through its guarded model catalog. Login
-/// must not require an inference side effect: a valid compatible server may
-/// intentionally expose only discovery until an actual user turn arrives.
+/// Legacy validation seam retained for its transport-classification tests.
+/// Credential mutations no longer call it: `/models` is post-commit work.
+#[cfg(test)]
 async fn validate_custom_provider_key(
     origin: &str,
     provider: &str,
@@ -1180,6 +1183,9 @@ pub(crate) type InternalModelRefreshSender =
 pub(crate) enum ProviderModelsRefreshCompletion {
     Wire(LoginRoute),
     Internal(Arc<StdMutex<Option<InternalModelRefreshSender>>>),
+    /// Credential-triggered refreshes publish inventory but never answer the
+    /// credential request that scheduled them.
+    Automatic,
 }
 
 impl ProviderModelsRefreshCompletion {
@@ -1217,6 +1223,7 @@ impl ProviderModelsRefreshCompletion {
                     let _ = sender.send(result);
                 }
             }
+            Self::Automatic => {}
         }
     }
 }
@@ -1668,6 +1675,10 @@ async fn run_account_actor(
     > = JoinSet::new();
     let mut model_refresh_routes = HashMap::new();
     let mut refreshing_providers = HashSet::new();
+    // Credential commits coalesce here before the actor starts network work.
+    // The set is bounded by registered provider ids and deduplicates both
+    // queued mutations and mutations that overlap an active flight.
+    let mut pending_catalog_discoveries = HashSet::new();
     let source_reconcile_period = source_reconcile_period(&profile_id);
     let mut source_reconcile = tokio::time::interval(source_reconcile_period);
     source_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1686,10 +1697,15 @@ async fn run_account_actor(
         if draining
             && model_refreshes.is_empty()
             && refreshing_providers.is_empty()
+            && pending_catalog_discoveries.is_empty()
             && device_discovery_refreshes.is_empty()
         {
             break;
         }
+        let automatic_discovery = pending_catalog_discoveries
+            .iter()
+            .find(|provider| !refreshing_providers.contains(*provider))
+            .cloned();
         let command = tokio::select! {
             biased;
             changed = force_stop.changed() => {
@@ -1703,6 +1719,28 @@ async fn run_account_actor(
                     break;
                 };
                 command
+            }
+            _ = std::future::ready(()), if automatic_discovery.is_some() => {
+                let Some(provider) = automatic_discovery else {
+                    continue;
+                };
+                pending_catalog_discoveries.remove(&provider);
+                begin_provider_models_refresh(
+                    &store,
+                    &accounts,
+                    &providers,
+                    broker.as_ref(),
+                    &model_discoverer,
+                    &commands,
+                    &mut model_refreshes,
+                    &mut model_refresh_routes,
+                    &mut refreshing_providers,
+                    provider,
+                    ProviderModelsRefreshCompletion::Automatic,
+                )
+                .await;
+                publish_inventory_states(&store, management.as_ref(), &accounts, &providers).await;
+                continue;
             }
             completed = model_refreshes.join_next_with_id(), if !model_refreshes.is_empty() => {
                 if let Some(completed) = completed {
@@ -1718,6 +1756,18 @@ async fn run_account_actor(
                             {
                                 if refresh {
                                     refreshing_providers.remove(&provider);
+                                    pending_catalog_discoveries.remove(&provider);
+                                    providers.models_unavailable(
+                                        &provider,
+                                        "provider model refresh worker failed".to_owned(),
+                                    );
+                                    publish_inventory_states(
+                                        &store,
+                                        management.as_ref(),
+                                        &accounts,
+                                        &providers,
+                                    )
+                                    .await;
                                 }
                                 respond_model_refresh_error(
                                     &route,
@@ -1772,6 +1822,7 @@ async fn run_account_actor(
                     &profile_id,
                     &default_model,
                     &mut pending,
+                    &mut pending_catalog_discoveries,
                     &reserved_aliases,
                     *job,
                 )
@@ -1784,6 +1835,8 @@ async fn run_account_actor(
                     Arc::clone(&vault),
                     &snapshot,
                     management.as_ref(),
+                    &providers,
+                    &mut pending_catalog_discoveries,
                     &profile_id,
                     &reserved_aliases,
                     *job,
@@ -1818,6 +1871,8 @@ async fn run_account_actor(
                     Arc::clone(&vault),
                     &snapshot,
                     management.as_ref(),
+                    &providers,
+                    &mut pending_catalog_discoveries,
                     &reserved_aliases,
                     &refresh_fences,
                     *job,
@@ -2107,6 +2162,7 @@ async fn run_account_actor(
                     &snapshot,
                     management.as_ref(),
                     &providers,
+                    &mut pending_catalog_discoveries,
                     &reserved_aliases,
                     &refresh_fences,
                     Arc::clone(&gcloud),
@@ -2172,6 +2228,7 @@ async fn run_account_actor(
                         vault: vault.as_ref(),
                         management: management.as_ref(),
                         providers: &mut providers,
+                        pending_catalog_discoveries: &mut pending_catalog_discoveries,
                         endpoint_validator: Arc::clone(&provider_endpoint_validator),
                         model_discoverer: model_discoverer.as_ref(),
                     },
@@ -2258,6 +2315,9 @@ async fn run_account_actor(
                 completed,
             } => {
                 refreshing_providers.remove(&provider);
+                // A credential committed while this provider was refreshing
+                // shares that bounded flight instead of opening a follower.
+                pending_catalog_discoveries.remove(&provider);
                 finish_provider_models_refresh(
                     ProviderModelsRefreshContext {
                         store: &store,
@@ -2328,6 +2388,8 @@ async fn run_account_actor(
                         Arc::clone(&vault),
                         &snapshot,
                         management.as_ref(),
+                        &providers,
+                        &mut pending_catalog_discoveries,
                         &reserved_aliases,
                         &refresh_fences,
                         &descriptor,
@@ -2843,9 +2905,13 @@ async fn begin_provider_models_refresh(
                         });
                     match access_token {
                         Ok(access_token) => ProviderModelsRefreshResult::Discovery(
-                            model_discoverer
-                                .discover(source, Some(access_token), etag.as_deref())
-                                .await,
+                            discover_provider_models_bounded(
+                                model_discoverer.as_ref(),
+                                source,
+                                Some(access_token),
+                                etag.as_deref(),
+                            )
+                            .await,
                         ),
                         Err(error) => ProviderModelsRefreshResult::Credential(error),
                     }
@@ -2853,9 +2919,13 @@ async fn begin_provider_models_refresh(
                 Err(error) => ProviderModelsRefreshResult::Credential(error),
             },
             (None, None) => ProviderModelsRefreshResult::Discovery(
-                model_discoverer
-                    .discover(source, None, etag.as_deref())
-                    .await,
+                discover_provider_models_bounded(
+                    model_discoverer.as_ref(),
+                    source,
+                    None,
+                    etag.as_deref(),
+                )
+                .await,
             ),
             _ => ProviderModelsRefreshResult::Credential(HaiderError::new(
                 ErrorCode::Internal,
@@ -3193,6 +3263,37 @@ fn catalog_source(
             Some((source, profile.auth_requirement))
         }
     }
+}
+
+fn enqueue_catalog_discovery(
+    provider: &str,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending: &mut HashSet<String>,
+) {
+    if catalog_source(provider, providers).is_some() {
+        pending.insert(provider.to_owned());
+    }
+}
+
+async fn discover_provider_models_bounded(
+    discoverer: &dyn ProviderModelDiscoverer,
+    source: CatalogSource,
+    access_token: Option<&str>,
+    etag: Option<&str>,
+) -> Result<DiscoveredCatalog, CatalogError> {
+    tokio::time::timeout(
+        PROVIDER_MODEL_DISCOVERY_TIMEOUT,
+        discoverer.discover(source, access_token, etag),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(CatalogError::Transport {
+            reason: format!(
+                "model catalog discovery timed out after {} seconds",
+                PROVIDER_MODEL_DISCOVERY_TIMEOUT.as_secs()
+            ),
+        })
+    })
 }
 
 fn respond_provider_models_unavailable(
@@ -4736,6 +4837,7 @@ struct ProviderConfigureContext<'a> {
     vault: &'a dyn Vault,
     management: Option<&'a ManagementSnapshot>,
     providers: &'a mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &'a mut HashSet<String>,
     endpoint_validator: Arc<dyn ProviderEndpointValidator>,
     model_discoverer: &'a dyn ProviderModelDiscoverer,
 }
@@ -4791,6 +4893,7 @@ async fn handle_provider_configure(
         vault,
         management,
         providers,
+        pending_catalog_discoveries,
         endpoint_validator,
         model_discoverer,
     } = context;
@@ -4890,7 +4993,9 @@ async fn handle_provider_configure(
             return;
         }
         let origin = origin.to_owned();
-        let configured_inventory = !job.input.models.is_empty() && job.probe_secret.is_none();
+        // A configuration-only request validates origin safety/DNS but never
+        // opens `/models`. Discovery belongs to the post-commit flight.
+        let configured_inventory = job.probe_secret.is_none();
         let validation = tokio::spawn(async move {
             if configured_inventory {
                 endpoint_validator.validate_configured_origin(&origin).await
@@ -4943,16 +5048,18 @@ async fn handle_provider_configure(
                 .as_ref()
                 .and_then(|profile| profile.base_url.as_deref())
         });
-        let should_discover = job.probe_secret.is_some() || job.input.models.is_empty();
+        let should_discover = job.probe_secret.is_some();
         if !should_discover
+            && !job.input.models.is_empty()
             && existing
                 .as_ref()
                 .is_none_or(|profile| matches!(profile.provenance, ProviderProvenance::Custom))
         {
-            // The card has already probed, or explicitly chosen a manual
-            // fallback. Preserve its complete stated inventory through the
-            // same durable cache/recovery path; do not require a second GET
-            // that could turn a successful picker into a dead end.
+            // A non-empty inventory means the card has already probed, or
+            // explicitly chosen a manual fallback. Preserve that inventory
+            // through the durable cache/recovery path. Empty means
+            // post-commit discovery is still pending, never a successful
+            // fetch of zero rows.
             let models = job
                 .input
                 .models
@@ -5123,6 +5230,7 @@ async fn handle_provider_configure(
     let custom_repoint = providers.get(&job.input.provider).is_some_and(|profile| {
         matches!(profile.provenance, ProviderProvenance::Custom) && job.input.origin.is_some()
     });
+    let discover_after_commit = job.probe_secret.is_none() && job.input.models.is_empty();
     let validate = match discovered_slugs.as_deref() {
         Some(inventory) => {
             providers.validate_configure_with_inventory(job.input.clone(), inventory)
@@ -5380,6 +5488,11 @@ async fn handle_provider_configure(
             accounts.list().to_vec(),
             providers.summaries(&provider_has_credential(accounts)),
         );
+    }
+    if discover_after_commit
+        && matches!(profile.auth_requirement, ProviderAuthRequirementWire::None)
+    {
+        enqueue_catalog_discovery(&profile.provider_id, providers, pending_catalog_discoveries);
     }
     respond(
         &job.route,
@@ -5899,6 +6012,7 @@ async fn handle_login(
     _profile_id: &str,
     default_model: &str,
     pending: &mut HashMap<String, PendingSecret>,
+    pending_catalog_discoveries: &mut HashSet<String>,
     reserved_aliases: &HashSet<String>,
     job: LoginJob,
 ) {
@@ -5911,8 +6025,9 @@ async fn handle_login(
         secret,
         route,
     } = job;
-    // A custom profile validates against its OWN stored `/v1/models`
-    // catalog; everything else keeps the fixed validator set.
+    // A custom profile supplies endpoint/default metadata, but its remote
+    // catalog is discovered only after the credential commits. Everything
+    // else keeps the fixed validator set.
     let custom_target = custom_login_target(management, &provider);
     // G4b: the enterprise builtins validate at their PROFILE endpoint with
     // the profile's declared default model spelling.
@@ -5976,6 +6091,11 @@ async fn handle_login(
             // committed result (secret drops zeroized here).
             drop(secret);
             pending.remove(&command_id);
+            enqueue_catalog_discovery(
+                &response.descriptor.provider,
+                providers,
+                pending_catalog_discoveries,
+            );
             respond(
                 &route,
                 ResponseBody::AccountLoginApi {
@@ -6043,6 +6163,7 @@ async fn handle_login(
                 &command_id,
                 &alias,
                 &route,
+                pending_catalog_discoveries,
             )
             .await;
             return;
@@ -6069,6 +6190,7 @@ async fn handle_login(
                 &command_id,
                 &alias,
                 &route,
+                pending_catalog_discoveries,
             )
             .await;
             return;
@@ -6091,22 +6213,12 @@ async fn handle_login(
     };
 
     let validation = match &custom_target {
-        Some(_)
-            if providers.get(&provider).is_some_and(|profile| {
-                matches!(profile.provenance, ProviderProvenance::Custom)
-                    && profile.enabled
-                    && profile.configured_models.contains(&identity.resolved_model)
-            }) =>
-        {
-            // A confirmed custom model is an explicit choice to proceed
-            // even when /models is absent or separately permissioned. That
-            // advisory endpoint cannot veto storing the user's key, and a
-            // second probe could strand a just-confirmed picker. This
-            // accepts key syntax only; inference still owns authentication.
+        Some(_) => {
+            // A remote catalog is advisory discovery, never credential
+            // validation on the mutation path. Commit syntactically valid
+            // key material first; the queued catalog flight and the next
+            // inference turn report remote authentication independently.
             accept_configured_custom_key(&provider, &secret)
-        }
-        Some((origin, _, api_family)) => {
-            validate_custom_provider_key(origin, &provider, *api_family, &secret).await
         }
         None => {
             validator
@@ -6195,6 +6307,7 @@ async fn handle_login(
                 &command_id,
                 &alias,
                 &route,
+                pending_catalog_discoveries,
             )
             .await;
         }
@@ -6315,6 +6428,8 @@ async fn handle_oauth_add(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut HashSet<String>,
     _profile_id: &str,
     reserved_aliases: &HashSet<String>,
     job: OAuthAddJob,
@@ -6352,6 +6467,11 @@ async fn handle_oauth_add(
         .await;
     let resume = match receipt {
         Ok(AccountAddClaim::Committed(response)) => {
+            enqueue_catalog_discovery(
+                &response.descriptor.provider,
+                providers,
+                pending_catalog_discoveries,
+            );
             respond(
                 &route,
                 ResponseBody::AccountAdd {
@@ -6388,6 +6508,8 @@ async fn handle_oauth_add(
             accounts,
             snapshot,
             management,
+            providers,
+            pending_catalog_discoveries,
             &command_id,
             &alias,
             &route,
@@ -6426,6 +6548,8 @@ async fn handle_oauth_add(
                         accounts,
                         snapshot,
                         management,
+                        providers,
+                        pending_catalog_discoveries,
                         &command_id,
                         &alias,
                         &route,
@@ -6487,6 +6611,8 @@ async fn handle_oauth_add(
         accounts,
         snapshot,
         management,
+        providers,
+        pending_catalog_discoveries,
         &command_id,
         &alias,
         &route,
@@ -6561,6 +6687,7 @@ async fn handle_device_import(
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut HashSet<String>,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -6623,6 +6750,8 @@ async fn handle_device_import(
         vault,
         snapshot,
         management,
+        providers,
+        pending_catalog_discoveries,
         reserved_aliases,
         refresh_fences,
         OAuthImportJob {
@@ -6853,6 +6982,8 @@ async fn handle_oauth_import_heal(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut HashSet<String>,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
     descriptor: &CredentialDescriptor,
@@ -7085,6 +7216,8 @@ async fn handle_oauth_import_heal(
         vault,
         snapshot,
         management,
+        providers,
+        pending_catalog_discoveries,
         reserved_aliases,
         refresh_fences,
         OAuthImportJob {
@@ -7168,6 +7301,8 @@ async fn handle_oauth_import(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut HashSet<String>,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
     job: OAuthImportJob,
@@ -7225,6 +7360,11 @@ async fn handle_oauth_import(
         .await
     {
         Ok(Some(ManagementClaim::Committed { response, revision })) => {
+            enqueue_catalog_discovery(
+                &response.descriptor.provider,
+                providers,
+                pending_catalog_discoveries,
+            );
             respond(
                 &job.route,
                 oauth_import_response(response_kind, response.descriptor, revision),
@@ -7263,6 +7403,11 @@ async fn handle_oauth_import(
                     return;
                 }
             };
+            enqueue_catalog_discovery(
+                &response.descriptor.provider,
+                providers,
+                pending_catalog_discoveries,
+            );
             respond(
                 &job.route,
                 oauth_import_response(response_kind, response.descriptor, revision),
@@ -7474,6 +7619,8 @@ async fn handle_oauth_import(
             accounts,
             snapshot,
             management,
+            providers,
+            pending_catalog_discoveries,
             &job.command_id,
             &alias,
             &job.route,
@@ -7503,6 +7650,8 @@ async fn handle_oauth_import(
         accounts,
         snapshot,
         management,
+        providers,
+        pending_catalog_discoveries,
         &job.command_id,
         &alias,
         &job.route,
@@ -7856,6 +8005,8 @@ async fn finalize_oauth_commit(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut HashSet<String>,
     command_id: &str,
     alias: &CredentialAlias,
     route: &LoginRoute,
@@ -7900,6 +8051,7 @@ async fn finalize_oauth_commit(
         }
     };
     publish_management_snapshot(snapshot, management, accounts, revision);
+    enqueue_catalog_discovery(&descriptor.provider, providers, pending_catalog_discoveries);
     match response {
         OAuthCommitResponse::Add => respond(route, ResponseBody::AccountAdd { descriptor }),
         OAuthCommitResponse::ImportLegacy | OAuthCommitResponse::ImportDevice => {
@@ -7974,6 +8126,7 @@ async fn finalize_and_respond(
     command_id: &str,
     alias: &CredentialAlias,
     route: &LoginRoute,
+    pending_catalog_discoveries: &mut HashSet<String>,
 ) {
     let Some(descriptor) = accounts.get(alias).cloned() else {
         respond_error(
@@ -8011,6 +8164,7 @@ async fn finalize_and_respond(
             providers.summaries(&provider_has_credential(accounts)),
         );
     }
+    enqueue_catalog_discovery(&descriptor.provider, providers, pending_catalog_discoveries);
     respond(route, ResponseBody::AccountLoginApi { descriptor });
 }
 

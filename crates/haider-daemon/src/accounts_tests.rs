@@ -1608,7 +1608,11 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
         .await
         .expect("credential-free mock discovery");
     server.await.expect("mock server served one request");
-    providers.replace_discovered_models("ollama".to_owned(), catalog.models, 1);
+    providers.replace_discovered_models(
+        "ollama".to_owned(),
+        catalog.models,
+        unix_ms_after(Duration::ZERO),
+    );
 
     let after = providers
         .summary("ollama", &|_| false)
@@ -2845,11 +2849,11 @@ fn provider_probe_failures_map_to_typed_secret_free_error_data() {
     );
 }
 
-/// A newly configured no-auth provider is not committed until discovery has
-/// supplied its live inventory; the same inventory reaches the durable cache
-/// and the response summary.
+/// A newly configured no-auth provider commits before discovery. The actor
+/// queue owns the subsequent catalog flight, so this handler publishes no
+/// invented rows and writes no empty successful cache entry.
 #[tokio::test]
-async fn custom_provider_configure_discovers_before_successful_commit() {
+async fn custom_provider_configure_commits_then_enqueues_discovery() {
     struct CanonicalEndpoint;
 
     #[async_trait::async_trait]
@@ -2901,6 +2905,7 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
     let discoverer = ImmediateDiscovery;
+    let mut pending_catalog_discoveries = HashSet::new();
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -2909,6 +2914,7 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
+            pending_catalog_discoveries: &mut pending_catalog_discoveries,
             endpoint_validator: Arc::new(CanonicalEndpoint),
             model_discoverer: &discoverer,
         },
@@ -2944,18 +2950,24 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
         } => {
             assert_eq!(revision, 1);
             assert_eq!(provider.provider, "router");
-            assert_eq!(provider.models, vec!["live-model".to_owned()]);
-            assert_eq!(provider.default_model.as_deref(), Some("live-model"));
+            assert!(provider.models.is_empty());
+            assert!(provider.default_model.is_none());
             assert!(provider.auth_methods.is_empty());
         }
         other => panic!("unexpected configure response: {other:?}"),
     }
-    let cached = store
-        .provider_models("router".into())
-        .await
-        .expect("read provider cache")
-        .expect("provider cache row");
-    assert!(cached.models_json.contains("live-model"));
+    assert!(
+        store
+            .provider_models("router".into())
+            .await
+            .expect("read provider cache")
+            .is_none(),
+        "configuration must not fabricate an empty fetched cache"
+    );
+    assert_eq!(
+        pending_catalog_discoveries,
+        HashSet::from(["router".to_owned()])
+    );
     store.close().await.expect("close store");
 }
 
@@ -2994,6 +3006,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let discoverer = UnusedDiscovery;
+    let mut pending_catalog_discoveries = HashSet::new();
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -3002,6 +3015,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
             vault: &vault,
             management: None,
             providers: &mut providers,
+            pending_catalog_discoveries: &mut pending_catalog_discoveries,
             endpoint_validator: Arc::new(TransportFailureEndpoint),
             model_discoverer: &discoverer,
         },
@@ -3763,6 +3777,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
+        &mut HashSet::new(),
         &HashSet::new(),
         login_job("command-ttl", "req-1", Some(b"sk-retained"), &sink),
     )
@@ -3794,6 +3809,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
+        &mut HashSet::new(),
         &HashSet::new(),
         login_job("command-ttl", "req-2", None, &sink),
     )
@@ -7464,7 +7480,11 @@ async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
             None,
         )]
     );
-    providers.replace_discovered_models(DEEPSEEK_PROVIDER_NAME.to_owned(), discovered.models, 1);
+    providers.replace_discovered_models(
+        DEEPSEEK_PROVIDER_NAME.to_owned(),
+        discovered.models,
+        unix_ms_after(Duration::ZERO),
+    );
     let after = providers
         .summary(DEEPSEEK_PROVIDER_NAME, &|provider| {
             provider == DEEPSEEK_PROVIDER_NAME
@@ -8245,7 +8265,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("post-panic response deadline")
             .expect("post-panic response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 2, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
             ..
         }
     ));
@@ -8282,7 +8302,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("draining response deadline")
             .expect("draining response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 2, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
             ..
         }
     ));
@@ -9522,6 +9542,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         &snapshot,
         Some(&management),
         &providers,
+        &mut HashSet::new(),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         Arc::new(UnreachableGcloud),
@@ -10060,16 +10081,18 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
         })))
         .await
         .expect("activate manual OAuth");
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), frames.recv())
-            .await
-            .expect("set active deadline")
-            .expect("set active response"),
+    let active_revision = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("set active deadline")
+        .expect("set active response")
+    {
         WireFrame::Response {
-            body: ResponseBody::AccountSetActive { revision: 3, .. },
+            body: ResponseBody::AccountSetActive { revision, .. },
             ..
-        }
-    ));
+        } => revision,
+        other => panic!("unexpected set-active response: {other:?}"),
+    };
+    assert!(active_revision >= 3);
 
     std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_2).expect("write Codex fixture 2");
     send_oauth_import(&commands, Arc::clone(&sink), "import-codex-second", "codex").await;
@@ -10082,10 +10105,13 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
             body:
                 ResponseBody::AccountOAuthImport {
                     descriptor,
-                    revision: 4,
+                    revision,
                 },
             ..
-        } => descriptor,
+        } => {
+            assert!(revision > active_revision);
+            descriptor
+        }
         other => panic!("unexpected second import response: {other:?}"),
     };
     assert_eq!(
@@ -11132,21 +11158,23 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
         &kimi_candidate,
     )
     .await;
-    let kimi_descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("Kimi device import deadline")
-        .expect("Kimi device import response")
-    {
-        WireFrame::Response {
-            body:
-                ResponseBody::AccountImportDevice {
-                    descriptor,
-                    revision: 2,
-                },
-            ..
-        } => descriptor,
-        other => panic!("unexpected Kimi device import response: {other:?}"),
-    };
+    let (kimi_descriptor, kimi_revision) =
+        match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("Kimi device import deadline")
+            .expect("Kimi device import response")
+        {
+            WireFrame::Response {
+                body:
+                    ResponseBody::AccountImportDevice {
+                        descriptor,
+                        revision,
+                    },
+                ..
+            } => (descriptor, revision),
+            other => panic!("unexpected Kimi device import response: {other:?}"),
+        };
+    assert!(kimi_revision >= 2);
     assert_eq!(kimi_descriptor.alias.as_str(), KIMI_OAUTH_PROVIDER_NAME);
     assert_eq!(kimi_descriptor.provider, KIMI_OAUTH_PROVIDER_NAME);
     assert_eq!(
@@ -11176,7 +11204,7 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
     );
 
     assert_eq!(snapshot.lock().expect("snapshot").len(), 2);
-    assert_eq!(management.read().expect("management").revision, 2);
+    assert!(management.read().expect("management").revision >= kimi_revision);
 
     let receipts = store.account_add_receipts().await.expect("import receipts");
     let receipt_for = |command_id: &str| {
@@ -11932,6 +11960,7 @@ async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_mod
         "profile-bedrock",
         "claude-global-default",
         &mut pending,
+        &mut HashSet::new(),
         &HashSet::new(),
         LoginJob {
             command_id: "bedrock-login".to_owned(),
@@ -12120,6 +12149,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
+        &mut HashSet::new(),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -12169,6 +12199,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
+        &mut HashSet::new(),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -14103,6 +14134,7 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
     let vault = MemoryVault::new();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
+    let mut pending_catalog_discoveries = HashSet::new();
     for (revision, ids, selected) in [
         (0, vec!["server-default", "other-model"], "other-model"),
         (1, vec!["manual-id"], "manual-id"),
@@ -14115,6 +14147,7 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
                 vault: &vault,
                 management: Some(&management),
                 providers: &mut providers,
+                pending_catalog_discoveries: &mut pending_catalog_discoveries,
                 endpoint_validator: Arc::new(CustomprovCanonicalEndpoint),
                 model_discoverer: &CustomprovNoSecondDiscovery,
             },
@@ -14277,6 +14310,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut pending_catalog_discoveries = HashSet::new();
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -14285,6 +14319,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
             vault: &vault,
             management: Some(&management),
             providers: &mut providers,
+            pending_catalog_discoveries: &mut pending_catalog_discoveries,
             endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
             model_discoverer: &CustomprovNoSecondDiscovery,
         },
@@ -14320,6 +14355,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
         "customprov-offline-profile",
         "unused-global-model",
         &mut pending,
+        &mut pending_catalog_discoveries,
         &HashSet::new(),
         LoginJob {
             command_id: "customprov-offline-login".into(),
@@ -14359,6 +14395,10 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
         other => panic!("manual key login must complete: {other:?}"),
     }
     assert_eq!(accounts.list().len(), 1);
+    assert_eq!(
+        pending_catalog_discoveries,
+        HashSet::from(["customprov-offline".to_owned()])
+    );
     store.close().await.expect("close offline store");
 }
 
