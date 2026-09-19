@@ -23,9 +23,10 @@ from turnperf_support import (
     ThrowawayProfile,
     assert_provider_ledger,
     assert_tool_effect,
+    cpu_accounting_self_check,
     load_one_minute,
     median_mad,
-    process_cpu_ms,
+    process_cpu_times,
     profile_lock_is_free,
     process_peak_rss_kib,
     process_rss_kib,
@@ -199,6 +200,7 @@ def run_one_shot_harness(
     ):
         if value is not None and (not math.isfinite(value) or value <= 0):
             raise ProofError(f"{name} must be finite and positive")
+    cpu_accounting = cpu_accounting_self_check()
     root = Path(tempfile.mkdtemp(prefix="htp-one-shot-"))
     proxy_ledger = root / "provider-ledger.jsonl"
     samples: list[dict[str, Any]] = []
@@ -434,6 +436,12 @@ def run_one_shot_harness(
     report = {
         "schema": "haider.turn-wall.v1",
         "mode": "one-shot",
+        "cpu_accounting": {
+            "version": 2,
+            "self_check": cpu_accounting,
+            "authority": "getrusage(RUSAGE_CHILDREN) seconds * 1000; complete reaped CLI/daemon lifecycle",
+            "sampled_client_authority": "native self CPU; lower bound at last live sample",
+        },
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "commit": commit_label or _git_commit(),
         "host": _host_facts(),
@@ -519,6 +527,7 @@ def run_harness(
 ) -> dict[str, Any]:
     if warmups < 0 or measured < 1:
         raise ProofError("warmups must be non-negative and measured must be positive")
+    cpu_accounting = cpu_accounting_self_check()
     root = Path(tempfile.mkdtemp(prefix="htp-run-", dir="/tmp"))
     proxy_ledger = root / "provider-ledger.jsonl"
     profile: ThrowawayProfile | None = None
@@ -544,14 +553,14 @@ def run_harness(
             def one_case(shape: str, sample_index: int, reported: bool) -> None:
                 nonlocal daemon_peak_rss_kib
                 case_id = proxy.state.begin_case(shape)
-                daemon_cpu_before = process_cpu_ms(pid)
+                daemon_cpu_before = process_cpu_times(pid)
                 result = profile.command(
                     run_arguments(shape),
                     timeout=82,
                     overrides=trace_override,
                     observe_pid=pid,
                 )
-                daemon_cpu_after = process_cpu_ms(pid)
+                daemon_cpu_after = process_cpu_times(pid)
                 daemon_peak = result.observed_peak_rss_kib
                 if result.child_peak_rss_kib <= 0 or daemon_peak <= 0:
                     raise ProofError(
@@ -580,7 +589,7 @@ def run_harness(
                         f"expected={identity} actual={(actual_pid, actual_generation)}"
                     )
                 daemon_rss = process_rss_kib(pid)
-                daemon_cpu_ms = max(0.0, daemon_cpu_after - daemon_cpu_before)
+                daemon_cpu = daemon_cpu_after.delta(daemon_cpu_before)
                 daemon_peak_rss_kib = max(daemon_peak_rss_kib, daemon_peak)
                 client_trace = _trace_records(result.stderr) if trace else []
                 client_terminal = [
@@ -600,8 +609,11 @@ def run_harness(
                     "client_cpu_ms": result.cpu_ms,
                     "client_sampled_cpu_lower_bound_ms": result.sampled_client_cpu_ms,
                     "client_cpu_sample_count": result.client_cpu_sample_count,
-                    "daemon_cpu_ms": daemon_cpu_ms,
-                    "combined_cpu_ms": result.cpu_ms + daemon_cpu_ms,
+                    "daemon_cpu_ms": daemon_cpu.self_ms,
+                    "daemon_reaped_children_cpu_ms": daemon_cpu.reaped_children_ms,
+                    "combined_cpu_ms": (
+                        result.cpu_ms + daemon_cpu.self_ms + daemon_cpu.reaped_children_ms
+                    ),
                     "client_peak_rss_kib": result.child_peak_rss_kib,
                     "daemon_rss_kib": daemon_rss,
                     "daemon_peak_rss_kib": daemon_peak,
@@ -709,6 +721,10 @@ def run_harness(
         summary[shape] = {
             "wall_ms": {"median": wall_median, "mad": wall_mad},
             "combined_cpu_ms": {"median": cpu_median, "mad": cpu_mad},
+            **{
+                name: dict(zip(("median", "mad"), median_mad([row[name] for row in samples[shape]])))
+                for name in ("client_cpu_ms", "daemon_cpu_ms", "daemon_reaped_children_cpu_ms")
+            },
             "peak_rss_kib": peak_rss_kib,
             "client_peak_rss_kib": client_peak_rss_kib,
             "daemon_peak_rss_kib": daemon_peak_rss_kib,
@@ -904,6 +920,17 @@ def run_harness(
 
     report = {
         "schema": "haider.turn-wall.v1",
+        "cpu_accounting": {
+            "version": 2,
+            "self_check": cpu_accounting,
+            "client": "getrusage(RUSAGE_CHILDREN) seconds * 1000; reaped CLI",
+            "daemon_cpu_ms": "daemon self CPU only",
+            "daemon_reaped_children_cpu_ms": "daemon's reaped child/descendant CPU delta",
+            "combined_cpu_ms": "client + daemon self + daemon reaped children",
+            "daemon_source": "proc_pid_rusage Mach ticks with runtime timebase on Darwin; /proc stat clock ticks on Linux",
+            "boundary": "before client launch to after client exit, BEFORE wait_session_idle/status probes",
+            "excludes": "unreaped/detached descendants, later daemon work, fake-provider/harness CPU",
+        },
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "commit": commit_label or _git_commit(),
         "host": _host_facts(),
@@ -958,7 +985,9 @@ def run_harness(
 
 def _arguments(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin-dir", type=Path, required=True)
+    parser.add_argument("--bin-dir", type=Path)
+    parser.add_argument("--self-check-cpu", action="store_true",
+                        help="check CPU units against native accounting without running a benchmark")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--one-shot", action="store_true")
     parser.add_argument("--warmups", type=int)
@@ -1000,6 +1029,11 @@ def main(argv: list[str] | None = None) -> int:
             print("turn-wall harness failed: budgets must be finite and positive", file=sys.stderr)
             return 2
     try:
+        if args.self_check_cpu:
+            print(json.dumps(cpu_accounting_self_check(), indent=2, sort_keys=True))
+            return 0
+        if args.bin_dir is None:
+            raise ProofError("--bin-dir is required unless --self-check-cpu is used")
         if args.one_shot:
             if args.tool_budget_ms is not None:
                 raise ProofError("--tool-budget-ms is not valid with --one-shot")
