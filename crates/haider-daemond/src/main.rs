@@ -396,10 +396,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
             );
         }
     };
-    // `HAIDER_DISCOVERY_DISABLED` (any value but `0`): never probe first-party
-    // device credential stores. Tests and CI set this so startup
-    // auto-adoption cannot read the HOST machine's real codex/Claude/kimi
-    // credentials into a throwaway profile.
+    // `HAIDER_DISCOVERY_DISABLED` (any value but `0`): disable background
+    // discovery, both first-party device-store probing and automatic catalog
+    // flights after credential mutations. Explicit foreground refreshes stay
+    // available. Tests and CI set this so throwaway profiles never contact
+    // ambient credential stores or remote catalogs implicitly.
     if std::env::var_os("HAIDER_DISCOVERY_DISABLED").is_some_and(|value| value != "0") {
         config.discovery_disabled = true;
     }

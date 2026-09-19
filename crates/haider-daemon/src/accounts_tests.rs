@@ -2905,7 +2905,7 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
     let discoverer = ImmediateDiscovery;
-    let mut pending_catalog_discoveries = HashSet::new();
+    let mut pending_catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(true);
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -2965,7 +2965,7 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
         "configuration must not fabricate an empty fetched cache"
     );
     assert_eq!(
-        pending_catalog_discoveries,
+        pending_catalog_discoveries.providers,
         HashSet::from(["router".to_owned()])
     );
     store.close().await.expect("close store");
@@ -3006,7 +3006,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let discoverer = UnusedDiscovery;
-    let mut pending_catalog_discoveries = HashSet::new();
+    let mut pending_catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(true);
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -3777,7 +3777,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
-        &mut HashSet::new(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
         &HashSet::new(),
         login_job("command-ttl", "req-1", Some(b"sk-retained"), &sink),
     )
@@ -3809,7 +3809,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
-        &mut HashSet::new(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
         &HashSet::new(),
         login_job("command-ttl", "req-2", None, &sink),
     )
@@ -7527,6 +7527,231 @@ impl ProviderModelDiscoverer for BlockingModelDiscoverer {
     }
 }
 
+struct GeminiCatalogLoginValidator;
+
+#[async_trait::async_trait]
+impl CredentialValidator for GeminiCatalogLoginValidator {
+    fn supports(&self, provider: &str) -> bool {
+        provider == GEMINI_PROVIDER_NAME
+    }
+
+    async fn validate(
+        &self,
+        provider: &str,
+        _model: &str,
+        _secret: &[u8],
+        _endpoint: Option<&str>,
+    ) -> Result<ValidatedIdentity, ValidationError> {
+        assert_eq!(provider, GEMINI_PROVIDER_NAME);
+        Ok(ValidatedIdentity {
+            identity: "Gemini catalog fixture".into(),
+        })
+    }
+}
+
+async fn start_gemini_catalog_test_actor(
+    discovery_disabled: bool,
+) -> (
+    tempfile::TempDir,
+    SqliteStoreHandle,
+    AccountActorHandle,
+    CredentialBroker,
+    Arc<BlockingModelDiscoverer>,
+) {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let vault = Arc::new(MemoryVault::new());
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let providers = ProviderRegistry::new(
+        provider_store,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([GEMINI_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("Gemini provider registry");
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let discoverer = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "gemini-2.5-flash".to_owned(),
+                    display_name: "Gemini 2.5 Flash".to_owned(),
+                    context_window: Some(1_048_576),
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    extensions: None,
+                }],
+                etag: None,
+            })),
+        ])),
+    });
+    let discoverer_trait: Arc<dyn ProviderModelDiscoverer> = discoverer.clone();
+    let broker_vault = vault.clone() as Arc<dyn Vault>;
+    let broker_snapshot = Arc::clone(&snapshot);
+    let (actor, broker) = start_account_actor_with_services(
+        AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: vault as Arc<dyn Vault>,
+            validator: Arc::new(GeminiCatalogLoginValidator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management),
+            device_discovery: DeviceDiscoverySnapshot::new(discovery_disabled),
+            profile_id: "gemini-catalog-flight".to_owned(),
+            default_model: "unused".to_owned(),
+            providers,
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            reserved_aliases: HashSet::new(),
+            refresh_fences: RefreshFenceRegistry::default(),
+            source_registry: empty_source_registry(),
+            source_snapshot: empty_source_snapshot(),
+        },
+        |commands| {
+            CredentialBroker::new(
+                broker_vault,
+                OAuthProviderCatalog::default(),
+                broker_snapshot,
+                commands,
+            )
+        },
+        discoverer_trait,
+        Arc::new(UnreachableGcloud),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+    )
+    .expect("Gemini catalog actor");
+    (dir, store, actor, broker, discoverer)
+}
+
+async fn login_gemini_catalog_fixture(actor: &AccountActorHandle, suffix: &str) {
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::Login(Box::new(LoginJob {
+            command_id: format!("gemini-catalog-login-{suffix}"),
+            provider: GEMINI_PROVIDER_NAME.to_owned(),
+            display_alias: Some(format!("gemini-catalog-{suffix}")),
+            validation_model: Some("gemini-2.5-flash".to_owned()),
+            replace_existing: false,
+            secret: Some(Zeroizing::new(
+                format!("GEMINI_CATALOG_KEY_{suffix}").into_bytes(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new(format!("gemini-catalog-login-{suffix}")),
+                sink,
+            },
+        })))
+        .await
+        .expect("Gemini login handoff");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("Gemini login response deadline")
+            .expect("Gemini login response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountLoginApi { .. },
+            ..
+        }
+    ));
+}
+
+/// Credential-triggered discovery is invisible to foreground refreshes: a
+/// foreground caller adopts the one active automatic flight. The daemon-wide
+/// discovery-off policy suppresses only that automatic work; an explicit
+/// refresh remains available and still performs exactly one bounded flight.
+#[tokio::test]
+async fn automatic_catalog_flight_coalesces_foreground_and_honors_discovery_disabled() {
+    let (_dir, store, mut actor, broker, discoverer) = start_gemini_catalog_test_actor(false).await;
+    login_gemini_catalog_fixture(&actor, "coalesce").await;
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("automatic catalog flight started");
+
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: GEMINI_PROVIDER_NAME.to_owned(),
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
+                request_id: RequestId::new("gemini-foreground-refresh"),
+                sink,
+            }),
+        })
+        .await
+        .expect("foreground refresh handoff");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), frames.recv())
+            .await
+            .is_err(),
+        "foreground refresh must await the automatic flight, not answer busy"
+    );
+    discoverer.release.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("coalesced refresh deadline")
+            .expect("coalesced refresh response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { .. },
+            ..
+        }
+    ));
+    assert_eq!(discoverer.seen.lock().expect("seen").len(), 1);
+    actor.shutdown().await;
+    assert!(broker.shutdown().await);
+    store.close().await.expect("close coalescing store");
+
+    let (_dir, store, mut actor, broker, discoverer) = start_gemini_catalog_test_actor(true).await;
+    login_gemini_catalog_fixture(&actor, "disabled").await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), discoverer.started.notified())
+            .await
+            .is_err(),
+        "discovery-disabled daemon must not launch an automatic catalog flight"
+    );
+    assert!(discoverer.seen.lock().expect("seen").is_empty());
+
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: GEMINI_PROVIDER_NAME.to_owned(),
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
+                request_id: RequestId::new("gemini-explicit-refresh"),
+                sink,
+            }),
+        })
+        .await
+        .expect("explicit refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("explicit catalog flight remains available");
+    discoverer.release.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("explicit refresh deadline")
+            .expect("explicit refresh response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { .. },
+            ..
+        }
+    ));
+    assert_eq!(discoverer.seen.lock().expect("seen").len(), 1);
+    actor.shutdown().await;
+    assert!(broker.shutdown().await);
+    store.close().await.expect("close disabled store");
+}
+
 fn refresh_oauth_catalog() -> OAuthProviderCatalog {
     let registration = crate::oauth::OAuthProviderRegistration::new(
         OPENAI_OAUTH_PROVIDER_NAME,
@@ -9542,7 +9767,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         &snapshot,
         Some(&management),
         &providers,
-        &mut HashSet::new(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         Arc::new(UnreachableGcloud),
@@ -11960,7 +12185,7 @@ async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_mod
         "profile-bedrock",
         "claude-global-default",
         &mut pending,
-        &mut HashSet::new(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
         &HashSet::new(),
         LoginJob {
             command_id: "bedrock-login".to_owned(),
@@ -12149,7 +12374,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
-        &mut HashSet::new(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -12199,7 +12424,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
-        &mut HashSet::new(),
+        &mut AutomaticCatalogDiscoveryQueue::new(true),
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -14134,7 +14359,7 @@ async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_withou
     let vault = MemoryVault::new();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
     let mut providers = test_provider_registry();
-    let mut pending_catalog_discoveries = HashSet::new();
+    let mut pending_catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(true);
     for (revision, ids, selected) in [
         (0, vec!["server-default", "other-model"], "other-model"),
         (1, vec!["manual-id"], "manual-id"),
@@ -14310,7 +14535,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     let vault = MemoryVault::new();
     let mut providers = test_provider_registry();
     let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
-    let mut pending_catalog_discoveries = HashSet::new();
+    let mut pending_catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(true);
     let (sink, mut frames) = channel_sink();
     handle_provider_configure(
         ProviderConfigureContext {
@@ -14396,7 +14621,7 @@ async fn customprov_manual_offline_create_and_key_login_complete_without_models_
     }
     assert_eq!(accounts.list().len(), 1);
     assert_eq!(
-        pending_catalog_discoveries,
+        pending_catalog_discoveries.providers,
         HashSet::from(["customprov-offline".to_owned()])
     );
     store.close().await.expect("close offline store");
@@ -14668,6 +14893,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
     let (commands, mut received) = mpsc::channel(8);
     let mut tasks = JoinSet::new();
     let mut routes = HashMap::new();
+    let mut followers = HashMap::new();
     let mut refreshing = HashSet::new();
     let (failed_sink, mut failed_frames) = channel_sink();
     begin_provider_models_refresh(
@@ -14679,6 +14905,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         &commands,
         &mut tasks,
         &mut routes,
+        &mut followers,
         &mut refreshing,
         OPENAI_OAUTH_PROVIDER_NAME.into(),
         ProviderModelsRefreshCompletion::Wire(LoginRoute {
@@ -14718,6 +14945,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         &commands,
         &mut tasks,
         &mut routes,
+        &mut followers,
         &mut refreshing,
         HAIDER_CODE_PROVIDER_NAME.into(),
         ProviderModelsRefreshCompletion::Wire(LoginRoute {
@@ -14811,6 +15039,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             &commands,
             &mut tasks,
             &mut routes,
+            &mut followers,
             &mut refreshing,
             OPENAI_OAUTH_PROVIDER_NAME.into(),
             ProviderModelsRefreshCompletion::Wire(LoginRoute {

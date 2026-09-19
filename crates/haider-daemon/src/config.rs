@@ -73,8 +73,9 @@ pub struct DaemonConfig {
     /// profile resolver; the packaged default is
     /// `haider_client::PACKAGED_DEFAULT_MODEL`.
     pub default_model: String,
-    /// Disables probing first-party device credential stores for this profile.
-    /// The wire reports an explicit disabled state rather than an empty scan.
+    /// Disables background discovery for this profile: first-party device
+    /// credential scans and credential-triggered catalog refreshes. Explicit
+    /// foreground catalog refreshes remain available.
     pub discovery_disabled: bool,
     /// Effective idle TTL of a launcher-owned daemon. `Some(Duration::ZERO)`
     /// is the explicit one-shot policy; `None` is an unbounded/direct daemon.
