@@ -1160,6 +1160,39 @@ pub enum SessionWorkspaceSetOutcome {
     },
 }
 
+/// Secret-free coordinates for one atomic launch-origin registration
+/// riding `session.attach` (`docs/design/dated-workspace-v1.md` §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaunchOriginCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    /// Client-minted open identity for this foreground activation.
+    pub open_id: String,
+    /// Current origin revision this registration replaces (0 = absence).
+    pub expected_revision: u64,
+    /// Already sanitised by the client and revalidated on ingress.
+    pub path: haider_protocol::session::LaunchOriginPathV1,
+    /// Whether the resolved workspace path existed on disk at registration.
+    pub workspace_materialized: Option<bool>,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Result of the atomic origin projection/event/receipt transaction (O4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionLaunchOriginOutcome {
+    Committed {
+        origin: haider_protocol::session::LaunchOriginV1,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        origin: haider_protocol::session::LaunchOriginV1,
+    },
+}
+
 /// Secret-free coordinates for one atomic durable attention acknowledgement.
 ///
 /// `session.seen` is ordered through the same actor as every session write.
@@ -8223,6 +8256,11 @@ impl Store {
             // binds a Loom identity later.
             agent_type: None,
             context_economy: ContextEconomy::default(),
+            // Dated-workspace v1: origin arrives with the first foreground
+            // attach; allocation facts ride the create command in a later
+            // additive step. Both stay off the wire while absent.
+            launch_origin: None,
+            workspace_allocation: None,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
@@ -9954,6 +9992,214 @@ impl Store {
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(SessionWorkspaceSetOutcome::Committed {
             selected,
+            envelope: Box::new(envelopes.remove(0)),
+        })
+    }
+
+    /// Looks up a committed launch-origin registration response before
+    /// session or generation validation (same response-loss recovery law
+    /// as `session.workspace.set`).
+    pub fn session_launch_origin_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<haider_protocol::session::LaunchOriginV1>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.origin.register",
+            request_digest,
+            request_json,
+            "session-launch-origin",
+        )
+    }
+
+    /// The session's CURRENT launch-origin snapshot: the typed-metadata
+    /// projection when present, otherwise the newest matching committed
+    /// origin event (legacy `{}` rows and projection recovery). Never
+    /// returns another session's copied history (`subject_session_id`
+    /// must match).
+    pub fn latest_launch_origin(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<Option<haider_protocol::session::LaunchOriginV1>> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        let metadata_json: String = connection
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        if let Some(metadata) = decode_session_metadata(session_id, &metadata_json)?
+            && metadata.launch_origin.is_some()
+        {
+            return Ok(metadata.launch_origin);
+        }
+        latest_launch_origin_event(&connection, session_id)
+    }
+
+    /// Atomically applies one launch-origin registration: revision CAS,
+    /// typed-metadata projection update (legacy `{}` stays `{}`), one
+    /// additive `session_launch_origin_selected` config event, and the
+    /// command receipt — session config only, with no conversation node,
+    /// run, cache-epoch, or seen/activity movement (O4).
+    pub fn register_session_launch_origin(
+        &self,
+        command: &SessionLaunchOriginCommand,
+    ) -> StoreResult<SessionLaunchOriginOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        // Ingress revalidation of the client-side sanitisation (O6).
+        if let Err(reason) = command.path.validate() {
+            return Err(store_error(ErrorCode::InvalidArgument, reason, false));
+        }
+        if command.open_id.trim().is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "origin registration needs an open id",
+                false,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(origin) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "session.origin.register",
+            &command.request_digest,
+            &command.request_json,
+            "session-launch-origin",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionLaunchOriginOutcome::IdempotentReplay { origin });
+        }
+        require_session(&transaction, &command.session_id)?;
+        let metadata_json: String = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        // Legacy `{}` metadata stays `{}`: the event alone carries origin.
+        let metadata = decode_session_metadata(&command.session_id, &metadata_json)?;
+        let current_revision = match &metadata {
+            Some(metadata) => match &metadata.launch_origin {
+                Some(origin) => origin.revision,
+                None => latest_launch_origin_event(&transaction, &command.session_id)?
+                    .map_or(0, |origin| origin.revision),
+            },
+            None => latest_launch_origin_event(&transaction, &command.session_id)?
+                .map_or(0, |origin| origin.revision),
+        };
+        if command.expected_revision != current_revision {
+            return Err(store_error(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "origin revision conflict: expected {}, current {current_revision}",
+                    command.expected_revision
+                ),
+                false,
+            ));
+        }
+        let revision = current_revision
+            .checked_add(1)
+            .ok_or_else(|| corrupt("origin revision overflow"))?;
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "session.origin.register",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let fact = haider_protocol::session::SessionLaunchOriginSelected {
+            subject_session_id: command.session_id.as_str().to_owned(),
+            open_id: command.open_id.clone(),
+            revision,
+            path: command.path.clone(),
+            recorded_at_ms: now,
+            workspace_materialized: command.workspace_materialized,
+        };
+        let payload = fact.to_payload_value().map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize launch-origin payload: {error}"),
+                false,
+            )
+        })?;
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            command.event_id.clone(),
+            &command.session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            self.worker_generation,
+            payload,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let origin = haider_protocol::session::LaunchOriginV1 {
+            subject_session_id: command.session_id.as_str().to_owned(),
+            open_id: command.open_id.clone(),
+            revision,
+            path: command.path.clone(),
+            recorded_at_ms: now,
+            selected_seq: envelopes[0].seq,
+        };
+        if let Some(mut metadata) = metadata {
+            metadata.launch_origin = Some(origin.clone());
+            let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize session metadata: {error}"),
+                    false,
+                )
+            })?;
+            let updated_rows = transaction
+                .execute(
+                    "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                    params![command.session_id.as_str(), updated_metadata],
+                )
+                .map_err(map_sqlite_error)?;
+            if updated_rows != 1 {
+                return Err(corrupt(
+                    "session row disappeared during origin registration",
+                ));
+            }
+        }
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(origin.selected_seq),
+            &origin,
+            now,
+            "session-launch-origin",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionLaunchOriginOutcome::Committed {
+            origin,
             envelope: Box::new(envelopes.remove(0)),
         })
     }
@@ -14347,6 +14593,43 @@ fn retracted_prompt_for_run(
             .map(Some)
             .ok_or_else(|| corrupt("invalid durable prompt retraction"));
         }
+    }
+    Ok(None)
+}
+
+/// Newest committed launch-origin fact for one session, reconstructed as
+/// a snapshot (legacy `{}` rows and projection recovery). Copied parent
+/// history is ignored: `subject_session_id` must match this session.
+/// This is an infrequent reconstruction path, not a per-turn scan.
+fn latest_launch_origin_event(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<haider_protocol::session::LaunchOriginV1>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT envelope_json FROM events WHERE session_id = ?1 AND payload_kind = 'session_launch_origin_selected' ORDER BY seq DESC",
+    ).map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(connection, row, 0)
+            .map_err(|error| corrupt(format!("invalid launch-origin fact: {error}")))?;
+        let Some(fact) = haider_protocol::session::SessionLaunchOriginSelected::from_payload_value(
+            &envelope.payload,
+        ) else {
+            continue;
+        };
+        if fact.subject_session_id != session_id.as_str() {
+            continue;
+        }
+        return Ok(Some(haider_protocol::session::LaunchOriginV1 {
+            subject_session_id: fact.subject_session_id,
+            open_id: fact.open_id,
+            revision: fact.revision,
+            path: fact.path,
+            recorded_at_ms: fact.recorded_at_ms,
+            selected_seq: envelope.seq,
+        }));
     }
     Ok(None)
 }

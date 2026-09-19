@@ -123,6 +123,7 @@ fn attach_all(driver: &mut LiveDriver, model: &mut AppModel, count: usize) {
         driver.apply(
             model,
             LiveReply::Attached {
+                launch_origin: None,
                 session: sid(n),
                 attachment: attachment(n),
                 worker_generation: 7,
@@ -472,6 +473,7 @@ fn a_reconnect_resends_the_outbox_under_the_same_durable_command_ids() {
     let resent_on_attach = driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,
@@ -504,6 +506,7 @@ fn a_reconnect_resends_the_outbox_under_the_same_durable_command_ids() {
     let again = driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,
@@ -721,6 +724,7 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
     let submitted = driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(1),
             attachment: attachment(1),
             worker_generation: 7,
@@ -748,6 +752,7 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
     let again = driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(1),
             attachment: attachment(1),
             worker_generation: 7,
@@ -815,6 +820,7 @@ fn a_cold_session_attaches_only_when_it_is_selected_and_only_once() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(4),
             attachment: attachment(4),
             worker_generation: 7,
@@ -1227,6 +1233,7 @@ fn a_cold_session_is_listable_with_its_head_and_readable_by_selection() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(5),
             attachment: attachment(5),
             worker_generation: 7,

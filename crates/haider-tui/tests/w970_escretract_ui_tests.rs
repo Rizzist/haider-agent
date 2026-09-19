@@ -176,6 +176,7 @@ fn accepted_turn() -> (LiveDriver, AppModel) {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(),
             attachment: attachment_id(),
             worker_generation: 7,
@@ -647,6 +648,7 @@ fn a_retracted_prompt_is_gone_from_replay_and_from_the_esc_esc_chooser() {
     replay_driver.apply(
         &mut replay,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(),
             attachment: attachment_id(),
             worker_generation: 7,

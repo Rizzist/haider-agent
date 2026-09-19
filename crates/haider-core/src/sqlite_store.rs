@@ -34,11 +34,12 @@ use haider_store::{
     QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
     QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RunRetryCommand,
     RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
-    SessionForkOutcome, SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRecencyKey,
-    SessionRecencyRow, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
-    SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
+    SessionForkOutcome, SessionLaunchOriginCommand, SessionLaunchOriginOutcome,
+    SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRecencyKey, SessionRecencyRow,
+    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -915,6 +916,47 @@ impl SqliteStoreHandle {
     ) -> Result<haider_store::SessionWorkspaceSetOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.set_session_workspace(&command))).await
+    }
+
+    /// Looks up a committed launch-origin registration response.
+    pub async fn session_launch_origin_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_protocol::session::LaunchOriginV1>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_launch_origin_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// The session's current launch-origin snapshot (typed projection or
+    /// event reconstruction for legacy rows).
+    pub async fn latest_launch_origin(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<haider_protocol::session::LaunchOriginV1>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || owner.with_store(|store| store.latest_launch_origin(&session_id)))
+            .await
+    }
+
+    /// Atomically applies one launch-origin registration (projection,
+    /// additive config event, and receipt in one transaction).
+    pub async fn register_session_launch_origin(
+        &self,
+        command: SessionLaunchOriginCommand,
+    ) -> Result<SessionLaunchOriginOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.register_session_launch_origin(&command))
+        })
+        .await
     }
 
     /// Reads the durable shared attention acknowledgement for one session.

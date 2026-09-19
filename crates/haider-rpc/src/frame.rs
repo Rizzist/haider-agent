@@ -584,6 +584,11 @@ pub const FEATURE_WIRE_MSGPACK_V1: &str = "wire_msgpack_v1";
 /// Daemon can omit superseded item deltas from the durable store phase of a
 /// session attachment replay while preserving the replay cursor and live tail.
 pub const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
+/// `session.attach` accepts an optional receipt-backed launch-origin
+/// registration and returns the current origin snapshot
+/// (`docs/design/dated-workspace-v1.md` §4). Zero new RPC methods; absent
+/// fields keep pre-feature bytes.
+pub const FEATURE_SESSION_LAUNCH_ORIGIN_V1: &str = "session_launch_origin_v1";
 
 /// `session.detach` can close a quiescent session's native resources without
 /// deleting its journal. Only a Control attachment may request this barrier.
@@ -3756,7 +3761,27 @@ pub enum RequestBody {
     /// The only operation that begins event delivery. `after_seq` is the
     /// greatest sequence the client has fully applied (zero for complete
     /// history); the daemon replays strictly after it.
+    ///
+    /// Origin-capable decode form: decoders normalize old and new JSON
+    /// into this variant. `launch_origin` is an optional receipt-backed
+    /// registration (feature `session_launch_origin_v1`); absent-field
+    /// bytes are identical to a pre-feature attach.
     #[serde(rename = "session.attach")]
+    SessionAttachWithOrigin {
+        session_id: SessionId,
+        after_seq: u64,
+        mode: AttachMode,
+        /// Omits item deltas from the initial durable replay only. Buffered
+        /// and live delivery after `AttachCaughtUp` remain unfiltered.
+        #[serde(default, skip_serializing_if = "is_false")]
+        sealed_replay: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_origin: Option<haider_protocol::session::LaunchOriginRegistrationV1>,
+    },
+    /// Encode-only source-compatible attach without origin registration.
+    /// Decoders normalize both old and new JSON into
+    /// [`Self::SessionAttachWithOrigin`].
+    #[serde(rename = "session.attach", skip_deserializing)]
     SessionAttach {
         session_id: SessionId,
         after_seq: u64,
@@ -5009,6 +5034,12 @@ pub enum ResponseBody {
     SessionAttach {
         attachment_id: AttachmentId,
         attach_state: AttachState,
+        /// Current launch-origin snapshot at the attach replay boundary
+        /// (feature `session_launch_origin_v1`). Absent on older daemons
+        /// and for sessions with no registered origin; absence keeps
+        /// pre-feature response bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_origin: Option<haider_protocol::session::LaunchOriginV1>,
     },
     #[serde(rename = "session.detach")]
     SessionDetach {

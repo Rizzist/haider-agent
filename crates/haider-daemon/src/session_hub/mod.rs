@@ -167,23 +167,23 @@ use haider_protocol::menu::{
 use haider_protocol::state::RunState;
 use haider_rpc::{
     ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachState, AttachmentId, CancelStatus, Capability,
-    CapabilitySet, CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_ARTIFACT_TOO_LARGE,
-    ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED, ERROR_CODE_ATTACHMENT_NOT_FOUND,
-    ERROR_CODE_ATTACHMENT_TOO_LARGE, ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY,
-    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
-    ERROR_CODE_FORK_CUT_UNSTABLE, ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE,
-    ERROR_CODE_GRAPH_WRONG_NODE, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
-    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED,
-    ERROR_CODE_PDF_TOO_LARGE, ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PEER_AMBIGUOUS,
-    ERROR_CODE_PEER_INVALID, ERROR_CODE_PEER_UNAVAILABLE, ERROR_CODE_PROVIDER_MODELS_UNKNOWN,
-    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
-    ERROR_CODE_SURFACE_TEXT_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS,
-    ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput,
-    ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
-    SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
-    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
-    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame, WorkflowCatalogEntryV1,
-    WorkflowInstanceSourceV1, WorkflowInstanceV1,
+    CapabilitySet, ClientKind, CommandId, ERROR_CODE_ALREADY_RESOLVED,
+    ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
+    ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
+    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
+    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_FORK_CUT_UNSTABLE,
+    ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE, ERROR_CODE_GRAPH_WRONG_NODE,
+    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
+    ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
+    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PEER_AMBIGUOUS, ERROR_CODE_PEER_INVALID,
+    ERROR_CODE_PEER_UNAVAILABLE, ERROR_CODE_PROVIDER_MODELS_UNKNOWN, ERROR_CODE_REVISION_CONFLICT,
+    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_SURFACE_TEXT_TOO_LARGE,
+    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
+    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
+    ResponseBody, SURFACE_INPUT_MAX_BYTES, SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult,
+    SessionSummary, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire,
+    SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
+    WorkflowCatalogEntryV1, WorkflowInstanceSourceV1, WorkflowInstanceV1,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1906,6 +1906,10 @@ enum ActorCommand {
         command: SessionSeenCommand,
         completed: oneshot::Sender<Result<SessionSeenOutcome, HaiderError>>,
     },
+    RegisterLaunchOrigin {
+        command: haider_core::SessionLaunchOriginCommand,
+        completed: oneshot::Sender<Result<haider_core::SessionLaunchOriginOutcome, HaiderError>>,
+    },
     PinGraph {
         command: GraphPinCommand,
         expected_digest: Option<String>,
@@ -2090,6 +2094,9 @@ pub struct HubConnection {
     hub: SessionHub,
     connection_id: String,
     capabilities: CapabilitySet,
+    /// Typed client class retained from handshake negotiation. This is
+    /// policy input only when combined with an authenticated transport.
+    client_kind: ClientKind,
     sink: Arc<dyn FrameSink>,
     /// Which transport carried this connection: raw-secret staging is
     /// LocalSameUid-only (R7), independent of the capability grant.
@@ -4594,13 +4601,26 @@ impl SessionHub {
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
     ) -> Result<HubConnection, SessionHubError> {
-        self.open_connection_with_runtime_paths(capabilities, sink, transport, None)
+        self.open_connection_with_client_kind(capabilities, sink, ClientKind::Unknown, transport)
+    }
+
+    /// Opens a synthetic or in-process connection with an explicit typed
+    /// client class. Real framed clients use the negotiated handshake value.
+    pub fn open_connection_with_client_kind(
+        &self,
+        capabilities: CapabilitySet,
+        sink: Arc<dyn FrameSink>,
+        client_kind: ClientKind,
+        transport: crate::accounts::ConnectionTransport,
+    ) -> Result<HubConnection, SessionHubError> {
+        self.open_connection_with_runtime_paths(capabilities, sink, client_kind, transport, None)
     }
 
     pub(crate) fn open_connection_with_runtime_paths(
         &self,
         capabilities: CapabilitySet,
         sink: Arc<dyn FrameSink>,
+        client_kind: ClientKind,
         transport: crate::accounts::ConnectionTransport,
         runtime: Option<DaemonRuntimeView>,
     ) -> Result<HubConnection, SessionHubError> {
@@ -4672,6 +4692,7 @@ impl SessionHub {
             hub: self.clone(),
             connection_id,
             capabilities,
+            client_kind,
             sink,
             transport,
             runtime_paths,
@@ -5291,6 +5312,55 @@ impl SessionHub {
         result
             .await
             .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_launch_origin_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<haider_protocol::session::LaunchOriginV1>, SessionHubError> {
+        self.inner
+            .store
+            .session_launch_origin_receipt(
+                command_id.to_owned(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Origin registration shares the serialized session actor with every
+    /// other session-config write: the metadata projection, additive
+    /// config fact, and receipt commit in one transaction, and only the
+    /// committed fact is published to attachments.
+    pub(crate) async fn register_session_launch_origin(
+        &self,
+        command: haider_core::SessionLaunchOriginCommand,
+    ) -> Result<haider_core::SessionLaunchOriginOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RegisterLaunchOrigin { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn latest_launch_origin(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<haider_protocol::session::LaunchOriginV1>, SessionHubError> {
+        self.inner
+            .store
+            .latest_launch_origin(session_id)
+            .await
             .map_err(Into::into)
     }
 

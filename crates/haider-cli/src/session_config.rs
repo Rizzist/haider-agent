@@ -582,6 +582,7 @@ async fn control_attachment(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            ..
         } => Ok((attachment_id, attach_state.worker_generation)),
         ResponseBody::Error {
             code,

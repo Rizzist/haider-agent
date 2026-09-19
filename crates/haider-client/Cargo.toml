@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 blake3.workspace = true
+getrandom.workspace = true
 haider-rpc = { path = "../haider-rpc" }
 haider-protocol = { path = "../haider-protocol" }
 haider-pdf = { path = "../haider-pdf" }
@@ -20,7 +21,7 @@ zeroize.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
 [lints]

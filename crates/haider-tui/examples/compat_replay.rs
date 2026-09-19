@@ -136,6 +136,7 @@ fn attach(
     driver.apply(
         model,
         LiveReply::Attached {
+            launch_origin: None,
             session: session.clone(),
             attachment: attachment.clone(),
             worker_generation: 1,

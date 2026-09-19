@@ -1321,6 +1321,7 @@ async fn stream_shard(
                 ResponseBody::SessionAttach {
                     attachment_id,
                     attach_state,
+                    ..
                 } if attach_state.session_id == *session_id => {
                     attachments.insert(
                         attachment_id.as_str().to_owned(),

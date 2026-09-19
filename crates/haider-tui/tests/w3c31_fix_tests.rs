@@ -180,6 +180,7 @@ fn a_fresh_attachs_first_envelope_is_gap_checked_against_the_cursor_it_asked_fro
         &mut driver,
         &mut model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,
@@ -237,6 +238,7 @@ fn a_contiguous_first_envelope_after_a_seeded_cursor_still_applies() {
         &mut driver,
         &mut model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,
@@ -268,6 +270,7 @@ fn a_contiguous_first_envelope_after_a_seeded_cursor_still_applies() {
         &mut driver,
         &mut model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(1),
             worker_generation: 7,
@@ -366,6 +369,7 @@ fn a_gap_produces_exactly_one_attach_through_the_loop_the_binary_runs() {
         &mut driver,
         &mut model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,
@@ -421,6 +425,7 @@ fn a_lagged_attachment_produces_exactly_one_attach_through_the_loop() {
         &mut driver,
         &mut model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,
@@ -468,6 +473,7 @@ fn a_reconnect_produces_exactly_one_attach_per_working_set_member() {
             &mut driver,
             &mut model,
             Some(LiveReply::Attached {
+                launch_origin: None,
                 session: sid(n),
                 attachment: attachment(n),
                 worker_generation: 7,
@@ -566,6 +572,7 @@ fn a_catch_up_short_of_its_high_water_mark_reattaches_instead_of_trusting_it() {
         &mut driver,
         &mut model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(0),
             worker_generation: 7,
@@ -612,6 +619,7 @@ fn a_catch_up_short_of_its_high_water_mark_reattaches_instead_of_trusting_it() {
         &mut driver,
         &mut model,
         Some(LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: attachment(1),
             worker_generation: 7,
@@ -668,6 +676,7 @@ fn dropped_frames_reattach_every_held_attachment_rather_than_vanishing() {
             &mut driver,
             &mut model,
             Some(LiveReply::Attached {
+                launch_origin: None,
                 session: sid(n),
                 attachment: attachment(n),
                 worker_generation: 7,

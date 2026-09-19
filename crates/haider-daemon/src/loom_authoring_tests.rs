@@ -85,6 +85,8 @@ async fn response(sink: &CapturingSink, request_id: &str) -> ResponseBody {
 
 fn metadata() -> SessionMetadataV1 {
     SessionMetadataV1 {
+        launch_origin: None,
+        workspace_allocation: None,
         provider_base_url: None,
         provider_rebind_id: None,
         cwd: "/workspace".into(),

@@ -178,6 +178,7 @@ async fn execute(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
+            ..
         } => (attachment_id, attach_state.worker_generation),
         ResponseBody::Error { code, message, .. } => {
             return Err(WorkspaceError::Rpc(code, message));

@@ -212,6 +212,7 @@ impl Client {
             .await;
         let (generation, attachment) = match response {
             ResponseBody::SessionAttach {
+                launch_origin: _,
                 attach_state,
                 attachment_id,
             } => (attach_state.worker_generation, attachment_id),

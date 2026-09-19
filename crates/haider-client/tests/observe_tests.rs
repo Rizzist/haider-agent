@@ -197,7 +197,7 @@ async fn accept_attach(
     attachment: &str,
 ) -> AttachmentId {
     let (request_id, body) = peer.request().await;
-    let RequestBody::SessionAttach {
+    let RequestBody::SessionAttachWithOrigin {
         session_id: attached,
         after_seq,
         mode,
@@ -213,6 +213,7 @@ async fn accept_attach(
     peer.respond(
         request_id,
         ResponseBody::SessionAttach {
+            launch_origin: None,
             attachment_id: attachment_id.clone(),
             attach_state: AttachState {
                 session_id: session_id.clone(),
@@ -868,7 +869,7 @@ async fn replay_overflow_during_attach_is_detected_and_resumed() {
     let server = tokio::spawn(async move {
         let mut first = accept_peer(&listener, welcome(&server_profile, "overflow-first")).await;
         let (request_id, body) = first.request().await;
-        let RequestBody::SessionAttach {
+        let RequestBody::SessionAttachWithOrigin {
             session_id: attached,
             after_seq,
             mode,
@@ -907,6 +908,7 @@ async fn replay_overflow_during_attach_is_detected_and_resumed() {
         burst.push(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionAttach {
+                launch_origin: None,
                 attachment_id: first_attachment,
                 attach_state: AttachState {
                     session_id: server_session.clone(),
@@ -922,7 +924,7 @@ async fn replay_overflow_during_attach_is_detected_and_resumed() {
 
         let mut second = accept_peer(&listener, welcome(&server_profile, "overflow-second")).await;
         let (request_id, body) = second.request().await;
-        let RequestBody::SessionAttach {
+        let RequestBody::SessionAttachWithOrigin {
             session_id: attached,
             after_seq,
             mode,
@@ -939,6 +941,7 @@ async fn replay_overflow_during_attach_is_detected_and_resumed() {
             .respond(
                 request_id,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: second_attachment.clone(),
                     attach_state: AttachState {
                         session_id: server_session.clone(),

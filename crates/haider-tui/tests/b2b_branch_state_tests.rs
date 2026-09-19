@@ -478,6 +478,7 @@ fn fork_issuance_travels_exact_coordinates_to_the_wire() {
     driver.apply(
         model_ref(&mut model),
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: AttachmentId::new("att-0"),
             worker_generation: 7,
@@ -677,6 +678,7 @@ fn a_submit_queued_before_a_later_switch_still_carries_its_captured_branch() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: AttachmentId::new("att-0"),
             worker_generation: 7,
@@ -720,6 +722,7 @@ fn shell_exec_captures_the_named_branch_through_the_scoped_wire() {
     driver.apply(
         &mut model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(0),
             attachment: AttachmentId::new("att-shell"),
             worker_generation: 7,

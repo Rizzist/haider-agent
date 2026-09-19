@@ -79,6 +79,144 @@ impl SessionPermissionOverridesV1 {
     }
 }
 
+/// Sanitised launch-origin path vocabulary
+/// (`docs/design/dated-workspace-v1.md` §4, O6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchOriginPathKindV1 {
+    /// The client's own home or a descendant, shown as `~`/`~/suffix`.
+    HomeRelative,
+    /// An absolute path outside any recognised home form.
+    Absolute,
+    /// Another user's home form with the user component masked.
+    Redacted,
+    /// The launch directory could not be captured.
+    Unavailable,
+}
+
+/// Upper bound on a serialized origin display (UTF-8 bytes). Ingress
+/// revalidation rejects anything longer without corrupting the session.
+pub const LAUNCH_ORIGIN_DISPLAY_MAX_BYTES: usize = 4096;
+
+/// One sanitised origin path. `display` is optional only for
+/// [`LaunchOriginPathKindV1::Unavailable`]. The value is display data —
+/// never a filesystem argument and never daemon proof a path exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOriginPathV1 {
+    pub kind: LaunchOriginPathKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+impl LaunchOriginPathV1 {
+    /// Ingress revalidation (O6): bounded display, no raw control/newline
+    /// bytes, and `display` present exactly when the kind requires it.
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.kind, &self.display) {
+            (LaunchOriginPathKindV1::Unavailable, _) => {}
+            (_, None) => return Err("origin display is required for this kind".to_string()),
+            (_, Some(_)) => {}
+        }
+        if let Some(display) = &self.display {
+            if display.len() > LAUNCH_ORIGIN_DISPLAY_MAX_BYTES {
+                return Err(format!(
+                    "origin display is {} bytes; limit is {LAUNCH_ORIGIN_DISPLAY_MAX_BYTES}",
+                    display.len()
+                ));
+            }
+            if display.chars().any(|character| {
+                character.is_control()
+                    || matches!(
+                        character as u32,
+                        0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
+                    )
+            }) {
+                return Err("origin display contains unescaped control text".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The CURRENT launch-origin snapshot for one session (O5): the latest
+/// successful foreground registration, stored as the typed-metadata
+/// projection and returned by `session.attach`. Client-reported context
+/// only — never workspace authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOriginV1 {
+    /// The session this origin belongs to; copied parent history can never
+    /// supply a child's origin.
+    pub subject_session_id: String,
+    /// Client-minted open identity (first foreground activation in one
+    /// local TUI process).
+    pub open_id: String,
+    /// Monotonic registration revision, starting at 1. CAS token for
+    /// replacement; `expected_revision = 0` means absence.
+    pub revision: u64,
+    pub path: LaunchOriginPathV1,
+    /// Daemon commit time, Unix milliseconds (never client clocks).
+    pub recorded_at_ms: u64,
+    /// Journal sequence of the accepted registration event.
+    pub selected_seq: u64,
+}
+
+/// Optional origin registration riding `session.attach` (O1–O3). Absent
+/// field bytes are identical to a pre-feature attach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOriginRegistrationV1 {
+    /// Receipt identity: an identical retry replays the original result.
+    pub command_id: String,
+    pub open_id: String,
+    pub worker_generation: u64,
+    /// Current origin revision this registration replaces (0 = absence).
+    /// A stale value is a conflict, never latest-timestamp-wins.
+    pub expected_revision: u64,
+    pub path: LaunchOriginPathV1,
+    /// Whether the resolved workspace path existed on disk at registration
+    /// time (L6): `Some(false)` records a resolved-but-unmaterialised
+    /// dated workspace without creating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_materialized: Option<bool>,
+}
+
+/// Additive replay fact appended atomically with a committed origin
+/// registration, its metadata projection update, and its receipt (O4).
+/// Raw history keeps every accepted registration; "replaced" refers only
+/// to the current UI/model-context slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLaunchOriginSelected {
+    pub subject_session_id: String,
+    pub open_id: String,
+    pub revision: u64,
+    pub path: LaunchOriginPathV1,
+    pub recorded_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_materialized: Option<bool>,
+}
+
+/// Dated-workspace allocation facts persisted beside session metadata
+/// (`docs/design/dated-workspace-v1.md` §2–3). Legacy metadata omits it;
+/// recording these facts never creates the paths they name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceAllocationV1 {
+    /// Canonical `<base>/Haider/<hijri-date>` organizing root.
+    pub daily_root: String,
+    /// Canonical session leaf (the tool workspace).
+    pub leaf: String,
+    /// 128-bit lowercase-hex allocation id (distinct from the session id).
+    pub allocation_id: String,
+    /// Calendar identifier (`islamic-civil` in v1).
+    pub calendar_id: String,
+    /// islamic-civil `YYYY-MM-DD` label used for the daily root.
+    pub hijri_date: String,
+    /// Sampled Gregorian `YYYY-MM-DD` civil date.
+    pub gregorian_date: String,
+    /// UTC allocation instant, Unix milliseconds.
+    pub allocated_at_ms: u64,
+    /// Offset seconds east of UTC observed at allocation time.
+    pub offset_seconds: i32,
+}
+
 /// Authoritative metadata stored in `sessions.meta_json` for live sessions.
 ///
 /// The version suffix is intentional: old rows contain `{}` and decode as no
@@ -165,6 +303,16 @@ pub struct SessionMetadataV1 {
         skip_serializing_if = "crate::context::ContextEconomy::is_empty"
     )]
     pub context_economy: crate::context::ContextEconomy,
+    /// Current launch-origin snapshot (O5). `None` for legacy rows and
+    /// sessions never foreground-opened; absence stays off the wire so
+    /// pre-feature metadata bytes are unchanged. Display context only —
+    /// workspace authority remains `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_origin: Option<LaunchOriginV1>,
+    /// Dated-workspace allocation facts (§2–3). Absent for legacy rows,
+    /// preserved-cwd sessions, and explicit workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_allocation: Option<WorkspaceAllocationV1>,
     /// Durable creation time in Unix milliseconds.
     pub created_at_ms: u64,
 }
@@ -261,6 +409,9 @@ pub enum SessionConfigEventPayload {
     FastModeSelected(FastModeSelected),
     SessionProviderRebound(SessionProviderRebound),
     AgentTypeSelected(AgentTypeSelected),
+    /// Committed launch-origin registration (O4). Session config only: no
+    /// conversation node, run, cache-epoch, or seen/activity movement.
+    SessionLaunchOriginSelected(SessionLaunchOriginSelected),
 }
 
 impl SessionConfigEventPayload {
@@ -284,6 +435,22 @@ impl SessionConfigEventPayload {
     /// Encodes one committed attention acknowledgement.
     pub fn session_seen_value(seen_at_ms: u64) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(Self::SessionSeen { seen_at_ms })
+    }
+}
+
+impl SessionLaunchOriginSelected {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(SessionConfigEventPayload::SessionLaunchOriginSelected(
+            self.clone(),
+        ))
+    }
+
+    #[must_use]
+    pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
+        match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
+            SessionConfigEventPayload::SessionLaunchOriginSelected(selected) => Some(selected),
+            _ => None,
+        }
     }
 }
 

@@ -236,6 +236,8 @@ async fn respond_create_and_attach_with_account(
             created_seq: 0,
             worker_generation: 7,
             metadata: SessionMetadataV1 {
+                launch_origin: None,
+                workspace_allocation: None,
                 provider_base_url: None,
                 provider_rebind_id: None,
                 cwd: "/tmp".into(),
@@ -259,7 +261,7 @@ async fn respond_create_and_attach_with_account(
     .await;
 
     let (attach_request, attach) = peer.request().await;
-    let RequestBody::SessionAttach {
+    let RequestBody::SessionAttachWithOrigin {
         session_id: attached,
         after_seq,
         mode,
@@ -275,6 +277,7 @@ async fn respond_create_and_attach_with_account(
     peer.respond(
         attach_request,
         ResponseBody::SessionAttach {
+            launch_origin: None,
             attachment_id: attachment_id.clone(),
             attach_state: AttachState {
                 session_id: session_id.clone(),
@@ -422,6 +425,8 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
                 created_seq: 0,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    launch_origin: None,
+                    workspace_allocation: None,
                     provider_base_url: None,
                     provider_rebind_id: None,
                     cwd: "/tmp".into(),
@@ -447,7 +452,7 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
         let (attach_request, attach) = peer.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 mode: AttachMode::Control,
                 ..
             }
@@ -463,6 +468,7 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
         peer.respond(
             attach_request.clone(),
             ResponseBody::SessionAttach {
+                launch_origin: None,
                 attachment_id: attachment_id.clone(),
                 attach_state: AttachState {
                     session_id: session_id.clone(),
@@ -1167,7 +1173,7 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
         let (attach_request, attach) = second.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 0,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -1179,6 +1185,7 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
             .respond(
                 attach_request,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: attachment_id.clone(),
                     attach_state: AttachState {
                         session_id: session_id.clone(),
@@ -1387,7 +1394,7 @@ async fn attach_upload_resume_case(binary: bool) {
         let (attach_request, attach) = second.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 0,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -1399,6 +1406,7 @@ async fn attach_upload_resume_case(binary: bool) {
             .respond(
                 attach_request,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: attachment_id.clone(),
                     attach_state: AttachState {
                         session_id: session_id.clone(),
@@ -1546,7 +1554,7 @@ async fn withheld_submit_response_is_recovered_and_durably_cancelled() {
         let (attach_request, attach) = second.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 0,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -1558,6 +1566,7 @@ async fn withheld_submit_response_is_recovered_and_durably_cancelled() {
             .respond(
                 attach_request,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: attachment_id.clone(),
                     attach_state: AttachState {
                         session_id: session_id.clone(),
@@ -1686,7 +1695,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
         let (attach_request, attach) = peer.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 1,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -1697,6 +1706,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
         peer.respond(
             attach_request,
             ResponseBody::SessionAttach {
+                launch_origin: None,
                 attachment_id: replay_attachment.clone(),
                 attach_state: AttachState {
                     session_id: session_id.clone(),
@@ -1818,7 +1828,7 @@ async fn lagged_pressure_recovers_every_durable_sequence() {
         )
         .await;
         let (attach_request, attach) = peer.request().await;
-        let RequestBody::SessionAttach {
+        let RequestBody::SessionAttachWithOrigin {
             after_seq,
             mode: AttachMode::Control,
             sealed_replay: false,
@@ -1832,6 +1842,7 @@ async fn lagged_pressure_recovers_every_durable_sequence() {
         peer.respond(
             attach_request,
             ResponseBody::SessionAttach {
+                launch_origin: None,
                 attachment_id: replay_attachment.clone(),
                 attach_state: AttachState {
                     session_id: session_id.clone(),
@@ -1922,7 +1933,7 @@ async fn withheld_recovery_barrier_cannot_defeat_run_and_grace_deadlines() {
         let (attach_request, attach) = peer.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 0,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -1932,6 +1943,7 @@ async fn withheld_recovery_barrier_cannot_defeat_run_and_grace_deadlines() {
         peer.respond(
             attach_request,
             ResponseBody::SessionAttach {
+                launch_origin: None,
                 attachment_id: AttachmentId::new("withheld-caught-up"),
                 attach_state: AttachState {
                     session_id,
@@ -2180,7 +2192,7 @@ async fn permission_answer_response_loss_replays_then_retries_current_generation
         let (attach_request, attach) = second.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 2,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -2192,6 +2204,7 @@ async fn permission_answer_response_loss_replays_then_retries_current_generation
             .respond(
                 attach_request,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: retry_attachment.clone(),
                     attach_state: AttachState {
                         session_id: session_id.clone(),
@@ -2352,7 +2365,7 @@ async fn competing_permission_resolution_is_fail_closed_and_cancelled() {
         let (attach_request, attach) = second.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 2,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -2364,6 +2377,7 @@ async fn competing_permission_resolution_is_fail_closed_and_cancelled() {
             .respond(
                 attach_request,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: replay_attachment.clone(),
                     attach_state: AttachState {
                         session_id: session_id.clone(),
@@ -2826,7 +2840,7 @@ async fn confirmed_cancel_disconnect_replays_terminal_within_grace() {
         let (attach_request, attach) = second.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 0,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -2838,6 +2852,7 @@ async fn confirmed_cancel_disconnect_replays_terminal_within_grace() {
             .respond(
                 attach_request,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: attachment_id.clone(),
                     attach_state: AttachState {
                         session_id: session_id.clone(),
@@ -2918,7 +2933,7 @@ async fn cancel_response_loss_replays_then_retries_same_command_at_current_gener
         let (attach_request, attach) = second.request().await;
         assert!(matches!(
             attach,
-            RequestBody::SessionAttach {
+            RequestBody::SessionAttachWithOrigin {
                 after_seq: 0,
                 mode: AttachMode::Control,
                 sealed_replay: false,
@@ -2930,6 +2945,7 @@ async fn cancel_response_loss_replays_then_retries_same_command_at_current_gener
             .respond(
                 attach_request,
                 ResponseBody::SessionAttach {
+                    launch_origin: None,
                     attachment_id: retry_attachment.clone(),
                     attach_state: AttachState {
                         session_id: session_id.clone(),
@@ -3288,12 +3304,13 @@ async fn resume_budget_checkpoint_submits_new_turn_in_original_session() {
         .await;
         let (attach_request, attach) = peer.request().await;
         assert!(
-            matches!(attach, RequestBody::SessionAttach { session_id: attached, after_seq: 0, mode: AttachMode::Control, .. } if attached == session_id)
+            matches!(attach, RequestBody::SessionAttachWithOrigin { session_id: attached, after_seq: 0, mode: AttachMode::Control, .. } if attached == session_id)
         );
         let attachment_id = AttachmentId::new("resume-attachment");
         peer.respond(
             attach_request,
             ResponseBody::SessionAttach {
+                launch_origin: None,
                 attachment_id: attachment_id.clone(),
                 attach_state: AttachState {
                     session_id: session_id.clone(),

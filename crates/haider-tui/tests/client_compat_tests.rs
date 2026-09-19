@@ -95,6 +95,7 @@ fn attached(model: &mut AppModel, driver: &mut LiveDriver, n: u64) {
     driver.apply(
         model,
         LiveReply::Attached {
+            launch_origin: None,
             session: sid(),
             attachment: aid(n),
             worker_generation: 1,

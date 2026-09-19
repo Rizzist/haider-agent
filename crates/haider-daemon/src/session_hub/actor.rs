@@ -624,6 +624,36 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::RegisterLaunchOrigin { command, completed } => {
+                // Origin registration is session config only: the metadata
+                // projection, additive `session_launch_origin_selected`
+                // fact, and receipt are one transaction, and only the
+                // committed fact is publishable. The serialized arm keeps
+                // the revision CAS honest against concurrent config writes.
+                let result = store.register_session_launch_origin(command).await;
+                if let Ok(haider_core::SessionLaunchOriginOutcome::Committed { envelope, .. }) =
+                    &result
+                {
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::Seen { command, completed } => {
                 // Attention state is durable session truth, not a surface
                 // flag. Its non-meaningful config fact must still move this

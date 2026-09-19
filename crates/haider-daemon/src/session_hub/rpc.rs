@@ -4309,6 +4309,47 @@ impl HubConnection {
                 self.hooks_trust(request_id, command_id, digest, false)
                     .await
             }
+            RequestBody::SessionAttachWithOrigin {
+                session_id,
+                after_seq,
+                mode,
+                sealed_replay,
+                launch_origin,
+            } => {
+                let operation = match mode {
+                    AttachMode::View => Operation::View,
+                    AttachMode::Control => Operation::Control,
+                    // `Unknown` and any future mode: never guess an
+                    // authorization level for a mode this daemon predates.
+                    _ => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "unknown attachment mode",
+                            false,
+                            None,
+                        );
+                    }
+                };
+                if let Err(message) = authorize(&self.capabilities, operation) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_attach(
+                    request_id,
+                    session_id,
+                    after_seq,
+                    mode,
+                    sealed_replay,
+                    launch_origin,
+                )
+                .await
+            }
             RequestBody::SessionAttach {
                 session_id,
                 after_seq,
@@ -4339,7 +4380,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_attach(request_id, session_id, after_seq, mode, sealed_replay)
+                self.session_attach(request_id, session_id, after_seq, mode, sealed_replay, None)
                     .await
             }
             RequestBody::SessionDetach {
@@ -8099,6 +8140,7 @@ impl HubConnection {
                 hub: self.hub.clone(),
                 connection_id: self.connection_id.clone(),
                 capabilities: self.capabilities.clone(),
+                client_kind: self.client_kind,
                 sink,
                 transport: self.transport,
                 runtime_paths: None,
@@ -17905,6 +17947,7 @@ impl HubConnection {
         after_seq: u64,
         mode: AttachMode,
         sealed_replay: bool,
+        launch_origin: Option<haider_protocol::session::LaunchOriginRegistrationV1>,
     ) -> Result<(), SessionHubError> {
         if lock(&self.hub.inner.deleting_sessions)?.contains(&session_id) {
             return self.respond_error(
@@ -17923,6 +17966,115 @@ impl HubConnection {
                 false,
                 None,
             );
+        }
+        // Launch-origin registration (dated-workspace addendum §4) commits
+        // BEFORE the attach replay boundary is captured, so the accepted
+        // fact is part of the replayed durable history and the returned
+        // snapshot is consistent with the attach watermark.
+        if let Some(origin_request) = launch_origin {
+            // O8: client-name strings and a generic Control grant are not
+            // sufficient. Registration additionally requires the negotiated
+            // interactive TUI class over the peer-UID-authenticated local
+            // transport. Remote/mobile/fleet/peer and local CLI/headless
+            // control clients fail before any receipt or session mutation.
+            if self.client_kind != ClientKind::Tui
+                || self.transport != crate::accounts::ConnectionTransport::LocalSameUid
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_CAPABILITY_DENIED,
+                    "origin registration requires an authenticated local TUI connection",
+                    false,
+                    None,
+                );
+            }
+            // A view-mode request also fails without mutation.
+            if mode != AttachMode::Control {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "origin registration requires a control attach",
+                    false,
+                    None,
+                );
+            }
+            if origin_request.command_id.trim().is_empty() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "origin registration needs a command id",
+                    false,
+                    None,
+                );
+            }
+            // O6: revalidate the client-side sanitisation on ingress.
+            if let Err(reason) = origin_request.path.validate() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &reason,
+                    false,
+                    None,
+                );
+            }
+            let request_json = serde_json::to_string(&serde_json::json!({
+                "session_id": &session_id,
+                "open_id": &origin_request.open_id,
+                "worker_generation": origin_request.worker_generation,
+                "expected_revision": origin_request.expected_revision,
+                "path": &origin_request.path,
+                "workspace_materialized": &origin_request.workspace_materialized,
+            }))
+            .map_err(|error| {
+                SessionHubError::Task(format!("cannot encode origin coordinates: {error}"))
+            })?;
+            let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+            // O2: an identical retry replays the original registration
+            // result without changing current metadata.
+            match self
+                .hub
+                .session_launch_origin_receipt(
+                    &origin_request.command_id,
+                    &request_digest,
+                    &request_json,
+                )
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let command = haider_core::SessionLaunchOriginCommand {
+                        command_id: origin_request.command_id.clone(),
+                        request_digest,
+                        request_json,
+                        session_id: session_id.clone(),
+                        worker_generation: origin_request.worker_generation,
+                        open_id: origin_request.open_id.clone(),
+                        expected_revision: origin_request.expected_revision,
+                        path: origin_request.path.clone(),
+                        workspace_materialized: origin_request.workspace_materialized,
+                        event_id: EventId::new(random_id("launch-origin")?),
+                        device_id: self.hub.inner.device_id.clone(),
+                    };
+                    match self.hub.register_session_launch_origin(command).await {
+                        Ok(
+                            haider_core::SessionLaunchOriginOutcome::Committed { .. }
+                            | haider_core::SessionLaunchOriginOutcome::IdempotentReplay { .. },
+                        ) => {}
+                        Err(SessionHubError::Store(error)) => {
+                            // O3: a stale CAS or store refusal fails this
+                            // attach precisely; the client may reattach
+                            // without registration or with a fresh
+                            // revision after rereading.
+                            return self.respond_turn_error(request_id, error);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(SessionHubError::Store(error)) => {
+                    return self.respond_turn_error(request_id, error);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let registration = match self
             .hub
@@ -17947,15 +18099,31 @@ impl HubConnection {
         };
         let attachment_id = registration.attachment_id.clone();
         let attach_state = registration.attach_state.clone();
-        let workspace_unavailable = self
+        let metadata = self
             .hub
             .inner
             .store
             .session_metadata(&attach_state.session_id)
-            .await?
-            .and_then(|metadata| {
-                crate::workspace::unavailable(std::path::Path::new(&metadata.cwd))
-            });
+            .await?;
+        // O5: the response snapshot is always the durable CURRENT origin,
+        // never the original response carried by a replayed, superseded
+        // receipt. Typed projection is authoritative when present; legacy
+        // `{}` rows reconstruct from immutable origin events. Absence stays
+        // off the wire so pre-feature response bytes are unchanged.
+        let current_origin = match metadata
+            .as_ref()
+            .and_then(|meta| meta.launch_origin.clone())
+        {
+            Some(origin) => Some(origin),
+            None => {
+                self.hub
+                    .latest_launch_origin(&attach_state.session_id)
+                    .await?
+            }
+        };
+        let workspace_unavailable = metadata.and_then(|metadata| {
+            crate::workspace::unavailable(std::path::Path::new(&metadata.cwd))
+        });
         if let Some(unavailable) = workspace_unavailable {
             tracing::info!(
                 target: "haider.workspace",
@@ -17988,6 +18156,7 @@ impl HubConnection {
                     body: ResponseBody::SessionAttach {
                         attachment_id: attachment_id.clone(),
                         attach_state,
+                        launch_origin: current_origin,
                     },
                 },
             )

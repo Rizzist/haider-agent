@@ -212,6 +212,9 @@ pub(crate) struct ConnectionGrant {
     /// Exactly what `negotiate` granted this connection — never re-derived
     /// from the client's request, and never widened afterwards.
     pub(crate) capabilities: CapabilitySet,
+    /// Negotiated typed client class; unlike `client_name`, this is retained
+    /// as explicit authorization input for client-class-specific methods.
+    pub(crate) client_kind: haider_rpc::ClientKind,
     /// Exact additive feature set carried by this peer's Welcome. Tight-frame
     /// withholding must narrow request shapes as well as client affordances.
     pub(crate) features: BTreeSet<String>,
@@ -1937,6 +1940,7 @@ async fn handle_frame(
                     .open_connection_with_runtime_paths(
                         granted.capabilities.clone(),
                         sink,
+                        granted.client_kind,
                         crate::accounts::ConnectionTransport::LocalSameUid,
                         Some(DaemonRuntimeView {
                             paths: (context.endpoint_path.clone(), context.pid_file_path.clone()),
@@ -2122,6 +2126,7 @@ fn negotiate_hello(
     grant: &mut Option<ConnectionGrant>,
     outbound_limit: usize,
 ) -> Result<Option<WireEncoding>, DaemonError> {
+    let client_kind = hello.client_kind;
     let server_range = ServerRange {
         protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
         protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
@@ -2189,6 +2194,7 @@ fn negotiate_hello(
     // against (W3b2 reads it through `ConnectionGrant`).
     *grant = Some(ConnectionGrant {
         capabilities: negotiated.capabilities_granted,
+        client_kind,
         features: encoded_welcome.features,
     });
     Ok(Some(match negotiated.encoding.as_deref() {
@@ -2330,6 +2336,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_CLOSE_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
         haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
