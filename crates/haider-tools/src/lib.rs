@@ -34,6 +34,7 @@ mod shell;
 mod spawn_subagent;
 mod task_outcome;
 mod tasks;
+mod test_summary;
 mod todo_write;
 mod webfetch;
 mod workflow_author;
@@ -138,6 +139,12 @@ pub use tasks::{
     TaskKillHandle, TaskOutputBuffer, default_task_name, lock_task_output, probe_group_liveness,
     probe_group_liveness_evidence, reap_orphan_group, shared_task_output, supervise_background,
     task_completion_digest, task_kill_channel, task_kill_manifest, task_output_manifest,
+};
+pub use test_summary::{
+    TEST_RUN_FAILURE_DETAIL_MAX_BYTES, TEST_RUN_MAX_LISTED_FAILURES, TEST_RUN_MAX_OUTPUT_BYTES,
+    TEST_RUN_UNKNOWN_TAIL_MAX_BYTES, TEST_RUN_WALL_TIMEOUT_SECS, TestCounts, TestFailure,
+    TestOutputFormat, TestRunRenderContext, TestRunSummary, render_test_run_output,
+    summarize_test_output, test_run_process_bounds,
 };
 pub use todo_write::{MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TodoWrite, todo_write_manifest};
 pub use webfetch::{

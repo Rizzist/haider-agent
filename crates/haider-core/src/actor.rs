@@ -210,7 +210,10 @@ fn model_tool_result_projection(
 /// must survive byte-for-byte. Task IDs used to page background output are
 /// functional return values and are not process receipt envelopes.
 fn tool_envelope_output(tool_name: &str, result: &BoundedResult) -> Option<(String, bool)> {
-    let process = matches!(tool_name, "process_exec" | "ssh_shell");
+    // `test_run` shares the process envelope shape: the daemon-owned summary
+    // rides `output`, while volatile identities (effect id, capture handle)
+    // stay in the durable envelope for surfaces, never in provider content.
+    let process = matches!(tool_name, "process_exec" | "ssh_shell" | "test_run");
     let mutation = matches!(
         tool_name,
         "fs_write" | "fs_edit" | "fs_path" | "write" | "edit"

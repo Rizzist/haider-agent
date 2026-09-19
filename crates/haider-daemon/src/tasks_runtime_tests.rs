@@ -2201,3 +2201,226 @@ fn assert_repair_carriers_present(text: &str) {
         );
     }
 }
+
+/// AX-1 wishlist #4 — `test_run` end-to-end through the ONE process
+/// pipeline: same broker dispatch, same foreground capture retention, same
+/// redaction consumer, same journal facts as `process_exec`; only the
+/// provider-facing presentation differs (deterministic counts + verbatim
+/// failures + `cap:<call_id>` alias). MUTATION CHECK: grow a second
+/// execution path and the effect phases, capture handle, or redaction
+/// assertions below break.
+#[tokio::test]
+async fn test_run_dispatch_summarizes_through_the_shared_process_pipeline() {
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let padding = (0..200)
+        .map(|index| format!("test tests::pad_{index:03} ... ok\n"))
+        .collect::<String>();
+    let transcript = format!(
+        "running 201 tests\n{padding}test tests::boom ... FAILED\n\nfailures:\n\n---- tests::boom stdout ----\ntoken=sk-abcdefghijklmnopQRSTUV\nassertion `left == right` failed: fixture defect\n  left: 1\n right: 2\n\nfailures:\n    tests::boom\n\ntest result: FAILED. 200 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s\n"
+    );
+    assert!(transcript.len() > 2_048, "must exceed the inline window");
+    std::fs::write(
+        std::path::Path::new(&cwd).join("fake-tests.txt"),
+        &transcript,
+    )
+    .expect("fixture transcript");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = create_task_session(&hub, "testrun-session", &cwd).await;
+    let run = RunId::new("testrun-run");
+    prepare_tool_run(&hub, &session, &run, "testrun").await;
+    let dispatcher = task_dispatcher(&hub, &session, &cwd, "testrun", &run).await;
+    let outcome = dispatcher
+        .execute(
+            &run,
+            &ItemId::new("testrun-item"),
+            "testrun-call",
+            "test_run",
+            serde_json::json!({"command": "cat fake-tests.txt; exit 101"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("test_run dispatch");
+    let ToolDispatchResult::Completed(bounded) = outcome else {
+        panic!("test_run must complete under the explicit exec override");
+    };
+    assert_eq!(
+        bounded.status,
+        haider_protocol::tool::ToolResultStatus::Failed
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(bounded.payload_text()).expect("envelope JSON");
+    assert_eq!(value["exit_code"], 101);
+    let output = value["output"].as_str().expect("summary output");
+    assert!(
+        output.contains("test_run summary (format=cargo_test): 200 passed, 1 failed, 0 ignored"),
+        "{output:?}"
+    );
+    assert!(output.contains("--- tests::boom ---"));
+    // The single shared redaction consumer already scrubbed the capture;
+    // the verbatim failure carries the standard marker, never the secret.
+    assert!(output.contains("[REDACTED"), "{output:?}");
+    assert!(!output.contains("sk-abcdefghijklmnopQRSTUV"));
+    assert!(
+        output.contains("assertion `left == right` failed: fixture defect"),
+        "{output:?}"
+    );
+    // Row-63 discipline: deterministic alias only in provider-facing text;
+    // the volatile handle stays in the durable envelope's capture field.
+    assert!(output.contains("cap:testrun-call"), "{output:?}");
+    assert!(!output.contains("capture:effect"), "{output:?}");
+    let handle = value["capture"]
+        .as_str()
+        .expect("capture handle")
+        .to_owned();
+    assert!(handle.starts_with("capture:"), "{handle:?}");
+    assert_eq!(value["test_summary"]["format"], "cargo_test");
+    assert_eq!(value["test_summary"]["failing_tests"][0], "tests::boom");
+    // The full secret-redacted transcript pages through the SAME capture
+    // consumer via the deterministic alias.
+    let mut cursor = 0;
+    let mut full = String::new();
+    loop {
+        let page = dispatch(
+            &dispatcher,
+            &run,
+            &format!("testrun-page-{cursor}"),
+            "task_output",
+            serde_json::json!({"task_id": "cap:testrun-call", "cursor": cursor}),
+        )
+        .await;
+        full.push_str(page["chunk"].as_str().expect("chunk"));
+        if page["exhausted"] == true {
+            break;
+        }
+        cursor = page["next_cursor"].as_u64().expect("cursor");
+    }
+    assert_eq!(full, haider_tools::redact_output_text(&transcript));
+    assert!(!full.contains("sk-abcdefghijklmnopQRSTUV"));
+    // The brokered effect phases exist exactly as for process_exec: the
+    // affordance is not a second execution path.
+    let phases = process_effect_phases(&store, &session).await;
+    assert!(
+        phases
+            .iter()
+            .any(|phase| matches!(phase, EffectPhase::Dispatched { .. })),
+        "test_run must dispatch through the effect broker"
+    );
+    dispatcher.close().await.expect("close dispatcher");
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close store");
+}
+
+/// Permission parity: without the explicit exec override an interactive
+/// session parks BOTH `process_exec` and `test_run` on the same ProcessExec
+/// Ask class — neither runs, both journal an Ask verdict, and a typed grant
+/// without the ProcessExec effect refuses `test_run` at the ceiling.
+#[tokio::test]
+async fn test_run_permission_parity_with_process_exec() {
+    let profile = tempfile::tempdir().expect("profile");
+    let (workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = create_task_session(&hub, "testrun-ask", &cwd).await;
+    let run = RunId::new("testrun-ask-run");
+    prepare_tool_run(&hub, &session, &run, "testrun-ask").await;
+    let dispatcher = task_dispatcher_with_monitor_policy(
+        &hub,
+        &session,
+        &cwd,
+        "testrun-ask",
+        &run,
+        None,
+        SessionInteractionModeV1::Interactive,
+    )
+    .await;
+    let marker = workspace.path().join("testrun-ask-marker");
+    let marker_command = monitor_marker_command(&marker);
+    for (call, tool) in [
+        ("testrun-ask-call", "test_run"),
+        ("testrun-ask-process-call", "process_exec"),
+    ] {
+        let outcome = dispatcher
+            .execute(
+                &run,
+                &ItemId::new(format!("{call}-item")),
+                call,
+                tool,
+                serde_json::json!({"command": marker_command}),
+                &CancelToken::new(),
+            )
+            .await
+            .expect("Ask is a parked tool result");
+        match outcome {
+            ToolDispatchResult::ApprovalRequired(_) => {}
+            ToolDispatchResult::Completed(result) => {
+                panic!(
+                    "{tool} Ask completed instead of parking: {}",
+                    result.preview
+                )
+            }
+            ToolDispatchResult::Deferred(_) => panic!("{tool} Ask became deferred"),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!marker.exists(), "Ask must not start the command");
+    let phases = process_effect_phases(&store, &session).await;
+    assert!(phases.iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::Ask { .. },
+            ..
+        }
+    )));
+    assert!(
+        !phases
+            .iter()
+            .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+    );
+    dispatcher.cancel().await.expect("cancel parked dispatcher");
+
+    // A grant that names the tool but lacks the ProcessExec effect is a
+    // completed ceiling refusal — identical to process_exec's fence.
+    let fenced_session = create_task_session(&hub, "testrun-fence", &cwd).await;
+    let fenced_run = RunId::new("testrun-fence-run");
+    prepare_tool_run(&hub, &fenced_session, &fenced_run, "testrun-fence").await;
+    let fenced = task_dispatcher_with_grant(
+        &hub,
+        &fenced_session,
+        &cwd,
+        "testrun-fence",
+        &fenced_run,
+        Some(haider_protocol::agent::Grant {
+            tools: vec!["test_run".into()],
+            effect_ceiling: vec![haider_protocol::effect::EffectClass::FsRead],
+        }),
+    )
+    .await;
+    let outcome = fenced
+        .execute(
+            &fenced_run,
+            &ItemId::new("testrun-fence-item"),
+            "testrun-fence-call",
+            "test_run",
+            serde_json::json!({"command": "echo fenced"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("ceiling refusal is a completed result");
+    let ToolDispatchResult::Completed(result) = outcome else {
+        panic!("grant violation must be a completed dispatch result");
+    };
+    assert_eq!(
+        result.status,
+        haider_protocol::tool::ToolResultStatus::Rejected
+    );
+    assert!(result.preview.contains("grant_ceiling_violation"));
+    fenced.close().await.expect("close fenced dispatcher");
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close store");
+}

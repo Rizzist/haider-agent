@@ -11,7 +11,11 @@ The daemon can start a session with a smaller schema pack. Set
 | `discovery` | `list_tools` |
 
 Use `automation` for filesystem/process workflows without task tracking or
-delegation and `inspection` for browsing a workspace. Unknown or unset profile names retain `coding`.
+delegation and `inspection` for browsing a workspace. The authorized catalog
+also carries `test_run` (run one test command, get deterministic
+pass/fail/ignored counts plus verbatim failing tests); it is not in any
+initial pack — the default instruct-pipe byte budget has no headroom — so
+promote it with `list_tools(filter="test_run")`. Unknown or unset profile names retain `coding`.
 The selection applies to the daemon's sessions; changing a client's environment
 does not reconfigure a resident daemon. Embedded callers can select the typed
 `haider_core::ToolCapabilityProfile` through

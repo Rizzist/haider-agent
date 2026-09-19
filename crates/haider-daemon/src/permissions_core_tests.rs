@@ -116,6 +116,7 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
         .collect::<Vec<_>>();
     assert_eq!(advertised, registered);
     assert!(advertised.contains(&"process_exec"));
+    assert!(advertised.contains(&"test_run"));
     assert!(advertised.contains(&"message_subagent"));
     assert!(advertised.contains(&"computer"));
     assert!(advertised.contains(&"mobile"));
@@ -836,6 +837,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "edit",
             "fs_path",
             "process_exec",
+            "test_run",
             "spawn_subagent",
             "message_subagent",
             "task_output",
@@ -1629,8 +1631,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     let registry = registered_tools();
     assert_eq!(
         authorized.len(),
-        29,
-        "27 former tools plus session_transcript and task_outcome"
+        30,
+        "27 former tools plus session_transcript, task_outcome, and test_run"
     );
     let full_prefix: usize = authorized
         .iter()
@@ -1646,16 +1648,18 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
                     .len()
         })
         .sum();
-    // Union full-pack pin: 971 redaction (+98), 972 task_outcome (+515), and
-    // 972 output-ergonomics task_output capture-alias wording (+47).
+    // Union full-pack pin: 971 redaction (+98), 972 task_outcome (+515),
+    // 972 output-ergonomics task_output capture-alias wording (+47), and
+    // 972-ax-testrun's platform-invariant `test_run` manifest (+974). The
+    // default instruct-pipe pack is unchanged: test_run is discovery-only.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_663;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_637;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_614;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_588;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_613;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_587;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 23_608;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_582;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1674,7 +1678,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         - 2;
     let expected_pipe_bytes =
         EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
-    assert_eq!(registered_tools().len(), 32);
+    assert_eq!(registered_tools().len(), 33);
     assert_eq!(
         tools.len(),
         10,

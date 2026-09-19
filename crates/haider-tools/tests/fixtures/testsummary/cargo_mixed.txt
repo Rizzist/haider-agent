@@ -1,0 +1,34 @@
+   Compiling fixture-mixed v0.1.0 (/private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/cargo_mixed)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (/private/tmp/claude-501/-Users-rizzist-Developer-haiderharness-haider-agent/4e09edb8-f20f-45b7-aedf-418035616e7b/scratchpad/fixturecap/target/debug/deps/fixture_mixed-dd28ff77f4d3cfa5)
+
+running 5 tests
+test tests::slow_integration_case ... ignored
+test tests::addition_commutes ... ok
+test tests::addition_works ... ok
+test tests::addition_is_wrong_here ... FAILED
+test tests::subtraction_panics ... FAILED
+
+failures:
+
+---- tests::addition_is_wrong_here stdout ----
+
+thread 'tests::addition_is_wrong_here' (27265509) panicked at src/lib.rs:15:9:
+assertion `left == right` failed: two plus two should equal five in this fixture
+  left: 4
+ right: 5
+
+---- tests::subtraction_panics stdout ----
+
+thread 'tests::subtraction_panics' (27265511) panicked at src/lib.rs:21:23:
+index out of bounds: the len is 0 but the index is 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::addition_is_wrong_here
+    tests::subtraction_panics
+
+test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

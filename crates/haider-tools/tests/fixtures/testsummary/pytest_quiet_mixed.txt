@@ -1,0 +1,14 @@
+.F.s                                                                     [100%]
+=================================== FAILURES ===================================
+_______________________ test_unreadable_file_exit_code ________________________
+
+    def test_unreadable_file_exit_code():
+>       assert unreadable_file_exit_code() == 2
+E       AssertionError: expected an unreadable file to return exit code 2
+E       assert 1 == 2
+
+test_io.py:19: AssertionError
+=========================== short test summary info ============================
+FAILED test_io.py::test_unreadable_file_exit_code - AssertionError: expected...
+SKIPPED [1] test_io.py:22: platform does not expose this permission mode
+1 failed, 2 passed, 1 skipped in 0.04s

@@ -1,0 +1,8 @@
+test_alpha (test_passing.PassingTests) ... ok
+test_beta (test_passing.PassingTests) ... ok
+test_gamma (test_passing.PassingTests) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK

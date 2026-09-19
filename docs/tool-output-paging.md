@@ -83,6 +83,19 @@ output carries no pointer. Terminal `task_output` status reads return the
 same digest. Historical completion facts without a digest keep their
 tail-only replay format.
 
+`test_run(command, cwd?)` executes through the same process broker, capture,
+and redaction pipeline as `process_exec` (same Ask/Auto permission class,
+foreground and local only) with a 600-second wall limit and the 2 MiB output
+ceiling. Its result replaces the raw transcript with a deterministic summary:
+pass/fail/ignored counts parsed from recognized console formats (`cargo test`,
+pytest including `-q`, `python -m unittest`, Gradle/JUnit console) and each failing test's
+secret-redacted output verbatim within a 12 KiB budget. Unrecognized output —
+including a compilation failure before any test ran or a run cut off by an
+execution limit — reports `format=unknown` with the exit code and a bounded
+tail; counts are never inferred. Sub-2 KiB transcripts are embedded whole with
+no paging pointer; larger runs keep the full capture pageable through the same
+`cap:<call_id>` alias described above.
+
 Raw captures remain in the existing owner-authorized CAS. They are not used
 as model pages. Complete lines are redacted before live command output enters
 the journal, including credentials split across OS read chunks. Terminal control

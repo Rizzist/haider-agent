@@ -295,6 +295,7 @@ fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
     }
     for forbidden in [
         "process_exec",
+        "test_run",
         "task_output",
         "task_kill",
         "fs_edit",
@@ -345,6 +346,7 @@ fn auto_hermetic_turn_advertises_no_egress_tools() {
         "spawn_subagent",
         "list_models",
         "process_exec",
+        "test_run",
     ] {
         assert!(!names.contains(&egress), "advertised egress tool {egress}");
     }
@@ -1044,5 +1046,57 @@ fn session_transcript_surface_is_manifest_route_and_digest_pinned() {
         tool_manual_line("session_transcript")
             .expect("manual")
             .contains("next_after_seq")
+    );
+}
+
+/// AX-1 wishlist #4 — the `test_run` catalog contract: identical Ask policy
+/// class to `process_exec` under a strictly narrower (local-only) effect
+/// ceiling, foreground-only schema (no background/profile/name), and refusal
+/// everywhere `process_exec` is unavailable (lockdown allowlist, auto-hermetic
+/// envelope; android-standalone drops the route at catalog build).
+#[test]
+fn test_run_catalog_mirrors_process_exec_policy_without_widening_it() {
+    let process = registered_tool_by_name("process_exec").expect("process_exec manifest");
+    let test_run = registered_tool_by_name("test_run").expect("test_run manifest");
+    assert_eq!(test_run.route, RegisteredToolRoute::TestRun);
+    assert_eq!(test_run.default, ToolPermissionDefault::Ask);
+    assert_eq!(test_run.default, process.default, "Ask parity");
+    assert_eq!(test_run.manifest.effects, [EffectClass::ProcessExec]);
+    assert!(
+        test_run
+            .manifest
+            .effects
+            .iter()
+            .all(|effect| process.manifest.effects.contains(effect)),
+        "test_run must never exceed process_exec authority"
+    );
+    assert!(
+        !test_run
+            .manifest
+            .effects
+            .contains(&EffectClass::RemoteExecution),
+        "test_run is local-only"
+    );
+    let schema = test_run
+        .manifest
+        .input_schema
+        .as_object()
+        .expect("schema object");
+    assert_eq!(schema["required"], serde_json::json!(["command"]));
+    assert_eq!(schema["additionalProperties"], false);
+    let properties = schema["properties"].as_object().expect("properties");
+    assert_eq!(
+        properties.keys().collect::<Vec<_>>(),
+        ["command", "cwd"],
+        "foreground-only: no background/name/profile arguments"
+    );
+    // Lockdown parity: not in the fixed allowlist, so both the pack filter
+    // and the per-dispatch tools_allowed fence refuse it, like process_exec.
+    assert!(!crate::lockdown::tool_allowed("test_run"));
+    assert!(!crate::lockdown::tool_allowed("process_exec"));
+    assert!(
+        !crate::lockdown::allowed_tool_names()
+            .iter()
+            .any(|name| name == "test_run")
     );
 }

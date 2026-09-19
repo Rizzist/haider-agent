@@ -1231,7 +1231,9 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
     let glob = text("glob").or_else(|| text("include"));
     let description = text("description").or_else(|| text("desc"));
     match name {
-        "bash" | "shell" | "sh" | "zsh" | "process_exec" | "ssh_shell" | "command" => {
+        // `test_run` summarizes by its command like the other shell-ish
+        // tools while keeping its own fold noun ("test_run calls").
+        "bash" | "shell" | "sh" | "zsh" | "process_exec" | "test_run" | "ssh_shell" | "command" => {
             match (command, description) {
                 (Some(command), Some(description)) if command != description => {
                     format!("{command} — {description}")
