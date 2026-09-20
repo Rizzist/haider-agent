@@ -185,6 +185,7 @@ fn cache_assertion_request(
             session_scope: "live-cache-assertion-session".into(),
             cache_cohort: None,
             account_scope: Some("anthropic-env".into()),
+            account_incarnation: Some(1),
             stable_prefix_tokens: 5_000,
             expected_later_reads: 2,
             reuse_gap_ms: Some(1_000),

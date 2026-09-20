@@ -1071,6 +1071,7 @@ fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
             session_scope: "session-shape-pin".into(),
             cache_cohort: None,
             account_scope: Some("account-shape-pin".into()),
+            account_incarnation: Some(1),
             stable_prefix_tokens: 8_192,
             expected_later_reads: 2,
             reuse_gap_ms: Some(1_000),

@@ -1019,7 +1019,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         active: true,
         label: None,
         account_identity: None,
-        created_at_ms: None,
+        created_at_ms: Some(42),
     };
     let summary = ProviderSummaryWire {
         provider: provider.to_owned(),
@@ -1119,6 +1119,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         .expect("custom family dispatch");
     assert_eq!(resolved.provider_name, provider);
     assert_eq!(resolved.account_alias.as_deref(), Some(alias.as_str()));
+    assert_eq!(resolved.account_incarnation, Some(42));
     assert_eq!(resolved.context_window, Some(131_072));
     assert_eq!(
         factory.model_context_window(provider, "not-in-the-catalog"),

@@ -99,6 +99,7 @@ impl ProviderAttemptResolver for RuntimeFallbackResolver {
         Ok(ProviderAttemptDecision::Switch(ProviderPairSwitchTarget {
             provider: Arc::clone(&self.target) as Arc<dyn haider_provider::Provider>,
             account: CredentialAlias::new("fake-b-account"),
+            account_incarnation: Some(2),
             provider_name: "fake-b".into(),
             model: "model-b".into(),
             context_window: None,
@@ -142,6 +143,7 @@ impl ProviderFactory for RoutingProviderFactory {
             account_alias: attempt_resolver
                 .as_ref()
                 .map(|_| "fake-a-account".to_owned()),
+            account_incarnation: None,
             active_no_auth: false,
             initial_rotation: None,
             rotation_budget_consumed: false,

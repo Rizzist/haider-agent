@@ -869,6 +869,10 @@ pub struct HarnessConfig {
     pub tool_result_images_supported: bool,
     /// Account pinned by the turn-scoped provider resolver.
     pub usage_account: Option<CredentialAlias>,
+    /// Immutable creation identity for the credential behind
+    /// `usage_account`. This is cache-routing state, not a secret or a
+    /// replacement for the operator-facing alias.
+    pub account_incarnation: Option<u64>,
     /// Non-secret provider/model/auth/cache-domain coordinates attached to
     /// usage telemetry after the provider response is decoded.
     pub usage_scope: UsageScope,
@@ -1052,6 +1056,7 @@ impl HarnessConfig {
             attachments: Vec::new(),
             tool_result_images_supported: false,
             usage_account: None,
+            account_incarnation: None,
             usage_scope: UsageScope::default(),
             cache_stable_history_end: None,
             cache_current_user_start: None,
@@ -1653,6 +1658,7 @@ async fn release_provider_budget_request(
 pub struct ResolvedProviderAttempt {
     pub provider: Arc<dyn Provider>,
     pub account: CredentialAlias,
+    pub account_incarnation: Option<u64>,
     pub rotation: RotationEvent,
 }
 
@@ -1692,6 +1698,7 @@ pub struct ProviderDerivedRequestState {
 pub struct ProviderPairSwitchTarget {
     pub provider: Arc<dyn Provider>,
     pub account: CredentialAlias,
+    pub account_incarnation: Option<u64>,
     pub provider_name: String,
     pub model: String,
     pub context_window: Option<u64>,
@@ -1707,6 +1714,7 @@ impl std::fmt::Debug for ProviderPairSwitchTarget {
         formatter
             .debug_struct("ProviderPairSwitchTarget")
             .field("account", &self.account)
+            .field("account_incarnation", &self.account_incarnation)
             .field("provider_name", &self.provider_name)
             .field("model", &self.model)
             .field("context_window", &self.context_window)
@@ -1791,6 +1799,7 @@ pub struct ProviderRebindTarget {
     pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub account: Option<CredentialAlias>,
+    pub account_incarnation: Option<u64>,
     pub context_window: Option<u64>,
     pub cached_input_is_subset: bool,
     pub provider_request_state: ProviderDerivedRequestState,
@@ -3952,6 +3961,7 @@ impl HarnessActor {
                         self.config
                             .install_provider_derived_request_state(&target.provider_request_state);
                         self.config.usage_account = target.account.clone();
+                        self.config.account_incarnation = target.account_incarnation;
                         self.config.usage_scope.provider = target.provider_name;
                         self.config.usage_scope.account_scope = target.account.clone();
                         self.config.usage_scope.auth_scope = target.auth_scope;
@@ -7468,6 +7478,7 @@ impl HarnessActor {
                     .map_err(DriveError::Store)?;
                     *provider = resolved.provider;
                     *account = Some(resolved.account);
+                    self.config.account_incarnation = resolved.account_incarnation;
                     *rotation_budget_consumed = true;
                     return Ok(());
                 }
@@ -7644,6 +7655,7 @@ impl HarnessActor {
         self.config.cache_expected_later_reads =
             u32::from(!self.config.tool_definitions().is_empty()) * 2;
         self.config.usage_account = Some(target.account.clone());
+        self.config.account_incarnation = target.account_incarnation;
         self.config.usage_scope.provider = target.provider_name.clone();
         self.config.usage_scope.model = target.model.clone();
         self.config.usage_scope.account_scope = Some(target.account.clone());
@@ -13672,6 +13684,7 @@ fn prompt_cache_metadata(
         session_scope: config.session_id.as_str().to_owned(),
         cache_cohort: config.cache_cohort.clone(),
         account_scope: account_scope.map(|scope| scope.as_str().to_owned()),
+        account_incarnation: config.account_incarnation,
         stable_prefix_tokens,
         expected_later_reads: config.cache_expected_later_reads,
         // The daemon measured this gap for the initially resolved account.

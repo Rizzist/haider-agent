@@ -10,6 +10,7 @@ from turnperf_support import validate_jsonl
 from deep_turn_harness import (
     CHECKPOINTS,
     MODEL_ID,
+    PromptCacheOracle,
     PROVIDER_COUNT,
     PROVIDER_ID,
     SPILL_TURNS,
@@ -31,6 +32,51 @@ from deep_turn_harness import (
 
 
 class DeepTurnHarnessTests(unittest.TestCase):
+    def test_cache_oracle_requires_both_key_and_exact_prefix(self) -> None:
+        oracle = PromptCacheOracle()
+        shared = "shared-system-" + ("x" * 5_000)
+        tools = [{"type": "function", "function": {"name": "read"}}]
+
+        first = oracle.observe(
+            {
+                "prompt_cache_key": "account-a",
+                "tools": tools,
+                "messages": [
+                    {"role": "system", "content": shared},
+                    {"role": "user", "content": "first"},
+                ],
+            }
+        )
+        same_partition = oracle.observe(
+            {
+                "prompt_cache_key": "account-a",
+                "tools": tools,
+                "messages": [
+                    {"role": "system", "content": shared},
+                    {"role": "user", "content": "second"},
+                ],
+            }
+        )
+        other_partition = oracle.observe(
+            {
+                "prompt_cache_key": "account-b",
+                "tools": tools,
+                "messages": [
+                    {"role": "system", "content": shared},
+                    {"role": "user", "content": "second"},
+                ],
+            }
+        )
+
+        self.assertEqual(first["cache_read"], 0)
+        self.assertGreater(same_partition["cache_read"], 1_024)
+        self.assertEqual(other_partition["cache_read"], 0)
+        for usage in (first, same_partition, other_partition):
+            self.assertEqual(
+                usage["logical"],
+                usage["cache_read"] + usage["cache_write"] + usage["fresh"],
+            )
+
     def test_foreign_daemon_snapshot_parser_keeps_only_exact_daemons(self) -> None:
         rows = parse_daemon_processes(
             "  17 /tmp/base/haiderd\n"

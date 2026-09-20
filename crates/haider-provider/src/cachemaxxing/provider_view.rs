@@ -343,6 +343,7 @@ mod tests {
                 session_scope: "session".into(),
                 cache_cohort: None,
                 account_scope: Some("account".into()),
+                account_incarnation: Some(1),
                 stable_prefix_tokens: 1_024,
                 expected_later_reads: 2,
                 reuse_gap_ms: None,

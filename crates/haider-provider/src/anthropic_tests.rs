@@ -469,6 +469,7 @@ fn cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetad
         session_scope: "session-a".into(),
         cache_cohort: None,
         account_scope: Some("account-a".into()),
+        account_incarnation: Some(1),
         stable_prefix_tokens: 8_192,
         expected_later_reads: 2,
         reuse_gap_ms: Some(30_000),

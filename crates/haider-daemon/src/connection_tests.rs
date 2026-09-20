@@ -2079,6 +2079,7 @@ impl crate::worker::ProviderFactory for PairedFakeFactory {
             model: metadata.model.clone(),
             context_window: None,
             account_alias: None,
+            account_incarnation: None,
             active_no_auth: false,
             initial_rotation: None,
             rotation_budget_consumed: false,

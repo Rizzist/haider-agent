@@ -107,6 +107,7 @@ impl ProviderFactory for FixedProviderFactory {
                 .fallback_resolver
                 .as_ref()
                 .map(|_| "test-web-account".to_owned()),
+            account_incarnation: None,
             active_no_auth: false,
             initial_rotation: None,
             rotation_budget_consumed: false,
