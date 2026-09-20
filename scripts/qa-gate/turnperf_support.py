@@ -245,9 +245,15 @@ def _tool_specifications(body: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return result
 
 
-def _select_exec_tool(
-    body: Mapping[str, Any], effect_token: str
+def select_exec_tool(
+    body: Mapping[str, Any], command: str
 ) -> tuple[str, dict[str, Any]]:
+    """Select the advertised local process tool and encode one command.
+
+    The benchmark providers must derive the argument key from the real catalog
+    instead of baking in a product schema.  Keeping that rule here gives the
+    ordinary and deep fixtures one compatibility seam.
+    """
     specifications = _tool_specifications(body)
     selected = next(
         (
@@ -292,11 +298,7 @@ def _select_exec_tool(
         None,
     )
     command_key = command_key or (next(iter(properties), None)) or "command"
-    arguments: dict[str, Any] = {
-        command_key: (
-            "printf '%s\\n' '" + effect_token + "' >> turnperf-tool-effects.log"
-        )
-    }
+    arguments: dict[str, Any] = {command_key: command}
     required = schema.get("required", []) if isinstance(schema, Mapping) else []
     if isinstance(required, list):
         for key in required:
@@ -305,7 +307,16 @@ def _select_exec_tool(
     return name, arguments
 
 
-def _chat_chunk(model: str, delta: Mapping[str, Any], finish: str | None = None) -> bytes:
+def _select_exec_tool(
+    body: Mapping[str, Any], effect_token: str
+) -> tuple[str, dict[str, Any]]:
+    return select_exec_tool(
+        body,
+        "printf '%s\\n' '" + effect_token + "' >> turnperf-tool-effects.log",
+    )
+
+
+def chat_chunk(model: str, delta: Mapping[str, Any], finish: str | None = None) -> bytes:
     value = {
         "id": "chatcmpl-turnperf",
         "object": "chat.completion.chunk",
@@ -318,9 +329,9 @@ def _chat_chunk(model: str, delta: Mapping[str, Any], finish: str | None = None)
 
 def _text_response(model: str) -> list[bytes]:
     return [
-        _chat_chunk(model, {"role": "assistant"}),
-        _chat_chunk(model, {"content": "turnperf complete"}),
-        _chat_chunk(model, {}, "stop"),
+        chat_chunk(model, {"role": "assistant"}),
+        chat_chunk(model, {"content": "turnperf complete"}),
+        chat_chunk(model, {}, "stop"),
         b"data: [DONE]\n\n",
     ]
 
@@ -337,9 +348,9 @@ def _tool_response(model: str, body: Mapping[str, Any], effect_token: str) -> li
         },
     }
     return [
-        _chat_chunk(model, {"role": "assistant"}),
-        _chat_chunk(model, {"tool_calls": [call]}),
-        _chat_chunk(model, {}, "tool_calls"),
+        chat_chunk(model, {"role": "assistant"}),
+        chat_chunk(model, {"tool_calls": [call]}),
+        chat_chunk(model, {}, "tool_calls"),
         b"data: [DONE]\n\n",
     ]
 
@@ -834,7 +845,9 @@ def runtime_socket_paths(runtime: Path) -> list[Path]:
     return sockets
 
 
-def validate_jsonl(stdout: str, shape: str) -> dict[str, Any]:
+def validate_jsonl(
+    stdout: str, shape: str, *, continuation: bool = False
+) -> dict[str, Any]:
     documents = parse_json_lines(stdout, f"{shape} JSONL")
     if not documents or documents[0].get("event") != "accepted":
         raise ProofError(f"{shape} JSONL first record is not accepted")
@@ -844,8 +857,14 @@ def validate_jsonl(stdout: str, shape: str) -> dict[str, Any]:
         raise ProofError(f"{shape} JSONL has no envelopes")
     session_id = accepted.get("session_id")
     sequences = [event.get("seq") for event in events]
-    if sequences[0] != accepted.get("head_seq"):
-        raise ProofError(f"{shape} JSONL head_seq does not match first envelope")
+    expected_first = accepted.get("head_seq")
+    if continuation and isinstance(expected_first, int):
+        expected_first += 1
+    if sequences[0] != expected_first:
+        relationship = "pre-submit head_seq + 1" if continuation else "head_seq"
+        raise ProofError(
+            f"{shape} JSONL {relationship} does not match first envelope"
+        )
     if any(
         isinstance(before, bool)
         or not isinstance(before, int)
