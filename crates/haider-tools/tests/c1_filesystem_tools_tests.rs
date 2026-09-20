@@ -470,6 +470,54 @@ async fn edit_requires_exactly_one_anchor_or_nonempty_replace_all() {
 }
 
 #[tokio::test]
+async fn edit_rejects_empty_changes_and_anchors_without_writing() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("empty.txt");
+    fs::write(&path, []).expect("seed empty edit target");
+    let (mut broker, _) = broker(directory.path(), "empty-edits", 1);
+    let policy = allow(EffectClass::FsWrite);
+    let ledger = ChangeLedger::new();
+    let turn = attribution("empty-edits", "turn");
+    assert_eq!(read_file(&mut broker, "empty.txt").await, "");
+
+    let empty_anchor = broker
+        .fs_edit(
+            &FsEdit::new("empty.txt", "", "unexpected insertion"),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect_err("empty old anchor must be invalid");
+    assert_eq!(
+        empty_anchor,
+        ToolError::InvalidArgument {
+            message: "fs_edit old anchors cannot be empty".into(),
+        }
+    );
+    assert_eq!(fs::metadata(&path).expect("empty target metadata").len(), 0);
+    assert_eq!(fs::read(&path).expect("empty target bytes"), b"");
+
+    let empty_edits = broker
+        .fs_edit(
+            &FsEdit::many("empty.txt", Vec::new()),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect_err("empty edit list must be invalid");
+    assert_eq!(
+        empty_edits,
+        ToolError::InvalidArgument {
+            message: "fs_edit edits cannot be empty".into(),
+        }
+    );
+    assert_eq!(fs::metadata(&path).expect("empty target metadata").len(), 0);
+    assert_eq!(fs::read(path).expect("empty target bytes"), b"");
+}
+
+#[tokio::test]
 async fn multi_edit_rejects_atomically_when_a_later_anchor_is_bad() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("batch.txt");

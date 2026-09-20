@@ -1105,6 +1105,14 @@ pub(crate) fn build_permission_file_review(
 }
 
 fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(String, usize)> {
+    if operation.edits.is_empty() {
+        return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
+    }
+    if operation.edits.iter().any(|edit| edit.old.is_empty()) {
+        return Err(ToolError::invalid_argument(
+            "fs_edit old anchors cannot be empty",
+        ));
+    }
     let mut replacements = 0usize;
     for edit in &operation.edits {
         let matches = edited.match_indices(&edit.old).count();
@@ -1132,6 +1140,33 @@ fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(Str
         replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
     }
     Ok((edited, replacements))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod edit_change_tests {
+    use super::*;
+
+    #[test]
+    fn shared_unix_and_windows_edit_path_rejects_empty_inputs() {
+        let empty_edits = FsEdit::many("target.txt", Vec::new());
+        assert_eq!(
+            apply_edit_changes(&empty_edits, "unchanged".into())
+                .expect_err("empty edit list must be invalid"),
+            ToolError::InvalidArgument {
+                message: "fs_edit edits cannot be empty".into(),
+            }
+        );
+
+        let empty_anchor = FsEdit::new("target.txt", "", "unexpected insertion");
+        assert_eq!(
+            apply_edit_changes(&empty_anchor, String::new())
+                .expect_err("empty old anchor must be invalid"),
+            ToolError::InvalidArgument {
+                message: "fs_edit old anchors cannot be empty".into(),
+            }
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5054,14 +5089,6 @@ fn apply_windows_edit(
     operation: &FsEdit,
     expected_digest: Option<&str>,
 ) -> ToolResult<AppliedMutation> {
-    if operation.edits.is_empty() {
-        return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
-    }
-    if operation.edits.iter().any(|edit| edit.old.is_empty()) {
-        return Err(ToolError::invalid_argument(
-            "fs_edit old anchors cannot be empty",
-        ));
-    }
     let (parent, target) =
         windows_mutation_target(workspace_root, relative, &operation.path, false)?;
     let mut source_file = open_windows_locked_file(&target, &operation.path)?;
