@@ -2,8 +2,10 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
 use base64::Engine as _;
@@ -68,12 +70,38 @@ fn workspace_mentions_index_files_and_tab_accepts_the_selected_path() {
     model.handle(common::key(KeyCode::Tab));
     assert_eq!(model.composer.text(), "@src/main.rs");
     assert!(model.mention_completion.is_none());
+
+    model.composer.set_text("");
+    for character in "@src".chars() {
+        model.handle(common::key(KeyCode::Char(character)));
+    }
+    assert!(model.mention_completion.is_some());
+    model.handle(common::ctrl(KeyCode::Char('c')));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert!(model.mention_completion.is_none());
+
+    let backend = ratatui::backend::TestBackend::new(118, 36);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            haider_tui::render::render(&model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let rendered = buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        !rendered.contains("src/main.rs"),
+        "the mention popup must not survive on the launcher"
+    );
 }
 
 #[test]
 fn ctrl_f_opens_a_transcript_search_without_mutating_the_composer() {
-    let mut model = AppModel::new();
-    model.screen = Screen::Session;
+    let mut model = session_model();
     model.composer.insert_str("draft");
     model.handle(common::ctrl(KeyCode::Char('f')));
     assert!(model.transcript_search.is_some());
@@ -90,6 +118,24 @@ fn ctrl_f_opens_a_transcript_search_without_mutating_the_composer() {
         KeyModifiers::NONE,
     )));
     assert_eq!(model.composer.text(), "draftf");
+
+    agent(&mut model, "match", "needle");
+    model.handle(common::ctrl(KeyCode::Char('f')));
+    for character in "needle".chars() {
+        model.handle(common::key(KeyCode::Char(character)));
+    }
+    assert_eq!(*model.search_jump.borrow(), Some(0));
+    model.handle(common::ctrl(KeyCode::Char('c')));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert!(model.transcript_search.is_none());
+    assert_eq!(*model.search_jump.borrow(), None);
+
+    model.handle(common::key(KeyCode::Char('X')));
+    assert_eq!(
+        model.composer.text(),
+        "X",
+        "typing after navigation belongs to the launcher composer"
+    );
 }
 
 #[test]
@@ -117,6 +163,11 @@ fn transcript_search_preserves_arrival_order_and_wraps_selection() {
     assert_eq!(model.transcript_search.as_ref().unwrap().selected, 0);
     model.handle(common::key(KeyCode::Up));
     assert_eq!(model.transcript_search.as_ref().unwrap().selected, 1);
+
+    model.checkin();
+    assert!(model.transcript_search.is_none());
+    assert_eq!(*model.search_jump.borrow(), None);
+    assert!(model.mention_completion.is_none());
 }
 
 #[test]
@@ -137,6 +188,11 @@ fn wide_unicode_search_rows_render_and_match() {
         })
         .expect("render");
     assert_eq!(model.transcript_search.as_ref().unwrap().query, "界界");
+
+    let active = model.active_session_id().expect("active session").clone();
+    model.open_session(&active);
+    assert!(model.transcript_search.is_none());
+    assert_eq!(*model.search_jump.borrow(), None);
 }
 
 #[test]
@@ -198,11 +254,17 @@ fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
     for index in 0..300 {
         fs::write(root.path().join(format!("file-{index:03}.txt")), "x").expect("file");
     }
-    let non_utf8 = OsString::from_vec(b"bad-\xff.txt".to_vec());
-    let non_utf8_created = fs::write(root.path().join(&non_utf8), "x").is_ok();
-    if !non_utf8_created {
-        assert!(non_utf8.to_string_lossy().contains('�'));
-    }
+    #[cfg(unix)]
+    let special_name_created = {
+        let non_utf8 = OsString::from_vec(b"bad-\xff.txt".to_vec());
+        let created = fs::write(root.path().join(&non_utf8), "x").is_ok();
+        if !created {
+            assert!(non_utf8.to_string_lossy().contains('�'));
+        }
+        created
+    };
+    #[cfg(not(unix))]
+    let special_name_created = fs::write(root.path().join("bad-�.txt"), "x").is_ok();
 
     let mut model = AppModel::new();
     model.screen = Screen::Session;
@@ -227,15 +289,13 @@ fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
         .mention_completion
         .as_ref()
         .expect("non-UTF8 query completion");
-    if non_utf8_created {
+    if special_name_created {
         assert!(
             completion
                 .candidates
                 .iter()
                 .any(|candidate| candidate.contains("bad-"))
         );
-    } else {
-        assert!(non_utf8.to_string_lossy().contains('�'));
     }
 }
 
