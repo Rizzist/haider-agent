@@ -3079,9 +3079,13 @@ request.
 
 OpenAI-family prompt-cache routing uses the internal schema
 `haider.prompt-cache-prefix.v5`. The key binds the provider, model, output
-budget, active account scope, finalized provider-view header epoch, and full
-cache epoch. Session identity and the inherited fork cohort are deliberately
-absent: independent sessions under one resolved account may reuse an exact
+budget, active account scope, the stored credential's immutable creation
+identity, finalized provider-view header epoch, and full cache epoch. Removing
+and re-adding the same public alias creates a new credential incarnation and
+therefore a fresh partition. The same living descriptor retains its creation
+identity across sessions and daemon restarts, so legitimate reuse remains
+stable. Session identity and the inherited fork cohort are deliberately absent:
+independent sessions under one resolved account incarnation may reuse an exact
 provider-visible prefix instead of fragmenting the provider cache solely due
 to local session identity. This v5 rule supersedes the session-scoped cohort
 key (v4 at this boundary).
@@ -3092,6 +3096,15 @@ not make different session histories interchangeable. The account scope is
 load-bearing: even byte-identical prompts under different accounts receive
 different keys, preventing one account from being served or probing another
 account's cached prefix.
+
+`account.login_api.replace_existing=true` is an in-place credential
+replacement, not a remove/add incarnation change. The account store preserves
+the descriptor's original creation identity while replacing it, so the cache
+partition remains stable. This is safe because replacement cannot change the
+alias, provider, auth method, or endpoint coordinates, and the provider still
+requires an exact prefix match; ordinary key/token rotation within that same
+account does not grant a different account access to the partition. A later
+remove followed by add creates a new descriptor identity and rotates it.
 
 The separate, existing `haider.prompt-cache-cohort.v4` route retains the C3
 session/fork cohort for transports such as xAI whose header denotes a sticky

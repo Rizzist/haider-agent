@@ -2338,6 +2338,7 @@ fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheM
         session_scope: "session-a".into(),
         cache_cohort: None,
         account_scope: Some("account-a".into()),
+        account_incarnation: Some(1),
         stable_prefix_tokens: 8_192,
         expected_later_reads: 2,
         reuse_gap_ms: Some(10_000),
@@ -3058,6 +3059,14 @@ fn prompt_cache_prefix_can_never_be_served_across_accounts() {
     let same_account_key =
         openai_prompt_cache_key(&same_account_session).expect("same account key");
     let account_b_key = openai_prompt_cache_key(&account_b).expect("account B key");
+    let mut replacement_incarnation = same_account_session.clone();
+    replacement_incarnation
+        .cache_metadata
+        .as_mut()
+        .expect("replacement cache metadata")
+        .account_incarnation = Some(2);
+    let replacement_key =
+        openai_prompt_cache_key(&replacement_incarnation).expect("replacement key");
     let cached_prefix: &[u8] = b"shared-policy/account-a-private-history";
     let cache_entry = (account_a_key.as_str(), cached_prefix);
     let can_serve = |key: &str, prefix: &[u8]| cache_entry == (key, prefix);
@@ -3076,6 +3085,10 @@ fn prompt_cache_prefix_can_never_be_served_across_accounts() {
     assert!(
         !can_serve(&account_b_key, cached_prefix),
         "one account's cached prefix must never serve another account"
+    );
+    assert!(
+        !can_serve(&replacement_key, cached_prefix),
+        "a re-added alias must never reuse the removed credential's partition"
     );
 
     // Keep the fresh-session mutation live instead of optimizing it away.
@@ -4280,6 +4293,10 @@ async fn xai_inference_uses_stable_opaque_cohort_cache_route() {
     assert_eq!(first_id.len(), 64, "conversation ID is BLAKE3 hex");
     assert!(first_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_ne!(first_id, "session-a", "raw session scope stays private");
+    assert_eq!(
+        first_id, "04352c1152758fd97ab36ba23f58913311e8b2f9e66b52a7b0bd04d6c98da1dd",
+        "the credential-incarnation fix must not rotate xAI's v4 route"
+    );
     let prepared = crate::Provider::prepare_turn(&provider, &request).expect("prepared xAI turn");
     assert_eq!(
         *prepared.cache_control(),

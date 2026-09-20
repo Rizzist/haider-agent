@@ -1826,6 +1826,11 @@ pub struct PromptCacheMetadata {
     /// isolation boundary for OpenAI-family prompt-cache keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_scope: Option<String>,
+    /// Immutable, non-secret identity of the stored credential incarnation.
+    /// Removing and re-adding an alias creates a new value; in-place
+    /// credential replacement preserves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_incarnation: Option<u64>,
     /// Conservative stable-prefix size estimate used by explicit-cache gates.
     #[serde(default)]
     pub stable_prefix_tokens: u64,

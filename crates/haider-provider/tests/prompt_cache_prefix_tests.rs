@@ -121,6 +121,7 @@ fn cache_metadata(
         session_scope: "prefix-session".into(),
         cache_cohort: None,
         account_scope: Some("prefix-account".into()),
+        account_incarnation: Some(1),
         stable_prefix_tokens: 4_096,
         expected_later_reads: 2,
         reuse_gap_ms: Some(1_000),

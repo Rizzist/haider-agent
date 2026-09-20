@@ -296,6 +296,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             account: resolved
                 .account_alias
                 .map(haider_protocol::ids::CredentialAlias::new),
+            account_incarnation: resolved.account_incarnation,
             context_window: resolved.context_window,
             cached_input_is_subset: cached_input_is_subset_for_provider(&metadata.provider),
             provider_request_state: request_state,

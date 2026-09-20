@@ -29,6 +29,7 @@ impl ProviderFactory for RecordingRebindFactory {
             model: metadata.model.clone(),
             context_window: Some(128_000),
             account_alias: metadata.account_alias.clone(),
+            account_incarnation: Some(1),
             active_no_auth: self.active_no_auth.load(Ordering::Acquire),
             initial_rotation: None,
             rotation_budget_consumed: false,

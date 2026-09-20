@@ -417,6 +417,7 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
             session_scope: "session-a".into(),
             cache_cohort: None,
             account_scope: Some("account-a".into()),
+            account_incarnation: Some(1),
             stable_prefix_tokens: 2_048,
             expected_later_reads: 2,
             reuse_gap_ms: None,

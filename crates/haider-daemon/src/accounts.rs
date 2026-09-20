@@ -9756,6 +9756,7 @@ impl AccountsProviderFactory {
         Some(haider_core::ProviderPairSwitchTarget {
             provider,
             account: resolved.descriptor.alias,
+            account_incarnation: resolved.descriptor.created_at_ms,
             provider_name: target.provider.clone(),
             model,
             context_window: Some(target_window),
@@ -10492,6 +10493,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             haider_core::ResolvedProviderAttempt {
                 provider,
                 account: resolved.descriptor.alias,
+                account_incarnation: resolved.descriptor.created_at_ms,
                 rotation,
             },
         ))
@@ -10605,6 +10607,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 haider_core::ProviderPairSwitchTarget {
                     provider,
                     account: resolved.descriptor.alias,
+                    account_incarnation: resolved.descriptor.created_at_ms,
                     provider_name: entry.provider.clone(),
                     model,
                     context_window,
@@ -10650,6 +10653,7 @@ impl AccountsProviderFactory {
             model: metadata.model.clone(),
             context_window,
             account_alias: Some(resolved.descriptor.alias.as_str().to_owned()),
+            account_incarnation: resolved.descriptor.created_at_ms,
             active_no_auth,
             initial_rotation: resolved.rotation,
             rotation_budget_consumed,

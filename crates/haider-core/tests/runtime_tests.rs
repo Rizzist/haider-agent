@@ -1431,6 +1431,7 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     bounded.compaction_promotion = Some(ProviderPairSwitchTarget {
         provider: promoted.clone(),
         account: CredentialAlias::new("fake-a-primary"),
+        account_incarnation: Some(1),
         provider_name: "fake-a".into(),
         model: "model-large".into(),
         context_window: Some(promoted_window),
@@ -1502,6 +1503,7 @@ async fn compaction_promotion_refuses_a_model_without_a_larger_known_window() {
     bounded.compaction_promotion = Some(ProviderPairSwitchTarget {
         provider: promoted.clone(),
         account: CredentialAlias::new("fake-a-primary"),
+        account_incarnation: Some(1),
         provider_name: "fake-a".into(),
         model: "model-not-larger".into(),
         context_window: Some(window),
@@ -5015,6 +5017,7 @@ async fn provider_rebind_initial_rotation_is_durable_before_target_request() {
             provider: target.clone(),
             provider_name: "fake".into(),
             account: Some(rotation.to.clone()),
+            account_incarnation: Some(2),
             context_window: None,
             cached_input_is_subset: false,
             provider_request_state: Default::default(),
@@ -5104,6 +5107,7 @@ async fn provider_rebind_cannot_refund_or_drop_consumed_rotation_budget() {
                 provider: failed_target.clone(),
                 provider_name: "fake".into(),
                 account: Some(CredentialAlias::new("rebind-b")),
+                account_incarnation: Some(2),
                 context_window: None,
                 cached_input_is_subset: false,
                 provider_request_state: Default::default(),
@@ -7078,6 +7082,7 @@ impl ProviderAttemptResolver for ScriptedRotationResolver {
         Ok(ProviderAttemptDecision::Rotate(ResolvedProviderAttempt {
             provider,
             account: account.clone(),
+            account_incarnation: Some(2),
             rotation: RotationEvent {
                 provider: "fake".into(),
                 from: current_account.clone(),

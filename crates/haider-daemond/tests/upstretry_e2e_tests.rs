@@ -84,6 +84,7 @@ impl ProviderFactory for RoutingFactory {
             model: metadata.model.clone(),
             context_window: None,
             account_alias: Some("upstretry-fixture-account".into()),
+            account_incarnation: None,
             active_no_auth: true,
             initial_rotation: None,
             rotation_budget_consumed: false,

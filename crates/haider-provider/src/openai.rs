@@ -5171,7 +5171,8 @@ fn custom_prompt_cache_key(
 }
 
 /// Prompt-cache account/prefix isolation law: a key exists only for one
-/// daemon-resolved account and one exact stable provider header/cache epoch.
+/// daemon-resolved account incarnation and one exact stable provider
+/// header/cache epoch.
 /// Session identity is deliberately absent so byte-identical prefixes can be
 /// reused across fresh sessions on that account. The key is only a provider
 /// routing/accounting partition: the provider's exact prefix match remains
@@ -5213,6 +5214,7 @@ fn prompt_cache_prefix_key_with_header(
         "model": request.model,
         "max_tokens": request.max_tokens,
         "account_scope": account_scope,
+        "account_incarnation": metadata.account_incarnation,
         "header_epoch": header_epoch,
         "cache_epoch": cache_epoch,
     });

@@ -224,6 +224,8 @@ pub struct ResolvedTurnProvider {
     pub context_window: Option<u64>,
     /// Stamped into usage until an automatic pre-event rotation changes it.
     pub account_alias: Option<String>,
+    /// Immutable creation identity of the resolved stored credential.
+    pub account_incarnation: Option<u64>,
     /// True only when provider construction selected the synthesized custom
     /// no-auth account rather than a stored credential.
     pub active_no_auth: bool,
@@ -492,6 +494,7 @@ struct DaemonContextCompactor {
     branch_id: Option<BranchId>,
     usage_scope: UsageScope,
     usage_account: Option<haider_protocol::ids::CredentialAlias>,
+    account_incarnation: Option<u64>,
     turn_ordinal: u64,
     request_ordinals: ProviderRequestOrdinal,
     turn_trace: Option<TurnTraceContext>,
@@ -1038,6 +1041,7 @@ impl DaemonContextCompactor {
                 .usage_account
                 .as_ref()
                 .map(|scope| scope.as_str().to_owned()),
+            account_incarnation: self.account_incarnation,
             stable_prefix_tokens,
             expected_later_reads: self.cache_expected_later_reads,
             reuse_gap_ms: self.cache_reuse_gap_ms,
@@ -7546,6 +7550,7 @@ async fn perform_manual_compaction(
         branch_id: branch_id.clone(),
         usage_scope,
         usage_account,
+        account_incarnation: resolved.account_incarnation,
         turn_ordinal,
         request_ordinals,
         turn_trace,
@@ -9373,6 +9378,7 @@ async fn start_turn(
     // later turn. Toolless lanes retain the zero-reuse safe fallback.
     config.cache_expected_later_reads = u32::from(!config.tool_definitions().is_empty()) * 2;
     config.usage_account = account_scope;
+    config.account_incarnation = resolved.account_incarnation;
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
     // result at the cap; hiding the tool would turn that recoverable model
@@ -9430,6 +9436,7 @@ async fn start_turn(
         branch_id: accepted.branch_id.clone(),
         usage_scope: config.usage_scope.clone(),
         usage_account: config.usage_account.clone(),
+        account_incarnation: config.account_incarnation,
         turn_ordinal: accepted.turn_ordinal,
         request_ordinals: request_ordinals.clone(),
         turn_trace: turn_trace.clone(),
