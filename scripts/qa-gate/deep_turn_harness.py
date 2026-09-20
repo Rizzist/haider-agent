@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import statistics
 import subprocess
@@ -77,6 +78,29 @@ T95 = {
     9: 2.262,
     10: 2.228,
 }
+
+
+def projection_bytes(body: Mapping[str, Any]) -> bytes:
+    """Stable bytes for byte-comparing the provider-bound prompt/history.
+
+    Each fixture run owns a random short `/tmp/hdp-*` root and daemon-minted
+    UUIDs. They are coordinates rather than projected content, so normalize
+    only those two known dynamic forms before hashing the exact ordered
+    `messages` JSON. No text, role, block, tool-call, or result field is
+    otherwise rewritten.
+    """
+
+    messages = json.dumps(
+        body.get("messages"), ensure_ascii=False, separators=(",", ":")
+    )
+    messages = re.sub(r"/tmp/hdp-[^/\\\"\s]+", "/tmp/hdp-FIXTURE", messages)
+    messages = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        "FIXTURE-UUID",
+        messages,
+        flags=re.IGNORECASE,
+    )
+    return messages.encode("utf-8")
 
 
 def abba_order(rounds: int) -> list[tuple[int, int, str]]:
@@ -253,6 +277,7 @@ class DeepProviderState:
         session_id, run_id, turn, request = parse_turn_header(turn_header)
         messages = body.get("messages")
         tools = body.get("tools")
+        projected = projection_bytes(body)
         entry = {
             "session_id": session_id,
             "run_id": run_id,
@@ -261,6 +286,8 @@ class DeepProviderState:
             "request_kind": "primary",
             "body_bytes": len(raw),
             "body_sha256": hashlib.sha256(raw).hexdigest(),
+            "projection_bytes": len(projected),
+            "projection_sha256": hashlib.sha256(projected).hexdigest(),
             "messages": len(messages) if isinstance(messages, list) else 0,
             "tools": len(tools) if isinstance(tools, list) else 0,
             "decode_micros": decode_micros,
@@ -998,6 +1025,45 @@ def summarize_contrasts(runs: Sequence[dict[str, Any]]) -> dict[str, Any] | None
     return result
 
 
+def summarize_projection_equivalence(
+    runs: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if {run["arm"] for run in runs} != {"a", "b"}:
+        return None
+    turns: dict[str, Any] = {}
+    all_identical = True
+    for turn in range(1, TURNS + 1):
+        request_count = 2 if turn_is_tool(turn) else 1
+        requests: dict[str, Any] = {}
+        turn_identical = True
+        for ordinal in range(1, request_count + 1):
+            digests = {
+                arm: sorted(
+                    {
+                        request["projection_sha256"]
+                        for run in runs
+                        if run["arm"] == arm
+                        for request in run["turns"][turn - 1]["provider_requests"]
+                        if request["request_ordinal"] == ordinal
+                    }
+                )
+                for arm in ("a", "b")
+            }
+            identical = digests["a"] == digests["b"]
+            turn_identical = turn_identical and identical
+            requests[str(ordinal)] = {
+                "byte_identical": identical,
+                "a_sha256": digests["a"],
+                "b_sha256": digests["b"],
+            }
+        all_identical = all_identical and turn_identical
+        turns[str(turn)] = {
+            "byte_identical": turn_identical,
+            "requests": requests,
+        }
+    return {"all_turns_byte_identical": all_identical, "turns": turns}
+
+
 def arms_for(args: argparse.Namespace) -> tuple[Arm, Arm | None]:
     base = args.bin_dir.resolve()
     if args.experiment == "baseline":
@@ -1028,6 +1094,18 @@ def arms_for(args: argparse.Namespace) -> tuple[Arm, Arm | None]:
         return (
             Arm("a", base, {}, "system allocator"),
             Arm("b", args.variant_bin_dir.resolve(), {}, "haider-daemond/mimalloc"),
+        )
+    if args.experiment == "wall1-journal":
+        if args.variant_bin_dir is None:
+            raise ProofError("wall1-journal requires --variant-bin-dir")
+        return (
+            Arm("a", base, {}, "pre-WALL-1 journal decode"),
+            Arm(
+                "b",
+                args.variant_bin_dir.resolve(),
+                {},
+                "WALL-1 incremental journal projections",
+            ),
         )
     raise ProofError(f"unknown experiment {args.experiment!r}")
 
@@ -1075,6 +1153,7 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
             "free1-store-trace",
             "free2-msgpack",
             "free3-mimalloc",
+            "wall1-journal",
         ),
         default="baseline",
     )
@@ -1155,6 +1234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "runs": runs,
             "summary": summarize_arms(runs),
             "contrasts": summarize_contrasts(runs),
+            "projection_equivalence": summarize_projection_equivalence(runs),
             "failures": [],
             "passed": True,
         }

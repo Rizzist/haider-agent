@@ -119,7 +119,7 @@ pub(crate) async fn open_retention_test_hub(
 }
 
 use crate::DaemonError;
-use crate::worker::{TurnSetupReductionCache, WorkerManagerHandle};
+use crate::worker::{TurnSetupReductionCache, WarmJournalProjectionCache, WorkerManagerHandle};
 use actor::run_session_actor;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -1144,6 +1144,10 @@ struct HubInner {
     /// Like prompt history, this is daemon-lifetime only; restart rebuilds
     /// from journal authority before installing a new revision.
     turn_setup_reductions: TurnSetupReductionCache,
+    /// Small daemon-lifetime heads for unconditional turn-start projections.
+    /// Every use verifies the durable journal boundary; restart and revision
+    /// mismatch rebuild by decoding the authoritative journal from zero.
+    warm_journal_projections: Arc<WarmJournalProjectionCache>,
 }
 
 #[derive(Default)]
@@ -1190,6 +1194,7 @@ struct ResidentBindingState {
 pub(super) struct CommitProjection {
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
+    warm_journal_projections: Arc<WarmJournalProjectionCache>,
     roster_publications: broadcast::Sender<SessionId>,
     completion_publications: broadcast::Sender<SessionId>,
     haider_code_plan_changes: watch::Sender<u64>,
@@ -1197,6 +1202,7 @@ pub(super) struct CommitProjection {
 
 impl CommitProjection {
     pub(super) fn observe_committed(&self, envelopes: &[RawEnvelope]) {
+        self.warm_journal_projections.observe_committed(envelopes);
         self.observe_digests.observe_committed(envelopes);
         if let Ok(installed) = self.hooks.lock()
             && let Some(hooks) = installed
@@ -2510,9 +2516,11 @@ impl SessionHub {
         let (shell_registry_events_cancel, _) = watch::channel(false);
         let hooks = Arc::new(Mutex::new(None));
         let observe_digests = Arc::new(rpc::ObserveDigestCache::default());
+        let warm_journal_projections = Arc::new(WarmJournalProjectionCache::default());
         let commit_projection = Arc::new(CommitProjection {
             hooks: Arc::clone(&hooks),
             observe_digests: Arc::clone(&observe_digests),
+            warm_journal_projections: Arc::clone(&warm_journal_projections),
             roster_publications: roster_publications.clone(),
             completion_publications: completion_publications.clone(),
             haider_code_plan_changes: haider_code_plan_changes.clone(),
@@ -2581,6 +2589,7 @@ impl SessionHub {
             lockdown_turn_bound: Notify::new(),
             prompt_history: PromptHistoryCache::default(),
             turn_setup_reductions: TurnSetupReductionCache::default(),
+            warm_journal_projections,
         });
         let hub = Self { inner };
         hub.spawn_shell_registry_events()?;
@@ -4527,6 +4536,20 @@ impl SessionHub {
         limit: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         self.inner.store.read(session_id, since_seq, limit).await
+    }
+
+    pub(crate) async fn headless_run_context_for_session(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<crate::worker::DurableHeadlessRunContext>, HaiderError> {
+        crate::worker::cached_headless_run_context(
+            &self.inner.store,
+            session_id,
+            &self.inner.warm_journal_projections,
+            run_id,
+        )
+        .await
     }
 
     pub(crate) async fn latest_internal_session_seq(
@@ -6509,6 +6532,9 @@ impl SessionHub {
                     .await
                     .remove(session_id);
                 self.inner.monitors.release_session_tombstone(session_id);
+                self.inner
+                    .warm_journal_projections
+                    .remove_session(session_id);
             }
             Err(error) => {
                 self.inner
@@ -8216,6 +8242,49 @@ impl HubStoreHandle {
             branch_id,
             agent_id,
             current_run,
+        )
+        .await
+    }
+
+    pub(crate) async fn headless_run_context(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<crate::worker::DurableHeadlessRunContext>, HaiderError> {
+        crate::worker::cached_headless_run_context(
+            self,
+            &self.session_id,
+            &self.hub.inner.warm_journal_projections,
+            run_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn latest_context_economy(
+        &self,
+    ) -> Result<Option<haider_protocol::context::ContextEconomy>, HaiderError> {
+        crate::worker::cached_latest_context_economy(
+            self,
+            &self.session_id,
+            &self.hub.inner.warm_journal_projections,
+        )
+        .await
+    }
+
+    pub(crate) async fn turn_start_journal_projection(
+        &self,
+        run_id: &RunId,
+    ) -> Result<
+        (
+            Option<crate::worker::DurableHeadlessRunContext>,
+            Option<haider_protocol::context::ContextEconomy>,
+        ),
+        HaiderError,
+    > {
+        crate::worker::cached_turn_start_projection(
+            self,
+            &self.session_id,
+            &self.hub.inner.warm_journal_projections,
+            run_id,
         )
         .await
     }

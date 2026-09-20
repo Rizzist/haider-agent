@@ -58,6 +58,9 @@ mod worker_tool_exposure_tests;
 #[cfg(test)]
 #[path = "worker_turn_setup_reduction_tests.rs"]
 mod worker_turn_setup_reduction_tests;
+#[cfg(test)]
+#[path = "worker_warm_journal_projection_tests.rs"]
+mod worker_warm_journal_projection_tests;
 
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::diagnostics::{EffectBreadcrumb, EffectDiagnostics};
@@ -95,7 +98,8 @@ use haider_protocol::cache::{
     ProviderViewLedgerV1,
 };
 use haider_protocol::context::{
-    ContextCompactionTier, ContextFootprint, ContextFootprintTruth, OutputSavings,
+    ContextCompactionTier, ContextEconomy, ContextFootprint, ContextFootprintTruth,
+    ContextSavingsEvent, ContextSavingsLayer, OutputSavings,
 };
 use haider_protocol::context_compaction::{
     CompactionItemUnit, ContextCompactionEventPayload, ContextCompactionV1,
@@ -1549,9 +1553,7 @@ impl ContextCompactor for DaemonContextCompactor {
         } else {
             (covered_messages, attachments)
         };
-        let recovered_economy =
-            PromptHistoryCompiler::latest_context_economy(&self.store, self.store.session_id())
-                .await?;
+        let recovered_economy = self.store.latest_context_economy().await?;
         let economy_before = recovered_economy
             .as_ref()
             .filter(|economy| economy.operation_count > economy_before.operation_count)
@@ -8241,7 +8243,15 @@ async fn refresh_context_economy(
     lease: &HubStoreHandle,
     metadata: &haider_protocol::context::ContextEconomy,
 ) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
-    let journal = PromptHistoryCompiler::latest_context_economy(lease, lease.session_id()).await?;
+    let journal = lease.latest_context_economy().await?;
+    refresh_context_economy_from_journal(lease, metadata, journal).await
+}
+
+async fn refresh_context_economy_from_journal(
+    lease: &HubStoreHandle,
+    metadata: &haider_protocol::context::ContextEconomy,
+    journal: Option<haider_protocol::context::ContextEconomy>,
+) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
     let (economy, heal_metadata) = reconcile_context_economy(metadata, journal)?;
     if heal_metadata {
         lease
@@ -8310,11 +8320,17 @@ async fn start_turn(
         })
     });
     let request_ordinals = ProviderRequestOrdinal::new(provider_request_ordinal_already_made);
-    let headless = headless_run_context(lease, &accepted.run_id).await?;
+    let (headless, journal_economy) = lease
+        .turn_start_journal_projection(&accepted.run_id)
+        .await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
-    pinned_metadata.context_economy =
-        refresh_context_economy(lease, &pinned_metadata.context_economy).await?;
+    pinned_metadata.context_economy = refresh_context_economy_from_journal(
+        lease,
+        &pinned_metadata.context_economy,
+        journal_economy,
+    )
+    .await?;
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
         provider_rebind::pin_headless_turn_metadata(
@@ -9622,6 +9638,398 @@ const TURN_SETUP_REDUCTION_PAYLOAD_KINDS: &[&str] = &[
     "tool_result",
     "session_forked",
 ];
+
+// `run_state` is the first durable event for every newly accepted run. It is
+// needed even though its payload is not projected: the legacy headless scan
+// uses that first envelope's timestamp and branch as the budget origin.
+const WARM_JOURNAL_PROJECTION_PAYLOAD_KINDS: &[&str] = &[
+    "run_state",
+    "headless_run_configured",
+    "run_budget_exhausted",
+    "run_deadline_exceeded",
+    "item",
+];
+
+#[derive(Clone, PartialEq, Eq)]
+struct WarmJournalRevision {
+    head_seq: u64,
+    head_event_id: EventId,
+}
+
+impl From<(u64, EventId)> for WarmJournalRevision {
+    fn from((head_seq, head_event_id): (u64, EventId)) -> Self {
+        Self {
+            head_seq,
+            head_event_id,
+        }
+    }
+}
+
+struct WarmHeadlessRunProjection {
+    accepted_at_ms: u64,
+    branch_id: Option<BranchId>,
+    spec: Option<HeadlessRunSpecV1>,
+    exhausted: Option<RunBudgetExhaustedV1>,
+    deadline_exceeded: Option<RunDeadlineExceededV1>,
+}
+
+#[derive(Default)]
+struct WarmJournalProjection {
+    headless_runs: HashMap<RunId, WarmHeadlessRunProjection>,
+    latest_context_savings: Option<ContextSavingsEvent>,
+    last_conversation_savings: Option<ContextSavingsEvent>,
+    last_output_savings: Option<ContextSavingsEvent>,
+    context_savings_error: Option<HaiderError>,
+}
+
+impl WarmJournalProjection {
+    fn observe_envelope(&mut self, envelope: &RawEnvelope) -> Result<(), HaiderError> {
+        if let Some(run_id) = envelope.run_id.as_ref() {
+            let remove_non_headless_terminal = {
+                let run = self.headless_runs.entry(run_id.clone()).or_insert_with(|| {
+                    WarmHeadlessRunProjection {
+                        accepted_at_ms: envelope.committed_at_ms,
+                        branch_id: envelope.branch_id.clone(),
+                        spec: None,
+                        exhausted: None,
+                        deadline_exceeded: None,
+                    }
+                });
+                match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
+                    Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
+                        run.spec = Some(configured);
+                    }
+                    Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
+                        run.exhausted = Some(fact);
+                    }
+                    Some(HeadlessRunEventPayload::RunDeadlineExceeded(fact)) => {
+                        run.deadline_exceeded = Some(fact);
+                    }
+                    None => {}
+                }
+                run.spec.is_none()
+                    && matches!(
+                        envelope.payload.decode_event(),
+                        Ok(EventPayload::RunState(state)) if state.is_terminal()
+                    )
+            };
+            if remove_non_headless_terminal {
+                self.headless_runs.remove(run_id);
+            }
+        }
+
+        let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+            envelope.payload.decode_event()
+        else {
+            return Ok(());
+        };
+        if self.context_savings_error.is_some() {
+            return Ok(());
+        }
+        let event = match ContextSavingsEvent::try_from_extension_item(&item) {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                self.context_savings_error = Some(warm_projection_corrupt(format!(
+                    "context-savings event is malformed: {error}"
+                )));
+                return Ok(());
+            }
+        };
+        if let Some(existing) = &self.latest_context_savings {
+            if event.session_operation_count < existing.session_operation_count {
+                self.context_savings_error = Some(warm_projection_corrupt(
+                    "context-savings operation count moved backwards",
+                ));
+                return Ok(());
+            }
+            if event.session_operation_count == existing.session_operation_count
+                && event != *existing
+            {
+                self.context_savings_error = Some(warm_projection_corrupt(
+                    "equal context-savings coordinates disagree",
+                ));
+                return Ok(());
+            }
+        }
+        match event.layer {
+            ContextSavingsLayer::Conversation => {
+                self.last_conversation_savings = Some(event.clone());
+            }
+            ContextSavingsLayer::ToolOutput => {
+                self.last_output_savings = Some(event.clone());
+            }
+        }
+        self.latest_context_savings = Some(event);
+        Ok(())
+    }
+
+    fn headless_run_context(&self, run_id: &RunId) -> Option<DurableHeadlessRunContext> {
+        let run = self.headless_runs.get(run_id)?;
+        Some(DurableHeadlessRunContext {
+            spec: run.spec.clone()?,
+            accepted_at_ms: run.accepted_at_ms,
+            branch_id: run.branch_id.clone(),
+            exhausted: run.exhausted.clone(),
+            deadline_exceeded: run.deadline_exceeded.clone(),
+        })
+    }
+
+    fn latest_context_economy(&self) -> Result<Option<ContextEconomy>, HaiderError> {
+        if let Some(error) = &self.context_savings_error {
+            return Err(error.clone());
+        }
+        Ok(self
+            .latest_context_savings
+            .as_ref()
+            .map(|event| ContextEconomy {
+                cumulative_estimated_tokens_saved: event.session_cumulative_estimated_tokens_saved,
+                operation_count: event.session_operation_count,
+                last_event: self.last_conversation_savings.clone(),
+                last_output_event: self.last_output_savings.clone(),
+            }))
+    }
+}
+
+fn warm_projection_corrupt(message: impl Into<String>) -> HaiderError {
+    HaiderError::new(ErrorCode::StoreCorrupt, message, false)
+}
+
+#[derive(Default)]
+struct CachedWarmJournalProjection {
+    last_touched: u64,
+    revision: Option<WarmJournalRevision>,
+    projection: WarmJournalProjection,
+}
+
+#[derive(Default)]
+struct WarmJournalProjectionEntries {
+    touch_clock: u64,
+    projections: HashMap<SessionId, CachedWarmJournalProjection>,
+}
+
+const WARM_JOURNAL_PROJECTION_CACHE_LIMIT: usize = 16;
+
+/// Daemon-lifetime incremental projection for the two unconditional warm
+/// journal reads. The journal remains the sole authority: a cold entry is
+/// rebuilt by decoding every durable envelope, and every cached entry is
+/// checked against the store's transactionally sampled `(head_seq, event_id)`
+/// before use. Rewinds and same-sequence replacements therefore replay from
+/// zero; ordinary head advances decode only indexed projection-bearing rows.
+#[derive(Default)]
+pub(crate) struct WarmJournalProjectionCache {
+    entries: StdMutex<WarmJournalProjectionEntries>,
+}
+
+impl WarmJournalProjectionCache {
+    fn take(&self, session_id: &SessionId) -> Option<CachedWarmJournalProjection> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .projections
+            .remove(session_id)
+    }
+
+    fn install(&self, session_id: SessionId, mut candidate: CachedWarmJournalProjection) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.touch_clock = entries.touch_clock.saturating_add(1);
+        candidate.last_touched = entries.touch_clock;
+        let replace = entries.projections.get(&session_id).is_none_or(|current| {
+            match (&candidate.revision, &current.revision) {
+                (Some(candidate), Some(current)) => {
+                    candidate.head_seq > current.head_seq || candidate == current
+                }
+                (Some(_), None) | (None, None) => true,
+                (None, Some(_)) => false,
+            }
+        });
+        if replace {
+            entries.projections.insert(session_id, candidate);
+        }
+        while entries.projections.len() > WARM_JOURNAL_PROJECTION_CACHE_LIMIT {
+            let Some(evicted) = entries
+                .projections
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_touched)
+                .map(|(session_id, _)| session_id.clone())
+            else {
+                break;
+            };
+            entries.projections.remove(&evicted);
+        }
+    }
+
+    pub(crate) fn observe_committed(&self, envelopes: &[RawEnvelope]) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for envelope in envelopes {
+            let Some(cached) = entries.projections.get_mut(&envelope.session_id) else {
+                continue;
+            };
+            let contiguous = cached
+                .revision
+                .as_ref()
+                .is_some_and(|head| head.head_seq.saturating_add(1) == envelope.seq);
+            if !contiguous {
+                entries.projections.remove(&envelope.session_id);
+                continue;
+            }
+            cached
+                .projection
+                .observe_envelope(envelope)
+                .unwrap_or_else(|error| cached.projection.context_savings_error = Some(error));
+            cached.revision = Some(WarmJournalRevision {
+                head_seq: envelope.seq,
+                head_event_id: envelope.event_id.clone(),
+            });
+        }
+    }
+
+    pub(crate) fn remove_session(&self, session_id: &SessionId) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .projections
+            .remove(session_id)
+            .is_some()
+    }
+}
+
+pub(crate) async fn cached_headless_run_context(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    cache: &WarmJournalProjectionCache,
+    run_id: &RunId,
+) -> Result<Option<DurableHeadlessRunContext>, HaiderError> {
+    reduce_warm_journal_projection_cached(store, session_id, cache, |projection| {
+        projection.headless_run_context(run_id)
+    })
+    .await
+}
+
+pub(crate) async fn cached_latest_context_economy(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    cache: &WarmJournalProjectionCache,
+) -> Result<Option<ContextEconomy>, HaiderError> {
+    reduce_warm_journal_projection_cached(store, session_id, cache, |projection| {
+        projection.latest_context_economy()
+    })
+    .await?
+}
+
+pub(crate) async fn cached_turn_start_projection(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    cache: &WarmJournalProjectionCache,
+    run_id: &RunId,
+) -> Result<(Option<DurableHeadlessRunContext>, Option<ContextEconomy>), HaiderError> {
+    let (headless, economy) =
+        reduce_warm_journal_projection_cached(store, session_id, cache, |projection| {
+            (
+                projection.headless_run_context(run_id),
+                projection.latest_context_economy(),
+            )
+        })
+        .await?;
+    Ok((headless, economy?))
+}
+
+async fn reduce_warm_journal_projection_cached<T>(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    cache: &WarmJournalProjectionCache,
+    select: impl Fn(&WarmJournalProjection) -> T,
+) -> Result<T, HaiderError> {
+    let mut cached = cache.take(session_id).unwrap_or_default();
+    'replay: loop {
+        let started_from_cached_revision = cached.revision.is_some();
+        let mut cursor = cached.revision.as_ref().map_or(0, |head| head.head_seq);
+        let mut expected_revision = cached.revision.take();
+        if expected_revision.is_none() {
+            cached.projection = WarmJournalProjection::default();
+            let mut last_revision = None;
+            loop {
+                let page = store.read(session_id, cursor, 256).await?;
+                if page.is_empty() {
+                    break;
+                }
+                let next_cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+                if next_cursor <= cursor {
+                    return Err(warm_projection_corrupt(
+                        "warm journal replay did not advance its sequence cursor",
+                    ));
+                }
+                for envelope in &page {
+                    cached.projection.observe_envelope(envelope)?;
+                }
+                cursor = next_cursor;
+                last_revision = page.last().map(|envelope| WarmJournalRevision {
+                    head_seq: envelope.seq,
+                    head_event_id: envelope.event_id.clone(),
+                });
+            }
+            expected_revision = last_revision;
+        }
+
+        let mut final_revision = expected_revision.clone();
+        let mut exact_boundary = true;
+        loop {
+            let page = StoreHandle::read_reducer_page_with_boundary(
+                store,
+                session_id,
+                cursor,
+                256,
+                usize::MAX,
+                WARM_JOURNAL_PROJECTION_PAYLOAD_KINDS,
+            )
+            .await?;
+            let observed_revision = page.observed_head.map(WarmJournalRevision::from);
+            if observed_revision.is_none() {
+                exact_boundary = false;
+            }
+            if let Some(expected) = expected_revision.take() {
+                let valid_suffix = observed_revision
+                    .as_ref()
+                    .map_or(!started_from_cached_revision, |observed| {
+                        observed.head_seq > expected.head_seq || observed == &expected
+                    });
+                let impossible_exact_page =
+                    observed_revision.as_ref() == Some(&expected) && !page.envelopes.is_empty();
+                if !valid_suffix || impossible_exact_page {
+                    cached = CachedWarmJournalProjection::default();
+                    continue 'replay;
+                }
+            }
+            if page.envelopes.is_empty() {
+                final_revision = observed_revision.or(final_revision);
+                cached.revision = exact_boundary.then_some(final_revision).flatten();
+                let selected = select(&cached.projection);
+                cache.install(session_id.clone(), cached);
+                return Ok(selected);
+            }
+            let next_cursor = page
+                .envelopes
+                .last()
+                .map_or(cursor, |envelope| envelope.seq);
+            if next_cursor <= cursor {
+                return Err(warm_projection_corrupt(
+                    "warm journal suffix did not advance its sequence cursor",
+                ));
+            }
+            for envelope in &page.envelopes {
+                cached.projection.observe_envelope(envelope)?;
+            }
+            cursor = next_cursor;
+            final_revision = observed_revision.or(final_revision);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct TurnSetupReductionSelector {
@@ -10961,51 +11369,7 @@ async fn headless_run_context(
     store: &HubStoreHandle,
     run_id: &RunId,
 ) -> Result<Option<DurableHeadlessRunContext>, HaiderError> {
-    let mut cursor = 0_u64;
-    let mut accepted_at_ms = None;
-    let mut branch_id = None;
-    let mut spec = None;
-    let mut exhausted = None;
-    let mut deadline_exceeded = None;
-    loop {
-        let page = store.read(store.session_id(), cursor, 256).await?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len();
-        for envelope in page {
-            cursor = envelope.seq;
-            if envelope.run_id.as_ref() != Some(run_id) {
-                continue;
-            }
-            if accepted_at_ms.is_none() {
-                accepted_at_ms = Some(envelope.committed_at_ms);
-                branch_id = envelope.branch_id.clone();
-            }
-            match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
-                Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
-                    spec = Some(configured);
-                }
-                Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
-                    exhausted = Some(fact);
-                }
-                Some(HeadlessRunEventPayload::RunDeadlineExceeded(fact)) => {
-                    deadline_exceeded = Some(fact);
-                }
-                None => {}
-            }
-        }
-        if page_len < 256 {
-            break;
-        }
-    }
-    Ok(spec.map(|spec| DurableHeadlessRunContext {
-        spec,
-        accepted_at_ms: accepted_at_ms.unwrap_or(0),
-        branch_id,
-        exhausted,
-        deadline_exceeded,
-    }))
+    store.headless_run_context(run_id).await
 }
 
 async fn headless_run_context_for_session(
@@ -11013,54 +11377,12 @@ async fn headless_run_context_for_session(
     session_id: &SessionId,
     run_id: &RunId,
 ) -> Result<Option<DurableHeadlessRunContext>, HaiderError> {
-    let mut cursor = 0_u64;
-    let mut accepted_at_ms = None;
-    let mut branch_id = None;
-    let mut spec = None;
-    let mut exhausted = None;
-    let mut deadline_exceeded = None;
-    loop {
-        let page = hub.read_internal_session(session_id, cursor, 256).await?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len();
-        for envelope in page {
-            cursor = envelope.seq;
-            if envelope.run_id.as_ref() != Some(run_id) {
-                continue;
-            }
-            if accepted_at_ms.is_none() {
-                accepted_at_ms = Some(envelope.committed_at_ms);
-                branch_id = envelope.branch_id.clone();
-            }
-            match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
-                Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
-                    spec = Some(configured);
-                }
-                Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
-                    exhausted = Some(fact);
-                }
-                Some(HeadlessRunEventPayload::RunDeadlineExceeded(fact)) => {
-                    deadline_exceeded = Some(fact);
-                }
-                None => {}
-            }
-        }
-        if page_len < 256 {
-            break;
-        }
-    }
-    Ok(spec.map(|spec| DurableHeadlessRunContext {
-        spec,
-        accepted_at_ms: accepted_at_ms.unwrap_or(0),
-        branch_id,
-        exhausted,
-        deadline_exceeded,
-    }))
+    hub.headless_run_context_for_session(session_id, run_id)
+        .await
 }
 
-struct DurableHeadlessRunContext {
+#[derive(Clone)]
+pub(crate) struct DurableHeadlessRunContext {
     spec: HeadlessRunSpecV1,
     accepted_at_ms: u64,
     branch_id: Option<BranchId>,
