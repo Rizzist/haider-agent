@@ -130,6 +130,7 @@ fn run_headless(command: routing::Command<'_>) -> ExitCode {
     }
     code
 }
+
 /// Keep a completed client process alive for the release footprint harness.
 ///
 /// This is deliberately an opt-in measurement seam rather than a command-line

@@ -83,30 +83,30 @@ pub fn sync<T>(phase: Phase, operation: impl FnOnce() -> T) -> T {
 }
 
 /// Measure an asynchronous operation, charging CPU only during its polls.
-pub async fn measure<T>(phase: Phase, future: impl Future<Output = T>) -> T {
+pub fn measure<F: Future>(phase: Phase, future: F) -> impl Future<Output = F::Output> {
     #[cfg(unix)]
     {
-        if native::enabled() {
-            return native::measure(phase, future, true).await;
-        }
+        native::Measure::new(phase, future, true)
     }
     #[cfg(not(unix))]
-    let _ = phase;
-    future.await
+    {
+        let _ = phase;
+        future
+    }
 }
 
 /// Attribute active control/handler work without calling its idle time RPC or
 /// request assembly. Nested specific scopes retain their own exclusive CPU.
-pub async fn measure_active<T>(phase: Phase, future: impl Future<Output = T>) -> T {
+pub fn measure_active<F: Future>(phase: Phase, future: F) -> impl Future<Output = F::Output> {
     #[cfg(unix)]
     {
-        if native::enabled() {
-            return native::measure(phase, future, false).await;
-        }
+        native::Measure::new(phase, future, false)
     }
     #[cfg(not(unix))]
-    let _ = phase;
-    future.await
+    {
+        let _ = phase;
+        future
+    }
 }
 
 /// Declare before all executable state so its drop flushes after shutdown.
@@ -124,13 +124,14 @@ mod native {
     use super::Phase;
     use rustix::time::{ClockId, clock_gettime};
     use std::cell::RefCell;
-    use std::future::{Future, poll_fn};
+    use std::future::Future;
     use std::io::{BufWriter, Write};
     use std::marker::PhantomData;
     use std::path::PathBuf;
-    use std::pin::pin;
+    use std::pin::Pin;
     use std::rc::Rc;
     use std::sync::{Mutex, OnceLock};
+    use std::task::{Context, Poll};
 
     const MAX_RECORDS: usize = 100_000;
     static DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -238,32 +239,51 @@ mod native {
         }
     }
 
-    pub(super) async fn measure<T>(
+    pub(super) struct Measure<F> {
         phase: Phase,
-        future: impl Future<Output = T>,
+        future: Pin<Box<F>>,
         record_waits: bool,
-    ) -> T {
-        let mut future = pin!(future);
-        let mut waiting_since = None;
-        poll_fn(|cx| {
-            if let Some(start) = waiting_since.take() {
+        waiting_since: Option<u64>,
+        enabled: bool,
+    }
+
+    impl<F> Measure<F> {
+        pub(super) fn new(phase: Phase, future: F, record_waits: bool) -> Self {
+            Self {
+                phase,
+                future: Box::pin(future),
+                record_waits,
+                waiting_since: None,
+                enabled: enabled(),
+            }
+        }
+    }
+
+    impl<F: Future> Future for Measure<F> {
+        type Output = F::Output;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if !this.enabled {
+                return this.future.as_mut().poll(cx);
+            }
+            if let Some(start) = this.waiting_since.take() {
                 record(Row {
-                    phase,
+                    phase: this.phase,
                     start,
                     end: clock_ns(ClockId::Monotonic),
                     cpu: 0,
                     waiting: true,
                 });
             }
-            let scope = Scope::new(phase);
-            let result = future.as_mut().poll(cx);
+            let scope = Scope::new(this.phase);
+            let result = this.future.as_mut().poll(cx);
             drop(scope);
-            if record_waits && result.is_pending() {
-                waiting_since = Some(clock_ns(ClockId::Monotonic));
+            if this.record_waits && result.is_pending() {
+                this.waiting_since = Some(clock_ns(ClockId::Monotonic));
             }
             result
-        })
-        .await
+        }
     }
 
     pub(super) fn flush() {
@@ -312,6 +332,8 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::future::poll_fn;
+        use std::pin::pin;
 
         #[test]
         fn suspended_future_does_not_charge_interleaved_work() {
@@ -344,7 +366,7 @@ mod native {
                 return;
             }
             let mut polled = false;
-            let mut future = pin!(super::measure(
+            let mut future = pin!(Measure::new(
                 Phase::Rpc,
                 poll_fn(|_| {
                     if std::mem::replace(&mut polled, true) {
