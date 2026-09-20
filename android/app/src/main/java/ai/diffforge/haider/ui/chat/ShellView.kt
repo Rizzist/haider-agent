@@ -74,6 +74,22 @@ const val SHELL_VIEW_TAG = "shell_view"
 const val SHELL_INPUT_TAG = "shell_input"
 
 /**
+ * Availability reasons that are observations about this client's connection or
+ * a not-yet-finished capability check, not capability denials. The terminal
+ * keeps rendering its cached redacted history for them, with input disabled
+ * and a truthful inline notice (FACADE-SHELL.md: show cached history while
+ * reconnecting; never synthesize completion, never resubmit).
+ */
+private val shellConnectivityReasons = setOf("not_observed", "checking", "disconnected", "daemon_unavailable")
+
+/**
+ * The only reasons whose honest explanation is the on-device process policy.
+ * Every other denial gets the generic truthful card plus the verbatim code;
+ * unknown additive reasons stay unavailable rather than mapping to success.
+ */
+private val shellPolicyReasons = setOf("process_exec_disabled", "policy_unavailable")
+
+/**
  * The session's terminal (lane 972-android-shell, FACADE-SHELL.md).
  *
  * One-shot, non-PTY commands over the daemon's own door: history is the
@@ -104,7 +120,14 @@ fun ShellView(
 ) {
     val colors = Forge.colors
     val type = Forge.type
-    if (!availability.available) {
+    // `available` is a capability observation, not a curtain. `session_busy`
+    // means the terminal's own command is running — render it, its streaming
+    // output and its Stop. Connection/observation loss keeps the cached
+    // redacted history on screen with input disabled. Only a genuine denial
+    // closes the door with the card, and only policy reasons may claim policy.
+    val busyObserved = !availability.available && availability.reason == "session_busy"
+    val connectionLost = !availability.available && availability.reason in shellConnectivityReasons
+    if (!availability.available && !busyObserved && !connectionLost) {
         ShellUnavailable(availability, modifier)
         return
     }
@@ -114,7 +137,8 @@ fun ShellView(
     val nonterminal = executions.any {
         it.status == ShellExecutionStatus.Running || it.status == ShellExecutionStatus.Reconnecting
     }
-    val canRun = pending == null && !busy && !nonterminal && draft.isNotBlank()
+    val canRun = pending == null && !busy && !nonterminal && !busyObserved && !connectionLost &&
+        draft.isNotBlank()
     val listState = rememberLazyListState()
     LaunchedEffect(executions.size, executions.lastOrNull()?.output?.size) {
         if (executions.isNotEmpty()) listState.scrollToItem(executions.lastIndex)
@@ -205,9 +229,33 @@ fun ShellView(
                 }
             }
         }
+        if (connectionLost) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = ForgeSpace.xl, vertical = ForgeSpace.xs),
+                verticalArrangement = Arrangement.spacedBy(ForgeSpace.xs),
+            ) {
+                // The truthful state of THIS client's connection — never a
+                // policy claim, never a request to resubmit anything.
+                Text(
+                    stringResource(
+                        if (availability.reason == "disconnected" || availability.reason == "daemon_unavailable") {
+                            R.string.shell_reconnecting_notice
+                        } else {
+                            R.string.shell_checking_notice
+                        },
+                    ),
+                    style = type.sessionMeta,
+                    color = colors.amber,
+                )
+                // mono: the daemon's/facade's own reason code, quoted verbatim.
+                availability.reason?.let { Text(it, style = type.toolRow, color = colors.textMuted) }
+            }
+        }
         ShellInputRow(
             draft = draft,
-            enabled = pending == null,
+            enabled = pending == null && !connectionLost,
             canRun = canRun,
             onDraft = onDraft,
             onRun = onRun,
@@ -421,7 +469,11 @@ private fun ShellExecutionCard(
     }
 }
 
-/** The honest closed door: the daemon's own reason, verbatim. */
+/**
+ * The honest closed door: the daemon's own reason, verbatim. The policy
+ * sentence is reserved for reasons that ARE the process policy; every other
+ * denial states only that the daemon is not offering a shell here.
+ */
 @Composable
 private fun ShellUnavailable(
     availability: ShellAvailability,
@@ -429,6 +481,7 @@ private fun ShellUnavailable(
 ) {
     val colors = Forge.colors
     val type = Forge.type
+    val policy = availability.reason in shellPolicyReasons
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -446,12 +499,16 @@ private fun ShellUnavailable(
             verticalArrangement = Arrangement.spacedBy(ForgeSpace.md),
         ) {
             Text(
-                stringResource(R.string.shell_unavailable_title),
+                stringResource(
+                    if (policy) R.string.shell_unavailable_title else R.string.shell_unavailable_generic_title,
+                ),
                 style = type.sessionTitle,
                 color = colors.text,
             )
             Text(
-                stringResource(R.string.shell_unavailable_body),
+                stringResource(
+                    if (policy) R.string.shell_unavailable_body else R.string.shell_unavailable_generic_body,
+                ),
                 style = type.sessionMeta,
                 color = colors.textMuted,
             )

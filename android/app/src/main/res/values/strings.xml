@@ -158,6 +158,10 @@
     <string name="tab_shell">Shell</string>
     <string name="shell_unavailable_title">No shell on this device</string>
     <string name="shell_unavailable_body">Haider runs its tools in-app, and the on-device policy does not allow it to start processes. Use a computer for a shell until this ships.</string>
+    <string name="shell_unavailable_generic_title">Shell unavailable</string>
+    <string name="shell_unavailable_generic_body">The daemon is not offering a shell for this session right now.</string>
+    <string name="shell_reconnecting_notice">Connection lost — showing cached history. Reconnecting…</string>
+    <string name="shell_checking_notice">Checking shell availability…</string>
     <string name="shell_empty">No commands yet.</string>
     <string name="shell_placeholder">Run a command…</string>
     <string name="cd_shell_input">Command line</string>

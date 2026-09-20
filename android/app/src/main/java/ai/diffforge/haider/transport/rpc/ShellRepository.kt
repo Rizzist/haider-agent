@@ -118,6 +118,11 @@ internal class ShellRepository(
         ShellExecutionRef(session, submissionId, response.string("run_id"), response.string("item_id"),
             response.number("worker_generation")).also {
             pending.receipt = it
+            // Mirror the observation the daemon itself would now report: the
+            // session holds one nonterminal run, so `shell.inventory` says
+            // session_busy until it settles (the lifecycle-change collector
+            // re-observes then). This is a capability OBSERVATION, not a policy
+            // denial — the terminal keeps rendering for it (FACADE-SHELL.md).
             if (selected.value == session) availability.value = ShellAvailability(reason = "session_busy", sessionId = session,
                 workerGeneration = it.workerGeneration)
         }
@@ -154,10 +159,17 @@ internal object ShellProjection {
                     val item = value["item"] as? JsonObject
                     if (item != null) {
                         val previous = commands[id]
+                        // The daemon records an ordinary nonzero exit as a FAILED
+                        // tool item that keeps its authoritative exit_code
+                        // (process.rs ToolStatus::Failed). The terminal contract
+                        // calls that Completed(exitCode); Error is reserved for
+                        // an item that failed without one (FACADE-SHELL.md).
                         val status = when (item.string("status")) {
                             "completed" -> ShellExecutionStatus.Completed
                             "cancelled" -> ShellExecutionStatus.Cancelled
-                            "failed" -> ShellExecutionStatus.Error
+                            "failed" -> if (item.optionalNumber("exit_code") != null)
+                                ShellExecutionStatus.Completed
+                            else ShellExecutionStatus.Error
                             else -> ShellExecutionStatus.Running
                         }
                         commands[id] = ShellExecution(ShellExecutionRef(session, item.string("call_id"), run, id,

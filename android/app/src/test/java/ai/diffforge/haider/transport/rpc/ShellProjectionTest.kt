@@ -41,6 +41,36 @@ class ShellProjectionTest {
         } finally { directory.deleteRecursively() }
     }
 
+    /** Real display projection over cache entries, the way ShellRepository consumes it. */
+    private fun projected(vararg payloads: kotlinx.serialization.json.JsonObject) =
+        ShellProjection.project("s", payloads.mapIndexed { i, payload ->
+            TranscriptCache.Entry(i + 1L, TranscriptCache.displayProjection(envelope(i + 1L, payload))) }, true)
+
+    @Test fun aFailedItemWithAnExitCodeIsACompletedCommandWithThatCode() {
+        // The daemon marks an ordinary nonzero exit as ToolStatus::Failed while
+        // keeping the authoritative exit_code; the terminal must say `exit 7`,
+        // never `error — unknown` (972-android-shell B2).
+        val command = projected(item(), item("failed", 7)).single()
+        assertEquals(ShellExecutionStatus.Completed, command.status)
+        assertEquals(7, command.exitCode)
+        assertNull(command.error)
+    }
+
+    @Test fun aFailedItemWithoutAnExitCodeStaysAnError() {
+        val command = projected(item(), item("failed")).single()
+        assertEquals(ShellExecutionStatus.Error, command.status)
+        assertNull(command.exitCode)
+    }
+
+    @Test fun aRunFailureKeepsTheErrorPresentationWithTheRealReason() {
+        val command = projected(item(),
+            obj("type" to "run_state", "state" to "errored"),
+            obj("type" to "run_failed", "code" to "spawn_failed")).single()
+        assertEquals(ShellExecutionStatus.Error, command.status)
+        assertEquals("spawn_failed", command.error)
+        assertNull(command.exitCode)
+    }
+
     @Test fun cancellationAndOutputClippingAreExplicit() {
         val entries = listOf(envelope(1, item()), envelope(2, output(ByteArray(ShellProjection.MAX_OUTPUT_BYTES + 1))),
             envelope(3, obj("type" to "run_state", "state" to "cancelled"))).mapIndexed { i, e ->

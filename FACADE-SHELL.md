@@ -38,6 +38,12 @@ Treat `available` as a recent daemon observation, not an authorization credentia
 
 Known reason codes include `not_observed`, `checking`, `no_session`, `disconnected`, `capability_unknown`, `capability_unavailable`, `control_required`, `control_attachment_required`, `daemon_unavailable`, `session_unavailable`, `session_ineligible`, `read_only`, `lockdown`, `policy_unavailable`, `workspace_unavailable`, `system_shell_unavailable`, `session_busy`, and `process_exec_disabled`. Unknown additive reasons must render as unavailable rather than being mapped to success.
 
+Not every `available = false` observation is a capability denial, and the reasons map to distinct truthful presentations:
+
+- `session_busy` means the session's one nonterminal run is in flight — usually this terminal's own command. Render the normal terminal: the command cards, seq-ordered streaming output, the running status, and a reachable Stop; only new submission is held.
+- `not_observed`, `checking`, `disconnected`, and `daemon_unavailable` describe this client's connection or an unfinished observation. Keep the cached redacted history on screen with the `Reconnecting` presentation and a disabled input plus a truthful inline notice. Never auto-resubmit on reconnect.
+- Every other reason (and any unknown additive reason) closes the door with an unavailable explanation that quotes the daemon's own code. Claim the on-device process policy only for reasons that are the policy (`process_exec_disabled`, `policy_unavailable`); a busy or disconnected session must never be presented as a policy denial.
+
 Availability requires a connected/ready daemon, an eligible idle root session, current Control capability and attachment, a valid Android workspace, a full-trust non-lockdown provider, the current worker generation, and the Android system shell. Child/delegated or typed-agent sessions are not eligible for this direct user door.
 
 ## Starting a command
@@ -102,9 +108,9 @@ Status meanings:
 
 - `Running`: replay is caught up and the command is nonterminal.
 - `Reconnecting`: a previously observed nonterminal command is being replayed after connection loss or a detected gap. It is not a request to resubmit.
-- `Completed`: the command item completed; `exitCode` is authoritative and may be nonzero.
+- `Completed`: the command item finished; `exitCode` is authoritative and may be nonzero. The daemon records an ordinary nonzero exit as a failed tool item that retains its `exit_code`; the projection maps that to `Completed` with the retained code, rendered as `exit N`.
 - `Cancelled`: durable run state reports cancellation.
-- `Error`: the item or run failed; `error` is a bounded daemon error code when available.
+- `Error`: the item or run failed without an authoritative `exitCode`; `error` is a bounded daemon error code when available.
 
 Commands can keep running when the Shell tab closes, another session is selected, the RPC socket drops, or the UI process dies. Reattachment rebuilds the list from durable redacted replay and deduplicates by journal sequence. The UI should therefore show cached history while reconnecting and must not synthesize completion.
 

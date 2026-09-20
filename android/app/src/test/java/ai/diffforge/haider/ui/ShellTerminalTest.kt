@@ -281,4 +281,70 @@ class ShellTerminalTest {
         rule.onNodeWithText("process_exec_disabled").assertIsDisplayed()
         assertEquals(0, rule.onAllNodesWithTagSafe(SHELL_INPUT_TAG))
     }
+
+    @Test
+    fun `a non-policy denial gets the generic truthful card, never the policy claim`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        val viewModel = rule.setHaiderApp(service)
+        service.setShell(ShellAvailability(available = false, reason = "lockdown", sessionId = session))
+        viewModel.selectViewTab(SessionViewTab.Shell)
+        rule.waitForIdle()
+        rule.onNodeWithText("Shell unavailable").assertIsDisplayed()
+        // The daemon's own code, verbatim — and no invented policy sentence.
+        rule.onNodeWithText("lockdown").assertIsDisplayed()
+        assertEquals(0, rule.onAllNodesWithTextSafe("No shell on this device"))
+        assertEquals(0, rule.onAllNodesWithTagSafe(SHELL_INPUT_TAG))
+    }
+
+    // ---------- availability is an observation, not a curtain (B1) ----------
+
+    @Test
+    fun `session_busy keeps the terminal, its output and a reachable Stop`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        openShell(service)
+        run("sleep 300")
+        val ref = onlyRef(service)
+        service.appendShellOutput(ref, "tick\n")
+        // The daemon's availability observation flips while the run is live.
+        service.setShell(ShellAvailability(available = false, reason = "session_busy", sessionId = session))
+        rule.waitForIdle()
+        // The live terminal stays: command card, streamed output, running state.
+        rule.onNodeWithText("$ sleep 300").assertIsDisplayed()
+        rule.onNodeWithText("tick", substring = true).assertIsDisplayed()
+        assertTrue(rule.onAllNodesWithTextSafe("running") > 0)
+        // Busy is never presented as a policy denial (truthful messaging).
+        assertEquals(0, rule.onAllNodesWithTextSafe("No shell on this device"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Shell unavailable"))
+        // Stop is reachable inside the Shell tab and cancels with the retained
+        // coordinates — no detour through Chat's global Stop.
+        rule.onNodeWithContentDescription("Stop this command").performClick()
+        rule.waitForIdle()
+        assertTrue(service.calls.contains("shell.cancel:${ref.commandId}"))
+        assertTrue(rule.onAllNodesWithTextSafe("cancelled") > 0)
+    }
+
+    @Test
+    fun `disconnected keeps cached history with Reconnecting, input held, no policy claim`() {
+        val service = ComposeHost.install(FakeScenario.Populated)
+        openShell(service)
+        run("tail -f app.log")
+        val ref = onlyRef(service)
+        service.appendShellOutput(ref, "line one\n")
+        // Connection loss: replay is catching up and availability observes it.
+        service.setShellResult(ref, ShellExecutionStatus.Reconnecting)
+        service.setShell(ShellAvailability(available = false, reason = "disconnected", sessionId = session))
+        rule.waitForIdle()
+        // Cached redacted history stays visible while replay catches up.
+        rule.onNodeWithText("$ tail -f app.log").assertIsDisplayed()
+        rule.onNodeWithText("line one", substring = true).assertIsDisplayed()
+        rule.onNodeWithText("Reconnecting — replaying output…").assertIsDisplayed()
+        // A truthful inline notice with the verbatim reason; input is disabled.
+        rule.onNodeWithText("Connection lost — showing cached history. Reconnecting…").assertIsDisplayed()
+        rule.onNodeWithText("disconnected").assertIsDisplayed()
+        rule.onNodeWithTag(SHELL_INPUT_TAG).assertIsNotEnabled()
+        // Never the policy card, and nothing was resubmitted.
+        assertEquals(0, rule.onAllNodesWithTextSafe("No shell on this device"))
+        assertEquals(0, rule.onAllNodesWithTextSafe("Shell unavailable"))
+        assertEquals(1, service.calls.count { it.startsWith("shell.exec:") })
+    }
 }
