@@ -265,6 +265,7 @@ impl FileCas {
     /// same handle so pathname replacement cannot change the verified object.
     /// CAS objects are immutable; callers may then stream or seek this handle.
     pub fn open_verified(&self, artifact: &ArtifactRef) -> StoreResult<File> {
+        let mut trace = haider_platform::phase_trace::cas_hash_scope(false);
         let path = self.path_for(artifact)?;
         let mut file = File::open(&path).map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
@@ -277,7 +278,13 @@ impl FileCas {
                 io_error("open CAS object", &path, error)
             }
         })?;
-        if artifact_for_reader(&mut file, &path)? != *artifact {
+        let actual = if trace.enabled() {
+            artifact_for_reader_counted(&mut file, &path, |read| trace.note_bytes_read(read))?
+        } else {
+            artifact_for_reader(&mut file, &path)?
+        };
+        trace.note_block_hashed();
+        if actual != *artifact {
             return Err(corrupt_object(&path));
         }
         file.rewind()
@@ -352,8 +359,18 @@ impl FileCas {
     /// Returns whether the object at `path` exists with bytes matching
     /// `artifact`; missing is `Ok(false)`, unreadable is an error.
     fn verify_existing(&self, artifact: &ArtifactRef, path: &Path) -> StoreResult<bool> {
+        let mut trace = haider_platform::phase_trace::cas_hash_scope(true);
+        trace.note_reverify_call();
         match File::open(path) {
-            Ok(file) => Ok(artifact_for_reader(file, path)? == *artifact),
+            Ok(file) => {
+                let actual = if trace.enabled() {
+                    artifact_for_reader_counted(file, path, |read| trace.note_bytes_read(read))?
+                } else {
+                    artifact_for_reader(file, path)?
+                };
+                trace.note_block_hashed();
+                Ok(actual == *artifact)
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("read CAS object", path, error)),
         }
@@ -851,6 +868,7 @@ impl Cas for FileCas {
     }
 
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>> {
+        let mut trace = haider_platform::phase_trace::cas_hash_scope(false);
         let path = self.path_for(artifact)?;
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -863,7 +881,10 @@ impl Cas for FileCas {
             }
             Err(error) => return Err(io_error("read CAS object", &path, error)),
         };
-        if artifact_for(&bytes) != *artifact {
+        trace.note_bytes_read(bytes.len());
+        let actual = artifact_for(&bytes);
+        trace.note_block_hashed();
+        if actual != *artifact {
             return Err(corrupt_object(&path));
         }
         Ok(bytes)
@@ -1352,6 +1373,14 @@ fn artifact_for(bytes: &[u8]) -> ArtifactRef {
 }
 
 fn artifact_for_reader(mut reader: impl Read, path: &Path) -> StoreResult<ArtifactRef> {
+    artifact_for_reader_counted(&mut reader, path, |_| {})
+}
+
+fn artifact_for_reader_counted(
+    mut reader: impl Read,
+    path: &Path,
+    mut note_read: impl FnMut(usize),
+) -> StoreResult<ArtifactRef> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -1361,6 +1390,7 @@ fn artifact_for_reader(mut reader: impl Read, path: &Path) -> StoreResult<Artifa
         if read == 0 {
             break;
         }
+        note_read(read);
         hasher.update(&buffer[..read]);
     }
     Ok(ArtifactRef::new(format!(

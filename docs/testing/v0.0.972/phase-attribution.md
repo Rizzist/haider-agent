@@ -1,4 +1,4 @@
-# Phase attribution v1
+# Phase attribution v2
 
 `python3 scripts/qa-gate/turn_wall_harness.py --bin-dir <candidate>` and
 `... --one-shot` enable buffered phase probes by default. Use `--no-phases`
@@ -12,6 +12,8 @@ flushes one content-free JSONL file on exit. Warm records are read after the
 owned daemon stops, then selected by exact client/daemon PID and command
 CLOCK_MONOTONIC boundaries. Prompt text, paths, tool arguments and identifiers
 other than PIDs are never recorded. The report retains raw selected records.
+Trace schema v2 adds content-free CAS byte, block-hash and re-verification-call
+counters; the reader remains compatible with schema v1 traces.
 No credential or signing material is needed: the existing fake HTTP provider,
 throwaway profile, real RPC and real tool fixtures remain authoritative.
 
@@ -62,6 +64,7 @@ mean that the CPU was executing throughout that wall interval.
 | projection_digest | SQL run-head projection updates, durable run lookup, initial budget usage, journal rendering and prompt cache metadata |
 | provider_assembly | Built-in prepare_turn call including selected adapter wire serialization; other request setup stays residual |
 | stream_decode | OpenAI SSE/framing/typed decoder push entry points; not Anthropic or the provider network wait |
+| cas_read_hash / cas_reverify | CAS integrity hashing on actual reads / full hashing performed only to establish that a write target already contains the addressed bytes; v2 rows also count bytes read, blocks hashed and re-verification calls |
 | tool_dispatch | Real general-tool dispatcher active polls/waits; external child CPU is separate |
 | daemon_reaped_children | Corrected native before/after counter delta; CPU only, no wall allocation |
 | client_control / turn_control | Active CLI dispatch / core drive_turn polls, excluding nested specific scopes; waiting time is not recorded for these broad control buckets |

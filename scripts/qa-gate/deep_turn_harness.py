@@ -78,6 +78,38 @@ T95 = {
     9: 2.262,
     10: 2.228,
 }
+CAS_PHASES = ("cas_read_hash", "cas_reverify")
+
+
+def foreign_haiderd_snapshot(*, exclude_pids: Sequence[int] = ()) -> list[dict[str, Any]]:
+    """Return content-free identities for daemons this fixture does not own."""
+
+    excluded = set(exclude_pids)
+    found = subprocess.run(
+        ["pgrep", "-x", "haiderd"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if found.returncode not in (0, 1):
+        raise ProofError(f"cannot snapshot foreign haiderd processes: {found.stderr.strip()}")
+    rows = []
+    for token in found.stdout.split():
+        pid = int(token)
+        if pid in excluded:
+            continue
+        process = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "pid=", "-o", "ppid=", "-o", "comm="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if process.returncode != 0 or not process.stdout.strip():
+            continue
+        parts = process.stdout.strip().split(maxsplit=2)
+        if len(parts) == 3:
+            rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "executable": parts[2]})
+    return sorted(rows, key=lambda row: row["pid"])
 
 
 def parse_daemon_processes(stdout: str) -> list[dict[str, Any]]:
@@ -677,6 +709,7 @@ def run_fixture(
     phase_dir.mkdir()
     profile: ThrowawayProfile | None = None
     stopped = False
+    foreign_start = foreign_haiderd_snapshot()
     try:
         with DeepProvider() as provider:
             profile = ThrowawayProfile(
@@ -848,6 +881,7 @@ def run_fixture(
             if not wait_pid_gone(pid, 5):
                 raise ProofError(f"owned daemon pid {pid} survived stop")
             stopped = True
+            foreign_end = foreign_haiderd_snapshot(exclude_pids=(pid,))
             phase_records, phase_pids = attribution.read_records(phase_dir)
             for row in rows:
                 phase_map = attribution.partition(
@@ -865,6 +899,7 @@ def run_fixture(
                         )
                 phase_map["selected_record_count"] = len(phase_map.pop("records"))
                 row["phase_attribution"] = phase_map
+                row["cas_attribution"] = _cas_attribution(phase_map)
             load_end = _assert_quiet(label + "/end", require_quiet)
             provider_entries = provider.state.snapshot()
             if len(provider_entries) != TURNS + len(TOOL_TURNS):
@@ -905,6 +940,12 @@ def run_fixture(
                 "checkpoint_request_body_bytes": dict(zip(CHECKPOINTS, checkpoint_sizes)),
                 "phase_files": _phase_file_evidence(phase_dir),
                 "phase_reconciliation": "exact integer nanoseconds for every turn",
+                "foreign_daemons": {
+                    "block_start": foreign_start,
+                    "block_end": foreign_end,
+                    "contaminated": bool(foreign_start or foreign_end),
+                    "policy": "discard the complete block when any foreign haiderd is observed",
+                },
             }
             if keep_root:
                 report["retained_root"] = str(root)
@@ -933,17 +974,63 @@ def _phase_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         },
         "phases_mean_ms": {
             name: {
-                key.removesuffix("_ns"): (
-                    None if value is None else value / count / 1_000_000
+                key.removesuffix("_ns") + ("_ms" if key.endswith("_ns") else ""): (
+                    None
+                    if value is None
+                    else value / count / (1_000_000 if key.endswith("_ns") else 1)
                 )
                 for key, value in phase.items()
-                if key in ("wall_ns", "cpu_ns")
+                if key in ("wall_ns", "cpu_ns", *attribution.COUNTERS)
             }
             for name, phase in summary["phases"].items()
         },
         "residual_mean_ms": {
             key.removesuffix("_ns"): value / count / 1_000_000
             for key, value in summary["residual"].items()
+        },
+    }
+
+
+def _cas_attribution(phase_map: Mapping[str, Any]) -> dict[str, Any]:
+    phases = [phase_map["detail"][name] for name in CAS_PHASES]
+    reverify = phase_map["detail"]["cas_reverify"]
+    return {
+        "wall_ns": sum(phase["wall_ns"] or 0 for phase in phases),
+        "cpu_ns": sum(phase["cpu_ns"] or 0 for phase in phases),
+        "reverify_wall_ns": reverify["wall_ns"],
+        "reverify_cpu_ns": reverify["cpu_ns"],
+        "reverify_bytes_read": reverify["bytes_read"],
+        "reverify_blocks_hashed": reverify["blocks_hashed"],
+        "reverify_calls": reverify["reverify_calls"],
+        **{
+            counter: sum(phase[counter] for phase in phases)
+            for counter in attribution.COUNTERS
+        },
+    }
+
+
+def _cas_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    count = len(rows)
+    fields = (
+        "wall_ns",
+        "cpu_ns",
+        "reverify_wall_ns",
+        "reverify_cpu_ns",
+        "reverify_bytes_read",
+        "reverify_blocks_hashed",
+        "reverify_calls",
+        *attribution.COUNTERS,
+    )
+    return {
+        "count": count,
+        "aggregation": "pooled trace counters; divide by count for per-turn mean",
+        "per_turn_mean": {
+            key.removesuffix("_ns") + ("_ms" if key.endswith("_ns") else ""): (
+                sum((row["cas_attribution"][key] or 0) for row in rows)
+                / count
+                / (1_000_000 if key.endswith("_ns") else 1)
+            )
+            for key in fields
         },
     }
 
@@ -1001,6 +1088,7 @@ def summarize_arms(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
                     ),
                 },
                 "phase_attribution": _phase_summary(rows),
+                "cas_attribution": _cas_summary(rows),
             }
         result[arm] = {"runs": len(arm_runs), "depths": depths}
     return result
@@ -1288,6 +1376,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{len(discarded_blocks)} block(s); clean runs={len(runs)} "
                 f"expected={expected_runs}"
             )
+        contaminated_blocks = {
+            int(run["block"])
+            for run in runs
+            if run["foreign_daemons"]["contaminated"]
+        }
+        valid_runs = [run for run in runs if int(run["block"]) not in contaminated_blocks]
+        discarded_runs = [
+            run["label"] for run in runs if int(run["block"]) in contaminated_blocks
+        ]
         report = {
             "schema": "haider.deep-turn.v1",
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1317,13 +1414,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for name, arm in arms.items()
             },
             "runs": runs,
-            "foreign_daemon_snapshots": foreign_daemon_snapshots,
-            "discarded_blocks": discarded_blocks,
-            "summary": summarize_arms(runs),
-            "contrasts": summarize_contrasts(runs),
-            "projection_equivalence": summarize_projection_equivalence(runs),
-            "failures": [],
-            "passed": True,
+            "foreign_daemon_policy": {
+                "contaminated_blocks": sorted(contaminated_blocks),
+                "discarded_runs": discarded_runs,
+            },
+            "summary": summarize_arms(valid_runs),
+            "contrasts": summarize_contrasts(valid_runs),
+            "projection_equivalence": summarize_projection_equivalence(valid_runs),
+            "failures": [] if not discarded_runs else [
+                "foreign haiderd contamination left fewer valid blocks than requested"
+            ],
+            "passed": not discarded_runs,
         }
         rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.output:
@@ -1331,7 +1432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output.write_text(rendered, encoding="utf-8")
         else:
             print(rendered, end="")
-        return 0
+        return 0 if report["passed"] else 1
     except Exception as error:
         print(
             f"deep-turn harness failed: {type(error).__name__}: {error}",

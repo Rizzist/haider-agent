@@ -13,13 +13,14 @@ from pathlib import Path
 from typing import Any
 
 ENV = "HAIDER_PHASE_TRACE_DIR"
-# Specific work overrides enclosing transport/tool waits. Frozen in schema v1.
+# Specific work overrides enclosing transport/tool waits. Schema v2 adds the
+# CAS phases and counters; the reader remains compatible with v1 trace files.
 PHASES = (
     "client_control", "turn_control", "turn_setup", "lockdown_bind_activate", "store_access",
     "submit", "rpc", "tool_dispatch", "completion_render", "spawn",
     "runtime_init", "socket_handshake", "directory_prep", "store_open",
     "capability_catalog", "provider_assembly", "store_journal",
-    "projection_digest", "stream_decode",
+    "projection_digest", "stream_decode", "cas_read_hash", "cas_reverify",
 )
 COLD_PHASES = (
     "spawn", "dynamic_link", "runtime_init", "store_open", "directory_prep",
@@ -27,6 +28,7 @@ COLD_PHASES = (
     "first_request", "teardown",
 )
 ALL_PHASES = (*PHASES, "teardown", "daemon_reaped_children")
+COUNTERS = ("bytes_read", "blocks_hashed", "reverify_calls")
 
 
 def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
@@ -37,7 +39,8 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
         if not lines:
             raise ValueError(f"empty phase trace: {path.name}")
         header = json.loads(lines[0])
-        if (header.get("schema") != 1 or header.get("dropped") != 0
+        schema = header.get("schema")
+        if (schema not in (1, 2) or header.get("dropped") != 0
                 or type(header.get("records")) is not int
                 or header["records"] != len(lines) - 1
                 or header.get("clock") != "CLOCK_MONOTONIC"
@@ -58,6 +61,15 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
                 raise ValueError("invalid phase interval")
             if row["waiting"] and row["cpu_ns"]:
                 raise ValueError("wait interval charged CPU")
+            if schema == 2 and "counters" not in row:
+                raise ValueError("phase trace v2 record has no counters")
+            counters = row.get("counters", {})
+            if not isinstance(counters, dict) or any(
+                type(counters.get(key, 0)) is not int or counters.get(key, 0) < 0
+                for key in COUNTERS
+            ):
+                raise ValueError("invalid phase counters")
+            row["counters"] = {key: counters.get(key, 0) for key in COUNTERS}
             records.append({**row, "pid": pid})
     return records, pids
 
@@ -67,7 +79,10 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
               cold: bool = False, reaped_children_cpu_ns: int | None = None) -> dict[str, Any]:
     if end_ns <= start_ns or cpu_ns < 0:
         raise ValueError("invalid independent measurement boundary")
-    rows = {name: {"wall_ns": 0, "cpu_ns": 0, "records": 0} for name in ALL_PHASES}
+    rows = {
+        name: {"wall_ns": 0, "cpu_ns": 0, "records": 0, **dict.fromkeys(COUNTERS, 0)}
+        for name in ALL_PHASES
+    }
     events: dict[int, list[tuple[bool, int]]] = {start_ns: [], end_ns: []}
     selected: list[dict[str, Any]] = []
     observed_records: list[dict[str, Any]] = []
@@ -79,6 +94,7 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
                        if row["pid"] == expected_pids[0] and row["phase"] == "teardown"
                        and request_start <= row["start_ns"] < end_ns), default=end_ns)
     boundary_cpu_records = 0
+    boundary_counter_records = 0
     excluded_cold_request_records = 0
     for record in records:
         if record["pid"] not in expected_pids:
@@ -100,11 +116,17 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
         events.setdefault(b, []).append((False, index))
         phase = rows[record["phase"]]
         phase["records"] += 1
+        counters = record.get("counters", {})
         # Never prorate CPU across a sample boundary: unknown distribution.
         if record["start_ns"] >= a and record["end_ns"] <= b:
             phase["cpu_ns"] += record["cpu_ns"]
-        elif record["cpu_ns"]:
-            boundary_cpu_records += 1
+            for key in COUNTERS:
+                phase[key] += counters.get(key, 0)
+        else:
+            if record["cpu_ns"]:
+                boundary_cpu_records += 1
+            if any(counters.values()):
+                boundary_counter_records += 1
     active: set[int] = set()
     heap: list[tuple[int, int, int]] = []
     prior = start_ns
@@ -135,18 +157,20 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
     residual = {"wall_ns": wall_residual, "cpu_ns": cpu_ns - accounted_cpu}
     assert sum(row["wall_ns"] for row in rows.values()) + residual["wall_ns"] == end_ns - start_ns
     detail = {name: ({**row, "coverage": "observed_scopes"} if row["records"] else
-                    {"wall_ns": None, "cpu_ns": None, "records": 0, "coverage": "unobserved"})
+                    {"wall_ns": None, "cpu_ns": None, "records": 0,
+                     **dict.fromkeys(COUNTERS, 0), "coverage": "unobserved"})
               for name, row in rows.items()}
     if reaped_children_cpu_ns is not None:
         detail["daemon_reaped_children"]["coverage"] = "cpu_counter_only; no wall allocation"
     phases = detail
     if cold:
         phases = {name: detail.get(name, {"wall_ns": None, "cpu_ns": None, "records": 0,
+                                        **dict.fromkeys(COUNTERS, 0),
                                         "coverage": "unavailable_before_main"})
                   for name in COLD_PHASES if name != "first_request"}
         request = [row for name, row in rows.items() if name not in COLD_PHASES]
         phases["first_request"] = {key: sum(row[key] for row in request)
-                                   for key in ("wall_ns", "cpu_ns", "records")}
+                                   for key in ("wall_ns", "cpu_ns", "records", *COUNTERS)}
         if not phases["first_request"]["records"]:
             phases["first_request"].update(wall_ns=None, cpu_ns=None)
         phases["first_request"]["coverage"] = "observed_constituents_between_first_client_rpc_and_teardown"
@@ -155,9 +179,9 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
             raise ValueError(f"phase rollup does not reconcile: {key}")
     missing = sorted(set(expected_pids) - set(available_pids))
     return {
-        "schema": "haider.phase_attribution.v1",
+        "schema": "haider.phase_attribution.v2",
         "status": "missing_process_traces" if missing else "partial_attribution",
-        "wall_policy": "active_before_wait_then_phase_priority_v1",
+        "wall_policy": "active_before_wait_then_phase_priority_v2",
         "wall_priority_low_to_high": list(ALL_PHASES),
         "cpu_policy": "exclusive_thread_cpu_per_active_poll; separate_daemon_reaped_child_counter",
         "total": {"wall_ns": end_ns - start_ns, "cpu_ns": cpu_ns},
@@ -165,6 +189,7 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
         "residual_includes": ["pre-main and dynamic link", "uninstrumented work",
                               "trace bookkeeping and flush", "child CPU when no independent counter is available"],
         "missing_pids": missing, "boundary_cpu_records": boundary_cpu_records,
+        "boundary_counter_records": boundary_counter_records,
         "cold_request_boundary_ns": None if not cold or not client_rpc_starts else
             {"start": request_start, "end": request_end},
         "excluded_cold_request_records": excluded_cold_request_records,
@@ -177,16 +202,17 @@ def summarize(maps: list[dict[str, Any]]) -> dict[str, Any]:
     if not maps:
         return {"count": 0}
     names = maps[0]["phases"]
-    def sum_pair(rows: list[dict[str, Any]]) -> dict[str, int]:
-        return {key: sum(row[key] or 0 for row in rows) for key in ("wall_ns", "cpu_ns")}
+    def sum_fields(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> dict[str, int]:
+        return {key: sum(row.get(key, 0) or 0 for row in rows) for key in fields}
     return {
         "count": len(maps), "aggregation": "pooled_ns; divide by count for additive mean",
-        "total": sum_pair([row["total"] for row in maps]),
+        "total": sum_fields([row["total"] for row in maps], ("wall_ns", "cpu_ns")),
         "phases": {name: {
-            **(sum_pair([row["phases"][name] for row in maps])
+            **(sum_fields([row["phases"][name] for row in maps],
+                          ("wall_ns", "cpu_ns", *COUNTERS))
                if any(row["phases"][name]["records"] for row in maps)
-               else {"wall_ns": None, "cpu_ns": None}),
+               else {"wall_ns": None, "cpu_ns": None, **dict.fromkeys(COUNTERS, 0)}),
             "observed_samples": sum(row["phases"][name]["records"] > 0 for row in maps)}
             for name in names},
-        "residual": sum_pair([row["residual"] for row in maps]),
+        "residual": sum_fields([row["residual"] for row in maps], ("wall_ns", "cpu_ns")),
     }

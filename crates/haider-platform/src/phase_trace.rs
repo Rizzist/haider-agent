@@ -16,6 +16,8 @@ pub enum Phase {
     TurnSetup,
     LockdownBindActivate,
     StoreAccess,
+    CasReadHash,
+    CasReverify,
     Spawn,
     RuntimeInit,
     StoreOpen,
@@ -42,6 +44,8 @@ impl Phase {
             Self::TurnSetup => "turn_setup",
             Self::LockdownBindActivate => "lockdown_bind_activate",
             Self::StoreAccess => "store_access",
+            Self::CasReadHash => "cas_read_hash",
+            Self::CasReverify => "cas_reverify",
             Self::Spawn => "spawn",
             Self::RuntimeInit => "runtime_init",
             Self::StoreOpen => "store_open",
@@ -67,6 +71,58 @@ impl Phase {
 pub struct Scope {
     #[cfg(unix)]
     _native: native::Scope,
+}
+
+/// Trace-only counters for one CAS hash operation.
+///
+/// The wrapper deliberately exposes no content or artifact identity. When the
+/// phase trace is disabled, [`Self::enabled`] is false and the note methods are
+/// no-ops, so callers can retain their ordinary uncounted read loop.
+#[must_use]
+pub struct CasHashScope {
+    scope: Scope,
+}
+
+impl CasHashScope {
+    pub fn enabled(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.scope._native.enabled()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub fn note_bytes_read(&mut self, bytes: usize) {
+        #[cfg(unix)]
+        self.scope._native.note_bytes_read(bytes);
+        #[cfg(not(unix))]
+        let _ = bytes;
+    }
+
+    pub fn note_block_hashed(&mut self) {
+        #[cfg(unix)]
+        self.scope._native.note_block_hashed();
+    }
+
+    pub fn note_reverify_call(&mut self) {
+        #[cfg(unix)]
+        self.scope._native.note_reverify_call();
+    }
+}
+
+/// Starts a content-free CAS hash scope. Only ordinary read-path verification
+/// and write-side re-verification are accepted so their costs stay separable.
+pub fn cas_hash_scope(reverify: bool) -> CasHashScope {
+    CasHashScope {
+        scope: scope(if reverify {
+            Phase::CasReverify
+        } else {
+            Phase::CasReadHash
+        }),
+    }
 }
 
 pub fn scope(phase: Phase) -> Scope {
@@ -167,6 +223,14 @@ mod native {
         end: u64,
         cpu: u64,
         waiting: bool,
+        counters: CasCounters,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct CasCounters {
+        bytes_read: u64,
+        blocks_hashed: u64,
+        reverify_calls: u64,
     }
     struct Records {
         rows: Vec<Row>,
@@ -215,20 +279,51 @@ mod native {
     }
 
     pub(super) struct Scope {
-        state: Option<(Phase, u64, PollCpu)>,
+        state: Option<(Phase, u64, PollCpu, CasCounters)>,
     }
 
     impl Scope {
         pub(super) fn new(phase: Phase) -> Self {
             Self {
-                state: enabled().then(|| (phase, clock_ns(ClockId::Monotonic), PollCpu::new())),
+                state: enabled().then(|| {
+                    (
+                        phase,
+                        clock_ns(ClockId::Monotonic),
+                        PollCpu::new(),
+                        CasCounters::default(),
+                    )
+                }),
+            }
+        }
+
+        pub(super) fn enabled(&self) -> bool {
+            self.state.is_some()
+        }
+
+        pub(super) fn note_bytes_read(&mut self, bytes: usize) {
+            if let Some((_, _, _, counters)) = self.state.as_mut() {
+                counters.bytes_read = counters
+                    .bytes_read
+                    .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+            }
+        }
+
+        pub(super) fn note_block_hashed(&mut self) {
+            if let Some((_, _, _, counters)) = self.state.as_mut() {
+                counters.blocks_hashed = counters.blocks_hashed.saturating_add(1);
+            }
+        }
+
+        pub(super) fn note_reverify_call(&mut self) {
+            if let Some((_, _, _, counters)) = self.state.as_mut() {
+                counters.reverify_calls = counters.reverify_calls.saturating_add(1);
             }
         }
     }
 
     impl Drop for Scope {
         fn drop(&mut self) {
-            if let Some((phase, start, cpu)) = self.state.take() {
+            if let Some((phase, start, cpu, counters)) = self.state.take() {
                 let cpu = cpu.finish();
                 record(Row {
                     phase,
@@ -236,6 +331,7 @@ mod native {
                     end: clock_ns(ClockId::Monotonic),
                     cpu,
                     waiting: false,
+                    counters,
                 });
             }
         }
@@ -276,6 +372,7 @@ mod native {
                     end: clock_ns(ClockId::Monotonic),
                     cpu: 0,
                     waiting: true,
+                    counters: CasCounters::default(),
                 });
             }
             let scope = Scope::new(this.phase);
@@ -308,7 +405,7 @@ mod native {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             writeln!(
                 output,
-                "{{\"schema\":1,\"pid\":{},\"dropped\":{},\"records\":{},\"clock\":\"CLOCK_MONOTONIC\",\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\"}}",
+                "{{\"schema\":2,\"pid\":{},\"dropped\":{},\"records\":{},\"clock\":\"CLOCK_MONOTONIC\",\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\"}}",
                 std::process::id(),
                 records.dropped,
                 records.rows.len()
@@ -316,12 +413,15 @@ mod native {
             for row in &records.rows {
                 writeln!(
                     output,
-                    "{{\"phase\":\"{}\",\"start_ns\":{},\"end_ns\":{},\"cpu_ns\":{},\"waiting\":{}}}",
+                    "{{\"phase\":\"{}\",\"start_ns\":{},\"end_ns\":{},\"cpu_ns\":{},\"waiting\":{},\"counters\":{{\"bytes_read\":{},\"blocks_hashed\":{},\"reverify_calls\":{}}}}}",
                     row.phase.name(),
                     row.start,
                     row.end,
                     row.cpu,
-                    row.waiting
+                    row.waiting,
+                    row.counters.bytes_read,
+                    row.counters.blocks_hashed,
+                    row.counters.reverify_calls,
                 )?;
             }
             output.flush()
@@ -359,13 +459,24 @@ mod native {
                     "{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                assert_eq!(
-                    std::fs::read_dir(directory.path())
-                        .unwrap_or_else(|error| panic!("{error}"))
-                        .count(),
-                    1
-                );
+                let paths = std::fs::read_dir(directory.path())
+                    .unwrap_or_else(|error| panic!("{error}"))
+                    .map(|entry| entry.unwrap_or_else(|error| panic!("{error}")).path())
+                    .collect::<Vec<_>>();
+                assert_eq!(paths.len(), 1);
+                let trace =
+                    std::fs::read_to_string(&paths[0]).unwrap_or_else(|error| panic!("{error}"));
+                assert!(trace.contains("\"schema\":2"));
+                assert!(trace.contains(
+                    "\"counters\":{\"bytes_read\":17,\"blocks_hashed\":1,\"reverify_calls\":1}"
+                ));
                 return;
+            }
+            {
+                let mut cas = super::super::cas_hash_scope(true);
+                cas.note_bytes_read(17);
+                cas.note_block_hashed();
+                cas.note_reverify_call();
             }
             let mut polled = false;
             let mut future = pin!(Measure::new(

@@ -87,6 +87,20 @@ class PhaseAttributionTests(unittest.TestCase):
             self.assertEqual(sum(row[key] or 0 for row in summary["phases"].values())
                              + summary["residual"][key], summary["total"][key])
 
+    def test_cas_counters_and_nested_wall_are_attributed_per_turn(self):
+        cas = record("cas_reverify", 120, 150, 15)
+        cas["counters"] = {
+            "bytes_read": 131_072,
+            "blocks_hashed": 2,
+            "reverify_calls": 3,
+        }
+        result = self.build([record("store_access", 110, 180, 20), cas])
+        self.assertEqual(result["detail"]["cas_reverify"]["wall_ns"], 30)
+        self.assertEqual(result["detail"]["store_access"]["wall_ns"], 40)
+        self.assertEqual(result["detail"]["cas_reverify"]["bytes_read"], 131_072)
+        self.assertEqual(result["detail"]["cas_reverify"]["blocks_hashed"], 2)
+        self.assertEqual(result["detail"]["cas_reverify"]["reverify_calls"], 3)
+
     def test_reader_rejects_dropped_records_and_cpu_on_waits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -105,6 +119,24 @@ class PhaseAttributionTests(unittest.TestCase):
             row.pop("pid")
             path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
             with self.assertRaisesRegex(ValueError, "wait interval charged CPU"):
+                read_records(root)
+
+    def test_reader_accepts_v1_without_counters_and_requires_them_in_v2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "phase-1.jsonl"
+            header = {"schema": 1, "pid": 1, "dropped": 0, "records": 1,
+                      "clock": "CLOCK_MONOTONIC",
+                      "cpu_clock": "CLOCK_THREAD_CPUTIME_ID"}
+            row = record("rpc", 1, 2)
+            row.pop("pid")
+            path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
+            records, _ = read_records(root)
+            self.assertEqual(records[0]["counters"], dict.fromkeys(
+                ("bytes_read", "blocks_hashed", "reverify_calls"), 0))
+            header["schema"] = 2
+            path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
+            with self.assertRaisesRegex(ValueError, "v2 record has no counters"):
                 read_records(root)
 
     def test_json_cli_enables_phases_and_explicit_off_is_available(self):
