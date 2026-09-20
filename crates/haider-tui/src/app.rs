@@ -6469,6 +6469,7 @@ impl AppModel {
     /// doc (the founding donation and the two identity-flip split seams).
     pub(crate) fn switch_surface(&mut self, to: Screen) {
         self.close_backtrack();
+        self.retire_surface_overlays();
         let from = self.screen;
         let from_key = self.surface_key();
         self.screen = to;
@@ -7202,6 +7203,20 @@ impl AppModel {
         self.transcript_search = None;
         *self.search_jump.borrow_mut() = None;
         self.dirty = true;
+    }
+
+    /// Retire overlays whose input and geometry belong to the surface being
+    /// left. These are intentionally cleared instead of parked per surface:
+    /// reopening search or completion recomputes both against the current
+    /// transcript/composer, matching the TUI's other transient overlays.
+    fn retire_surface_overlays(&mut self) {
+        let had_overlay = self.transcript_search.is_some()
+            || self.search_jump.borrow().is_some()
+            || self.mention_completion.is_some();
+        self.transcript_search = None;
+        *self.search_jump.borrow_mut() = None;
+        self.mention_completion = None;
+        self.dirty |= had_overlay;
     }
 
     fn search_move(&mut self, forward: bool) {
@@ -18268,6 +18283,9 @@ impl AppModel {
     /// running). The surface then returns to the neutral no-session state
     /// item 12 requires of the launcher.
     pub fn checkin(&mut self) {
+        // Direct checkin callers do not necessarily pass through
+        // switch_surface (identity flips are deliberately split seams).
+        self.retire_surface_overlays();
         let Some(active) = self.active_session.take() else {
             return;
         };
@@ -18364,6 +18382,9 @@ impl AppModel {
     /// running turn are untouched, so the session resumes exactly where it
     /// was left.
     pub fn back_to_launcher(&mut self) {
+        // This also covers scratch/no-session returns where checkin is not
+        // reached. The helper is idempotent for the attached-session path.
+        self.retire_surface_overlays();
         // TUI5 item 9: park the departing surface's draft (session, aura,
         // or the scratch surface — which shares the launcher key, so its
         // stash/restore is an exact round-trip).
