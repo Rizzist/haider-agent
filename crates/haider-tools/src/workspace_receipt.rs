@@ -1,14 +1,14 @@
 use crate::repo::{WalkEntry, WalkOptions, detect_repo_root, walk_files};
-use std::ffi::OsStr;
-#[cfg(unix)]
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
 use std::io::Read;
 use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt as _;
+use tokio::process::Command;
 
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -22,7 +22,6 @@ const WORKSPACE_RECEIPT_MAX_ENTRIES: usize = 4_096;
 const WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const WORKSPACE_RECEIPT_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const WORKSPACE_RECEIPT_WALL_TIME: Duration = Duration::from_millis(500);
-const GIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const GIT_INDEX_HEADER_BYTES: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,12 +301,23 @@ fn finalize(hasher: blake3::Hasher) -> String {
 /// caps, so a timed-out worker cannot continue into an unbounded traversal.
 #[must_use]
 pub fn workspace_state_receipt(root: &Path) -> WorkspaceStateReceipt {
-    let root = root.to_path_buf();
+    workspace_state_receipt_with_git(root.to_path_buf(), OsString::from("git"))
+}
+
+fn workspace_state_receipt_with_git(root: PathBuf, git_program: OsString) -> WorkspaceStateReceipt {
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
         .name("haider-workspace-receipt".into())
         .spawn(move || {
-            let _ = sender.send(compute_workspace_state_receipt(&root));
+            let receipt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map(|runtime| {
+                    runtime.block_on(workspace_state_receipt_async_with_git(root, git_program))
+                })
+                .unwrap_or_else(|_| WorkspaceStateReceipt::worker_failed());
+            let _ = sender.send(receipt);
         });
     if worker.is_err() {
         return WorkspaceStateReceipt::unknown_unreported(
@@ -333,51 +343,102 @@ pub fn workspace_state_digest(root: &Path) -> String {
     workspace_state_receipt(root).mutation_digest()
 }
 
-fn compute_workspace_state_receipt(root: &Path) -> WorkspaceStateReceipt {
-    compute_workspace_state_receipt_with_git(root, OsStr::new("git"))
-}
-
+#[cfg(test)]
 fn compute_workspace_state_receipt_with_git(
     root: &Path,
     git_program: &OsStr,
 ) -> WorkspaceStateReceipt {
+    workspace_state_receipt_with_git(root.to_path_buf(), git_program.to_os_string())
+}
+
+async fn workspace_state_receipt_async(root: PathBuf) -> WorkspaceStateReceipt {
+    workspace_state_receipt_async_with_git(root, OsString::from("git")).await
+}
+
+enum ReceiptPreparation {
+    Complete(WorkspaceStateReceipt),
+    Git {
+        walked: WorkspaceStateReceipt,
+        index: GitIndexSummary,
+    },
+}
+
+async fn workspace_state_receipt_async_with_git(
+    root: PathBuf,
+    git_program: OsString,
+) -> WorkspaceStateReceipt {
+    match tokio::time::timeout(
+        WORKSPACE_RECEIPT_WALL_TIME,
+        compute_workspace_state_receipt_async(root, git_program),
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(_) => WorkspaceStateReceipt::unknown_unreported(
+            WorkspaceReceiptStrategy::NotEnumerated,
+            WorkspaceReceiptUnknownReason::WallTimeLimit,
+        ),
+    }
+}
+
+async fn compute_workspace_state_receipt_async(
+    root: PathBuf,
+    git_program: OsString,
+) -> WorkspaceStateReceipt {
     let deadline = Instant::now() + WORKSPACE_RECEIPT_WALL_TIME;
+    let preparation_root = root.clone();
+    let preparation = match tokio::task::spawn_blocking(move || {
+        prepare_workspace_receipt(&preparation_root, deadline)
+    })
+    .await
+    {
+        Ok(preparation) => preparation,
+        Err(_) => return WorkspaceStateReceipt::worker_failed(),
+    };
+    let (walked, index) = match preparation {
+        ReceiptPreparation::Complete(receipt) => return receipt,
+        ReceiptPreparation::Git { walked, index } => (walked, index),
+    };
+    match git_workspace_receipt(&root, &git_program, deadline, &walked, index).await {
+        Ok(receipt) => receipt,
+        // The anchored walk is already complete, so a missing, locked, broken,
+        // or slow Git binary is an optimization miss rather than a tool error.
+        Err(_) => walked,
+    }
+}
+
+fn prepare_workspace_receipt(root: &Path, deadline: Instant) -> ReceiptPreparation {
     if detect_repo_root(root, root).as_deref() != Some(root) {
-        return WorkspaceStateReceipt::unknown(
+        return ReceiptPreparation::Complete(WorkspaceStateReceipt::unknown(
             WorkspaceReceiptStrategy::NotEnumerated,
             WorkspaceReceiptUnknownReason::NonRepository,
             0,
             0,
-        );
+        ));
     }
     // Enumerate with our own unsorted, capped walker before Git. This is the
     // constructional bound: an opaque Git process is never launched for a tree
     // that we could not enumerate within the entry/content/wall limits.
     let walked = repository_walk_receipt(root, deadline);
     if walked.coverage != WorkspaceReceiptCoverage::Complete {
-        return walked;
+        return ReceiptPreparation::Complete(walked);
     }
     let Some(index) = repository_index_entry_count(root) else {
         // Linked worktrees/submodules use a `.git` file whose target may live
         // outside the workspace. Keep the complete anchored walk rather than
         // following that external metadata path.
-        return walked;
+        return ReceiptPreparation::Complete(walked);
     };
     let entries_visited = walked.entries_visited.saturating_add(index.entries);
     if entries_visited > WORKSPACE_RECEIPT_MAX_ENTRIES {
-        return WorkspaceStateReceipt::unknown(
+        return ReceiptPreparation::Complete(WorkspaceStateReceipt::unknown(
             WorkspaceReceiptStrategy::RepositoryWalk,
             WorkspaceReceiptUnknownReason::EntryLimit,
             entries_visited,
             walked.content_bytes_read.saturating_add(index.bytes_read),
-        );
+        ));
     }
-    match git_workspace_receipt(root, git_program, deadline, &walked, index) {
-        Ok(receipt) => receipt,
-        // The anchored walk is already complete, so a missing, locked, broken,
-        // or slow Git binary is an optimization miss rather than a tool error.
-        Err(_) => walked,
-    }
+    ReceiptPreparation::Git { walked, index }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -413,7 +474,7 @@ fn repository_index_entry_count(root: &Path) -> Option<GitIndexSummary> {
     })
 }
 
-fn git_workspace_receipt(
+async fn git_workspace_receipt(
     root: &Path,
     git_program: &OsStr,
     deadline: Instant,
@@ -438,7 +499,8 @@ fn git_workspace_receipt(
             OsStr::new("."),
         ],
         deadline,
-    )?;
+    )
+    .await?;
     if !status.status.success() {
         return Err(WorkspaceReceiptUnknownReason::GitFailed);
     }
@@ -461,7 +523,7 @@ struct GitCommandOutput {
     bytes: Vec<u8>,
 }
 
-fn run_git(
+async fn run_git(
     root: &Path,
     git_program: &OsStr,
     args: &[&OsStr],
@@ -478,6 +540,7 @@ fn run_git(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    command.kill_on_drop(true);
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             WorkspaceReceiptUnknownReason::GitUnavailable
@@ -486,47 +549,32 @@ fn run_git(
         }
     })?;
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
         return Err(WorkspaceReceiptUnknownReason::GitFailed);
     };
-    let (sender, receiver) = mpsc::sync_channel(1);
-    if std::thread::Builder::new()
-        .name("haider-git-receipt-output".into())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let limit = u64::try_from(WORKSPACE_RECEIPT_GIT_OUTPUT_BYTES.saturating_add(1))
-                .unwrap_or(u64::MAX);
-            let result = stdout.take(limit).read_to_end(&mut bytes).map(|_| bytes);
-            let _ = sender.send(result);
-        })
-        .is_err()
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(WorkspaceReceiptUnknownReason::ReceiptWorkerFailed);
-    }
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_POLL_INTERVAL),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(WorkspaceReceiptUnknownReason::WallTimeLimit);
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(WorkspaceReceiptUnknownReason::GitFailed);
-            }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let limit =
+        u64::try_from(WORKSPACE_RECEIPT_GIT_OUTPUT_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    let mut bounded_stdout = tokio::io::AsyncReadExt::take(stdout, limit);
+    let waited = tokio::time::timeout(remaining, async {
+        tokio::try_join!(child.wait(), bounded_stdout.read_to_end(&mut bytes))
+    })
+    .await;
+    let (status, _) = match waited {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(WorkspaceReceiptUnknownReason::GitFailed);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(WorkspaceReceiptUnknownReason::WallTimeLimit);
         }
     };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let bytes = receiver
-        .recv_timeout(remaining)
-        .map_err(|_| WorkspaceReceiptUnknownReason::WallTimeLimit)?
-        .map_err(|_| WorkspaceReceiptUnknownReason::GitFailed)?;
     if bytes.len() > WORKSPACE_RECEIPT_GIT_OUTPUT_BYTES {
         return Err(WorkspaceReceiptUnknownReason::GitOutputLimit);
     }
@@ -902,16 +950,7 @@ impl WorkspaceReceiptTracker {
         if !self.needs_initial_receipt() {
             return;
         }
-        let receipt =
-            match tokio::task::spawn_blocking(move || workspace_state_receipt(&root)).await {
-                Ok(receipt) => receipt,
-                Err(_) => WorkspaceStateReceipt::unknown(
-                    WorkspaceReceiptStrategy::NotEnumerated,
-                    WorkspaceReceiptUnknownReason::ReceiptWorkerFailed,
-                    0,
-                    0,
-                ),
-            };
+        let receipt = workspace_state_receipt_async(root).await;
         self.install_initial_receipt(receipt);
     }
 
@@ -1006,11 +1045,7 @@ impl WorkspaceReceiptLease {
         if !self.requires_after_receipt() {
             return self.finish_without_after_receipt();
         }
-        let after = match tokio::task::spawn_blocking(move || workspace_state_receipt(&root)).await
-        {
-            Ok(receipt) => receipt,
-            Err(_) => WorkspaceStateReceipt::worker_failed(),
-        };
+        let after = workspace_state_receipt_async(root).await;
         self.finish(after)
     }
 

@@ -581,6 +581,17 @@ async fn provider_rebind_recovery_rejects_changed_frozen_permissions_and_lockdow
     let run_id = RunId::new("ordinary-full");
     hub.bind_lockdown_turn(&session_id, &run_id, "fake", Full)
         .expect("freeze Full");
+    assert_eq!(
+        rebound_active_turn_lockdown_snapshot(&hub, &session_id, &run_id, true, "fake-b", Full,)
+            .expect("activate recovered Full authority"),
+        None
+    );
+    assert_eq!(
+        hub.bound_session_lockdown(&session_id)
+            .expect("active recovered Full authority"),
+        Some(("fake".into(), Full)),
+        "explicit Full recovery activates the accepted authority without rebinding it"
+    );
     assert!(
         rebound_turn_lockdown_snapshot(&hub, &session_id, &run_id, false, "fake-b", Full).is_err(),
         "ordinary recovery cannot invent an unjournaled route change"

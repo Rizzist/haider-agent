@@ -188,7 +188,7 @@ struct TurnBindingLedger {
     bindings: Vec<DurableTurnBinding>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DurableTurnBinding {
     profile_id: String,
@@ -314,56 +314,98 @@ impl LockdownManager {
     ) -> Result<(String, bool, bool), LockdownError> {
         self.with_global_lock(|| {
             let mut ledger = self.load_turn_bindings()?;
-            if let Some(index) = ledger.bindings.iter().position(|binding| {
-                binding.profile_id == profile_id
-                    && binding.session_id == session_id
-                    && binding.run_id == run_id
-            }) {
-                let binding = &mut ledger.bindings[index];
-                if binding.provider != provider {
-                    return Err(LockdownError::TurnBindingConflict {
-                        session_id: session_id.to_owned(),
-                        run_id: run_id.to_owned(),
-                        stored_provider: binding.provider.clone(),
-                        requested_provider: provider.to_owned(),
-                    });
-                }
-                // The exact active-account fact can arrive after an older
-                // manifest or observer installed ordinary lockdown. Allow
-                // only this monotonic narrowing; Full or Configured can
-                // never replace an already-auto-hermetic binding.
-                if proposed_auto_hermetic && !binding.auto_hermetic {
-                    binding.lockdown = true;
-                    binding.auto_hermetic = true;
-                    let result = (
-                        binding.provider.clone(),
-                        binding.lockdown,
-                        binding.auto_hermetic,
-                    );
-                    self.persist_turn_bindings(&ledger)?;
-                    return Ok(result);
-                }
-                return Ok((
-                    binding.provider.clone(),
-                    binding.lockdown,
-                    binding.auto_hermetic,
-                ));
-            }
-            ledger.bindings.push(DurableTurnBinding {
-                profile_id: profile_id.to_owned(),
-                session_id: session_id.to_owned(),
-                run_id: run_id.to_owned(),
-                provider: provider.to_owned(),
-                lockdown: proposed_lockdown,
-                auto_hermetic: proposed_auto_hermetic,
-            });
-            self.persist_turn_bindings(&ledger)?;
-            Ok((
-                provider.to_owned(),
+            let (binding, changed) = Self::bind_turn_in_ledger(
+                &mut ledger,
+                profile_id,
+                session_id,
+                run_id,
+                provider,
                 proposed_lockdown,
                 proposed_auto_hermetic,
-            ))
+            )?;
+            if changed {
+                self.persist_turn_bindings(&ledger)?;
+            }
+            Ok((binding.provider, binding.lockdown, binding.auto_hermetic))
         })
+    }
+
+    /// Freezes and activates one turn in a single atomic ledger replacement.
+    /// The caller must not execute the turn until this returns successfully;
+    /// a crash can therefore reveal either the previous active boundary or
+    /// the complete new binding and active boundary, never a bound-only gap.
+    pub(crate) fn bind_and_activate_turn(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+        run_id: &str,
+        provider: &str,
+        proposed_lockdown: bool,
+        proposed_auto_hermetic: bool,
+    ) -> Result<(String, bool, bool), LockdownError> {
+        self.with_global_lock(|| {
+            let mut ledger = self.load_turn_bindings()?;
+            let (binding, _) = Self::bind_turn_in_ledger(
+                &mut ledger,
+                profile_id,
+                session_id,
+                run_id,
+                provider,
+                proposed_lockdown,
+                proposed_auto_hermetic,
+            )?;
+            ledger.active.retain(|active| {
+                active.profile_id != profile_id || active.session_id != session_id
+            });
+            ledger.active.push(binding.clone());
+            self.persist_turn_bindings(&ledger)?;
+            Ok((binding.provider, binding.lockdown, binding.auto_hermetic))
+        })
+    }
+
+    fn bind_turn_in_ledger(
+        ledger: &mut TurnBindingLedger,
+        profile_id: &str,
+        session_id: &str,
+        run_id: &str,
+        provider: &str,
+        proposed_lockdown: bool,
+        proposed_auto_hermetic: bool,
+    ) -> Result<(DurableTurnBinding, bool), LockdownError> {
+        if let Some(binding) = ledger.bindings.iter_mut().find(|binding| {
+            binding.profile_id == profile_id
+                && binding.session_id == session_id
+                && binding.run_id == run_id
+        }) {
+            if binding.provider != provider {
+                return Err(LockdownError::TurnBindingConflict {
+                    session_id: session_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    stored_provider: binding.provider.clone(),
+                    requested_provider: provider.to_owned(),
+                });
+            }
+            // The exact active-account fact can arrive after an older
+            // manifest or observer installed ordinary lockdown. Allow only
+            // this monotonic narrowing; Full or Configured can never replace
+            // an already-auto-hermetic binding.
+            let changed = proposed_auto_hermetic && !binding.auto_hermetic;
+            if changed {
+                binding.lockdown = true;
+                binding.auto_hermetic = true;
+            }
+            return Ok((binding.clone(), changed));
+        }
+        let binding = DurableTurnBinding {
+            profile_id: profile_id.to_owned(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            provider: provider.to_owned(),
+            lockdown: proposed_lockdown,
+            auto_hermetic: proposed_auto_hermetic,
+        };
+        ledger.bindings.push(binding.clone());
+        Ok((binding, true))
     }
 
     pub(crate) fn turn_binding(

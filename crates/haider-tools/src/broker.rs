@@ -88,6 +88,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait JournalSink: Send {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()>;
 
+    /// Appends an ordered group of payloads before the caller may act on the
+    /// final one. Production sinks should commit the group atomically. The
+    /// sequential default remains safe for simple embedders and test doubles:
+    /// an error before the final `Dispatched` payload prevents the effect from
+    /// executing, while a durable final payload retains the ordinary startup
+    /// recovery boundary.
+    async fn append_batch(&mut self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        for payload in payloads {
+            self.append(payload).await?;
+        }
+        Ok(())
+    }
+
     /// Declares support for committing an outcome/checkpoint pair atomically.
     /// The broker checks this before a filesystem worker can mutate bytes.
     fn supports_checkpoint_batches(&self) -> bool {
@@ -678,6 +691,17 @@ impl BrokerJournal {
         Ok(())
     }
 
+    async fn append_phases(&self, phases: Vec<EffectPhase>) -> ToolResult<()> {
+        let payloads = phases.iter().cloned().map(EventPayload::Effect).collect();
+        self.sink.lock().await.append_batch(payloads).await?;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .journaled_phases
+            .extend(phases);
+        Ok(())
+    }
+
     async fn append_phase_with_checkpoint(
         &self,
         phase: EffectPhase,
@@ -729,18 +753,12 @@ impl BrokerJournal {
             .cloned()
     }
 
-    fn insert_intent(&self, intent: EffectIntent) {
+    fn insert_intent(&self, intent: EffectIntent, state: LifecycleState) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .lifecycles
-            .insert(
-                intent.effect.clone(),
-                LifecycleRecord {
-                    intent,
-                    state: LifecycleState::Intent,
-                },
-            );
+            .insert(intent.effect.clone(), LifecycleRecord { intent, state });
     }
 
     fn require_state(&self, effect: &EffectId, expected: LifecycleState) -> ToolResult<()> {
@@ -1288,10 +1306,12 @@ impl EffectBroker {
             .map_err(|error| ToolError::io("duplicate workspace root", &self.workspace_root, error))
     }
 
-    pub(crate) async fn begin_workspace_receipt(&self) -> WorkspaceReceiptLease {
-        self.workspace_receipts
-            .begin_foreground_for_root(self.workspace_root.clone())
-            .await
+    pub(crate) fn workspace_receipt_future(
+        &self,
+    ) -> impl Future<Output = WorkspaceReceiptLease> + Send + 'static {
+        let tracker = self.workspace_receipts.clone();
+        let root = self.workspace_root.clone();
+        async move { tracker.begin_foreground_for_root(root).await }
     }
 
     pub(crate) async fn begin_detached_workspace_receipt(&self) -> WorkspaceReceiptLease {
@@ -1452,6 +1472,25 @@ impl EffectBroker {
     where
         O: EffectOperation,
     {
+        let (intent, approval_preview, file_review_recipe) = self.prepare_intent(operation)?;
+        self.append_phase(EffectPhase::Intent(intent.clone()))
+            .await?;
+        self.record_intent(
+            &intent,
+            LifecycleState::Intent,
+            &approval_preview,
+            file_review_recipe.as_ref(),
+        );
+        Ok(intent)
+    }
+
+    fn prepare_intent<O>(
+        &mut self,
+        operation: &O,
+    ) -> ToolResult<(EffectIntent, Vec<String>, Option<FileReviewRecipe>)>
+    where
+        O: EffectOperation,
+    {
         let canonical = canonical_json(operation.canonical_arguments(&self.workspace_root)?)?;
         let args_digest = format!("blake3:{}", blake3::hash(&canonical).to_hex());
         self.next_effect += 1;
@@ -1468,16 +1507,27 @@ impl EffectBroker {
             args_digest,
             workspace_revision: operation.workspace_revision(),
         };
-        self.append_phase(EffectPhase::Intent(intent.clone()))
-            .await?;
-        self.journal.insert_intent(intent.clone());
+        Ok((
+            intent,
+            operation.approval_preview(),
+            operation.file_review_recipe(),
+        ))
+    }
+
+    fn record_intent(
+        &mut self,
+        intent: &EffectIntent,
+        state: LifecycleState,
+        approval_preview: &[String],
+        file_review_recipe: Option<&FileReviewRecipe>,
+    ) {
+        self.journal.insert_intent(intent.clone(), state);
         self.approval_previews
-            .insert(intent.effect.clone(), operation.approval_preview());
-        if let Some(recipe) = operation.file_review_recipe() {
+            .insert(intent.effect.clone(), approval_preview.to_vec());
+        if let Some(recipe) = file_review_recipe {
             self.file_review_recipes
-                .insert(intent.effect.clone(), recipe);
+                .insert(intent.effect.clone(), recipe.clone());
         }
-        Ok(intent)
     }
 
     /// Evaluates and journals the authorization verdict for one intent.
@@ -1488,22 +1538,49 @@ impl EffectBroker {
     ) -> ToolResult<AuthorizationVerdict> {
         self.require_state(&intent.effect, LifecycleState::Intent)?;
         let recorded = self.require_recorded_intent(intent)?;
-        let policy_decision = policy.decision(&recorded);
-        let decision = match policy_decision {
+        let decision = self.authorization_decision(&recorded, policy);
+        let (verdict, pending_permission) =
+            self.authorization_verdict(&recorded, decision, None, None)?;
+        self.append_phase(EffectPhase::Authorized {
+            effect: intent.effect.clone(),
+            verdict: verdict.clone(),
+        })
+        .await?;
+        self.record_authorization(intent, &verdict, pending_permission)?;
+        Ok(verdict)
+    }
+
+    fn authorization_decision(
+        &mut self,
+        recorded: &EffectIntent,
+        policy: &PermissionPolicy,
+    ) -> PolicyDecision {
+        let policy_decision = policy.decision(recorded);
+        match policy_decision {
             // Current hard/explicit policy denies are the highest authority.
             PolicyDecision::Deny { .. } => policy_decision,
             // A previously committed answer is explicit user intent for this
             // exact class+argument digest. It must beat both ordinary policy
             // allows and Autonomous's residual-Ask promotion.
             PolicyDecision::Allow | PolicyDecision::Ask => self
-                .take_one_shot_decision(&recorded)
+                .take_one_shot_decision(recorded)
                 .unwrap_or(policy_decision),
-        };
+        }
+    }
+
+    fn authorization_verdict(
+        &mut self,
+        recorded: &EffectIntent,
+        decision: PolicyDecision,
+        prepared_preview: Option<&[String]>,
+        prepared_file_review: Option<&FileReviewRecipe>,
+    ) -> ToolResult<(AuthorizationVerdict, Option<(MenuId, PendingPermission)>)> {
         let mut pending_permission = None;
         let verdict = match decision {
             PolicyDecision::Allow => AuthorizationVerdict::Allow,
             PolicyDecision::Ask => {
-                let menu = self.permission_menu_for(&recorded)?;
+                let menu =
+                    self.permission_menu_for(recorded, prepared_preview, prepared_file_review)?;
                 let menu_id = menu.id.clone();
                 pending_permission = Some((
                     menu_id.clone(),
@@ -1517,17 +1594,15 @@ impl EffectBroker {
             }
             PolicyDecision::Deny { reason } => AuthorizationVerdict::Deny { reason },
         };
-        self.append_phase(EffectPhase::Authorized {
-            effect: intent.effect.clone(),
-            verdict: verdict.clone(),
-        })
-        .await?;
-        self.file_review_recipes.remove(&intent.effect);
-        // Register the menu only after its `Ask` verdict is durably journaled,
-        // so no answerable menu exists for an unjournaled authorization.
-        if let Some((menu_id, pending)) = pending_permission {
-            self.pending_permissions.insert(menu_id, pending);
-        }
+        Ok((verdict, pending_permission))
+    }
+
+    fn record_authorization(
+        &mut self,
+        intent: &EffectIntent,
+        verdict: &AuthorizationVerdict,
+        pending_permission: Option<(MenuId, PendingPermission)>,
+    ) -> ToolResult<()> {
         let state = if matches!(
             verdict,
             AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. }
@@ -1537,7 +1612,13 @@ impl EffectBroker {
             LifecycleState::AuthorizedBlocked
         };
         self.set_state(&intent.effect, state)?;
-        Ok(verdict)
+        self.file_review_recipes.remove(&intent.effect);
+        // Register the menu only after its `Ask` verdict is durably journaled
+        // and the broker's lifecycle reflects that durable authorization.
+        if let Some((menu_id, pending)) = pending_permission {
+            self.pending_permissions.insert(menu_id, pending);
+        }
+        Ok(())
     }
 
     /// Converts a journaled deny verdict through the same hard-ceiling
@@ -1852,14 +1933,76 @@ impl EffectBroker {
     where
         O: EffectOperation,
     {
-        let intent = self.normalize(operation).await?;
-        match self.authorize(&intent, policy).await? {
-            AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => {
-                self.journal_dispatched(&intent).await?;
+        let (intent, approval_preview, file_review_recipe) = self.prepare_intent(operation)?;
+        match self.authorization_decision(&intent, policy) {
+            PolicyDecision::Allow => {
+                let verdict = AuthorizationVerdict::Allow;
+                self.journal
+                    .append_phases(vec![
+                        EffectPhase::Intent(intent.clone()),
+                        EffectPhase::Authorized {
+                            effect: intent.effect.clone(),
+                            verdict,
+                        },
+                        EffectPhase::Dispatched {
+                            effect: intent.effect.clone(),
+                        },
+                    ])
+                    .await?;
+                self.record_intent(
+                    &intent,
+                    LifecycleState::Dispatched,
+                    &approval_preview,
+                    file_review_recipe.as_ref(),
+                );
+                self.file_review_recipes.remove(&intent.effect);
                 Ok(intent)
             }
-            AuthorizationVerdict::Ask { menu } => Err(ToolError::AuthorizationRequired { menu }),
-            AuthorizationVerdict::Deny { reason } => {
+            decision @ PolicyDecision::Ask => {
+                self.append_phase(EffectPhase::Intent(intent.clone()))
+                    .await?;
+                self.record_intent(
+                    &intent,
+                    LifecycleState::Intent,
+                    &approval_preview,
+                    file_review_recipe.as_ref(),
+                );
+                let (verdict, pending_permission) = self.authorization_verdict(
+                    &intent,
+                    decision,
+                    Some(&approval_preview),
+                    file_review_recipe.as_ref(),
+                )?;
+                let AuthorizationVerdict::Ask { menu } = &verdict else {
+                    unreachable!("Ask policy decision must yield an Ask verdict")
+                };
+                let menu = menu.clone();
+                self.append_phase(EffectPhase::Authorized {
+                    effect: intent.effect.clone(),
+                    verdict: verdict.clone(),
+                })
+                .await?;
+                self.record_authorization(&intent, &verdict, pending_permission)?;
+                Err(ToolError::AuthorizationRequired { menu })
+            }
+            PolicyDecision::Deny { reason } => {
+                self.append_phase(EffectPhase::Intent(intent.clone()))
+                    .await?;
+                self.record_intent(
+                    &intent,
+                    LifecycleState::Intent,
+                    &approval_preview,
+                    file_review_recipe.as_ref(),
+                );
+                let verdict = AuthorizationVerdict::Deny {
+                    reason: reason.clone(),
+                };
+                self.append_phase(EffectPhase::Authorized {
+                    effect: intent.effect.clone(),
+                    verdict: verdict.clone(),
+                })
+                .await?;
+                self.record_authorization(&intent, &verdict, None)?;
                 Err(denied_effect_error(policy, &intent, reason))
             }
         }
@@ -2021,12 +2164,16 @@ impl EffectBroker {
         self.journal.set_state(effect, state)
     }
 
-    fn permission_menu_for(&mut self, intent: &EffectIntent) -> ToolResult<Menu> {
+    fn permission_menu_for(
+        &mut self,
+        intent: &EffectIntent,
+        prepared_preview: Option<&[String]>,
+        prepared_file_review: Option<&FileReviewRecipe>,
+    ) -> ToolResult<Menu> {
         self.next_menu += 1;
-        let mut body = self
-            .approval_previews
-            .get(&intent.effect)
-            .cloned()
+        let mut body = prepared_preview
+            .map(<[String]>::to_vec)
+            .or_else(|| self.approval_previews.get(&intent.effect).cloned())
             .unwrap_or_else(|| vec![intent.summary.clone()]);
         body.push(format!("Effect class: {:?}", intent.class));
         if intent.class == EffectClass::ProcessExec {
@@ -2041,10 +2188,9 @@ impl EffectBroker {
                 intent.class
             ));
         }
-        let file_review = self
-            .file_review_recipes
-            .get(&intent.effect)
+        let file_review = prepared_file_review
             .cloned()
+            .or_else(|| self.file_review_recipes.get(&intent.effect).cloned())
             .map(|recipe| {
                 crate::filesystem::build_permission_file_review(
                     &self.workspace_root,

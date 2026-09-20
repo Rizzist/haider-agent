@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 from turnperf_support import validate_jsonl
@@ -15,7 +17,9 @@ from deep_turn_harness import (
     _continuation_arguments,
     _initial_arguments,
     abba_order,
+    arms_for,
     fragment_bytes,
+    parse_daemon_processes,
     parse_store_records,
     process_command,
     provider_catalog,
@@ -27,6 +31,23 @@ from deep_turn_harness import (
 
 
 class DeepTurnHarnessTests(unittest.TestCase):
+    def test_foreign_daemon_snapshot_parser_keeps_only_exact_daemons(self) -> None:
+        rows = parse_daemon_processes(
+            "  17 /tmp/base/haiderd\n"
+            "  18 /tmp/candidate/haiderd\n"
+            "  19 /tmp/haiderd-helper\n"
+            "bad malformed\n"
+            "  20 python3\n"
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                {"pid": 17, "executable": "/tmp/base/haiderd"},
+                {"pid": 18, "executable": "/tmp/candidate/haiderd"},
+            ],
+        )
+
     def test_static_contract_is_pinned(self):
         checks = self_check()
         self.assertEqual(checks["turns"], 40)
@@ -127,6 +148,18 @@ class DeepTurnHarnessTests(unittest.TestCase):
         for block in range(1, 4):
             arms = [arm for actual, _position, arm in order if actual == block]
             self.assertEqual(arms, ["a", "b", "b", "a"])
+
+    def test_wall_toolpath_compares_distinct_binary_directories(self):
+        args = SimpleNamespace(
+            experiment="wall-toolpath",
+            bin_dir=Path("base"),
+            variant_bin_dir=Path("candidate"),
+        )
+        arm_a, arm_b = arms_for(args)
+        self.assertEqual(arm_a.bin_dir, Path("base").resolve())
+        self.assertEqual(arm_b.bin_dir, Path("candidate").resolve())
+        self.assertIn("pre-WALL-3+4", arm_a.description)
+        self.assertIn("WALL-3+4", arm_b.description)
 
     def test_store_trace_parser_rejects_partial_and_user_fields(self):
         text = "\n".join(

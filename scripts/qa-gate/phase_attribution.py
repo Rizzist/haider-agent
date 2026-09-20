@@ -15,7 +15,7 @@ from typing import Any
 ENV = "HAIDER_PHASE_TRACE_DIR"
 # Specific work overrides enclosing transport/tool waits. Frozen in schema v1.
 PHASES = (
-    "client_control", "turn_control", "turn_setup", "store_access",
+    "client_control", "turn_control", "turn_setup", "lockdown_bind_activate", "store_access",
     "submit", "rpc", "tool_dispatch", "completion_render", "spawn",
     "runtime_init", "socket_handshake", "directory_prep", "store_open",
     "capability_catalog", "provider_assembly", "store_journal",
@@ -23,7 +23,8 @@ PHASES = (
 )
 COLD_PHASES = (
     "spawn", "dynamic_link", "runtime_init", "store_open", "directory_prep",
-    "socket_handshake", "capability_catalog", "first_request", "teardown",
+    "socket_handshake", "capability_catalog", "lockdown_bind_activate",
+    "first_request", "teardown",
 )
 ALL_PHASES = (*PHASES, "teardown", "daemon_reaped_children")
 

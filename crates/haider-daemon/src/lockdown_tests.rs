@@ -250,6 +250,62 @@ fn turn_binding_allows_only_exact_auto_hermetic_narrowing() {
 }
 
 #[test]
+fn bind_and_activate_turn_persists_one_complete_atomic_state() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let root = fixture.path().join("lockdown");
+    let manager = LockdownManager::initialize(root.clone()).expect("manager");
+    assert_eq!(
+        manager
+            .bind_and_activate_turn("profile", "session", "run", "research", true, true)
+            .expect("bind and activate"),
+        ("research".to_owned(), true, true)
+    );
+    let expected = br#"{
+  "version": 1,
+  "active": [
+    {
+      "profile_id": "profile",
+      "session_id": "session",
+      "run_id": "run",
+      "provider": "research",
+      "lockdown": true,
+      "auto_hermetic": true
+    }
+  ],
+  "bindings": [
+    {
+      "profile_id": "profile",
+      "session_id": "session",
+      "run_id": "run",
+      "provider": "research",
+      "lockdown": true,
+      "auto_hermetic": true
+    }
+  ]
+}"#;
+    let ledger_path = root.join("turns.json");
+    assert_eq!(fs::read(&ledger_path).expect("ledger bytes"), expected);
+    assert!(matches!(
+        manager
+            .bind_and_activate_turn("profile", "session", "run", "other", false, false)
+            .expect_err("conflicting provider"),
+        LockdownError::TurnBindingConflict { .. }
+    ));
+    assert_eq!(
+        fs::read(&ledger_path).expect("ledger after conflict"),
+        expected,
+        "a refused atomic transition must leave the byte-identical ledger"
+    );
+    let restarted = LockdownManager::initialize(root).expect("restart");
+    assert_eq!(
+        restarted
+            .active_session_binding("profile", "session")
+            .expect("active binding after restart"),
+        Some(("run".to_owned(), "research".to_owned(), true, true))
+    );
+}
+
+#[test]
 fn sandbox_rejects_parent_escape_and_sensitive_reads() {
     let fixture = tempfile::tempdir().expect("fixture");
     let workspace = fixture.path().join("workspace");

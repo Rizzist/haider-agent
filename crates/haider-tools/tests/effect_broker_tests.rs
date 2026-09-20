@@ -77,6 +77,68 @@ impl JournalSink for RejectDispatchJournal {
         self.payloads.push(payload);
         Ok(())
     }
+
+    async fn append_batch(&mut self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        if payloads.iter().any(|payload| {
+            matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Dispatched { .. })
+            )
+        }) {
+            return Err(haider_tools::ToolError::journal(
+                "durable append unavailable",
+            ));
+        }
+        self.payloads.extend(payloads);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BatchJournal {
+    transaction_sizes: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+#[async_trait::async_trait]
+impl JournalSink for BatchJournal {
+    async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
+        self.transaction_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(1);
+        Ok(())
+    }
+
+    async fn append_batch(&mut self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        self.transaction_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(payloads.len());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FailFirstAuthorizationJournal {
+    reject_authorized: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl JournalSink for FailFirstAuthorizationJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        if matches!(
+            payload,
+            EventPayload::Effect(EffectPhase::Authorized { .. })
+        ) && self
+            .reject_authorized
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(haider_tools::ToolError::journal(
+                "durable authorization append unavailable",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -768,6 +830,98 @@ async fn edit_ask_carries_redacted_numbered_review_on_existing_permission_menu()
 }
 
 #[tokio::test]
+async fn brokered_edit_ask_keeps_review_payload_and_separate_journal_boundaries() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("review.rs");
+    fs::write(&path, "fn before() {}\n").expect("seed review target");
+    let journal = BatchJournal::default();
+    let observer = journal.clone();
+    let mut broker = broker_at(journal, directory.path(), 1);
+    let ledger = haider_tools::ChangeLedger::new();
+    let attribution = haider_tools::TurnAttribution::new(
+        haider_protocol::ids::SessionId::new("session"),
+        haider_protocol::ids::RunId::new("turn"),
+    );
+
+    let error = broker
+        .fs_edit(
+            &FsEdit::new("review.rs", "before", "after"),
+            &PermissionPolicy::default(),
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("default policy must ask");
+    let haider_tools::ToolError::AuthorizationRequired { menu } = error else {
+        panic!("expected authorization request, got {error:?}");
+    };
+    let opened = broker.permission_menu(&menu).expect("durable Ask menu");
+    let haider_protocol::menu::MenuKind::Permission {
+        file_review: Some(review),
+        ..
+    } = &opened.kind
+    else {
+        panic!("brokered edit Ask must retain its review payload");
+    };
+
+    assert_eq!(review.effect.as_str(), "effect-session-1-1700000000000-1");
+    assert_eq!((review.added, review.removed), (1, 1));
+    assert_eq!(
+        *observer
+            .transaction_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![1, 1],
+        "Ask keeps Intent and Authorized as separate durable boundaries"
+    );
+    assert_eq!(
+        fs::read_to_string(path).expect("read unchanged target"),
+        "fn before() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_ask_registers_only_after_durable_authorized_and_review_survives_retry() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    fs::write(directory.path().join("review.rs"), "fn before() {}\n").expect("seed review target");
+    let journal = FailFirstAuthorizationJournal {
+        reject_authorized: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    let mut broker = broker_at(journal, directory.path(), 1);
+    let intent = broker
+        .normalize(&FsEdit::new("review.rs", "before", "after"))
+        .await
+        .expect("durable intent");
+
+    let error = broker
+        .authorize(&intent, &PermissionPolicy::default())
+        .await
+        .expect_err("first Authorized append must fail");
+    assert!(matches!(error, haider_tools::ToolError::Journal { .. }));
+    let first_menu = haider_protocol::ids::MenuId::new("permission-session-1-1700000000000-1");
+    assert!(
+        broker.permission_menu(&first_menu).is_none(),
+        "an unjournaled Ask menu must never become answerable"
+    );
+
+    let AuthorizationVerdict::Ask { menu } = broker
+        .authorize(&intent, &PermissionPolicy::default())
+        .await
+        .expect("retry journals authorization")
+    else {
+        panic!("default policy must ask on retry");
+    };
+    let opened = broker.permission_menu(&menu).expect("durable retry menu");
+    assert!(matches!(
+        &opened.kind,
+        haider_protocol::menu::MenuKind::Permission {
+            file_review: Some(_),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn denied_write_does_not_read_target_for_review() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
@@ -854,7 +1008,10 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     assert!(matches!(error, haider_tools::ToolError::Journal { .. }));
     assert_eq!(fs::read_to_string(&path).expect("read file"), "before");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
-    assert_eq!(broker.journal_snapshot().len(), 2);
+    assert!(
+        broker.journal_snapshot().is_empty(),
+        "an atomic start-batch rejection must leave no lifecycle prefix"
+    );
 }
 
 /// Windows byte-range locks are mandatory even between handles in one process.
@@ -1111,6 +1268,37 @@ async fn successful_dispatch_has_strict_four_phase_order() {
         }
     ));
     assert_eq!(phases.len(), 4);
+}
+
+#[tokio::test]
+async fn immediately_allowed_effect_commits_start_phases_as_one_batch() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("read.txt");
+    fs::write(&path, "small result").expect("seed file");
+    let journal = BatchJournal::default();
+    let observer = journal.clone();
+    let mut broker = broker_at(journal, directory.path(), 1);
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::FsRead);
+
+    broker
+        .fs_read(
+            &FsRead::new(&path),
+            &policy,
+            &mut UnusedCas,
+            ResultBounds::default(),
+        )
+        .await
+        .expect("read succeeds");
+
+    assert_eq!(
+        *observer
+            .transaction_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![3, 1],
+        "Intent/Authorized/Dispatched share one commit; Outcome remains terminal"
+    );
 }
 
 #[tokio::test]

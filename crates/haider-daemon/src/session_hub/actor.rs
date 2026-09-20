@@ -422,6 +422,11 @@ pub(super) async fn run_session_actor(
                                 );
                             }
                         }
+                        // Append callers depend on durability, not on
+                        // synchronous client projection. Wake them as soon as
+                        // the complete batch is durable; this actor still
+                        // publishes in-order before accepting another command.
+                        let _ = completed.send(Ok(Arc::clone(&envelopes)));
                         let fanout_started =
                             trace.as_ref().map(TurnTraceContext::now_us_from_accept);
                         pipe_sidecar.enqueue(&envelopes);
@@ -450,7 +455,6 @@ pub(super) async fn run_session_actor(
                         if terminal {
                             unregister_turn_trace_for_envelopes(&envelopes);
                         }
-                        let _ = completed.send(Ok(envelopes));
                     }
                     Err(error) => {
                         let _ = completed.send(Err(error));
@@ -1463,6 +1467,10 @@ pub(super) async fn run_session_actor(
                                 );
                             }
                         }
+                        // Effects may execute once their complete receipt
+                        // batch is durable. Client projection is synchronous
+                        // but is not an authorization or recovery boundary.
+                        let _ = completed.send(Ok(Arc::clone(&envelopes)));
                         let fanout_started =
                             trace.as_ref().map(TurnTraceContext::now_us_from_accept);
                         pipe_sidecar.enqueue(&envelopes);
@@ -1491,7 +1499,6 @@ pub(super) async fn run_session_actor(
                         if terminal {
                             unregister_turn_trace_for_envelopes(&envelopes);
                         }
-                        let _ = completed.send(Ok(envelopes));
                     }
                     Err(error) => {
                         let _ = completed.send(Err(error));
