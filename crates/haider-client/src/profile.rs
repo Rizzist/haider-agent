@@ -321,6 +321,8 @@ fn resolve_profile_with_store_mode(
     env: &ProfileEnv,
     materialize_store: bool,
 ) -> Result<(ResolvedProfile, RuntimeDirResolution), ProfileError> {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::DirectoryPrep);
     let store_dir = match &env.profile_dir {
         Some(dir) => dir.clone(),
         None => profile_home(env)

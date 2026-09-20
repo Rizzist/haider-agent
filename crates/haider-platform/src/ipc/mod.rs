@@ -307,6 +307,7 @@ pub use windows::{
 pub fn prepare_runtime_directory(
     runtime_dir: &Path,
 ) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    let _phase = crate::phase_trace::scope(crate::phase_trace::Phase::DirectoryPrep);
     unix::prepare_runtime_directory(runtime_dir, None)
 }
 
@@ -317,6 +318,7 @@ pub fn prepare_runtime_directory_with_temp(
     runtime_dir: &Path,
     daemon_temp_dir: &Path,
 ) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    let _phase = crate::phase_trace::scope(crate::phase_trace::Phase::DirectoryPrep);
     unix::prepare_runtime_directory(runtime_dir, Some(daemon_temp_dir))
 }
 
@@ -326,6 +328,7 @@ pub fn prepare_runtime_directory_with_temp(
 pub fn prepare_runtime_directory(
     runtime_dir: &Path,
 ) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    let _phase = crate::phase_trace::scope(crate::phase_trace::Phase::DirectoryPrep);
     windows::prepare_runtime_directory(runtime_dir)
 }
 
@@ -335,6 +338,7 @@ pub fn prepare_runtime_directory_with_temp(
     runtime_dir: &Path,
     daemon_temp_dir: &Path,
 ) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    let _phase = crate::phase_trace::scope(crate::phase_trace::Phase::DirectoryPrep);
     windows::prepare_runtime_directory_with_temp(runtime_dir, daemon_temp_dir)
 }
 

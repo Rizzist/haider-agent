@@ -69,6 +69,7 @@ const DAEMON_WORKER_THREADS: usize = 4;
 
 #[cfg(not(windows))]
 fn main() -> ExitCode {
+    let _phase_trace = haider_platform::phase_trace::ExitGuard;
     initialize_process_diagnostics();
     let Some(parsed) = (match prepare_dispatch() {
         Ok(parsed) => parsed,
@@ -91,6 +92,7 @@ fn main() -> ExitCode {
 // its ordinary process main thread.
 #[cfg(windows)]
 fn main() -> ExitCode {
+    let _phase_trace = haider_platform::phase_trace::ExitGuard;
     initialize_process_diagnostics();
     let Some(parsed) = (match prepare_dispatch() {
         Ok(parsed) => parsed,
@@ -122,6 +124,8 @@ fn main() -> ExitCode {
 }
 
 fn daemon_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::RuntimeInit);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(DAEMON_WORKER_THREADS)
         .enable_all()

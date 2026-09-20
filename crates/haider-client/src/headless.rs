@@ -2436,14 +2436,17 @@ async fn teardown_owned_daemon(
     client: &ClientConfig,
     daemon_ownership: &Mutex<Option<DaemonOwnershipToken>>,
 ) -> Result<(), HeadlessRunError> {
-    let Some(ownership) = take_live_daemon_ownership(daemon_ownership)? else {
-        return Ok(());
-    };
-    let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
-    let shutdown =
-        reconnect_and_shutdown_owned_daemon_peer(profile, client, &ownership, request_deadline)
-            .await;
-    finish_owned_daemon_teardown(ownership, shutdown, request_deadline).await
+    haider_platform::phase_trace::measure(haider_platform::phase_trace::Phase::Teardown, async {
+        let Some(ownership) = take_live_daemon_ownership(daemon_ownership)? else {
+            return Ok(());
+        };
+        let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
+        let shutdown =
+            reconnect_and_shutdown_owned_daemon_peer(profile, client, &ownership, request_deadline)
+                .await;
+        finish_owned_daemon_teardown(ownership, shutdown, request_deadline).await
+    })
+    .await
 }
 
 async fn teardown_owned_daemon_on_connection(
@@ -2451,20 +2454,23 @@ async fn teardown_owned_daemon_on_connection(
     connection: &mut HeadlessConnection,
     daemon_ownership: &Mutex<Option<DaemonOwnershipToken>>,
 ) -> Result<(), HeadlessRunError> {
-    let Some(ownership) = take_live_daemon_ownership(daemon_ownership)? else {
-        return Ok(());
-    };
-    let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
-    let HeadlessConnection { client, events, .. } = connection;
-    let shutdown = shutdown_owned_daemon_peer(
-        &profile.profile_id,
-        client,
-        events,
-        &ownership,
-        request_deadline,
-    )
-    .await;
-    finish_owned_daemon_teardown(ownership, shutdown, request_deadline).await
+    haider_platform::phase_trace::measure(haider_platform::phase_trace::Phase::Teardown, async {
+        let Some(ownership) = take_live_daemon_ownership(daemon_ownership)? else {
+            return Ok(());
+        };
+        let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
+        let HeadlessConnection { client, events, .. } = connection;
+        let shutdown = shutdown_owned_daemon_peer(
+            &profile.profile_id,
+            client,
+            events,
+            &ownership,
+            request_deadline,
+        )
+        .await;
+        finish_owned_daemon_teardown(ownership, shutdown, request_deadline).await
+    })
+    .await
 }
 
 fn take_live_daemon_ownership(

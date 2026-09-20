@@ -597,8 +597,9 @@ fn observe_parsers_and_stream_help_are_explicit() {
 }
 
 /// MUTATION CHECK: route no-spawn through ensure_daemon, panic on a missing
-/// socket, or return generic failure. Expected RUNTIME failure: either command
-/// creates daemon state or exits with a code other than literal 69.
+/// socket, return generic failure, or wrap the uninstrumented dispatch future.
+/// Expected RUNTIME failure: either command creates daemon state, exits with a
+/// code other than literal 69, or aborts on the real binary's main-thread stack.
 #[test]
 fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
     #[cfg(unix)]
@@ -621,6 +622,7 @@ fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
             .args(command)
             .env("HAIDER_PROFILE_DIR", &profile_dir)
             .env("HAIDER_DISCOVERY_DISABLED", "1")
+            .env_remove("HAIDER_PHASE_TRACE_DIR")
             .env_remove("XDG_RUNTIME_DIR")
             .output()
             .expect("run no-spawn observe command");

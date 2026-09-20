@@ -93,6 +93,8 @@ fn haider() -> HaiderCommand {
         // the HOST machine's real codex/Claude credentials into this
         // throwaway profile — "no active account" tests stop being true.
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // These real-binary tests pin the ordinary uninstrumented stack path.
+        .env_remove("HAIDER_PHASE_TRACE_DIR")
         .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT);
     HaiderCommand {
         command,

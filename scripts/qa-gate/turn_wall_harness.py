@@ -10,6 +10,9 @@ import math
 import os
 from pathlib import Path
 import platform
+import shutil
+
+import phase_attribution as attribution
 import subprocess
 import sys
 import tempfile
@@ -184,6 +187,7 @@ def run_one_shot_harness(
     measured: int = ONE_SHOT_MEASURED,
     load_limit: float = LOAD_LIMIT,
     trace: bool = False,
+    phases: bool = True,
     keep_root: bool = False,
     budget_ms: float | None = None,
     cpu_total_21_budget_ms: float | None = None,
@@ -202,6 +206,9 @@ def run_one_shot_harness(
             raise ProofError(f"{name} must be finite and positive")
     cpu_accounting = cpu_accounting_self_check()
     root = Path(tempfile.mkdtemp(prefix="htp-one-shot-"))
+    phase_dir = root / "phase-traces"
+    if phases:
+        phase_dir.mkdir()
     proxy_ledger = root / "provider-ledger.jsonl"
     samples: list[dict[str, Any]] = []
     warmup_rows: list[dict[str, Any]] = []
@@ -228,6 +235,7 @@ def run_one_shot_harness(
                     # the daemon's full trace port perturbs pre-Ready startup.
                     CLIENT_TRACE_ENV: "1" if trace else None,
                     TRACE_ENV: None,
+                    attribution.ENV: str(phase_dir) if phases else None,
                 }
                 observed_pid: int | None = None
                 try:
@@ -303,6 +311,13 @@ def run_one_shot_harness(
                         "terminal_seq": parsed["terminal_seq"],
                         "provider_requests": len(ledger),
                     }
+                    if phases:
+                        phase_records, phase_pids = attribution.read_records(phase_dir)
+                        row["phase_attribution"] = attribution.partition(
+                            phase_records, start_ns=result.started_clock_ns,
+                            end_ns=result.ended_clock_ns, cpu_ns=round(result.cpu_ms * 1_000_000),
+                            expected_pids=[result.client_pid, result.observed_pid],
+                            available_pids=phase_pids, cold=True)
                     if trace:
                         case_turn_records = _trace_records(result.stderr + daemon_trace)
                         case_lifecycle_records = _lifecycle_trace_records(result.stderr)
@@ -379,6 +394,7 @@ def run_one_shot_harness(
     finally:
         if not keep_root:
             try:
+                shutil.rmtree(phase_dir, ignore_errors=True)
                 proxy_ledger.unlink()
                 root.rmdir()
             except OSError:
@@ -458,6 +474,7 @@ def run_one_shot_harness(
                 Path(__file__).with_name("turnperf_support.py")
             ),
             "harness_source_sha256": sha256_file(Path(__file__)),
+            "phase_attribution_source_sha256": sha256_file(Path(attribution.__file__)),
         },
         "parameters": {
             "warmups": warmups,
@@ -466,6 +483,7 @@ def run_one_shot_harness(
             "daemon_idle_ttl_ms": 0,
             "load_limit_one_minute": load_limit,
             "trace": trace,
+            "phase_attribution": phases,
         },
         "load_one_minute": load,
         "measurement_accepted": measurement_accepted,
@@ -502,6 +520,7 @@ def run_one_shot_harness(
         "trace_records": trace_records,
         "lifecycle_trace_records": lifecycle_trace_records,
         "trace_stage_summary": stage_summary,
+        "phase_summary": attribution.summarize([row["phase_attribution"] for row in samples]) if phases else None,
         "correctness_failures": correctness_failures,
         "budget_failures": budget_failures,
         "failures": correctness_failures + budget_failures,
@@ -520,6 +539,7 @@ def run_harness(
     measured: int = MEASURED_PER_SHAPE,
     load_limit: float = LOAD_LIMIT,
     trace: bool = False,
+    phases: bool = True,
     keep_root: bool = False,
     budget_ms: dict[str, float] | None = None,
     resource_baseline: dict[str, dict[str, float]] | None = None,
@@ -529,6 +549,9 @@ def run_harness(
         raise ProofError("warmups must be non-negative and measured must be positive")
     cpu_accounting = cpu_accounting_self_check()
     root = Path(tempfile.mkdtemp(prefix="htp-run-", dir="/tmp"))
+    phase_dir = root / "phase-traces"
+    if phases:
+        phase_dir.mkdir()
     proxy_ledger = root / "provider-ledger.jsonl"
     profile: ThrowawayProfile | None = None
     correctness_failures: list[str] = []
@@ -544,7 +567,8 @@ def run_harness(
     try:
         with FakeProvider(proxy_ledger) as proxy:
             profile = ThrowawayProfile(bin_dir, proxy.base_url, root=root / "profile-root")
-            trace_override = {TRACE_ENV: "1" if trace else None}
+            trace_override = {TRACE_ENV: "1" if trace else None,
+                              attribution.ENV: str(phase_dir) if phases else None}
             profile.ready(trace_override)
             pid, generation, _status = profile.status()
             identity = (pid, generation)
@@ -625,6 +649,12 @@ def run_harness(
                     "run_id": ledger[0]["turn_id"].split("/")[1],
                     "turn_ordinal": int(ledger[0]["turn_id"].split("/")[2]),
                 }
+                if phases:
+                    row["phase_boundary"] = {
+                        "start_ns": result.started_clock_ns, "end_ns": result.ended_clock_ns,
+                        "cpu_ns": round(row["combined_cpu_ms"] * 1_000_000),
+                        "expected_pids": [result.client_pid, pid],
+                        "reaped_children_cpu_ns": round(row["daemon_reaped_children_cpu_ms"] * 1_000_000)}
                 if reported:
                     samples[shape].append(row)
                 else:
@@ -662,6 +692,8 @@ def run_harness(
             }
             if stop.returncode != 0 or stop_document.get("outcome") != "stopped_cleanly":
                 correctness_failures.append(f"exact daemon stop failed: {stop_evidence}")
+            if phases and not wait_pid_gone(pid, 2):
+                raise ProofError("phase trace cannot be read before owned daemon exit")
             provider_ledger = proxy.state.read_disk_ledger()
     finally:
         if profile is not None and not stop_evidence:
@@ -675,6 +707,12 @@ def run_harness(
                 active.add_note(str(error))
         if sys.exc_info()[0] is not None and profile is not None:
             profile.dispose()
+
+    if phases:
+        phase_records, phase_pids = attribution.read_records(phase_dir)
+        for row in [*warmup_rows, *samples["single"], *samples["tool"]]:
+            row["phase_attribution"] = attribution.partition(
+                phase_records, **row.pop("phase_boundary"), available_pids=phase_pids)
 
     overload = [name for name, value in load.items() if value >= load_limit]
     parameter_reasons = []
@@ -939,6 +977,7 @@ def run_harness(
             "haiderd": {"path": str((bin_dir / "haiderd").resolve()), "sha256": sha256_file(bin_dir / "haiderd")},
             "proxy_source_sha256": sha256_file(Path(__file__).with_name("turnperf_support.py")),
             "harness_source_sha256": sha256_file(Path(__file__)),
+            "phase_attribution_source_sha256": sha256_file(Path(attribution.__file__)),
         },
         "parameters": {
             "warmups_per_shape": warmups,
@@ -946,6 +985,7 @@ def run_harness(
             "order": "ABBA",
             "load_limit_one_minute": load_limit,
             "trace": trace,
+            "phase_attribution": phases,
         },
         "daemon": {
             "pid": identity[0] if identity else None,
@@ -964,6 +1004,8 @@ def run_harness(
         "summary": summary,
         "trace_records": trace_records,
         "trace_stage_summary": trace_stage_summary,
+        "phase_summary": {shape: attribution.summarize([row["phase_attribution"] for row in rows])
+                          for shape, rows in samples.items()} if phases else None,
         "provider_ledger": provider_ledger,
         "provider_ledger_sha256": sha256_file(proxy_ledger),
         "correctness_failures": correctness_failures,
@@ -976,6 +1018,7 @@ def run_harness(
     elif profile is not None:
         profile.dispose()
         try:
+            shutil.rmtree(phase_dir, ignore_errors=True)
             proxy_ledger.unlink()
             root.rmdir()
         except OSError:
@@ -994,6 +1037,8 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--measured", type=int)
     parser.add_argument("--load-limit", type=float, default=LOAD_LIMIT)
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--phases", action=argparse.BooleanOptionalAction, default=True,
+                        help="buffer content-free phase attribution (default: enabled)")
     parser.add_argument("--keep-root", action="store_true")
     parser.add_argument("--single-budget-ms", type=float)
     parser.add_argument("--tool-budget-ms", type=float)
@@ -1043,6 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
                 measured=measured,
                 load_limit=args.load_limit,
                 trace=args.trace,
+                phases=args.phases,
                 keep_root=args.keep_root,
                 budget_ms=args.single_budget_ms,
                 cpu_total_21_budget_ms=args.cpu_total_21_budget_ms,
@@ -1060,6 +1106,7 @@ def main(argv: list[str] | None = None) -> int:
                 measured=measured,
                 load_limit=args.load_limit,
                 trace=args.trace,
+                phases=args.phases,
                 keep_root=args.keep_root,
                 budget_ms=budgets,
                 commit_label=args.commit_label,

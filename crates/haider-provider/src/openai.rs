@@ -2431,6 +2431,8 @@ enum OpenAiDecoder {
 
 impl OpenAiDecoder {
     fn push(&mut self, bytes: &[u8]) -> Vec<ProviderStreamItem> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StreamDecode);
         match self {
             Self::Responses(decoder) => decoder.push(bytes),
             Self::Chat(decoder) => decoder.push(bytes),
@@ -2468,6 +2470,8 @@ struct SseFramer {
 
 impl SseFramer {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseFrame>, ProviderError> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StreamDecode);
         let decoded = self.utf8.push(bytes)?;
         let mut frames = Vec::new();
         for text in decoded {
@@ -2575,6 +2579,8 @@ impl ResponsesDecoder {
     }
 
     fn push(&mut self, bytes: &[u8]) -> Vec<ProviderStreamItem> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StreamDecode);
         if self.terminal {
             return Vec::new();
         }
@@ -3501,6 +3507,8 @@ impl ChatDecoder {
     }
 
     fn push(&mut self, bytes: &[u8]) -> Vec<ProviderStreamItem> {
+        let _phase =
+            haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StreamDecode);
         if self.terminal {
             return Vec::new();
         }

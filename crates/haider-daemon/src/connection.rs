@@ -1530,7 +1530,7 @@ where
                             decoder.set_encoding(encoding);
                         }
                         if let Some(frame) = step.frame {
-                            close = handle_frame(
+                            close = haider_platform::phase_trace::measure_active(haider_platform::phase_trace::Phase::Rpc, handle_frame(
                                 frame,
                                 &context,
                                 &drain,
@@ -1539,7 +1539,8 @@ where
                                 &mut hub_connection,
                                 &mut outbound_limit,
                                 &mut encoding,
-                            ).await?;
+                            ))
+                            .await?;
                             if close {
                                 retirement_reason = ConnectionRetirementReason::Error;
                             }

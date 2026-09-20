@@ -4302,6 +4302,8 @@ fn render_journal_with_facts(
     current_run: Option<&RunId>,
     require_current_user: bool,
 ) -> Result<RenderedJournal, HaiderError> {
+    let _phase =
+        haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::ProjectionDigest);
     let mut messages = Vec::new();
     let mut pending_tool_results = HashMap::<String, BoundedResult>::new();
     let mut user_command_outputs =

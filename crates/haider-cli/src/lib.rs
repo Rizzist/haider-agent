@@ -37,6 +37,7 @@ const MAX_FOOTPRINT_HOLD_MS: u64 = 5 * 60 * 1_000;
 /// The Windows control dispatcher needs the established 8 MiB main stack.
 /// The payload is selected before creating either this thread or Tokio.
 pub fn main() -> ExitCode {
+    let _phase_trace = haider_platform::phase_trace::ExitGuard;
     let code = dispatch_main();
     #[cfg(windows)]
     hold_explorer_console_on_failure(code);
@@ -103,10 +104,14 @@ fn dispatch_main() -> ExitCode {
 }
 
 fn run_headless(command: routing::Command<'_>) -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match haider_platform::phase_trace::sync(
+        haider_platform::phase_trace::Phase::RuntimeInit,
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        },
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("haider: could not start async runtime: {error}");
@@ -114,7 +119,10 @@ fn run_headless(command: routing::Command<'_>) -> ExitCode {
         }
     };
     let is_run = matches!(command, routing::Command::Run(_));
-    let code = runtime.block_on(dispatch(command));
+    let code = runtime.block_on(haider_platform::phase_trace::measure_active(
+        haider_platform::phase_trace::Phase::ClientControl,
+        dispatch(command),
+    ));
     footprint_probe_hold();
     // Retain run's existing owned output/daemon teardown before runtime drop.
     if !is_run {
@@ -122,6 +130,7 @@ fn run_headless(command: routing::Command<'_>) -> ExitCode {
     }
     code
 }
+
 /// Keep a completed client process alive for the release footprint harness.
 ///
 /// This is deliberately an opt-in measurement seam rather than a command-line

@@ -18,7 +18,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-rustix = { workspace = true, features = ["net", "system", "pipe"] }
+rustix = { workspace = true, features = ["net", "system", "pipe", "time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31.3", features = ["event"] }

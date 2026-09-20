@@ -58,12 +58,22 @@ class CommandResult:
     combined_peak_rss_kib: int
     ended_unix_micros: int
     observed_pid: int | None
+    client_pid: int = 0
+    started_clock_ns: int = 0
+    ended_clock_ns: int = 0
     timed_out: bool = False
     # Own-process CPU from the same live native sampler as client RSS. Unlike
     # cpu_ms this excludes reaped descendants, but misses work after the last
     # successful sample and is therefore a measured lower bound, not exit CPU.
     sampled_client_cpu_ms: float | None = None
     client_cpu_sample_count: int = 0
+
+
+def phase_clock_ns() -> int:
+    """Same POSIX epoch as Rust; Darwin's Python monotonic clock differs."""
+    if hasattr(time, "CLOCK_MONOTONIC"):
+        return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    return time.monotonic_ns()
 
 
 def run_command(
@@ -77,7 +87,7 @@ def run_command(
 ) -> CommandResult:
     command = tuple(os.fspath(value) for value in argv)
     before_usage = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
-    started = time.monotonic_ns()
+    started = phase_clock_ns()
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -143,7 +153,7 @@ def run_command(
         stdout, stderr = process.communicate()
     sampling_done.set()
     sampler.join(timeout=1)
-    ended = time.monotonic_ns()
+    ended = phase_clock_ns()
     ended_unix_micros = time.time_ns() // 1_000
     after_usage = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
     cpu_ms = 0.0
@@ -168,6 +178,9 @@ def run_command(
         combined_peak_rss_kib=sampled_combined_peak_rss_kib,
         ended_unix_micros=ended_unix_micros,
         observed_pid=sampled_observed_pid,
+        client_pid=process.pid,
+        started_clock_ns=started,
+        ended_clock_ns=ended,
         timed_out=timed_out,
         sampled_client_cpu_ms=sampled_client_cpu_ms,
         client_cpu_sample_count=client_cpu_sample_count,
