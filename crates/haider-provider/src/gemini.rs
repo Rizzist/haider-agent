@@ -380,7 +380,7 @@ impl GeminiProvider {
         self.request_body_prepared(crate::PreparedWire {
             payload,
             history_boundary: None,
-            reply_bindings: Vec::new(),
+            reply_bindings: crate::PreparedReplyBindings::default(),
         })
         .await
     }
@@ -435,7 +435,7 @@ impl GeminiProvider {
                 crate::PreparedWire {
                     payload,
                     history_boundary: Some(boundary),
-                    reply_bindings: Vec::new(),
+                    reply_bindings: crate::PreparedReplyBindings::default(),
                 }
             }
         };
@@ -538,6 +538,7 @@ impl GeminiProvider {
                 true,
             )
             .ok()?;
+        let reply_bindings = crate::PreparedReplyBindings::try_new(reply_bindings)?;
         let full_payload = crate::AttachmentMovePayload::new(rendered_payload, attachment_moves);
         let contents = payload_contents(&full_payload)?;
         let history_blocks =
@@ -884,13 +885,14 @@ impl GeminiCacheRegistry {
         )
         .ok()
         .map(|(_, boundary, _)| boundary);
+        let reply_bindings = crate::PreparedReplyBindings::default();
         self.prepare_generate_payload_with_boundary(
             request,
             full_payload,
             history_boundary,
             backend,
             web_builtins,
-            &[],
+            &reply_bindings,
         )
         .await
     }
@@ -902,7 +904,7 @@ impl GeminiCacheRegistry {
         history_boundary: Option<crate::PreparedHistoryBoundary>,
         backend: Arc<dyn GeminiCacheBackend>,
         web_builtins: bool,
-        reply_bindings: &[crate::PreparedReplyBinding],
+        reply_bindings: &crate::PreparedReplyBindings,
     ) -> serde_json::Value {
         let Some(metadata) = request.cache_metadata.as_ref().filter(|metadata| {
             metadata.boundaries_valid(request.messages.len())
@@ -1616,7 +1618,7 @@ impl Serialize for GeminiContentPrefix<'_> {
 fn gemini_history_digest(
     full_payload: &serde_json::Value,
     boundary: crate::PreparedHistoryBoundary,
-    reply_bindings: &[crate::PreparedReplyBinding],
+    reply_bindings: &crate::PreparedReplyBindings,
 ) -> Option<String> {
     let contents = payload_contents(full_payload)?;
     crate::exact_json_digest_with_replies(
@@ -1628,7 +1630,7 @@ fn gemini_history_digest(
 fn gemini_provider_view_blocks(
     contents: &[serde_json::Value],
     boundary: crate::PreparedHistoryBoundary,
-    reply_bindings: &[crate::PreparedReplyBinding],
+    reply_bindings: &crate::PreparedReplyBindings,
 ) -> Option<Vec<haider_protocol::cache::ProviderViewBlobV1>> {
     let end = boundary.items.min(contents.len());
     contents[..end]
@@ -1655,7 +1657,7 @@ fn gemini_previous_provider_view_block_refs(
     current_boundary: crate::PreparedHistoryBoundary,
     current_blocks: &[haider_protocol::cache::ProviderViewBlobV1],
     previous_boundary: crate::PreparedHistoryBoundary,
-    reply_bindings: &[crate::PreparedReplyBinding],
+    reply_bindings: &crate::PreparedReplyBindings,
 ) -> Option<(
     Vec<haider_protocol::cache::ProviderViewBlockRefV1>,
     Option<usize>,
@@ -1720,7 +1722,7 @@ fn gemini_cacheable_contents(
 
 fn gemini_content_block_refs(
     contents: &[serde_json::Value],
-    reply_bindings: &[crate::PreparedReplyBinding],
+    reply_bindings: &crate::PreparedReplyBindings,
 ) -> Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>> {
     if reply_bindings.is_empty() {
         return contents.iter().map(crate::exact_wire_block_ref).collect();

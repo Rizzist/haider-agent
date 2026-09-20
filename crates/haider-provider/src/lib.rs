@@ -38,6 +38,8 @@ mod pricing;
 #[doc(hidden)]
 #[path = "../tests/support/prompt_cache_fake.rs"]
 pub mod prompt_cache_fake;
+#[cfg(test)]
+mod reply_binding_tests;
 mod usage;
 mod webfetch;
 #[cfg(test)]
@@ -925,23 +927,22 @@ where
 
 fn reply_token_locations(
     encoded: &[u8],
-    bindings: &[PreparedReplyBinding],
+    bindings: &PreparedReplyBindings,
 ) -> Option<Vec<(usize, usize, ReplyText)>> {
-    let mut locations = Vec::new();
-    for binding in bindings {
-        let token = serde_json::to_vec(&binding.marker).ok()?;
-        let mut matches = encoded
-            .windows(token.len())
-            .enumerate()
-            .filter_map(|(offset, window)| (window == token).then_some(offset));
-        let Some(offset) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_some() {
-            return None;
-        }
-        locations.push((offset, token.len(), binding.text.clone()));
-    }
+    let offsets = bindings.matcher.unique_locations([encoded])?;
+    let mut locations = offsets
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, offset)| {
+            offset.map(|offset| {
+                (
+                    offset,
+                    bindings.matcher.token_lengths[index],
+                    bindings.items[index].text.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
     locations.sort_unstable_by_key(|(offset, _, _)| *offset);
     let mut end = 0;
     for (offset, len, _) in &locations {
@@ -955,7 +956,7 @@ fn reply_token_locations(
 
 pub(crate) fn provider_view_json_blob<T: Serialize + ?Sized>(
     value: &T,
-    bindings: &[PreparedReplyBinding],
+    bindings: &PreparedReplyBindings,
 ) -> Option<haider_protocol::cache::ProviderViewBlobV1> {
     use haider_protocol::cache::ProviderViewBlobSegmentV1;
 
@@ -983,7 +984,7 @@ pub(crate) fn provider_view_json_blob<T: Serialize + ?Sized>(
 
 pub(crate) fn exact_json_digest_with_replies<T: Serialize + ?Sized>(
     value: &T,
-    bindings: &[PreparedReplyBinding],
+    bindings: &PreparedReplyBindings,
 ) -> Option<String> {
     provider_view_json_blob(value, bindings)?
         .block
@@ -1020,7 +1021,7 @@ fn write_json_reply_scalar(
 fn write_json_value_with_replies(
     writer: &mut impl std::io::Write,
     value: &serde_json::Value,
-    bindings: &[PreparedReplyBinding],
+    bindings: &PreparedReplyBindings,
 ) -> std::io::Result<()> {
     let encoded = serialize_json_fragment(value)
         .ok_or_else(|| std::io::Error::other("provider JSON template could not serialize"))?;
@@ -1072,7 +1073,7 @@ pub(crate) fn serialized_provider_view_history(
     history_wire_start: usize,
     stable_wire_end: usize,
     previous_wire_end: Option<usize>,
-    reply_bindings: &[PreparedReplyBinding],
+    reply_bindings: &PreparedReplyBindings,
 ) -> Option<SerializedProviderViewHistory> {
     let start = history_wire_start.min(history.len());
     let stable_end = stable_wire_end.max(start).min(history.len());
@@ -1178,7 +1179,7 @@ pub(crate) fn serialize_json_body(payload: serde_json::Value) -> Result<Vec<u8>,
     serialize_prepared_json_body(PreparedWire {
         payload,
         history_boundary: None,
-        reply_bindings: Vec::new(),
+        reply_bindings: PreparedReplyBindings::default(),
     })
 }
 
@@ -2178,12 +2179,155 @@ pub struct PreparedTurn {
 pub(crate) struct PreparedWire {
     pub(crate) payload: serde_json::Value,
     pub(crate) history_boundary: Option<PreparedHistoryBoundary>,
-    pub(crate) reply_bindings: Vec<PreparedReplyBinding>,
+    pub(crate) reply_bindings: PreparedReplyBindings,
 }
 
 pub(crate) struct PreparedReplyBinding {
     marker: String,
     text: ReplyText,
+}
+
+/// One compiled multi-pattern search shared by provider-view assembly and the
+/// final wire serializer. Matching bytes instead of decoded strings preserves
+/// the old ambiguity rule exactly, including matches in unrelated JSON text.
+struct ReplyTokenMatcher {
+    nodes: Vec<ReplyTokenNode>,
+    token_lengths: Vec<usize>,
+}
+
+#[derive(Default)]
+struct ReplyTokenNode {
+    transitions: Vec<(u8, usize)>,
+    failure: usize,
+    outputs: Vec<usize>,
+}
+
+impl ReplyTokenMatcher {
+    fn new(tokens: &[Vec<u8>]) -> Option<Self> {
+        let mut nodes = vec![ReplyTokenNode::default()];
+        let mut token_lengths = Vec::with_capacity(tokens.len());
+        for (token_index, token) in tokens.iter().enumerate() {
+            if token.is_empty() {
+                return None;
+            }
+            token_lengths.push(token.len());
+            let mut state = 0;
+            for byte in token {
+                let next = nodes[state]
+                    .transitions
+                    .iter()
+                    .find_map(|(candidate, next)| (candidate == byte).then_some(*next));
+                state = match next {
+                    Some(next) => next,
+                    None => {
+                        let next = nodes.len();
+                        nodes.push(ReplyTokenNode::default());
+                        nodes[state].transitions.push((*byte, next));
+                        next
+                    }
+                };
+            }
+            nodes[state].outputs.push(token_index);
+        }
+
+        let mut pending = std::collections::VecDeque::new();
+        for (_, child) in nodes[0].transitions.clone() {
+            pending.push_back(child);
+        }
+        while let Some(state) = pending.pop_front() {
+            for (byte, child) in nodes[state].transitions.clone() {
+                let mut failure = nodes[state].failure;
+                while failure != 0 && Self::transition(&nodes[failure], byte).is_none() {
+                    failure = nodes[failure].failure;
+                }
+                if let Some(next) = Self::transition(&nodes[failure], byte) {
+                    failure = next;
+                }
+                nodes[child].failure = failure;
+                let inherited = nodes[failure].outputs.clone();
+                nodes[child].outputs.extend(inherited);
+                pending.push_back(child);
+            }
+        }
+        Some(Self {
+            nodes,
+            token_lengths,
+        })
+    }
+
+    fn transition(node: &ReplyTokenNode, byte: u8) -> Option<usize> {
+        node.transitions
+            .iter()
+            .find_map(|(candidate, next)| (*candidate == byte).then_some(*next))
+    }
+
+    /// Returns each pattern's sole byte offset. A second occurrence is the
+    /// same ambiguity the former per-pattern `windows()` scan rejected.
+    fn unique_locations<'a>(
+        &self,
+        chunks: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Option<Vec<Option<usize>>> {
+        let mut locations = vec![None; self.token_lengths.len()];
+        let mut state = 0;
+        let mut position = 0usize;
+        for chunk in chunks {
+            for byte in chunk {
+                while state != 0 && Self::transition(&self.nodes[state], *byte).is_none() {
+                    state = self.nodes[state].failure;
+                }
+                state = Self::transition(&self.nodes[state], *byte).unwrap_or(0);
+                for token_index in &self.nodes[state].outputs {
+                    let offset = position
+                        .checked_add(1)?
+                        .checked_sub(self.token_lengths[*token_index])?;
+                    if locations[*token_index].replace(offset).is_some() {
+                        return None;
+                    }
+                }
+                position = position.checked_add(1)?;
+            }
+        }
+        Some(locations)
+    }
+}
+
+pub(crate) struct PreparedReplyBindings {
+    items: Vec<PreparedReplyBinding>,
+    matcher: ReplyTokenMatcher,
+}
+
+impl PreparedReplyBindings {
+    pub(crate) fn try_new(items: Vec<PreparedReplyBinding>) -> Option<Self> {
+        let tokens = items
+            .iter()
+            .map(|binding| serde_json::to_vec(&binding.marker))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some(Self {
+            matcher: ReplyTokenMatcher::new(&tokens)?,
+            items,
+        })
+    }
+}
+
+impl Default for PreparedReplyBindings {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            matcher: ReplyTokenMatcher {
+                nodes: vec![ReplyTokenNode::default()],
+                token_lengths: Vec::new(),
+            },
+        }
+    }
+}
+
+impl std::ops::Deref for PreparedReplyBindings {
+    type Target = [PreparedReplyBinding];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
 }
 
 static NEXT_REPLY_MARKER: AtomicU64 = AtomicU64::new(0);

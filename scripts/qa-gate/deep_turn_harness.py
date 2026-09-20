@@ -183,6 +183,29 @@ def projection_bytes(body: Mapping[str, Any]) -> bytes:
     return messages.encode("utf-8")
 
 
+def comparable_wire_bytes(raw: bytes) -> bytes:
+    """Normalize only fixture-owned coordinates in otherwise exact wire bytes."""
+
+    body = raw.decode("utf-8")
+    body = re.sub(r"/tmp/hdp-[^/\\\"\s]+", "/tmp/hdp-FIXTURE", body)
+    body = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        "FIXTURE-UUID",
+        body,
+        flags=re.IGNORECASE,
+    )
+    # The daemon deliberately salts this routing cohort with the independent
+    # fixture session. Compare the surrounding wire exactly while removing
+    # only that deterministic 64-hex coordinate.
+    body = re.sub(
+        r'("prompt_cache_key":")[0-9a-f]{64}(")',
+        r"\1FIXTURE-PROMPT-CACHE-KEY\2",
+        body,
+        flags=re.IGNORECASE,
+    )
+    return body.encode("utf-8")
+
+
 def abba_order(rounds: int) -> list[tuple[int, int, str]]:
     if rounds < 1:
         raise ProofError("ABBA rounds must be positive")
@@ -358,6 +381,7 @@ class DeepProviderState:
         messages = body.get("messages")
         tools = body.get("tools")
         projected = projection_bytes(body)
+        comparable_wire = comparable_wire_bytes(raw)
         entry = {
             "session_id": session_id,
             "run_id": run_id,
@@ -366,6 +390,8 @@ class DeepProviderState:
             "request_kind": "primary",
             "body_bytes": len(raw),
             "body_sha256": hashlib.sha256(raw).hexdigest(),
+            "comparable_wire_bytes": len(comparable_wire),
+            "comparable_wire_sha256": hashlib.sha256(comparable_wire).hexdigest(),
             "projection_bytes": len(projected),
             "projection_sha256": hashlib.sha256(projected).hexdigest(),
             "messages": len(messages) if isinstance(messages, list) else 0,
@@ -1254,6 +1280,55 @@ def summarize_projection_equivalence(
     return {"all_turns_byte_identical": all_identical, "turns": turns}
 
 
+def summarize_wire_equivalence(
+    runs: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if {run["arm"] for run in runs} != {"a", "b"}:
+        return None
+    turns: dict[str, Any] = {}
+    all_identical = True
+    for turn in range(1, TURNS + 1):
+        request_count = 2 if turn_is_tool(turn) else 1
+        requests: dict[str, Any] = {}
+        turn_identical = True
+        for ordinal in range(1, request_count + 1):
+            digests = {
+                arm: sorted(
+                    {
+                        (
+                            request["comparable_wire_bytes"],
+                            request["comparable_wire_sha256"],
+                        )
+                        for run in runs
+                        if run["arm"] == arm
+                        for request in run["turns"][turn - 1]["provider_requests"]
+                        if request["request_ordinal"] == ordinal
+                    }
+                )
+                for arm in ("a", "b")
+            }
+            identical = digests["a"] == digests["b"]
+            turn_identical = turn_identical and identical
+            requests[str(ordinal)] = {
+                "byte_identical_after_coordinate_normalization": identical,
+                "a_length_sha256": digests["a"],
+                "b_length_sha256": digests["b"],
+            }
+        all_identical = all_identical and turn_identical
+        turns[str(turn)] = {
+            "byte_identical_after_coordinate_normalization": turn_identical,
+            "requests": requests,
+        }
+    return {
+        "normalization": (
+            "only fixture temp roots, daemon-minted UUID coordinates, and "
+            "session-derived prompt-cache routing keys"
+        ),
+        "all_turns_byte_identical_after_coordinate_normalization": all_identical,
+        "turns": turns,
+    }
+
+
 def arms_for(args: argparse.Namespace) -> tuple[Arm, Arm | None]:
     base = args.bin_dir.resolve()
     if args.experiment == "baseline":
@@ -1321,6 +1396,18 @@ def arms_for(args: argparse.Namespace) -> tuple[Arm, Arm | None]:
                 "incremental native-pipe journal projection",
             ),
         )
+    if args.experiment == "provider-binding-linear":
+        if args.variant_bin_dir is None:
+            raise ProofError("provider-binding-linear requires --variant-bin-dir")
+        return (
+            Arm("a", base, {}, "per-binding full-buffer reply-marker scans"),
+            Arm(
+                "b",
+                args.variant_bin_dir.resolve(),
+                {},
+                "shared linear reply-marker index",
+            ),
+        )
     raise ProofError(f"unknown experiment {args.experiment!r}")
 
 
@@ -1328,6 +1415,18 @@ def self_check() -> dict[str, Any]:
     payload = b"".join(text_response(1))
     fragments = fragment_bytes(payload)
     catalog = provider_catalog("http://127.0.0.1:1/v1")
+    wire_a = (
+        b'{"prompt_cache_key":"'
+        + (b"a" * 64)
+        + b'","path":"/tmp/hdp-alpha/out",'
+        + b'"turn":"11111111-1111-1111-1111-111111111111"}'
+    )
+    wire_b = (
+        b'{"prompt_cache_key":"'
+        + (b"b" * 64)
+        + b'","path":"/tmp/hdp-beta/out",'
+        + b'"turn":"22222222-2222-2222-2222-222222222222"}'
+    )
     checks = {
         "turns": TURNS,
         "checkpoints": list(CHECKPOINTS),
@@ -1340,6 +1439,9 @@ def self_check() -> dict[str, Any]:
         "abba_n_per_arm_at_three_rounds": [
             arm for _block, _position, arm in abba_order(3)
         ].count("a"),
+        "wire_coordinate_normalization": (
+            comparable_wire_bytes(wire_a) == comparable_wire_bytes(wire_b)
+        ),
     }
     if checks != {
         "turns": 40,
@@ -1351,6 +1453,7 @@ def self_check() -> dict[str, Any]:
         "fragment_reassembly": True,
         "max_fragment_bytes": 21,
         "abba_n_per_arm_at_three_rounds": 6,
+        "wire_coordinate_normalization": True,
     }:
         raise ProofError(f"deep fixture self-check failed: {checks}")
     return checks
@@ -1368,6 +1471,7 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
             "free2-msgpack",
             "free3-mimalloc",
             "store-decode",
+            "provider-binding-linear",
             "wall1-journal",
             "wall-toolpath",
         ),
@@ -1433,6 +1537,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         discarded_runs = [
             run["label"] for run in runs if int(run["block"]) in contaminated_blocks
         ]
+        projection_equivalence = summarize_projection_equivalence(valid_runs)
+        wire_equivalence = summarize_wire_equivalence(valid_runs)
+        equivalence_failures = []
+        if args.experiment == "provider-binding-linear":
+            if not projection_equivalence or not projection_equivalence[
+                "all_turns_byte_identical"
+            ]:
+                equivalence_failures.append(
+                    "provider projections differ between baseline and candidate"
+                )
+            if not wire_equivalence or not wire_equivalence[
+                "all_turns_byte_identical_after_coordinate_normalization"
+            ]:
+                equivalence_failures.append(
+                    "provider wire bytes differ between baseline and candidate"
+                )
+        failures = (
+            []
+            if not discarded_runs
+            else ["foreign haiderd contamination left fewer valid blocks than requested"]
+        ) + equivalence_failures
         report = {
             "schema": "haider.deep-turn.v1",
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1469,11 +1594,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             "summary": summarize_arms(valid_runs),
             "contrasts": summarize_contrasts(valid_runs),
-            "projection_equivalence": summarize_projection_equivalence(valid_runs),
-            "failures": [] if not discarded_runs else [
-                "foreign haiderd contamination left fewer valid blocks than requested"
-            ],
-            "passed": not discarded_runs,
+            "projection_equivalence": projection_equivalence,
+            "wire_equivalence": wire_equivalence,
+            "failures": failures,
+            "passed": not failures,
         }
         rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.output:
