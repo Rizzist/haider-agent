@@ -1,0 +1,101 @@
+# tuivirt golden · report_providers · 160x50
+00|PROVIDERS — registry truth · accounts live in /accounts                                                                                                         |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×9; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×46; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×105
+01|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+02|openai  ● available                                                                                                                                             |
+   ~ Rgb(242, 242, 242)/Rgb(39, 39, 39)/BOLD×6; Rgb(212, 212, 212)/Rgb(39, 39, 39)/NONE×2; Rgb(134, 196, 147)/Rgb(39, 39, 39)/NONE×11; Rgb(212, 212, 212)/Rgb(39, 39, 39)/NONE×141
+03|    responses · https://api.openai.com/v1                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+04|    models: gpt-5.6  gpt-5.6-codex*  o4-mini                                                                                                                    |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×9; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×125
+05|    account: work-chatgpt · oauth · in use  [accounts]                                                                                                          |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×42; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106
+06|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+07|anthropic  ● available                                                                                                                                          |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×138
+08|    messages · https://api.anthropic.com                                                                                                                        |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×120
+09|    models: claude-opus-5*  claude-sonnet-5                                                                                                                     |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×134
+10|    account: personal-max · oauth · in use  [accounts]                                                                                                          |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×42; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106
+11|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+12|gemini  ● available                                                                                                                                             |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×141
+13|    gemini · https://generativelanguage.googleapis.com/v1beta                                                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×61; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×99
+14|    models: gemini-3*                                                                                                                                           |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×139
+15|    account: gemini-key · api key · in use  [accounts]                                                                                                          |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×42; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106
+16|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+17|kimi-oauth  ○ provider model inventory is unavailable                                                                                                           |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×107
+18|    openai-compatible · https://api.kimi.com/coding/v1                                                                                                          |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×54; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106
+19|    models: —                                                                                                                                                   |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×147
+20|    account: — (/accounts)  [accounts]                                                                                                                          |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×26; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×122
+21|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+22|local  ● available                                                                                                                                              |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×5; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×142
+23|    openai-compatible · http://127.0.0.1:8000/v1                                                                                                                |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×48; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+24|    models: qwen3-coder*                                                                                                                                        |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×12; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×136
+25|    account: vllm-local · api key · in use  [accounts]                                                                                                          |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×42; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×106
+26|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+27|huggingface  ● available                                                                                                                                        |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×136
+28|    openai-compatible · https://llama-3-70b.endpoints.huggingface.cloud/v1                                                                                      |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×74; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×86
+29|    models: llama-3-70b*                                                                                                                                        |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×12; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×136
+30|    account: hf-endpoint · api key · in use  [accounts]                                                                                                         |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×43; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×105
+31|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+32|deepseek  ○ provider has no credential                                                                                                                          |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×122
+33|    openai-compatible · https://api.deepseek.com                                                                                                                |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×48; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+34|    models: deepseek-chat*  deepseek-reasoner                                                                                                                   |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×134
+35|⋮   account: — (/accounts)  [accounts]                                                                                                                          |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×122
+36|[+ OpenAI (OAuth)]  [+ Anthropic (OAuth)]  [+ OpenAI (API)]                                                                                                     |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×101
+37|[+ Anthropic (API)]  [+ Kimi (OAuth)]  [+ Grok (OAuth)]  [+ Gemini (API)]                                                                                       |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×87
+38|[+ Google Antigravity (OAuth)]                                                                                                                                  |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×130
+39|[+ Haider Code (API)]  [+ DeepSeek (API)]  [+ xAI (API)]                                                                                                        |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×104
+40|[+ HuggingFace]  [+ OpenCode Zen]  [+ OpenCode Go]                                                                                                              |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×110
+41|[+ Ollama (local)]  [+ LM Studio (local)]                                                                                                                       |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+42|[+ Azure OpenAI]  [+ Bedrock (Claude)]  [+ Vertex (Claude)]                                                                                                     |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×20; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×101
+43|[+ Add custom server]                                                                                                                                           |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×139
+44|presets: h HuggingFace · z Zen · g Go · o Ollama · l LM Studio                                                                                                  |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×98
+45|named: d DeepSeek · enterprise: a Azure · b Bedrock · v Vertex                                                                                                  |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×98
+46|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
+47|model click sets default · t trust · e edit · x remove · f refresh · esc back                                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×77; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×83
+48|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
+49| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                                                                                                        |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118

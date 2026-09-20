@@ -1,0 +1,49 @@
+# tuivirt golden · report_usage · 80x24
+00|USAGE · accounts — meters are provider truth · stats are this device's journal ·|
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×5; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×64
+01|  accounts · calendar · global · history · models    s next scope · ← → account |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×5; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×3; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+02|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+03|anthropic-oauth  [anthropic]                                                    |
+   ~ Rgb(242, 242, 242)/Rgb(39, 39, 39)/BOLD×15; Rgb(212, 212, 212)/Rgb(39, 39, 39)/NONE×2; Rgb(217, 181, 68)/Rgb(39, 39, 39)/NONE×11; Rgb(212, 212, 212)/Rgb(39, 39, 39)/NONE×52
+04|    m**@e******.com · max_20x · oauth                                           |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×37; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×43
+05|    ▰▱▱▱▱▱▱▱▱▱   17% left (five_hour) · resets in 2h 14m                        |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×4; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×10; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×31; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×24
+06|    ▰▰▰▰▰▰▰▰▱▱   83% left (seven_day) · resets in 5d 3h                         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×4; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×10; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×25
+07|    local — 0 sessions · 0s · plan · $— API rate · +0 −0 lines                  |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×18
+08|    tokens — in 0 · out 0 · reasoning 0 · cached 0                              |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×50; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×30
+09|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+10|openai  [openai]                                                                |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×64
+11|    d**@c***.dev · api key                                                      |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×26; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×54
+12|    api key — no provider meter · local counters only                           |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×53; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×27
+13|    local — 0 sessions · 0s · est $— · +0 −0 lines                              |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×50; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×30
+14|    tokens — in 0 · out 0 · reasoning 0 · cached 0                              |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×50; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×30
+15|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+16|THIS DEVICE — journal totals over 2 shown accounts                              |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×30
+17|    0 sessions · 0s · plan · +0 −0 lines                                        |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×40
+18|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+19|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+20|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+21|←/→ account · ↑↓ provider · r reveal · f refresh · s scope · esc back           |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×69; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×11
+22|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38
