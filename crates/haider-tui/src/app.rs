@@ -8438,7 +8438,7 @@ impl AppModel {
         }
         if self.screen == Screen::Tools {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                self.screen = Screen::Session;
+                self.switch_surface(Screen::Session);
                 self.dirty = true;
             }
             return;
@@ -8470,7 +8470,7 @@ impl AppModel {
                                 .and_then(|descriptor| descriptor.source_branch_id.clone());
                             self.tree_sel = 0;
                         }
-                        None => self.screen = Screen::Session,
+                        None => self.switch_surface(Screen::Session),
                     }
                     self.dirty = true;
                 }
@@ -8907,7 +8907,7 @@ impl AppModel {
         // swallowed — pin/abandon are `/graph` commands, not hotkeys.
         if self.screen == Screen::Graph {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                self.screen = Screen::Session;
+                self.switch_surface(Screen::Session);
                 self.dirty = true;
             }
             return;
@@ -13997,7 +13997,9 @@ impl AppModel {
         }
         self.session_browser_sel = 0;
         self.session_browser_query.clear();
-        self.screen = Screen::Sessions;
+        // 972-band-reports: band views enter through switch_surface so the
+        // surface overlays retire (the nav retirement law).
+        self.switch_surface(Screen::Sessions);
     }
 
     /// Every known session, ordered by ATTENTION (owner 2026-08-21): the
@@ -14307,10 +14309,11 @@ impl AppModel {
             }
             KeyCode::Esc => {
                 if self.session_browser_query.is_empty() {
-                    self.screen = self
+                    let target = self
                         .session_browser_return
                         .take()
                         .unwrap_or(Screen::Launcher);
+                    self.switch_surface(target);
                 } else {
                     self.session_browser_query.clear();
                     self.session_browser_sel = 0;
@@ -14994,7 +14997,9 @@ impl AppModel {
                 self.graph_unsupported = false;
                 self.requests.push(AppRequest::GraphRefresh);
                 self.requests.push(AppRequest::GraphInspectRefresh);
-                self.screen = Screen::Graph;
+                // Same surface key as the session (no draft moves), entered
+                // through switch_surface so overlays retire (972-band-reports).
+                self.switch_surface(Screen::Graph);
             }
         }
     }
@@ -15007,9 +15012,10 @@ impl AppModel {
         }
         if self.mode.fabricates_locally() {
             self.hooks.open_demo();
-            // Same-key screen write (the Tools/Tree precedent): the hooks
-            // screen shares the session's surface key, so no draft moves.
-            self.screen = Screen::Hooks;
+            // Same surface key as the session (no draft moves), entered
+            // through switch_surface so the surface overlays retire
+            // (972-band-reports; the nav retirement law).
+            self.switch_surface(Screen::Hooks);
             return;
         }
         if !self.daemon_serves(haider_rpc::FEATURE_HOOKS_V1) {
@@ -15017,7 +15023,7 @@ impl AppModel {
             return;
         }
         self.hooks.open_live();
-        self.screen = Screen::Hooks;
+        self.switch_surface(Screen::Hooks);
         // The cwd is CAPTURED AT ISSUANCE (the B2b capture law): prefer the
         // active session's daemon summary coordinate, even when this TUI was
         // launched from another directory. Older daemons fall back to the
@@ -15056,7 +15062,7 @@ impl AppModel {
         }
         match code {
             KeyCode::Esc => {
-                self.screen = Screen::Session;
+                self.switch_surface(Screen::Session);
                 self.dirty = true;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -15367,7 +15373,11 @@ impl AppModel {
                 // snapshot when the reply lands.
                 if self.screen == Screen::Session {
                     self.tools_inventory = None;
-                    self.screen = Screen::Tools;
+                    // 972-band-reports: every band view enters through
+                    // switch_surface — the key is the session's own (no
+                    // draft moves), but the surface overlays retire (the
+                    // nav retirement law).
+                    self.switch_surface(Screen::Tools);
                     self.requests.push(AppRequest::ToolsRefresh);
                 } else {
                     self.flash = Some("· /tools — session only".to_owned());
@@ -15619,7 +15629,9 @@ impl AppModel {
                 if self.screen == Screen::Session {
                     self.tree_sel = 0;
                     self.tree_view = None;
-                    self.screen = Screen::Tree;
+                    // Same surface key (no draft moves), entered through
+                    // switch_surface so overlays retire (972-band-reports).
+                    self.switch_surface(Screen::Tree);
                     self.dirty = true;
                 } else {
                     self.flash = Some("· /tree — session only".to_owned());
@@ -15780,6 +15792,11 @@ impl AppModel {
             "hooks" => self.enter_hooks(),
             // CG-M1: `/graph [pin|abandon|status]`.
             "graph" => self.enter_graph(arg.as_deref()),
+            // 972-band-reports: the fleet view's typed door — the same
+            // session-born surface ⌥F / the subagents summary row opens
+            // (`open_fleet` keeps the honest no-subagents refusal), now
+            // reachable from the palette like every other report.
+            "fleet" => self.open_fleet(),
             "loom" => self.enter_loom(),
             // Owner 2026-08-21: every session on the machine, with the
             // shared attention state visible (unseen dot, needs-you chip).
@@ -19299,11 +19316,7 @@ impl AppModel {
                 self.graph_unsupported = false;
                 self.requests.push(AppRequest::GraphRefresh);
                 self.requests.push(AppRequest::GraphInspectRefresh);
-                if self.screen == Screen::Loom {
-                    self.switch_surface(Screen::Graph);
-                } else {
-                    self.screen = Screen::Graph;
-                }
+                self.switch_surface(Screen::Graph);
             }
             Hit::LockdownStatus => {
                 self.lockdown_overlay = true;

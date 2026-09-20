@@ -187,25 +187,34 @@ fn composer_views() -> Vec<(&'static str, AppModel)> {
 fn banded_views() -> Vec<(&'static str, AppModel)> {
     let mut views = composer_views();
     views.push(("accounts", on_screen(Screen::Accounts)));
+    // 972-band-reports: the read-only report screens joined the banded set
+    // — each carries the `/accounts` shape (key map in the slot, no
+    // composer) through `render::report_band`.
+    views.push(("providers", on_screen(Screen::Providers)));
+    views.push(("usage", on_screen(Screen::Usage)));
+    views.push(("tools", on_screen(Screen::Tools)));
+    views.push(("hooks", on_screen(Screen::Hooks)));
+    views.push(("tree", on_screen(Screen::Tree)));
+    views.push(("sessions", on_screen(Screen::Sessions)));
+    views.push(("fleet", on_screen(Screen::Fleet)));
+    views.push(("graph", on_screen(Screen::Graph)));
     views
 }
 
-/// Every full-screen surface, banded or not — the status line is theirs too.
+/// Every full-screen surface — banded, all of them, since 972-band-reports.
 ///
-/// DOCUMENTED EXCLUSION (verify round 2, accepted for this lane): the
-/// read-only report screens — `/providers`, `/usage`, `/tools`, `/hooks`,
-/// `/tree`, the fleet, graph and session browsers — are asserted on the
-/// STATUS ROW only, not on the band. They draw their own footers, and those
-/// footers are not one row: `/providers` pins the provider grid plus three
-/// hint lines (actions, presets, enterprise), which cannot occupy a one-row
-/// band slot without redesigning the footer itself. Bringing them onto the
-/// band is a separate lane, not a gap in this one.
+/// The round-2 exclusion this used to document is CLOSED: the read-only
+/// report screens — `/providers`, `/usage`, `/tools`, `/hooks`, `/tree`,
+/// the fleet, graph and session browsers — had their footers redesigned
+/// onto the shared band (`render::report_band`): the key map rides the
+/// band's one-row slot (the `/accounts` owner ruling — geometry and
+/// framing, no composer), and whatever else a footer pinned (the
+/// `/providers` add-login grid and preset lines) is ordinary pinned chrome
+/// ABOVE the opening rule now. So `all_views` and `banded_views` are the
+/// same set, and every screen holds the full band anatomy, not just the
+/// status row.
 fn all_views() -> Vec<(&'static str, AppModel)> {
-    let mut views = banded_views();
-    views.push(("providers", on_screen(Screen::Providers)));
-    views.push(("tools", on_screen(Screen::Tools)));
-    views.push(("tree", on_screen(Screen::Tree)));
-    views
+    banded_views()
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +280,15 @@ fn one_model_places_the_band_identically_on_every_screen() {
             Screen::Loom,
             Screen::Aura,
             Screen::Accounts,
+            // 972-band-reports: the report screens joined the banded set.
+            Screen::Providers,
+            Screen::Usage,
+            Screen::Tools,
+            Screen::Hooks,
+            Screen::Tree,
+            Screen::Sessions,
+            Screen::Fleet,
+            Screen::Graph,
         ] {
             let mut model = session_with_ledger();
             model.screen = screen;

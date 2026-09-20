@@ -709,3 +709,310 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         }
     }
 }
+
+// --------------------------------------------------------------- reports ----
+//
+// 972-band-reports: plain parity for the read-only report screens — the
+// same information as each styled surface in honest UTF-8 lines (the
+// `fleet::fleet_plain` / `graph::plain_status` precedent; the fleet and
+// graph reports keep their own plain functions beside their layout code).
+// Plain parity is about INFORMATION, not geometry: nothing here degrades
+// by width, and every glyph-borne fact is spelled in words (the
+// `status_word` law).
+
+/// `/providers` plain grammar — registry truth: one block per provider
+/// with availability spelled in words, the endpoint, the model list with
+/// the default named, and the active-account projection.
+#[must_use]
+pub fn providers_plain(model: &crate::app::AppModel) -> String {
+    use haider_rpc::ProviderAvailabilityWire;
+    let mut out = "PROVIDERS — registry truth; accounts live in /accounts\n".to_owned();
+    if model.providers.providers.is_empty() {
+        out.push_str("no providers in the registry snapshot yet\n");
+    }
+    for summary in &model.providers.providers {
+        let health = match summary.availability {
+            ProviderAvailabilityWire::Available => "available".to_owned(),
+            ProviderAvailabilityWire::Unavailable => {
+                summary.availability_reason.clone().map_or_else(
+                    || "unavailable".to_owned(),
+                    |reason| format!("unavailable — {reason}"),
+                )
+            }
+            _ => "unknown".to_owned(),
+        };
+        out.push_str(&format!("{} — {health}\n", summary.provider));
+        out.push_str(&format!(
+            "  endpoint: {}\n",
+            summary.endpoint.as_deref().unwrap_or("none")
+        ));
+        if summary.models.is_empty() {
+            out.push_str("  models: none listed\n");
+        } else {
+            let models = summary
+                .models
+                .iter()
+                .map(|name| {
+                    if summary.default_model.as_deref() == Some(name.as_str()) {
+                        format!("{name} (default)")
+                    } else {
+                        name.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            out.push_str(&format!("  models: {models}\n"));
+        }
+        match model
+            .accounts
+            .rows
+            .iter()
+            .find(|row| row.provider == summary.provider && row.selected)
+        {
+            Some(row) => out.push_str(&format!(
+                "  account: {} — {}; in use\n",
+                row.alias,
+                crate::app::auth_label(row.method)
+            )),
+            None => out.push_str("  account: none selected (/accounts)\n"),
+        }
+    }
+    out
+}
+
+/// `/usage` plain grammar — the scope headline, the honesty lines (demo /
+/// fetching / read error), and one line per account: worst-window meter
+/// state spelled in words plus this device's journal totals.
+#[must_use]
+pub fn usage_plain(model: &crate::app::AppModel) -> String {
+    use haider_protocol::usage::AccountMeterStateV1;
+    let usage = &model.usage;
+    let mut out = format!(
+        "USAGE — scope {}; meters are provider truth; stats are this device's journal\n",
+        usage.scope.name()
+    );
+    if let Some(filter) = &usage.filter {
+        out.push_str(&format!("filter: {filter}*\n"));
+    }
+    if model.mode.fabricates_locally() {
+        out.push_str("demo — usage is live daemon truth, never fabricated\n");
+        return out;
+    }
+    if usage.fetching {
+        out.push_str("fetching…\n");
+    }
+    if let Some(error) = &usage.error {
+        out.push_str(&format!("usage read failed — {error}\n"));
+    }
+    let Some(report) = &usage.report else {
+        if !usage.fetching && usage.error.is_none() {
+            out.push_str("no usage report yet\n");
+        }
+        return out;
+    };
+    if report.accounts.is_empty() {
+        out.push_str("no accounts known — /login adds one\n");
+    }
+    for account in &report.accounts {
+        let meter = match &account.meter {
+            AccountMeterStateV1::Metered { windows } => windows
+                .iter()
+                .max_by(|a, b| {
+                    a.utilization
+                        .partial_cmp(&b.utilization)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map_or_else(
+                    || "metered; no windows published".to_owned(),
+                    |worst| {
+                        format!(
+                            "{} left in {}",
+                            crate::format::fmt_remaining(worst.utilization),
+                            worst.window
+                        )
+                    },
+                ),
+            AccountMeterStateV1::Unavailable { reason } => format!(
+                "meter unavailable — {}",
+                crate::format::fmt_meter_reason(reason)
+            ),
+            AccountMeterStateV1::LocalOnly => "local only".to_owned(),
+        };
+        let local = &account.local;
+        out.push_str(&format!(
+            "{} — {} — {meter}; in {}; out {}; cached {}\n",
+            account.alias,
+            account.provider,
+            fmt_tok(local.input_tokens),
+            fmt_tok(local.output_tokens),
+            fmt_tok(local.cached_tokens),
+        ));
+    }
+    out
+}
+
+/// `/tools` plain grammar — the daemon inventory: one line per tool with
+/// its effects and default decision, then the remembered session grants
+/// and the standing read-only disclosure.
+#[must_use]
+pub fn tools_plain(model: &crate::app::AppModel) -> String {
+    let mut out = "TOOLS — daemon inventory\n".to_owned();
+    match &model.tools_inventory {
+        None => out.push_str("fetching the daemon's tool inventory…\n"),
+        Some(snapshot) => {
+            for entry in &snapshot.tools {
+                let effects = entry
+                    .manifest
+                    .effects
+                    .iter()
+                    .map(|effect| format!("{effect:?}").to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("+");
+                let effects = if effects.is_empty() {
+                    "none".to_owned()
+                } else {
+                    effects
+                };
+                out.push_str(&format!(
+                    "{} — effects {effects}; default {}\n",
+                    entry.manifest.name,
+                    format!("{:?}", entry.default).to_ascii_lowercase()
+                ));
+            }
+            if snapshot.remembered_grants.is_empty() {
+                out.push_str("no remembered session grants\n");
+            } else {
+                out.push_str("remembered session grants:\n");
+                for grant in &snapshot.remembered_grants {
+                    out.push_str(&format!("  {grant:?}\n"));
+                }
+            }
+        }
+    }
+    out.push_str("read-only — workspace cwd + bounded supervised process, not a sandbox\n");
+    out
+}
+
+/// `/hooks` plain grammar — discovery rows with the trust state spelled in
+/// words (never the bare glyph), then the session's journaled firings.
+#[must_use]
+pub fn hooks_plain(model: &crate::app::AppModel) -> String {
+    let hooks = &model.hooks;
+    let mut out = match &hooks.policy {
+        Some(policy) => format!("HOOKS — workspace + profile; policy {policy}\n"),
+        None => "HOOKS — workspace + profile\n".to_owned(),
+    };
+    if let Some(message) = &hooks.message {
+        out.push_str(message);
+        out.push('\n');
+    }
+    match &hooks.rows {
+        None => {
+            if hooks.message.is_none() {
+                out.push_str("fetching the daemon's hook discovery…\n");
+            }
+        }
+        Some(rows) if rows.is_empty() => {
+            out.push_str(if model.mode.fabricates_locally() {
+                "no hooks in the demo — live mode lists the daemon's discovery\n"
+            } else {
+                "no hooks discovered\n"
+            });
+        }
+        Some(rows) => {
+            for row in rows {
+                let glyph = hooks.glyph(row);
+                let decision = if row.decision { "; decision" } else { "" };
+                out.push_str(&format!(
+                    "{} — {}:{}{decision}; {}; {}\n",
+                    row.name,
+                    row.kind,
+                    row.event,
+                    crate::hooks::short_digest(&row.digest),
+                    glyph.label(),
+                ));
+            }
+        }
+    }
+    out.push_str("recent firings — newest first\n");
+    if model.hook_facts.is_empty() {
+        out.push_str("  none this session\n");
+    } else {
+        for entry in model
+            .hook_facts
+            .recent()
+            .take(crate::hooks::FIRING_ROWS_MAX)
+        {
+            let linked = if entry.menu_id().is_some() {
+                " [decision menu]"
+            } else {
+                ""
+            };
+            out.push_str(&format!("  {}{linked}\n", entry.line()));
+        }
+    }
+    out
+}
+
+/// `/tree` plain grammar — the crumb path and every row's own label (the
+/// rows already spell branch/fork/node in text).
+#[must_use]
+pub fn tree_plain(model: &crate::app::AppModel) -> String {
+    let name = model.display_name();
+    let crumb = crate::app::tree_crumb(model).join(" > ");
+    let mut out = format!("SESSION TREE — {name} — {crumb}\n");
+    for row in crate::app::tree_rows(model) {
+        out.push_str(row.label());
+        out.push('\n');
+    }
+    out
+}
+
+/// `/resume` (sessions browser) plain grammar — the attention counts, then
+/// one line per session in the browser's own order with the attention
+/// facts spelled in words (needs-you kind, busy, unseen).
+#[must_use]
+pub fn sessions_plain(model: &crate::app::AppModel) -> String {
+    let rows = model.session_browser_rows();
+    let needs = rows.iter().filter(|row| row.needs_input.is_some()).count();
+    let unseen = rows.iter().filter(|row| row.unseen).count();
+    let mut out = format!(
+        "SESSIONS — {} on this machine; {needs} need you; {unseen} unseen\n",
+        rows.len()
+    );
+    if !model.session_browser_query.is_empty() {
+        out.push_str(&format!("search: {}\n", model.session_browser_query));
+    }
+    if rows.is_empty() {
+        out.push_str(if model.session_browser_query.is_empty() {
+            "no sessions yet — start one from the launcher\n"
+        } else {
+            "no sessions match\n"
+        });
+    }
+    for row in rows {
+        let mut facts = Vec::new();
+        if let Some(card) = &row.needs_input {
+            facts.push(format!(
+                "needs you: {}",
+                crate::render::needs_input_label(card)
+            ));
+        }
+        if row.busy {
+            facts.push("busy".to_owned());
+        }
+        if row.unseen {
+            facts.push("unseen".to_owned());
+        }
+        let facts = if facts.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", facts.join("; "))
+        };
+        out.push_str(&format!(
+            "{} — {}; {}; {}{facts}\n",
+            row.title, row.model_short, row.dir, row.ago
+        ));
+    }
+    out
+}

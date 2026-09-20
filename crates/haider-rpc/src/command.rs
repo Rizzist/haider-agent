@@ -233,6 +233,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Convergence Graph — the pinned run: nodes, gates, evidence",
         "[pin]",
     ),
+    session_client_cmd(
+        "fleet",
+        "Fleet — this session's subagent tree (also ⌥F)",
+        "",
+    ),
     client_cmd(
         "workflows",
         "Workflows — typed pipe DAGs: signatures, node chains, source",

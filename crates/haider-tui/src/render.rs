@@ -1076,7 +1076,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
             Screen::Session => render_session(model, theme, frame, body, &mut hits),
             Screen::Tree => render_tree(model, theme, frame, body, &mut hits),
-            Screen::Tools => render_tools(model, theme, frame, body),
+            Screen::Tools => render_tools(model, theme, frame, body, &mut hits),
             Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
             Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
             Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
@@ -3600,26 +3600,38 @@ fn render_providers(
     // G4a: the preset roster outgrew one hint line at narrow widths — the
     // key map splits into the action line and the preset line so `esc back`
     // stays visible at 100-118 columns.
+    //
+    // 972-band-reports: the ACTION line rides the SHARED BOTTOM BAND's slot
+    // now (the `/accounts` owner ruling — geometry and framing, no
+    // composer), so this screen's `esc back` lands on the same row as every
+    // other view's. The preset/enterprise lines and the add-login grid stay
+    // pinned chrome ABOVE the band's opening rule.
     let hint = "model click sets default · t trust · e edit · x remove · f refresh · esc back";
     let preset_hint = "presets: h HuggingFace · z Zen · g Go · o Ollama · l LM Studio";
     let enterprise_hint = "named: d DeepSeek · enterprise: a Azure · b Bedrock · v Vertex";
+    let inner = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(hint, theme.faint_style()),
+        hits,
+    );
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
     let mut footer_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
-    let pinned = area.height >= 12;
+    let pinned = inner.height >= 12;
     if pinned {
         push_account_add_buttons(model, theme, &mut footer_lines, &mut footer_hits);
-        footer_lines.push(Line::styled(hint, theme.faint_style()));
         footer_lines.push(Line::styled(preset_hint, theme.faint_style()));
         footer_lines.push(Line::styled(enterprise_hint, theme.faint_style()));
     } else {
         push_account_add_buttons(model, theme, &mut lines, &mut chip_hits);
-        lines.push(Line::styled(hint, theme.faint_style()));
         lines.push(Line::styled(preset_hint, theme.faint_style()));
         lines.push(Line::styled(enterprise_hint, theme.faint_style()));
     }
     let footer_height = u16::try_from(footer_lines.len()).unwrap_or(0);
     let [roster_area, footer_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(area);
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(inner);
 
     // RENDER is the single scroll authority (the transcript's law): the
     // frame writes the true max, reconciles the offset, and resolves a
@@ -5394,30 +5406,39 @@ fn render_usage(
         ));
     }
 
-    // F2b: a PINNED footer hint under the scrolling report; tiny frames
-    // keep the flowed layout (still reachable by scrolling to the end).
+    // 972-band-reports: the key map rides the SHARED BOTTOM BAND's slot
+    // (the `/accounts` owner ruling — geometry and framing, no composer),
+    // so `esc back` lands on the same row as every other view's. The band
+    // never unpins; its own last-resort floor covers tiny frames. The map
+    // degrades by WIDTH so `esc back` survives at 80 columns.
+    let wide = area.width >= 118;
     let hint = match model.usage.scope {
-        crate::app::UsageScope::Models => {
+        crate::app::UsageScope::Models if wide => {
             "↑↓/PgUp/PgDn scroll · r range · f refresh · s next scope · esc back"
         }
+        crate::app::UsageScope::Models => "↑↓/⇞⇟ scroll · r range · f refresh · s scope · esc back",
         crate::app::UsageScope::History => "PgUp/PgDn scroll · f refresh · s next scope · esc back",
-        crate::app::UsageScope::Calendar => {
+        crate::app::UsageScope::Calendar if wide => {
             "</> account · ↑↓ provider · PgUp/PgDn scroll · f refresh · s next scope · esc back"
         }
-        crate::app::UsageScope::Accounts | crate::app::UsageScope::Global => {
+        crate::app::UsageScope::Calendar => {
+            "</> account · ↑↓ provider · f refresh · s scope · esc back"
+        }
+        crate::app::UsageScope::Accounts | crate::app::UsageScope::Global if wide => {
             "←/→ account · ↑↓ provider · r reveal · f refresh · s next scope · esc back"
         }
+        crate::app::UsageScope::Accounts | crate::app::UsageScope::Global => {
+            "←/→ account · ↑↓ provider · r reveal · f refresh · s scope · esc back"
+        }
     };
-    let mut footer_lines: Vec<Line<'_>> = Vec::new();
-    let pinned = area.height >= 12;
-    if pinned {
-        footer_lines.push(Line::styled(hint, theme.faint_style()));
-    } else {
-        lines.push(Line::styled(hint, theme.faint_style()));
-    }
-    let footer_height = u16::try_from(footer_lines.len()).unwrap_or(0);
-    let [report_area, footer_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(area);
+    let report_area = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(hint, theme.faint_style()),
+        hits,
+    );
 
     // RENDER is the single scroll authority (the transcript's law): the
     // frame writes the true max, reconciles the offset, and resolves a
@@ -5465,10 +5486,6 @@ fn render_usage(
             },
         );
     }
-    if footer_height > 0 {
-        frame.render_widget(Paragraph::new(footer_lines), footer_area);
-    }
-
     for (line_index, x, width, hit) in chip_hits {
         let line = u16::try_from(line_index).unwrap_or(u16::MAX);
         if line < scroll || line - scroll >= report_area.height || x >= report_area.width {
@@ -7345,6 +7362,22 @@ fn render_tree(
     let rows = crate::app::tree_rows(model);
     let crumb = crate::app::tree_crumb(model).join(" ▸ ");
     let drilled = crate::app::tree_viewed(model).is_some();
+    // 972-band-reports: the key map rides the SHARED BOTTOM BAND's slot
+    // (the `/accounts` owner ruling — geometry and framing, no composer).
+    let area = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(
+            format!(
+                "↑↓ select · ⏎ jump / open fork · f fork at node · esc {}",
+                if drilled { "up to parent" } else { "back" }
+            ),
+            theme.dim_style(),
+        ),
+        hits,
+    );
     let mut lines = vec![
         Line::styled(
             format!("SESSION TREE — {name} — {crumb}"),
@@ -7353,7 +7386,7 @@ fn render_tree(
         Line::raw(""),
     ];
     // Selection windows around `tree_sel` when the list outgrows the frame.
-    let budget = usize::from(area.height.saturating_sub(4)).max(1);
+    let budget = usize::from(area.height.saturating_sub(2)).max(1);
     let selected = model.tree_sel.min(rows.len().saturating_sub(1));
     let first = selected
         .saturating_sub(budget.saturating_sub(1))
@@ -7379,14 +7412,6 @@ fn render_tree(
         ));
         lines.push(line);
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        format!(
-            "↑↓ select · ⏎ jump / open fork · f fork at node · esc {}",
-            if drilled { "up to parent" } else { "back" }
-        ),
-        theme.dim_style(),
-    ));
     frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
 }
 
@@ -7409,6 +7434,24 @@ fn render_sessions(
     let rows = model.session_browser_rows();
     let needs = rows.iter().filter(|row| row.needs_input.is_some()).count();
     let unseen = rows.iter().filter(|row| row.unseen).count();
+    // 972-band-reports: the key map rides the SHARED BOTTOM BAND's slot
+    // (the `/accounts` owner ruling — geometry and framing, no composer).
+    // It degrades by WIDTH so `esc back` survives at 80 columns.
+    let area = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(
+            if area.width >= 118 {
+                "↑↓ select · PgUp/PgDn page · ⏎ open the session · type to search · esc back"
+            } else {
+                "↑↓ select · ⏎ open · type to search · esc back"
+            },
+            theme.faint_style(),
+        ),
+        hits,
+    );
     let mut lines = vec![
         Line::from(vec![
             Span::styled("SESSIONS", theme.bright_style()),
@@ -7454,7 +7497,7 @@ fn render_sessions(
     }
     // The list body: one row per session, the selected row banded.
     let list_top = area.y.saturating_add(2);
-    let visible = area.height.saturating_sub(3) as usize;
+    let visible = area.height.saturating_sub(2) as usize;
     let first = model
         .session_browser_sel
         .saturating_sub(visible.saturating_sub(1));
@@ -7517,7 +7560,7 @@ fn render_sessions(
 }
 
 /// The needs-you chip's copy for one unified card.
-fn needs_input_label(card: &haider_rpc::NeedsInputWire) -> &'static str {
+pub(crate) fn needs_input_label(card: &haider_rpc::NeedsInputWire) -> &'static str {
     use haider_rpc::NeedsInputKindWire;
     match card.kind {
         NeedsInputKindWire::Permission => "permission",
@@ -7894,7 +7937,31 @@ pub fn workflow_live_dag_lines(
     lines
 }
 
-fn render_tools(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+fn render_tools(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    // 972-band-reports: the key map rides the SHARED BOTTOM BAND's slot
+    // (the `/accounts` owner ruling — geometry and framing, no composer).
+    // It degrades by WIDTH so `esc back` survives at 80 columns.
+    let area = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(
+            if area.width >= 118 {
+                "read-only — workspace cwd + bounded supervised process, not a sandbox · esc back"
+            } else {
+                "read-only — not a sandbox · esc back"
+            },
+            theme.dim_style(),
+        ),
+        hits,
+    );
     let mut lines = vec![
         Line::styled("TOOLS — daemon inventory", theme.bright_style()),
         Line::raw(""),
@@ -7948,11 +8015,6 @@ fn render_tools(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Re
             }
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "read-only — workspace cwd + bounded supervised process, not a sandbox · esc back",
-        theme.dim_style(),
-    ));
     frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
 }
 
@@ -7969,6 +8031,19 @@ fn render_hooks(
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     let hooks = &model.hooks;
+    // 972-band-reports: the key map rides the SHARED BOTTOM BAND's slot
+    // (the `/accounts` owner ruling — geometry and framing, no composer).
+    let area = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(
+            "↑↓ select · 1-9 pick · ⏎ trust / revoke · esc back",
+            theme.dim_style(),
+        ),
+        hits,
+    );
     let mut lines = vec![Line::from(vec![
         Span::styled(
             "HOOKS",
@@ -8109,11 +8184,6 @@ fn render_hooks(
             }
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "↑↓ select · 1-9 pick · ⏎ trust / revoke · esc back",
-        theme.dim_style(),
-    ));
     frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
     // The trust/revoke confirmation card — an overlay the session-scoped
     // esc law closes (esc cancels the CARD, never the screen).
@@ -9703,12 +9773,25 @@ fn render_graph(
     theme: &Theme,
     frame: &mut Frame<'_>,
     area: Rect,
-    _hits: &mut [(Rect, Hit)],
+    hits: &mut Vec<(Rect, Hit)>,
 ) {
     use haider_protocol::graph::GraphPhase;
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // 972-band-reports: the key map rides the SHARED BOTTOM BAND's slot
+    // (the `/accounts` owner ruling — geometry and framing, no composer).
+    let area = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(
+            "/graph pin · /graph abandon · esc back to session",
+            theme.dim_style(),
+        ),
+        hits,
+    );
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(model.display_name().to_owned(), theme.dim_style()),
@@ -9729,8 +9812,6 @@ fn render_graph(
                 theme.dim_style(),
             ));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("esc back to session", theme.dim_style()));
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     };
@@ -10002,11 +10083,6 @@ fn render_graph(
             }
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "/graph pin · /graph abandon · esc back to session",
-        theme.dim_style(),
-    ));
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
@@ -10022,6 +10098,37 @@ fn render_fleet(
         return;
     }
     let view = &model.fleet;
+    // 972-band-reports: the key map rides the SHARED BOTTOM BAND's slot
+    // (the `/accounts` owner ruling — geometry and framing, no composer).
+    // The map names the current level's own vocabulary — list, grid,
+    // member detail, or the honest no-snapshot state.
+    let hint = match (view.snapshot.as_ref(), view.detail.is_some()) {
+        (None, _) => "esc back to session".to_owned(),
+        (Some(_), true) => "esc back".to_owned(),
+        (Some(snapshot), false) => {
+            let (level, _) = fleet::resolve(snapshot, &view.stack);
+            let esc_label = if view.stack.is_empty() {
+                "esc back to session"
+            } else {
+                "esc up one level"
+            };
+            match fleet::density(fleet::rollup(level).total) {
+                fleet::Density::List => format!("↑↓ move · ⏎ drill into a subtree · {esc_label}"),
+                fleet::Density::Grid => format!("arrows move · ⏎ drill in · {esc_label}"),
+            }
+        }
+    };
+    let area = report_band(
+        model,
+        theme,
+        frame,
+        area,
+        Line::styled(hint, theme.dim_style()),
+        hits,
+    );
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let width = area.width as usize;
     let mut lines: Vec<Line<'_>> = Vec::new();
     // (line offset, x offset, width, hit) — resolved to rects after layout.
@@ -10075,7 +10182,6 @@ fn render_fleet(
                 theme.dim_style(),
             ));
         }
-        lines.push(Line::styled("esc back to session", theme.dim_style()));
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     };
@@ -10220,8 +10326,6 @@ fn render_fleet(
                 }
             }
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("esc back", theme.dim_style()));
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         for (offset, hit) in detail_hits {
             let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
@@ -10288,8 +10392,9 @@ fn render_fleet(
     lines.push(Line::raw(""));
     let header_rows = lines.len();
 
-    // -- footers: an error over a stale snapshot, the truncation witness,
-    //    and the key hints — all honest, all budgeted before the body.
+    // -- footers: an error over a stale snapshot and the truncation
+    //    witness — all honest, all budgeted before the body. The key hints
+    //    ride the shared band's slot now (972-band-reports).
     let mut footer: Vec<Line<'_>> = Vec::new();
     if let Some(error) = &view.error {
         footer.push(Line::styled(
@@ -10300,18 +10405,6 @@ fn render_fleet(
     if let Some(witness) = fleet::truncation_footer(snapshot) {
         footer.push(Line::styled(witness, theme.warn_style()));
     }
-    let esc_label = if view.stack.is_empty() {
-        "esc back to session"
-    } else {
-        "esc up one level"
-    };
-    footer.push(Line::styled(
-        match density {
-            fleet::Density::List => format!("↑↓ move · ⏎ drill into a subtree · {esc_label}"),
-            fleet::Density::Grid => format!("arrows move · ⏎ drill in · {esc_label}"),
-        },
-        theme.dim_style(),
-    ));
 
     let body_rows = (area.height as usize)
         .saturating_sub(header_rows)
@@ -12580,6 +12673,48 @@ fn bottom_band(
         slot,
         close,
     }
+}
+
+/// The read-only report screens' shared band (972-band-reports — the footer
+/// redesign that closes the `w971_tui_fixes_tests::all_views` exclusion).
+///
+/// Every report surface — `/providers`, `/usage`, `/tools`, `/hooks`,
+/// `/tree`, the fleet, graph and session browsers — frames its bottom
+/// through this one door: the shared [`bottom_band`] geometry with the
+/// screen's KEY MAP in the slot, exactly the `/accounts` owner ruling
+/// (round 2): a single-key surface takes the band's geometry and framing,
+/// not a composer. The slot's hint is the caller's, already degraded by
+/// width; the rules and the background-task line are the band's own, so no
+/// report can place them differently or omit them.
+///
+/// Returns the CONTENT rect the report lays its own body (and any pinned
+/// chrome, like `/providers`' add-login grid) into — the band is below it.
+fn report_band(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hint: Line<'_>,
+    hits: &mut Vec<(Rect, Hit)>,
+) -> Rect {
+    let band = bottom_band(model, theme, frame, area, BandHeights::new(1, 1, 1), hits);
+    let rule_line = |width: u16| {
+        Paragraph::new(Line::styled(
+            "─".repeat(width as usize),
+            theme.frame_style(),
+        ))
+        .style(theme.text_style())
+    };
+    if band.rule.height > 0 {
+        frame.render_widget(rule_line(band.rule.width), band.rule);
+    }
+    if band.slot.height > 0 {
+        frame.render_widget(Paragraph::new(hint).style(theme.text_style()), band.slot);
+    }
+    if band.close.height > 0 {
+        frame.render_widget(rule_line(band.close.width), band.close);
+    }
+    band.content
 }
 
 /// The band's live background-task line (971-tui-collapse addition, owner
