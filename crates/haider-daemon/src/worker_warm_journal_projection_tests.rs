@@ -298,12 +298,10 @@ async fn assert_projection_parity(
     session_id: &SessionId,
     run_id: &RunId,
 ) -> (Vec<u64>, Vec<u64>) {
-    let cached_headless = cached_headless_run_context(store, session_id, cache, run_id)
-        .await
-        .expect("cached headless projection");
-    let cached_economy = cached_latest_context_economy(store, session_id, cache)
-        .await
-        .expect("cached economy projection");
+    let (cached_headless, cached_economy) =
+        cached_turn_start_projection(store, session_id, cache, run_id)
+            .await
+            .expect("cached turn-start projection");
     let cache_reads = store.take_full_read_starts();
     let reducer_reads = store.take_reducer_starts();
     let legacy_headless = legacy_headless_run_context(store, session_id, run_id)
@@ -370,7 +368,7 @@ async fn warm_projection_matches_oracles_across_every_session_lifecycle_edge() {
 
     // Branch switching changes the durable head but not these session-global
     // facts. The verified boundary advances without a full replay.
-    append(
+    let branch_commit = append(
         &store,
         vec![projection_envelope(
             &session_id,
@@ -381,14 +379,17 @@ async fn warm_projection_matches_oracles_across_every_session_lifecycle_edge() {
         )],
     )
     .await;
-    let (branch_reads, _) = assert_projection_parity(&store, &cache, &session_id, &run_id).await;
+    cache.observe_committed(&branch_commit);
+    let (branch_reads, branch_reducers) =
+        assert_projection_parity(&store, &cache, &session_id, &run_id).await;
     assert!(branch_reads.is_empty());
+    assert!(branch_reducers.iter().all(|cursor| *cursor == 4));
 
     // Compaction/context editing contributes a new savings coordinate and an
     // irrelevant boundary event respectively; both stay oracle-identical.
     let (economy_two, saving_two) =
         economy_one.record(ContextCompactionTier::StructuralTrim12, 700, 500);
-    append(
+    let savings_commit = append(
         &store,
         vec![projection_envelope(
             &session_id,
@@ -399,6 +400,7 @@ async fn warm_projection_matches_oracles_across_every_session_lifecycle_edge() {
         )],
     )
     .await;
+    cache.observe_committed(&savings_commit);
     let (_, _) = assert_projection_parity(&store, &cache, &session_id, &run_id).await;
     append(
         &store,

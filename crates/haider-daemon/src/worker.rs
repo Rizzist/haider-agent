@@ -8244,6 +8244,14 @@ async fn refresh_context_economy(
     metadata: &haider_protocol::context::ContextEconomy,
 ) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
     let journal = lease.latest_context_economy().await?;
+    refresh_context_economy_from_journal(lease, metadata, journal).await
+}
+
+async fn refresh_context_economy_from_journal(
+    lease: &HubStoreHandle,
+    metadata: &haider_protocol::context::ContextEconomy,
+    journal: Option<haider_protocol::context::ContextEconomy>,
+) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
     let (economy, heal_metadata) = reconcile_context_economy(metadata, journal)?;
     if heal_metadata {
         lease
@@ -8312,11 +8320,17 @@ async fn start_turn(
         })
     });
     let request_ordinals = ProviderRequestOrdinal::new(provider_request_ordinal_already_made);
-    let headless = headless_run_context(lease, &accepted.run_id).await?;
+    let (headless, journal_economy) = lease
+        .turn_start_journal_projection(&accepted.run_id)
+        .await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
-    pinned_metadata.context_economy =
-        refresh_context_economy(lease, &pinned_metadata.context_economy).await?;
+    pinned_metadata.context_economy = refresh_context_economy_from_journal(
+        lease,
+        &pinned_metadata.context_economy,
+        journal_economy,
+    )
+    .await?;
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
         provider_rebind::pin_headless_turn_metadata(
@@ -9804,16 +9818,23 @@ const WARM_JOURNAL_PROJECTION_CACHE_LIMIT: usize = 16;
 /// zero; ordinary head advances decode only indexed projection-bearing rows.
 #[derive(Default)]
 pub(crate) struct WarmJournalProjectionCache {
-    entries: tokio::sync::Mutex<WarmJournalProjectionEntries>,
+    entries: StdMutex<WarmJournalProjectionEntries>,
 }
 
 impl WarmJournalProjectionCache {
-    async fn take(&self, session_id: &SessionId) -> Option<CachedWarmJournalProjection> {
-        self.entries.lock().await.projections.remove(session_id)
+    fn take(&self, session_id: &SessionId) -> Option<CachedWarmJournalProjection> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .projections
+            .remove(session_id)
     }
 
-    async fn install(&self, session_id: SessionId, mut candidate: CachedWarmJournalProjection) {
-        let mut entries = self.entries.lock().await;
+    fn install(&self, session_id: SessionId, mut candidate: CachedWarmJournalProjection) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.touch_clock = entries.touch_clock.saturating_add(1);
         candidate.last_touched = entries.touch_clock;
         let replace = entries.projections.get(&session_id).is_none_or(|current| {
@@ -9841,10 +9862,38 @@ impl WarmJournalProjectionCache {
         }
     }
 
-    pub(crate) async fn remove_session(&self, session_id: &SessionId) -> bool {
+    pub(crate) fn observe_committed(&self, envelopes: &[RawEnvelope]) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for envelope in envelopes {
+            let Some(cached) = entries.projections.get_mut(&envelope.session_id) else {
+                continue;
+            };
+            let contiguous = cached
+                .revision
+                .as_ref()
+                .is_some_and(|head| head.head_seq.saturating_add(1) == envelope.seq);
+            if !contiguous {
+                entries.projections.remove(&envelope.session_id);
+                continue;
+            }
+            cached
+                .projection
+                .observe_envelope(envelope)
+                .unwrap_or_else(|error| cached.projection.context_savings_error = Some(error));
+            cached.revision = Some(WarmJournalRevision {
+                head_seq: envelope.seq,
+                head_event_id: envelope.event_id.clone(),
+            });
+        }
+    }
+
+    pub(crate) fn remove_session(&self, session_id: &SessionId) -> bool {
         self.entries
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .projections
             .remove(session_id)
             .is_some()
@@ -9874,13 +9923,30 @@ pub(crate) async fn cached_latest_context_economy(
     .await?
 }
 
+pub(crate) async fn cached_turn_start_projection(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    cache: &WarmJournalProjectionCache,
+    run_id: &RunId,
+) -> Result<(Option<DurableHeadlessRunContext>, Option<ContextEconomy>), HaiderError> {
+    let (headless, economy) =
+        reduce_warm_journal_projection_cached(store, session_id, cache, |projection| {
+            (
+                projection.headless_run_context(run_id),
+                projection.latest_context_economy(),
+            )
+        })
+        .await?;
+    Ok((headless, economy?))
+}
+
 async fn reduce_warm_journal_projection_cached<T>(
     store: &dyn StoreHandle,
     session_id: &SessionId,
     cache: &WarmJournalProjectionCache,
     select: impl Fn(&WarmJournalProjection) -> T,
 ) -> Result<T, HaiderError> {
-    let mut cached = cache.take(session_id).await.unwrap_or_default();
+    let mut cached = cache.take(session_id).unwrap_or_default();
     'replay: loop {
         let started_from_cached_revision = cached.revision.is_some();
         let mut cursor = cached.revision.as_ref().map_or(0, |head| head.head_seq);
@@ -9944,7 +10010,7 @@ async fn reduce_warm_journal_projection_cached<T>(
                 final_revision = observed_revision.or(final_revision);
                 cached.revision = exact_boundary.then_some(final_revision).flatten();
                 let selected = select(&cached.projection);
-                cache.install(session_id.clone(), cached).await;
+                cache.install(session_id.clone(), cached);
                 return Ok(selected);
             }
             let next_cursor = page
