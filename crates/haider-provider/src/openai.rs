@@ -1800,7 +1800,7 @@ impl OpenAiCompatibleProvider {
                         if metadata.boundaries_valid(request.messages.len())
                             && metadata.provider == KIMI_OAUTH_PROVIDER_NAME =>
                     {
-                        prompt_cache_cohort_key(request, metadata)
+                        prompt_cache_prefix_key(request, metadata)
                     }
                     CompatibleDialect::KimiOAuth
                     | CompatibleDialect::DeepSeekApi
@@ -1917,7 +1917,7 @@ impl Provider for OpenAiCompatibleProvider {
                 true,
             )
             .ok()?;
-        // Kimi's cohort key is a routing overlay, not prompt content. Remove
+        // Kimi's prefix key is a routing overlay, not prompt content. Remove
         // it from the only render until M4's exact provider view is frozen.
         if matches!(
             self.dialect,
@@ -1993,7 +1993,7 @@ impl Provider for OpenAiCompatibleProvider {
                         CompatibleDialect::Generic => {
                             custom_prompt_cache_key(request, metadata, Some(header_epoch))
                         }
-                        CompatibleDialect::KimiOAuth => prompt_cache_cohort_key_with_header(
+                        CompatibleDialect::KimiOAuth => prompt_cache_prefix_key_with_header(
                             request,
                             metadata,
                             Some(header_epoch),
@@ -4900,10 +4900,10 @@ fn openai_automatic_cache_key_supported(model: &str) -> bool {
 /// shard-routed, and fast agentic rounds always outran its async warm-up
 /// (observed 0%-cached rounds on live sessions, 2026-08-21). codex 0.145
 /// sends a stable routing key. Prefix bytes still decide whether a cached
-/// entry matches; the key keeps one session, plus only a fork whose exact C3
-/// inherited segment is still active, on one provider route without crossing
-/// an account boundary. The base is the exact provider-view header epoch, so
-/// there is no second competing system/tool digest path.
+/// entry matches. The key groups exact reusable prefixes within one resolved
+/// account while keeping every other account in a different routing and
+/// accounting partition. The base is the exact provider-view header epoch,
+/// so there is no second competing system/tool digest path.
 fn openai_prompt_cache_key(request: &TurnRequest) -> Option<String> {
     openai_prompt_cache_key_with_header(request, None)
 }
@@ -4924,12 +4924,12 @@ fn openai_prompt_cache_key_with_header(
     {
         return None;
     }
-    prompt_cache_cohort_key_with_header(request, metadata, header_epoch)
+    prompt_cache_prefix_key_with_header(request, metadata, header_epoch)
 }
 
 /// Refreshes the coupled OpenAI routing fields after the provider-view header
 /// has been finalized. A prepared payload must never retain a TTL without its
-/// cohort key, or gain a cohort key while silently losing the explicit TTL.
+/// prefix key, or gain a prefix key while silently losing the explicit TTL.
 fn refresh_openai_cache_routing(
     request: &TurnRequest,
     codex_responses_lite: bool,
@@ -5149,10 +5149,10 @@ fn xai_prompt_cache_conversation_id(
     {
         return None;
     }
-    prompt_cache_cohort_key_with_header(request, metadata, header_epoch)
+    prompt_cache_conversation_key_with_header(request, metadata, header_epoch)
 }
 
-/// Custom OpenAI-compatible profiles use the same v4 routing cohort as the
+/// Custom OpenAI-compatible profiles use the same account/prefix partition as
 /// named OpenAI-family adapters. The provider name is intentionally not a
 /// constructor constant: custom aliases are daemon-owned metadata carried in
 /// the request, and the resolved account scope provides the hard isolation
@@ -5167,26 +5167,65 @@ fn custom_prompt_cache_key(
     {
         return None;
     }
-    prompt_cache_cohort_key_with_header(request, metadata, header_epoch)
+    prompt_cache_prefix_key_with_header(request, metadata, header_epoch)
 }
 
-/// Cache-cohort isolation law: a route exists only for a daemon-resolved
-/// account and a non-empty session/cohort identity. Unrelated sessions default
-/// to their own `session_scope`; only C3 forks whose exact inherited
-/// provider-view segment is still active carry the fork-root route in
-/// `cache_cohort`.
+/// Prompt-cache account/prefix isolation law: a key exists only for one
+/// daemon-resolved account and one exact stable provider header/cache epoch.
+/// Session identity is deliberately absent so byte-identical prefixes can be
+/// reused across fresh sessions on that account. The key is only a provider
+/// routing/accounting partition: the provider's exact prefix match remains
+/// mandatory, so session-specific history can never be served to a different
+/// prefix. `account_scope` is load-bearing and prevents both cross-account
+/// cache service and cache-hit probing.
 /// Provider/account/model, the finalized provider-view header, the full cache
 /// epoch, and the output budget remain hard domain boundaries. Immutable
-/// history bytes stay at the provider's prefix-match layer; a divergent fork
-/// never receives the inherited cohort in the first place.
-fn prompt_cache_cohort_key(
+/// history bytes stay at the provider's prefix-match layer.
+fn prompt_cache_prefix_key(
     request: &TurnRequest,
     metadata: &crate::PromptCacheMetadata,
 ) -> Option<String> {
-    prompt_cache_cohort_key_with_header(request, metadata, None)
+    prompt_cache_prefix_key_with_header(request, metadata, None)
 }
 
-fn prompt_cache_cohort_key_with_header(
+fn prompt_cache_prefix_key_with_header(
+    request: &TurnRequest,
+    metadata: &crate::PromptCacheMetadata,
+    header_epoch: Option<&str>,
+) -> Option<String> {
+    if request.max_tokens == 0 {
+        return None;
+    }
+    let account_scope = metadata
+        .account_scope
+        .as_deref()
+        .filter(|scope| !scope.is_empty())?;
+    let cache_epoch =
+        (!metadata.cache_epoch.is_empty()).then_some(metadata.cache_epoch.as_str())?;
+    let header_epoch = header_epoch
+        .filter(|header_epoch| !header_epoch.is_empty())
+        .or_else(|| {
+            (!metadata.header_epoch.is_empty()).then_some(metadata.header_epoch.as_str())
+        })?;
+    let domain = serde_json::json!({
+        "schema": "haider.prompt-cache-prefix.v5",
+        "provider": metadata.provider,
+        "model": request.model,
+        "max_tokens": request.max_tokens,
+        "account_scope": account_scope,
+        "header_epoch": header_epoch,
+        "cache_epoch": cache_epoch,
+    });
+    serde_json::to_vec(&domain)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Conversation-route isolation remains session-scoped for transports such
+/// as xAI whose routing header denotes a conversation rather than an OpenAI
+/// prompt-cache accounting group. A C3 exact fork may retain its inherited
+/// root only while the daemon continues to supply that audited cohort.
+fn prompt_cache_conversation_key_with_header(
     request: &TurnRequest,
     metadata: &crate::PromptCacheMetadata,
     header_epoch: Option<&str>,
@@ -5581,7 +5620,7 @@ fn chat_request_json_with_boundary(
                 if metadata.boundaries_valid(request.messages.len())
                     && metadata.provider == KIMI_OAUTH_PROVIDER_NAME
                 {
-                    prompt_cache_cohort_key(request, metadata)
+                    prompt_cache_prefix_key(request, metadata)
                 } else {
                     None
                 }

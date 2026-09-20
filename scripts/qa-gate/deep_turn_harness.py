@@ -290,6 +290,72 @@ def tool_response(turn: int, body: Mapping[str, Any]) -> list[bytes]:
     ]
 
 
+class PromptCacheOracle:
+    """Exact-prefix cache accounting partitioned by ``prompt_cache_key``.
+
+    The oracle models the provider contract rather than manufacturing hits:
+    a read requires the same routing key and exact leading provider-visible
+    components from a prior request. Token units are deterministic UTF-8
+    bytes/4 estimates, not a claim about a vendor tokenizer.
+    """
+
+    MINIMUM_CACHE_TOKENS = 1_024
+
+    def __init__(self) -> None:
+        self._entries: dict[str, list[list[bytes]]] = {}
+
+    @staticmethod
+    def _components(body: Mapping[str, Any]) -> list[bytes]:
+        components: list[bytes] = []
+        for section in ("tools", "messages"):
+            values = body.get(section)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                components.append(
+                    json.dumps(
+                        {"section": section, "value": value},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                )
+        return components
+
+    @staticmethod
+    def _tokens(components: Sequence[bytes]) -> int:
+        byte_count = sum(len(component) + 1 for component in components)
+        return (byte_count + 3) // 4
+
+    def observe(self, body: Mapping[str, Any]) -> dict[str, int | str | None]:
+        components = self._components(body)
+        logical = self._tokens(components)
+        key = body.get("prompt_cache_key")
+        key = key if isinstance(key, str) and key else None
+        cache_read = 0
+        if key is not None:
+            for previous in self._entries.get(key, []):
+                common = 0
+                for current_component, previous_component in zip(components, previous):
+                    if current_component != previous_component:
+                        break
+                    common += 1
+                tokens = self._tokens(components[:common])
+                if tokens >= self.MINIMUM_CACHE_TOKENS:
+                    cache_read = max(cache_read, tokens)
+            self._entries.setdefault(key, []).append(components)
+        cache_write = logical - cache_read if key is not None else 0
+        return {
+            "logical": logical,
+            "cache_read": cache_read,
+            "cache_write": cache_write,
+            "fresh": logical - cache_read - cache_write,
+            "prompt_cache_key_sha256": (
+                hashlib.sha256(key.encode("utf-8")).hexdigest() if key is not None else None
+            ),
+        }
+
+
 def provider_catalog(base_url: str) -> dict[str, Any]:
     providers = []
     for provider_index in range(PROVIDER_COUNT):
@@ -331,11 +397,12 @@ def parse_turn_header(value: str | None) -> tuple[str, str, int, int]:
 
 
 class DeepProviderState:
-    def __init__(self) -> None:
+    def __init__(self, *, cache_accounting: bool = False) -> None:
         self._lock = threading.Lock()
         self._entries: list[dict[str, Any]] = []
         self._active = 0
         self._condition = threading.Condition(self._lock)
+        self._cache = PromptCacheOracle() if cache_accounting else None
 
     def enter(self) -> None:
         with self._condition:
@@ -358,7 +425,8 @@ class DeepProviderState:
         messages = body.get("messages")
         tools = body.get("tools")
         projected = projection_bytes(body)
-        entry = {
+        usage = self._cache.observe(body) if self._cache is not None else None
+        entry: dict[str, Any] = {
             "session_id": session_id,
             "run_id": run_id,
             "turn_ordinal": turn,
@@ -373,6 +441,8 @@ class DeepProviderState:
             "decode_micros": decode_micros,
             "handler_micros": None,
         }
+        if usage is not None:
+            entry["cache_usage"] = usage
         with self._condition:
             self._entries.append(entry)
             return len(self._entries) - 1
@@ -475,8 +545,8 @@ class _DeepServer(ThreadingHTTPServer):
 
 
 class DeepProvider:
-    def __init__(self) -> None:
-        self.state = DeepProviderState()
+    def __init__(self, *, cache_accounting: bool = False) -> None:
+        self.state = DeepProviderState(cache_accounting=cache_accounting)
         handler = type("DeepTurnHandler", (_DeepHandler,), {"state": self.state})
         self.server = _DeepServer(("127.0.0.1", 0), handler)
         self.server.daemon_threads = True
@@ -704,6 +774,7 @@ def run_fixture(
     position: int,
     require_quiet: bool,
     keep_root: bool,
+    cache_accounting: bool = False,
 ) -> dict[str, Any]:
     label = f"block-{block:02d}-position-{position}-{arm.name}"
     load_start = _assert_quiet(label, require_quiet)
@@ -716,7 +787,7 @@ def run_fixture(
     stopped = False
     foreign_start = foreign_haiderd_snapshot()
     try:
-        with DeepProvider() as provider:
+        with DeepProvider(cache_accounting=cache_accounting) as provider:
             profile = ThrowawayProfile(
                 arm.bin_dir, provider.base_url, root=root / "x"
             )
@@ -920,6 +991,7 @@ def run_fixture(
                 "position": position,
                 "description": arm.description,
                 "environment": arm.environment,
+                "cache_accounting": cache_accounting,
                 "binary_dir": str(arm.bin_dir.resolve()),
                 "binaries": {
                     name: sha256_file(arm.bin_dir / name) for name in ("haider", "haiderd")
@@ -1380,6 +1452,7 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--inter-run-cooldown-seconds", type=float, default=0.0)
     parser.add_argument("--keep-root", action="store_true")
     parser.add_argument("--commit-label")
+    parser.add_argument("--cache-accounting", action="store_true")
     parser.add_argument("--self-check", action="store_true")
     return parser.parse_args(argv)
 
@@ -1416,6 +1489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 position=position,
                 require_quiet=args.require_quiet,
                 keep_root=args.keep_root,
+                cache_accounting=args.cache_accounting,
             )
             runs.append(run)
             print(

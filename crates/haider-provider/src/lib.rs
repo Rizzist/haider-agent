@@ -1811,15 +1811,19 @@ pub struct PromptCacheMetadata {
     pub compaction_epoch: String,
     /// Provider name selected for this request.
     pub provider: String,
-    /// Session identity used for ephemeral resource ownership and as the
-    /// fail-closed cache cohort when no inherited fork root is present.
+    /// Session identity used for ephemeral resource ownership and for
+    /// transports whose routing primitive denotes a conversation. OpenAI-
+    /// family prompt-cache keys deliberately do not include this field.
     pub session_scope: String,
-    /// Opaque cache-routing cohort. Empty/absent means the session scope;
-    /// inherited forks carry the durable C3 root route only while the exact
-    /// inherited provider-view segment remains active.
+    /// Opaque session-bound routing cohort. Empty/absent means the session
+    /// scope; inherited forks carry the durable C3 root route only while the
+    /// exact inherited provider-view segment remains active. This remains
+    /// authoritative for conversation routes such as xAI, but not for the
+    /// OpenAI-family account/prefix cache partition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_cohort: Option<String>,
-    /// Non-secret account/cache routing scope.
+    /// Non-secret account/cache routing scope. This is the load-bearing
+    /// isolation boundary for OpenAI-family prompt-cache keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_scope: Option<String>,
     /// Conservative stable-prefix size estimate used by explicit-cache gates.

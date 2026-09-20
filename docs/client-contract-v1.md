@@ -2854,8 +2854,8 @@ surface from these implementation facts:
 |---|---|
 | cachemaxxing | Provider-view ledgers, breakpoint placement, cache lifecycle, header epochs, and economic cache accounting refine the existing published cache metrics. They add no RPC method; clients still read the authorities in §1.1 and §9.1. |
 | C1 | A provider-only graph/Loom/inventory snapshot is refreshed at each logical provider request and frozen across that request's physical transport retries. It is not journaled or exposed as a client field. |
-| C2 | OpenAI-family prompt-cache routing hashes provider + model + account scope + finalized provider-view header epoch + cohort. Cohort defaults to the session identity, so unrelated same-account sessions are isolated. The opaque provider key is not a client surface. |
-| C3 | A byte-identical fork may inherit the parent provider-view segment and its fork-cohort root; only `context_epoch: inherited` with a present, still-active `inherited_cache_segment` shares that route. A `fresh` fork, or an inherited child after its provider view diverges from the recorded segment, uses its own session cohort. The segment records provider/model/account scope, cache route/epoch, exact prefix digest and stable boundary, and source provider-view coordinates; no new `session.fork` request or response field was added. |
+| C2 | At the v0.0.962 boundary, OpenAI-family prompt-cache routing hashed provider + model + account scope + finalized provider-view header epoch + cohort. Cohort defaulted to the session identity. The v5 account/prefix policy in §15.5 supersedes that internal routing rule without adding a client surface. |
+| C3 | A byte-identical fork may inherit the parent provider-view segment and its fork-cohort root; only `context_epoch: inherited` with a present, still-active `inherited_cache_segment` shares that route. A `fresh` fork, or an inherited child after its provider view diverges from the recorded segment, uses its own session cohort. The segment records provider/model/account scope, cache route/epoch, exact prefix digest and stable boundary, and source provider-view coordinates; no new `session.fork` request or response field was added. C3 remains authoritative for session-bound resources and conversation routes such as xAI; the v5 OpenAI-family prompt-cache key does not consume the cohort. |
 | C4 | Pure filesystem reads and validated web responses may be served from bounded, freshness-checked process-local memos. Tool results retain their existing wire and journal shapes. |
 | S1 | Launch-race and terminal-theme probe latency changed; discovery, framing, and launcher ownership rules in §§2–3 did not. |
 | S2 | Exact-config provider adapters retain bounded shared HTTP connection pools. Cache warm/keepalive work uses the same retained adapter/client. OpenAI-family profiles use distinct 10 s connect, 60 s response-open, and 90 s chunk-idle defaults; durable `provider.configure.response_open_timeout_ms` overrides the response-open budget and remains subordinate to the run deadline. `provider.list` projects the stored override. Timeout telemetry retains `opened_within_ms` and `budget_ms`, and transient provider timeouts enter the existing bounded retry/backoff policy. |
@@ -3075,29 +3075,42 @@ discoverability, but invoking such a row against an unadvertised peer must
 stop locally with an unsupported-feature error and must not send a checkpoint
 request.
 
-### 15.5 Prompt-cache cohort key v3
+### 15.5 Prompt-cache account/prefix key v5
 
 OpenAI-family prompt-cache routing uses the internal schema
-`haider.prompt-cache-cohort.v3`. The key binds the provider, model, active
-account scope, finalized provider-view header epoch, and cohort. A normal
-session uses its session identity as the cohort, so unrelated sessions on the
-same account do not share a provider route. A byte-identical fork may keep the
-parent cohort only while its durable context epoch is `inherited` and its
-recorded inherited cache segment still matches the exact provider-view
-coordinates and prefix digest. Once that segment diverges, the child uses its
-own session cohort.
+`haider.prompt-cache-prefix.v5`. The key binds the provider, model, output
+budget, active account scope, finalized provider-view header epoch, and full
+cache epoch. Session identity and the inherited fork cohort are deliberately
+absent: independent sessions under one resolved account may reuse an exact
+provider-visible prefix instead of fragmenting the provider cache solely due
+to local session identity. This v5 rule supersedes the session-scoped cohort
+key (v4 at this boundary).
+
+The provider must still match the exact prompt prefix before serving cached
+tokens. Sharing a key therefore groups legitimate reuse candidates; it does
+not make different session histories interchangeable. The account scope is
+load-bearing: even byte-identical prompts under different accounts receive
+different keys, preventing one account from being served or probing another
+account's cached prefix.
+
+The separate, existing `haider.prompt-cache-cohort.v4` route retains the C3
+session/fork cohort for transports such as xAI whose header denotes a sticky
+conversation rather than an OpenAI prompt-cache accounting group. A
+byte-identical inherited fork may keep that route only while its audited C3
+segment remains active; a fresh or diverged child receives its own route.
 
 The resulting provider key is opaque implementation state. It is not a client
 request field, response field, feature token, journal fact, or value that a
 client may reproduce. Cache usage remains observable only through the typed
 usage authorities described in §9.1.
 
-**Absence law.** If account scope or a non-empty cohort cannot be established,
-the adapter omits the provider cache key; it never substitutes a global,
-account-wide, empty, or model-only cohort. A missing/invalid inherited segment
-means a fresh child cohort, not permission to reuse the parent route. Because
-this schema is not negotiated, clients must treat its absence as no routing
-authority and must not infer it from cache-hit telemetry.
+**Absence law.** If account scope, header epoch, or cache epoch cannot be
+established, the adapter omits the provider cache key; it never substitutes a
+global, cross-account, empty, or model-only partition. A missing/invalid
+inherited segment still means a fresh child for conversation-bound routes, not
+permission to reuse the parent route. Because these schemas are not
+negotiated, clients must treat their absence as no routing authority and must
+not infer them from cache-hit telemetry.
 
 ### 15.6 Response-open timeout budget
 
@@ -3254,9 +3267,9 @@ OpenAI-compatible usage parsing recognizes
 `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`. Missing, malformed, or
 non-reconciling cache fields remain unavailable; no zero or hit rate is
 fabricated. Unknown prices remain unknown. Custom OpenAI-family turns also
-use `haider.prompt-cache-cohort.v3`; the custom alias is the account scope,
-including no-auth profiles, and all provider/model/header/cohort isolation
-laws in §15.5 apply unchanged.
+use `haider.prompt-cache-prefix.v5`; the custom alias is the account scope,
+including no-auth profiles, and all provider/model/header/cache-epoch
+isolation laws in §15.5 apply unchanged.
 
 **Absence law.** Missing `probe_vault_reference` means discovery has no newly
 staged key; it never means an empty key. Missing inventory timestamps/ages are
