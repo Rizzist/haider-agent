@@ -43,12 +43,14 @@ pub(crate) const PIPE_PROJECTION_PAYLOAD_KINDS: &[&str] = &[
     "item",
     "item_tool_call",
     "node_committed",
+    "prompt_retracted",
     "run_failed",
     "run_state",
     "tool_result",
 ];
 const JOIN_PREWARM_ENVELOPES: u64 = 1_024;
 const COVERAGE_COALESCE_ENVELOPES: u64 = 256;
+const RECONCILED_SESSION_LIMIT: usize = 16;
 const TAIL_SCAN_BYTES: usize = 8 * 1_024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -84,7 +86,9 @@ struct SidecarCursor {
 }
 
 struct ReconciledSidecar {
+    last_touched: u64,
     cursor: SidecarCursor,
+    revision: Option<PipeJournalRevision>,
     projector: TranscriptProjector,
     base_path: PathBuf,
     /// Append handle kept open across hot batches within one reconciled
@@ -94,6 +98,27 @@ struct ReconciledSidecar {
     file: File,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PipeJournalRevision {
+    head_seq: u64,
+    head_event_id: haider_protocol::ids::EventId,
+}
+
+impl From<(u64, haider_protocol::ids::EventId)> for PipeJournalRevision {
+    fn from((head_seq, head_event_id): (u64, haider_protocol::ids::EventId)) -> Self {
+        Self {
+            head_seq,
+            head_event_id,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReconciledSessions {
+    touch_clock: u64,
+    sessions: HashMap<SessionId, ReconciledSidecar>,
+}
+
 /// One page-fed native-sidecar fold. Runtime owns at most one of these while
 /// startup recovery visits a session, so decoded journal memory is bounded by
 /// the shared scan's current page.
@@ -101,6 +126,7 @@ pub(crate) struct PipeBootSession {
     session_id: SessionId,
     base_path: PathBuf,
     read_cursor: u64,
+    revision: Option<PipeJournalRevision>,
     mode: PipeBootMode,
 }
 
@@ -163,13 +189,25 @@ impl PipeBootSession {
         self.read_cursor
     }
 
-    pub(crate) fn advance_through(&mut self, through_seq: u64) {
+    pub(crate) fn advance_through(
+        &mut self,
+        through_seq: u64,
+        boundary_event_id: &haider_protocol::ids::EventId,
+    ) {
         self.read_cursor = self.read_cursor.max(through_seq);
+        self.revision = Some(PipeJournalRevision {
+            head_seq: through_seq,
+            head_event_id: boundary_event_id.clone(),
+        });
     }
 
     pub(crate) async fn fold_page(&mut self, page: &[RawEnvelope]) -> Result<(), PipeNativeError> {
         if let Some(last) = page.last() {
             self.read_cursor = self.read_cursor.max(last.seq);
+            self.revision = Some(PipeJournalRevision {
+                head_seq: last.seq,
+                head_event_id: last.event_id.clone(),
+            });
         }
         match &mut self.mode {
             PipeBootMode::Reconcile {
@@ -242,6 +280,7 @@ impl PipeBootSession {
         let session_id = self.session_id;
         let base_path = self.base_path;
         let read_cursor = self.read_cursor;
+        let revision = self.revision;
         match self.mode {
             PipeBootMode::Reconcile {
                 durable_cursor,
@@ -274,12 +313,14 @@ impl PipeBootSession {
                 open = write_open(open, coverage_line(covered, durable_cursor.generation)?).await?;
                 let file = sync_open(open).await?;
                 Ok(ReconciledSidecar {
+                    last_touched: 0,
                     cursor: SidecarCursor {
                         seq: covered,
                         pending_seq: read_cursor,
                         generation: durable_cursor.generation,
                         segment,
                     },
+                    revision,
                     projector,
                     base_path,
                     file,
@@ -330,12 +371,14 @@ impl PipeBootSession {
                     file
                 };
                 Ok(ReconciledSidecar {
+                    last_touched: 0,
                     cursor: SidecarCursor {
                         seq: covered,
                         pending_seq: read_cursor,
                         generation,
                         segment,
                     },
+                    revision,
                     projector,
                     base_path,
                     file,
@@ -429,21 +472,67 @@ impl From<std::io::Error> for PipeNativeError {
 /// which tasks completed lazy first-touch reconciliation in this daemon life.
 pub(crate) struct PipeNativeWriter {
     pipe_dir: PathBuf,
-    reconciled: Mutex<HashMap<SessionId, ReconciledSidecar>>,
+    reconciled: Mutex<ReconciledSessions>,
     dirty: Mutex<HashSet<SessionId>>,
     #[cfg(test)]
     journal_head_reads: AtomicU64,
+    #[cfg(test)]
+    cached_suffix_reads: AtomicU64,
+    #[cfg(test)]
+    cached_suffix_rows: AtomicU64,
 }
 
 impl PipeNativeWriter {
     pub(crate) fn new(store_root: &Path) -> Self {
         Self {
             pipe_dir: store_root.join("pipe"),
-            reconciled: Mutex::new(HashMap::new()),
+            reconciled: Mutex::new(ReconciledSessions::default()),
             dirty: Mutex::new(HashSet::new()),
             #[cfg(test)]
             journal_head_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            cached_suffix_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            cached_suffix_rows: AtomicU64::new(0),
         }
+    }
+
+    fn take_reconciled(&self, session_id: &SessionId) -> Option<ReconciledSidecar> {
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .remove(session_id)
+    }
+
+    fn install_reconciled(&self, session_id: SessionId, mut state: ReconciledSidecar) {
+        let mut reconciled = self
+            .reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reconciled.touch_clock = reconciled.touch_clock.saturating_add(1);
+        state.last_touched = reconciled.touch_clock;
+        reconciled.sessions.insert(session_id, state);
+        while reconciled.sessions.len() > RECONCILED_SESSION_LIMIT {
+            let Some(evicted) = reconciled
+                .sessions
+                .iter()
+                .min_by_key(|(_, state)| state.last_touched)
+                .map(|(session_id, _)| session_id.clone())
+            else {
+                break;
+            };
+            reconciled.sessions.remove(&evicted);
+        }
+    }
+
+    #[cfg(test)]
+    fn reconciled_count(&self) -> usize {
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .len()
     }
 
     async fn journal_head(
@@ -463,10 +552,7 @@ impl PipeNativeWriter {
     /// draining its post-commit queue. The next touch must reconcile from the
     /// journal instead of advancing from a cursor that may have missed a batch.
     pub(crate) fn invalidate(&self, session_id: &SessionId) {
-        self.reconciled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
+        self.take_reconciled(session_id);
         self.dirty
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -496,6 +582,7 @@ impl PipeNativeWriter {
                     session_id: session_id.clone(),
                     base_path: path,
                     read_cursor: prewarm_start,
+                    revision: None,
                     mode: PipeBootMode::Reconcile {
                         durable_cursor: cursor,
                         prewarm_start,
@@ -520,6 +607,7 @@ impl PipeNativeWriter {
                     session_id: session_id.clone(),
                     base_path: path,
                     read_cursor: 0,
+                    revision: None,
                     mode: PipeBootMode::Rebuild {
                         generation,
                         file: Some(file),
@@ -540,10 +628,7 @@ impl PipeNativeWriter {
     /// keeping every profile session's file open before Ready would defeat the
     /// bounded startup fold on mature profiles.
     pub(crate) fn release_clean(&self, session_id: &SessionId) {
-        self.reconciled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
+        self.take_reconciled(session_id);
         self.dirty
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -590,6 +675,7 @@ impl PipeNativeWriter {
             .reconciled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
             .get(session_id)
             .map(|state| (state.cursor.seq, state.cursor.generation));
         match covered {
@@ -616,6 +702,7 @@ impl PipeNativeWriter {
         self.reconciled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
             .get(session_id)
             .is_some_and(|state| {
                 state.cursor.seq >= known_committed_head && state.cursor.generation > 0
@@ -627,6 +714,7 @@ impl PipeNativeWriter {
         self.reconciled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
             .get(session_id)
             .map(|state| (state.cursor.seq, state.cursor.generation))
     }
@@ -646,10 +734,7 @@ impl PipeNativeWriter {
         }
         let reconciled = boot.finish().await?;
         sweep_orphan_segments_best_effort(&reconciled.base_path, session_id).await;
-        self.reconciled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.clone(), reconciled);
+        self.install_reconciled(session_id.clone(), reconciled);
         self.dirty
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -665,11 +750,7 @@ impl PipeNativeWriter {
         known_committed_head: u64,
     ) -> Result<(), PipeNativeError> {
         let path = self.sidecar_path(session_id)?;
-        let known = self
-            .reconciled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
+        let known = self.take_reconciled(session_id);
         let first_touch = known.is_none();
 
         let dirty = self
@@ -680,9 +761,7 @@ impl PipeNativeWriter {
         let state = if let Some(mut state) = known {
             let already_processed = committed
                 .last()
-                .map_or(known_committed_head <= state.cursor.pending_seq, |last| {
-                    last.seq <= state.cursor.pending_seq
-                });
+                .is_some_and(|last| last.seq <= state.cursor.pending_seq);
             let directly_follows = !committed.is_empty()
                 && committed.first().is_some_and(|first| {
                     state.cursor.pending_seq.checked_add(1) == Some(first.seq)
@@ -703,14 +782,25 @@ impl PipeNativeWriter {
                 drop(state);
                 self.rebuild(store, session_id, path, generation).await?
             } else if !directly_follows {
-                let latest_seq = self.journal_head(store, session_id).await?;
-                let cursor = state.cursor;
-                let generation = cursor.generation;
-                drop(state);
-                if cursor.seq > latest_seq {
-                    self.rebuild(store, session_id, path, generation).await?
+                if state.revision.is_some() {
+                    self.reconcile_cached_suffix(
+                        store,
+                        session_id,
+                        path,
+                        state,
+                        known_committed_head,
+                    )
+                    .await?
                 } else {
-                    self.reconcile_from(store, session_id, path, cursor).await?
+                    let latest_seq = self.journal_head(store, session_id).await?;
+                    let cursor = state.cursor;
+                    let generation = cursor.generation;
+                    drop(state);
+                    if cursor.seq > latest_seq {
+                        self.rebuild(store, session_id, path, generation).await?
+                    } else {
+                        self.reconcile_from(store, session_id, path, cursor).await?
+                    }
                 }
             } else {
                 let (data, mut next_cursor) = render_hot_batch(
@@ -736,6 +826,10 @@ impl PipeNativeWriter {
                     next_cursor.segment = segment;
                 }
                 state.cursor = next_cursor;
+                state.revision = committed.last().map(|envelope| PipeJournalRevision {
+                    head_seq: envelope.seq,
+                    head_event_id: envelope.event_id.clone(),
+                });
                 state
             }
         } else {
@@ -766,15 +860,158 @@ impl PipeNativeWriter {
             sweep_orphan_segments_best_effort(&state.base_path, session_id).await;
         }
 
-        self.reconciled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.clone(), state);
+        self.install_reconciled(session_id.clone(), state);
         self.dirty
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
         Ok(())
+    }
+
+    /// Advances a verified in-memory projector from the journal suffix. The
+    /// sidecar is derived output only: the transactionally sampled journal
+    /// boundary fences every reuse, and any rewind, same-sequence replacement,
+    /// retraction, or missing boundary discards the candidate and rebuilds
+    /// from durable authority.
+    async fn reconcile_cached_suffix(
+        &self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+        path: PathBuf,
+        mut state: ReconciledSidecar,
+        known_committed_head: u64,
+    ) -> Result<ReconciledSidecar, PipeNativeError> {
+        let Some(mut expected) = state.revision.clone() else {
+            let cursor = state.cursor;
+            drop(state);
+            return self.reconcile_from(store, session_id, path, cursor).await;
+        };
+        if expected.head_seq != state.cursor.pending_seq {
+            let generation = state.cursor.generation;
+            drop(state);
+            return self.rebuild(store, session_id, path, generation).await;
+        }
+
+        let mut read_cursor = state.cursor.pending_seq;
+        let mut first_page = true;
+        loop {
+            let page = store
+                .read_reducer_page_with_boundary_for(
+                    haider_platform::phase_trace::StoreReadCaller::NativePipe,
+                    session_id,
+                    read_cursor,
+                    RECONCILE_PAGE_ENVELOPES,
+                    RECONCILE_PAGE_BYTES,
+                    PIPE_PROJECTION_PAYLOAD_KINDS,
+                )
+                .await
+                .map_err(|error| {
+                    PipeNativeError::store("journal suffix projection failed", error)
+                })?;
+            #[cfg(test)]
+            {
+                self.cached_suffix_reads.fetch_add(1, Ordering::Relaxed);
+                self.cached_suffix_rows.fetch_add(
+                    u64::try_from(page.envelopes.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+            let Some(observed) = page.observed_head.map(PipeJournalRevision::from) else {
+                let cursor = state.cursor;
+                drop(state);
+                return self.reconcile_from(store, session_id, path, cursor).await;
+            };
+            let valid_boundary = observed.head_seq > expected.head_seq || observed == expected;
+            let impossible_exact_page =
+                first_page && observed == expected && !page.envelopes.is_empty();
+            if !valid_boundary || impossible_exact_page {
+                let generation = state.cursor.generation;
+                drop(state);
+                return self.rebuild(store, session_id, path, generation).await;
+            }
+            if observed.head_seq < known_committed_head {
+                return Err(PipeNativeError::other(format!(
+                    "journal suffix boundary {} trails committed head {known_committed_head}",
+                    observed.head_seq
+                )));
+            }
+            if page.envelopes.iter().any(|envelope| {
+                haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                    &envelope.payload,
+                )
+                .is_some()
+            }) {
+                let generation = state.cursor.generation;
+                drop(state);
+                return self.rebuild(store, session_id, path, generation).await;
+            }
+
+            if page.envelopes.is_empty() {
+                let (data, mut next_cursor) = render_incremental_batch(
+                    &[],
+                    observed.head_seq,
+                    observed.head_seq,
+                    state.cursor,
+                    &mut state.projector,
+                )?;
+                if !data.is_empty() {
+                    let mut sealed_root = None;
+                    let (file, segment) = write_segmented_open(
+                        state.file,
+                        data,
+                        &state.base_path,
+                        session_id,
+                        state.cursor.generation,
+                        state.cursor.segment,
+                        false,
+                        &mut sealed_root,
+                    )
+                    .await?;
+                    state.file = file;
+                    next_cursor.segment = segment;
+                }
+                state.cursor = next_cursor;
+                state.revision = Some(observed);
+                return Ok(state);
+            }
+
+            let next_read_cursor = page
+                .envelopes
+                .last()
+                .map_or(read_cursor, |envelope| envelope.seq);
+            if next_read_cursor <= read_cursor {
+                return Err(PipeNativeError::other(
+                    "journal suffix projection did not advance".into(),
+                ));
+            }
+            let (data, mut next_cursor) = render_incremental_batch(
+                &page.envelopes,
+                next_read_cursor,
+                observed.head_seq,
+                state.cursor,
+                &mut state.projector,
+            )?;
+            if !data.is_empty() {
+                let mut sealed_root = None;
+                let (file, segment) = write_segmented_open(
+                    state.file,
+                    data,
+                    &state.base_path,
+                    session_id,
+                    state.cursor.generation,
+                    state.cursor.segment,
+                    false,
+                    &mut sealed_root,
+                )
+                .await?;
+                state.file = file;
+                next_cursor.segment = segment;
+            }
+            state.cursor = next_cursor;
+            read_cursor = next_read_cursor;
+            expected = observed;
+            first_page = false;
+        }
     }
 
     /// Reconciles pages inline to preserve append ordering. Each page is
@@ -802,9 +1039,11 @@ impl PipeNativeWriter {
         let mut file = open_append(active_path).await?;
         let mut segment = cursor.segment;
         let mut sealed_root = None;
+        let mut revision = None;
         loop {
             let page = store
-                .read_reducer_page_with_boundary(
+                .read_reducer_page_with_boundary_for(
+                    haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
                     read_cursor,
                     RECONCILE_PAGE_ENVELOPES,
@@ -813,6 +1052,11 @@ impl PipeNativeWriter {
                 )
                 .await
                 .map_err(|error| PipeNativeError::store("journal reconciliation failed", error))?;
+            revision = page
+                .observed_head
+                .clone()
+                .map(PipeJournalRevision::from)
+                .or(revision);
             let Some(last) = page.envelopes.last() else {
                 if let Some((through_seq, _)) = page.observed_head {
                     read_cursor = read_cursor.max(through_seq);
@@ -857,12 +1101,14 @@ impl PipeNativeWriter {
         // The synced handle is kept for subsequent hot appends.
         let file = sync_open(file).await?;
         Ok(ReconciledSidecar {
+            last_touched: 0,
             cursor: SidecarCursor {
                 seq: covered,
                 pending_seq: read_cursor,
                 segment,
                 ..cursor
             },
+            revision,
             projector,
             base_path: path,
             file,
@@ -884,11 +1130,13 @@ impl PipeNativeWriter {
         let mut segment = 0;
         let mut sealed_root = None;
         let mut read_cursor = 0;
+        let mut revision = None;
         let (retracted_nodes, _) = retracted_prompt_nodes(store, session_id, 0).await?;
         let mut projector = TranscriptProjector::with_retracted_prompt_nodes(retracted_nodes);
         loop {
             let page = store
-                .read_reducer_page_with_boundary(
+                .read_reducer_page_with_boundary_for(
+                    haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
                     read_cursor,
                     RECONCILE_PAGE_ENVELOPES,
@@ -897,6 +1145,11 @@ impl PipeNativeWriter {
                 )
                 .await
                 .map_err(|error| PipeNativeError::store("journal rebuild failed", error))?;
+            revision = page
+                .observed_head
+                .clone()
+                .map(PipeJournalRevision::from)
+                .or(revision);
             let Some(last) = page.envelopes.last() else {
                 if let Some((through_seq, _)) = page.observed_head {
                     read_cursor = read_cursor.max(through_seq);
@@ -944,12 +1197,14 @@ impl PipeNativeWriter {
             file
         };
         Ok(ReconciledSidecar {
+            last_touched: 0,
             cursor: SidecarCursor {
                 seq: covered,
                 pending_seq: read_cursor,
                 generation,
                 segment,
             },
+            revision,
             projector,
             base_path: path,
             file,
@@ -997,7 +1252,8 @@ async fn retracted_prompt_nodes(
     let mut cursor = since_seq;
     loop {
         let page = store
-            .read_reducer_page(
+            .read_reducer_page_for(
+                haider_platform::phase_trace::StoreReadCaller::NativePipe,
                 session_id,
                 cursor,
                 RECONCILE_PAGE_ENVELOPES,
@@ -1030,7 +1286,8 @@ async fn prewarm_projector(
     let mut read_cursor = through_seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
     while read_cursor < through_seq {
         let page = store
-            .read_reducer_page(
+            .read_reducer_page_for(
+                haider_platform::phase_trace::StoreReadCaller::NativePipe,
                 session_id,
                 read_cursor,
                 RECONCILE_PAGE_ENVELOPES,
@@ -1712,10 +1969,32 @@ fn render_hot_batch(
     cursor: SidecarCursor,
     projector: &mut TranscriptProjector,
 ) -> Result<(String, SidecarCursor), PipeNativeError> {
+    let processed_through = envelopes
+        .iter()
+        .map(|envelope| envelope.seq)
+        .max()
+        .unwrap_or(cursor.pending_seq);
+    render_incremental_batch(
+        envelopes,
+        processed_through,
+        durable_head,
+        cursor,
+        projector,
+    )
+}
+
+fn render_incremental_batch(
+    envelopes: &[RawEnvelope],
+    processed_through: u64,
+    durable_head: u64,
+    cursor: SidecarCursor,
+    projector: &mut TranscriptProjector,
+) -> Result<(String, SidecarCursor), PipeNativeError> {
     let ordered = ordered_after(envelopes, cursor.pending_seq);
     let pending_seq = ordered
         .last()
-        .map_or(cursor.pending_seq, |envelope| envelope.seq);
+        .map_or(cursor.pending_seq, |envelope| envelope.seq)
+        .max(processed_through);
     let mut data = String::new();
     let mut produced_row = false;
     for envelope in ordered {
@@ -2192,7 +2471,7 @@ mod tests {
         assert!(base.exists(), "live root survives boot sweep");
         assert!(!orphan.exists(), "old-generation orphan is swept");
         assert!(
-            writer.reconciled.lock().expect("reconciled map").is_empty(),
+            writer.reconciled_count() == 0,
             "boot-only sidecar handles are released before Ready"
         );
         drop(writer);

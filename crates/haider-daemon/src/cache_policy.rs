@@ -158,7 +158,14 @@ pub(crate) async fn latest_main_cache_scope(
     let mut cursor = 0;
     let mut latest = None;
     loop {
-        let page = StoreHandle::read(store, session_id, cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::CachePolicy,
+            session_id,
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             break;
         }

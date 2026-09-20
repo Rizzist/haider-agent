@@ -400,7 +400,8 @@ impl StartupJournalVisitor for StartupHydration {
                 cursor = cursor.min(pipe_session.through_seq());
             }
             let page = store
-                .read_reducer_page_with_boundary(
+                .read_reducer_page_with_boundary_for(
+                    haider_platform::phase_trace::StoreReadCaller::StartupHydration,
                     session_id,
                     cursor,
                     STARTUP_JOURNAL_PAGE_ENVELOPES,
@@ -413,7 +414,7 @@ impl StartupJournalVisitor for StartupHydration {
                     self.hooks
                         .advance_through(session_id, through_seq, &boundary_event_id);
                     if let Some(pipe_session) = &mut self.pipe_session {
-                        pipe_session.advance_through(through_seq);
+                        pipe_session.advance_through(through_seq, &boundary_event_id);
                     }
                 }
                 break;

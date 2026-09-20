@@ -274,7 +274,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&coordinates.parent_session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &coordinates.parent_session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 return Ok((inherited, false));
@@ -1431,7 +1436,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&record.parent_session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &record.parent_session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -1470,7 +1480,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&record.parent_session_id, mirror.parent_answer_cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &record.parent_session_id,
+                    mirror.parent_answer_cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 return Ok(());
@@ -2011,7 +2026,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -2053,7 +2073,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 return Ok(None);
@@ -2241,7 +2266,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&record.parent_session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &record.parent_session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 return Ok(ids);
@@ -2295,7 +2325,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&record.child_session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &record.child_session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -2604,7 +2639,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&record.parent_session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &record.parent_session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -2704,7 +2744,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&record.child_session_id, mirror.child_cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &record.child_session_id,
+                    mirror.child_cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 return Ok(());
@@ -2965,7 +3010,12 @@ impl DelegationHandle {
         loop {
             let page = self
                 .hub
-                .read_internal_session(&record.child_session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    &record.child_session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;

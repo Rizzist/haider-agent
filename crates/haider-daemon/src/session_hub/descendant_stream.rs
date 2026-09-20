@@ -415,7 +415,12 @@ async fn descendant_child_state(
     let mut cursor = 0;
     while cursor < through_seq {
         let page = store
-            .read(&record.child_session_id, cursor, REPLAY_PAGE_SIZE)
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::DescendantStream,
+                &record.child_session_id,
+                cursor,
+                REPLAY_PAGE_SIZE,
+            )
             .await?;
         if page.is_empty() {
             return Err(HaiderError::new(
@@ -492,7 +497,12 @@ async fn descendant_parent_anchors(
     let mut cursor = after_seq;
     while cursor < through_seq {
         let page = store
-            .read(&record.parent_session_id, cursor, REPLAY_PAGE_SIZE)
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::DescendantStream,
+                &record.parent_session_id,
+                cursor,
+                REPLAY_PAGE_SIZE,
+            )
             .await?;
         if page.is_empty() {
             return Err(HaiderError::new(
@@ -900,7 +910,8 @@ async fn replay_child(
         let page = match hub
             .inner
             .store
-            .read(
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::DescendantStream,
                 &child.record.child_session_id,
                 child.cursor,
                 REPLAY_PAGE_SIZE,

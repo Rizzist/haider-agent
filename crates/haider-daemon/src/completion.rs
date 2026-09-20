@@ -61,7 +61,12 @@ pub(crate) async fn load(
     let journal = cache.entry(session.clone()).or_default();
     loop {
         let page = hub
-            .read_internal_session(session, journal.cursor, 256)
+            .read_internal_session_for(
+                haider_platform::phase_trace::StoreReadCaller::Completion,
+                session,
+                journal.cursor,
+                256,
+            )
             .await?;
         if page.is_empty() {
             break;

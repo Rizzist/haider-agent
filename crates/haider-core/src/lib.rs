@@ -198,6 +198,17 @@ pub trait StoreHandle: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError>;
 
+    async fn read_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let _ = caller;
+        self.read(session_id, since_seq, limit).await
+    }
+
     /// Reads a reducer page containing only its declared outer payload kinds.
     ///
     /// Journal-only stores retain correct behavior through this default full
@@ -252,6 +263,20 @@ pub trait StoreHandle: Send + Sync {
         }
     }
 
+    async fn read_reducer_page_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let _ = caller;
+        self.read_reducer_page(session_id, since_seq, limit, byte_budget, payload_kinds)
+            .await
+    }
+
     /// Reads a filtered page together with a transactionally compatible
     /// journal-head observation when the store can provide one. Journal-only
     /// adapters return no head and remain correct by retaining their reducer
@@ -270,6 +295,26 @@ pub trait StoreHandle: Send + Sync {
                 envelopes,
                 observed_head: None,
             })
+    }
+
+    async fn read_reducer_page_with_boundary_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<ReducerPage, HaiderError> {
+        let _ = caller;
+        self.read_reducer_page_with_boundary(
+            session_id,
+            since_seq,
+            limit,
+            byte_budget,
+            payload_kinds,
+        )
+        .await
     }
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError>;

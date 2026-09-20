@@ -867,7 +867,14 @@ async fn session_agent_metrics_truth(
     let mut folder = crate::usage_report::SessionFolder::new(initial_model);
     let mut since_seq = 0;
     while since_seq < through_seq {
-        let page = store.read(session_id, since_seq, REPLAY_PAGE_SIZE).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                session_id,
+                since_seq,
+                REPLAY_PAGE_SIZE,
+            )
+            .await?;
         if page.is_empty() {
             break;
         }
@@ -912,7 +919,12 @@ async fn fleet_child_truth(
     let mut since_seq = 0;
     while since_seq < through_seq {
         let page = store
-            .read(&record.child_session_id, since_seq, REPLAY_PAGE_SIZE)
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                &record.child_session_id,
+                since_seq,
+                REPLAY_PAGE_SIZE,
+            )
             .await?;
         if page.is_empty() {
             break;
@@ -2642,7 +2654,14 @@ async fn rebuild_observe_fold(
     let mut fold = ObserveFold::new(initial_model);
     let mut cursor = 0;
     while cursor < through_seq {
-        let page = store.read(session_id, cursor, REPLAY_PAGE_SIZE).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                session_id,
+                cursor,
+                REPLAY_PAGE_SIZE,
+            )
+            .await?;
         if page.is_empty() {
             break;
         }
@@ -3315,7 +3334,16 @@ impl SessionHub {
         let mut cursor = 0_u64;
         let mut intent = None::<EffectIntent>;
         loop {
-            let page = self.inner.store.read(&session_id, cursor, 256).await?;
+            let page = self
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    &session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
             if page.is_empty() {
                 break;
             }
@@ -8345,7 +8373,12 @@ impl HubConnection {
                 .hub
                 .inner
                 .store
-                .read(session_id, after_seq, REPLAY_PAGE_SIZE)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    session_id,
+                    after_seq,
+                    REPLAY_PAGE_SIZE,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -8531,7 +8564,12 @@ impl HubConnection {
             .hub
             .inner
             .store
-            .read(session_id, latest_seq.saturating_sub(1), 1)
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                session_id,
+                latest_seq.saturating_sub(1),
+                1,
+            )
             .await?;
         let head = head.pop().ok_or_else(|| {
             SessionHubError::Task("cache confirmation could not resolve the session head".into())
@@ -8638,7 +8676,12 @@ impl HubConnection {
             .hub
             .inner
             .store
-            .read(&session_id, latest_seq.saturating_sub(1), 1)
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                &session_id,
+                latest_seq.saturating_sub(1),
+                1,
+            )
             .await?;
         let Some(head) = head.pop() else {
             return self.respond_error(
@@ -10112,9 +10155,14 @@ impl HubConnection {
         let event_id = EventId::new(format!("lockdown-refusal-{command_id}-{tool}"));
         let mut cursor = 0_u64;
         loop {
-            let page =
-                haider_core::StoreHandle::read(&self.hub.inner.store, session_id, cursor, 512)
-                    .await?;
+            let page = haider_core::StoreHandle::read_for(
+                &self.hub.inner.store,
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                session_id,
+                cursor,
+                512,
+            )
+            .await?;
             if page.is_empty() {
                 break;
             }
@@ -10261,9 +10309,14 @@ impl HubConnection {
             let mut cursor = 0_u64;
             let mut exists = false;
             loop {
-                let page =
-                    haider_core::StoreHandle::read(&self.hub.inner.store, &session_id, cursor, 512)
-                        .await?;
+                let page = haider_core::StoreHandle::read_for(
+                    &self.hub.inner.store,
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    &session_id,
+                    cursor,
+                    512,
+                )
+                .await?;
                 if page.is_empty() {
                     break;
                 }
@@ -11719,7 +11772,12 @@ impl HubConnection {
                 .hub
                 .inner
                 .store
-                .read(source_session_id, cursor, 256)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    source_session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -15568,7 +15626,17 @@ impl HubConnection {
         let mut matching_needed = false;
         let mut resolved = false;
         loop {
-            let page = self.hub.inner.store.read(&session_id, cursor, 256).await?;
+            let page = self
+                .hub
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    &session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
             if page.is_empty() {
                 break;
             }
@@ -15823,7 +15891,17 @@ impl HubConnection {
             let mut spec = None;
             let mut budget_exhausted = None;
             loop {
-                let page = self.hub.inner.store.read(&session_id, cursor, 256).await?;
+                let page = self
+                    .hub
+                    .inner
+                    .store
+                    .read_for(
+                        haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                        &session_id,
+                        cursor,
+                        256,
+                    )
+                    .await?;
                 if page.is_empty() {
                     break;
                 }
@@ -17888,7 +17966,12 @@ impl HubConnection {
                 .hub
                 .inner
                 .store
-                .read(&session_id, cursor, REPLAY_PAGE_SIZE)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    &session_id,
+                    cursor,
+                    REPLAY_PAGE_SIZE,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -18334,7 +18417,12 @@ impl HubConnection {
             .hub
             .inner
             .store
-            .read(session_id, request_seq.saturating_sub(1), 1)
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                session_id,
+                request_seq.saturating_sub(1),
+                1,
+            )
             .await?
             .into_iter()
             .find(|envelope| envelope.seq == request_seq);
@@ -18450,7 +18538,12 @@ impl HubConnection {
             .hub
             .inner
             .store
-            .read(session_id, request_seq.saturating_sub(1), 1)
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                session_id,
+                request_seq.saturating_sub(1),
+                1,
+            )
             .await?
             .into_iter()
             .find(|envelope| envelope.seq == request_seq);
@@ -19304,7 +19397,12 @@ async fn replay_monitor_delivery_range(
             return false;
         }
         let page = match hub
-            .read_internal_session(session_id, *cursor, REPLAY_PAGE_SIZE)
+            .read_internal_session_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                session_id,
+                *cursor,
+                REPLAY_PAGE_SIZE,
+            )
             .await
         {
             Ok(page) => page,

@@ -2327,11 +2327,29 @@ impl SqliteStoreHandle {
         max_envelopes: usize,
         byte_budget: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.read_page_for(
+            haider_platform::phase_trace::StoreReadCaller::Unattributed,
+            session_id,
+            since_seq,
+            max_envelopes,
+            byte_budget,
+        )
+        .await
+    }
+
+    pub async fn read_page_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        max_envelopes: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || {
             owner.with_store(|store| {
-                store.read_page(&session_id, since_seq, max_envelopes, byte_budget)
+                store.read_page_for(caller, &session_id, since_seq, max_envelopes, byte_budget)
             })
         })
         .await
@@ -2908,6 +2926,21 @@ impl StoreHandle for SqliteStoreHandle {
             .await
     }
 
+    async fn read_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.read_for(caller, &session_id, since_seq, limit))
+        })
+        .await
+    }
+
     async fn read_reducer_page(
         &self,
         session_id: &SessionId,
@@ -2926,6 +2959,32 @@ impl StoreHandle for SqliteStoreHandle {
         .await
     }
 
+    async fn read_reducer_page_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.read_reducer_page_for(
+                    caller,
+                    &session_id,
+                    since_seq,
+                    limit,
+                    byte_budget,
+                    payload_kinds,
+                )
+            })
+        })
+        .await
+    }
+
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
@@ -2939,6 +2998,32 @@ impl StoreHandle for SqliteStoreHandle {
         run_blocking(move || {
             owner.with_store(|store| {
                 store.read_reducer_page_with_boundary(
+                    &session_id,
+                    since_seq,
+                    limit,
+                    byte_budget,
+                    payload_kinds,
+                )
+            })
+        })
+        .await
+    }
+
+    async fn read_reducer_page_with_boundary_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<ReducerPage, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.read_reducer_page_with_boundary_for(
+                    caller,
                     &session_id,
                     since_seq,
                     limit,

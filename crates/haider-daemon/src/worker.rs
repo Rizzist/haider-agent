@@ -6142,7 +6142,14 @@ async fn durable_runs(
             let mut runs =
                 HashMap::<RunId, (RunState, Option<u64>, Option<BranchId>, Option<RunId>)>::new();
             loop {
-                let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+                let page = StoreHandle::read_for(
+                    store,
+                    haider_platform::phase_trace::StoreReadCaller::WorkerRunHeads,
+                    store.session_id(),
+                    cursor,
+                    256,
+                )
+                .await?;
                 if page.is_empty() {
                     break;
                 }
@@ -6238,7 +6245,14 @@ async fn durable_user_command_scope(
     let mut marker = None::<(UserCommandOriginV1, Option<BranchId>, Option<AgentId>)>;
     let mut command_items = HashMap::<ItemId, (String, Option<BranchId>, Option<AgentId>)>::new();
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerUserCommand,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             break;
         }
@@ -6318,7 +6332,14 @@ async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64
     let mut cursor = 0;
     let mut sequences = HashSet::new();
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerUserMessages,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             return Ok(sequences);
         }
@@ -6427,7 +6448,14 @@ async fn scan_unknown_effects(
         .collect::<Vec<_>>();
     let mut cursor = 0;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 512).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerEffects,
+            store.session_id(),
+            cursor,
+            512,
+        )
+        .await?;
         if page.is_empty() {
             break;
         }
@@ -6609,7 +6637,14 @@ async fn durable_queue_consumed(
     let mut cursor = 0;
     let mut consumed = false;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerQueue,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             return Ok(consumed);
         }
@@ -6640,11 +6675,17 @@ async fn durable_workspace_mutation(
 ) -> ToolResult<WorkspaceMutation> {
     let mut cursor = 0;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256)
-            .await
-            .map_err(|error| ToolError::Runtime {
-                message: error.message,
-            })?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerWorkspace,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: error.message,
+        })?;
         if page.is_empty() {
             return Err(ToolError::Runtime {
                 message: format!(
@@ -6941,7 +6982,14 @@ async fn find_compaction_receipt(
     let mut provider_request_turn_ordinal = None;
     let mut cursor = 0;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerCompaction,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             break;
         }
@@ -9987,7 +10035,14 @@ async fn reduce_warm_journal_projection_cached<T>(
             cached.projection = WarmJournalProjection::default();
             let mut last_revision = None;
             loop {
-                let page = store.read(session_id, cursor, 256).await?;
+                let page = store
+                    .read_for(
+                        haider_platform::phase_trace::StoreReadCaller::WarmJournalProjection,
+                        session_id,
+                        cursor,
+                        256,
+                    )
+                    .await?;
                 if page.is_empty() {
                     break;
                 }
@@ -10012,8 +10067,9 @@ async fn reduce_warm_journal_projection_cached<T>(
         let mut final_revision = expected_revision.clone();
         let mut exact_boundary = true;
         loop {
-            let page = StoreHandle::read_reducer_page_with_boundary(
+            let page = StoreHandle::read_reducer_page_with_boundary_for(
                 store,
+                haider_platform::phase_trace::StoreReadCaller::WarmJournalProjection,
                 session_id,
                 cursor,
                 256,
@@ -10653,8 +10709,9 @@ async fn reduce_turn_setup_journal_cached(
     let mut final_revision = None;
     let mut exact_boundary = true;
     loop {
-        let page = StoreHandle::read_reducer_page_with_boundary(
+        let page = StoreHandle::read_reducer_page_with_boundary_for(
             store,
+            haider_platform::phase_trace::StoreReadCaller::TurnSetupReduction,
             session_id,
             cursor,
             256,
@@ -10737,7 +10794,14 @@ async fn accepted_plan_bodies(
     let mut accepted = Vec::new();
     let mut cursor = 0;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerPlanMenus,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             return Ok(accepted);
         }
@@ -10775,7 +10839,14 @@ async fn find_committed_menu_answer(
 ) -> Result<Option<haider_protocol::envelope::RawEnvelope>, HaiderError> {
     let mut cursor = 0;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerPlanMenus,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             return Ok(None);
         }
@@ -11639,7 +11710,14 @@ async fn run_budget_usage(
             let mut cursor = 0_u64;
             let mut chunks = BudgetUsageChunks::new();
             loop {
-                let page = store.read(store.session_id(), cursor, 256).await?;
+                let page = store
+                    .read_for(
+                        haider_platform::phase_trace::StoreReadCaller::WorkerBudget,
+                        store.session_id(),
+                        cursor,
+                        256,
+                    )
+                    .await?;
                 if page.is_empty() {
                     break;
                 }
@@ -11686,7 +11764,12 @@ async fn run_budget_usage_for_context(
         loop {
             let page = coordinator
                 .hub
-                .read_internal_session(&session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::WorkerBudget,
+                    &session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -12762,7 +12845,14 @@ async fn prior_cache_request_context(
     let mut latest_deliberate_boundary = None::<(u64, CacheRewarmReasonV1)>;
     let mut cursor = 0_u64;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_for(
+            store,
+            haider_platform::phase_trace::StoreReadCaller::WorkerCacheContext,
+            store.session_id(),
+            cursor,
+            256,
+        )
+        .await?;
         if page.is_empty() {
             break;
         }
@@ -17116,7 +17206,12 @@ impl BrokerToolDispatcher {
             let page = self
                 .output
                 .store
-                .read(&self.session_id, cursor, 256)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::WorkerPermission,
+                    &self.session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 return Ok(found);
@@ -19501,7 +19596,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
             };
             let hub = self.output.store.hub();
             let Some((head, envelopes)) = hub
-                .read_session_journal(
+                .read_session_journal_for(
+                    haider_platform::phase_trace::StoreReadCaller::WorkerReplay,
                     &request.session_id,
                     request.after_seq,
                     request.limit as usize,
@@ -21530,7 +21626,14 @@ pub(crate) async fn durable_session_tool_state(
     let mut cursor = 0;
     let mut reduction = DurableToolStateReduction::default();
     loop {
-        let page = store.read(session_id, cursor, 256).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::WorkerToolState,
+                session_id,
+                cursor,
+                256,
+            )
+            .await?;
         if page.is_empty() {
             return Ok(reduction.snapshot());
         }
@@ -21577,7 +21680,14 @@ pub(crate) async fn durable_read_only_terminal_failure(
     }
     let mut cursor = 0;
     loop {
-        let page = store.read(session_id, cursor, 256).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::WorkerToolState,
+                session_id,
+                cursor,
+                256,
+            )
+            .await?;
         if page.is_empty() {
             return Ok(None);
         }

@@ -1,4 +1,4 @@
-# Phase attribution v3
+# Phase attribution v4
 
 `python3 scripts/qa-gate/turn_wall_harness.py --bin-dir <candidate>` and
 `... --one-shot` enable buffered phase probes by default. Use `--no-phases`
@@ -14,7 +14,10 @@ CLOCK_MONOTONIC boundaries. Prompt text, paths, tool arguments and identifiers
 other than PIDs are never recorded. The report retains raw selected records.
 Trace schema v2 added content-free CAS byte, block-hash and re-verification-call
 counters. Schema v3 adds the store-access split plus row, materialized-byte and
-decoded-event counters; the reader remains compatible with schema v1/v2 traces.
+decoded-event counters. Schema v4 adds a frozen, content-free `store_caller`
+tag to replay/reducer page-query and decode records, allowing the deep harness
+to report pages, rows, bytes, wall and CPU by consumer family. The reader
+remains compatible with schema v1/v2/v3 traces.
 No credential or signing material is needed: the existing fake HTTP provider,
 throwaway profile, real RPC and real tool fixtures remain authoritative.
 
@@ -67,7 +70,7 @@ mean that the CPU was executing throughout that wall interval.
 | stream_decode | OpenAI SSE/framing/typed decoder push entry points; not Anthropic or the provider network wait |
 | cas_read_hash / cas_reverify | CAS integrity hashing on actual reads / full hashing performed only to establish that a write target already contains the addressed bytes; v2 rows also count bytes read, blocks hashed and re-verification calls |
 | store_query_replay / store_query_reducer / store_query_point | Full journal replay pages, payload-kind-filtered reducer pages, and hot metadata/checkpoint/head queries. Replay/reducer rows count materialized envelopes and true-weight bytes. |
-| store_event_decode | Row iteration, envelope materialization, storage-class decode, validation and page canonicalization for one replay/reducer page; v3 counters report decoded rows/bytes/events without recording content. |
+| store_event_decode | Row iteration, envelope materialization, storage-class decode, validation and page canonicalization for one replay/reducer page; v3 counters report decoded rows/bytes/events without recording content, and v4 attributes them to a frozen consumer family. |
 | store_provider_view | Provider-view CAS/index verification, reads and request-attempt persistence; v3 counters report referenced/written blocks and bytes. Nested CAS phases keep hash work distinct. |
 | store_receipt_attempt | Turn receipt replay/ordinal queries and the fused acceptance transaction. |
 | store_owner_lock_wait / store_connection_lock_wait / store_other | Profile-owner mutex acquisition / SQLite-connection mutex acquisition / the remaining generic store operation body. Lock intervals are emitted as zero-CPU waits so overlapping active holders retain wall attribution. These close the named `store_access` partition instead of silently dropping uncategorized calls. |

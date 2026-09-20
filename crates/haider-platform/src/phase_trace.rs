@@ -8,6 +8,105 @@
 
 use std::future::Future;
 
+/// Frozen caller families for journal page reads. No caller-supplied text or
+/// durable identifier enters a trace.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum StoreReadCaller {
+    #[default]
+    Unattributed,
+    AttachmentReplay,
+    UsageReport,
+    UsageBackfill,
+    PromptHistory,
+    CoreRecovery,
+    ActorNarrative,
+    ActorToolRepair,
+    ActorControl,
+    ActorAgentSpawn,
+    TurnRecovery,
+    StartupHydration,
+    NativePipe,
+    WarmJournalProjection,
+    TurnSetupReduction,
+    WorkerRunHeads,
+    WorkerUserCommand,
+    WorkerUserMessages,
+    WorkerEffects,
+    WorkerQueue,
+    WorkerWorkspace,
+    WorkerCompaction,
+    WorkerPlanMenus,
+    WorkerCacheContext,
+    WorkerBudget,
+    WorkerToolState,
+    WorkerPermission,
+    WorkerReplay,
+    ProviderRebind,
+    SessionHubActor,
+    SessionHubRpc,
+    DescendantStream,
+    HookProjection,
+    ForegroundCapture,
+    Delegation,
+    Completion,
+    Tasks,
+    Monitor,
+    PeerDelivery,
+    CachePolicy,
+    Accounts,
+    Evidence,
+}
+
+impl StoreReadCaller {
+    #[cfg(unix)]
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Unattributed => None,
+            Self::AttachmentReplay => Some("attachment_replay"),
+            Self::UsageReport => Some("usage_report"),
+            Self::UsageBackfill => Some("usage_backfill"),
+            Self::PromptHistory => Some("prompt_history"),
+            Self::CoreRecovery => Some("core_recovery"),
+            Self::ActorNarrative => Some("actor_narrative"),
+            Self::ActorToolRepair => Some("actor_tool_repair"),
+            Self::ActorControl => Some("actor_control"),
+            Self::ActorAgentSpawn => Some("actor_agent_spawn"),
+            Self::TurnRecovery => Some("turn_recovery"),
+            Self::StartupHydration => Some("startup_hydration"),
+            Self::NativePipe => Some("native_pipe"),
+            Self::WarmJournalProjection => Some("warm_journal_projection"),
+            Self::TurnSetupReduction => Some("turn_setup_reduction"),
+            Self::WorkerRunHeads => Some("worker_run_heads"),
+            Self::WorkerUserCommand => Some("worker_user_command"),
+            Self::WorkerUserMessages => Some("worker_user_messages"),
+            Self::WorkerEffects => Some("worker_effects"),
+            Self::WorkerQueue => Some("worker_queue"),
+            Self::WorkerWorkspace => Some("worker_workspace"),
+            Self::WorkerCompaction => Some("worker_compaction"),
+            Self::WorkerPlanMenus => Some("worker_plan_menus"),
+            Self::WorkerCacheContext => Some("worker_cache_context"),
+            Self::WorkerBudget => Some("worker_budget"),
+            Self::WorkerToolState => Some("worker_tool_state"),
+            Self::WorkerPermission => Some("worker_permission"),
+            Self::WorkerReplay => Some("worker_replay"),
+            Self::ProviderRebind => Some("provider_rebind"),
+            Self::SessionHubActor => Some("session_hub_actor"),
+            Self::SessionHubRpc => Some("session_hub_rpc"),
+            Self::DescendantStream => Some("descendant_stream"),
+            Self::HookProjection => Some("hook_projection"),
+            Self::ForegroundCapture => Some("foreground_capture"),
+            Self::Delegation => Some("delegation"),
+            Self::Completion => Some("completion"),
+            Self::Tasks => Some("tasks"),
+            Self::Monitor => Some("monitor"),
+            Self::PeerDelivery => Some("peer_delivery"),
+            Self::CachePolicy => Some("cache_policy"),
+            Self::Accounts => Some("accounts"),
+            Self::Evidence => Some("evidence"),
+        }
+    }
+}
+
 /// Frozen report vocabulary. No caller-supplied text enters a trace.
 #[derive(Clone, Copy, Debug)]
 pub enum Phase {
@@ -185,6 +284,11 @@ impl StoreScope {
 /// Starts one named store sub-scope. The accepted phases are frozen enum
 /// variants, so no SQL, path, identifier, or payload content enters a trace.
 pub fn store_scope(phase: Phase) -> StoreScope {
+    store_scope_for(phase, StoreReadCaller::Unattributed)
+}
+
+/// Starts a named store sub-scope attributed to one frozen page consumer.
+pub fn store_scope_for(phase: Phase, caller: StoreReadCaller) -> StoreScope {
     debug_assert!(matches!(
         phase,
         Phase::StoreOther
@@ -197,8 +301,13 @@ pub fn store_scope(phase: Phase) -> StoreScope {
             | Phase::StoreProviderView
             | Phase::StoreReceiptAttempt
     ));
+    #[cfg(not(unix))]
+    let _ = (phase, caller);
     StoreScope {
-        scope: scope(phase),
+        scope: Scope {
+            #[cfg(unix)]
+            _native: native::Scope::new_with_store_caller(phase, caller),
+        },
     }
 }
 
@@ -282,7 +391,7 @@ impl Drop for ExitGuard {
 
 #[cfg(unix)]
 mod native {
-    use super::Phase;
+    use super::{Phase, StoreReadCaller};
     use rustix::time::{ClockId, clock_gettime};
     use std::cell::RefCell;
     use std::future::Future;
@@ -322,6 +431,7 @@ mod native {
 
     struct Row {
         phase: Phase,
+        store_caller: StoreReadCaller,
         start: u64,
         end: u64,
         cpu: u64,
@@ -385,15 +495,20 @@ mod native {
     }
 
     pub(super) struct Scope {
-        state: Option<(Phase, u64, PollCpu, TraceCounters)>,
+        state: Option<(Phase, StoreReadCaller, u64, PollCpu, TraceCounters)>,
     }
 
     impl Scope {
         pub(super) fn new(phase: Phase) -> Self {
+            Self::new_with_store_caller(phase, StoreReadCaller::Unattributed)
+        }
+
+        pub(super) fn new_with_store_caller(phase: Phase, store_caller: StoreReadCaller) -> Self {
             Self {
                 state: enabled().then(|| {
                     (
                         phase,
+                        store_caller,
                         clock_ns(ClockId::Monotonic),
                         PollCpu::new(),
                         TraceCounters::default(),
@@ -407,7 +522,7 @@ mod native {
         }
 
         pub(super) fn note_bytes_read(&mut self, bytes: usize) {
-            if let Some((_, _, _, counters)) = self.state.as_mut() {
+            if let Some((_, _, _, _, counters)) = self.state.as_mut() {
                 counters.bytes_read = counters
                     .bytes_read
                     .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
@@ -415,19 +530,19 @@ mod native {
         }
 
         pub(super) fn note_block_hashed(&mut self) {
-            if let Some((_, _, _, counters)) = self.state.as_mut() {
+            if let Some((_, _, _, _, counters)) = self.state.as_mut() {
                 counters.blocks_hashed = counters.blocks_hashed.saturating_add(1);
             }
         }
 
         pub(super) fn note_reverify_call(&mut self) {
-            if let Some((_, _, _, counters)) = self.state.as_mut() {
+            if let Some((_, _, _, _, counters)) = self.state.as_mut() {
                 counters.reverify_calls = counters.reverify_calls.saturating_add(1);
             }
         }
 
         pub(super) fn note_rows_read(&mut self, rows: usize) {
-            if let Some((_, _, _, counters)) = self.state.as_mut() {
+            if let Some((_, _, _, _, counters)) = self.state.as_mut() {
                 counters.rows_read = counters
                     .rows_read
                     .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
@@ -435,7 +550,7 @@ mod native {
         }
 
         pub(super) fn note_payload_bytes(&mut self, bytes: usize) {
-            if let Some((_, _, _, counters)) = self.state.as_mut() {
+            if let Some((_, _, _, _, counters)) = self.state.as_mut() {
                 counters.payload_bytes = counters
                     .payload_bytes
                     .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
@@ -443,7 +558,7 @@ mod native {
         }
 
         pub(super) fn note_event_decoded(&mut self) {
-            if let Some((_, _, _, counters)) = self.state.as_mut() {
+            if let Some((_, _, _, _, counters)) = self.state.as_mut() {
                 counters.events_decoded = counters.events_decoded.saturating_add(1);
             }
         }
@@ -451,10 +566,11 @@ mod native {
 
     impl Drop for Scope {
         fn drop(&mut self) {
-            if let Some((phase, start, cpu, counters)) = self.state.take() {
+            if let Some((phase, store_caller, start, cpu, counters)) = self.state.take() {
                 let cpu = cpu.finish();
                 record(Row {
                     phase,
+                    store_caller,
                     start,
                     end: clock_ns(ClockId::Monotonic),
                     cpu,
@@ -482,6 +598,7 @@ mod native {
             if let Some((phase, start)) = self.state.take() {
                 record(Row {
                     phase,
+                    store_caller: StoreReadCaller::Unattributed,
                     start,
                     end: clock_ns(ClockId::Monotonic),
                     cpu: 0,
@@ -523,6 +640,7 @@ mod native {
             if let Some(start) = this.waiting_since.take() {
                 record(Row {
                     phase: this.phase,
+                    store_caller: StoreReadCaller::Unattributed,
                     start,
                     end: clock_ns(ClockId::Monotonic),
                     cpu: 0,
@@ -560,16 +678,20 @@ mod native {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             writeln!(
                 output,
-                "{{\"schema\":3,\"pid\":{},\"dropped\":{},\"records\":{},\"clock\":\"CLOCK_MONOTONIC\",\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\"}}",
+                "{{\"schema\":4,\"pid\":{},\"dropped\":{},\"records\":{},\"clock\":\"CLOCK_MONOTONIC\",\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\"}}",
                 std::process::id(),
                 records.dropped,
                 records.rows.len()
             )?;
             for row in &records.rows {
+                let caller = row.store_caller.name().map_or(String::new(), |name| {
+                    format!(",\"store_caller\":\"{name}\"")
+                });
                 writeln!(
                     output,
-                    "{{\"phase\":\"{}\",\"start_ns\":{},\"end_ns\":{},\"cpu_ns\":{},\"waiting\":{},\"counters\":{{\"bytes_read\":{},\"blocks_hashed\":{},\"reverify_calls\":{},\"rows_read\":{},\"payload_bytes\":{},\"events_decoded\":{}}}}}",
+                    "{{\"phase\":\"{}\"{},\"start_ns\":{},\"end_ns\":{},\"cpu_ns\":{},\"waiting\":{},\"counters\":{{\"bytes_read\":{},\"blocks_hashed\":{},\"reverify_calls\":{},\"rows_read\":{},\"payload_bytes\":{},\"events_decoded\":{}}}}}",
                     row.phase.name(),
+                    caller,
                     row.start,
                     row.end,
                     row.cpu,
@@ -624,10 +746,14 @@ mod native {
                 assert_eq!(paths.len(), 1);
                 let trace =
                     std::fs::read_to_string(&paths[0]).unwrap_or_else(|error| panic!("{error}"));
-                assert!(trace.contains("\"schema\":3"));
+                assert!(trace.contains("\"schema\":4"));
                 assert!(trace.contains(
                     "\"counters\":{\"bytes_read\":17,\"blocks_hashed\":1,\"reverify_calls\":1,\"rows_read\":0,\"payload_bytes\":0,\"events_decoded\":0}"
                 ));
+                assert!(trace.lines().any(|line| {
+                    line.contains("\"phase\":\"store_query_replay\"")
+                        && line.contains("\"store_caller\":\"prompt_history\"")
+                }));
                 assert!(trace.lines().any(|line| {
                     line.contains("\"phase\":\"store_owner_lock_wait\"")
                         && line.contains("\"cpu_ns\":0")
@@ -641,6 +767,10 @@ mod native {
                 cas.note_block_hashed();
                 cas.note_reverify_call();
             }
+            drop(super::super::store_scope_for(
+                Phase::StoreQueryReplay,
+                StoreReadCaller::PromptHistory,
+            ));
             drop(super::super::store_wait_scope(Phase::StoreOwnerLockWait));
             let mut polled = false;
             let mut future = pin!(Measure::new(

@@ -1838,7 +1838,12 @@ impl MonitorService {
         let mut pending_reports = BTreeMap::<String, PendingMonitorReport>::new();
         loop {
             let page = hub
-                .read_internal_session(session, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Monitor,
+                    session,
+                    cursor,
+                    256,
+                )
                 .await
                 .map_err(monitor_store_error)?;
             if page.is_empty() {
@@ -2024,7 +2029,12 @@ impl MonitorService {
         let mut cursor = 0_u64;
         loop {
             let page = hub
-                .read_internal_session(session, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Monitor,
+                    session,
+                    cursor,
+                    256,
+                )
                 .await
                 .map_err(|error| monitor_tool_error(monitor_store_error(error)))?;
             if page.is_empty() {
@@ -2062,7 +2072,12 @@ impl MonitorService {
         let mut cursor = 0_u64;
         loop {
             let page = hub
-                .read_internal_session(session, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Monitor,
+                    session,
+                    cursor,
+                    256,
+                )
                 .await
                 .map_err(monitor_store_error)?;
             if page.is_empty() {

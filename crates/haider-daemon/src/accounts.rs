@@ -6015,7 +6015,14 @@ async fn provider_management_events(
         let mut cursor = 0_u64;
         let mut already_journaled = false;
         loop {
-            let page = StoreHandle::read(store, &session_id, cursor, 512).await?;
+            let page = StoreHandle::read_for(
+                store,
+                haider_platform::phase_trace::StoreReadCaller::Accounts,
+                &session_id,
+                cursor,
+                512,
+            )
+            .await?;
             if page.is_empty() {
                 break;
             }

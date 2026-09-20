@@ -1073,7 +1073,14 @@ impl PromptHistoryCache {
         let mut cursor = cached.head_seq;
         let mut compaction_after_checkpoint = false;
         'read_suffix: while cursor < head_seq {
-            let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+            let page = store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+                    session_id,
+                    cursor,
+                    HISTORY_PAGE,
+                )
+                .await?;
             let before = cached.envelopes.len();
             for envelope in page {
                 if envelope.seq > head_seq {
@@ -1395,7 +1402,14 @@ async fn replay_cached_session(
     let mut cached = CachedPromptSession::default();
     let mut cursor = 0;
     while cursor < head_seq {
-        let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+                session_id,
+                cursor,
+                HISTORY_PAGE,
+            )
+            .await?;
         let before = cached.envelopes.len();
         for envelope in page {
             if envelope.seq > head_seq {
@@ -1930,7 +1944,12 @@ async fn load_prompt_checkpoint(
         return None;
     }
     let boundary = match store
-        .read(session_id, decoded.through_seq.saturating_sub(1), 1)
+        .read_for(
+            haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+            session_id,
+            decoded.through_seq.saturating_sub(1),
+            1,
+        )
         .await
     {
         Ok(events) => events.into_iter().next()?,
@@ -1964,7 +1983,15 @@ async fn load_prompt_checkpoint(
     let mut checkpoint_head_node = None;
     let mut saw_compaction = false;
     while anchor_cursor < decoded.through_seq {
-        let page = match store.read(session_id, anchor_cursor, HISTORY_PAGE).await {
+        let page = match store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+                session_id,
+                anchor_cursor,
+                HISTORY_PAGE,
+            )
+            .await
+        {
             Ok(page) => page,
             Err(error) => {
                 tracing::debug!(
@@ -4546,7 +4573,14 @@ async fn read_all(
     let mut completed_reply_arenas = HashMap::new();
     let mut cursor = 0;
     loop {
-        let mut page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+        let mut page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+                session_id,
+                cursor,
+                HISTORY_PAGE,
+            )
+            .await?;
         if page.is_empty() {
             break;
         }

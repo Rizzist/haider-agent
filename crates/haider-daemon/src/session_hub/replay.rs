@@ -508,7 +508,8 @@ async fn replay_range(
         }
         // Byte-budgeted page (NOW-2): bounds the transient envelopes one page
         // may materialize; a short page just resumes from `last_sent_seq`.
-        let read = hub.inner.store.read_page(
+        let read = hub.inner.store.read_page_for(
+            haider_platform::phase_trace::StoreReadCaller::AttachmentReplay,
             session_id,
             *last_sent_seq,
             REPLAY_PAGE_SIZE,

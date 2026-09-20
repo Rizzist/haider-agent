@@ -31,7 +31,14 @@ pub(super) async fn pin_headless_turn_metadata(
     // rebound runs, leaving ordinary turn startup's reads unchanged.
     let mut cursor = 0;
     loop {
-        let page = store.read(store.session_id(), cursor, 256).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::ProviderRebind,
+                store.session_id(),
+                cursor,
+                256,
+            )
+            .await?;
         let page_len = page.len();
         for envelope in page {
             cursor = envelope.seq;

@@ -96,7 +96,12 @@ impl TaskFacade {
         'scan: loop {
             let page = self
                 .hub
-                .read_internal_session(session, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::ForegroundCapture,
+                    session,
+                    cursor,
+                    256,
+                )
                 .await
                 .map_err(|error| ToolError::cas(error.message))?;
             if page.is_empty() {

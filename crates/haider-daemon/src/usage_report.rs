@@ -2123,7 +2123,13 @@ async fn collect_local_stats(
         let mut since_seq = 0;
         loop {
             let page = store
-                .read_page(&session_id, since_seq, SCAN_PAGE_ENVELOPES, SCAN_PAGE_BYTES)
+                .read_page_for(
+                    haider_platform::phase_trace::StoreReadCaller::UsageReport,
+                    &session_id,
+                    since_seq,
+                    SCAN_PAGE_ENVELOPES,
+                    SCAN_PAGE_BYTES,
+                )
                 .await?;
             let Some(last) = page.last() else {
                 break;

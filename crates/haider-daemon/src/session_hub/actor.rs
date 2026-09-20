@@ -1985,7 +1985,14 @@ async fn session_is_quiescent(
     let mut cursor = 0;
     let mut states = HashMap::<RunId, RunState>::new();
     loop {
-        let page = store.read(session_id, cursor, 256).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::SessionHubActor,
+                session_id,
+                cursor,
+                256,
+            )
+            .await?;
         if page.is_empty() {
             return Ok(states.values().all(RunState::is_terminal));
         }
@@ -2291,8 +2298,9 @@ async fn non_tree_fact_only_delta(
         return false;
     }
     let expected_len = head - expected_head;
-    let Ok(delta) = StoreHandle::read(
+    let Ok(delta) = StoreHandle::read_for(
         store,
+        haider_platform::phase_trace::StoreReadCaller::SessionHubActor,
         session_id,
         expected_head,
         usize::try_from(expected_len)

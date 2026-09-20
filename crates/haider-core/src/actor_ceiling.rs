@@ -76,7 +76,12 @@ impl HarnessActor {
                 }
                 let page = self
                     .store
-                    .read(&self.config.session_id, cursor, 256)
+                    .read_for(
+                        haider_platform::phase_trace::StoreReadCaller::ActorControl,
+                        &self.config.session_id,
+                        cursor,
+                        256,
+                    )
                     .await?;
                 if page.is_empty() {
                     break;
@@ -174,7 +179,12 @@ impl HarnessActor {
         loop {
             let page = self
                 .store
-                .read(&self.config.session_id, cursor, 256)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::ActorControl,
+                    &self.config.session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;

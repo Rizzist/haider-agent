@@ -1352,7 +1352,12 @@ impl HookStartupHydrator {
             let boundary_valid = if structurally_valid {
                 if let (Some(through_seq), Some(through_digest)) = (through_seq, through_digest) {
                     store
-                        .read(session_id, through_seq.saturating_sub(1), 1)
+                        .read_for(
+                            haider_platform::phase_trace::StoreReadCaller::HookProjection,
+                            session_id,
+                            through_seq.saturating_sub(1),
+                            1,
+                        )
                         .await?
                         .into_iter()
                         .find(|envelope| envelope.seq == through_seq)

@@ -409,7 +409,8 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
         let mut boundary = None;
         loop {
             let page = store
-                .read_reducer_page_with_boundary(
+                .read_reducer_page_with_boundary_for(
+                    haider_platform::phase_trace::StoreReadCaller::TurnRecovery,
                     &session_id,
                     cursor,
                     PAGE_SIZE,
@@ -1259,7 +1260,8 @@ async fn latest_run_state(
     let mut state = None;
     loop {
         let page = store
-            .read_reducer_page(
+            .read_reducer_page_for(
+                haider_platform::phase_trace::StoreReadCaller::TurnRecovery,
                 session_id,
                 cursor,
                 PAGE_SIZE,
@@ -2110,7 +2112,14 @@ async fn resumption_terminal_payloads(
     let mut reduction = RunReduction::default();
     let mut cursor = 0;
     loop {
-        let page = store.read(session_id, cursor, PAGE_SIZE).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::TurnRecovery,
+                session_id,
+                cursor,
+                PAGE_SIZE,
+            )
+            .await?;
         if page.is_empty() {
             break;
         }

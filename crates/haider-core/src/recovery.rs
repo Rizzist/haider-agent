@@ -108,7 +108,8 @@ async fn gather_effect_recovery_evidence<S: StoreHandle + ?Sized>(
     let mut cursor = 0;
     loop {
         let page = store
-            .read_reducer_page(
+            .read_reducer_page_for(
+                haider_platform::phase_trace::StoreReadCaller::CoreRecovery,
                 session_id,
                 cursor,
                 RECOVERY_PAGE_SIZE,
@@ -515,7 +516,8 @@ async fn read_startup_recovery_page<S: StoreHandle + ?Sized>(
     cursor: u64,
 ) -> Result<Vec<RawEnvelope>, HaiderError> {
     store
-        .read_reducer_page(
+        .read_reducer_page_for(
+            haider_platform::phase_trace::StoreReadCaller::CoreRecovery,
             session_id,
             cursor,
             RECOVERY_PAGE_SIZE,

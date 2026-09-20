@@ -124,6 +124,24 @@ class PhaseAttributionTests(unittest.TestCase):
         )
         self.assertEqual(result["detail"]["store_query_reducer"]["events_decoded"], 7)
 
+    def test_store_caller_splits_query_and_decode_without_double_counting_wall(self):
+        query = record("store_query_reducer", 120, 180, 5)
+        query["store_caller"] = "actor_narrative"
+        query["counters"] = {"rows_read": 7, "payload_bytes": 65_536}
+        decode = record("store_event_decode", 130, 170, 6)
+        decode["store_caller"] = "actor_narrative"
+        decode["counters"] = {
+            "rows_read": 7,
+            "payload_bytes": 65_536,
+            "events_decoded": 7,
+        }
+        result = self.build([query, decode])
+        caller = result["store_callers"]["actor_narrative"]
+        self.assertEqual(caller["store_query_reducer"]["records"], 1)
+        self.assertEqual(caller["store_query_reducer"]["wall_ns"], 20)
+        self.assertEqual(caller["store_event_decode"]["wall_ns"], 40)
+        self.assertEqual(caller["store_event_decode"]["events_decoded"], 7)
+
     def test_store_lock_wait_yields_wall_to_active_holder(self):
         result = self.build([
             record("store_owner_lock_wait", 110, 190, waiting=True),
@@ -166,11 +184,37 @@ class PhaseAttributionTests(unittest.TestCase):
             path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
             records, _ = read_records(root)
             self.assertEqual(records[0]["counters"], dict.fromkeys(COUNTERS, 0))
-            for schema in (2, 3):
+            for schema in (2, 3, 4):
                 header["schema"] = schema
                 path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
                 with self.assertRaisesRegex(ValueError, f"v{schema} record has no counters"):
                     read_records(root)
+
+    def test_reader_accepts_only_frozen_v4_store_callers_on_store_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "phase-1.jsonl"
+            header = {"schema": 4, "pid": 1, "dropped": 0, "records": 1,
+                      "clock": "CLOCK_MONOTONIC",
+                      "cpu_clock": "CLOCK_THREAD_CPUTIME_ID"}
+            row = record("store_event_decode", 1, 2)
+            row.pop("pid")
+            row["counters"] = {}
+            row["store_caller"] = "prompt_history"
+            path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
+            records, _ = read_records(root)
+            self.assertEqual(records[0]["store_caller"], "prompt_history")
+
+            row["store_caller"] = "user-controlled"
+            path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
+            with self.assertRaisesRegex(ValueError, "invalid store caller"):
+                read_records(root)
+
+            row["store_caller"] = "prompt_history"
+            row["phase"] = "rpc"
+            path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
+            with self.assertRaisesRegex(ValueError, "invalid store caller"):
+                read_records(root)
 
     def test_json_cli_enables_phases_and_explicit_off_is_available(self):
         from turn_wall_harness import _arguments

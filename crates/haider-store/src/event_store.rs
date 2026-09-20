@@ -2857,7 +2857,8 @@ impl Store {
             let checkpoint_cursor = cursor;
             let mut boundary = None;
             loop {
-                let page = self.read_reducer_page_with_boundary(
+                let page = self.read_reducer_page_with_boundary_for(
+                    haider_platform::phase_trace::StoreReadCaller::UsageBackfill,
                     &session_id,
                     cursor,
                     REPLAY_PAGE_SIZE,
@@ -14099,6 +14100,78 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Reads an envelope-count-bounded replay page attributed to one frozen
+    /// consumer family.
+    pub fn read_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<RawEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut query_phase = haider_platform::phase_trace::store_scope_for(
+            haider_platform::phase_trace::Phase::StoreQueryReplay,
+            caller,
+        );
+        let trace_enabled = query_phase.enabled();
+        let connection = self.connection()?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT seq, envelope_json, event_id, committed_at_ms
+                 FROM events
+                 WHERE session_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC
+                 LIMIT ?3",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query(params![
+                session.as_str(),
+                to_sqlite_integer(since_seq)?,
+                limit
+            ])
+            .map_err(map_sqlite_error)?;
+        let mut envelopes = Vec::new();
+        let mut decode_phase = trace_enabled.then(|| {
+            haider_platform::phase_trace::store_scope_for(
+                haider_platform::phase_trace::Phase::StoreEventDecode,
+                caller,
+            )
+        });
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+            let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
+            let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
+            let envelope = decode_envelope_column(&connection, row, 1).map_err(|error| {
+                corrupt(format!(
+                    "invalid envelope for session {session}, seq {stored_seq}: {error}"
+                ))
+            })?;
+            validate_stored_envelope(
+                session,
+                stored_seq,
+                &stored_event_id,
+                stored_committed_at_ms,
+                &envelope,
+            )?;
+            if let Some(phase) = decode_phase.as_mut() {
+                let weight = envelope_weight_bytes(&envelope);
+                phase.note_rows_read(1);
+                phase.note_payload_bytes(weight);
+                phase.note_event_decoded();
+                query_phase.note_rows_read(1);
+                query_phase.note_payload_bytes(weight);
+            }
+            envelopes.push(envelope);
+        }
+        canonicalize_reply_page(&mut envelopes);
+        Ok(envelopes)
+    }
+
     /// Reads one true-weight-budgeted replay page: committed envelopes with
     /// `seq > since_seq` in sequence order.
     ///
@@ -14119,11 +14192,29 @@ impl Store {
         max_envelopes: usize,
         byte_budget: usize,
     ) -> StoreResult<Vec<RawEnvelope>> {
+        self.read_page_for(
+            haider_platform::phase_trace::StoreReadCaller::Unattributed,
+            session,
+            since_seq,
+            max_envelopes,
+            byte_budget,
+        )
+    }
+
+    pub fn read_page_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session: &SessionId,
+        since_seq: u64,
+        max_envelopes: usize,
+        byte_budget: usize,
+    ) -> StoreResult<Vec<RawEnvelope>> {
         if max_envelopes == 0 {
             return Ok(Vec::new());
         }
-        let mut query_phase = haider_platform::phase_trace::store_scope(
+        let mut query_phase = haider_platform::phase_trace::store_scope_for(
             haider_platform::phase_trace::Phase::StoreQueryReplay,
+            caller,
         );
         let trace_enabled = query_phase.enabled();
         let connection = self.connection()?;
@@ -14148,8 +14239,9 @@ impl Store {
         let mut envelopes = Vec::new();
         let mut spent = 0_usize;
         let mut decode_phase = trace_enabled.then(|| {
-            haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::store_scope_for(
                 haider_platform::phase_trace::Phase::StoreEventDecode,
+                caller,
             )
         });
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
@@ -14207,27 +14299,50 @@ impl Store {
         byte_budget: usize,
         payload_kinds: &[&str],
     ) -> StoreResult<Vec<RawEnvelope>> {
-        if limit == 0 || payload_kinds.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query_phase = haider_platform::phase_trace::store_scope(
-            haider_platform::phase_trace::Phase::StoreQueryReducer,
-        );
-        let connection = self.connection()?;
-        let filtered = read_reducer_page_with_connection(
-            &connection,
+        self.read_reducer_page_for(
+            haider_platform::phase_trace::StoreReadCaller::Unattributed,
             session,
             since_seq,
             limit,
             byte_budget,
             payload_kinds,
+        )
+    }
+
+    pub fn read_reducer_page_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &[&str],
+    ) -> StoreResult<Vec<RawEnvelope>> {
+        if limit == 0 || payload_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query_phase = haider_platform::phase_trace::store_scope_for(
+            haider_platform::phase_trace::Phase::StoreQueryReducer,
+            caller,
+        );
+        let connection = self.connection()?;
+        let filtered = read_reducer_page_with_connection(
+            &connection,
+            ReducerPageQuery {
+                caller,
+                session,
+                since_seq,
+                limit,
+                byte_budget,
+                payload_kinds,
+            },
             &mut query_phase,
         );
         drop(connection);
         match filtered {
             Ok(envelopes) => Ok(envelopes),
             Err(FilteredReadError::Decode) => {
-                self.read_page(session, since_seq, limit, byte_budget)
+                self.read_page_for(caller, session, since_seq, limit, byte_budget)
             }
             Err(FilteredReadError::Store(error)) => Err(error),
         }
@@ -14245,24 +14360,47 @@ impl Store {
         byte_budget: usize,
         payload_kinds: &[&str],
     ) -> StoreResult<ReducerPage> {
+        self.read_reducer_page_with_boundary_for(
+            haider_platform::phase_trace::StoreReadCaller::Unattributed,
+            session,
+            since_seq,
+            limit,
+            byte_budget,
+            payload_kinds,
+        )
+    }
+
+    pub fn read_reducer_page_with_boundary_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &[&str],
+    ) -> StoreResult<ReducerPage> {
         if limit == 0 || payload_kinds.is_empty() {
             return Ok(ReducerPage {
                 envelopes: Vec::new(),
                 observed_head: None,
             });
         }
-        let mut query_phase = haider_platform::phase_trace::store_scope(
+        let mut query_phase = haider_platform::phase_trace::store_scope_for(
             haider_platform::phase_trace::Phase::StoreQueryReducer,
+            caller,
         );
         let connection = self.connection()?;
         let boundary = journal_boundary_with_connection(&connection, session)?;
         let filtered = read_reducer_page_with_connection(
             &connection,
-            session,
-            since_seq,
-            limit,
-            byte_budget,
-            payload_kinds,
+            ReducerPageQuery {
+                caller,
+                session,
+                since_seq,
+                limit,
+                byte_budget,
+                payload_kinds,
+            },
             &mut query_phase,
         );
         drop(connection);
@@ -14272,7 +14410,7 @@ impl Store {
                 observed_head: boundary,
             }),
             Err(FilteredReadError::Decode) => self
-                .read_page(session, since_seq, limit, byte_budget)
+                .read_page_for(caller, session, since_seq, limit, byte_budget)
                 .map(|envelopes| ReducerPage {
                     envelopes,
                     observed_head: None,
@@ -21863,66 +22001,12 @@ impl EventStore for Store {
         since_seq: u64,
         limit: usize,
     ) -> StoreResult<Vec<RawEnvelope>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let mut query_phase = haider_platform::phase_trace::store_scope(
-            haider_platform::phase_trace::Phase::StoreQueryReplay,
-        );
-        let trace_enabled = query_phase.enabled();
-        let connection = self.connection()?;
-        // A limit beyond i64::MAX is effectively unbounded; clamp, don't error.
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut statement = connection
-            .prepare_cached(
-                "SELECT seq, envelope_json, event_id, committed_at_ms
-                 FROM events
-                 WHERE session_id = ?1 AND seq > ?2
-                 ORDER BY seq ASC
-                 LIMIT ?3",
-            )
-            .map_err(map_sqlite_error)?;
-        let mut rows = statement
-            .query(params![
-                session.as_str(),
-                to_sqlite_integer(since_seq)?,
-                limit
-            ])
-            .map_err(map_sqlite_error)?;
-        let mut envelopes = Vec::new();
-        let mut decode_phase = trace_enabled.then(|| {
-            haider_platform::phase_trace::store_scope(
-                haider_platform::phase_trace::Phase::StoreEventDecode,
-            )
-        });
-        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-            let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
-            let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
-            let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-            let envelope = decode_envelope_column(&connection, row, 1).map_err(|error| {
-                corrupt(format!(
-                    "invalid envelope for session {session}, seq {stored_seq}: {error}"
-                ))
-            })?;
-            validate_stored_envelope(
-                session,
-                stored_seq,
-                &stored_event_id,
-                stored_committed_at_ms,
-                &envelope,
-            )?;
-            if let Some(phase) = decode_phase.as_mut() {
-                let weight = envelope_weight_bytes(&envelope);
-                phase.note_rows_read(1);
-                phase.note_payload_bytes(weight);
-                phase.note_event_decoded();
-                query_phase.note_rows_read(1);
-                query_phase.note_payload_bytes(weight);
-            }
-            envelopes.push(envelope);
-        }
-        canonicalize_reply_page(&mut envelopes);
-        Ok(envelopes)
+        self.read_for(
+            haider_platform::phase_trace::StoreReadCaller::Unattributed,
+            session,
+            since_seq,
+            limit,
+        )
     }
 
     fn latest_seq(&self, session: &SessionId) -> StoreResult<u64> {
@@ -25510,15 +25594,28 @@ enum FilteredReadError {
     Store(HaiderError),
 }
 
-fn read_reducer_page_with_connection(
-    connection: &Connection,
-    session: &SessionId,
+struct ReducerPageQuery<'a> {
+    caller: haider_platform::phase_trace::StoreReadCaller,
+    session: &'a SessionId,
     since_seq: u64,
     limit: usize,
     byte_budget: usize,
-    payload_kinds: &[&str],
+    payload_kinds: &'a [&'a str],
+}
+
+fn read_reducer_page_with_connection(
+    connection: &Connection,
+    query: ReducerPageQuery<'_>,
     query_phase: &mut haider_platform::phase_trace::StoreScope,
 ) -> Result<Vec<RawEnvelope>, FilteredReadError> {
+    let ReducerPageQuery {
+        caller,
+        session,
+        since_seq,
+        limit,
+        byte_budget,
+        payload_kinds,
+    } = query;
     let trace_enabled = query_phase.enabled();
     let (sql, parameter_capacity) = reducer_page_sql(payload_kinds.len())?;
     let mut parameters = Vec::with_capacity(parameter_capacity);
@@ -25544,8 +25641,9 @@ fn read_reducer_page_with_connection(
     let mut envelopes = Vec::new();
     let mut spent = 0_usize;
     let mut decode_phase = trace_enabled.then(|| {
-        haider_platform::phase_trace::store_scope(
+        haider_platform::phase_trace::store_scope_for(
             haider_platform::phase_trace::Phase::StoreEventDecode,
+            caller,
         )
     });
     while let Some(row) = rows

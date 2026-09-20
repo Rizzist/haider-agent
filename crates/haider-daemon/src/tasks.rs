@@ -1261,7 +1261,12 @@ impl TaskFacade {
         loop {
             let page = self
                 .hub
-                .read_internal_session(session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Tasks,
+                    session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -1373,7 +1378,12 @@ impl TaskFacade {
         loop {
             let page = self
                 .hub
-                .read_internal_session(session_id, cursor, 256)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Tasks,
+                    session_id,
+                    cursor,
+                    256,
+                )
                 .await?;
             if page.is_empty() {
                 return Ok(scan);

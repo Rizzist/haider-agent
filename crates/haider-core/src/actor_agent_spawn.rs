@@ -121,7 +121,12 @@ impl HarnessActor {
         loop {
             let page = self
                 .store
-                .read(&self.config.session_id, cursor, 256)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::ActorAgentSpawn,
+                    &self.config.session_id,
+                    cursor,
+                    256,
+                )
                 .await
                 .map_err(DriveError::Store)?;
             if page.is_empty() {
@@ -273,7 +278,12 @@ impl HarnessActor {
         loop {
             let page = self
                 .store
-                .read(&self.config.session_id, cursor, 256)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::ActorAgentSpawn,
+                    &self.config.session_id,
+                    cursor,
+                    256,
+                )
                 .await
                 .map_err(DriveError::Store)?;
             if page.is_empty() {

@@ -15,7 +15,8 @@ from typing import Any
 ENV = "HAIDER_PHASE_TRACE_DIR"
 # Specific work overrides enclosing transport/tool waits. Schema v2 added the
 # CAS phases/counters; v3 adds the store residual split and content-free page
-# counters. The reader remains compatible with both earlier trace schemas.
+# counters; v4 adds a frozen caller family to page records. The reader remains
+# compatible with all earlier trace schemas.
 PHASES = (
     "client_control", "turn_control", "turn_setup", "lockdown_bind_activate", "store_access",
     "submit", "rpc", "tool_dispatch", "completion_render", "spawn",
@@ -37,6 +38,20 @@ COUNTERS = (
     "bytes_read", "blocks_hashed", "reverify_calls", "rows_read",
     "payload_bytes", "events_decoded",
 )
+STORE_CALLERS = (
+    "attachment_replay", "usage_report", "usage_backfill", "prompt_history",
+    "core_recovery", "actor_narrative", "actor_tool_repair", "actor_control",
+    "actor_agent_spawn", "turn_recovery",
+    "startup_hydration", "native_pipe", "warm_journal_projection",
+    "turn_setup_reduction", "worker_run_heads", "worker_user_command",
+    "worker_user_messages", "worker_effects", "worker_queue", "worker_workspace",
+    "worker_compaction", "worker_plan_menus", "worker_cache_context",
+    "worker_budget", "worker_tool_state", "worker_permission", "worker_replay",
+    "provider_rebind", "session_hub_actor", "session_hub_rpc", "descendant_stream",
+    "hook_projection", "foreground_capture", "delegation", "completion", "tasks",
+    "monitor", "peer_delivery", "cache_policy", "accounts", "evidence",
+)
+CALLER_PHASES = ("store_query_replay", "store_query_reducer", "store_event_decode")
 
 
 def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
@@ -48,7 +63,7 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
             raise ValueError(f"empty phase trace: {path.name}")
         header = json.loads(lines[0])
         schema = header.get("schema")
-        if (schema not in (1, 2, 3) or header.get("dropped") != 0
+        if (schema not in (1, 2, 3, 4) or header.get("dropped") != 0
                 or type(header.get("records")) is not int
                 or header["records"] != len(lines) - 1
                 or header.get("clock") != "CLOCK_MONOTONIC"
@@ -69,7 +84,7 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
                 raise ValueError("invalid phase interval")
             if row["waiting"] and row["cpu_ns"]:
                 raise ValueError("wait interval charged CPU")
-            if schema in (2, 3) and "counters" not in row:
+            if schema in (2, 3, 4) and "counters" not in row:
                 raise ValueError(f"phase trace v{schema} record has no counters")
             counters = row.get("counters", {})
             if not isinstance(counters, dict) or any(
@@ -78,6 +93,11 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
             ):
                 raise ValueError("invalid phase counters")
             row["counters"] = {key: counters.get(key, 0) for key in COUNTERS}
+            caller = row.get("store_caller")
+            if caller is not None and (
+                schema != 4 or caller not in STORE_CALLERS or row["phase"] not in CALLER_PHASES
+            ):
+                raise ValueError("invalid store caller attribution")
             records.append({**row, "pid": pid})
     return records, pids
 
@@ -90,6 +110,13 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
     rows = {
         name: {"wall_ns": 0, "cpu_ns": 0, "records": 0, **dict.fromkeys(COUNTERS, 0)}
         for name in ALL_PHASES
+    }
+    caller_rows = {
+        caller: {
+            phase: {"wall_ns": 0, "cpu_ns": 0, "records": 0, **dict.fromkeys(COUNTERS, 0)}
+            for phase in CALLER_PHASES
+        }
+        for caller in STORE_CALLERS
     }
     events: dict[int, list[tuple[bool, int]]] = {start_ns: [], end_ns: []}
     selected: list[dict[str, Any]] = []
@@ -124,12 +151,20 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
         events.setdefault(b, []).append((False, index))
         phase = rows[record["phase"]]
         phase["records"] += 1
+        caller_phase = None
+        if record.get("store_caller") is not None:
+            caller_phase = caller_rows[record["store_caller"]][record["phase"]]
+            caller_phase["records"] += 1
         counters = record.get("counters", {})
         # Never prorate CPU across a sample boundary: unknown distribution.
         if record["start_ns"] >= a and record["end_ns"] <= b:
             phase["cpu_ns"] += record["cpu_ns"]
+            if caller_phase is not None:
+                caller_phase["cpu_ns"] += record["cpu_ns"]
             for key in COUNTERS:
                 phase[key] += counters.get(key, 0)
+                if caller_phase is not None:
+                    caller_phase[key] += counters.get(key, 0)
         else:
             if record["cpu_ns"]:
                 boundary_cpu_records += 1
@@ -144,7 +179,10 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
             heapq.heappop(heap)
         elapsed = at - prior
         if heap:
-            rows[selected[heap[0][2]]["phase"]]["wall_ns"] += elapsed
+            winner = selected[heap[0][2]]
+            rows[winner["phase"]]["wall_ns"] += elapsed
+            if winner.get("store_caller") is not None:
+                caller_rows[winner["store_caller"]][winner["phase"]]["wall_ns"] += elapsed
         else:
             wall_residual += elapsed
         for entering, index in changes:
@@ -187,13 +225,17 @@ def partition(records: list[dict[str, Any]], *, start_ns: int, end_ns: int,
             raise ValueError(f"phase rollup does not reconcile: {key}")
     missing = sorted(set(expected_pids) - set(available_pids))
     return {
-        "schema": "haider.phase_attribution.v2",
+        "schema": "haider.phase_attribution.v4",
         "status": "missing_process_traces" if missing else "partial_attribution",
         "wall_policy": "active_before_wait_then_phase_priority_v2",
         "wall_priority_low_to_high": list(ALL_PHASES),
         "cpu_policy": "exclusive_thread_cpu_per_active_poll; separate_daemon_reaped_child_counter",
         "total": {"wall_ns": end_ns - start_ns, "cpu_ns": cpu_ns},
-        "phases": phases, "detail": detail, "residual": residual,
+        "phases": phases, "detail": detail, "store_callers": {
+            caller: phases
+            for caller, phases in caller_rows.items()
+            if any(phase["records"] for phase in phases.values())
+        }, "residual": residual,
         "residual_includes": ["pre-main and dynamic link", "uninstrumented work",
                               "trace bookkeeping and flush", "child CPU when no independent counter is available"],
         "missing_pids": missing, "boundary_cpu_records": boundary_cpu_records,

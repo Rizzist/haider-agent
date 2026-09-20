@@ -1,17 +1,20 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
+use haider_core::{BranchCreateCommand, BranchCreateOutcome, SessionCreateCommand};
 use haider_protocol::EventPayload;
-use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::history::{NodeKind, TreeNode};
-use haider_protocol::ids::{DeviceId, EventId, ItemId, NodeId, RunId};
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION, write_envelope_messagepack,
+};
+use haider_protocol::history::{CompactionResume, NodeKind, TreeNode};
+use haider_protocol::ids::{ArtifactRef, BranchId, DeviceId, EventId, ItemId, NodeId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::state::RunState;
 
 fn state_envelope(session_id: &SessionId, ordinal: u64) -> RawEnvelope {
     EventEnvelope {
         schema_version: SCHEMA_VERSION,
-        event_id: EventId::new(format!("pipe-head-{ordinal}")),
+        event_id: EventId::new(format!("{session_id}-pipe-head-{ordinal}")),
         seq: 0,
         session_id: session_id.clone(),
         branch_id: None,
@@ -44,9 +47,9 @@ async fn append_one(
     envelopes.into_iter().next().expect("one envelope")
 }
 
-/// MUTATION CHECK: restore the unconditional `latest_seq` call in the known
-/// sidecar branch. The in-sync assertion observes one store read instead of
-/// zero. Remove lag detection and the trailing-cursor assertion observes zero.
+/// MUTATION CHECK: discard the verified cached projector on a head-only wake.
+/// The suffix-row assertion stays zero because the old path reconstructs a
+/// full join window instead of consuming exactly the two missed commits.
 #[tokio::test]
 async fn hot_batch_uses_stamped_head_unless_the_sidecar_cursor_trails() {
     let root = tempfile::tempdir().expect("temp profile");
@@ -61,6 +64,8 @@ async fn hot_batch_uses_stamped_head_unless_the_sidecar_cursor_trails() {
         .expect("first-touch rebuild succeeds");
 
     writer.journal_head_reads.store(0, Ordering::Relaxed);
+    writer.cached_suffix_reads.store(0, Ordering::Relaxed);
+    writer.cached_suffix_rows.store(0, Ordering::Relaxed);
     let second = append_one(&store, &session_id, 2).await;
     writer
         .maintain(
@@ -79,7 +84,9 @@ async fn hot_batch_uses_stamped_head_unless_the_sidecar_cursor_trails() {
         .maintain(&store, &session_id, &[], fourth.seq)
         .await
         .expect("coalesced head wake reconciles the trailing cursor");
-    assert_eq!(writer.journal_head_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(writer.journal_head_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(writer.cached_suffix_reads.load(Ordering::Relaxed), 2);
+    assert_eq!(writer.cached_suffix_rows.load(Ordering::Relaxed), 2);
 
     drop(writer);
     store.close().await.expect("store closes");
@@ -90,6 +97,96 @@ fn projected_envelope(session_id: &SessionId, ordinal: u64, payload: EventPayloa
     envelope.seq = ordinal;
     *envelope.payload = serde_json::to_value(payload).expect("payload serializes");
     envelope
+}
+
+fn user_node_envelope(
+    session_id: &SessionId,
+    ordinal: u64,
+    branch_id: Option<BranchId>,
+    text: &str,
+) -> RawEnvelope {
+    let mut envelope = projected_envelope(
+        session_id,
+        ordinal,
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new(format!("pipe-user-node-{ordinal}")),
+            parent: None,
+            kind: NodeKind::UserTurn {
+                text: text.into(),
+                attachments: Vec::new(),
+            },
+        }),
+    );
+    envelope.branch_id = branch_id;
+    envelope
+}
+
+fn projected_sidecar_values(
+    writer: &PipeNativeWriter,
+    session_id: &SessionId,
+) -> Vec<serde_json::Value> {
+    let base = writer.sidecar_path(session_id).expect("sidecar path");
+    reachable_sidecar_paths(&base, session_id)
+        .expect("reachable sidecar chain")
+        .into_iter()
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .expect("sidecar segment reads")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("sidecar JSON"))
+                .filter(|value| {
+                    value.get("pipe").is_none()
+                        && value.get("coverage").is_none()
+                        && value.get("segment_end").is_none()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn remove_sidecar_chain(writer: &PipeNativeWriter, session_id: &SessionId) {
+    let base = writer.sidecar_path(session_id).expect("sidecar path");
+    let paths = reachable_sidecar_paths(&base, session_id).expect("reachable sidecar chain");
+    for path in paths {
+        std::fs::remove_file(path).expect("remove derived sidecar segment");
+    }
+}
+
+async fn create_branch(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    branch_id: BranchId,
+    source_branch_id: Option<BranchId>,
+    fork_node_id: NodeId,
+    fork_seq: u64,
+) {
+    let command_id = format!("create-{branch_id}");
+    let request_json = serde_json::json!({
+        "session_id": session_id,
+        "worker_generation": store.worker_generation(),
+        "source_branch_id": source_branch_id,
+        "fork_node_id": fork_node_id,
+        "fork_seq": fork_seq,
+    })
+    .to_string();
+    let result = store
+        .create_branch(BranchCreateCommand {
+            command_id: command_id.clone(),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            branch_id,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            name: None,
+            event_id: EventId::new(format!("{session_id}-{command_id}")),
+            device_id: DeviceId::new("pipe-head-device"),
+        })
+        .await
+        .expect("create branch");
+    assert!(matches!(result, BranchCreateOutcome::Committed { .. }));
 }
 
 /// MUTATION CHECK: pass the current batch head instead of the latest
@@ -145,6 +242,342 @@ fn queued_head_delays_unresolved_tool_eof_flush() {
     )
     .expect("latest queued batch renders");
     assert!(second.contains("\"name\":\"shell\""));
+}
+
+#[tokio::test]
+async fn incremental_projection_matches_cold_oracle_across_branch_compaction_fork_and_reopen() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let writer = PipeNativeWriter::new(root.path());
+    let session_id = SessionId::new("pipe-incremental-oracle");
+    let branch_a = BranchId::new("pipe-branch-a");
+    let branch_b = BranchId::new("pipe-branch-b");
+    store
+        .create_session(SessionCreateCommand {
+            command_id: "create-pipe-incremental-oracle".into(),
+            request_digest: "create-pipe-incremental-oracle-digest".into(),
+            request_json: r#"{"session":"pipe-incremental-oracle"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: root.path().to_string_lossy().into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4_096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "pipe-native-test-v1".into(),
+            event_id: EventId::new("pipe-incremental-oracle-created"),
+            device_id: DeviceId::new("pipe-head-device"),
+        })
+        .await
+        .expect("create owned session");
+
+    let mut first = vec![
+        user_node_envelope(&session_id, 1, None, "parent branch one"),
+        projected_envelope(&session_id, 2, EventPayload::RunState(RunState::Done)),
+    ];
+    store.append(&mut first).await.expect("append first branch");
+    writer
+        .maintain(&store, &session_id, &first, first[1].seq)
+        .await
+        .expect("initial projection");
+
+    create_branch(
+        &store,
+        &session_id,
+        branch_a.clone(),
+        None,
+        NodeId::new("pipe-user-node-1"),
+        first[0].seq,
+    )
+    .await;
+    let mut branch_a_suffix = vec![
+        user_node_envelope(&session_id, 4, Some(branch_a.clone()), "parent branch two"),
+        projected_envelope(&session_id, 5, EventPayload::RunState(RunState::Done)),
+    ];
+    for envelope in &mut branch_a_suffix {
+        envelope.run_id = Some(RunId::new("pipe-branch-a-run"));
+    }
+    branch_a_suffix[1].branch_id = Some(branch_a.clone());
+    store
+        .append(&mut branch_a_suffix)
+        .await
+        .expect("append first named branch");
+    create_branch(
+        &store,
+        &session_id,
+        branch_b.clone(),
+        Some(branch_a),
+        NodeId::new("pipe-user-node-4"),
+        branch_a_suffix[0].seq,
+    )
+    .await;
+
+    let mut suffix = vec![
+        projected_envelope(
+            &session_id,
+            7,
+            EventPayload::NodeCommitted(TreeNode {
+                node: NodeId::new("pipe-compaction-node"),
+                parent: None,
+                kind: NodeKind::Compaction {
+                    covers_from: NodeId::new("pipe-user-node-1"),
+                    covers_to: NodeId::new("pipe-user-node-4"),
+                    summary_artifact: ArtifactRef::new("pipe-summary-artifact"),
+                    tokens_before: 100,
+                    tokens_after: 10,
+                    resume_cause: CompactionResume::AutoMidTurn,
+                },
+            }),
+        ),
+        projected_envelope(&session_id, 8, EventPayload::RunState(RunState::Done)),
+    ];
+    for envelope in &mut suffix {
+        envelope.run_id = Some(RunId::new("pipe-branch-b-run"));
+    }
+    suffix[0].branch_id = Some(branch_b.clone());
+    suffix[1].branch_id = Some(branch_b);
+    store
+        .append(&mut suffix)
+        .await
+        .expect("append branch suffix");
+    writer
+        .maintain(&store, &session_id, &[], suffix[1].seq)
+        .await
+        .expect("missed-commit suffix projection");
+    let hot = projected_sidecar_values(&writer, &session_id);
+
+    writer.release_clean(&session_id);
+    remove_sidecar_chain(&writer, &session_id);
+    let oracle = PipeNativeWriter::new(root.path());
+    oracle
+        .maintain(&store, &session_id, &[], suffix[1].seq)
+        .await
+        .expect("from-scratch oracle projection");
+    assert_eq!(projected_sidecar_values(&oracle, &session_id), hot);
+
+    let child_session = SessionId::new("pipe-incremental-oracle-child");
+    let mut child = [user_node_envelope(
+        &child_session,
+        1,
+        None,
+        "fork child stays isolated",
+    )];
+    store.append(&mut child).await.expect("append fork child");
+    oracle
+        .maintain(&store, &child_session, &child, child[0].seq)
+        .await
+        .expect("project fork child");
+    assert!(
+        projected_sidecar_values(&oracle, &child_session)
+            .iter()
+            .any(|value| value.to_string().contains("fork child stays isolated"))
+    );
+    assert_eq!(projected_sidecar_values(&oracle, &session_id), hot);
+
+    oracle.release_clean(&session_id);
+    oracle.release_clean(&child_session);
+    store.close().await.expect("close first store");
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store");
+    let restarted = PipeNativeWriter::new(root.path());
+    restarted
+        .maintain(&reopened, &session_id, &[], suffix[1].seq)
+        .await
+        .expect("reopen projection");
+    assert_eq!(projected_sidecar_values(&restarted, &session_id), hot);
+    drop(restarted);
+    reopened.close().await.expect("close reopened store");
+}
+
+#[tokio::test]
+async fn cached_revision_rebuilds_on_same_sequence_replacement_and_truncation() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let writer = PipeNativeWriter::new(root.path());
+    let session_id = SessionId::new("pipe-revision-fence");
+    let mut events = vec![
+        user_node_envelope(&session_id, 1, None, "retained one"),
+        user_node_envelope(&session_id, 2, None, "retained two"),
+        user_node_envelope(&session_id, 3, None, "truncated three"),
+    ];
+    store
+        .append(&mut events)
+        .await
+        .expect("append revision fixture");
+    writer
+        .maintain(&store, &session_id, &events, events[2].seq)
+        .await
+        .expect("initial revision projection");
+    let generation = writer
+        .confirmed_coverage(&session_id)
+        .expect("initial coverage")
+        .1;
+
+    store.close().await.expect("close before head replacement");
+    let mut replacement = user_node_envelope(&session_id, 3, None, "replacement three");
+    replacement.seq = events[2].seq;
+    replacement.event_id = EventId::new("pipe-revision-replacement-event");
+    replacement.committed_at_ms = events[2].committed_at_ms;
+    let mut encoded_replacement = Vec::new();
+    write_envelope_messagepack(&mut encoded_replacement, &replacement)
+        .expect("encode replacement envelope");
+    let raw = rusqlite::Connection::open(root.path().join("store.sqlite"))
+        .expect("open raw journal for replacement");
+    raw.execute(
+        "UPDATE events SET envelope_json = ?3, event_id = ?4
+         WHERE session_id = ?1 AND seq = ?2",
+        rusqlite::params![
+            session_id.as_str(),
+            i64::try_from(events[2].seq).expect("test seq fits SQLite"),
+            encoded_replacement,
+            replacement.event_id.as_str(),
+        ],
+    )
+    .expect("replace journal head at the same sequence");
+    drop(raw);
+    let replaced = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen replaced store");
+    writer
+        .maintain(&replaced, &session_id, &[], replacement.seq)
+        .await
+        .expect("same-sequence mismatch rebuilds");
+    assert!(
+        writer
+            .confirmed_coverage(&session_id)
+            .expect("replacement coverage")
+            .1
+            > generation
+    );
+    let projected = projected_sidecar_values(&writer, &session_id);
+    assert!(
+        projected
+            .iter()
+            .any(|value| value.to_string().contains("replacement three"))
+    );
+
+    replaced.close().await.expect("close before truncation");
+    let raw =
+        rusqlite::Connection::open(root.path().join("store.sqlite")).expect("open raw journal");
+    raw.pragma_update(None, "foreign_keys", false)
+        .expect("disable derived-row foreign keys for truncation fixture");
+    raw.execute(
+        "DELETE FROM events WHERE session_id = ?1 AND seq > 2",
+        [session_id.as_str()],
+    )
+    .expect("truncate journal");
+    drop(raw);
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen truncated store");
+
+    writer
+        .maintain(&reopened, &session_id, &[], 2)
+        .await
+        .expect("truncated authority rebuilds");
+    let projected = projected_sidecar_values(&writer, &session_id);
+    assert!(
+        projected
+            .iter()
+            .any(|value| value.to_string().contains("retained one"))
+    );
+    assert!(
+        projected
+            .iter()
+            .any(|value| value.to_string().contains("retained two"))
+    );
+    assert!(
+        projected
+            .iter()
+            .all(|value| !value.to_string().contains("replacement three"))
+    );
+    drop(writer);
+    reopened.close().await.expect("close truncated store");
+}
+
+#[tokio::test]
+async fn cached_and_cold_projection_refuse_the_same_corrupt_matching_envelope() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let writer = PipeNativeWriter::new(root.path());
+    let session_id = SessionId::new("pipe-corrupt-suffix");
+    let mut first = [user_node_envelope(&session_id, 1, None, "valid prefix")];
+    store.append(&mut first).await.expect("append valid prefix");
+    writer
+        .maintain(&store, &session_id, &first, first[0].seq)
+        .await
+        .expect("project valid prefix");
+    let mut corrupt = [user_node_envelope(&session_id, 2, None, "corrupt suffix")];
+    store
+        .append(&mut corrupt)
+        .await
+        .expect("append corrupt target");
+    store.close().await.expect("close before corruption");
+    let raw =
+        rusqlite::Connection::open(root.path().join("store.sqlite")).expect("open raw journal");
+    raw.execute(
+        "UPDATE events SET envelope_json = X'C1' WHERE event_id = ?1",
+        [corrupt[0].event_id.as_str()],
+    )
+    .expect("corrupt matching envelope");
+    drop(raw);
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen corrupt store");
+
+    let cached_error = writer
+        .maintain(&reopened, &session_id, &[], corrupt[0].seq)
+        .await
+        .expect_err("cached suffix must refuse corruption")
+        .into_store_error()
+        .expect("cached refusal preserves store error");
+    let cold = PipeNativeWriter::new(root.path());
+    let cold_error = cold
+        .maintain(&reopened, &session_id, &[], corrupt[0].seq)
+        .await
+        .expect_err("cold replay must refuse corruption")
+        .into_store_error()
+        .expect("cold refusal preserves store error");
+    assert_eq!(cached_error, cold_error);
+    drop(cold);
+    drop(writer);
+    reopened.close().await.expect("close corrupt store");
+}
+
+#[tokio::test]
+async fn reconciled_projection_cache_is_bounded_and_eviction_replays_authority() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let writer = PipeNativeWriter::new(root.path());
+    let first = SessionId::new("pipe-bounded-00");
+    for index in 0..=RECONCILED_SESSION_LIMIT {
+        let session_id = SessionId::new(format!("pipe-bounded-{index:02}"));
+        let event = append_one(&store, &session_id, 1).await;
+        writer
+            .maintain(&store, &session_id, std::slice::from_ref(&event), event.seq)
+            .await
+            .expect("project bounded session");
+    }
+    assert_eq!(writer.reconciled_count(), RECONCILED_SESSION_LIMIT);
+    assert_eq!(
+        writer.confirmed_coverage(&first),
+        None,
+        "oldest entry evicted"
+    );
+    writer
+        .maintain(&store, &first, &[], 1)
+        .await
+        .expect("evicted entry replays journal authority");
+    assert_eq!(writer.reconciled_count(), RECONCILED_SESSION_LIMIT);
+    assert_eq!(
+        writer.confirmed_coverage(&first).map(|value| value.0),
+        Some(1)
+    );
+    drop(writer);
+    store.close().await.expect("close store");
 }
 
 /// Keep the failed writer itself across the failure/retry boundary. A journal

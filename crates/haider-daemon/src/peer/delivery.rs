@@ -56,7 +56,12 @@ pub(super) async fn recover(hub: &SessionHub) -> Result<Outbox, PeerError> {
         let mut after = 0;
         loop {
             let events = hub
-                .read_internal_session(&session, after, PAGE_SIZE)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::PeerDelivery,
+                    &session,
+                    after,
+                    PAGE_SIZE,
+                )
                 .await
                 .map_err(SessionHubError::from)?;
             let full = events.len() == PAGE_SIZE;
@@ -171,7 +176,12 @@ impl PeerService {
         }
         let events = self
             .hub()?
-            .read_internal_session(&query.session_id, query.after_seq, PAGE_SIZE)
+            .read_internal_session_for(
+                haider_platform::phase_trace::StoreReadCaller::PeerDelivery,
+                &query.session_id,
+                query.after_seq,
+                PAGE_SIZE,
+            )
             .await
             .map_err(SessionHubError::from)?;
         let next_seq = events.last().map_or(query.after_seq, |event| event.seq);
@@ -204,7 +214,12 @@ impl PeerService {
         let hub = self.hub()?;
         loop {
             let events = hub
-                .read_internal_session(from, after, PAGE_SIZE)
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::PeerDelivery,
+                    from,
+                    after,
+                    PAGE_SIZE,
+                )
                 .await
                 .map_err(SessionHubError::from)?;
             let full = events.len() == PAGE_SIZE;

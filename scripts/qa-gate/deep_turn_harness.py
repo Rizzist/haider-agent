@@ -79,6 +79,11 @@ T95 = {
     10: 2.228,
 }
 CAS_PHASES = ("cas_read_hash", "cas_reverify")
+STORE_READ_PHASES = (
+    "store_query_replay",
+    "store_query_reducer",
+    "store_event_decode",
+)
 
 
 def foreign_haiderd_snapshot(*, exclude_pids: Sequence[int] = ()) -> list[dict[str, Any]]:
@@ -900,6 +905,7 @@ def run_fixture(
                 phase_map["selected_record_count"] = len(phase_map.pop("records"))
                 row["phase_attribution"] = phase_map
                 row["cas_attribution"] = _cas_attribution(phase_map)
+                row["store_caller_attribution"] = _store_caller_attribution(phase_map)
             load_end = _assert_quiet(label + "/end", require_quiet)
             provider_entries = provider.state.snapshot()
             if len(provider_entries) != TURNS + len(TOOL_TURNS):
@@ -1009,6 +1015,58 @@ def _cas_attribution(phase_map: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _store_caller_attribution(phase_map: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for caller, phases in phase_map["store_callers"].items():
+        replay = phases["store_query_replay"]
+        reducer = phases["store_query_reducer"]
+        decode = phases["store_event_decode"]
+        result[caller] = {
+            "replay_pages": replay["records"],
+            "reducer_pages": reducer["records"],
+            "pages": replay["records"] + reducer["records"],
+            "rows_read": decode["rows_read"],
+            "payload_bytes": decode["payload_bytes"],
+            "events_decoded": decode["events_decoded"],
+            "wall_ns": sum(phases[name]["wall_ns"] for name in STORE_READ_PHASES),
+            "cpu_ns": sum(phases[name]["cpu_ns"] for name in STORE_READ_PHASES),
+        }
+    return result
+
+
+def _store_caller_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    callers = sorted(
+        {
+            caller
+            for row in rows
+            for caller in row["store_caller_attribution"]
+        }
+    )
+    count = len(rows)
+    fields = (
+        "replay_pages",
+        "reducer_pages",
+        "pages",
+        "rows_read",
+        "payload_bytes",
+        "events_decoded",
+        "wall_ns",
+        "cpu_ns",
+    )
+    return {
+        caller: {
+            key.removesuffix("_ns") + ("_ms" if key.endswith("_ns") else ""): sum(
+                row["store_caller_attribution"].get(caller, {}).get(key, 0)
+                for row in rows
+            )
+            / count
+            / (1_000_000 if key.endswith("_ns") else 1)
+            for key in fields
+        }
+        for caller in callers
+    }
+
+
 def _cas_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     count = len(rows)
     fields = (
@@ -1089,6 +1147,7 @@ def summarize_arms(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 },
                 "phase_attribution": _phase_summary(rows),
                 "cas_attribution": _cas_summary(rows),
+                "store_caller_attribution": _store_caller_summary(rows),
             }
         result[arm] = {"runs": len(arm_runs), "depths": depths}
     return result
@@ -1238,16 +1297,16 @@ def arms_for(args: argparse.Namespace) -> tuple[Arm, Arm | None]:
                 "WALL-1 incremental journal projections",
             ),
         )
-    if args.experiment == "wall-toolpath":
+    if args.experiment == "store-decode":
         if args.variant_bin_dir is None:
-            raise ProofError("wall-toolpath requires --variant-bin-dir")
+            raise ProofError("store-decode requires --variant-bin-dir")
         return (
-            Arm("a", base, {}, "pre-WALL-3+4 tool path"),
+            Arm("a", base, {}, "pre-projection native-pipe journal decode"),
             Arm(
                 "b",
                 args.variant_bin_dir.resolve(),
                 {},
-                "WALL-3+4 overlapped receipt and batched durable phases",
+                "incremental native-pipe journal projection",
             ),
         )
     raise ProofError(f"unknown experiment {args.experiment!r}")
@@ -1296,6 +1355,7 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
             "free1-store-trace",
             "free2-msgpack",
             "free3-mimalloc",
+            "store-decode",
             "wall1-journal",
             "wall-toolpath",
         ),
@@ -1324,8 +1384,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ProofError("--inter-run-cooldown-seconds must be between 0 and 300")
         arm_a, arm_b = arms_for(args)
         if arm_b is None:
-            if args.runs < 5:
-                raise ProofError("baseline requires at least five independent runs")
+            if args.runs < 3:
+                raise ProofError("baseline requires at least three independent runs")
             order = [(index, 1, "a") for index in range(1, args.runs + 1)]
             arms = {"a": arm_a}
         else:

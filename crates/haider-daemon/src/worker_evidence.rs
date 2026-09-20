@@ -40,7 +40,14 @@ pub(super) async fn resolve(
     let mut end = store.latest_seq(session).await?;
     while end > 0 {
         let start = end.saturating_sub(256);
-        let page = store.read(session, start, 256).await?;
+        let page = store
+            .read_for(
+                haider_platform::phase_trace::StoreReadCaller::Evidence,
+                session,
+                start,
+                256,
+            )
+            .await?;
         for envelope in page.into_iter().rev() {
             if envelope.seq > end || envelope.run_id.as_ref() != Some(run) {
                 continue;

@@ -3233,7 +3233,14 @@ impl SessionHub {
         since_seq: u64,
         limit: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
-        haider_core::StoreHandle::read(&self.inner.store, session_id, since_seq, limit).await
+        haider_core::StoreHandle::read_for(
+            &self.inner.store,
+            haider_platform::phase_trace::StoreReadCaller::SessionHubActor,
+            session_id,
+            since_seq,
+            limit,
+        )
+        .await
     }
 
     pub(crate) fn install_worker_manager(
@@ -4507,6 +4514,22 @@ impl SessionHub {
         after_seq: u64,
         limit: usize,
     ) -> Result<Option<(u64, Vec<RawEnvelope>)>, HaiderError> {
+        self.read_session_journal_for(
+            haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+            session_id,
+            after_seq,
+            limit,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_session_journal_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Option<(u64, Vec<RawEnvelope>)>, HaiderError> {
         let head = self.inner.store.latest_seq(session_id).await?;
         if head == 0 {
             return Ok(None);
@@ -4515,7 +4538,7 @@ impl SessionHub {
         let envelopes = self
             .inner
             .store
-            .read(session_id, after_seq, limit)
+            .read_for(caller, session_id, after_seq, limit)
             .await?
             .into_iter()
             .take_while(|envelope| envelope.seq <= end_seq)
@@ -4523,13 +4546,17 @@ impl SessionHub {
         Ok(Some((head, envelopes)))
     }
 
-    pub(crate) async fn read_internal_session(
+    pub(crate) async fn read_internal_session_for(
         &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
         session_id: &SessionId,
         since_seq: u64,
         limit: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
-        self.inner.store.read(session_id, since_seq, limit).await
+        self.inner
+            .store
+            .read_for(caller, session_id, since_seq, limit)
+            .await
     }
 
     pub(crate) async fn headless_run_context_for_session(
@@ -5092,7 +5119,8 @@ impl SessionHub {
             _ => self
                 .inner
                 .store
-                .read(
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubActor,
                     &created.session_id,
                     created.created_seq.saturating_sub(1),
                     1,
@@ -6602,7 +6630,16 @@ impl SessionHub {
         let mut cursor = 0;
         let mut states = HashMap::<RunId, RunState>::new();
         loop {
-            let page = self.inner.store.read(session_id, cursor, 256).await?;
+            let page = self
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubActor,
+                    session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
             if page.is_empty() {
                 return Ok(states.values().any(|state| !state.is_terminal()));
             }
@@ -6743,7 +6780,12 @@ impl SessionHub {
         } else {
             self.inner
                 .store
-                .read(&session_id, head.saturating_sub(1), 1)
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubActor,
+                    &session_id,
+                    head.saturating_sub(1),
+                    1,
+                )
                 .await?
                 .into_iter()
                 .next()
@@ -7896,6 +7938,21 @@ impl StoreHandle for HubStoreHandle {
             .await
     }
 
+    async fn read_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .read_for(caller, session_id, since_seq, limit)
+            .await
+    }
+
     async fn read_reducer_page(
         &self,
         session_id: &SessionId,
@@ -7912,6 +7969,30 @@ impl StoreHandle for HubStoreHandle {
             .await
     }
 
+    async fn read_reducer_page_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .read_reducer_page_for(
+                caller,
+                session_id,
+                since_seq,
+                limit,
+                byte_budget,
+                payload_kinds,
+            )
+            .await
+    }
+
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
@@ -7925,6 +8006,30 @@ impl StoreHandle for HubStoreHandle {
             .inner
             .store
             .read_reducer_page_with_boundary(
+                session_id,
+                since_seq,
+                limit,
+                byte_budget,
+                payload_kinds,
+            )
+            .await
+    }
+
+    async fn read_reducer_page_with_boundary_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<haider_core::ReducerPage, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .read_reducer_page_with_boundary_for(
+                caller,
                 session_id,
                 since_seq,
                 limit,
