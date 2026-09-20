@@ -63,6 +63,7 @@ struct StoreOwner {
     schema_bootstrapped_from_zero: bool,
     worker_generation: u64,
     profile_installation_id: String,
+    cache_diagnostic_key: crate::CacheDiagnosticKey,
     store: Mutex<Option<Store>>,
     fault: tokio::sync::watch::Sender<Option<ProfileStoreFault>>,
     hook_dispatch_decode_count: AtomicU64,
@@ -155,6 +156,8 @@ impl SqliteStoreHandle {
         let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
         let worker_generation = store.worker_generation();
         let profile_installation_id = store.profile_installation_id()?;
+        let cache_diagnostic_key =
+            crate::CacheDiagnosticKey::from_bytes(store.cache_diagnostic_key_bytes());
         let (fault, _) = tokio::sync::watch::channel(None);
         Ok(Self {
             owner: Arc::new(StoreOwner {
@@ -162,6 +165,7 @@ impl SqliteStoreHandle {
                 schema_bootstrapped_from_zero,
                 worker_generation,
                 profile_installation_id,
+                cache_diagnostic_key,
                 store: Mutex::new(Some(store)),
                 fault,
                 hook_dispatch_decode_count: AtomicU64::new(0),
@@ -244,6 +248,12 @@ impl SqliteStoreHandle {
     #[must_use]
     pub fn cached_profile_installation_id(&self) -> &str {
         &self.owner.profile_installation_id
+    }
+
+    /// Profile-scoped key captured behind the store's boot publication barrier.
+    #[must_use]
+    pub fn cache_diagnostic_key(&self) -> crate::CacheDiagnosticKey {
+        self.owner.cache_diagnostic_key.clone()
     }
 
     /// Completes the one-time journal backfill and reconciles closed slots

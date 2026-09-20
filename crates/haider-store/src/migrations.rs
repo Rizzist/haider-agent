@@ -19,8 +19,8 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 28;
-const LATEST_SCHEMA_VERSION: u32 = 28;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 29;
+const LATEST_SCHEMA_VERSION: u32 = 29;
 
 struct Migration {
     version: u32,
@@ -720,6 +720,19 @@ const MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 29,
+        sql: "
+            ALTER TABLE profile_meta ADD COLUMN boot_publication_pending INTEGER
+                NOT NULL DEFAULT 1 CHECK (boot_publication_pending IN (0, 1));
+
+            -- Only a direct schema-zero bootstrap owns the coalesced
+            -- publication operation. Profiles that reach this migration
+            -- already published their namespaces through the original
+            -- independent barriers.
+            UPDATE profile_meta SET boot_publication_pending = 0;
+        ",
+    },
 ];
 
 // The direct schema for an empty profile. The equivalence pin in
@@ -1009,7 +1022,8 @@ CREATE TABLE profile_meta (
             CHECK (daemon_generation >= 0), management_revision INTEGER NOT NULL DEFAULT 0
             CHECK (management_revision >= 0), installation_id TEXT, usage_backfill_version INTEGER
                 NOT NULL DEFAULT 0 CHECK (usage_backfill_version >= 0), workflow_graph_backfill_version INTEGER
-                NOT NULL DEFAULT 0 CHECK (workflow_graph_backfill_version >= 0));
+                NOT NULL DEFAULT 0 CHECK (workflow_graph_backfill_version >= 0), boot_publication_pending INTEGER
+                NOT NULL DEFAULT 1 CHECK (boot_publication_pending IN (0, 1)));
 
 CREATE TABLE provider_models (
                 provider        TEXT PRIMARY KEY,

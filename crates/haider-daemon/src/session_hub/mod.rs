@@ -350,67 +350,6 @@ impl SessionHubConfig {
     }
 }
 
-const CACHE_DIAGNOSTIC_KEY_FILE: &str = "cache-diagnostic.key";
-
-fn load_or_create_cache_diagnostic_key(
-    root: &std::path::Path,
-) -> std::io::Result<CacheDiagnosticKey> {
-    use std::io::{Read as _, Write as _};
-
-    let path = root.join(CACHE_DIAGNOSTIC_KEY_FILE);
-    loop {
-        match std::fs::File::open(&path) {
-            Ok(mut file) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-
-                    if file.metadata()?.permissions().mode() & 0o077 != 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "cache diagnostic key is not owner-only",
-                        ));
-                    }
-                }
-                let mut bytes = [0_u8; 32];
-                file.read_exact(&mut bytes)?;
-                let mut trailing = [0_u8; 1];
-                if file.read(&mut trailing)? != 0 {
-                    return Err(std::io::Error::other(
-                        "cache diagnostic key has an invalid length",
-                    ));
-                }
-                return Ok(CacheDiagnosticKey::from_bytes(bytes));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-
-        let mut bytes = [0_u8; 32];
-        getrandom::fill(&mut bytes)
-            .map_err(|error| std::io::Error::other(format!("generate key: {error}")))?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(mut file) => {
-                file.write_all(&bytes)?;
-                // A newly generated diagnostic key must retain full durability.
-                haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full)?;
-                // The key's new directory entry shares the same full-durability boundary.
-                haider_platform::fs::sync_directory(root, haider_platform::SyncPolicy::Full)?;
-                return Ok(CacheDiagnosticKey::from_bytes(bytes));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 /// How a sink answered an [`FrameSink::offer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendAdmission {
@@ -2491,10 +2430,7 @@ impl SessionHub {
         pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
     ) -> Result<Self, SessionHubError> {
         config.validate().map_err(SessionHubError::InvalidConfig)?;
-        let cache_diagnostic_key =
-            load_or_create_cache_diagnostic_key(store.root()).map_err(|error| {
-                SessionHubError::Task(format!("cannot load cache diagnostic key: {error}"))
-            })?;
+        let cache_diagnostic_key = store.cache_diagnostic_key();
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
         let (append_requests, append_receiver) = mpsc::channel(APPEND_QUEUE_MAX_REQUESTS);
         let admitted_commits = Arc::new(AtomicUsize::new(0));

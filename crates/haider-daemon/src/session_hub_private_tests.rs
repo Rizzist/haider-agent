@@ -196,14 +196,21 @@ async fn attachment_title_repairs_use_distinct_stable_event_ids_across_sessions(
     store.close().await.expect("store close");
 }
 
-#[test]
-fn cache_diagnostic_key_is_persistent_exact_length_and_private() {
+#[tokio::test]
+async fn cache_diagnostic_key_is_persistent_exact_length_and_private() {
     let root = tempfile::tempdir().expect("temporary profile");
-    let first = load_or_create_cache_diagnostic_key(root.path()).expect("create key");
-    let first_bytes = std::fs::read(root.path().join(CACHE_DIAGNOSTIC_KEY_FILE)).expect("read key");
-    let second = load_or_create_cache_diagnostic_key(root.path()).expect("reload key");
-    let second_bytes =
-        std::fs::read(root.path().join(CACHE_DIAGNOSTIC_KEY_FILE)).expect("reread key");
+    let key_path = root.path().join("cache-diagnostic.key");
+    let first_store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("create store");
+    let first = first_store.cache_diagnostic_key();
+    let first_bytes = std::fs::read(&key_path).expect("read key");
+    first_store.close().await.expect("close first store");
+    let second_store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store");
+    let second = second_store.cache_diagnostic_key();
+    let second_bytes = std::fs::read(&key_path).expect("reread key");
     assert_eq!(first_bytes.len(), 32);
     assert_eq!(
         first_bytes, second_bytes,
@@ -216,13 +223,14 @@ fn cache_diagnostic_key_is_persistent_exact_length_and_private() {
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let mode = std::fs::metadata(root.path().join(CACHE_DIAGNOSTIC_KEY_FILE))
+        let mode = std::fs::metadata(&key_path)
             .expect("key metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "diagnostic key must be owner-only");
     }
+    second_store.close().await.expect("close second store");
 }
 
 /// R2-18 hold-out pin: the known-zero probe elision regressed and was

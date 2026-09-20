@@ -71,7 +71,19 @@ impl ProviderViewSweepSchedule {
 
 impl ProviderViewStore {
     pub(crate) fn open(profile_root: &Path) -> StoreResult<Self> {
-        let cas = FileCas::open_namespace(profile_root, "provider-view-cas")?;
+        Self::open_with_publication(profile_root, true)
+    }
+
+    pub(crate) fn open_deferred(profile_root: &Path) -> StoreResult<Self> {
+        Self::open_with_publication(profile_root, false)
+    }
+
+    fn open_with_publication(profile_root: &Path, publish_created: bool) -> StoreResult<Self> {
+        let cas = if publish_created {
+            FileCas::open_namespace(profile_root, "provider-view-cas")?
+        } else {
+            FileCas::open_namespace_deferred(profile_root, "provider-view-cas")?
+        };
         #[cfg(target_vendor = "apple")]
         ensure_provider_view_barrier_device(profile_root)?;
         Ok(Self {

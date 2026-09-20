@@ -293,10 +293,28 @@ impl FileCas {
     /// Opens one store-owned CAS namespace. Namespace names are compile-time
     /// constants supplied by this crate, never user-controlled paths.
     pub(crate) fn open_namespace(profile_root: &Path, namespace: &str) -> StoreResult<Self> {
+        Self::open_namespace_with_publication(profile_root, namespace, true)
+    }
+
+    /// Opens a store-owned namespace while a fresh-profile boot transaction
+    /// owns publication of all new entries in the common profile directory.
+    /// Standalone [`FileCas`] callers retain the immediate barrier above.
+    pub(crate) fn open_namespace_deferred(
+        profile_root: &Path,
+        namespace: &str,
+    ) -> StoreResult<Self> {
+        Self::open_namespace_with_publication(profile_root, namespace, false)
+    }
+
+    fn open_namespace_with_publication(
+        profile_root: &Path,
+        namespace: &str,
+        publish_created: bool,
+    ) -> StoreResult<Self> {
         let root = profile_root.join(namespace);
         let created = !root.exists();
         fs::create_dir_all(&root).map_err(|error| io_error("create CAS root", &root, error))?;
-        if created {
+        if created && publish_created {
             // Persist the new `cas/` directory entry itself.
             sync_directory(profile_root, haider_platform::SyncPolicy::Full)?;
         }

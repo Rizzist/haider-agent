@@ -125,7 +125,7 @@ use rusqlite::{
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -149,6 +149,7 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
 /// pattern is indexed and serialized, so a 512 KiB ceiling retains the hot
 /// B-tree path without pinning SQLite's 2 MiB default page cache at idle.
 const SQLITE_PAGE_CACHE_KIB: i64 = -512;
+const CACHE_DIAGNOSTIC_KEY_FILE: &str = "cache-diagnostic.key";
 /// A v25 upgrade may need old graph facts, but profile open must never retain
 /// an unbounded copy of the journal. `envelope_weight_bytes` conservatively
 /// charges the decoded heap representation, not just its compact SQLite bytes.
@@ -2099,6 +2100,7 @@ pub struct Store {
     graph_telemetry: Mutex<GraphTelemetryCache>,
     cas: FileCas,
     provider_views: ProviderViewStore,
+    cache_diagnostic_key: [u8; 32],
     _lock: ProfileLock,
 }
 
@@ -2130,6 +2132,180 @@ fn trim_to_latest<T>(rows: &mut Vec<T>, limit: usize) {
         rows.drain(..rows.len() - limit);
     }
 }
+
+fn boot_publication_pending(connection: &Connection) -> StoreResult<bool> {
+    let pending: i64 = connection
+        .query_row(
+            "SELECT boot_publication_pending FROM profile_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    match pending {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(corrupt("profile boot-publication marker is invalid")),
+    }
+}
+
+fn complete_boot_publication(connection: &Connection) -> StoreResult<()> {
+    let updated = connection
+        .execute(
+            "UPDATE profile_meta SET boot_publication_pending = 0
+             WHERE singleton = 1 AND boot_publication_pending = 1",
+            [],
+        )
+        .map_err(map_sqlite_error)?;
+    if updated != 1 {
+        return Err(corrupt(
+            "profile boot-publication marker lost its completion claim",
+        ));
+    }
+    Ok(())
+}
+
+fn load_or_create_cache_diagnostic_key(
+    root: &Path,
+    publish_created: bool,
+) -> StoreResult<[u8; 32]> {
+    let path = root.join(CACHE_DIAGNOSTIC_KEY_FILE);
+    loop {
+        match fs::File::open(&path) {
+            Ok(mut file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+
+                    if file
+                        .metadata()
+                        .map_err(|error| {
+                            boot_io_error("inspect cache diagnostic key", &path, error)
+                        })?
+                        .permissions()
+                        .mode()
+                        & 0o077
+                        != 0
+                    {
+                        return Err(store_error(
+                            ErrorCode::Internal,
+                            "cache diagnostic key is not owner-only",
+                            false,
+                        ));
+                    }
+                }
+                let mut bytes = [0_u8; 32];
+                file.read_exact(&mut bytes)
+                    .map_err(|error| boot_io_error("read cache diagnostic key", &path, error))?;
+                let mut trailing = [0_u8; 1];
+                if file
+                    .read(&mut trailing)
+                    .map_err(|error| boot_io_error("read cache diagnostic key", &path, error))?
+                    != 0
+                {
+                    return Err(store_error(
+                        ErrorCode::Internal,
+                        "cache diagnostic key has an invalid length",
+                        false,
+                    ));
+                }
+                return Ok(bytes);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(boot_io_error("open cache diagnostic key", &path, error));
+            }
+        }
+
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|error| {
+            store_error(
+                ErrorCode::Internal,
+                format!("cannot generate cache diagnostic key: {error}"),
+                false,
+            )
+        })?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(&bytes)
+                    .map_err(|error| boot_io_error("write cache diagnostic key", &path, error))?;
+                haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full)
+                    .map_err(|error| boot_io_error("sync cache diagnostic key", &path, error))?;
+                if publish_created {
+                    haider_platform::fs::sync_directory(root, haider_platform::SyncPolicy::Full)
+                        .map_err(|error| {
+                            boot_io_error("publish cache diagnostic key", root, error)
+                        })?;
+                }
+                return Ok(bytes);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(boot_io_error("create cache diagnostic key", &path, error));
+            }
+        }
+    }
+}
+
+fn boot_io_error(action: &str, path: &Path, error: io::Error) -> HaiderError {
+    store_error(
+        ErrorCode::Internal,
+        format!("cannot {action} {}: {error}", path.display()),
+        false,
+    )
+}
+
+fn sync_boot_profile_directory(root: &Path) -> StoreResult<()> {
+    #[cfg(test)]
+    BOOT_PUBLICATION_SYNC_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(root);
+        }
+    });
+    haider_platform::fs::sync_directory(root, haider_platform::SyncPolicy::Full)
+        .map_err(|error| boot_io_error("publish fresh profile entries", root, error))
+}
+
+#[cfg(test)]
+type BootPublicationSyncTestHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static BOOT_PUBLICATION_SYNC_TEST_HOOK: std::cell::RefCell<Option<BootPublicationSyncTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_boot_publication_sync_test_hook<T>(
+    hook: impl FnMut(&Path) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<BootPublicationSyncTestHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOOT_PUBLICATION_SYNC_TEST_HOOK.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore =
+        Restore(BOOT_PUBLICATION_SYNC_TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    action()
+}
+
+#[cfg(test)]
+fn crash_boot_publication_for_test(stage: &str) {
+    if std::env::var("HAIDER_TEST_CRASH_BOOT_PUBLICATION_AT").as_deref() == Ok(stage) {
+        std::process::exit(74);
+    }
+}
+
+#[cfg(not(test))]
+fn crash_boot_publication_for_test(_stage: &str) {}
 
 impl Store {
     /// Acquires the profile lifetime lock without opening its durable store.
@@ -2167,11 +2343,29 @@ impl Store {
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection_with(&database_path, synchronous)?;
         let migration = migrations::migrate(&mut connection)?;
+        let publication_pending = boot_publication_pending(&connection)?;
         backfill_payload_kinds(&mut connection)?;
         backfill_run_head_projections(&mut connection)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
-        let cas = FileCas::open(&root)?;
-        let provider_views = ProviderViewStore::open(&root)?;
+        let (cas, provider_views) = if publication_pending {
+            let cas = FileCas::open_namespace_deferred(&root, "cas")?;
+            crash_boot_publication_for_test("cas_namespace");
+            let provider_views = ProviderViewStore::open_deferred(&root)?;
+            crash_boot_publication_for_test("provider_view_namespace");
+            (cas, provider_views)
+        } else {
+            (FileCas::open(&root)?, ProviderViewStore::open(&root)?)
+        };
+        let cache_diagnostic_key =
+            load_or_create_cache_diagnostic_key(&root, !publication_pending)?;
+        crash_boot_publication_for_test("diagnostic_key");
+        if publication_pending {
+            // All three entries share this parent. The key file itself has
+            // already crossed its unchanged Full file-sync boundary.
+            sync_boot_profile_directory(&root)?;
+            crash_boot_publication_for_test("parent_synced");
+            complete_boot_publication(&connection)?;
+        }
         provider_views.sweep_expired(&mut connection, now_ms()?)?;
         let worker_generation = next_worker_generation(&mut connection)?;
         backfill_workflow_graph_journals(&mut connection, &cas, worker_generation)?;
@@ -2190,6 +2384,7 @@ impl Store {
             graph_telemetry: Mutex::new(graph_telemetry),
             cas,
             provider_views,
+            cache_diagnostic_key,
             _lock: profile_lock,
         })
     }
@@ -2268,6 +2463,14 @@ impl Store {
     /// an existing empty store must still run the ordinary recovery path.
     pub fn schema_bootstrapped_from_zero(&self) -> bool {
         self.schema_bootstrapped_from_zero
+    }
+
+    /// Already-validated profile key used for keyed cache diagnostics. The
+    /// bytes are intentionally opaque outside the store adapter and are never
+    /// formatted or logged.
+    #[must_use]
+    pub fn cache_diagnostic_key_bytes(&self) -> [u8; 32] {
+        self.cache_diagnostic_key
     }
 
     /// Persists one provider-rendered request view into the dedicated CAS and
@@ -26725,6 +26928,121 @@ mod reducer_filter_tests {
     use super::*;
     use crate::usage_ledger::reduce_journal_usage;
 
+    #[test]
+    fn fresh_profile_publishes_three_entries_with_one_parent_sync() {
+        let root = tempfile::tempdir().expect("fresh profile");
+        let syncs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&syncs);
+        let namespace_syncs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_namespace_syncs = std::sync::Arc::clone(&namespace_syncs);
+        let expected_root = root.path().to_path_buf();
+        let expected_namespace_root = expected_root.clone();
+        let store = crate::cas::with_cas_sync_test_hook(
+            move |path, policy, target| {
+                if path == expected_namespace_root
+                    && policy == haider_platform::SyncPolicy::Full
+                    && target == crate::cas::CasSyncTarget::Directory
+                {
+                    observed_namespace_syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+            || {
+                with_boot_publication_sync_test_hook(
+                    move |path| {
+                        assert_eq!(path, expected_root);
+                        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    },
+                    || Store::open(root.path()).expect("fresh store"),
+                )
+            },
+        );
+        assert_eq!(
+            namespace_syncs.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "fresh namespaces must not publish their entries independently"
+        );
+        assert_eq!(
+            syncs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "CAS, provider-view CAS, and the fully synced key share one parent barrier"
+        );
+        drop(store);
+
+        let reopened_syncs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&reopened_syncs);
+        let _reopened = with_boot_publication_sync_test_hook(
+            move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            || Store::open(root.path()).expect("reopen published store"),
+        );
+        assert_eq!(
+            reopened_syncs.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "completed profiles do not repeat the fresh publication barrier"
+        );
+    }
+
+    #[test]
+    fn boot_publication_crash_retries_the_full_parent_barrier() {
+        const ROOT_ENV: &str = "HAIDER_TEST_BOOT_PUBLICATION_ROOT";
+        const STAGE_ENV: &str = "HAIDER_TEST_CRASH_BOOT_PUBLICATION_AT";
+        const TEST_NAME: &str = "event_store::reducer_filter_tests::boot_publication_crash_retries_the_full_parent_barrier";
+
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let _store = Store::open(PathBuf::from(root)).expect("crash-child store open");
+            std::process::exit(75);
+        }
+
+        for stage in [
+            "cas_namespace",
+            "provider_view_namespace",
+            "diagnostic_key",
+            "parent_synced",
+        ] {
+            let root = tempfile::tempdir().expect("crash profile");
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                .env(ROOT_ENV, root.path())
+                .env(STAGE_ENV, stage)
+                .status()
+                .expect("run boot-publication crash child");
+            assert_eq!(status.code(), Some(74), "child crash stage {stage}");
+
+            let connection =
+                Connection::open(root.path().join("store.sqlite")).expect("inspect crashed marker");
+            let pending: i64 = connection
+                .query_row(
+                    "SELECT boot_publication_pending FROM profile_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read crashed marker");
+            assert_eq!(pending, 1, "stage {stage} must remain retryable");
+            drop(connection);
+
+            let store = Store::open(root.path()).expect("retry crashed boot");
+            let completed: i64 = store
+                .connection()
+                .expect("retry connection")
+                .query_row(
+                    "SELECT boot_publication_pending FROM profile_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read completed marker");
+            assert_eq!(completed, 0, "stage {stage} retry completes publication");
+            assert!(root.path().join("cas").is_dir());
+            assert!(root.path().join("provider-view-cas").is_dir());
+            assert_eq!(
+                fs::read(root.path().join(CACHE_DIAGNOSTIC_KEY_FILE))
+                    .expect("published diagnostic key")
+                    .len(),
+                32
+            );
+        }
+    }
+
     #[derive(Debug, PartialEq)]
     struct ReducerOutputs {
         run_states: HashMap<RunId, DurableRunHead>,
@@ -27825,7 +28143,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v28 and reopen.
+    /// v23's run-head backfill remains untouched through v29 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -27853,6 +28171,7 @@ mod run_head_projection_tests {
              ALTER TABLE loom_cli_install_events DROP COLUMN cancelled;
              DROP TABLE workflow_node_states;
              DROP TABLE workflow_graph_instances;
+             ALTER TABLE profile_meta DROP COLUMN boot_publication_pending;
              ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
              DROP TABLE provider_view_gc;
              DROP TABLE provider_view_blocks;
@@ -27868,7 +28187,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 28);
+            assert_eq!(store.schema_version().expect("schema version"), 29);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

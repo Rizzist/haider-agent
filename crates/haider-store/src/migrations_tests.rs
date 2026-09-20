@@ -78,6 +78,14 @@ fn fresh_database_bootstraps_directly_to_latest() {
         .query_row("SELECT COUNT(*) FROM profile_meta", [], |row| row.get(0))
         .expect("count seeded profile rows");
     assert_eq!(profile_rows, 1);
+    let publication_pending: i64 = connection
+        .query_row(
+            "SELECT boot_publication_pending FROM profile_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read fresh publication marker");
+    assert_eq!(publication_pending, 1, "schema-zero boot owns publication");
 }
 
 /// MUTATION PIN: every new migration must also update `LATEST_SCHEMA_SQL`.
@@ -95,4 +103,15 @@ fn zero_to_latest_migration_matches_fresh_bootstrap_schema() {
     validate_registry(&incrementally_migrated).expect("validate incremental registry");
 
     assert_eq!(schema(&bootstrapped), schema(&incrementally_migrated));
+    let publication_pending: i64 = incrementally_migrated
+        .query_row(
+            "SELECT boot_publication_pending FROM profile_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated publication marker");
+    assert_eq!(
+        publication_pending, 0,
+        "existing profiles retain their independent publication barriers"
+    );
 }
