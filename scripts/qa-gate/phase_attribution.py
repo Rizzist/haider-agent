@@ -13,14 +13,19 @@ from pathlib import Path
 from typing import Any
 
 ENV = "HAIDER_PHASE_TRACE_DIR"
-# Specific work overrides enclosing transport/tool waits. Schema v2 adds the
-# CAS phases and counters; the reader remains compatible with v1 trace files.
+# Specific work overrides enclosing transport/tool waits. Schema v2 added the
+# CAS phases/counters; v3 adds the store residual split and content-free page
+# counters. The reader remains compatible with both earlier trace schemas.
 PHASES = (
     "client_control", "turn_control", "turn_setup", "lockdown_bind_activate", "store_access",
     "submit", "rpc", "tool_dispatch", "completion_render", "spawn",
     "runtime_init", "socket_handshake", "directory_prep", "store_open",
-    "capability_catalog", "provider_assembly", "store_journal",
-    "projection_digest", "stream_decode", "cas_read_hash", "cas_reverify",
+    "capability_catalog", "provider_assembly", "stream_decode",
+    "store_other", "store_journal", "projection_digest", "store_query_point",
+    "store_receipt_attempt", "store_provider_view", "store_query_replay",
+    "store_query_reducer", "store_event_decode",
+    "store_owner_lock_wait", "store_connection_lock_wait",
+    "cas_read_hash", "cas_reverify",
 )
 COLD_PHASES = (
     "spawn", "dynamic_link", "runtime_init", "store_open", "directory_prep",
@@ -28,7 +33,10 @@ COLD_PHASES = (
     "first_request", "teardown",
 )
 ALL_PHASES = (*PHASES, "teardown", "daemon_reaped_children")
-COUNTERS = ("bytes_read", "blocks_hashed", "reverify_calls")
+COUNTERS = (
+    "bytes_read", "blocks_hashed", "reverify_calls", "rows_read",
+    "payload_bytes", "events_decoded",
+)
 
 
 def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
@@ -40,7 +48,7 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
             raise ValueError(f"empty phase trace: {path.name}")
         header = json.loads(lines[0])
         schema = header.get("schema")
-        if (schema not in (1, 2) or header.get("dropped") != 0
+        if (schema not in (1, 2, 3) or header.get("dropped") != 0
                 or type(header.get("records")) is not int
                 or header["records"] != len(lines) - 1
                 or header.get("clock") != "CLOCK_MONOTONIC"
@@ -61,8 +69,8 @@ def read_records(directory: Path) -> tuple[list[dict[str, Any]], list[int]]:
                 raise ValueError("invalid phase interval")
             if row["waiting"] and row["cpu_ns"]:
                 raise ValueError("wait interval charged CPU")
-            if schema == 2 and "counters" not in row:
-                raise ValueError("phase trace v2 record has no counters")
+            if schema in (2, 3) and "counters" not in row:
+                raise ValueError(f"phase trace v{schema} record has no counters")
             counters = row.get("counters", {})
             if not isinstance(counters, dict) or any(
                 type(counters.get(key, 0)) is not int or counters.get(key, 0) < 0

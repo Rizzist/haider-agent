@@ -16,6 +16,15 @@ pub enum Phase {
     TurnSetup,
     LockdownBindActivate,
     StoreAccess,
+    StoreOther,
+    StoreOwnerLockWait,
+    StoreConnectionLockWait,
+    StoreQueryReplay,
+    StoreQueryReducer,
+    StoreQueryPoint,
+    StoreEventDecode,
+    StoreProviderView,
+    StoreReceiptAttempt,
     CasReadHash,
     CasReverify,
     Spawn,
@@ -44,6 +53,15 @@ impl Phase {
             Self::TurnSetup => "turn_setup",
             Self::LockdownBindActivate => "lockdown_bind_activate",
             Self::StoreAccess => "store_access",
+            Self::StoreOther => "store_other",
+            Self::StoreOwnerLockWait => "store_owner_lock_wait",
+            Self::StoreConnectionLockWait => "store_connection_lock_wait",
+            Self::StoreQueryReplay => "store_query_replay",
+            Self::StoreQueryReducer => "store_query_reducer",
+            Self::StoreQueryPoint => "store_query_point",
+            Self::StoreEventDecode => "store_event_decode",
+            Self::StoreProviderView => "store_provider_view",
+            Self::StoreReceiptAttempt => "store_receipt_attempt",
             Self::CasReadHash => "cas_read_hash",
             Self::CasReverify => "cas_reverify",
             Self::Spawn => "spawn",
@@ -71,6 +89,16 @@ impl Phase {
 pub struct Scope {
     #[cfg(unix)]
     _native: native::Scope,
+}
+
+/// Synchronous wait guard with zero attributed CPU.
+///
+/// Unlike [`Scope`], this marks its interval as waiting so concurrent active
+/// work wins wall attribution. It is intended only for blocking lock calls.
+#[must_use]
+pub struct WaitScope {
+    #[cfg(unix)]
+    _native: native::WaitScope,
 }
 
 /// Trace-only counters for one CAS hash operation.
@@ -110,6 +138,81 @@ impl CasHashScope {
     pub fn note_reverify_call(&mut self) {
         #[cfg(unix)]
         self.scope._native.note_reverify_call();
+    }
+}
+
+/// Content-free counters for one named store operation.
+///
+/// Callers compute counts only after checking [`Self::enabled`], keeping the
+/// disabled path to the same no-op branch as every other phase probe.
+#[must_use]
+pub struct StoreScope {
+    scope: Scope,
+}
+
+impl StoreScope {
+    pub fn enabled(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.scope._native.enabled()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub fn note_rows_read(&mut self, rows: usize) {
+        #[cfg(unix)]
+        self.scope._native.note_rows_read(rows);
+        #[cfg(not(unix))]
+        let _ = rows;
+    }
+
+    pub fn note_payload_bytes(&mut self, bytes: usize) {
+        #[cfg(unix)]
+        self.scope._native.note_payload_bytes(bytes);
+        #[cfg(not(unix))]
+        let _ = bytes;
+    }
+
+    pub fn note_event_decoded(&mut self) {
+        #[cfg(unix)]
+        self.scope._native.note_event_decoded();
+    }
+}
+
+/// Starts one named store sub-scope. The accepted phases are frozen enum
+/// variants, so no SQL, path, identifier, or payload content enters a trace.
+pub fn store_scope(phase: Phase) -> StoreScope {
+    debug_assert!(matches!(
+        phase,
+        Phase::StoreOther
+            | Phase::StoreOwnerLockWait
+            | Phase::StoreConnectionLockWait
+            | Phase::StoreQueryReplay
+            | Phase::StoreQueryReducer
+            | Phase::StoreQueryPoint
+            | Phase::StoreEventDecode
+            | Phase::StoreProviderView
+            | Phase::StoreReceiptAttempt
+    ));
+    StoreScope {
+        scope: scope(phase),
+    }
+}
+
+/// Starts a synchronous store-lock wait interval.
+pub fn store_wait_scope(phase: Phase) -> WaitScope {
+    debug_assert!(matches!(
+        phase,
+        Phase::StoreOwnerLockWait | Phase::StoreConnectionLockWait
+    ));
+    #[cfg(not(unix))]
+    let _ = phase;
+    WaitScope {
+        #[cfg(unix)]
+        _native: native::WaitScope::new(phase),
     }
 }
 
@@ -223,14 +326,17 @@ mod native {
         end: u64,
         cpu: u64,
         waiting: bool,
-        counters: CasCounters,
+        counters: TraceCounters,
     }
 
     #[derive(Clone, Copy, Default)]
-    struct CasCounters {
+    struct TraceCounters {
         bytes_read: u64,
         blocks_hashed: u64,
         reverify_calls: u64,
+        rows_read: u64,
+        payload_bytes: u64,
+        events_decoded: u64,
     }
     struct Records {
         rows: Vec<Row>,
@@ -279,7 +385,7 @@ mod native {
     }
 
     pub(super) struct Scope {
-        state: Option<(Phase, u64, PollCpu, CasCounters)>,
+        state: Option<(Phase, u64, PollCpu, TraceCounters)>,
     }
 
     impl Scope {
@@ -290,7 +396,7 @@ mod native {
                         phase,
                         clock_ns(ClockId::Monotonic),
                         PollCpu::new(),
-                        CasCounters::default(),
+                        TraceCounters::default(),
                     )
                 }),
             }
@@ -319,6 +425,28 @@ mod native {
                 counters.reverify_calls = counters.reverify_calls.saturating_add(1);
             }
         }
+
+        pub(super) fn note_rows_read(&mut self, rows: usize) {
+            if let Some((_, _, _, counters)) = self.state.as_mut() {
+                counters.rows_read = counters
+                    .rows_read
+                    .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+            }
+        }
+
+        pub(super) fn note_payload_bytes(&mut self, bytes: usize) {
+            if let Some((_, _, _, counters)) = self.state.as_mut() {
+                counters.payload_bytes = counters
+                    .payload_bytes
+                    .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+            }
+        }
+
+        pub(super) fn note_event_decoded(&mut self) {
+            if let Some((_, _, _, counters)) = self.state.as_mut() {
+                counters.events_decoded = counters.events_decoded.saturating_add(1);
+            }
+        }
     }
 
     impl Drop for Scope {
@@ -332,6 +460,33 @@ mod native {
                     cpu,
                     waiting: false,
                     counters,
+                });
+            }
+        }
+    }
+
+    pub(super) struct WaitScope {
+        state: Option<(Phase, u64)>,
+    }
+
+    impl WaitScope {
+        pub(super) fn new(phase: Phase) -> Self {
+            Self {
+                state: enabled().then(|| (phase, clock_ns(ClockId::Monotonic))),
+            }
+        }
+    }
+
+    impl Drop for WaitScope {
+        fn drop(&mut self) {
+            if let Some((phase, start)) = self.state.take() {
+                record(Row {
+                    phase,
+                    start,
+                    end: clock_ns(ClockId::Monotonic),
+                    cpu: 0,
+                    waiting: true,
+                    counters: TraceCounters::default(),
                 });
             }
         }
@@ -372,7 +527,7 @@ mod native {
                     end: clock_ns(ClockId::Monotonic),
                     cpu: 0,
                     waiting: true,
-                    counters: CasCounters::default(),
+                    counters: TraceCounters::default(),
                 });
             }
             let scope = Scope::new(this.phase);
@@ -405,7 +560,7 @@ mod native {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             writeln!(
                 output,
-                "{{\"schema\":2,\"pid\":{},\"dropped\":{},\"records\":{},\"clock\":\"CLOCK_MONOTONIC\",\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\"}}",
+                "{{\"schema\":3,\"pid\":{},\"dropped\":{},\"records\":{},\"clock\":\"CLOCK_MONOTONIC\",\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\"}}",
                 std::process::id(),
                 records.dropped,
                 records.rows.len()
@@ -413,7 +568,7 @@ mod native {
             for row in &records.rows {
                 writeln!(
                     output,
-                    "{{\"phase\":\"{}\",\"start_ns\":{},\"end_ns\":{},\"cpu_ns\":{},\"waiting\":{},\"counters\":{{\"bytes_read\":{},\"blocks_hashed\":{},\"reverify_calls\":{}}}}}",
+                    "{{\"phase\":\"{}\",\"start_ns\":{},\"end_ns\":{},\"cpu_ns\":{},\"waiting\":{},\"counters\":{{\"bytes_read\":{},\"blocks_hashed\":{},\"reverify_calls\":{},\"rows_read\":{},\"payload_bytes\":{},\"events_decoded\":{}}}}}",
                     row.phase.name(),
                     row.start,
                     row.end,
@@ -422,6 +577,9 @@ mod native {
                     row.counters.bytes_read,
                     row.counters.blocks_hashed,
                     row.counters.reverify_calls,
+                    row.counters.rows_read,
+                    row.counters.payload_bytes,
+                    row.counters.events_decoded,
                 )?;
             }
             output.flush()
@@ -466,10 +624,15 @@ mod native {
                 assert_eq!(paths.len(), 1);
                 let trace =
                     std::fs::read_to_string(&paths[0]).unwrap_or_else(|error| panic!("{error}"));
-                assert!(trace.contains("\"schema\":2"));
+                assert!(trace.contains("\"schema\":3"));
                 assert!(trace.contains(
-                    "\"counters\":{\"bytes_read\":17,\"blocks_hashed\":1,\"reverify_calls\":1}"
+                    "\"counters\":{\"bytes_read\":17,\"blocks_hashed\":1,\"reverify_calls\":1,\"rows_read\":0,\"payload_bytes\":0,\"events_decoded\":0}"
                 ));
+                assert!(trace.lines().any(|line| {
+                    line.contains("\"phase\":\"store_owner_lock_wait\"")
+                        && line.contains("\"cpu_ns\":0")
+                        && line.contains("\"waiting\":true")
+                }));
                 return;
             }
             {
@@ -478,6 +641,7 @@ mod native {
                 cas.note_block_hashed();
                 cas.note_reverify_call();
             }
+            drop(super::super::store_wait_scope(Phase::StoreOwnerLockWait));
             let mut polled = false;
             let mut future = pin!(Measure::new(
                 Phase::Rpc,

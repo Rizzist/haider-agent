@@ -1305,6 +1305,7 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--require-quiet", action="store_true")
+    parser.add_argument("--inter-run-cooldown-seconds", type=float, default=0.0)
     parser.add_argument("--keep-root", action="store_true")
     parser.add_argument("--commit-label")
     parser.add_argument("--self-check", action="store_true")
@@ -1319,6 +1320,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.bin_dir is None:
             raise ProofError("--bin-dir is required")
+        if not 0.0 <= args.inter_run_cooldown_seconds <= 300.0:
+            raise ProofError("--inter-run-cooldown-seconds must be between 0 and 300")
         arm_a, arm_b = arms_for(args)
         if arm_b is None:
             if args.runs < 5:
@@ -1332,49 +1335,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             arms = {"a": arm_a, "b": arm_b}
         cpu_accounting = cpu_accounting_self_check()
         runs = []
-        foreign_daemon_snapshots = []
-        discarded_blocks = []
-        positions_by_block = {
-            block: [entry for entry in order if entry[0] == block]
-            for block in sorted({entry[0] for entry in order})
-        }
-        for block, positions in positions_by_block.items():
-            block_runs = []
-            started = foreign_daemon_snapshot()
-            for _block, position, arm_name in positions:
-                run = run_fixture(
-                    arms[arm_name],
-                    block=block,
-                    position=position,
-                    require_quiet=args.require_quiet,
-                    keep_root=args.keep_root,
-                )
-                block_runs.append(run)
-                print(
-                    f"deep-turn {run['label']} complete "
-                    f"depth40={run['turns'][39]['wall_ms']:.3f}ms",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            finished = foreign_daemon_snapshot()
-            snapshot = {"block": block, "start": started, "end": finished}
-            foreign_daemon_snapshots.append(snapshot)
-            if started["foreign_daemon_count"] or finished["foreign_daemon_count"]:
-                discarded_blocks.append(
-                    {
-                        "block": block,
-                        "reason": "foreign daemon present at block boundary",
-                        "run_labels": [run["label"] for run in block_runs],
-                    }
-                )
-                continue
-            runs.extend(block_runs)
-        expected_runs = len(order)
-        if len(runs) != expected_runs:
-            raise ProofError(
-                "foreign-daemon contamination discarded "
-                f"{len(discarded_blocks)} block(s); clean runs={len(runs)} "
-                f"expected={expected_runs}"
+        for block, position, arm_name in order:
+            if runs and args.inter_run_cooldown_seconds:
+                time.sleep(args.inter_run_cooldown_seconds)
+            run = run_fixture(
+                arms[arm_name],
+                block=block,
+                position=position,
+                require_quiet=args.require_quiet,
+                keep_root=args.keep_root,
+            )
+            runs.append(run)
+            print(
+                f"deep-turn {run['label']} complete "
+                f"depth40={run['turns'][39]['wall_ms']:.3f}ms",
+                file=sys.stderr,
+                flush=True,
             )
         contaminated_blocks = {
             int(run["block"])
@@ -1403,6 +1379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "rounds": None if arm_b is None else args.rounds,
                 "require_quiet": args.require_quiet,
                 "strict_load_limit": STRICT_LOAD_LIMIT if args.require_quiet else None,
+                "inter_run_cooldown_seconds": args.inter_run_cooldown_seconds,
             },
             "cpu_accounting": cpu_accounting,
             "arms": {

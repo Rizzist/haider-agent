@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from phase_attribution import partition, read_records, summarize
+from phase_attribution import COUNTERS, partition, read_records, summarize
 
 
 def record(phase, start, end, cpu=0, waiting=False):
@@ -101,6 +101,39 @@ class PhaseAttributionTests(unittest.TestCase):
         self.assertEqual(result["detail"]["cas_reverify"]["blocks_hashed"], 2)
         self.assertEqual(result["detail"]["cas_reverify"]["reverify_calls"], 3)
 
+    def test_store_subscopes_partition_the_generic_bucket_and_keep_counters(self):
+        reducer = record("store_query_reducer", 120, 180, 5)
+        reducer["counters"] = {
+            "rows_read": 7,
+            "payload_bytes": 65_536,
+            "events_decoded": 7,
+        }
+        result = self.build([
+            record("store_access", 110, 190, 5),
+            record("store_other", 115, 185, 5),
+            reducer,
+            record("store_event_decode", 130, 170, 5),
+        ])
+        self.assertEqual(result["detail"]["store_access"]["wall_ns"], 10)
+        self.assertEqual(result["detail"]["store_other"]["wall_ns"], 10)
+        self.assertEqual(result["detail"]["store_query_reducer"]["wall_ns"], 20)
+        self.assertEqual(result["detail"]["store_event_decode"]["wall_ns"], 40)
+        self.assertEqual(result["detail"]["store_query_reducer"]["rows_read"], 7)
+        self.assertEqual(
+            result["detail"]["store_query_reducer"]["payload_bytes"], 65_536
+        )
+        self.assertEqual(result["detail"]["store_query_reducer"]["events_decoded"], 7)
+
+    def test_store_lock_wait_yields_wall_to_active_holder(self):
+        result = self.build([
+            record("store_owner_lock_wait", 110, 190, waiting=True),
+            record("store_event_decode", 130, 170, 5),
+        ])
+        self.assertEqual(result["detail"]["store_owner_lock_wait"]["wall_ns"], 40)
+        self.assertEqual(result["detail"]["store_owner_lock_wait"]["cpu_ns"], 0)
+        self.assertEqual(result["detail"]["store_event_decode"]["wall_ns"], 40)
+        self.assertEqual(result["residual"]["wall_ns"], 20)
+
     def test_reader_rejects_dropped_records_and_cpu_on_waits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -121,7 +154,7 @@ class PhaseAttributionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "wait interval charged CPU"):
                 read_records(root)
 
-    def test_reader_accepts_v1_without_counters_and_requires_them_in_v2(self):
+    def test_reader_accepts_v1_without_counters_and_requires_them_later(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "phase-1.jsonl"
@@ -132,12 +165,12 @@ class PhaseAttributionTests(unittest.TestCase):
             row.pop("pid")
             path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
             records, _ = read_records(root)
-            self.assertEqual(records[0]["counters"], dict.fromkeys(
-                ("bytes_read", "blocks_hashed", "reverify_calls"), 0))
-            header["schema"] = 2
-            path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
-            with self.assertRaisesRegex(ValueError, "v2 record has no counters"):
-                read_records(root)
+            self.assertEqual(records[0]["counters"], dict.fromkeys(COUNTERS, 0))
+            for schema in (2, 3):
+                header["schema"] = schema
+                path.write_text(json.dumps(header) + "\n" + json.dumps(row) + "\n")
+                with self.assertRaisesRegex(ValueError, f"v{schema} record has no counters"):
+                    read_records(root)
 
     def test_json_cli_enables_phases_and_explicit_off_is_available(self):
         from turn_wall_harness import _arguments

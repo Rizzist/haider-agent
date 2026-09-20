@@ -3074,8 +3074,15 @@ impl StoreOwner {
     ) -> Result<T, HaiderError> {
         let _phase =
             haider_platform::phase_trace::scope(haider_platform::phase_trace::Phase::StoreAccess);
+        let lock_phase = haider_platform::phase_trace::store_wait_scope(
+            haider_platform::phase_trace::Phase::StoreOwnerLockWait,
+        );
         let store = self.store.lock().map_err(|_| owner_lock_error())?;
+        drop(lock_phase);
         let store = store.as_ref().ok_or_else(closed_error)?;
+        let _other = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreOther,
+        );
         let result = operation(store);
         if let Err(error) = &result {
             self.note_failed_write(error, Vec::new());

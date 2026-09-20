@@ -2481,6 +2481,18 @@ impl Store {
         ledger: ProviderViewLedgerV1,
         blobs: Vec<ProviderViewBlobV1>,
     ) -> StoreResult<ProviderViewLedgerV1> {
+        let mut phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreProviderView,
+        );
+        if phase.enabled() {
+            phase.note_rows_read(blobs.len());
+            phase.note_payload_bytes(
+                blobs
+                    .iter()
+                    .map(ProviderViewBlobV1::byte_len)
+                    .fold(0_usize, usize::saturating_add),
+            );
+        }
         let mut connection = self.connection()?;
         let _ = self
             .provider_views
@@ -2507,6 +2519,18 @@ impl Store {
         attempt_ordinal: u64,
         envelopes: &mut [RawEnvelope],
     ) -> StoreResult<ProviderViewLedgerV1> {
+        let mut phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreProviderView,
+        );
+        if phase.enabled() {
+            phase.note_rows_read(blobs.len());
+            phase.note_payload_bytes(
+                blobs
+                    .iter()
+                    .map(ProviderViewBlobV1::byte_len)
+                    .fold(0_usize, usize::saturating_add),
+            );
+        }
         let mut connection = self.connection()?;
         let _ = self
             .provider_views
@@ -2552,6 +2576,18 @@ impl Store {
         blobs: Vec<ProviderViewBlobV1>,
         expires_at_ms: u64,
     ) -> StoreResult<ProviderViewLedgerV1> {
+        let mut phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreProviderView,
+        );
+        if phase.enabled() {
+            phase.note_rows_read(blobs.len());
+            phase.note_payload_bytes(
+                blobs
+                    .iter()
+                    .map(ProviderViewBlobV1::byte_len)
+                    .fold(0_usize, usize::saturating_add),
+            );
+        }
         let mut connection = self.connection()?;
         self.provider_views
             .persist(&mut connection, session_id, ledger, blobs, expires_at_ms)
@@ -2560,6 +2596,20 @@ impl Store {
     /// Verifies every referenced block directly from disk without retaining
     /// a complete request view.
     pub fn verify_provider_view(&self, ledger: &ProviderViewLedgerV1) -> StoreResult<()> {
+        let mut phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreProviderView,
+        );
+        if phase.enabled() {
+            let blocks = std::iter::once(&ledger.system_block)
+                .chain(std::iter::once(&ledger.tool_schema_block))
+                .chain(ledger.history_blocks.iter());
+            phase.note_rows_read(ledger.history_blocks.len().saturating_add(2));
+            phase.note_payload_bytes(
+                blocks
+                    .map(|block| usize::try_from(block.byte_len).unwrap_or(usize::MAX))
+                    .fold(0_usize, usize::saturating_add),
+            );
+        }
         let connection = self.connection()?;
         self.provider_views.verify(&connection, ledger)
     }
@@ -2571,6 +2621,13 @@ impl Store {
         ledger: &ProviderViewLedgerV1,
         block: &ProviderViewBlockRefV1,
     ) -> StoreResult<Vec<u8>> {
+        let mut phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreProviderView,
+        );
+        if phase.enabled() {
+            phase.note_rows_read(1);
+            phase.note_payload_bytes(usize::try_from(block.byte_len).unwrap_or(usize::MAX));
+        }
         let connection = self.connection()?;
         self.provider_views.read_block(&connection, ledger, block)
     }
@@ -4667,6 +4724,9 @@ impl Store {
         projection: &str,
         timeline_key: &str,
     ) -> StoreResult<Option<SessionProjectionCheckpoint>> {
+        let _phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryPoint,
+        );
         let connection = self.connection()?;
         if projection == RUN_HEADS_PROJECTION && timeline_key == RUN_HEADS_TIMELINE {
             return run_heads_projection_checkpoint(&connection, session_id).map(Some);
@@ -4855,6 +4915,9 @@ impl Store {
         &self,
         session_id: &SessionId,
     ) -> StoreResult<Option<SessionMetadataV1>> {
+        let _phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryPoint,
+        );
         let connection = self.connection()?;
         let metadata = connection
             .query_row(
@@ -10920,6 +10983,9 @@ impl Store {
         request_digest: &str,
         request_json: &str,
     ) -> StoreResult<Option<AcceptedTurn>> {
+        let _phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreReceiptAttempt,
+        );
         validate_command_identity(command_id, request_digest, request_json)?;
         let connection = self.connection()?;
         lookup_turn_accept_receipt(&connection, command_id, request_digest, request_json)
@@ -10929,6 +10995,9 @@ impl Store {
     /// used only by recovery and same-run receipt paths; fresh acceptance uses
     /// the run-head count already loaded inside its transaction.
     pub fn turn_ordinal(&self, session_id: &SessionId, run_id: &RunId) -> StoreResult<Option<u64>> {
+        let _phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreReceiptAttempt,
+        );
         let connection = self.connection()?;
         projected_turn_ordinal(&connection, session_id, run_id)
     }
@@ -11410,6 +11479,9 @@ impl Store {
         auto_title: Option<&str>,
         validate_headless: bool,
     ) -> StoreResult<TurnAcceptOutcome> {
+        let _phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreReceiptAttempt,
+        );
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -12861,6 +12933,10 @@ impl Store {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let mut query_phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryReplay,
+        );
+        let trace_enabled = query_phase.enabled();
         let connection = self.connection()?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = connection
@@ -12876,6 +12952,11 @@ impl Store {
         let mut rows = statement.query([limit]).map_err(map_sqlite_error)?;
         let mut envelopes = Vec::new();
         let mut resident_bytes = 0_usize;
+        let mut decode_phase = trace_enabled.then(|| {
+            haider_platform::phase_trace::store_scope(
+                haider_platform::phase_trace::Phase::StoreEventDecode,
+            )
+        });
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let session_id: String = row.get(0).map_err(map_sqlite_error)?;
             let seq: i64 = row.get(1).map_err(map_sqlite_error)?;
@@ -12892,6 +12973,13 @@ impl Store {
                 ));
             }
             let weight = envelope_weight_bytes(&envelope);
+            if let Some(phase) = decode_phase.as_mut() {
+                phase.note_rows_read(1);
+                phase.note_payload_bytes(weight);
+                phase.note_event_decoded();
+                query_phase.note_rows_read(1);
+                query_phase.note_payload_bytes(weight);
+            }
             if !envelopes.is_empty() && resident_bytes.saturating_add(weight) > byte_budget {
                 break;
             }
@@ -14034,6 +14122,10 @@ impl Store {
         if max_envelopes == 0 {
             return Ok(Vec::new());
         }
+        let mut query_phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryReplay,
+        );
+        let trace_enabled = query_phase.enabled();
         let connection = self.connection()?;
         // A limit beyond i64::MAX is effectively unbounded; clamp, don't error.
         let limit = i64::try_from(max_envelopes).unwrap_or(i64::MAX);
@@ -14055,6 +14147,11 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let mut envelopes = Vec::new();
         let mut spent = 0_usize;
+        let mut decode_phase = trace_enabled.then(|| {
+            haider_platform::phase_trace::store_scope(
+                haider_platform::phase_trace::Phase::StoreEventDecode,
+            )
+        });
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
             let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
@@ -14072,6 +14169,13 @@ impl Store {
                 &envelope,
             )?;
             let weight = envelope_weight_bytes(&envelope);
+            if let Some(phase) = decode_phase.as_mut() {
+                phase.note_rows_read(1);
+                phase.note_payload_bytes(weight);
+                phase.note_event_decoded();
+                query_phase.note_rows_read(1);
+                query_phase.note_payload_bytes(weight);
+            }
             if !envelopes.is_empty() && spent.saturating_add(weight) > byte_budget {
                 break;
             }
@@ -14106,6 +14210,9 @@ impl Store {
         if limit == 0 || payload_kinds.is_empty() {
             return Ok(Vec::new());
         }
+        let mut query_phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryReducer,
+        );
         let connection = self.connection()?;
         let filtered = read_reducer_page_with_connection(
             &connection,
@@ -14114,6 +14221,7 @@ impl Store {
             limit,
             byte_budget,
             payload_kinds,
+            &mut query_phase,
         );
         drop(connection);
         match filtered {
@@ -14143,6 +14251,9 @@ impl Store {
                 observed_head: None,
             });
         }
+        let mut query_phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryReducer,
+        );
         let connection = self.connection()?;
         let boundary = journal_boundary_with_connection(&connection, session)?;
         let filtered = read_reducer_page_with_connection(
@@ -14152,6 +14263,7 @@ impl Store {
             limit,
             byte_budget,
             payload_kinds,
+            &mut query_phase,
         );
         drop(connection);
         match filtered {
@@ -14185,6 +14297,9 @@ impl Store {
     }
 
     fn connection(&self) -> StoreResult<MutexGuard<'_, Connection>> {
+        let _phase = haider_platform::phase_trace::store_wait_scope(
+            haider_platform::phase_trace::Phase::StoreConnectionLockWait,
+        );
         self.connection.lock().map_err(|_| {
             store_error(
                 ErrorCode::Internal,
@@ -21751,6 +21866,10 @@ impl EventStore for Store {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let mut query_phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryReplay,
+        );
+        let trace_enabled = query_phase.enabled();
         let connection = self.connection()?;
         // A limit beyond i64::MAX is effectively unbounded; clamp, don't error.
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -21771,6 +21890,11 @@ impl EventStore for Store {
             ])
             .map_err(map_sqlite_error)?;
         let mut envelopes = Vec::new();
+        let mut decode_phase = trace_enabled.then(|| {
+            haider_platform::phase_trace::store_scope(
+                haider_platform::phase_trace::Phase::StoreEventDecode,
+            )
+        });
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
             let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
@@ -21787,6 +21911,14 @@ impl EventStore for Store {
                 stored_committed_at_ms,
                 &envelope,
             )?;
+            if let Some(phase) = decode_phase.as_mut() {
+                let weight = envelope_weight_bytes(&envelope);
+                phase.note_rows_read(1);
+                phase.note_payload_bytes(weight);
+                phase.note_event_decoded();
+                query_phase.note_rows_read(1);
+                query_phase.note_payload_bytes(weight);
+            }
             envelopes.push(envelope);
         }
         canonicalize_reply_page(&mut envelopes);
@@ -21794,6 +21926,9 @@ impl EventStore for Store {
     }
 
     fn latest_seq(&self, session: &SessionId) -> StoreResult<u64> {
+        let _phase = haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreQueryPoint,
+        );
         let connection = self.connection()?;
         let latest: i64 = connection
             .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
@@ -25382,7 +25517,9 @@ fn read_reducer_page_with_connection(
     limit: usize,
     byte_budget: usize,
     payload_kinds: &[&str],
+    query_phase: &mut haider_platform::phase_trace::StoreScope,
 ) -> Result<Vec<RawEnvelope>, FilteredReadError> {
+    let trace_enabled = query_phase.enabled();
     let (sql, parameter_capacity) = reducer_page_sql(payload_kinds.len())?;
     let mut parameters = Vec::with_capacity(parameter_capacity);
     parameters.push(SqlValue::Text(session.as_str().to_owned()));
@@ -25406,6 +25543,11 @@ fn read_reducer_page_with_connection(
         .map_err(FilteredReadError::Store)?;
     let mut envelopes = Vec::new();
     let mut spent = 0_usize;
+    let mut decode_phase = trace_enabled.then(|| {
+        haider_platform::phase_trace::store_scope(
+            haider_platform::phase_trace::Phase::StoreEventDecode,
+        )
+    });
     while let Some(row) = rows
         .next()
         .map_err(map_sqlite_error)
@@ -25434,6 +25576,13 @@ fn read_reducer_page_with_connection(
         )
         .map_err(FilteredReadError::Store)?;
         let weight = envelope_weight_bytes(&envelope);
+        if let Some(phase) = decode_phase.as_mut() {
+            phase.note_rows_read(1);
+            phase.note_payload_bytes(weight);
+            phase.note_event_decoded();
+            query_phase.note_rows_read(1);
+            query_phase.note_payload_bytes(weight);
+        }
         if !envelopes.is_empty() && spent.saturating_add(weight) > byte_budget {
             break;
         }
