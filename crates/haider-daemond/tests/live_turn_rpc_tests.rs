@@ -1435,6 +1435,7 @@ fn process_start_observer_menu(id: MenuId) -> Menu {
         id,
         kind: haider_protocol::menu::MenuKind::Permission {
             effect_summary: "run fixture command".into(),
+            file_review: None,
         },
         title: "Allow fixture?".into(),
         body: Vec::new(),

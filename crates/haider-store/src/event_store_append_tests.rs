@@ -154,6 +154,7 @@ fn permission_blocker_codes_mirror_the_headless_reducer() {
         id: MenuId::new("permission"),
         kind: MenuKind::Permission {
             effect_summary: "write".into(),
+            file_review: None,
         },
         title: "Permission".into(),
         body: Vec::new(),

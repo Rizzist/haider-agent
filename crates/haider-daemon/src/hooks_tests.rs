@@ -450,6 +450,7 @@ fn permission_menu(options: Vec<MenuOption>) -> Menu {
         id: MenuId::new("hook-permission-menu"),
         kind: MenuKind::Permission {
             effect_summary: "run exact hook test command".into(),
+            file_review: None,
         },
         title: "Allow command?".into(),
         body: vec!["exact effect bytes".into()],

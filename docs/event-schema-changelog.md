@@ -21,6 +21,17 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.972 — permission-bound Edit/Write review
+
+`menu.kind = permission` gains optional `file_review`. The payload binds a
+redacted Edit/Write unified diff to its effect id and records the path,
+operation, pre/post digests, complete add/remove counts, numbered hunks, and a
+bounded-content marker. Absence preserves every earlier permission-menu byte.
+The review is opened through the existing durable `menu_opened` fact; accept
+and reject remain typed options on the existing `menu_answered` fact, and the
+effect outcome remains authoritative for execution. No RPC method was added;
+the exhaustive method pin remains 136 and `schema_version` remains 1.
+
 ### v0.0.972 — session launch-origin registration
 
 New supplemental kind: `session_config:session_launch_origin_selected`

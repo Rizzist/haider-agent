@@ -147,6 +147,11 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     client_cmd("sessions", "List sessions — attach, or start fresh", ""),
     client_cmd(
+        "inbox",
+        "Needs you — pending asks, agent questions, stalled tasks",
+        "",
+    ),
+    client_cmd(
         "aura",
         "Aura Mode — a voice/orchestrator session (spawns sessions, never codes)",
         "",

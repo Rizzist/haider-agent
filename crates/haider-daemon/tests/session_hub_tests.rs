@@ -5381,6 +5381,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
         id: permission_menu_id.clone(),
         kind: MenuKind::Permission {
             effect_summary: "write src/lib.rs".into(),
+            file_review: None,
         },
         title: "Allow write?".into(),
         // v0.0.937 policy: permission bodies are broker-authored display
@@ -10947,6 +10948,7 @@ async fn waiting_why_types_parked_states_with_menu_identity() {
         "attention-perm-menu",
         MenuKind::Permission {
             effect_summary: "write a file".into(),
+            file_review: None,
         },
         |menu| RunState::PermissionRequired { menu },
     );

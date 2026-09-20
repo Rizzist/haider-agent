@@ -7,10 +7,13 @@
 //! selects a continuation arm.
 
 use haider_protocol::EventPayload;
+use haider_protocol::file_review::{
+    FileDiffHunk, FileDiffLine, FileDiffLineKind, FileReview, FileReviewOperation,
+};
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{EffectId, ItemId, MenuId};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::{RunState, WaitReason};
 
 /// One demo event through the driver channel — an envelope, or the demo's
@@ -872,7 +875,9 @@ pub fn respond_branch(
     // start the sequence past them (the preamble emitted none).
     // Branch 1's own gate is a BARE /subagent/ (tui.js:1262) — only the
     // PLURAL detection carries `\b` (see `branch_subagent`).
-    if low.contains("subagent") {
+    if low.contains("review diff") || low.contains("edit review") {
+        branch_file_review(&mut b);
+    } else if low.contains("subagent") {
         branch_subagent(&mut b, &low, roster);
     } else if ["crash", "unstable", "unreliable", "corrupt"]
         .iter()
@@ -917,6 +922,134 @@ pub fn respond_branch(
     // ends: on the turn's TERMINAL run state, in the reducer.
     b.beats.push(Beat::TurnEnd);
     b.beats
+}
+
+/// Demo-only entrypoint for exercising the real edit review interaction in
+/// a PTY. The durable shape is the same MenuOpened/MenuAnswered path used by
+/// live file effects; this branch only supplies deterministic sample text.
+fn branch_file_review(b: &mut B) {
+    b.stream("The edit is ready for review. Inspect both hunks before choosing a decision.");
+    let menu_id = MenuId::new(format!("t{}-file-review", b.turn));
+    b.state(RunState::PermissionRequired {
+        menu: menu_id.clone(),
+    });
+    b.emit(EventPayload::MenuOpened(Menu {
+        id: menu_id.clone(),
+        kind: MenuKind::Permission {
+            effect_summary: "patch crates/haider-store/src/event_store.rs".to_owned(),
+            file_review: Some(FileReview {
+                effect: EffectId::new(format!("demo-edit-review-{}", b.turn)),
+                path: "crates/haider-store/src/event_store.rs".to_owned(),
+                operation: FileReviewOperation::Edit,
+                old_digest: Some(format!("blake3:{}", "1".repeat(64))),
+                new_digest: format!("blake3:{}", "2".repeat(64)),
+                added: 2,
+                removed: 1,
+                hunks: vec![
+                    FileDiffHunk {
+                        old_start: 118,
+                        old_lines: 3,
+                        new_start: 118,
+                        new_lines: 4,
+                        lines: vec![
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Context,
+                                old_line: Some(118),
+                                new_line: Some(118),
+                                text: "pub fn accepts_seq(seq: u64) -> bool {".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Removal,
+                                old_line: Some(119),
+                                new_line: None,
+                                text: "    seq > 0 && seq <= MAX_SEQ".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Addition,
+                                old_line: None,
+                                new_line: Some(119),
+                                text: "    seq <= MAX_SEQ".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Addition,
+                                old_line: None,
+                                new_line: Some(120),
+                                text: "        // sequence zero is valid".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Context,
+                                old_line: Some(120),
+                                new_line: Some(121),
+                                text: "}".to_owned(),
+                            },
+                        ],
+                    },
+                    FileDiffHunk {
+                        old_start: 240,
+                        old_lines: 1,
+                        new_start: 241,
+                        new_lines: 1,
+                        lines: vec![FileDiffLine {
+                            kind: FileDiffLineKind::Context,
+                            old_line: Some(240),
+                            new_line: Some(241),
+                            text: "// replay keeps the same boundary".to_owned(),
+                        }],
+                    },
+                ],
+                truncated: false,
+            }),
+        },
+        title: "Allow fs_edit — event_store.rs?".to_owned(),
+        body: vec![
+            "fs_edit wants to modify crates/haider-store/src/event_store.rs".to_owned(),
+            "effect class: workspace write · reversible via /tree".to_owned(),
+        ],
+        options: vec![
+            MenuOption {
+                key: "allow".to_owned(),
+                label: "Allow once".to_owned(),
+                detail: Some("Run only this exact requested effect.".to_owned()),
+                decision: Some(DecisionKind::AllowOnce),
+            },
+            MenuOption {
+                key: "deny".to_owned(),
+                label: "Deny".to_owned(),
+                detail: Some("Do not run this effect.".to_owned()),
+                decision: Some(DecisionKind::RejectOnce),
+            },
+        ],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "fs_edit".to_owned(),
+        ttl_ms: None,
+        timeout_option: None,
+    }));
+
+    let mut allow = B::new(b.turn);
+    allow.seq = 90;
+    allow.emit(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new(format!("t{}-review-change", b.turn)),
+        item: TurnItem::FileChange {
+            path: "crates/haider-store/src/event_store.rs".to_owned(),
+            added: 2,
+            removed: 1,
+        },
+    }));
+    allow.streaming();
+    allow.stream("Applied the reviewed edit and preserved its effect binding.");
+    allow.beats.push(Beat::TurnEnd);
+
+    let mut deny = B::new(b.turn);
+    deny.seq = 95;
+    deny.streaming();
+    deny.stream("Rejected the edit. The workspace was left unchanged.");
+    deny.beats.push(Beat::TurnEnd);
+
+    b.beats.push(Beat::AwaitMenu {
+        menu: menu_id,
+        arms: vec![allow.beats, deny.beats],
+    });
 }
 
 /// The full turn (preamble + branch) — kept for the beat-level tests and
@@ -1118,6 +1251,7 @@ fn branch_prod(b: &mut B) {
         id: menu_id.clone(),
         kind: MenuKind::Permission {
             effect_summary: "cargo run --bin migrate -- --prod".to_owned(),
+            file_review: None,
         },
         title: "process_exec requests approval".to_owned(),
         body: vec![

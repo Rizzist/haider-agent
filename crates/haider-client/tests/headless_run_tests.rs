@@ -2021,6 +2021,7 @@ async fn permission_menu_selects_typed_allow_once_and_continues_to_done() {
                     id: menu_id.clone(),
                     kind: MenuKind::Permission {
                         effect_summary: "write /tmp/output".into(),
+                        file_review: None,
                     },
                     title: "Allow write?".into(),
                     body: Vec::new(),
@@ -2159,6 +2160,7 @@ async fn permission_answer_response_loss_replays_then_retries_current_generation
                     id: menu_id.clone(),
                     kind: MenuKind::Permission {
                         effect_summary: "execute command".into(),
+                        file_review: None,
                     },
                     title: "Allow execution?".into(),
                     body: Vec::new(),
@@ -2324,6 +2326,7 @@ async fn competing_permission_resolution_is_fail_closed_and_cancelled() {
                     id: menu_id.clone(),
                     kind: MenuKind::Permission {
                         effect_summary: "write protected file".into(),
+                        file_review: None,
                     },
                     title: "Allow write?".into(),
                     body: Vec::new(),

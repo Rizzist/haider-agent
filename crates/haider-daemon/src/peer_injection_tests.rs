@@ -221,6 +221,7 @@ async fn peer_approval_attempt_queues_without_answering_permission_or_changing_a
             id: menu_id.clone(),
             kind: MenuKind::Permission {
                 effect_summary: "write the workspace file".into(),
+                file_review: None,
             },
             title: "Allow file write?".into(),
             body: vec!["Only the user may approve this effect.".into()],

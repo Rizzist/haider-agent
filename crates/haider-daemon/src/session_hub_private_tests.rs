@@ -1736,6 +1736,7 @@ async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
         id: menu_id.clone(),
         kind: MenuKind::Permission {
             effect_summary: "write a file".into(),
+            file_review: None,
         },
         title: "Allow write?".into(),
         body: vec!["Allow this write for the session".into()],

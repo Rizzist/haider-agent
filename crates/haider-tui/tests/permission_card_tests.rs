@@ -55,6 +55,7 @@ fn permission_menu() -> Menu {
         id: MenuId::new(MENU_ID),
         kind: MenuKind::Permission {
             effect_summary: "computer requires Screen Recording".to_owned(),
+            file_review: None,
         },
         title: "Allow Screen Recording".to_owned(),
         body: vec!["macOS requires a real user grant.".to_owned()],

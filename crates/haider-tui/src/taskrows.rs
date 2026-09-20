@@ -29,7 +29,7 @@ pub struct TaskRow {
 pub enum TaskRowState {
     Running,
     Completed { exit_code: Option<i32> },
-    Failed,
+    Failed { reason: String },
     Killed,
 }
 
@@ -67,7 +67,9 @@ impl TaskPanel {
                     TaskTerminalState::Completed { exit_code } => TaskRowState::Completed {
                         exit_code: *exit_code,
                     },
-                    TaskTerminalState::Failed { .. } => TaskRowState::Failed,
+                    TaskTerminalState::Failed { reason } => TaskRowState::Failed {
+                        reason: reason.clone(),
+                    },
                     TaskTerminalState::Killed => TaskRowState::Killed,
                 };
                 if let Some(row) = self.find_mut(completed.task.as_str()) {

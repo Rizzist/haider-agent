@@ -37,6 +37,10 @@ pub enum MenuKind {
     /// Tool-call approval: effect class + the exact rule an "always" creates.
     Permission {
         effect_summary: String,
+        /// A redacted unified diff for an Edit/Write effect. It is carried by
+        /// the permission card so MenuAnswered remains the sole decision fact.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_review: Option<crate::file_review::FileReview>,
     },
     /// effect_outcome_unknown reconciliation (probe / retry / mark errored).
     /// Reconciliation re-emits the effect's terminal `Outcome` phase.

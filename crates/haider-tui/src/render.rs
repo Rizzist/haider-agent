@@ -1089,7 +1089,10 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Sessions => render_sessions(model, theme, frame, body, &mut hits),
         }
     }
-    if model.help_open {
+    if model.inbox_open {
+        render_inbox(model, theme, frame, body);
+        hits.clear();
+    } else if model.help_open {
         render_help(model, theme, frame, body);
         hits.clear();
     } else if model.shells_open {
@@ -6465,6 +6468,14 @@ fn render_session(
         .projection
         .open_menu()
         .filter(|open| open.origin == "plan" && !open.options.is_empty() && model.login.is_none());
+    let file_review_menu = model.projection.open_menu().and_then(|open| {
+        if open.options.is_empty() || model.login.is_some() {
+            return None;
+        }
+        let review = crate::app::menu_file_review(open)?;
+        let review_key = crate::app::file_review_menu_key(open)?;
+        Some((review, review_key))
+    });
     if let Some(plan) = plan_menu {
         // Review round 2: RENDER owns the new-proposal reset — plan B paints
         // from the top even before any keypress reaches the key handler.
@@ -6478,6 +6489,29 @@ fn render_session(
         let max_scroll =
             render_plan_document(plan, theme, frame, transcript_area, model.plan_scroll.get());
         model.plan_scroll_max.set(max_scroll);
+    } else if let Some((review, ref review_key)) = file_review_menu {
+        if model.file_review_seen.borrow().as_ref() != Some(review_key) {
+            *model.file_review_seen.borrow_mut() = Some(review_key.clone());
+            model.file_review_hunk.set(0);
+            model.file_review_scroll.set(0);
+        }
+        let selected = model
+            .file_review_hunk
+            .get()
+            .min(review.hunks.len().saturating_sub(1));
+        model.file_review_hunk.set(selected);
+        let max_scroll = render_file_review_document(
+            review,
+            selected,
+            theme,
+            frame,
+            transcript_area,
+            model.file_review_scroll.get(),
+        );
+        model.file_review_scroll_max.set(max_scroll);
+        model
+            .file_review_scroll
+            .set(model.file_review_scroll.get().min(max_scroll));
     } else {
         let visible_lines = highlight_transcript_lines(
             visible_lines,
@@ -6532,7 +6566,8 @@ fn render_session(
     // real wheel so it never covers the row it just revealed.
     // Review round 2: while a plan owns the transcript, the sticky prompt
     // band must neither paint over the document nor keep a clickable hit.
-    if plan_menu.is_none()
+    let document_menu_open = plan_menu.is_some() || file_review_menu.is_some();
+    if !document_menu_open
         && scroll_back > 0
         && scroll > 0
         && transcript_area.height > 0
@@ -6603,7 +6638,7 @@ fn render_session(
     // plan-menu suppression as the sticky band (surface ownership law).
     if model.scroll_back.get() == 0 {
         model.bottom_watermark.set(model.projection.entries().len());
-    } else if plan_menu.is_none() && transcript_area.height > 1 {
+    } else if !document_menu_open && transcript_area.height > 1 {
         let unseen = model
             .projection
             .entries()
@@ -6714,7 +6749,7 @@ fn render_session(
         }
     }
 
-    // The background-agent waiting line (item 8b) — plain text, never a hit.
+    // The needs-you aggregate shares the established background-agent row.
     if let Some(line) = &waiting_line
         && waiting_area.height > 0
     {
@@ -6729,6 +6764,9 @@ fn render_session(
             ])),
             waiting_area,
         );
+        if !model.inbox_rows().is_empty() {
+            hits.push((waiting_area, Hit::InboxBand));
+        }
     }
 
     // W-A: the running background-task band — same ambient voice as the
@@ -7004,12 +7042,19 @@ fn render_session(
             .style(theme.text_style()),
             rule_area,
         );
-        let footer = format!(
-            " ↑↓ select · ⏎ confirm · 1-{} quick · menu {} · menu.answer(\"{}\", n) over RPC",
-            menu.options.len(),
-            menu.id,
-            menu.id
-        );
+        let footer = if crate::app::menu_file_review(menu).is_some() {
+            format!(
+                " ←→ hunks · ↑↓ scroll · Tab decision · ⏎ apply · 1-{} quick",
+                menu.options.len()
+            )
+        } else {
+            format!(
+                " ↑↓ select · ⏎ confirm · 1-{} quick · menu {} · menu.answer(\"{}\", n) over RPC",
+                menu.options.len(),
+                menu.id,
+                menu.id
+            )
+        };
         let (menu_lines, option_rows) = menu_block(
             menu,
             model.menu_selection,
@@ -8167,6 +8212,31 @@ fn hover_band<'a>(mut line: Line<'a>, hovered: bool, width: u16, theme: &Theme) 
 /// question is still unfinished, but it is unfinished ON THE USER, so the
 /// line says so rather than implying the agent is busy.
 fn waiting_for_agents(model: &AppModel) -> Option<String> {
+    let counts = model.inbox_counts();
+    if counts != crate::app::InboxCounts::default() {
+        let mut parts = Vec::new();
+        if counts.asks > 0 {
+            parts.push(format!(
+                "{} ask{}",
+                counts.asks,
+                if counts.asks == 1 { "" } else { "s" }
+            ));
+        }
+        if counts.agents > 0 {
+            parts.push(format!(
+                "{} agent question{}",
+                counts.agents,
+                if counts.agents == 1 { "" } else { "s" }
+            ));
+        }
+        if counts.stalled > 0 {
+            parts.push(format!("{} stalled", counts.stalled));
+        }
+        if counts.unseen > 0 {
+            parts.push(format!("{} unseen", counts.unseen));
+        }
+        return Some(format!("✳ Needs you — {} · /inbox", parts.join(" · ")));
+    }
     let live = crate::app::tree_live_count(&model.chips);
     if live == 0 {
         return None;
@@ -11558,6 +11628,12 @@ fn wrapped_menu_body(
             DiffTone::Body,
         )];
     }
+    if crate::app::menu_file_review(menu).is_some() {
+        return vec![(
+            "diff above — ←→ hunks · ↑↓/PgUp/PgDn scroll · Tab cycles the decision".into(),
+            DiffTone::Body,
+        )];
+    }
     let budget = (width as usize).saturating_sub(2).max(1);
     // Both recovery families speak through their typed presentation when
     // they carry one: the provider/account card (E2) and the E6
@@ -11852,6 +11928,106 @@ fn render_plan_document(
     max_scroll
 }
 
+/// Full-height unified diff for an Edit/Write permission menu. The selected
+/// hunk owns the viewport while the ordinary card remains in the bottom band.
+fn render_file_review_document(
+    review: &haider_protocol::file_review::FileReview,
+    hunk_index: usize,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    scroll: u16,
+) -> u16 {
+    use haider_protocol::file_review::FileDiffLineKind;
+    if area.height == 0 || area.width == 0 {
+        return 0;
+    }
+    let count = review.hunks.len();
+    let selected = hunk_index.min(count.saturating_sub(1));
+    let operation = match review.operation {
+        haider_protocol::file_review::FileReviewOperation::Edit => "EDIT REVIEW",
+        haider_protocol::file_review::FileReviewOperation::Write => "WRITE REVIEW",
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("◇ {operation} "), theme.gold_style()),
+        Span::styled("· ", theme.dim_style()),
+        Span::styled(review.path.clone(), theme.bright_style()),
+        Span::styled(
+            format!(
+                " · +{} -{} · hunk {}/{}{}",
+                review.added,
+                review.removed,
+                if count == 0 { 0 } else { selected + 1 },
+                count,
+                if review.truncated { " · bounded" } else { "" }
+            ),
+            theme.dim_style(),
+        ),
+    ])];
+    lines.push(Line::styled(
+        "─".repeat(area.width as usize),
+        theme.dim_style(),
+    ));
+    if let Some(hunk) = review.hunks.get(selected) {
+        lines.push(Line::styled(
+            format!(
+                "@@ -{},{} +{},{} @@",
+                hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+            ),
+            theme.faint_style(),
+        ));
+        let number_width = hunk
+            .lines
+            .iter()
+            .flat_map(|line| [line.old_line, line.new_line])
+            .flatten()
+            .max()
+            .unwrap_or(0)
+            .to_string()
+            .len()
+            .max(1);
+        for line in &hunk.lines {
+            let old = line.old_line.map_or_else(
+                || " ".repeat(number_width),
+                |n| format!("{n:>number_width$}"),
+            );
+            let new = line.new_line.map_or_else(
+                || " ".repeat(number_width),
+                |n| format!("{n:>number_width$}"),
+            );
+            let (marker, style) = match line.kind {
+                FileDiffLineKind::Context => (' ', theme.dim_style()),
+                FileDiffLineKind::Addition => ('+', theme.ok_style()),
+                FileDiffLineKind::Removal => ('-', theme.err_style()),
+            };
+            let prefix = if area.width >= 34 {
+                format!(" {old} {new} {marker} ")
+            } else {
+                let active = line.old_line.or(line.new_line).unwrap_or(0);
+                format!(" {active:>number_width$} {marker} ")
+            };
+            let budget = (area.width as usize).saturating_sub(prefix.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(prefix, theme.faint_style()),
+                Span::styled(ellipsize(&line.text, budget), style),
+            ]));
+        }
+    } else {
+        lines.push(Line::styled(" No content changes.", theme.dim_style()));
+    }
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(area.height);
+    let clamped = scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((clamped, 0)),
+        area,
+    );
+    max_scroll
+}
+
 fn menu_block(
     menu: &haider_protocol::menu::Menu,
     selection: usize,
@@ -11885,7 +12061,8 @@ fn menu_block(
         // E6: the effect-reconciliation card is UNCERTAINTY, not failure —
         // the write may or may not have committed. Calm amber, never err;
         // the ⌁ glyph and the options carry the rest.
-        haider_protocol::menu::MenuKind::Recovery { .. } => Some(theme.warn),
+        haider_protocol::menu::MenuKind::Recovery { .. }
+        | haider_protocol::menu::MenuKind::Permission { .. } => Some(theme.warn),
         _ => None,
     };
     let selection = selection.min(menu.options.len().saturating_sub(1));
@@ -11955,6 +12132,15 @@ fn menu_block(
         // The server's first recovery option is primary; selection styling
         // takes precedence over its idle gold accent.
         let primary = index == 0 && recovery_ink.is_some();
+        let decision_style = match option.decision {
+            Some(haider_protocol::menu::DecisionKind::AllowOnce) => Some(theme.ok_style()),
+            Some(haider_protocol::menu::DecisionKind::AllowAlways) => Some(theme.gold_style()),
+            Some(
+                haider_protocol::menu::DecisionKind::RejectOnce
+                | haider_protocol::menu::DecisionKind::RejectAlways,
+            ) => Some(theme.err_style()),
+            None => None,
+        };
         // The gutter's first cell carries the ⋮ viewport marker on edge
         // rows adjacent to hidden options — none may vanish silently.
         let edge = (offset == 0 && hidden_above) || (offset + 1 == window_len && hidden_below);
@@ -11965,6 +12151,8 @@ fn menu_block(
                 format!("{}. {}", index + 1, option.label),
                 if selected {
                     theme.bright_style()
+                } else if let Some(style) = decision_style {
+                    style
                 } else if primary {
                     theme.gold_style()
                 } else {
@@ -11974,7 +12162,7 @@ fn menu_block(
         ];
         // Option detail is all-or-nothing; it never truncates mid-word.
         if selected
-            && recovery_ink.is_some()
+            && (recovery_ink.is_some() || option.decision.is_some())
             && let Some(detail) = &option.detail
         {
             let suffix = format!(" — {detail}");
@@ -12246,6 +12434,7 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
         MenuKind::Exhausted => "⟳",
         // CG-M1 SHIP gate: the graph flag, matching the strip and note rows.
         MenuKind::GraphHumanConfirm { .. } => "⚑",
+        MenuKind::Permission { .. } => "!",
         MenuKind::Choice if menu.origin == "voice" => "◉",
         MenuKind::Choice if menu.origin == "tools" => "⚒",
         MenuKind::Choice if menu.origin == "theme" => "◑",
@@ -13687,6 +13876,75 @@ fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
     );
+}
+
+fn render_inbox(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    use crate::app::InboxKind;
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Block::default().style(theme.text_style()), area);
+    let rows = model.inbox_rows();
+    let counts = model.inbox_counts();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            " ✳ NEEDS YOU",
+            theme.gold_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " · {} asks · {} agent questions · {} stalled · {} unseen",
+                counts.asks, counts.agents, counts.stalled, counts.unseen
+            ),
+            theme.dim_style(),
+        ),
+    ])];
+    lines.push(Line::from(vec![Span::styled(
+        " ↑↓ select · ⏎ open · esc back",
+        theme.faint_style(),
+    )]));
+    lines.push(Line::styled(
+        "─".repeat(area.width as usize),
+        theme.frame_style(),
+    ));
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            " Nothing needs your attention.",
+            theme.dim_style(),
+        ));
+    } else {
+        let capacity = (area.height as usize).saturating_sub(lines.len()).max(1);
+        let selected = model.inbox_cursor.min(rows.len().saturating_sub(1));
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(capacity)
+            .min(rows.len().saturating_sub(capacity));
+        for (index, row) in rows.iter().enumerate().skip(start).take(capacity) {
+            let (tag, tag_style) = match row.kind {
+                InboxKind::Ask => ("ASK", theme.warn_style()),
+                InboxKind::Agent => ("AGENT", theme.gold_style()),
+                InboxKind::StalledTask => ("TASK", theme.err_style()),
+                InboxKind::Unseen => ("UNSEEN", theme.dim_style()),
+            };
+            let prefix = format!(" {} {:<6} ", if index == selected { "❯" } else { " " }, tag);
+            let budget = (area.width as usize).saturating_sub(prefix.chars().count());
+            let text = ellipsize(&format!("{} · {}", row.title, row.detail), budget);
+            let mut line = Line::from(vec![
+                Span::styled(prefix, tag_style),
+                Span::styled(text, theme.text_style()),
+            ]);
+            if index == selected {
+                let pad = (area.width as usize).saturating_sub(line.width());
+                if pad > 0 {
+                    line.push_span(Span::raw(" ".repeat(pad)));
+                }
+                line = line.style(theme.selection_style());
+            }
+            lines.push(line);
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 /// Floating terminal-registry details. This reuses the existing body overlay

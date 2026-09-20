@@ -16658,6 +16658,7 @@ impl BrokerToolDispatcher {
             )),
             kind: MenuKind::Permission {
                 effect_summary: format!("{} requires {pane_name}", intent.summary),
+                file_review: None,
             },
             title: format!("Allow {pane_name}"),
             body: vec![

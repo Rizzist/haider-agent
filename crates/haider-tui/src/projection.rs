@@ -787,6 +787,35 @@ impl SessionProjection {
             EventPayload::MenuOpened(menu) => self.menu = Some(menu.clone()),
             EventPayload::MenuAnswered(answer) => {
                 if self.menu.as_ref().is_some_and(|m| m.id == answer.menu) {
+                    if let Some(menu) = self.menu.as_ref()
+                        && matches!(
+                            menu.kind,
+                            haider_protocol::menu::MenuKind::Permission { .. }
+                        )
+                    {
+                        let option = answer
+                            .option_key
+                            .as_ref()
+                            .and_then(|key| menu.options.iter().find(|option| &option.key == key))
+                            .or_else(|| menu.options.get(answer.option_index as usize));
+                        if let Some(option) = option
+                            && let Some(decision) = option.decision
+                        {
+                            let result = match decision {
+                                haider_protocol::menu::DecisionKind::AllowOnce => "allowed once",
+                                haider_protocol::menu::DecisionKind::AllowAlways => {
+                                    "allowed for this session"
+                                }
+                                haider_protocol::menu::DecisionKind::RejectOnce => "rejected",
+                                haider_protocol::menu::DecisionKind::RejectAlways => {
+                                    "always rejected"
+                                }
+                            };
+                            self.entries.push(TranscriptEntry::Note {
+                                text: format!("permission {result} · {}", menu.title),
+                            });
+                        }
+                    }
                     self.menu = None;
                 }
             }

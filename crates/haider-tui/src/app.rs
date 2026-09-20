@@ -405,6 +405,21 @@ pub fn plan_menu_key(menu: &haider_protocol::menu::Menu) -> (MenuId, u64) {
     (menu.id.clone(), hasher.finish())
 }
 
+#[must_use]
+pub fn menu_file_review(
+    menu: &haider_protocol::menu::Menu,
+) -> Option<&haider_protocol::file_review::FileReview> {
+    match &menu.kind {
+        haider_protocol::menu::MenuKind::Permission { file_review, .. } => file_review.as_ref(),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn file_review_menu_key(menu: &haider_protocol::menu::Menu) -> Option<(MenuId, String)> {
+    menu_file_review(menu).map(|review| (menu.id.clone(), review.new_digest.clone()))
+}
+
 impl AppModel {
     /// D1 — resolve a Loom agent type by id (chip coloring, graph rows).
     #[must_use]
@@ -4128,6 +4143,40 @@ pub struct SessionBrowserRow {
     pub created_at_ms: Option<u64>,
 }
 
+/// One read-only needs-you row, derived from existing projections. Targets
+/// carry authoritative ids so activating a row cannot drift with a refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxRow {
+    pub kind: InboxKind,
+    pub title: String,
+    pub detail: String,
+    pub target: InboxTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxKind {
+    Ask,
+    Agent,
+    StalledTask,
+    Unseen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxTarget {
+    CurrentMenu,
+    Session(SessionId),
+    Agent(String),
+    Task(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InboxCounts {
+    pub asks: usize,
+    pub agents: usize,
+    pub stalled: usize,
+    pub unseen: usize,
+}
+
 /// Incremental search over the currently attached transcript.  Matching is
 /// entry based so the renderer can jump through its existing wrapped-row
 /// geometry without copying or reflowing the transcript.
@@ -4245,6 +4294,8 @@ impl VoiceState {
 /// screen — or be dropped — never a different row the model drifted to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
+    /// Shared needs-you line in the session bottom band.
+    InboxBand,
     /// The launcher row's SESSION ID at render time (review P2-9: an
     /// ordinal resolved against current state could attach a different
     /// session than the one clicked).
@@ -5509,6 +5560,11 @@ pub struct AppModel {
     /// Keyed by (menu id, body byte length) so a re-issued id with different
     /// content still reads as a new proposal (round 3).
     pub plan_menu_seen: std::cell::RefCell<Option<(MenuId, u64)>>,
+    /// Selected hunk and scroll state for an open Edit/Write permission diff.
+    pub file_review_hunk: std::cell::Cell<usize>,
+    pub file_review_scroll: std::cell::Cell<u16>,
+    pub file_review_scroll_max: std::cell::Cell<u16>,
+    pub file_review_seen: std::cell::RefCell<Option<(MenuId, String)>>,
     /// Selected row in the slash palette (open while composer starts with /).
     /// Ranges over the FULL match list; the render window follows.
     pub palette_selection: usize,
@@ -5520,6 +5576,9 @@ pub struct AppModel {
     pub palette_dismissed: bool,
     /// The /help overlay (esc closes).
     pub help_open: bool,
+    /// Unified read-only needs-you overlay and its selected row.
+    pub inbox_open: bool,
+    pub inbox_cursor: usize,
     /// `/shells` terminal-registry overlay; activity floats over the body.
     pub shells_open: bool,
     /// Selected shell row in the overlay's keyboard path.
@@ -5947,10 +6006,16 @@ impl Default for AppModel {
             plan_scroll: std::cell::Cell::new(0),
             plan_scroll_max: std::cell::Cell::new(0),
             plan_menu_seen: std::cell::RefCell::new(None),
+            file_review_hunk: std::cell::Cell::new(0),
+            file_review_scroll: std::cell::Cell::new(0),
+            file_review_scroll_max: std::cell::Cell::new(0),
+            file_review_seen: std::cell::RefCell::new(None),
             palette_selection: 0,
             palette_scroll: 0,
             palette_dismissed: false,
             help_open: false,
+            inbox_open: false,
+            inbox_cursor: 0,
             shells_open: false,
             shells_cursor: 0,
             ssh_open: false,
@@ -7212,10 +7277,12 @@ impl AppModel {
     fn retire_surface_overlays(&mut self) {
         let had_overlay = self.transcript_search.is_some()
             || self.search_jump.borrow().is_some()
-            || self.mention_completion.is_some();
+            || self.mention_completion.is_some()
+            || self.inbox_open;
         self.transcript_search = None;
         *self.search_jump.borrow_mut() = None;
         self.mention_completion = None;
+        self.inbox_open = false;
         self.dirty |= had_overlay;
     }
 
@@ -8515,6 +8582,24 @@ impl AppModel {
             self.handle_sessions_key(key);
             return;
         }
+        if self.inbox_open {
+            let last = self.inbox_rows().len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.inbox_open = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.inbox_cursor = self.inbox_cursor.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.inbox_cursor = (self.inbox_cursor + 1).min(last);
+                }
+                KeyCode::Home => self.inbox_cursor = 0,
+                KeyCode::End => self.inbox_cursor = last,
+                KeyCode::Enter => self.activate_inbox_row(),
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
         if self.transcript_search.is_some() {
             match key.code {
                 KeyCode::Esc => self.close_transcript_search(),
@@ -9044,6 +9129,92 @@ impl AppModel {
                 }
                 _ => {}
             }
+        }
+        // Edit/Write review keeps the ordinary permission-menu answer path.
+        // The transcript area owns hunk navigation; Tab moves among the
+        // server supplied decisions and digits/Enter answer as usual.
+        if self.screen == Screen::Session
+            && let Some(menu) = self.projection.open_menu()
+            && let Some(review) = menu_file_review(menu)
+            && let Some(review_key) = file_review_menu_key(menu)
+            && !menu.options.is_empty()
+        {
+            if self.file_review_seen.borrow().as_ref() != Some(&review_key) {
+                *self.file_review_seen.borrow_mut() = Some(review_key);
+                self.file_review_hunk.set(0);
+                self.file_review_scroll.set(0);
+                self.file_review_scroll_max.set(u16::MAX);
+            }
+            let hunk_count = review.hunks.len().max(1);
+            let ceiling = self.file_review_scroll_max.get();
+            match key.code {
+                KeyCode::Left | KeyCode::Char('[') | KeyCode::Char('p') => {
+                    self.file_review_hunk.set(
+                        (self.file_review_hunk.get().min(hunk_count - 1) + hunk_count - 1)
+                            % hunk_count,
+                    );
+                    self.file_review_scroll.set(0);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Right | KeyCode::Char(']') | KeyCode::Char('n') => {
+                    self.file_review_hunk
+                        .set((self.file_review_hunk.get() + 1) % hunk_count);
+                    self.file_review_scroll.set(0);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Up => {
+                    self.file_review_scroll
+                        .set(self.file_review_scroll.get().min(ceiling).saturating_sub(1));
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Down => {
+                    self.file_review_scroll
+                        .set(self.file_review_scroll.get().saturating_add(1).min(ceiling));
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.file_review_scroll.set(
+                        self.file_review_scroll
+                            .get()
+                            .min(ceiling)
+                            .saturating_sub(10),
+                    );
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.file_review_scroll.set(
+                        self.file_review_scroll
+                            .get()
+                            .saturating_add(10)
+                            .min(ceiling),
+                    );
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Home => {
+                    self.file_review_scroll.set(0);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::End => {
+                    self.file_review_scroll.set(ceiling);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.menu_selection = (self.menu_selection + 1) % menu.options.len();
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
+            }
+            self.handle_menu_key(key.code);
+            return;
         }
         // D4: an open `plan` proposal owns the scroll keys — the document
         // fills the transcript area, so ↑↓/PgUp/PgDn page it and Tab cycles
@@ -13838,6 +14009,126 @@ impl AppModel {
         self.session_rows_for_query(&self.session_browser_query)
     }
 
+    /// Unified read-only attention view. Every row is derived from the
+    /// already reduced menu, roster, chip, and task state.
+    #[must_use]
+    pub fn inbox_rows(&self) -> Vec<InboxRow> {
+        let sessions = self.session_rows_for_query("");
+        let active_has_roster_ask = self.active_session.as_ref().is_some_and(|active| {
+            sessions
+                .iter()
+                .any(|row| &row.id == active && row.needs_input.is_some())
+        });
+        let mut rows = Vec::new();
+        if !active_has_roster_ask && let Some(menu) = self.projection.open_menu() {
+            rows.push(InboxRow {
+                kind: InboxKind::Ask,
+                title: menu.title.clone(),
+                detail: format!("current session · {}", menu.origin),
+                target: InboxTarget::CurrentMenu,
+            });
+        }
+        for row in &sessions {
+            if let Some(need) = &row.needs_input {
+                rows.push(InboxRow {
+                    kind: InboxKind::Ask,
+                    title: need.title.clone(),
+                    detail: format!("{} · {}", row.title, row.ago),
+                    target: InboxTarget::Session(row.id.clone()),
+                });
+            }
+        }
+        for (_, chip) in flatten_chips(&self.chips) {
+            if let Some(menu) = chip.question_menu() {
+                rows.push(InboxRow {
+                    kind: InboxKind::Agent,
+                    title: menu.title.clone(),
+                    detail: format!("{} · {}", chip_display_name(chip), chip.name),
+                    target: InboxTarget::Agent(chip.agent.clone()),
+                });
+            }
+        }
+        for task in self.tasks.rows() {
+            let detail = match &task.state {
+                crate::taskrows::TaskRowState::Failed { reason } => Some(reason.clone()),
+                crate::taskrows::TaskRowState::Completed {
+                    exit_code: Some(code),
+                } if *code != 0 => Some(format!("exit {code}")),
+                crate::taskrows::TaskRowState::Completed { exit_code: None } => {
+                    Some("ended by signal".to_owned())
+                }
+                _ => None,
+            };
+            if let Some(detail) = detail {
+                rows.push(InboxRow {
+                    kind: InboxKind::StalledTask,
+                    title: task.name.clone(),
+                    detail,
+                    target: InboxTarget::Task(task.task.clone()),
+                });
+            }
+        }
+        for row in sessions {
+            if row.unseen && row.needs_input.is_none() {
+                rows.push(InboxRow {
+                    kind: InboxKind::Unseen,
+                    title: row.title,
+                    detail: format!("unseen session activity · {}", row.ago),
+                    target: InboxTarget::Session(row.id),
+                });
+            }
+        }
+        rows
+    }
+
+    #[must_use]
+    pub fn inbox_counts(&self) -> InboxCounts {
+        let mut counts = InboxCounts::default();
+        for row in self.inbox_rows() {
+            match row.kind {
+                InboxKind::Ask => counts.asks += 1,
+                InboxKind::Agent => counts.agents += 1,
+                InboxKind::StalledTask => counts.stalled += 1,
+                InboxKind::Unseen => counts.unseen += 1,
+            }
+        }
+        counts
+    }
+
+    fn open_inbox(&mut self) {
+        self.inbox_open = true;
+        self.inbox_cursor = 0;
+        self.dirty = true;
+    }
+
+    fn activate_inbox_row(&mut self) {
+        let Some(target) = self
+            .inbox_rows()
+            .get(self.inbox_cursor)
+            .map(|row| row.target.clone())
+        else {
+            return;
+        };
+        self.inbox_open = false;
+        match target {
+            InboxTarget::CurrentMenu => self.switch_surface(Screen::Session),
+            InboxTarget::Session(session) => self.open_session(&session),
+            InboxTarget::Agent(agent) => {
+                if let Some(path) = path_to_chip(&self.chips, &agent) {
+                    self.view_path = path;
+                    self.switch_surface(Screen::Subagent);
+                }
+            }
+            InboxTarget::Task(task) => {
+                self.switch_surface(Screen::Session);
+                self.flash = Some(format!(
+                    "· stalled task {task} is recorded in this transcript"
+                ));
+            }
+        }
+        self.dirty = true;
+    }
+
     /// Top-level rows in launch/browser order, independent of the browser's
     /// transient filter. The launcher, digit bindings, and `/sessions <n>`
     /// all consume these exact identities so paint and action cannot drift.
@@ -15038,6 +15329,7 @@ impl AppModel {
             .map(str::to_ascii_lowercase);
         match name.as_str() {
             "help" => self.help_open = true,
+            "inbox" => self.open_inbox(),
             // Explicit parity for terminals/frontends where a rapid double
             // Esc cannot be distinguished. Bare opens the same chooser;
             // an ordinal loads that durable prompt verbatim.
@@ -18990,6 +19282,7 @@ impl AppModel {
             return;
         }
         match hit {
+            Hit::InboxBand => self.open_inbox(),
             // M2c: a click on the always-visible graph strip opens the
             // `/graph` telemetry screen — the same effect as the command
             // (fetch status + one-shot graph.inspect, then show the view).

@@ -1,0 +1,66 @@
+{
+  "id": "m-review-1",
+  "kind": {
+    "kind": "permission",
+    "effect_summary": "edit src/lib.rs",
+    "file_review": {
+      "effect": "effect-review-1",
+      "path": "src/lib.rs",
+      "operation": "edit",
+      "old_digest": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+      "new_digest": "blake3:2222222222222222222222222222222222222222222222222222222222222222",
+      "added": 1,
+      "removed": 1,
+      "hunks": [
+        {
+          "old_start": 7,
+          "old_lines": 2,
+          "new_start": 7,
+          "new_lines": 2,
+          "lines": [
+            {
+              "kind": "context",
+              "old_line": 7,
+              "new_line": 7,
+              "text": "fn answer() -> u32 {"
+            },
+            {
+              "kind": "removal",
+              "old_line": 8,
+              "text": "    41"
+            },
+            {
+              "kind": "addition",
+              "new_line": 8,
+              "text": "    42"
+            }
+          ]
+        }
+      ],
+      "truncated": false
+    }
+  },
+  "title": "Allow edit src/lib.rs?",
+  "body": [
+    "Effect class: FsWrite"
+  ],
+  "options": [
+    {
+      "key": "approve_once",
+      "label": "Approve once",
+      "detail": "Run only this exact requested effect.",
+      "decision": "allow_once"
+    },
+    {
+      "key": "deny",
+      "label": "Deny",
+      "detail": "Do not run this effect.",
+      "decision": "reject_once"
+    }
+  ],
+  "blocking": true,
+  "scope": {
+    "scope": "session"
+  },
+  "origin": "effect_broker"
+}

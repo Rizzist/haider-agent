@@ -43,7 +43,7 @@
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
 21|  /sessions  List sessions — attach, or start fresh                             |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×51; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×29
-22|  /aura  Aura Mode — a voice/orchestrator session (spawns sessions, never codes)|
-   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80
+22|  /inbox  Needs you — pending asks, agent questions, stalled tasks              |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×66; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×14
 23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38

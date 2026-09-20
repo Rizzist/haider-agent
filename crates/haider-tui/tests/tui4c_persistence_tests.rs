@@ -521,6 +521,7 @@ async fn answering_a_hydrated_card_lands_the_stale_menu_note() {
         id: MenuId::new("t1-gate"),
         kind: MenuKind::Permission {
             effect_summary: "patch src/lib.rs".to_owned(),
+            file_review: None,
         },
         title: "Allow fs_edit — lib.rs?".to_owned(),
         body: vec!["persisted across a restart".to_owned()],

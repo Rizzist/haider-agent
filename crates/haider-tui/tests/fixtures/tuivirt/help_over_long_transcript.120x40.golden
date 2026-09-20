@@ -43,39 +43,39 @@
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×92; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×28
 21|  /sessions  List sessions — attach, or start fresh                                                                     |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×51; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×69
-22|  /aura  Aura Mode — a voice/orchestrator session (spawns sessions, never codes)                                        |
+22|  /inbox  Needs you — pending asks, agent questions, stalled tasks                                                      |
+   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×66; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×54
+23|  /aura  Aura Mode — a voice/orchestrator session (spawns sessions, never codes)                                        |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×80; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×40
-23|  /peer <name> <message>  List live peers or send: /peer <name> <message>                                               |
+24|  /peer <name> <message>  List live peers or send: /peer <name> <message>                                               |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×73; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×47
-24|  /ssh [scope all|none|name,…|shell name]  SSH profiles — list, scope, or open a remote shell                           |
+25|  /ssh [scope all|none|name,…|shell name]  SSH profiles — list, scope, or open a remote shell                           |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×93; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×27
-25|  /shells  List local and SSH terminal sessions                                                                         |
+26|  /shells  List local and SSH terminal sessions                                                                         |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×47; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×73
-26|  /monitors  Existing session monitor details                                                                           |
+27|  /monitors  Existing session monitor details                                                                           |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×45; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×75
-27|  /accounts  Accounts — provider credentials (OAuth / API), pick the active one                                         |
+28|  /accounts  Accounts — provider credentials (OAuth / API), pick the active one                                         |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×79; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×41
-28|  /account <alias>  Switch the active account for its provider                                                          |
+29|  /account <alias>  Switch the active account for its provider                                                          |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×62; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×58
-29|  /providers  Providers — registry truth: endpoints, models, defaults, health                                           |
+30|  /providers  Providers — registry truth: endpoints, models, defaults, health                                           |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×77; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×43
-30|  /usage [provider]  Usage — cross-provider limit meters, costs, local stats                                            |
+31|  /usage [provider]  Usage — cross-provider limit meters, costs, local stats                                            |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×76; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×44
-31|  /login <provider> <oauth|api>  Add a provider account                                                                 |
+32|  /login <provider> <oauth|api>  Add a provider account                                                                 |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×55; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×65
-32|  /clear  Clear back to the main screen; typing there starts a new session                                              |
+33|  /clear  Clear back to the main screen; typing there starts a new session                                              |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×74; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×46
-33|  /back  Back to the main screen — same as /clear                                                                       |
+34|  /back  Back to the main screen — same as /clear                                                                       |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×49; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×71
-34|  /compact  Compact context now — history stays in the tree                                                             |
+35|  /compact  Compact context now — history stays in the tree                                                             |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×59; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×61
-35|  /tokens  Token panel — context by model (also ⌃G)                                                                     |
+36|  /tokens  Token panel — context by model (also ⌃G)                                                                     |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×51; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×69
-36|  /history [number]  Recall durable prompts — newest first (also esc esc)                                               |
+37|  /history [number]  Recall durable prompts — newest first (also esc esc)                                               |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×73; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×47
-37|  /hooks  Hooks — review and trust third-party hooks                                                                    |
+38|  /hooks  Hooks — review and trust third-party hooks                                                                    |
    ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×52; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×68
-38|  /voice  Voice — enable and pick STT / TTS providers                                                                   |
-   ~ Rgb(139, 148, 158)/Rgb(25, 25, 25)/NONE×53; Rgb(212, 212, 212)/Rgb(25, 25, 25)/NONE×67
 39| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×78
