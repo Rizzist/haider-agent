@@ -55,6 +55,17 @@ class PhaseAttributionTests(unittest.TestCase):
         self.assertEqual(result["excluded_cold_request_records"], 2)
         self.assertEqual(len(result["records"]), 4)
 
+    def test_lockdown_binding_is_visible_in_cold_and_warm_attribution(self):
+        records = [record("rpc", 105, 190, waiting=True),
+                   record("turn_setup", 110, 180, 20),
+                   record("lockdown_bind_activate", 130, 145, 7)]
+        warm = self.build(records)
+        cold = self.build(records, cold=True)
+
+        self.assertEqual(warm["detail"]["lockdown_bind_activate"]["wall_ns"], 15)
+        self.assertEqual(cold["phases"]["lockdown_bind_activate"]["wall_ns"], 15)
+        self.assertEqual(cold["phases"]["lockdown_bind_activate"]["cpu_ns"], 7)
+
     def test_independent_reaped_cpu_is_separate_from_thread_scopes(self):
         result = self.build([record("tool_dispatch", 110, 150, 20)], reaped_children_cpu_ns=15)
         self.assertEqual(result["phases"]["daemon_reaped_children"]["cpu_ns"], 15)

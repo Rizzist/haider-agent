@@ -783,12 +783,18 @@ impl EffectBroker {
                 operation.call_id
             )));
         }
-        let intent = match policy {
-            Some(policy) => self.begin(&prepared, policy).await?,
-            None => self.begin_user_typed(&prepared).await?,
-        };
         let workspace_root = self.workspace_root().to_path_buf();
-        let workspace_receipt = self.begin_workspace_receipt().await;
+        let workspace_receipt = self.workspace_receipt_future();
+        let (intent, workspace_receipt) = tokio::join!(
+            async {
+                match policy {
+                    Some(policy) => self.begin(&prepared, policy).await,
+                    None => self.begin_user_typed(&prepared).await,
+                }
+            },
+            workspace_receipt,
+        );
+        let intent = intent?;
         let cwd_fd =
             match prepared.cwd_for_spawn(self.workspace_root(), self.duplicate_workspace_dir()?) {
                 Ok(cwd_fd) => cwd_fd,

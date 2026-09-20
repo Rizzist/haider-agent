@@ -77,6 +77,45 @@ impl JournalSink for RejectDispatchJournal {
         self.payloads.push(payload);
         Ok(())
     }
+
+    async fn append_batch(&mut self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        if payloads.iter().any(|payload| {
+            matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Dispatched { .. })
+            )
+        }) {
+            return Err(haider_tools::ToolError::journal(
+                "durable append unavailable",
+            ));
+        }
+        self.payloads.extend(payloads);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BatchJournal {
+    transaction_sizes: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+#[async_trait::async_trait]
+impl JournalSink for BatchJournal {
+    async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
+        self.transaction_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(1);
+        Ok(())
+    }
+
+    async fn append_batch(&mut self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        self.transaction_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(payloads.len());
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -798,7 +837,10 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     assert!(matches!(error, haider_tools::ToolError::Journal { .. }));
     assert_eq!(fs::read_to_string(&path).expect("read file"), "before");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
-    assert_eq!(broker.journal_snapshot().len(), 2);
+    assert!(
+        broker.journal_snapshot().is_empty(),
+        "an atomic start-batch rejection must leave no lifecycle prefix"
+    );
 }
 
 /// Windows byte-range locks are mandatory even between handles in one process.
@@ -1055,6 +1097,37 @@ async fn successful_dispatch_has_strict_four_phase_order() {
         }
     ));
     assert_eq!(phases.len(), 4);
+}
+
+#[tokio::test]
+async fn immediately_allowed_effect_commits_start_phases_as_one_batch() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("read.txt");
+    fs::write(&path, "small result").expect("seed file");
+    let journal = BatchJournal::default();
+    let observer = journal.clone();
+    let mut broker = broker_at(journal, directory.path(), 1);
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::FsRead);
+
+    broker
+        .fs_read(
+            &FsRead::new(&path),
+            &policy,
+            &mut UnusedCas,
+            ResultBounds::default(),
+        )
+        .await
+        .expect("read succeeds");
+
+    assert_eq!(
+        *observer
+            .transaction_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![3, 1],
+        "Intent/Authorized/Dispatched share one commit; Outcome remains terminal"
+    );
 }
 
 #[tokio::test]

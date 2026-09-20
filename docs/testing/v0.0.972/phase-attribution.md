@@ -65,6 +65,7 @@ mean that the CPU was executing throughout that wall interval.
 | tool_dispatch | Real general-tool dispatcher active polls/waits; external child CPU is separate |
 | daemon_reaped_children | Corrected native before/after counter delta; CPU only, no wall allocation |
 | client_control / turn_control | Active CLI dispatch / core drive_turn polls, excluding nested specific scopes; waiting time is not recorded for these broad control buckets |
+| lockdown_bind_activate | Synchronous durable per-run lockdown binding plus active-session activation inside turn setup; excludes provider resolution and any later background-task fence |
 | turn_setup / store_access | Active worker start_turn polls and generic StoreOwner::with_store operations, excluding nested specific scopes; supplementary buckets expose remaining setup/store work |
 | completion_render | Headless output per-event adaptation and final output; excludes waiting for the next event; not resident TUI paint |
 | teardown | Client owned-daemon teardown and daemon finalization; runtime drop/trace flush remains residual |

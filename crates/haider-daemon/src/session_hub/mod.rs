@@ -3151,6 +3151,63 @@ impl SessionHub {
         Ok(())
     }
 
+    /// Freezes and activates the turn with one durable ledger replacement.
+    /// Publishing the in-memory view happens only after that replacement, so
+    /// a worker cannot observe or execute an unenforced active boundary.
+    pub(crate) fn bind_activate_lockdown_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        provider: &str,
+        proposed_policy: crate::auto_hermetic::ProviderLockdownPolicy,
+    ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
+        let (proposed_lockdown, proposed_auto_hermetic) = proposed_policy.binding_bits();
+        let durable = match crate::lockdown::global() {
+            Ok(manager) => {
+                let profile_id = self.inner.store.cached_profile_installation_id();
+                Some(
+                    manager
+                        .bind_and_activate_turn(
+                            profile_id,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                            provider,
+                            proposed_lockdown,
+                            proposed_auto_hermetic,
+                        )
+                        .map_err(|error| SessionHubError::Task(error.to_string()))?,
+                )
+            }
+            #[cfg(test)]
+            Err(_) => None,
+            #[cfg(not(test))]
+            Err(error) => return Err(SessionHubError::Task(error.to_string())),
+        };
+        let (provider, lockdown, auto_hermetic) = durable.unwrap_or_else(|| {
+            (
+                provider.to_owned(),
+                proposed_lockdown,
+                proposed_auto_hermetic,
+            )
+        });
+        let policy =
+            crate::auto_hermetic::ProviderLockdownPolicy::from_binding(lockdown, auto_hermetic);
+        let key = (session_id.clone(), run_id.clone());
+        let mut turns = lock(&self.inner.lockdown_turns)?;
+        if let Some(binding) = turns.get(&key)
+            && binding.provider != provider
+        {
+            return Err(SessionHubError::Task(format!(
+                "lockdown turn binding conflict for {session_id}/{run_id}: stored provider `{}`, requested `{provider}`",
+                binding.provider
+            )));
+        }
+        turns.retain(|candidate, _| candidate.0 != *session_id || candidate == &key);
+        turns.insert(key, LockdownTurnBinding { provider, policy });
+        self.inner.lockdown_turn_bound.notify_waiters();
+        Ok(policy)
+    }
+
     /// Last provider ceiling that actually governed this session. Direct
     /// mutation surfaces use it until the next run boundary, including for a
     /// headless run whose provider differs from durable session metadata.

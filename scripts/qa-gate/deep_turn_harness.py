@@ -80,6 +80,49 @@ T95 = {
 }
 
 
+def parse_daemon_processes(stdout: str) -> list[dict[str, Any]]:
+    """Parse a content-free `ps pid,comm` inventory for foreign daemons."""
+
+    processes: list[dict[str, Any]] = []
+    for raw_line in stdout.splitlines():
+        fields = raw_line.strip().split(maxsplit=1)
+        if len(fields) != 2:
+            continue
+        pid_text, executable = fields
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if Path(executable).name != "haiderd":
+            continue
+        processes.append({"pid": pid, "executable": executable})
+    return processes
+
+
+def foreign_daemon_snapshot() -> dict[str, Any]:
+    """Capture daemons only where no fixture-owned daemon is meant to exist."""
+
+    if os.name != "posix":
+        raise ProofError("foreign daemon snapshots require a POSIX ps implementation")
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,comm="],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise ProofError(
+            f"foreign daemon snapshot failed exit={completed.returncode}"
+        )
+    processes = parse_daemon_processes(completed.stdout)
+    return {
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "processes": processes,
+        "foreign_daemon_count": len(processes),
+    }
+
+
 def projection_bytes(body: Mapping[str, Any]) -> bytes:
     """Stable bytes for byte-comparing the provider-bound prompt/history.
 
@@ -1107,6 +1150,18 @@ def arms_for(args: argparse.Namespace) -> tuple[Arm, Arm | None]:
                 "WALL-1 incremental journal projections",
             ),
         )
+    if args.experiment == "wall-toolpath":
+        if args.variant_bin_dir is None:
+            raise ProofError("wall-toolpath requires --variant-bin-dir")
+        return (
+            Arm("a", base, {}, "pre-WALL-3+4 tool path"),
+            Arm(
+                "b",
+                args.variant_bin_dir.resolve(),
+                {},
+                "WALL-3+4 overlapped receipt and batched durable phases",
+            ),
+        )
     raise ProofError(f"unknown experiment {args.experiment!r}")
 
 
@@ -1154,6 +1209,7 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
             "free2-msgpack",
             "free3-mimalloc",
             "wall1-journal",
+            "wall-toolpath",
         ),
         default="baseline",
     )
@@ -1188,20 +1244,49 @@ def main(argv: Sequence[str] | None = None) -> int:
             arms = {"a": arm_a, "b": arm_b}
         cpu_accounting = cpu_accounting_self_check()
         runs = []
-        for block, position, arm_name in order:
-            run = run_fixture(
-                arms[arm_name],
-                block=block,
-                position=position,
-                require_quiet=args.require_quiet,
-                keep_root=args.keep_root,
-            )
-            runs.append(run)
-            print(
-                f"deep-turn {run['label']} complete "
-                f"depth40={run['turns'][39]['wall_ms']:.3f}ms",
-                file=sys.stderr,
-                flush=True,
+        foreign_daemon_snapshots = []
+        discarded_blocks = []
+        positions_by_block = {
+            block: [entry for entry in order if entry[0] == block]
+            for block in sorted({entry[0] for entry in order})
+        }
+        for block, positions in positions_by_block.items():
+            block_runs = []
+            started = foreign_daemon_snapshot()
+            for _block, position, arm_name in positions:
+                run = run_fixture(
+                    arms[arm_name],
+                    block=block,
+                    position=position,
+                    require_quiet=args.require_quiet,
+                    keep_root=args.keep_root,
+                )
+                block_runs.append(run)
+                print(
+                    f"deep-turn {run['label']} complete "
+                    f"depth40={run['turns'][39]['wall_ms']:.3f}ms",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finished = foreign_daemon_snapshot()
+            snapshot = {"block": block, "start": started, "end": finished}
+            foreign_daemon_snapshots.append(snapshot)
+            if started["foreign_daemon_count"] or finished["foreign_daemon_count"]:
+                discarded_blocks.append(
+                    {
+                        "block": block,
+                        "reason": "foreign daemon present at block boundary",
+                        "run_labels": [run["label"] for run in block_runs],
+                    }
+                )
+                continue
+            runs.extend(block_runs)
+        expected_runs = len(order)
+        if len(runs) != expected_runs:
+            raise ProofError(
+                "foreign-daemon contamination discarded "
+                f"{len(discarded_blocks)} block(s); clean runs={len(runs)} "
+                f"expected={expected_runs}"
             )
         report = {
             "schema": "haider.deep-turn.v1",
@@ -1232,6 +1317,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for name, arm in arms.items()
             },
             "runs": runs,
+            "foreign_daemon_snapshots": foreign_daemon_snapshots,
+            "discarded_blocks": discarded_blocks,
             "summary": summarize_arms(runs),
             "contrasts": summarize_contrasts(runs),
             "projection_equivalence": summarize_projection_equivalence(runs),

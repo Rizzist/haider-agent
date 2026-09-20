@@ -7198,17 +7198,19 @@ async fn perform_manual_compaction(
         .hub()
         .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
         .map_err(hub_error)?;
-    let lockdown = lockdown_turn_snapshot(
-        lease.hub(),
-        lease.session_id(),
-        &boundary_run_id,
-        &resolved.provider_name,
-        provider_policy,
+    let lockdown = haider_platform::phase_trace::sync(
+        haider_platform::phase_trace::Phase::LockdownBindActivate,
+        || {
+            let lockdown = active_lockdown_turn_snapshot(
+                lease.hub(),
+                lease.session_id(),
+                &boundary_run_id,
+                &resolved.provider_name,
+                provider_policy,
+            )?;
+            Ok::<_, HaiderError>(lockdown)
+        },
     )?;
-    lease
-        .hub()
-        .activate_lockdown_turn(lease.session_id(), &boundary_run_id)
-        .map_err(hub_error)?;
     let workspace_unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd));
     if workspace_unavailable.is_some()
         && let Some(hooks) = lease.hub().hooks().map_err(hub_error)?
@@ -8680,18 +8682,20 @@ async fn start_turn(
         .hub()
         .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
         .map_err(hub_error)?;
-    let lockdown = provider_rebind::rebound_turn_lockdown_snapshot(
-        lease.hub(),
-        lease.session_id(),
-        &accepted.run_id,
-        metadata.provider_rebind_id.is_some(),
-        &resolved.provider_name,
-        provider_policy,
+    let lockdown = haider_platform::phase_trace::sync(
+        haider_platform::phase_trace::Phase::LockdownBindActivate,
+        || {
+            let lockdown = provider_rebind::rebound_active_turn_lockdown_snapshot(
+                lease.hub(),
+                lease.session_id(),
+                &accepted.run_id,
+                metadata.provider_rebind_id.is_some(),
+                &resolved.provider_name,
+                provider_policy,
+            )?;
+            Ok::<_, HaiderError>(lockdown)
+        },
     )?;
-    lease
-        .hub()
-        .activate_lockdown_turn(lease.session_id(), &accepted.run_id)
-        .map_err(hub_error)?;
     if lockdown.is_some() {
         // A task launched by an earlier Full turn must not remain a process
         // escape after this provider's next Lockdown boundary.
@@ -15507,6 +15511,7 @@ fn lockdown_tool_definition_pack(
     })
 }
 
+#[cfg(test)]
 fn lockdown_turn_snapshot(
     hub: &SessionHub,
     session_id: &SessionId,
@@ -15516,6 +15521,26 @@ fn lockdown_turn_snapshot(
 ) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
     let bound_policy = hub
         .bind_lockdown_turn(session_id, run_id, provider, policy)
+        .map_err(hub_error)?;
+    if !bound_policy.is_lockdown() {
+        return Ok(None);
+    }
+    let mut turn = crate::lockdown::global()
+        .and_then(|manager| manager.turn(provider))
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+    crate::auto_hermetic::apply_to_turn(&mut turn, bound_policy);
+    Ok(Some(turn))
+}
+
+fn active_lockdown_turn_snapshot(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    provider: &str,
+    policy: crate::auto_hermetic::ProviderLockdownPolicy,
+) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
+    let bound_policy = hub
+        .bind_activate_lockdown_turn(session_id, run_id, provider, policy)
         .map_err(hub_error)?;
     if !bound_policy.is_lockdown() {
         return Ok(None);
@@ -23712,64 +23737,75 @@ impl HubJournalSink {
             args_digest,
         })
     }
-}
 
-#[async_trait]
-impl JournalSink for HubJournalSink {
-    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
-        let intent_effect = match &payload {
-            EventPayload::Effect(EffectPhase::Intent(intent)) => Some(intent.effect.clone()),
-            _ => None,
-        };
-        if let EventPayload::Effect(EffectPhase::Intent(intent)) = &payload {
-            self.intent_digests
-                .insert(intent.effect.clone(), intent.args_digest.clone());
-        }
-        let effect_was_dispatched = matches!(
-            &payload,
-            EventPayload::Effect(EffectPhase::Dispatched { .. })
-        );
-        let dispatched = match &payload {
-            EventPayload::Effect(EffectPhase::Dispatched { effect })
-                if self.diagnostics.is_some() =>
-            {
-                Some(self.breadcrumb(effect)?)
-            }
-            _ => None,
-        };
-        let completed = match &payload {
-            EventPayload::Effect(EffectPhase::Outcome { effect, .. })
-                if self.diagnostics.is_some() =>
-            {
-                self.pending_breadcrumbs.get(effect).cloned()
-            }
-            _ => None,
-        };
-        let mut envelopes = [EventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            event_id: self.event_ids.next(),
-            seq: 0,
-            session_id: self.store.session_id().clone(),
-            branch_id: self.branch_id.clone(),
-            run_id: Some(self.run_id.clone()),
-            agent_id: None,
-            device_id: self.device_id.clone(),
-            authority_epoch: 0,
-            worker_generation: self.store.worker_generation(),
-            causation_id: None,
-            correlation_id: None,
-            committed_at_ms: 0,
-            render: RenderTargets {
-                ui: true,
-                durable: true,
-                prompt: PromptRender::Omit,
-            },
-            payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
-                |error| haider_tools::ToolError::Runtime {
-                    message: format!("cannot serialize effect envelope: {error}"),
+    async fn append_payloads(&mut self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        let intent_effects = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                    self.intent_digests
+                        .insert(intent.effect.clone(), intent.args_digest.clone());
+                    Some(intent.effect.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let effect_was_dispatched = payloads.iter().any(|payload| {
+            matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Dispatched { .. })
+            )
+        });
+        let dispatched = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                EventPayload::Effect(EffectPhase::Dispatched { effect })
+                    if self.diagnostics.is_some() =>
+                {
+                    Some(self.breadcrumb(effect))
+                }
+                _ => None,
+            })
+            .collect::<ToolResult<Vec<_>>>()?;
+        let completed = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                EventPayload::Effect(EffectPhase::Outcome { effect, .. })
+                    if self.diagnostics.is_some() =>
+                {
+                    self.pending_breadcrumbs.get(effect).cloned()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut envelopes = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            envelopes.push(EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: self.event_ids.next(),
+                seq: 0,
+                session_id: self.store.session_id().clone(),
+                branch_id: self.branch_id.clone(),
+                run_id: Some(self.run_id.clone()),
+                agent_id: None,
+                device_id: self.device_id.clone(),
+                authority_epoch: 0,
+                worker_generation: self.store.worker_generation(),
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: RenderTargets {
+                    ui: true,
+                    durable: true,
+                    prompt: PromptRender::Omit,
                 },
-            )?,
-        }];
+                payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
+                    |error| ToolError::Runtime {
+                        message: format!("cannot serialize effect envelope: {error}"),
+                    },
+                )?,
+            });
+        }
         if effect_was_dispatched {
             // The store actor can commit after cancellation drops this append
             // future while it awaits the acknowledgement. Mark conservatively
@@ -23777,51 +23813,62 @@ impl JournalSink for HubJournalSink {
             // the completion safety scan enabled.
             self.effect_dispatched.store(true, Ordering::Release);
         }
-        if let Some(breadcrumb) = dispatched.as_ref() {
+        for breadcrumb in &dispatched {
             self.pending_breadcrumbs
                 .insert(breadcrumb.effect_id.clone(), breadcrumb.clone());
         }
         let appended = haider_core::StoreHandle::append(&self.store, &mut envelopes)
             .await
-            .map_err(|error| haider_tools::ToolError::Runtime {
+            .map_err(|error| ToolError::Runtime {
                 message: error.message,
             });
         if let Err(error) = appended {
-            if let Some(breadcrumb) = dispatched.as_ref() {
+            for breadcrumb in &dispatched {
                 self.pending_breadcrumbs.remove(&breadcrumb.effect_id);
             }
-            if let Some(effect) = intent_effect {
+            for effect in intent_effects {
                 self.intent_digests.remove(&effect);
             }
             return Err(error);
         }
-        if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, dispatched)
-            && let Err(error) = diagnostics.record_start(breadcrumb).await
-        {
-            // Diagnostics are a best-effort crash breadcrumb, never part
-            // of the journal transaction's success value. Waiting here
-            // preserves Start-before-Complete ordering while swallowing
-            // failure preserves JournalSink's Err-means-no-commit law.
-            tracing::warn!(
-                %error,
-                "effect dispatch committed but start diagnostic update failed"
-            );
-        }
-        if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, completed) {
-            let diagnostics = Arc::clone(diagnostics);
-            let diagnostic_breadcrumb = breadcrumb.clone();
-            tokio::spawn(async move {
-                if let Err(error) = diagnostics.record_completion(diagnostic_breadcrumb).await {
+        if let Some(diagnostics) = &self.diagnostics {
+            for breadcrumb in dispatched {
+                if let Err(error) = diagnostics.record_start(breadcrumb).await {
+                    // Diagnostics are a best-effort crash breadcrumb, never
+                    // part of the journal transaction's success value.
                     tracing::warn!(
                         %error,
-                        "checkpoint outcome committed but completion diagnostic update failed"
+                        "effect dispatch committed but start diagnostic update failed"
                     );
                 }
-            });
-            self.pending_breadcrumbs.remove(&breadcrumb.effect_id);
-            self.intent_digests.remove(&breadcrumb.effect_id);
+            }
+            for breadcrumb in completed {
+                let diagnostics = Arc::clone(diagnostics);
+                let diagnostic_breadcrumb = breadcrumb.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = diagnostics.record_completion(diagnostic_breadcrumb).await {
+                        tracing::warn!(
+                            %error,
+                            "checkpoint outcome committed but completion diagnostic update failed"
+                        );
+                    }
+                });
+                self.pending_breadcrumbs.remove(&breadcrumb.effect_id);
+                self.intent_digests.remove(&breadcrumb.effect_id);
+            }
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl JournalSink for HubJournalSink {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        self.append_payloads(vec![payload]).await
+    }
+
+    async fn append_batch(&mut self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        self.append_payloads(payloads).await
     }
 
     fn supports_checkpoint_batches(&self) -> bool {

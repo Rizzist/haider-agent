@@ -66,6 +66,7 @@ pub(super) async fn pin_headless_turn_metadata(
 
 /// Recovery retains the accepted run's authority identity. An explicit Full
 /// route change does not create a new lockdown binding for that same run.
+#[cfg(test)]
 pub(super) fn rebound_turn_lockdown_snapshot(
     hub: &SessionHub,
     session_id: &SessionId,
@@ -93,6 +94,42 @@ pub(super) fn rebound_turn_lockdown_snapshot(
         }
     }
     lockdown_turn_snapshot(hub, session_id, run_id, provider, policy)
+}
+
+/// Recovery performs the same frozen-policy check, then publishes the binding
+/// and active boundary with one durable replacement before the turn proceeds.
+pub(super) fn rebound_active_turn_lockdown_snapshot(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    explicitly_rebound: bool,
+    provider: &str,
+    policy: crate::auto_hermetic::ProviderLockdownPolicy,
+) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
+    if explicitly_rebound
+        && let Some((bound_provider, bound_policy)) = hub
+            .bound_lockdown_run(session_id, run_id)
+            .map_err(hub_error)?
+    {
+        if bound_policy.binding_bits() != policy.binding_bits()
+            || (bound_policy.is_lockdown() && bound_provider != provider)
+        {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "provider rebind would change the recovered run's frozen provider trust",
+                true,
+            ));
+        }
+        if !bound_policy.is_lockdown() {
+            // A recovered explicit Full rebind intentionally keeps the
+            // accepted run's original authority identity. Its binding is
+            // already durable, so only activation remains to persist.
+            hub.activate_lockdown_turn(session_id, run_id)
+                .map_err(hub_error)?;
+            return Ok(None);
+        }
+    }
+    active_lockdown_turn_snapshot(hub, session_id, run_id, provider, policy)
 }
 
 pub(super) struct DaemonProviderRebindResolver {
