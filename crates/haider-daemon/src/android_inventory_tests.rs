@@ -2,9 +2,7 @@
 use super::*;
 
 const EXCLUDED: &[&str] = &[
-    "process_exec",
     "test_run",
-    "exec",
     "task_output",
     "task_kill",
     "workflow_author",
@@ -56,6 +54,8 @@ async fn android_standalone_inventory_golden_and_route_ceiling() {
         assert!(!child.tools.iter().any(|tool| tool == name), "{name}");
     }
     for name in [
+        "process_exec",
+        "exec",
         "write",
         "edit",
         "fs_path",
@@ -269,4 +269,61 @@ async fn android_recovered_desktop_grants_do_not_reappear_in_inventory() {
             .iter()
             .any(|tool| EXCLUDED.contains(&tool.manifest.name.as_str()))
     );
+}
+
+#[tokio::test]
+async fn android_process_exec_is_ask_default_and_rejects_alternate_modes() {
+    let entry = registered_tool_by_name("process_exec").expect("process route");
+    assert_eq!(entry.default, ToolPermissionDefault::Ask);
+    assert_eq!(entry.manifest.effects, vec![EffectClass::ProcessExec]);
+    let fixture = super::mobile_runtime_tests::mobile_dispatcher_fixture_with_policy(
+        "android-process-ask",
+        "ordinary request",
+        Arc::new(haider_tools::UnavailableMobileBackend),
+        None,
+        false,
+    )
+    .await;
+    for args in [
+        serde_json::json!({"command":"touch forbidden", "background":true}),
+        serde_json::json!({"command":"touch forbidden", "profile":"remote"}),
+    ] {
+        let result = fixture
+            .dispatcher
+            .execute(
+                &fixture.run_id,
+                &ItemId::new("android-alternate"),
+                "android-alternate",
+                "process_exec",
+                args,
+                &CancelToken::new(),
+            )
+            .await;
+        let ToolDispatchResult::Completed(result) = result.expect("typed refusal") else {
+            panic!("must not dispatch");
+        };
+        assert!(
+            result.preview.contains("foreground local commands only"),
+            "{}",
+            result.preview
+        );
+        assert!(result.effects.is_empty());
+    }
+    let result = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new("android-ask"),
+            "android-ask",
+            "process_exec",
+            serde_json::json!({"command":"printf must-ask"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("ask result");
+    assert!(
+        matches!(result, ToolDispatchResult::ApprovalRequired(_)),
+        "Ask must be real broker authorization"
+    );
+    super::mobile_runtime_tests::close_fixture(fixture).await;
 }

@@ -4759,6 +4759,15 @@ impl RequestBody {
     }
 }
 
+/// Session-scoped capability observation from the direct-shell admission gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCapabilityWire {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub worker_generation: u64,
+}
+
 /// v0.1 response method bodies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method")]
@@ -5296,6 +5305,10 @@ pub enum ResponseBody {
     ToolsInventory {
         session_id: SessionId,
         inventory: ToolInventorySnapshot,
+        /// Android direct-shell eligibility, not an authorization credential.
+        /// Absent on older/desktop daemons; clients must treat absence as unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<ShellCapabilityWire>,
     },
     /// Opaque staged-secret reference (R7): random, connection- and
     /// daemon-instance-scoped, single-use, and expired at

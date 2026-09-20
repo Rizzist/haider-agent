@@ -108,8 +108,7 @@ class FakeDaemonService(
     private val _searchIndex = MutableStateFlow(SearchIndexState())
     private val _providers = MutableStateFlow(ProviderInventory())
     private val _shell = MutableStateFlow(
-        // What `tools.inventory` reports on an android-standalone daemon:
-        // ProcessExec is neither advertised nor dispatchable (C4).
+        // Deliberately unavailable fixture until setShell supplies a capability.
         ShellAvailability(available = false, reason = "process_exec_disabled"),
     )
 
@@ -124,6 +123,62 @@ class FakeDaemonService(
     override val searchIndex: StateFlow<SearchIndexState> = _searchIndex.asStateFlow()
     override val providers: StateFlow<ProviderInventory> = _providers.asStateFlow()
     override val shell: StateFlow<ShellAvailability> = _shell.asStateFlow()
+    private val _shellExecutions = MutableStateFlow<Map<String, List<ShellExecution>>>(emptyMap())
+    override val shellExecutions = _shellExecutions.asStateFlow()
+    override suspend fun refreshShell() = Unit
+    /**
+     * Set to make the next [startShell] throw before anything is recorded —
+     * what a lost RPC response looks like from the UI: whether the daemon
+     * accepted is unknown, and only an explicit retry with the SAME submission
+     * id may resubmit (FACADE-SHELL.md).
+     */
+    var nextShellFailure: Exception? = null
+
+    override suspend fun startShell(sessionId: String, submissionId: String, command: String, cwd: String?): ShellExecutionRef {
+        nextShellFailure?.let { failure ->
+            nextShellFailure = null
+            throw failure
+        }
+        val existing = _shellExecutions.value.values.flatten().firstOrNull { it.ref.commandId == submissionId }
+        if (existing != null) {
+            require(existing.ref.sessionId == sessionId && existing.command == command)
+            return existing.ref
+        }
+        require(command.isNotBlank() && command.toByteArray(Charsets.UTF_8).size <= 8192)
+        require(cwd == null || (cwd.isNotEmpty() && !java.io.File(cwd).isAbsolute))
+        check(_shell.value.available) { _shell.value.reason ?: "shell_unavailable" }
+        val session = _sessions.value.firstOrNull { it.id == sessionId } ?: error("session_unavailable")
+        val history = _shellExecutions.value[sessionId].orEmpty()
+        check(history.none { it.status == ShellExecutionStatus.Running }) { "session_busy" }
+        calls += "shell.exec:$sessionId:$submissionId"
+        val ref = ShellExecutionRef(sessionId, submissionId, "shell-run-$submissionId", "shell-item-$submissionId",
+            session.workerGeneration ?: 1)
+        _shellExecutions.value = _shellExecutions.value + (sessionId to (history + ShellExecution(ref, command, ShellExecutionStatus.Running)).takeLast(64))
+        return ref
+    }
+    override suspend fun cancelShell(execution: ShellExecutionRef) {
+        calls += "shell.cancel:${execution.commandId}"
+        setShellResult(execution, ShellExecutionStatus.Cancelled)
+    }
+    /** Deterministic UI fixture controls: no actual shell or auto-generated success. */
+    fun appendShellOutput(execution: ShellExecutionRef, text: String, stream: ShellOutputStream = ShellOutputStream.Stdout) {
+        updateShell(execution) { current -> current.copy(output = current.output + ShellOutput(
+            (current.output.lastOrNull()?.seq ?: 0) + 1, stream,
+            java.util.Base64.getEncoder().encodeToString(text.toByteArray(Charsets.UTF_8)))) }
+    }
+    fun setShellResult(execution: ShellExecutionRef, status: ShellExecutionStatus, exitCode: Int? = null, error: String? = null) {
+        updateShell(execution) { it.copy(status = status, exitCode = exitCode, error = error) }
+    }
+    /** Marks the 256 KiB per-command UI projection bound reached (FACADE-SHELL.md). */
+    fun setShellTruncated(execution: ShellExecutionRef, truncated: Boolean = true) {
+        updateShell(execution) { it.copy(outputTruncated = truncated) }
+    }
+    private fun updateShell(execution: ShellExecutionRef, update: (ShellExecution) -> ShellExecution) {
+        val history = _shellExecutions.value[execution.sessionId].orEmpty()
+        check(history.any { it.ref == execution }) { "shell_execution_unavailable" }
+        _shellExecutions.value = _shellExecutions.value + (execution.sessionId to history.map { if (it.ref == execution) update(it) else it })
+    }
+
 
     private val transcripts = mutableMapOf<String, MutableList<Message>>()
     private var hiddenPages: List<List<SessionRow>> = emptyList()
@@ -562,7 +617,7 @@ class FakeDaemonService(
         _providers.value = inventory
     }
 
-    /** So a later lane's on-device shell can be exercised before it exists. */
+    /** Configure the same capability consumed by shell submission. */
     fun setShell(availability: ShellAvailability) {
         _shell.value = availability
     }

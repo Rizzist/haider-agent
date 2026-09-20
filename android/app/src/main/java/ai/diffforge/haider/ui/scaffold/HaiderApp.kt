@@ -483,7 +483,21 @@ fun HaiderApp(
                     // (verify-8 O1).
                     val needsInput = state.activeSession?.needsInput
                     if (state.viewTab == SessionViewTab.Shell) {
-                        ShellView(availability = state.shell, modifier = Modifier.fillMaxSize())
+                        ShellView(
+                            availability = state.shell,
+                            executions = state.activeShellExecutions,
+                            draft = state.shellDraft,
+                            pending = state.shellPending,
+                            notice = state.shellNotice,
+                            busy = state.shellBusy,
+                            onDraft = viewModel::setShellDraft,
+                            onRun = { viewModel.runShellCommand() },
+                            onRetry = { viewModel.retryShellSubmission() },
+                            onDiscard = viewModel::discardShellSubmission,
+                            onDismissNotice = viewModel::dismissShellNotice,
+                            onCancel = { viewModel.cancelShellExecution(it) },
+                            modifier = Modifier.fillMaxSize(),
+                        )
                     } else if (state.messages.isEmpty() && needsInput == null) {
                         StartSurface(
                             state = state,
@@ -600,73 +614,80 @@ fun HaiderApp(
                     }
                 }
 
-                val setupPending = !state.setup.complete && state.sessions.isEmpty()
-                val composerState = SendButtonMatrix.resolve(
-                    daemon = state.daemon,
-                    turnRunning = state.turnRunning,
-                    inputRequired = state.needsInputHere,
-                    // An image with no caption is a message. Round 12 asked
-                    // only about text, so Send sat Disabled with a staged
-                    // attachment on screen (verify-11 O8).
-                    hasText = state.draft.isNotBlank() || state.draftAttachments.isNotEmpty(),
-                    setupComplete = state.setup.complete || state.sessions.isNotEmpty(),
-                )
-                val chip = ModelChipStateMachine.resolve(
-                    daemon = state.daemon,
-                    config = state.models,
-                    catalogError = state.catalogError,
-                    selectionBusy = state.selectionBusy,
-                    requestedAtMs = state.catalogRequestedAtMs,
-                    nowMs = nowMs,
-                )
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        // The bottom inset is the union of the navigation bar
-                        // and the IME, so the composer sits against whichever
-                        // is there — and never against both.
-                        .windowInsetsPadding(
-                            WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom),
-                        ),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Composer(
-                        // The picker row is meaningless before the daemon can
-                        // answer; the input stays visible and disabled so the
-                        // shape of the screen does not jump (addition F, F2).
-                        showPickers = !setupPending,
-                        text = state.draft,
-                        onTextChange = viewModel::setDraft,
-                        composer = composerState,
-                        chip = chip,
-                        effort = state.models?.current?.effort,
-                        permissionMode = state.permissionMode,
-                        attachments = state.draftAttachments,
-                        attachmentNotice = state.attachmentNotice,
-                        service = service,
-                        queued = state.queue.rows.size,
-                        onRemoveAttachment = viewModel::removeAttachment,
-                        onOpenQueue = { viewModel.openOverlay(Overlay.Queue) },
-                        onSend = {
-                            // Send-while-running is a real choice, so it is
-                            // asked rather than assumed (DeliveryMode).
-                            if (composerState.showStop) {
-                                viewModel.askDelivery()
-                            } else {
-                                viewModel.send()
-                            }
-                        },
-                        onStop = { viewModel.stopTurn() },
-                        onStartDaemon = { viewModel.startDaemon() },
-                        onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
-                        onOpenEffort = { viewModel.openOverlay(Overlay.Picker(PickerKind.Effort)) },
-                        onOpenPermissions = {
-                            viewModel.openOverlay(Overlay.Picker(PickerKind.Permissions))
-                        },
-                        onRetryModels = { viewModel.refreshModels() },
-                        onAttach = { viewModel.openOverlay(Overlay.Attach) },
-                        modifier = Modifier.widthIn(max = ForgeSize.readableMax),
+                // The model composer belongs to Chat. On the Shell tab the
+                // terminal owns the bottom edge with its own command line:
+                // FACADE-SHELL forbids submitting commands through the model
+                // composer, and two stacked input fields would invite exactly
+                // that confusion.
+                if (state.viewTab != SessionViewTab.Shell) {
+                    val setupPending = !state.setup.complete && state.sessions.isEmpty()
+                    val composerState = SendButtonMatrix.resolve(
+                        daemon = state.daemon,
+                        turnRunning = state.turnRunning,
+                        inputRequired = state.needsInputHere,
+                        // An image with no caption is a message. Round 12 asked
+                        // only about text, so Send sat Disabled with a staged
+                        // attachment on screen (verify-11 O8).
+                        hasText = state.draft.isNotBlank() || state.draftAttachments.isNotEmpty(),
+                        setupComplete = state.setup.complete || state.sessions.isNotEmpty(),
                     )
+                    val chip = ModelChipStateMachine.resolve(
+                        daemon = state.daemon,
+                        config = state.models,
+                        catalogError = state.catalogError,
+                        selectionBusy = state.selectionBusy,
+                        requestedAtMs = state.catalogRequestedAtMs,
+                        nowMs = nowMs,
+                    )
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            // The bottom inset is the union of the navigation bar
+                            // and the IME, so the composer sits against whichever
+                            // is there — and never against both.
+                            .windowInsetsPadding(
+                                WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom),
+                            ),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Composer(
+                            // The picker row is meaningless before the daemon can
+                            // answer; the input stays visible and disabled so the
+                            // shape of the screen does not jump (addition F, F2).
+                            showPickers = !setupPending,
+                            text = state.draft,
+                            onTextChange = viewModel::setDraft,
+                            composer = composerState,
+                            chip = chip,
+                            effort = state.models?.current?.effort,
+                            permissionMode = state.permissionMode,
+                            attachments = state.draftAttachments,
+                            attachmentNotice = state.attachmentNotice,
+                            service = service,
+                            queued = state.queue.rows.size,
+                            onRemoveAttachment = viewModel::removeAttachment,
+                            onOpenQueue = { viewModel.openOverlay(Overlay.Queue) },
+                            onSend = {
+                                // Send-while-running is a real choice, so it is
+                                // asked rather than assumed (DeliveryMode).
+                                if (composerState.showStop) {
+                                    viewModel.askDelivery()
+                                } else {
+                                    viewModel.send()
+                                }
+                            },
+                            onStop = { viewModel.stopTurn() },
+                            onStartDaemon = { viewModel.startDaemon() },
+                            onOpenModel = { viewModel.openOverlay(Overlay.Picker(PickerKind.Model)) },
+                            onOpenEffort = { viewModel.openOverlay(Overlay.Picker(PickerKind.Effort)) },
+                            onOpenPermissions = {
+                                viewModel.openOverlay(Overlay.Picker(PickerKind.Permissions))
+                            },
+                            onRetryModels = { viewModel.refreshModels() },
+                            onAttach = { viewModel.openOverlay(Overlay.Attach) },
+                            modifier = Modifier.widthIn(max = ForgeSize.readableMax),
+                        )
+                    }
                 }
             }
         }

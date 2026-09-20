@@ -15329,6 +15329,17 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         }
+        if crate::android_policy::enabled()
+            && let Some(reason) = self.hub.android_shell_refusal(&session_id, true).await?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_PERMISSION_DENIED,
+                reason,
+                false,
+                None,
+            );
+        }
         let trimmed = command.trim();
         if trimmed == "cd"
             || trimmed
@@ -15415,11 +15426,31 @@ impl HubConnection {
         }
         let inventory =
             crate::worker::tool_inventory_snapshot(&self.hub.inner.store, &session_id).await?;
+        let shell = if crate::android_policy::enabled() {
+            let reason = if authorize(&self.capabilities, Operation::Control).is_err() {
+                Some("control_required")
+            } else if !self
+                .hub
+                .holds_control_attachment(&self.connection_id, &session_id)?
+            {
+                Some("control_attachment_required")
+            } else {
+                self.hub.android_shell_refusal(&session_id, true).await?
+            };
+            Some(haider_rpc::ShellCapabilityWire {
+                available: reason.is_none(),
+                reason: reason.map(str::to_owned),
+                worker_generation: self.hub.inner.store.worker_generation(),
+            })
+        } else {
+            None
+        };
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::ToolsInventory {
                 session_id,
                 inventory,
+                shell,
             },
         })
     }

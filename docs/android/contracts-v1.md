@@ -167,6 +167,10 @@ Kotlin in `:daemon` generates the random DEK and wraps it under a non-exportable
 
 ## C4 — android-standalone tool and capability policy
 
+**972 amendment:** [Android ProcessExec addendum](process-exec-c4.md) supersedes
+the local ProcessExec/shell exclusions below and clarifies the limits of cwd
+containment. All other exclusions remain in force.
+
 The policy is a hard platform ceiling; ordinary permissions, provider trust, tool discovery, stored grants, subagents, recovered turns and remote routes cannot widen it. Retained tools still obey existing permission, provider, model, grant and availability gates. “Retained” is not a promise of unconditional advertisement on every session.
 
 ### Tool allow/deny tables

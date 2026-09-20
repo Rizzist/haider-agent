@@ -124,7 +124,8 @@ pub use process::{
     PROCESS_MAX_OUTPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, PreparedMonitorProcess, ProcessBounds,
     ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,
     ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
-    ProcessSignal, capture_paging_hint, monitor_process_command, task_paging_hint,
+    ProcessSignal, android_shell_available, capture_paging_hint, monitor_process_command,
+    task_paging_hint,
 };
 pub use redact::{redact_lockdown_text, redact_output_text};
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};

@@ -411,6 +411,25 @@
       "name": "fs_path"
     },
     {
+      "description": "foreground Android system shell, Ask by default; app-UID authority, not workspace confinement; 60 s / 1 MiB; process-group cleanup on exit/cancel, escaped descendants and abrupt death are residual risks",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "process_exec"
+    },
+    {
       "description": "delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)",
       "input_schema": {
         "additionalProperties": false,
@@ -1482,6 +1501,34 @@
             "type": "object"
           },
           "name": "fs_path"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Run a foreground command with the Android system shell under ProcessExec policy (Ask by default). Executes as the app UID: cwd is workspace-contained, filesystem/network access is NOT workspace-confined. 60 s / 1 MiB limits; normal exit and cancellation sweep the process group; escaped descendants and abrupt daemon death remain containment risks. No remote or background mode.",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "process_exec"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "cwd": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          },
+          "name": "process_exec"
         }
       },
       {
@@ -2722,6 +2769,34 @@
             "type": "object"
           },
           "name": "fs_path"
+        }
+      },
+      {
+        "default": "ask",
+        "manifest": {
+          "description": "Run a foreground command with the Android system shell under ProcessExec policy (Ask by default). Executes as the app UID: cwd is workspace-contained, filesystem/network access is NOT workspace-confined. 60 s / 1 MiB limits; normal exit and cancellation sweep the process group; escaped descendants and abrupt daemon death remain containment risks. No remote or background mode.",
+          "dispatch": "await",
+          "effects": [
+            {
+              "class": "process_exec"
+            }
+          ],
+          "input_schema": {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "cwd": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          },
+          "name": "process_exec"
         }
       },
       {

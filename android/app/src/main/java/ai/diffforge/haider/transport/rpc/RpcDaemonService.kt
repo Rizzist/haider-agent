@@ -104,9 +104,18 @@ class RpcDaemonService(
             catch (_: Exception) { /* A refused or already-resolved menu is the daemon's answer, not a retry. */ }
         }
     }
-    // C4 is an immutable platform ceiling, independent of provider/session grants.
-    override val shell: StateFlow<ShellAvailability> =
-        MutableStateFlow(ShellAvailability(available = false, reason = "process_exec_disabled")).asStateFlow()
+    private val shellRepository = ShellRepository(client, replay, selected,
+        ready = { roster.isReady() && control.snapshots.value?.phase == DaemonPhase.Ready },
+        invalidations = merge(
+            combine(selected, roster.sessions, accountSource.providerRevision, client.connectionEpochs, targets) { _, _, _, _, _ -> Unit },
+            client.state.map { Unit },
+        ), scope = owner)
+    override val shell = shellRepository.shell
+    override val shellExecutions = shellRepository.executions
+    override suspend fun refreshShell() = shellRepository.refresh()
+    override suspend fun startShell(sessionId: String, submissionId: String, command: String, cwd: String?) =
+        shellRepository.start(sessionId, submissionId, command, cwd)
+    override suspend fun cancelShell(execution: ShellExecutionRef) = shellRepository.cancel(execution)
     override val models: StateFlow<SessionConfig?> = catalog.asStateFlow()
     override val providers: StateFlow<ProviderInventory> = inventory.asStateFlow()
     override val catalogError: StateFlow<String?> = catalogFailure.asStateFlow()

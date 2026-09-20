@@ -18,6 +18,8 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
     private val wanted = mutableMapOf<String, Boolean>()
     private val attaching = Mutex()
     private val recovering = mutableSetOf<String>()
+    private val _caughtUp = MutableStateFlow<Set<String>>(emptySet())
+    val caughtUp: StateFlow<Set<String>> = _caughtUp.asStateFlow()
     private val _revision = MutableStateFlow(0L)
     val revision: StateFlow<Long> = _revision.asStateFlow()
     private val _coverage = MutableStateFlow(Coverage())
@@ -34,13 +36,21 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
             }
             "lagged", "attach_caught_up" -> {
                 val session = synchronized(lock) { attachments[frame.string("attachment_id")]?.session }
-                if (session != null && (frame.string("kind") == "lagged" || frame.number("high_water_seq") > cache.lastApplied(session))) recover(session)
+                if (session != null) {
+                    if (frame.string("kind") == "lagged" || frame.number("high_water_seq") > cache.lastApplied(session)) {
+                        _caughtUp.update { it - session }
+                        recover(session)
+                    } else _caughtUp.update { it + session }
+                }
             }
         }
     }
     private val reconnect = scope.launch {
         client.state.collect { state ->
-            if (state != RpcConnectionState.CONNECTED) synchronized(lock) { attachments.clear() }
+            if (state != RpcConnectionState.CONNECTED) {
+                synchronized(lock) { attachments.clear() }
+                _caughtUp.value = emptySet()
+            }
             else synchronized(lock) { wanted.toMap() }.forEach { (session, control) ->
                 try { attach(session, control) } catch (_: java.io.IOException) { _coverage.value = _coverage.value.copy(complete = false, error = "replay_unavailable") }
             }
@@ -52,12 +62,15 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
     suspend fun attach(session: String, control: Boolean = false) = attaching.withLock { attachLocked(session, control) }
 
     /** Hold the attachment lease through the protected request, including concurrent selection/replay changes. */
-    suspend fun <T> withControlAttachment(session: String, operation: suspend (Long) -> T): T = attaching.withLock {
-        val epoch = attachLocked(session, control = true)
+    suspend fun <T> withControlAttachment(session: String, refresh: Boolean = true, operation: suspend (Long) -> T): T = attaching.withLock {
+        val existing = synchronized(lock) { attachments.values.any { it.session == session && it.control } }
+        val epoch = if (!refresh && existing && client.state.value == RpcConnectionState.CONNECTED) client.connectionEpoch
+            else attachLocked(session, control = true)
         operation(epoch)
     }
 
     private suspend fun attachLocked(session: String, control: Boolean): Long {
+        _caughtUp.update { it - session }
         synchronized(lock) { wanted[session] = control }
         detachCurrent(session)
         val epoch = client.connectionEpoch
@@ -76,6 +89,7 @@ class TranscriptRepository(private val client: RpcClient, private val scope: Cor
     }
 
     suspend fun detach(session: String) = attaching.withLock {
+        _caughtUp.update { it - session }
         synchronized(lock) { wanted.remove(session) }
         detachCurrent(session)
     }

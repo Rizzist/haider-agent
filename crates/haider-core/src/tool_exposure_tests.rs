@@ -617,3 +617,30 @@ fn task_outcome_is_initially_visible_only_when_granted() {
     assert!(names(&allowed).contains(&"task_outcome"));
     assert!(!names(&config()).contains(&"task_outcome"));
 }
+
+#[test]
+fn shell_discovery_never_recovers_process_exec_outside_the_installed_catalog() {
+    let mut config = HarnessConfig::for_session(
+        SessionId::new("android-shell-ceiling"),
+        DeviceId::new("fixture"),
+        1,
+        1,
+    );
+    config.tools = vec![definition("list_tools"), definition("fs_read")];
+    config.enable_tool_discovery_with_profile(
+        ToolCapabilityProfile::Coding,
+        vec!["process_exec".into()],
+    );
+    assert!(!names(&config).contains(&"process_exec"));
+    let result = config.discovered_tool_result(serde_json::json!({"filter":"process_exec"}));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result.preview).expect("JSON")["tools"],
+        serde_json::json!([])
+    );
+    // Installing an authorized Android ProcessExec exposes it under Coding.
+    config.restore_owned_tool_exposure();
+    config.tools.push(definition("process_exec"));
+    config.shared_tools = None;
+    config.enable_tool_discovery_with_profile(ToolCapabilityProfile::Coding, Vec::new());
+    assert!(names(&config).contains(&"process_exec"));
+}

@@ -6247,3 +6247,21 @@ fn observe_task_outcome_is_additive_and_roundtrips_both_codecs() {
     assert_eq!(old.run_id.as_deref(), Some("failed-run"));
     assert_eq!(old.run_state, "errored");
 }
+
+#[test]
+fn android_shell_capability_is_additive_and_round_trips_over_uds() {
+    let legacy = serde_json::json!({"v":1,"kind":"response","request_id":"shell-cap",
+        "body":{"method":"tools.inventory","session_id":"s","inventory":{"tools":[],"remembered_grants":[]}}});
+    let frame: WireFrame = serde_json::from_value(legacy.clone()).expect("legacy inventory");
+    assert_eq!(serde_json::to_value(&frame).expect("serialize"), legacy);
+    let mut capable = legacy;
+    capable["body"]["shell"] =
+        serde_json::json!({"available":false,"reason":"lockdown","worker_generation":7});
+    let frame: WireFrame = serde_json::from_value(capable).expect("capability inventory");
+    let encoded = serde_json::to_vec(&frame).expect("JSON");
+    let mut bytes = (encoded.len() as u32).to_be_bytes().to_vec();
+    bytes.extend(encoded);
+    let batch = uds_codec::Decoder::new(TEST_FRAME_LIMIT).push(&bytes);
+    assert!(batch.error.is_none());
+    assert_eq!(batch.frames, vec![frame]);
+}

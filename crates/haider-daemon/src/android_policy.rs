@@ -23,6 +23,7 @@ pub(crate) const fn route_allowed(route: RegisteredToolRoute) -> bool {
                 | RegisteredToolRoute::FsWrite
                 | RegisteredToolRoute::FsEdit
                 | RegisteredToolRoute::FsPath
+                | RegisteredToolRoute::ProcessExec
                 | RegisteredToolRoute::WebFetch
                 | RegisteredToolRoute::WebSearch
                 | RegisteredToolRoute::Mobile
@@ -35,7 +36,6 @@ pub(crate) const fn route_allowed(route: RegisteredToolRoute) -> bool {
 }
 
 pub(crate) const HARD_DENIED_EFFECTS: &[EffectClass] = &[
-    EffectClass::ProcessExec,
     EffectClass::RemoteExecution,
     EffectClass::GitOp,
     EffectClass::CredentialAccess,
@@ -61,12 +61,24 @@ pub(crate) fn request_denied(body: &RequestBody) -> bool {
     {
         return true;
     }
+    if enabled()
+        && matches!(
+            body,
+            RequestBody::ShellExecScoped {
+                branch_id: Some(_),
+                ..
+            } | RequestBody::ShellExecScoped {
+                agent_id: Some(_),
+                ..
+            }
+        )
+    {
+        return true;
+    }
     enabled()
         && matches!(
             body,
-            RequestBody::ShellExec { .. }
-                | RequestBody::ShellExecScoped { .. }
-                | RequestBody::ShellList
+            RequestBody::ShellList
                 | RequestBody::ShellClose { .. }
                 | RequestBody::SshList { .. }
                 | RequestBody::SshAdd { .. }

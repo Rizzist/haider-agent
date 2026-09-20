@@ -3476,9 +3476,6 @@ impl WorkerManagerHandle {
         command: String,
         cwd: Option<String>,
     ) -> Result<(), HaiderError> {
-        if crate::android_policy::enabled() {
-            return Err(crate::android_policy::denied());
-        }
         let (completed, response) = oneshot::channel();
         self.commands
             .try_send(ManagerCommand::ShellExec {
@@ -7567,9 +7564,6 @@ async fn perform_shell_exec(
     cancellation_wakes: &mut tokio::sync::watch::Receiver<u64>,
     drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), HaiderError> {
-    if crate::android_policy::enabled() {
-        return Err(crate::android_policy::denied());
-    }
     let run_id = pending.accepted.run_id.clone();
     let state = durable_run_state(lease, &run_id).await;
     if state.as_ref().is_some_and(RunState::is_terminal) {
@@ -7594,6 +7588,23 @@ async fn perform_shell_exec(
             format!("direct shell run {run_id} is not durably running"),
             false,
         ));
+    }
+    if crate::android_policy::enabled()
+        && let Some(reason) = lease
+            .hub()
+            .android_shell_refusal(lease.session_id(), false)
+            .await?
+    {
+        return fail_shell_exec(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
+            HaiderError::new(ErrorCode::PermissionDenied, reason, false),
+        )
+        .await;
     }
     if let Some(unavailable) = crate::workspace::unavailable(Path::new(&metadata.cwd)) {
         return fail_shell_exec(
@@ -7678,12 +7689,29 @@ async fn perform_shell_exec(
     // Direct-shell setup also canonicalizes its optional per-command cwd;
     // retain the broker's matching canonical identity here. Ordinary chat
     // turn setup uses `new_canonical` after the shared cheap root probe.
-    let mut broker = match EffectBroker::new(
-        Box::new(journal),
-        &metadata.cwd,
-        lease.session_id().clone(),
-        lease.worker_generation(),
-    ) {
+    let broker = if crate::android_policy::enabled() {
+        crate::android_workspace::open(Path::new(&metadata.cwd))
+            .map_err(|error| ToolError::Runtime {
+                message: error.to_string(),
+            })
+            .and_then(|directory| {
+                EffectBroker::new_anchored(
+                    Box::new(journal),
+                    PathBuf::from(&metadata.cwd),
+                    directory,
+                    lease.session_id().clone(),
+                    lease.worker_generation(),
+                )
+            })
+    } else {
+        EffectBroker::new(
+            Box::new(journal),
+            &metadata.cwd,
+            lease.session_id().clone(),
+            lease.worker_generation(),
+        )
+    };
+    let mut broker = match broker {
         Ok(broker) => broker,
         Err(error) => {
             let unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd)).unwrap_or(
@@ -14060,7 +14088,8 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         ),
         registered_tool(
             process_exec_definition(),
-            vec![EffectClass::ProcessExec, EffectClass::RemoteExecution],
+            if crate::android_policy::enabled() { vec![EffectClass::ProcessExec] }
+            else { vec![EffectClass::ProcessExec, EffectClass::RemoteExecution] },
             DispatchMode::Await,
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::ProcessExec,
@@ -15094,6 +15123,9 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "fs_path" => {
             "fs_path(operation, source, destination?, overwrite?) — move/delete/copy; destination is required for move and copy"
+        }
+        "process_exec" if crate::android_policy::enabled() => {
+            "process_exec(command, cwd?) — foreground Android system shell, Ask by default; app-UID authority, not workspace confinement; 60 s / 1 MiB; process-group cleanup on exit/cancel, escaped descendants and abrupt death are residual risks"
         }
         "process_exec" => {
             "process_exec(command, cwd?, background?, name?, profile?) — run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable"
@@ -17614,6 +17646,11 @@ impl BrokerToolDispatcher {
                 let requested_cwd = optional_string(args, "cwd")?;
                 let background = optional_bool(args, "background")?.unwrap_or(false);
                 let remote_profile = optional_string(args, "profile")?;
+                if crate::android_policy::enabled() && (background || remote_profile.is_some()) {
+                    return Err(ToolError::invalid_argument(
+                        "Android ProcessExec supports foreground local commands only",
+                    ));
+                }
                 let name = if background {
                     optional_string(args, "name")?
                 } else {
@@ -22472,6 +22509,18 @@ fn ssh_shell_manifest() -> ToolManifest {
 }
 
 fn process_exec_definition() -> ToolDefinition {
+    if crate::android_policy::enabled() {
+        return ToolDefinition {
+            name: "process_exec".into(),
+            description: "Run a foreground command with the Android system shell under ProcessExec policy (Ask by default). Executes as the app UID: cwd is workspace-contained, filesystem/network access is NOT workspace-confined. 60 s / 1 MiB limits; normal exit and cancellation sweep the process group; escaped descendants and abrupt daemon death remain containment risks. No remote or background mode.".into(),
+            input_schema: serde_json::json!({
+                "type":"object", "properties": {
+                    "command":{"type":"string"}, "cwd":{"type":"string"}
+                }, "required":["command"], "additionalProperties":false
+            }),
+        };
+    }
+
     #[cfg(unix)]
     let command_description =
         "Exact shell program passed to /bin/zsh -c when available, otherwise /bin/sh -c";

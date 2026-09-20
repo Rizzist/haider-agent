@@ -20,6 +20,7 @@ import ai.diffforge.haider.ui.daemon.MissingRunCoordinates
 import ai.diffforge.haider.ui.daemon.MenuAnswerInput
 import ai.diffforge.haider.ui.daemon.MenuCoordinates
 import ai.diffforge.haider.ui.daemon.SessionRow
+import ai.diffforge.haider.ui.daemon.ShellExecutionRef
 import ai.diffforge.haider.ui.daemon.TranscriptLoad
 import ai.diffforge.haider.ui.state.AppUiState
 import ai.diffforge.haider.ui.state.ChildTranscriptState
@@ -33,6 +34,7 @@ import ai.diffforge.haider.ui.state.SelectionRefusal
 import ai.diffforge.haider.ui.state.SessionListState
 import ai.diffforge.haider.ui.state.SessionTree
 import ai.diffforge.haider.ui.state.SetupPlan
+import ai.diffforge.haider.ui.state.ShellSubmission
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -82,6 +84,17 @@ class ChatViewModel(
      */
     private val draftAttachments = mutableMapOf<String, List<Attachment>>()
     private val attachmentNotices = mutableMapOf<String, String?>()
+
+    /**
+     * The shell tab's per-session state, keyed like [drafts] and for the same
+     * reason: a command typed in one session must not follow the user into
+     * another, and an uncertain submission belongs to the session that made it
+     * (lane 972-android-shell).
+     */
+    private val shellDrafts = mutableMapOf<String, String>()
+    private val shellPendingSubmissions = mutableMapOf<String, ShellSubmission>()
+    private val shellNotices = mutableMapOf<String, String>()
+    private val shellBusySessions = mutableSetOf<String>()
     private var batterySkipped = false
     private var searchJob: Job? = null
     private var childTranscriptJob: Job? = null
@@ -134,6 +147,10 @@ class ChatViewModel(
                         draft = drafts[id].orEmpty(),
                         draftAttachments = draftAttachments[id].orEmpty(),
                         attachmentNotice = attachmentNotices[id],
+                        shellDraft = shellDrafts[id].orEmpty(),
+                        shellPending = shellPendingSubmissions[id],
+                        shellNotice = shellNotices[id],
+                        shellBusy = id != null && id in shellBusySessions,
                     )
                 }
                 if (id == null) return@collectLatest
@@ -162,6 +179,29 @@ class ChatViewModel(
         }
         viewModelScope.launch {
             service.shell.collect { availability -> update { it.copy(shell = availability) } }
+        }
+        viewModelScope.launch {
+            service.shellExecutions.collect { executions ->
+                // A projected execution is the daemon's own answer: a
+                // submission that reappears in durable replay was definitely
+                // accepted, so its uncertain-retry state settles without
+                // anybody resubmitting it.
+                val settled = shellPendingSubmissions.filterValues { pending ->
+                    executions[pending.sessionId].orEmpty()
+                        .any { it.ref.commandId == pending.submissionId }
+                }.keys.toList()
+                settled.forEach { sessionId ->
+                    shellPendingSubmissions.remove(sessionId)
+                    shellNotices.remove(sessionId)
+                }
+                update {
+                    it.copy(
+                        shellExecutions = executions,
+                        shellPending = shellPendingSubmissions[it.activeSessionId],
+                        shellNotice = shellNotices[it.activeSessionId],
+                    )
+                }
+            }
         }
         viewModelScope.launch {
             service.permissionMode.collect { mode -> update { it.copy(permissionMode = mode) } }
@@ -957,8 +997,134 @@ class ChatViewModel(
 
     fun setFilter(filter: SessionFilter) = update { it.copy(filter = filter) }
 
-    fun selectViewTab(tab: ai.diffforge.haider.ui.state.SessionViewTab) =
+    fun selectViewTab(tab: ai.diffforge.haider.ui.state.SessionViewTab) {
         update { it.copy(viewTab = tab) }
+        // Availability is a recent observation, not a credential: FACADE-SHELL
+        // asks for a refresh when the tab becomes visible.
+        if (tab == ai.diffforge.haider.ui.state.SessionViewTab.Shell) refreshShell()
+    }
+
+    // ---------- the shell tab (lane 972-android-shell) ----------
+
+    fun setShellDraft(text: String) {
+        val id = _state.value.activeSessionId
+        if (id != null) shellDrafts[id] = text
+        update { it.copy(shellDraft = text) }
+    }
+
+    /**
+     * Re-reads the selected session's capability. A failed read is not an
+     * error state of its own: the availability flow stays authoritative and
+     * keeps whatever the backend last published.
+     */
+    fun refreshShell() = viewModelScope.launch {
+        try { service.refreshShell() }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: Exception) { }
+    }
+
+    /**
+     * Mints ONE fresh submission id for the typed command and submits it.
+     * While an uncertain submission is outstanding nothing new is minted: the
+     * person decides between Retry (same id, same command) and Discard first.
+     */
+    fun runShellCommand() = viewModelScope.launch {
+        val sessionId = _state.value.activeSessionId ?: return@launch
+        if (sessionId in shellBusySessions || shellPendingSubmissions.containsKey(sessionId)) return@launch
+        val command = shellDrafts[sessionId].orEmpty().trim()
+        if (command.isEmpty()) return@launch
+        submitShell(ShellSubmission(sessionId, java.util.UUID.randomUUID().toString(), command))
+    }
+
+    /** Resubmits the retained submission — the SAME id, command and cwd. */
+    fun retryShellSubmission() = viewModelScope.launch {
+        val sessionId = _state.value.activeSessionId ?: return@launch
+        if (sessionId in shellBusySessions) return@launch
+        val submission = shellPendingSubmissions[sessionId] ?: return@launch
+        submitShell(submission)
+    }
+
+    /** The user abandons the uncertain submission; its id is never reused. */
+    fun discardShellSubmission() {
+        val sessionId = _state.value.activeSessionId ?: return
+        shellPendingSubmissions.remove(sessionId)
+        shellNotices.remove(sessionId)
+        mirrorShell(sessionId)
+    }
+
+    fun dismissShellNotice() {
+        val sessionId = _state.value.activeSessionId ?: return
+        shellNotices.remove(sessionId)
+        mirrorShell(sessionId)
+    }
+
+    /**
+     * `turn.cancel` with the EXACT accepted coordinates the execution was
+     * rendered from — never reconstructed from the current selection or a
+     * newer generation (FACADE-SHELL.md).
+     */
+    fun cancelShellExecution(ref: ShellExecutionRef) = viewModelScope.launch {
+        try { service.cancelShell(ref) }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (refused: Exception) {
+            // An already-terminal or stale-generation refusal is reported, not
+            // hidden; the projection stays authoritative for the row's status.
+            shellNotices[ref.sessionId] = refused.message?.takeIf { it.isNotBlank() } ?: "cancel_failed"
+            mirrorShell(ref.sessionId)
+        }
+    }
+
+    private suspend fun submitShell(submission: ShellSubmission) {
+        val sessionId = submission.sessionId
+        shellBusySessions += sessionId
+        mirrorShell(sessionId)
+        try {
+            service.startShell(sessionId, submission.submissionId, submission.command, submission.cwd)
+            // Definitely accepted: the id is spent and the line clears —
+            // unless the person already typed something new while the call
+            // was in flight, which stays theirs (same rule as send()).
+            shellPendingSubmissions.remove(sessionId)
+            shellNotices.remove(sessionId)
+            if (shellDrafts[sessionId].orEmpty().trim() == submission.command) {
+                shellDrafts[sessionId] = ""
+                if (_state.value.activeSessionId == sessionId) update { it.copy(shellDraft = "") }
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (refused: ai.diffforge.haider.transport.rpc.RpcRemoteException) {
+            // The daemon answered: this submission is settled and will not run.
+            shellPendingSubmissions.remove(sessionId)
+            shellNotices[sessionId] = refused.code
+        } catch (invalid: IllegalArgumentException) {
+            shellPendingSubmissions.remove(sessionId)
+            shellNotices[sessionId] = invalid.message?.takeIf { it.isNotBlank() } ?: "invalid_command"
+        } catch (refused: IllegalStateException) {
+            shellPendingSubmissions.remove(sessionId)
+            shellNotices[sessionId] = refused.message?.takeIf { it.isNotBlank() } ?: "shell_unavailable"
+        } catch (lost: Exception) {
+            // Response loss: whether the daemon accepted is unknown. The EXACT
+            // submission is retained with its minted id, and only an explicit
+            // user retry may resubmit it — never a reconnect, never a new id
+            // (FACADE-SHELL.md). The draft stays put for the same reason.
+            shellPendingSubmissions[sessionId] = submission
+            shellNotices[sessionId] = lost.message?.takeIf { it.isNotBlank() } ?: "connection_lost"
+        } finally {
+            shellBusySessions -= sessionId
+            mirrorShell(sessionId)
+        }
+    }
+
+    /** Mirrors one session's shell bookkeeping into state, if it is on screen. */
+    private fun mirrorShell(sessionId: String) {
+        if (_state.value.activeSessionId != sessionId) return
+        update {
+            it.copy(
+                shellPending = shellPendingSubmissions[sessionId],
+                shellNotice = shellNotices[sessionId],
+                shellBusy = sessionId in shellBusySessions,
+            )
+        }
+    }
 
     /**
      * Metadata filtering is immediate; the full-roster transcript search runs

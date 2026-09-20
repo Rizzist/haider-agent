@@ -8,6 +8,7 @@ import ai.diffforge.haider.ui.daemon.SearchIndexState
 import ai.diffforge.haider.ui.daemon.SessionRow
 import ai.diffforge.haider.ui.daemon.SearchOutcome
 import ai.diffforge.haider.ui.daemon.ShellAvailability
+import ai.diffforge.haider.ui.daemon.ShellExecution
 import ai.diffforge.haider.ui.daemon.SessionVisualState
 import ai.diffforge.haider.ui.daemon.TurnCancel
 import ai.diffforge.haider.transport.SessionConfig
@@ -224,6 +225,20 @@ data class AppUiState(
     /** Chat or Shell, per addition E's segmented switch. */
     val viewTab: SessionViewTab = SessionViewTab.Chat,
     val shell: ShellAvailability = ShellAvailability(),
+    /** The facade's full-replacement projection, keyed by session id. */
+    val shellExecutions: Map<String, List<ShellExecution>> = emptyMap(),
+    /** The active session's unsent command line, keyed like [draft]. */
+    val shellDraft: String = "",
+    /**
+     * The active session's submission whose response was lost. It keeps its
+     * minted id: only an explicit user retry may resubmit it, with the SAME
+     * id — never a regenerated one (FACADE-SHELL.md).
+     */
+    val shellPending: ShellSubmission? = null,
+    /** The daemon's or facade's own refusal code for the last shell action. */
+    val shellNotice: String? = null,
+    /** True while this session's `shell.exec` round trip is in flight. */
+    val shellBusy: Boolean = false,
     val answeredElsewhere: Set<String> = emptySet(),
     /** Subagent reads for the visible session and for the fleet panel. */
     val fleet: FleetState = FleetState(),
@@ -245,6 +260,10 @@ data class AppUiState(
 ) {
     val activeSession: SessionRow?
         get() = sessions.firstOrNull { it.id == activeSessionId }
+
+    /** The terminal history the Shell tab renders, per the selected session. */
+    val activeShellExecutions: List<ShellExecution>
+        get() = shellExecutions[activeSessionId].orEmpty()
 
     /**
      * A Stop affordance exists only when the *current snapshot* carries run
@@ -308,4 +327,18 @@ data class SelectionRefusal(
     val provider: String? = null,
     val model: String? = null,
     val effort: String? = null,
+)
+
+/**
+ * One shell submission the UI minted an id for (lane 972-android-shell).
+ *
+ * FACADE-SHELL.md: the id is retained until `startShell` has definitely
+ * returned or the user abandons an uncertain submission, and may be reused
+ * only to retry this EXACT `(sessionId, command, cwd)` after response loss.
+ */
+data class ShellSubmission(
+    val sessionId: String,
+    val submissionId: String,
+    val command: String,
+    val cwd: String? = null,
 )
