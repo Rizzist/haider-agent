@@ -1297,6 +1297,18 @@ def arms_for(args: argparse.Namespace) -> tuple[Arm, Arm | None]:
                 "WALL-1 incremental journal projections",
             ),
         )
+    if args.experiment == "wall-toolpath":
+        if args.variant_bin_dir is None:
+            raise ProofError("wall-toolpath requires --variant-bin-dir")
+        return (
+            Arm("a", base, {}, "pre-WALL-3+4 tool path"),
+            Arm(
+                "b",
+                args.variant_bin_dir.resolve(),
+                {},
+                "WALL-3+4 overlapped receipt and batched durable phases",
+            ),
+        )
     if args.experiment == "store-decode":
         if args.variant_bin_dir is None:
             raise ProofError("store-decode requires --variant-bin-dir")
