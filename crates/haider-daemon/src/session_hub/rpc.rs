@@ -2974,7 +2974,9 @@ impl ObserveProjection {
                 // evidence, update/trust prompts) and never vault material.
                 let exposes_card = !matches!(menu.kind, MenuKind::Secret);
                 let (permission_description, presentation) = match &menu.kind {
-                    MenuKind::Permission { effect_summary } => (Some(effect_summary.clone()), None),
+                    MenuKind::Permission { effect_summary, .. } => {
+                        (Some(effect_summary.clone()), None)
+                    }
                     MenuKind::ErrorRecovery { presentation, .. } => {
                         (None, Some(presentation.clone()))
                     }

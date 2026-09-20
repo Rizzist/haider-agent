@@ -755,6 +755,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
         id: menu_id.clone(),
         kind: MenuKind::Permission {
             effect_summary: "write a file".into(),
+            file_review: None,
         },
         title: "Allow write?".into(),
         body: vec!["Allows FsWrite for this session".into()],
@@ -1092,6 +1093,7 @@ fn append_permission_checkpoint(
         id: menu_id,
         kind: MenuKind::Permission {
             effect_summary: "run exact command".into(),
+            file_review: None,
         },
         title: "process_exec requests approval".into(),
         body: vec!["exact command".into()],
@@ -1171,6 +1173,7 @@ fn autonomous_recovery_cas_selects_typed_allow_once() {
         id: MenuId::new("autonomous-recovery-menu"),
         kind: MenuKind::Permission {
             effect_summary: "write exact file".into(),
+            file_review: None,
         },
         title: "Permission".into(),
         body: Vec::new(),

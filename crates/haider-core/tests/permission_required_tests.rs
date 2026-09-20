@@ -184,6 +184,7 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
         id: MenuId::new("permission-menu-1"),
         kind: MenuKind::Permission {
             effect_summary: "write result.txt".into(),
+            file_review: None,
         },
         title: "fs_write requests approval".into(),
         body: vec!["Allow this exact write?".into()],
@@ -278,6 +279,7 @@ async fn recovered_approval_preserves_image_ref_and_resolves_it_for_continuation
         id: MenuId::new("recovered-image-menu"),
         kind: MenuKind::Permission {
             effect_summary: "capture screen".into(),
+            file_review: None,
         },
         title: "capture requests approval".into(),
         body: vec!["Allow this capture?".into()],

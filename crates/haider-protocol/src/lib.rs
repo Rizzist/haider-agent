@@ -23,6 +23,7 @@ pub mod credential;
 pub mod effect;
 pub mod envelope;
 pub mod error;
+pub mod file_review;
 pub mod graph;
 pub mod headless;
 pub mod history;

@@ -167,6 +167,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
         id: menu_id.clone(),
         kind: MenuKind::Permission {
             effect_summary: "patch crates/haider-store/src/event_store.rs".to_owned(),
+            file_review: None,
         },
         title: "Allow fs_edit — event_store.rs?".to_owned(),
         body: vec![

@@ -170,6 +170,12 @@ pub trait EffectOperation {
         vec![self.summary()]
     }
 
+    /// Optional structured review shown inside the ordinary permission menu.
+    /// Producers must redact file content before returning it.
+    fn file_review_recipe(&self) -> Option<FileReviewRecipe> {
+        None
+    }
+
     /// Returns the arguments used for authorization after resolving any
     /// workspace-relative values. Non-filesystem operations use their regular
     /// arguments; filesystem operations override this to bind canonical paths.
@@ -180,6 +186,30 @@ pub trait EffectOperation {
     fn workspace_revision(&self) -> Option<WorkspaceRevision> {
         None
     }
+}
+
+/// Deferred inputs for a permission diff. Keeping this as a recipe is a
+/// security property: target contents are read only after policy selected
+/// `Ask`, never while normalizing an effect that lockdown will deny.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileReviewRecipe {
+    Edit {
+        path: PathBuf,
+        edits: Vec<FileReviewEdit>,
+    },
+    Write {
+        path: PathBuf,
+        content: String,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileReviewEdit {
+    pub old: String,
+    pub new: String,
+    pub replace_all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1096,6 +1126,7 @@ pub struct EffectBroker {
     next_menu: u64,
     pending_permissions: HashMap<MenuId, PendingPermission>,
     approval_previews: HashMap<EffectId, Vec<String>>,
+    file_review_recipes: HashMap<EffectId, FileReviewRecipe>,
     one_shot_rules: Vec<OneShotRule>,
     next_finalizer: u64,
     finalizers: tokio::task::JoinSet<(u64, Option<ToolError>)>,
@@ -1234,6 +1265,7 @@ impl EffectBroker {
             next_menu: 0,
             pending_permissions: HashMap::new(),
             approval_previews: HashMap::new(),
+            file_review_recipes: HashMap::new(),
             one_shot_rules: Vec::new(),
             next_finalizer: 0,
             finalizers: tokio::task::JoinSet::new(),
@@ -1441,6 +1473,10 @@ impl EffectBroker {
         self.journal.insert_intent(intent.clone());
         self.approval_previews
             .insert(intent.effect.clone(), operation.approval_preview());
+        if let Some(recipe) = operation.file_review_recipe() {
+            self.file_review_recipes
+                .insert(intent.effect.clone(), recipe);
+        }
         Ok(intent)
     }
 
@@ -1467,7 +1503,7 @@ impl EffectBroker {
         let verdict = match decision {
             PolicyDecision::Allow => AuthorizationVerdict::Allow,
             PolicyDecision::Ask => {
-                let menu = self.permission_menu_for(&recorded);
+                let menu = self.permission_menu_for(&recorded)?;
                 let menu_id = menu.id.clone();
                 pending_permission = Some((
                     menu_id.clone(),
@@ -1486,6 +1522,7 @@ impl EffectBroker {
             verdict: verdict.clone(),
         })
         .await?;
+        self.file_review_recipes.remove(&intent.effect);
         // Register the menu only after its `Ask` verdict is durably journaled,
         // so no answerable menu exists for an unjournaled authorization.
         if let Some((menu_id, pending)) = pending_permission {
@@ -1984,7 +2021,7 @@ impl EffectBroker {
         self.journal.set_state(effect, state)
     }
 
-    fn permission_menu_for(&mut self, intent: &EffectIntent) -> Menu {
+    fn permission_menu_for(&mut self, intent: &EffectIntent) -> ToolResult<Menu> {
         self.next_menu += 1;
         let mut body = self
             .approval_previews
@@ -2004,7 +2041,19 @@ impl EffectBroker {
                 intent.class
             ));
         }
-        Menu {
+        let file_review = self
+            .file_review_recipes
+            .get(&intent.effect)
+            .cloned()
+            .map(|recipe| {
+                crate::filesystem::build_permission_file_review(
+                    &self.workspace_root,
+                    &intent.effect,
+                    recipe,
+                )
+            })
+            .transpose()?;
+        Ok(Menu {
             id: MenuId::new(format!(
                 "permission-{}-{}-{}-{}",
                 self.session_id.as_str(),
@@ -2014,24 +2063,36 @@ impl EffectBroker {
             )),
             kind: MenuKind::Permission {
                 effect_summary: intent.summary.clone(),
+                file_review,
             },
             title: format!("Allow {}?", intent.summary),
             body,
             options: vec![
-                permission_option("approve_once", "Approve once", DecisionKind::AllowOnce),
+                permission_option(
+                    "approve_once",
+                    "Approve once",
+                    "Run only this exact requested effect.",
+                    DecisionKind::AllowOnce,
+                ),
                 permission_option(
                     "approve_for_session",
                     "Approve for this session",
+                    "Allow this stated scope until the session ends.",
                     DecisionKind::AllowAlways,
                 ),
-                permission_option("deny", "Deny", DecisionKind::RejectOnce),
+                permission_option(
+                    "deny",
+                    "Deny",
+                    "Do not run this effect.",
+                    DecisionKind::RejectOnce,
+                ),
             ],
             blocking: true,
             scope: MenuScope::Session,
             origin: "effect_broker".into(),
             ttl_ms: None,
             timeout_option: None,
-        }
+        })
     }
 
     /// Consumes (single use) a stored menu decision for this exact class and
@@ -2076,11 +2137,11 @@ fn finish_close(
     }
 }
 
-fn permission_option(key: &str, label: &str, decision: DecisionKind) -> MenuOption {
+fn permission_option(key: &str, label: &str, detail: &str, decision: DecisionKind) -> MenuOption {
     MenuOption {
         key: key.into(),
         label: label.into(),
-        detail: None,
+        detail: Some(detail.into()),
         decision: Some(decision),
     }
 }

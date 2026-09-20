@@ -729,6 +729,62 @@ async fn dispatch_cannot_follow_a_blocked_authorization() {
 }
 
 #[tokio::test]
+async fn edit_ask_carries_redacted_numbered_review_on_existing_permission_menu() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    fs::write(
+        directory.path().join("review.rs"),
+        "fn token() {\n    let api_key = \"sk-abcdefghijklmnopqrstuvwxyz123456\";\n}\n",
+    )
+    .expect("seed review target");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+    let operation = FsEdit::new(
+        "review.rs",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "sk-zyxwvutsrqponmlkjihgfedcba654321",
+    );
+    let intent = broker.normalize(&operation).await.expect("normalize edit");
+    let AuthorizationVerdict::Ask { menu } = broker
+        .authorize(&intent, &PermissionPolicy::default())
+        .await
+        .expect("authorize edit")
+    else {
+        panic!("default policy asks");
+    };
+    let opened = broker.permission_menu(&menu).expect("permission menu");
+    let haider_protocol::menu::MenuKind::Permission {
+        file_review: Some(review),
+        ..
+    } = &opened.kind
+    else {
+        panic!("edit permission carries review");
+    };
+    assert_eq!(review.effect, intent.effect);
+    assert_eq!((review.added, review.removed), (1, 1));
+    assert_eq!(review.hunks[0].lines[0].old_line, Some(1));
+    let encoded = serde_json::to_string(opened).expect("serialize menu");
+    assert!(!encoded.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(!encoded.contains("zyxwvutsrqponmlkjihgfedcba"));
+    assert!(encoded.contains("REDACTED"));
+}
+
+#[tokio::test]
+async fn denied_write_does_not_read_target_for_review() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+    let operation = FsWrite::new(".", "would replace a directory");
+    let intent = broker.normalize(&operation).await.expect("normalize write");
+    let mut policy = PermissionPolicy::default();
+    policy.deny(EffectClass::FsWrite, "lockdown fixture");
+    assert!(matches!(
+        broker
+            .authorize(&intent, &policy)
+            .await
+            .expect("deny cleanly"),
+        AuthorizationVerdict::Deny { .. }
+    ));
+}
+
+#[tokio::test]
 async fn deny_is_journaled_and_blocks_filesystem_apply() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("denied.txt");

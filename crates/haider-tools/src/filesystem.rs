@@ -62,7 +62,9 @@
 //!   As on non-Apple Unix, a non-cooperating namespace swap in the final
 //!   userspace-check-to-rename gap remains an explicitly bounded limitation.
 
-use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
+use crate::broker::{
+    EffectBroker, EffectOperation, FileReviewEdit, FileReviewRecipe, PermissionPolicy,
+};
 use crate::checkpoint::{
     CheckpointCapture, CheckpointCapturePath, FreezeCheckpointInput, checkpoint_without_cas,
     freeze_checkpoint,
@@ -78,6 +80,8 @@ use haider_platform::WorkspaceDirectory as OwnedFd;
 use haider_platform::sync_file as sync_checkpoint_parent;
 use haider_protocol::checkpoint::{CheckpointKind, CheckpointOrigin};
 use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
+use haider_protocol::file_review::{FileReview, FileReviewOperation};
+use haider_protocol::ids::EffectId;
 use haider_protocol::ids::{ArtifactRef, BranchId, RunId, SessionId};
 use haider_protocol::tool::{
     BoundedResult, DispatchMode, ToolFileEffect, ToolFileEffectKind, ToolManifest, ToolTruncation,
@@ -965,6 +969,21 @@ impl EffectOperation for FsEdit {
         }));
         preview
     }
+
+    fn file_review_recipe(&self) -> Option<FileReviewRecipe> {
+        Some(FileReviewRecipe::Edit {
+            path: self.path.clone(),
+            edits: self
+                .edits
+                .iter()
+                .map(|edit| FileReviewEdit {
+                    old: edit.old.clone(),
+                    new: edit.new.clone(),
+                    replace_all: edit.replace_all,
+                })
+                .collect(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1017,6 +1036,136 @@ impl EffectOperation for FsWrite {
                 blake3::hash(self.content.as_bytes()).to_hex()
             ),
         ]
+    }
+
+    fn file_review_recipe(&self) -> Option<FileReviewRecipe> {
+        Some(FileReviewRecipe::Write {
+            path: self.path.clone(),
+            content: self.content.clone(),
+        })
+    }
+}
+
+pub(crate) fn build_permission_file_review(
+    workspace_root: &Path,
+    effect: &EffectId,
+    recipe: FileReviewRecipe,
+) -> ToolResult<FileReview> {
+    match recipe {
+        FileReviewRecipe::Edit { path, edits } => {
+            let resolved = resolve_workspace_path(workspace_root, &path, PathResolution::Existing)?;
+            let old = fs::read_to_string(&resolved)
+                .map_err(|error| ToolError::io("read edit review", &path, error))?;
+            let operation = FsEdit {
+                path: path.clone(),
+                edits: edits
+                    .into_iter()
+                    .map(|edit| FsEditChange {
+                        old: edit.old,
+                        new: edit.new,
+                        replace_all: edit.replace_all,
+                    })
+                    .collect(),
+            };
+            let (new, _) = apply_edit_changes(&operation, old.clone())?;
+            Ok(crate::file_review::build_file_review(
+                effect.clone(),
+                path_argument(&path)?.to_owned(),
+                FileReviewOperation::Edit,
+                Some(&old),
+                &new,
+            ))
+        }
+        FileReviewRecipe::Write { path, content } => {
+            let resolved =
+                resolve_workspace_path(workspace_root, &path, PathResolution::MissingPathOk)?;
+            let old_bytes = match fs::read(&resolved) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(ToolError::io("read write review", &path, error)),
+            };
+            let old_text = old_bytes.as_deref().map(|bytes| {
+                String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| {
+                    format!("[binary file omitted from review: {} bytes]", bytes.len())
+                })
+            });
+            let mut review = crate::file_review::build_file_review(
+                effect.clone(),
+                path_argument(&path)?.to_owned(),
+                FileReviewOperation::Write,
+                old_text.as_deref(),
+                &content,
+            );
+            review.old_digest = old_bytes
+                .as_deref()
+                .map(|bytes| format!("blake3:{}", blake3::hash(bytes).to_hex()));
+            Ok(review)
+        }
+    }
+}
+
+fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(String, usize)> {
+    if operation.edits.is_empty() {
+        return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
+    }
+    if operation.edits.iter().any(|edit| edit.old.is_empty()) {
+        return Err(ToolError::invalid_argument(
+            "fs_edit old anchors cannot be empty",
+        ));
+    }
+    let mut replacements = 0usize;
+    for edit in &operation.edits {
+        let matches = edited.match_indices(&edit.old).count();
+        if (!edit.replace_all && matches != 1) || (edit.replace_all && matches == 0) {
+            return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
+                path: operation.path.clone(),
+                matches,
+                replace_all: edit.replace_all,
+                nearest_candidate: (matches == 0)
+                    .then(|| {
+                        crate::filesystem_edit_diagnostic::nearest_anchor_candidate(
+                            &operation.path,
+                            &edited,
+                            &edit.old,
+                        )
+                    })
+                    .flatten(),
+            }));
+        }
+        edited = if edit.replace_all {
+            edited.replace(&edit.old, &edit.new)
+        } else {
+            edited.replacen(&edit.old, &edit.new, 1)
+        };
+        replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
+    }
+    Ok((edited, replacements))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod edit_change_tests {
+    use super::*;
+
+    #[test]
+    fn shared_unix_and_windows_edit_path_rejects_empty_inputs() {
+        let empty_edits = FsEdit::many("target.txt", Vec::new());
+        assert_eq!(
+            apply_edit_changes(&empty_edits, "unchanged".into())
+                .expect_err("empty edit list must be invalid"),
+            ToolError::InvalidArgument {
+                message: "fs_edit edits cannot be empty".into(),
+            }
+        );
+
+        let empty_anchor = FsEdit::new("target.txt", "", "unexpected insertion");
+        assert_eq!(
+            apply_edit_changes(&empty_anchor, String::new())
+                .expect_err("empty old anchor must be invalid"),
+            ToolError::InvalidArgument {
+                message: "fs_edit old anchors cannot be empty".into(),
+            }
+        );
     }
 }
 
@@ -4940,14 +5089,6 @@ fn apply_windows_edit(
     operation: &FsEdit,
     expected_digest: Option<&str>,
 ) -> ToolResult<AppliedMutation> {
-    if operation.edits.is_empty() {
-        return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
-    }
-    if operation.edits.iter().any(|edit| edit.old.is_empty()) {
-        return Err(ToolError::invalid_argument(
-            "fs_edit old anchors cannot be empty",
-        ));
-    }
     let (parent, target) =
         windows_mutation_target(workspace_root, relative, &operation.path, false)?;
     let mut source_file = open_windows_locked_file(&target, &operation.path)?;
@@ -4967,36 +5108,10 @@ fn apply_windows_edit(
     }
     let source_hash = blake3::hash(&source.bytes);
     let pre_bytes = source.bytes.clone();
-    let mut edited =
-        String::from_utf8(source.bytes).map_err(|error| ToolError::InvalidArgument {
-            message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
-        })?;
-    let mut replacements = 0usize;
-    for edit in &operation.edits {
-        let matches = edited.match_indices(&edit.old).count();
-        if (!edit.replace_all && matches != 1) || (edit.replace_all && matches == 0) {
-            return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
-                path: operation.path.clone(),
-                matches,
-                replace_all: edit.replace_all,
-                nearest_candidate: (matches == 0)
-                    .then(|| {
-                        crate::filesystem_edit_diagnostic::nearest_anchor_candidate(
-                            &operation.path,
-                            &edited,
-                            &edit.old,
-                        )
-                    })
-                    .flatten(),
-            }));
-        }
-        edited = if edit.replace_all {
-            edited.replace(&edit.old, &edit.new)
-        } else {
-            edited.replacen(&edit.old, &edit.new, 1)
-        };
-        replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
-    }
+    let edited = String::from_utf8(source.bytes).map_err(|error| ToolError::InvalidArgument {
+        message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
+    })?;
+    let (edited, replacements) = apply_edit_changes(operation, edited)?;
     let bytes = edited.as_bytes();
     let permissions = source_file
         .metadata()
@@ -6671,14 +6786,6 @@ fn apply_edit_at_with_commit_hooks(
     before_replace: impl FnOnce(),
     before_commit: impl FnOnce(),
 ) -> ToolResult<AppliedMutation> {
-    if operation.edits.is_empty() {
-        return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
-    }
-    if operation.edits.iter().any(|edit| edit.old.is_empty()) {
-        return Err(ToolError::invalid_argument(
-            "fs_edit old anchors cannot be empty",
-        ));
-    }
     let traversal_root = rustix::io::dup(&workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
@@ -6700,36 +6807,10 @@ fn apply_edit_at_with_commit_hooks(
     }
     let source_hash = blake3::hash(&source_bytes);
     let pre_bytes = source_bytes.clone();
-    let mut edited =
-        String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
-            message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
-        })?;
-    let mut replacements = 0usize;
-    for edit in &operation.edits {
-        let matches = edited.match_indices(&edit.old).count();
-        if (!edit.replace_all && matches != 1) || (edit.replace_all && matches == 0) {
-            return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
-                path: operation.path.clone(),
-                matches,
-                replace_all: edit.replace_all,
-                nearest_candidate: (matches == 0)
-                    .then(|| {
-                        crate::filesystem_edit_diagnostic::nearest_anchor_candidate(
-                            &operation.path,
-                            &edited,
-                            &edit.old,
-                        )
-                    })
-                    .flatten(),
-            }));
-        }
-        edited = if edit.replace_all {
-            edited.replace(&edit.old, &edit.new)
-        } else {
-            edited.replacen(&edit.old, &edit.new, 1)
-        };
-        replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
-    }
+    let edited = String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
+        message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
+    })?;
+    let (edited, replacements) = apply_edit_changes(operation, edited)?;
     let bytes = edited.as_bytes();
     let post_digest = mutation_digest(bytes);
     let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;

@@ -391,6 +391,7 @@ fn user_messages_and_menus_project() {
         id: haider_protocol::ids::MenuId::new("menu-1"),
         kind: MenuKind::Permission {
             effect_summary: "write src/lib.rs".to_owned(),
+            file_review: None,
         },
         title: "Allow fs_edit?".to_owned(),
         body: vec![],

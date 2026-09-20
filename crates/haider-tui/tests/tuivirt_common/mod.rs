@@ -14,8 +14,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::ids::{ItemId, SessionId};
+use haider_protocol::file_review::{
+    FileDiffHunk, FileDiffLine, FileDiffLineKind, FileReview, FileReviewOperation,
+};
+use haider_protocol::ids::{EffectId, ItemId, MenuId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, Hit, RuntimeMode, Screen};
 use haider_tui::render::{VERSION, render};
@@ -32,6 +36,103 @@ pub const UPDATE_ENV: &str = "UPDATE_TUIVIRT_GOLDENS";
 /// The three terminal sizes every golden is pinned at: a small laptop
 /// split, the bench's 118x36, and a wide desktop pane.
 pub const SIZES: [(u16, u16); 3] = [(80, 24), (118, 36), (160, 50)];
+
+/// Deterministic typed review used by the parity goldens and interaction
+/// tests without changing the long-standing demo transcript fixture.
+pub fn file_review_menu() -> Menu {
+    Menu {
+        id: MenuId::new("tuivirt-file-review"),
+        kind: MenuKind::Permission {
+            effect_summary: "patch crates/haider-store/src/event_store.rs".to_owned(),
+            file_review: Some(FileReview {
+                effect: EffectId::new("tuivirt-edit-review"),
+                path: "crates/haider-store/src/event_store.rs".to_owned(),
+                operation: FileReviewOperation::Edit,
+                old_digest: Some(format!("blake3:{}", "1".repeat(64))),
+                new_digest: format!("blake3:{}", "2".repeat(64)),
+                added: 2,
+                removed: 1,
+                hunks: vec![
+                    FileDiffHunk {
+                        old_start: 118,
+                        old_lines: 3,
+                        new_start: 118,
+                        new_lines: 4,
+                        lines: vec![
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Context,
+                                old_line: Some(118),
+                                new_line: Some(118),
+                                text: "pub fn accepts_seq(seq: u64) -> bool {".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Removal,
+                                old_line: Some(119),
+                                new_line: None,
+                                text: "    seq > 0 && seq <= MAX_SEQ".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Addition,
+                                old_line: None,
+                                new_line: Some(119),
+                                text: "    seq <= MAX_SEQ".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Addition,
+                                old_line: None,
+                                new_line: Some(120),
+                                text: "        // sequence zero is valid".to_owned(),
+                            },
+                            FileDiffLine {
+                                kind: FileDiffLineKind::Context,
+                                old_line: Some(120),
+                                new_line: Some(121),
+                                text: "}".to_owned(),
+                            },
+                        ],
+                    },
+                    FileDiffHunk {
+                        old_start: 240,
+                        old_lines: 1,
+                        new_start: 241,
+                        new_lines: 1,
+                        lines: vec![FileDiffLine {
+                            kind: FileDiffLineKind::Context,
+                            old_line: Some(240),
+                            new_line: Some(241),
+                            text: "// replay keeps the same boundary".to_owned(),
+                        }],
+                    },
+                ],
+                truncated: false,
+            }),
+        },
+        title: "Allow fs_edit — event_store.rs?".to_owned(),
+        body: vec![
+            "fs_edit wants to modify crates/haider-store/src/event_store.rs".to_owned(),
+            "effect class: workspace write · reversible via /tree".to_owned(),
+        ],
+        options: vec![
+            MenuOption {
+                key: "allow".to_owned(),
+                label: "Allow once".to_owned(),
+                detail: Some("Run only this exact requested effect.".to_owned()),
+                decision: Some(DecisionKind::AllowOnce),
+            },
+            MenuOption {
+                key: "deny".to_owned(),
+                label: "Deny".to_owned(),
+                detail: Some("Do not run this effect.".to_owned()),
+                decision: Some(DecisionKind::RejectOnce),
+            },
+        ],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "fs_edit".to_owned(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
 
 /// The bench's representative agent line (`w3c3_render_bench_tests`):
 /// wraps once at 118 columns, twice at 80.

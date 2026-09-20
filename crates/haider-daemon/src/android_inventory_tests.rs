@@ -213,6 +213,7 @@ async fn android_recovered_desktop_grants_do_not_reappear_in_inventory() {
                 id: menu.clone(),
                 kind: MenuKind::Permission {
                     effect_summary: "synthetic grant".into(),
+                    file_review: None,
                 },
                 title: "Synthetic prior permission".into(),
                 body: vec![],

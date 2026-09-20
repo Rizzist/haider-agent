@@ -15,6 +15,9 @@ use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayloa
 use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
+use haider_protocol::file_review::{
+    FileDiffHunk, FileDiffLine, FileDiffLineKind, FileReview, FileReviewOperation,
+};
 use haider_protocol::graph::{
     EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GraphAbandoned,
     GraphAdvanced, GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted,
@@ -474,6 +477,7 @@ fn golden_menu_permission() {
         id: MenuId::new("m-perm-1"),
         kind: MenuKind::Permission {
             effect_summary: "fs_write: src/lib.rs".into(),
+            file_review: None,
         },
         title: "Allow patch to src/lib.rs?".into(),
         body: vec!["+24 −6".into()],
@@ -515,6 +519,74 @@ fn golden_menu_permission() {
             reason: MenuCloseReason::Cancelled,
         },
     );
+}
+
+#[test]
+fn golden_menu_permission_file_review() {
+    let menu = Menu {
+        id: MenuId::new("m-review-1"),
+        kind: MenuKind::Permission {
+            effect_summary: "edit src/lib.rs".into(),
+            file_review: Some(FileReview {
+                effect: EffectId::new("effect-review-1"),
+                path: "src/lib.rs".into(),
+                operation: FileReviewOperation::Edit,
+                old_digest: Some(format!("blake3:{}", "1".repeat(64))),
+                new_digest: format!("blake3:{}", "2".repeat(64)),
+                added: 1,
+                removed: 1,
+                hunks: vec![FileDiffHunk {
+                    old_start: 7,
+                    old_lines: 2,
+                    new_start: 7,
+                    new_lines: 2,
+                    lines: vec![
+                        FileDiffLine {
+                            kind: FileDiffLineKind::Context,
+                            old_line: Some(7),
+                            new_line: Some(7),
+                            text: "fn answer() -> u32 {".into(),
+                        },
+                        FileDiffLine {
+                            kind: FileDiffLineKind::Removal,
+                            old_line: Some(8),
+                            new_line: None,
+                            text: "    41".into(),
+                        },
+                        FileDiffLine {
+                            kind: FileDiffLineKind::Addition,
+                            old_line: None,
+                            new_line: Some(8),
+                            text: "    42".into(),
+                        },
+                    ],
+                }],
+                truncated: false,
+            }),
+        },
+        title: "Allow edit src/lib.rs?".into(),
+        body: vec!["Effect class: FsWrite".into()],
+        options: vec![
+            MenuOption {
+                key: "approve_once".into(),
+                label: "Approve once".into(),
+                detail: Some("Run only this exact requested effect.".into()),
+                decision: Some(haider_protocol::menu::DecisionKind::AllowOnce),
+            },
+            MenuOption {
+                key: "deny".into(),
+                label: "Deny".into(),
+                detail: Some("Do not run this effect.".into()),
+                decision: Some(haider_protocol::menu::DecisionKind::RejectOnce),
+            },
+        ],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "effect_broker".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    golden("menu_permission_file_review", &menu);
 }
 
 /// E2/E3/E4 additive wire fixtures. Pre-E2 goldens remain byte-identical;

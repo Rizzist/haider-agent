@@ -578,7 +578,7 @@ fn menu_body_renders_dim_on_the_menu_ground() {
     assert_eq!(cell.fg, Color::from(theme.dim), "body line dim");
     assert_eq!(cell.bg, Color::from(theme.gold_soft), "menu ground");
     // Both body lines sit between title and first option.
-    let title_y = row_of(&rows, "? Allow fs_edit — event_store.rs?");
+    let title_y = row_of(&rows, "! Allow fs_edit — event_store.rs?");
     let option_y = row_of(&rows, "1. Allow once");
     let second_body_y = row_of(&rows, "effect class: workspace write");
     assert!(title_y < body_y && body_y < second_body_y && second_body_y < option_y);

@@ -656,6 +656,7 @@ fn decision_firing_jumps_to_its_committed_menu() {
         id: MenuId::new("hook-menu-drilldown"),
         kind: MenuKind::Permission {
             effect_summary: "run formatter".into(),
+            file_review: None,
         },
         title: "Allow formatter?".into(),
         body: vec!["The decision hook inspected this menu.".into()],

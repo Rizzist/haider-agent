@@ -238,6 +238,48 @@ fn render_plain_impl_with_status(
             out.push_str(&crate::projection::join_error_fact_segments(&facts));
             out.push('\n');
         }
+        if let haider_protocol::menu::MenuKind::Permission {
+            file_review: Some(review),
+            ..
+        } = &menu.kind
+        {
+            out.push_str(&format!(
+                "  file review: {} · +{} -{} · {} hunk(s){}\n",
+                review.path,
+                review.added,
+                review.removed,
+                review.hunks.len(),
+                if review.truncated { " · bounded" } else { "" }
+            ));
+            for (index, hunk) in review.hunks.iter().enumerate() {
+                out.push_str(&format!(
+                    "  hunk {}/{}: old line {}, {} line(s); new line {}, {} line(s)\n",
+                    index + 1,
+                    review.hunks.len(),
+                    hunk.old_start,
+                    hunk.old_lines,
+                    hunk.new_start,
+                    hunk.new_lines
+                ));
+                for line in &hunk.lines {
+                    let kind = match line.kind {
+                        haider_protocol::file_review::FileDiffLineKind::Context => "context",
+                        haider_protocol::file_review::FileDiffLineKind::Addition => "addition",
+                        haider_protocol::file_review::FileDiffLineKind::Removal => "removal",
+                    };
+                    let old = line
+                        .old_line
+                        .map_or_else(|| "-".to_owned(), |n| n.to_string());
+                    let new = line
+                        .new_line
+                        .map_or_else(|| "-".to_owned(), |n| n.to_string());
+                    out.push_str(&format!(
+                        "    {kind}; old {old}; new {new}: {}\n",
+                        line.text
+                    ));
+                }
+            }
+        }
         for (index, option) in menu.options.iter().enumerate() {
             out.push_str(&format!("  {}. {}\n", index + 1, option.label));
         }

@@ -13,6 +13,7 @@ mod checkpoint_tests;
 mod computer;
 mod error;
 mod file_preview;
+mod file_review;
 mod filesystem;
 mod filesystem_aliases;
 mod filesystem_edit_diagnostic;
@@ -53,8 +54,9 @@ pub const FILE_PREVIEW_MAX_LINES: usize = 2_000;
 
 pub use broker::{
     ALLOW_SCREEN_CONTROL_SESSION_GRANT, ALLOW_SCREEN_SESSION_GRANT, AlwaysAllowRule, EffectBroker,
-    EffectBrokerCloseError, EffectBrokerCloseReport, EffectOperation, JournalSink,
-    PermissionPolicy, PolicyDecision, SessionGrant, SessionGrantScope,
+    EffectBrokerCloseError, EffectBrokerCloseReport, EffectOperation, FileReviewEdit,
+    FileReviewRecipe, JournalSink, PermissionPolicy, PolicyDecision, SessionGrant,
+    SessionGrantScope,
 };
 #[cfg(unix)]
 pub use checkpoint::restore_checkpoint_plan_anchored;

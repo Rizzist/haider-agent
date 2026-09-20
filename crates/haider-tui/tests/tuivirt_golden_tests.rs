@@ -24,7 +24,9 @@ use haider_tui::mock::demo_script;
 use haider_tui::projection::OUTPUT_TAIL_MAX;
 
 mod tuivirt_common;
-use tuivirt_common::{SIZES, apply, check_golden, draw, push_agent, push_user, session_model};
+use tuivirt_common::{
+    SIZES, apply, check_golden, draw, file_review_menu, push_agent, push_user, session_model,
+};
 
 /// Pin one model at every size.
 fn pin(name: &str, model: &AppModel) {
@@ -368,6 +370,33 @@ fn input_required_menu_frames() {
         EventPayload::RunState(RunState::InputRequired { menu: id }),
     );
     pin("input_required_menu", &model);
+}
+
+#[test]
+fn file_review_permission_frames() {
+    let mut model = session_model();
+    let menu = file_review_menu();
+    let id = menu.id.clone();
+    apply(&mut model, EventPayload::MenuOpened(menu));
+    apply(
+        &mut model,
+        EventPayload::RunState(RunState::PermissionRequired { menu: id }),
+    );
+    pin("file_review_permission", &model);
+}
+
+#[test]
+fn needs_you_inbox_frames() {
+    let mut model = session_model();
+    let menu = file_review_menu();
+    let id = menu.id.clone();
+    apply(&mut model, EventPayload::MenuOpened(menu));
+    apply(
+        &mut model,
+        EventPayload::RunState(RunState::PermissionRequired { menu: id }),
+    );
+    model.inbox_open = true;
+    pin("needs_you_inbox", &model);
 }
 
 #[test]

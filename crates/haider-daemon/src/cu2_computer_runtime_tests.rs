@@ -361,6 +361,7 @@ async fn append_screen_control_grant(store: &SqliteStoreHandle, session_id: &Ses
         id: menu_id.clone(),
         kind: MenuKind::Permission {
             effect_summary: "computer left_click".into(),
+            file_review: None,
         },
         title: "Allow computer control?".into(),
         body: vec!["Effect class: ScreenControl".into()],

@@ -20,6 +20,7 @@ fn approval_menu() -> Menu {
         id: haider_protocol::ids::MenuId::new("permission-w4a4-1"),
         kind: MenuKind::Permission {
             effect_summary: "patch src/lib.rs".to_owned(),
+            file_review: None,
         },
         title: "Allow patch src/lib.rs?".to_owned(),
         body: vec![
@@ -66,9 +67,11 @@ fn draw_with_styles(model: &AppModel) -> (Vec<String>, Vec<Option<ratatui::style
         for x in 0..buffer.area.width {
             text.push_str(buffer[(x, y)].symbol());
         }
-        // The first non-space cell's fg is the row's body tone.
+        // The permission card now carries a warning rail. Sample the first
+        // content cell after that rail so the mutation guard still proves
+        // the preview text itself is diff-aware.
         let fg = (0..buffer.area.width)
-            .find(|&x| buffer[(x, y)].symbol() != " ")
+            .find(|&x| !matches!(buffer[(x, y)].symbol(), " " | "▏"))
             .and_then(|x| buffer[(x, y)].style().fg);
         rows.push(text);
         row_fg.push(fg);

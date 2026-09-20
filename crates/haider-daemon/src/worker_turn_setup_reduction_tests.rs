@@ -203,6 +203,7 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
             id: menu_id.clone(),
             kind: MenuKind::Permission {
                 effect_summary: "write setup".into(),
+                file_review: None,
             },
             title: "Allow write".into(),
             body: Vec::new(),

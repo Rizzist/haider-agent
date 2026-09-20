@@ -267,6 +267,45 @@ fn generic_rotation_post_increments_and_test_branch_reads_without_increment() {
 // ---- §1.2 crash ----
 
 #[test]
+fn edit_review_branch_exposes_two_numbered_hunks_and_typed_decisions() {
+    let beats = beats_for("review diff before applying it");
+    let (menu, arms) = await_menu(&beats);
+    let haider_protocol::menu::MenuKind::Permission {
+        file_review: Some(review),
+        ..
+    } = &menu.kind
+    else {
+        panic!("file review permission menu");
+    };
+    assert_eq!(review.hunks.len(), 2);
+    assert_eq!(review.hunks[0].old_start, 118);
+    assert_eq!(review.hunks[1].new_start, 241);
+    assert_eq!(review.effect.as_str(), "demo-edit-review-1");
+    assert_eq!(
+        menu.options
+            .iter()
+            .map(|option| option.decision)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(haider_protocol::menu::DecisionKind::AllowOnce),
+            Some(haider_protocol::menu::DecisionKind::RejectOnce),
+        ]
+    );
+    assert_eq!(arms.len(), 2);
+    assert!(emits(&arms[0]).iter().any(|payload| matches!(
+        payload,
+        EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+            item: haider_protocol::item::TurnItem::FileChange { .. },
+            ..
+        })
+    )));
+    assert_eq!(
+        agent_texts(&arms[1])[0],
+        "Rejected the edit. The workspace was left unchanged."
+    );
+}
+
+#[test]
 fn crash_branch_is_verbatim_with_three_arms() {
     let beats = beats_for("the migration is unstable");
     assert_eq!(
