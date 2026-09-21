@@ -348,6 +348,207 @@ fn process_exists(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn wait_for_daemon_ready(profile: &ResolvedProfile, guard: &DaemonGuard) -> u32 {
+    let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    loop {
+        if let Some(pid) = guard.pid()
+            && profile.endpoint_path.exists()
+        {
+            assert_daemon_serves(profile);
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not publish its PID and endpoint before the startup deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_daemon_exit(profile: &ResolvedProfile, pid: u32, boundary: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while process_exists(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !process_exists(pid),
+        "daemon {pid} survived {boundary}\n{}",
+        std::fs::read_to_string(profile.store_dir.join(haider_client::DAEMON_LOG_FILE))
+            .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"))
+    );
+    assert_eq!(
+        haider_client::profile_lock::profile_lock_owner_pid(&profile.store_dir)
+            .expect("query profile lock after daemon exit"),
+        None,
+        "daemon exit must release the kernel profile lock"
+    );
+}
+
+/// Registry #158 signal matrix: a second client interrupt takes the immediate
+/// exit path while the provider turn is stalled. The harness teardown then
+/// unlinks the runtime endpoint, reproducing the observed live-lock-owner with
+/// no connectable UDS. The normal health path exits immediately; with that
+/// path disabled, the degraded endpoint's absolute idle deadline still exits.
+#[test]
+fn sigint_twice_endpoint_loss_self_recovers_or_honors_degraded_idle_linger() {
+    ensure_haiderd_built();
+    for (case, disable_endpoint_recovery, idle_ttl_ms) in [
+        ("endpoint_recovery", false, 30_000_u64),
+        ("degraded_idle", true, 250_u64),
+    ] {
+        let store = tempfile::tempdir().expect("store dir");
+        let profile = resolved_for(store.path());
+        let guard = DaemonGuard {
+            store: store.path().to_path_buf(),
+        };
+        let mut launcher = haider_command(store.path());
+        launcher
+            .args([
+                "run",
+                "--provider",
+                "fake",
+                "--output",
+                "jsonl",
+                "--timeout",
+                "30s",
+                "-p",
+                "hold for double interrupt",
+            ])
+            .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", idle_ttl_ms.to_string());
+        if disable_endpoint_recovery {
+            launcher.env("HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY", "1");
+        }
+        let launcher = launcher.spawn().expect("spawn stalled run launcher");
+        let daemon_pid = wait_for_daemon_ready(&profile, &guard);
+        std::thread::sleep(Duration::from_millis(100));
+
+        haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
+            .expect("first SIGINT to run client");
+        std::thread::sleep(Duration::from_millis(10));
+        haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
+            .expect("second SIGINT to run client");
+        std::fs::remove_file(&profile.endpoint_path)
+            .expect("unlink daemon endpoint during double-interrupt teardown");
+        let client = wait_for_output(launcher, &format!("{case} double-interrupt client"));
+        assert!(
+            !client.status.success(),
+            "double-interrupted client unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&client.stdout),
+            String::from_utf8_lossy(&client.stderr)
+        );
+
+        wait_for_daemon_exit(&profile, daemon_pid, case);
+        let log = std::fs::read_to_string(profile.store_dir.join(haider_client::DAEMON_LOG_FILE))
+            .expect("read daemon recovery log");
+        assert!(
+            log.contains("endpoint-health event=coordinate_lost"),
+            "{case} did not observe the lost endpoint: {log}"
+        );
+        if disable_endpoint_recovery {
+            assert!(
+                log.contains("reason=degraded_endpoint_idle_deadline"),
+                "degraded linger did not own the shutdown decision: {log}"
+            );
+        }
+    }
+}
+
+/// When both autonomous recovery paths are test-disabled, `daemon stop`
+/// obtains the exact PID from `F_GETLK`, authenticates its executable/profile
+/// argv, and SIGTERMs only that process. PID files are corroboration only.
+#[test]
+fn daemon_stop_recovers_unreachable_lock_owner_with_matching_stale_or_absent_pid_file() {
+    let haiderd = ensure_haiderd_built();
+    for pid_file_case in ["matching", "stale", "absent"] {
+        let store = tempfile::tempdir().expect("store dir");
+        let profile = resolved_for(store.path());
+        let guard = DaemonGuard {
+            store: store.path().to_path_buf(),
+        };
+        let mut daemon = Command::new(&haiderd)
+            .args(["--profile", &profile.profile_id])
+            .arg("--store-dir")
+            .arg(&profile.store_dir)
+            .arg("--runtime-dir")
+            .arg(&profile.runtime_dir)
+            .env(
+                "HAIDER_TEST_FAKE_PROVIDER",
+                r#"[{"step":"finish","reason":"end_turn"}]"#,
+            )
+            .env("HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY", "1")
+            .env("HAIDER_TEST_DISABLE_DEGRADED_IDLE_REAP", "1")
+            .env("HAIDER_DISCOVERY_DISABLED", "1")
+            .env("HOME", test_home(store.path()))
+            .env("USERPROFILE", test_home(store.path()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn deliberately degraded daemon");
+        let daemon_pid = wait_for_daemon_ready(&profile, &guard);
+        assert_eq!(daemon.id(), daemon_pid);
+        std::fs::remove_file(&profile.endpoint_path).expect("unlink daemon endpoint");
+        let pid_path = profile.runtime_dir.join("haiderd.pid");
+        match pid_file_case {
+            "matching" => {}
+            "stale" => std::fs::write(&pid_path, format!("{}\n", daemon_pid + 1))
+                .expect("replace PID contents with stale value"),
+            "absent" => std::fs::remove_file(&pid_path).expect("remove daemon PID file"),
+            _ => unreachable!(),
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            process_exists(daemon_pid),
+            "test hooks failed to retain the degraded daemon"
+        );
+
+        let mut stop = haider_command(store.path());
+        stop.args(["daemon", "stop", "--json", "--timeout", "7s"]);
+        let alternate_runtime = (pid_file_case == "absent").then(|| {
+            tempfile::Builder::new()
+                .prefix("hds-")
+                .tempdir_in("/tmp")
+                .expect("short alternate runtime root")
+        });
+        if let Some(alternate_runtime) = alternate_runtime.as_ref() {
+            // Match the peer recovery recipe: HOME/store still identify the
+            // owned profile, but the caller no longer has the daemon's
+            // isolated runtime-root environment. The profile lock remains
+            // the authoritative coordinate; a PID file is unavailable here.
+            stop.env("HAIDER_RUNTIME_DIR", alternate_runtime.path());
+        }
+        let stopped = output_with_timeout(
+            &mut stop,
+            &format!("daemon stop recovery with {pid_file_case} PID file"),
+        );
+        assert!(
+            stopped.status.success(),
+            "recovery failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&stopped.stdout),
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&stopped.stdout).expect("daemon stop recovery JSON");
+        assert_eq!(report["outcome"], "recovered_by_signal");
+        assert_eq!(
+            report["recovery"]["owner_source"],
+            "kernel_profile_lock_f_getlk"
+        );
+        assert_eq!(report["recovery"]["pid"], daemon_pid);
+        assert_eq!(report["recovery"]["binary_and_profile_verified"], true);
+        assert_eq!(report["recovery"]["pid_file"]["outcome"], pid_file_case);
+        assert_eq!(report["recovery"]["signal"], "sigterm");
+        assert_eq!(report["recovery"]["process_exited"], true);
+        assert_eq!(report["recovery"]["profile_lock_released"], true);
+        let status = daemon.wait().expect("reap recovered daemon");
+        assert!(
+            status.success(),
+            "SIGTERM recovery was not graceful: {status}"
+        );
+    }
+}
+
 fn wait_for_idle_daemon_exit(profile: &ResolvedProfile, daemon_pid: u32, spawn_path: &str) {
     const IDLE_TTL_MS: u64 = 250;
     const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;

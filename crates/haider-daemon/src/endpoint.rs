@@ -168,6 +168,10 @@ impl BoundEndpoint {
         self.inner.close_listener();
     }
 
+    pub(crate) fn coordinate_is_owned(&self) -> Result<bool, DaemonError> {
+        self.inner.coordinate_is_owned().map_err(map_error)
+    }
+
     pub(crate) fn cleanup(&mut self) -> Result<(), haider_platform::EndpointError> {
         let endpoint_error = if self.endpoint_active {
             // Platform cleanup is intentionally one-shot: on Unix its owned

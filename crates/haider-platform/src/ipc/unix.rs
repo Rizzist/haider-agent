@@ -181,6 +181,26 @@ impl BoundEndpoint {
         self.cleanup.remove_owned()
     }
 
+    /// Reports whether the public rendezvous path still names this listener's
+    /// exact socket inode. A bound listener remains usable through its file
+    /// descriptor after another process unlinks the pathname, so accept errors
+    /// alone cannot detect this degraded, unreachable state.
+    pub fn coordinate_is_owned(&self) -> Result<bool, EndpointError> {
+        match rustix::fs::statat(
+            &self.cleanup.directory,
+            self.cleanup.name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => Ok(identity_of(&stat) == self.cleanup.identity),
+            Err(Errno::NOENT) => Ok(false),
+            Err(error) => Err(EndpointError::io(
+                "inspect bound endpoint coordinate",
+                &self.cleanup.path,
+                error.into(),
+            )),
+        }
+    }
+
     /// Filesystem paths that still name the exact socket inode this endpoint
     /// created. Cleanup can temporarily move that inode under a random claim
     /// name; retaining the generated path and checking its device/inode keeps

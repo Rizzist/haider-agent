@@ -99,6 +99,15 @@ pub struct DaemonConfig {
     /// use it to observe the early-PID/pre-Ready interval without guessing.
     #[doc(hidden)]
     pub inject_before_ready_delay: Option<Duration>,
+    /// Leaves a deliberately unlinked listener running so black-box tests can
+    /// exercise the degraded idle deadline and operator recovery path.
+    #[doc(hidden)]
+    pub inject_disable_endpoint_loss_recovery: bool,
+    /// Prevents the degraded idle deadline from retiring the daemon. This is
+    /// only used to construct the historical lock-held/endpoint-down state for
+    /// the `daemon stop` escape-hatch regression.
+    #[doc(hidden)]
+    pub inject_disable_degraded_idle_reap: bool,
 }
 
 impl DaemonConfig {
@@ -130,6 +139,8 @@ impl DaemonConfig {
             lockdown_root_override: None,
             inject_worker_manager_shutdown_error: false,
             inject_before_ready_delay: None,
+            inject_disable_endpoint_loss_recovery: false,
+            inject_disable_degraded_idle_reap: false,
         }
     }
 

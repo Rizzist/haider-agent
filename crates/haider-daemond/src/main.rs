@@ -54,6 +54,8 @@ mod telemetry;
 /// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
 const READY_DELAY_ENV: &str = "HAIDER_TEST_READY_DELAY_MS";
+const DISABLE_ENDPOINT_RECOVERY_ENV: &str = "HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY";
+const DISABLE_DEGRADED_IDLE_REAP_ENV: &str = "HAIDER_TEST_DISABLE_DEGRADED_IDLE_REAP";
 const MAX_TEST_READY_DELAY_MS: u64 = 10_000;
 const EX_SOFTWARE: u8 = 70;
 // This mitigation makes Tokio workers match the deliberately large daemon
@@ -425,6 +427,23 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
             ));
         }
         config.inject_before_ready_delay = Some(Duration::from_millis(millis));
+    }
+    for (name, target) in [
+        (
+            DISABLE_ENDPOINT_RECOVERY_ENV,
+            &mut config.inject_disable_endpoint_loss_recovery,
+        ),
+        (
+            DISABLE_DEGRADED_IDLE_REAP_ENV,
+            &mut config.inject_disable_degraded_idle_reap,
+        ),
+    ] {
+        if std::env::var_os(name).is_some_and(|value| value != "0") {
+            if std::env::var_os(FAKE_PROVIDER_ENV).is_none() {
+                return Err(format!("{name} requires {FAKE_PROVIDER_ENV}"));
+            }
+            *target = true;
+        }
     }
     let readiness = readiness
         .map(|token| haider_platform::DaemonReadyNotifier::from_spawn_token(&token))
