@@ -178,14 +178,14 @@ pub fn reduce_tool_output(tool: &str, output: &str, failed: bool) -> ReducedTool
     // whole output (retained head/tail of zero) and force a paging round-trip
     // even for sub-KiB results. Output within the retention window stays whole
     // inline; larger output keeps a bounded, deterministic head/tail window.
-    let retention_window = selected.trim().is_empty() && !stripped.trim().is_empty();
-    let selected = if retention_window && stripped.len() <= PROCESS_INLINE_RETENTION_BYTES {
+    let retention_window = stripped.len() <= PROCESS_INLINE_RETENTION_BYTES;
+    let selected = if retention_window {
         stripped.clone()
     } else {
         selected
     };
     let semantic_elision = (selected != stripped).then(|| {
-        if retention_window {
+        if selected.trim().is_empty() && !stripped.trim().is_empty() {
             // The window is a verbatim head/tail subset, so the omitted byte
             // count is exact.
             let scope = format!(

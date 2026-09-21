@@ -321,6 +321,15 @@ fn empty_semantic_selection_keeps_a_bounded_inline_window() {
 }
 
 #[test]
+fn short_repeated_output_stays_byte_complete() {
+    let output = "full fidelity row\n".repeat(16);
+    assert!(output.len() <= PROCESS_INLINE_RETENTION_BYTES);
+    let reduced = reduce_tool_output("process_exec", &output, false);
+    assert_eq!(reduced.text, output);
+    assert!(reduced.savings.is_none());
+}
+
+#[test]
 fn head_tail_elision_is_deterministic_utf8_safe_and_tail_weighted() {
     let input = format!(
         "command: cargo test\r\n{}\r\nFINAL FAILURE: assertion at src/lib.rs:999\r\n",
