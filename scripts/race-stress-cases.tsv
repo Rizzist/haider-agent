@@ -67,3 +67,4 @@ daemon-native-close-journal	linux	haider-daemon	lib	native_close_refuses_orphan_
 daemon-native-close-replay	linux	haider-daemon	lib	native_close_joins_detached_replays_and_refuses_late_replay_admission	crates/haider-daemon/src/session_close_tests.rs
 daemon-native-close-publication	linux	haider-daemon	lib	native_close_refuses_monitor_registration_between_commit_and_publication	crates/haider-daemon/src/session_close_tests.rs
 daemon-native-close-process-owner	linux	haider-daemon	lib	native_close_waits_for_cancelled_process_owner_cleanup	crates/haider-daemon/src/session_close_tests.rs
+warm-projection-seed-share	macos	haider-daemon	lib	concurrent_warm_readers_share_one_reducer_seed	crates/haider-daemon/src/worker_warm_journal_projection_tests.rs
