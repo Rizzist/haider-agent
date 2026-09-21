@@ -520,7 +520,7 @@ async fn orchestration_journal_counts(
         let page = StoreHandle::read_reducer_page_with_boundary(
             &fixture.store,
             &fixture.session_id,
-            cursor,
+            haider_core::ReducerPageCursor::after(cursor),
             1_024,
             4 * 1_024 * 1_024,
             &["effect", "tool_result", "item"],
@@ -605,7 +605,7 @@ async fn orchestration_activation_clocks(
         let page = StoreHandle::read_reducer_page_with_boundary(
             &fixture.store,
             &fixture.session_id,
-            cursor,
+            haider_core::ReducerPageCursor::after(cursor),
             1_024,
             4 * 1_024 * 1_024,
             &["item"],

@@ -80,10 +80,12 @@ impl UserCommandOriginV1 {
 /// Secret-safe, durable coordinates for one finalized tool invocation.
 ///
 /// `tool_item_id` binds this supplemental fact to the already-open
-/// [`TurnItem::ToolCall`]. `arguments` contains the complete object after
-/// stream validation and consumer redaction. Its serialization is also the
+/// [`TurnItem::ToolCall`]. `arguments` contains the complete argument value
+/// after stream validation and consumer redaction. Ordinary tools use their
+/// typed object; `tool_script` uses its raw UTF-8 source string so duplicate
+/// keys remain visible to audit consumers. Its serialization is also the
 /// permission card's display representation. Dispatch and approval continue
-/// to use the unredacted object for effect identity and execution; display
+/// to use the unredacted value for effect identity and execution; display
 /// bytes are never substituted for those raw arguments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolArgumentsFinalizedV1 {

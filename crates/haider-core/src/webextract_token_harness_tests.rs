@@ -218,6 +218,7 @@ fn bounded_fetch_result(
         artifact: None,
         images: Vec::new(),
         cursor: None,
+        orchestration: None,
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,

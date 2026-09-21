@@ -20685,7 +20685,7 @@ async fn recover_orchestration_child(
         let page = StoreHandle::read_reducer_page_with_boundary(
             store,
             store.session_id(),
-            cursor,
+            ReducerPageCursor::after(cursor),
             1_024,
             4 * 1_024 * 1_024,
             &["item_tool_call", "tool_result", "effect"],

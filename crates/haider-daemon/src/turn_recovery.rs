@@ -1705,7 +1705,9 @@ fn pending_checkpoint(
         if reduction.tool_results.contains(call_id) || !matching_tool {
             continue;
         }
-        let arguments = if open.args.is_empty() {
+        let arguments = if name == "tool_script" {
+            serde_json::Value::String(open.args.clone())
+        } else if open.args.is_empty() {
             serde_json::json!({})
         } else {
             serde_json::from_str(&open.args).map_err(|error| {

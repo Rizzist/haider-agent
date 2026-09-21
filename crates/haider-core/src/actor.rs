@@ -8731,6 +8731,15 @@ impl HarnessActor {
                     "provider ended unknown tool call `{call_id}`",
                 )))
             })?;
+        // An over-ceiling stream is not a finalized argument value: only the
+        // bounded prefix exists locally and publishing it as complete would be
+        // false. All complete buffered refusals still carry the same pair as
+        // dispatched calls.
+        if !tools[index].args_overflowed {
+            let arguments = tool_dispatch_arguments(&tools[index])?;
+            self.commit_tool_arguments_finalized(run_id, &tools[index], arguments.as_ref())
+                .await?;
+        }
         let now = unix_time_ms();
         let request_digest = orchestration_request_digest(tools[index].args.as_bytes());
         let terminal = ScriptTerminalV1 {
@@ -8871,11 +8880,7 @@ impl HarnessActor {
         // broker receipt, refusal, or external effect has begun. Keep
         // execution on the raw in-memory value while publishing only its
         // consumer-redacted display copy.
-        let args = if tools[index].name == "tool_script" {
-            Arc::new(serde_json::Value::String(tools[index].args.clone()))
-        } else {
-            parse_tool_args(&tools[index])?
-        };
+        let args = tool_dispatch_arguments(&tools[index])?;
         let display_args = self
             .commit_tool_arguments_finalized(run_id, &tools[index], args.as_ref())
             .await?;
@@ -9946,7 +9951,7 @@ impl HarnessActor {
         self.commit_state(run_id, RunState::RunningTool)
             .await
             .map_err(DriveError::Store)?;
-        let args = parse_tool_args(&tools[index])?;
+        let args = tool_dispatch_arguments(&tools[index])?;
         let outcome = self
             .execute_general_tool(
                 run_id,
@@ -13023,10 +13028,23 @@ fn parse_tool_args(tool: &ToolAccumulator) -> Result<Arc<serde_json::Value>, Dri
     }
 }
 
+/// Returns the value that crosses the dispatcher boundary. Ordinary tools
+/// receive their parsed JSON object. `tool_script` receives the exact UTF-8
+/// source as a JSON string so its stricter parser can observe duplicate keys.
+fn tool_dispatch_arguments(tool: &ToolAccumulator) -> Result<Arc<serde_json::Value>, DriveError> {
+    if tool.name == "tool_script" {
+        Ok(Arc::new(serde_json::Value::String(tool.args.clone())))
+    } else {
+        parse_tool_args(tool)
+    }
+}
+
 /// Applies the established tool-output redactor to every string leaf while
-/// retaining the argument object's typed JSON shape. Object-key context is
-/// included in classification so a low-entropy password/token value is still
-/// removed; the key itself stays available to typed consumers.
+/// retaining the argument's typed JSON shape. Object-key context is included
+/// in classification so a low-entropy password/token value is still removed;
+/// the key itself stays available to typed consumers. `tool_script` arrives as
+/// a string, so redaction operates on its exact source without parsing away
+/// duplicate keys.
 fn redact_tool_arguments(
     value: &serde_json::Value,
     key_context: Option<&str>,

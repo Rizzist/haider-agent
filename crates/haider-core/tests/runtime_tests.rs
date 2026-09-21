@@ -3215,12 +3215,18 @@ fn toolrepair_config(names: &[&str]) -> HarnessConfig {
 }
 
 #[tokio::test]
-async fn finalized_arguments_precede_preflight_failure_without_effect_receipts() {
+async fn tool_script_finalized_arguments_precede_preflight_failure() {
     let provider = Arc::new(FakeProvider::new(vec![
-        FakeStep::EmitToolCall {
+        FakeStep::EmitToolCallStart {
             call_id: "preflight-denied".into(),
-            name: "inspect".into(),
-            args: serde_json::json!({"path": "notes.txt"}),
+            name: "tool_script".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: "preflight-denied".into(),
+            fragment: "{\"duplicate\":1,\"duplicate\":2}".into(),
+        },
+        FakeStep::EmitToolCallEnd {
+            call_id: "preflight-denied".into(),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -3232,8 +3238,8 @@ async fn finalized_arguments_precede_preflight_failure_without_effect_receipts()
     });
     let mut cfg = config();
     cfg.tools = vec![haider_provider::ToolDefinition {
-        name: "inspect".into(),
-        description: "inspect fixture".into(),
+        name: "tool_script".into(),
+        description: "orchestration fixture".into(),
         input_schema: serde_json::json!({"type":"object"}),
     }];
     let (actor, handle) =
@@ -3269,6 +3275,115 @@ async fn finalized_arguments_precede_preflight_failure_without_effect_receipts()
     assert_items_closed_before_terminal(&events);
     handle.stop().await.expect("stop");
     task.await.expect("actor joined");
+}
+
+#[tokio::test]
+async fn tool_script_ceiling_refusal_emits_exactly_one_carrier_pair() {
+    let raw_source = "{\"duplicate\":1,\"duplicate\":2}";
+    let (outcome, events, requests, calls) = toolrepair_run(
+        toolrepair_config(&[]),
+        vec![
+            FakeStep::EmitToolCallStart {
+                call_id: "ceiling-denied-script".into(),
+                name: "tool_script".into(),
+            },
+            FakeStep::EmitToolArgsDelta {
+                call_id: "ceiling-denied-script".into(),
+                fragment: raw_source.into(),
+            },
+            FakeStep::EmitToolCallEnd {
+                call_id: "ceiling-denied-script".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "ceiling-denied-script".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(calls, 0, "ceiling-refused script never dispatches");
+    let (_, carrier_completed) =
+        assert_single_arguments_finalized_pair(&events, "ceiling-denied-script");
+    let carrier = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                ToolArgumentsFinalizedV1::from_extension_item(&item)
+                    .filter(|carrier| carrier.call_id == "ceiling-denied-script")
+            }
+            _ => None,
+        })
+        .expect("tool_script carrier");
+    assert_eq!(
+        carrier.arguments,
+        serde_json::Value::String(raw_source.into())
+    );
+    let rejection = events
+        .iter()
+        .position(|event| {
+            matches!(typed(event), EventPayload::ToolResult { result, .. }
+            if result.status == haider_protocol::tool::ToolResultStatus::Rejected
+                && result.preview.contains("grant_ceiling_violation"))
+        })
+        .expect("grant-ceiling rejection is durable");
+    assert!(carrier_completed < rejection);
+}
+
+#[tokio::test]
+async fn lifecycle_refused_tool_script_still_emits_one_carrier_pair() {
+    let raw_source = "{\"duplicate\":1,\"duplicate\":2}";
+    let (outcome, events, requests, calls) = toolrepair_run(
+        toolrepair_config(&["tool_script", "inspect"]),
+        vec![
+            FakeStep::EmitToolCallStart {
+                call_id: "lifecycle-refused-script".into(),
+                name: "tool_script".into(),
+            },
+            FakeStep::EmitToolArgsDelta {
+                call_id: "lifecycle-refused-script".into(),
+                fragment: raw_source.into(),
+            },
+            FakeStep::EmitToolCallEnd {
+                call_id: "lifecycle-refused-script".into(),
+            },
+            FakeStep::EmitToolCall {
+                call_id: "ordinary-sibling".into(),
+                name: "inspect".into(),
+                args: serde_json::json!({}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "lifecycle-refused-script".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(calls, 1, "only the ordinary sibling dispatches");
+    let (_, carrier_completed) =
+        assert_single_arguments_finalized_pair(&events, "lifecycle-refused-script");
+    let rejection = events
+        .iter()
+        .position(|event| {
+            matches!(typed(event), EventPayload::ToolResult { result, .. }
+            if result.status == haider_protocol::tool::ToolResultStatus::Rejected
+                && result.reason.as_deref().is_some_and(|reason| reason.contains("sole tool call")))
+        })
+        .expect("lifecycle rejection is durable");
+    assert!(carrier_completed < rejection);
 }
 
 #[tokio::test]

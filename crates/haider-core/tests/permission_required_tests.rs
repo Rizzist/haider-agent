@@ -435,6 +435,166 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
 }
 
 #[tokio::test]
+async fn tool_script_carrier_card_and_dispatch_preserve_redacted_raw_source() {
+    let session_id = SessionId::new("tool-script-carrier-session");
+    let store = Arc::new(MemoryStore::new());
+    let raw_source = concat!(
+        "{\n",
+        "  \"version\": 1,\n",
+        "  \"duplicate\": \"first\",\n",
+        "  \"duplicate\": \"second\",\n",
+        "  \"password\": \"short-secret\"\n",
+        "}"
+    )
+    .to_owned();
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCallStart {
+            call_id: "script-1".into(),
+            name: "tool_script".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: "script-1".into(),
+            fragment: raw_source.clone(),
+        },
+        FakeStep::EmitToolCallEnd {
+            call_id: "script-1".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "script-1".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let menu = Menu {
+        id: MenuId::new("tool-script-permission-menu"),
+        kind: MenuKind::Permission {
+            effect_summary: "run script child".into(),
+            file_review: None,
+        },
+        title: "tool_script requests approval".into(),
+        body: vec!["Allow this exact script?".into()],
+        options: vec![MenuOption {
+            key: "approve_once".into(),
+            label: "Allow once".into(),
+            detail: None,
+            decision: Some(DecisionKind::AllowOnce),
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "union-test-dispatcher".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let dispatcher = Arc::new(ApprovalDispatcher {
+        approved: AtomicBool::new(false),
+        menu,
+        seen_args: Mutex::new(None),
+        seen_card_args: Mutex::new(None),
+    });
+    let mut config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("tool-script-device"),
+        3,
+        7,
+    );
+    config.tools = vec![ToolDefinition {
+        name: "tool_script".into(),
+        description: "execute a typed orchestration script".into(),
+        input_schema: serde_json::json!({"type":"object"}),
+    }];
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config,
+        provider,
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("exercise the union tool_script path"))
+        .await
+        .expect("turn starts");
+    let mut states = handle.state_receiver();
+    states
+        .wait_for(|state| matches!(state, Some(RunState::PermissionRequired { .. })))
+        .await
+        .expect("tool_script parks for approval");
+
+    let journal = store.events(&session_id).await;
+    let opening = journal
+        .iter()
+        .find(|event| {
+            event.payload.decode_event().is_ok_and(
+                |payload| matches!(payload, EventPayload::MenuOpened(ref menu) if menu.id == MenuId::new("tool-script-permission-menu")),
+            )
+        })
+        .cloned()
+        .expect("approval card is durable");
+    let carriers = journal
+        .iter()
+        .filter_map(|event| match event.payload.decode_event().ok()? {
+            EventPayload::Item(
+                ItemEvent::Started { item, .. } | ItemEvent::Completed { item, .. },
+            ) => ToolArgumentsFinalizedV1::from_extension_item(&item)
+                .filter(|carrier| carrier.call_id == "script-1"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(carriers.len(), 2, "one carrier item pair is durable");
+    assert_eq!(carriers[0], carriers[1]);
+    let carrier = &carriers[1];
+    assert_eq!(carrier.name, "tool_script");
+    let redacted_source = carrier
+        .arguments
+        .as_str()
+        .expect("tool_script carrier arguments remain a raw string");
+    assert!(
+        redacted_source.contains("  \"duplicate\": \"first\",\n  \"duplicate\": \"second\","),
+        "whitespace, order, and duplicate keys stay byte-faithful"
+    );
+    assert!(!redacted_source.contains("short-secret"));
+    assert!(redacted_source.contains("[REDACTED:secret_value]"));
+    let card_args = dispatcher
+        .seen_card_args
+        .lock()
+        .expect("card args lock")
+        .clone()
+        .expect("approval checkpoint carries display arguments");
+    assert_eq!(
+        card_args,
+        serde_json::to_string(&carrier.arguments).expect("carrier arguments serialize"),
+        "permission-card bytes are identical to carrier bytes"
+    );
+
+    let mut answer = [committed_answer(
+        opening,
+        MenuId::new("tool-script-permission-menu"),
+    )];
+    store.append(&mut answer).await.expect("commit answer");
+    handle
+        .apply_committed_menu_event(answer[0].clone())
+        .expect("wake permission waiter");
+    assert_eq!(
+        turn.wait().await.expect("turn completes").state,
+        RunState::Done
+    );
+    assert_eq!(
+        dispatcher
+            .seen_args
+            .lock()
+            .expect("seen args lock")
+            .as_ref(),
+        Some(&serde_json::Value::String(raw_source)),
+        "dispatcher receives the exact unredacted source, including duplicate keys"
+    );
+    handle.stop().await.expect("stop actor");
+    actor_task.await.expect("actor joined");
+}
+
+#[tokio::test]
 async fn recovered_approval_preserves_image_ref_and_resolves_it_for_continuation() {
     let session_id = SessionId::new("recovered-image-approval-session");
     let run_id = RunId::new("recovered-image-approval-run");

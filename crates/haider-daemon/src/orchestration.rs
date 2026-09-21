@@ -713,7 +713,7 @@ pub(crate) async fn recover_checkpoint(
         let page = StoreHandle::read_reducer_page_with_boundary(
             store,
             store.session_id(),
-            cursor,
+            haider_core::ReducerPageCursor::after(cursor),
             REF_SCAN_PAGE,
             REF_SCAN_BYTES,
             &["item"],
@@ -1106,7 +1106,7 @@ pub(crate) async fn recover_terminal(
         let page = StoreHandle::read_reducer_page_with_boundary(
             store,
             store.session_id(),
-            cursor,
+            haider_core::ReducerPageCursor::after(cursor),
             REF_SCAN_PAGE,
             REF_SCAN_BYTES,
             &["item"],
@@ -2012,7 +2012,7 @@ async fn session_has_shape_access(
         let page = StoreHandle::read_reducer_page_with_boundary(
             store,
             store.session_id(),
-            cursor,
+            haider_core::ReducerPageCursor::after(cursor),
             REF_SCAN_PAGE,
             REF_SCAN_BYTES,
             &["item"],
