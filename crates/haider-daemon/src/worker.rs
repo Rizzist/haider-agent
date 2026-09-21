@@ -20166,6 +20166,17 @@ impl BrokerToolDispatcher {
                     .get("on_error")
                     .and_then(serde_json::Value::as_str)
                     == Some("value");
+                if child_status == Some(ToolResultStatus::Unknown) {
+                    let terminal = orchestration_terminal(
+                        &state,
+                        ScriptTerminalStatusV1::OutcomeUnknown,
+                        "child_outcome_unknown",
+                        "a child tool call has an unknown outcome and cannot be caught".into(),
+                    );
+                    return self
+                        .finish_orchestration(run_id, Some(&mut state), terminal)
+                        .await;
+                }
                 if child_status.is_some_and(|status| !status.is_completed()) && !catches {
                     let terminal = orchestration_terminal(
                         &state,
@@ -20181,6 +20192,7 @@ impl BrokerToolDispatcher {
 
             let value = match crate::orchestration::evaluate_pure(
                 &node,
+                &state.admitted.nodes,
                 &state.values,
                 &state.admitted.inputs,
             ) {

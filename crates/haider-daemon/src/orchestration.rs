@@ -1211,7 +1211,7 @@ fn validate_preflight_arguments(
         }) {
             continue;
         }
-        let Ok(value) = evaluate_pure(node, &values, inputs) else {
+        let Ok(value) = evaluate_pure(node, nodes, &values, inputs) else {
             // Pure evaluation failures remain runtime failures unless the
             // value is needed to prove a concrete wrapper argument.
             continue;
@@ -1783,6 +1783,7 @@ pub(crate) fn input_value<'a>(
 
 pub(crate) fn evaluate_pure(
     node: &InlineNodeV1,
+    nodes: &[InlineNodeV1],
     values: &[Option<RuntimeValueV1>],
     inputs: &[StrictJson],
 ) -> Result<RuntimeValueV1, String> {
@@ -1819,40 +1820,115 @@ pub(crate) fn evaluate_pure(
             let selected = if let Some(value) = subject.as_bool() {
                 if value { "true" } else { "false" }
             } else {
-                subject
-                    .as_object()
-                    .and_then(|value| value.values().find_map(Value::as_str))
-                    .ok_or("branch subject is not bool/tagged union")?
+                let source = node
+                    .ports
+                    .iter()
+                    .find(|port| port.role == OrchPortRoleV1::Data && port.port == "subject")
+                    .and_then(|port| nodes.get(port.source_slot as usize))
+                    .ok_or("branch subject source is unavailable")?;
+                if source.evidence_type == "OrchAwaitV1" {
+                    if subject.get("status").and_then(Value::as_str) == Some("completed") {
+                        "completed"
+                    } else {
+                        "recoverable_error"
+                    }
+                } else {
+                    let discriminant = source.config.0["type"]["discriminant"]
+                        .as_str()
+                        .ok_or("branch union discriminant is unavailable")?;
+                    subject
+                        .get(discriminant)
+                        .and_then(Value::as_str)
+                        .ok_or("branch subject is not a tagged union")?
+                }
             };
             if !cases.iter().any(|case| case.as_str() == Some(selected)) {
                 return Err("branch subject is not covered by cases".into());
             }
             Value::String(selected.into())
         }
-        "OrchJoinV1" => evaluate_join(node, values)?,
+        "OrchJoinV1" => evaluate_join(node, nodes, values)?,
         "OrchExitV1" => data()?.into_iter().next().ok_or("exit has no value")?,
         other => return Err(format!("{other} is not a pure definition")),
     };
+    if matches!(node.evidence_type.as_str(), "OrchValueV1" | "OrchJoinV1") {
+        let descriptor: OrchTypeV1 = serde_json::from_value(node.config.0["type"].clone())
+            .map_err(|error| format!("slot {} output type is invalid: {error}", node.slot))?;
+        validate_value(&value, &descriptor, 0).map_err(|error| {
+            format!(
+                "slot {} output violates its declared type: {error}",
+                node.slot
+            )
+        })?;
+    }
     Ok(RuntimeValueV1::Ready {
         value: StrictJson(value),
     })
 }
 
-fn evaluate_join(node: &InlineNodeV1, values: &[Option<RuntimeValueV1>]) -> Result<Value, String> {
+fn evaluate_join(
+    node: &InlineNodeV1,
+    nodes: &[InlineNodeV1],
+    values: &[Option<RuntimeValueV1>],
+) -> Result<Value, String> {
     match node.config.0["mode"].as_str().unwrap_or("all") {
-        "all" => Ok(Value::Array(
-            node.ports
+        "all" => {
+            let omit_inactive = node.config.0["omit_inactive"].as_bool().unwrap_or(false);
+            let mut output = Vec::new();
+            for port in node
+                .ports
                 .iter()
                 .filter(|port| port.role == OrchPortRoleV1::Data)
-                .filter_map(|port| {
-                    values
-                        .get(port.source_slot as usize)
-                        .and_then(Option::as_ref)
-                        .and_then(RuntimeValueV1::value)
-                        .cloned()
-                })
-                .collect(),
-        )),
+            {
+                match values
+                    .get(port.source_slot as usize)
+                    .and_then(Option::as_ref)
+                {
+                    Some(RuntimeValueV1::Ready { value }) if omit_inactive => {
+                        let source = values
+                            .get(port.source_slot as usize)
+                            .and_then(Option::as_ref)
+                            .and_then(RuntimeValueV1::value)
+                            .ok_or("map select output is unavailable")?;
+                        let record = source
+                            .as_object()
+                            .ok_or("map select output is not a tagged record")?;
+                        let discriminant = nodes
+                            .get(port.source_slot as usize)
+                            .and_then(|source| source.config.0["type"]["discriminant"].as_str())
+                            .ok_or("map select discriminant is unavailable")?;
+                        match record.get(discriminant).and_then(Value::as_str) {
+                            Some("present") => output.push(
+                                record
+                                    .get("value")
+                                    .cloned()
+                                    .ok_or("present map output has no value")?,
+                            ),
+                            Some("absent") => {}
+                            _ => return Err("map select output has an invalid tag".into()),
+                        }
+                    }
+                    Some(RuntimeValueV1::Ready { value }) => output.push(value.0.clone()),
+                    Some(RuntimeValueV1::Inactive) if omit_inactive => {}
+                    Some(RuntimeValueV1::Inactive) => {
+                        return Err(
+                            "all join encountered an inactive input without omit_inactive".into(),
+                        );
+                    }
+                    None => return Err("all join input is not settled".into()),
+                }
+            }
+            if output.is_empty()
+                && node
+                    .ports
+                    .iter()
+                    .all(|port| port.role != OrchPortRoleV1::Data)
+            {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Array(output))
+            }
+        }
         "select" => {
             let choice = input_value(node, OrchPortRoleV1::Data, "choice", values)
                 .and_then(Value::as_str)
@@ -2164,5 +2240,83 @@ pub(crate) fn validate_value(
         }
         OrchTypeV1::Opaque { .. } if value.is_object() => Ok(()),
         _ => Err("value does not match its declared type".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_join(omit_inactive: bool) -> InlineNodeV1 {
+        InlineNodeV1 {
+            slot: 2,
+            evidence_type: "OrchJoinV1".into(),
+            config: StrictJson(serde_json::json!({
+                "mode":"all",
+                "type":{"kind":"list","item":{"kind":"i64","min":0,"max":9},"max_items":2},
+                "omit_inactive":omit_inactive,
+                "region":[]
+            })),
+            ports: vec![
+                InlinePortV1 {
+                    role: OrchPortRoleV1::Data,
+                    port: "first".into(),
+                    source_slot: 0,
+                    output: "value".into(),
+                    selector: None,
+                },
+                InlinePortV1 {
+                    role: OrchPortRoleV1::Data,
+                    port: "second".into(),
+                    source_slot: 1,
+                    output: "value".into(),
+                    selector: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn map_join_extracts_present_values_and_omits_absent_values() {
+        let source = |slot| InlineNodeV1 {
+            slot,
+            evidence_type: "OrchJoinV1".into(),
+            config: StrictJson(serde_json::json!({
+                "mode":"select",
+                "type":{
+                    "kind":"union","discriminant":"kind",
+                    "variants":{
+                        "absent":{"kind":"record","fields":{"kind":{"kind":"string","max_bytes":7}}},
+                        "present":{"kind":"record","fields":{"kind":{"kind":"string","max_bytes":7},"value":{"kind":"i64","min":0,"max":9}}}
+                    }
+                },
+                "omit_inactive":false,"region":[]
+            })),
+            ports: vec![],
+        };
+        let nodes = vec![source(0), source(1), all_join(true)];
+        let values = vec![
+            Some(RuntimeValueV1::Ready {
+                value: StrictJson(serde_json::json!({"kind":"present","value":7})),
+            }),
+            Some(RuntimeValueV1::Ready {
+                value: StrictJson(serde_json::json!({"kind":"absent"})),
+            }),
+        ];
+        assert_eq!(
+            evaluate_join(&nodes[2], &nodes, &values).expect("recognized map values evaluate"),
+            serde_json::json!([7])
+        );
+    }
+
+    #[test]
+    fn ordinary_all_join_never_silently_drops_an_inactive_input() {
+        let values = vec![
+            Some(RuntimeValueV1::Ready {
+                value: StrictJson(Value::from(7)),
+            }),
+            Some(RuntimeValueV1::Inactive),
+        ];
+        assert!(evaluate_join(&all_join(false), &[], &values).is_err());
     }
 }

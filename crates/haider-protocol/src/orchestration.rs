@@ -464,6 +464,12 @@ pub struct OrchestrationRequestAttributionV1 {
     pub transport: String,
     pub generated_source_bytes: u64,
     pub generated_source_tokens: u64,
+    #[serde(default)]
+    pub token_basis: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_id: Option<String>,
+    #[serde(default)]
+    pub generating_request_ordinal: u64,
     pub graph_mode: OrchestrationGraphModeV1,
     pub cold_schema_discovery: bool,
 }
@@ -639,6 +645,12 @@ pub fn validate_inline_dag(
     }
     for parameter in parameters {
         validate_type(parameter, 0)?;
+        if type_contains_opaque(parameter) {
+            return Err(invalid(
+                "opaque_input_provenance",
+                "opaque parameters require a daemon-issued ref binding, which v1 inline inputs do not provide",
+            ));
+        }
     }
     let mut parent_entries = 0usize;
     let mut attempt_bound = 0u32;
@@ -747,7 +759,28 @@ fn validate_type(value: &OrchTypeV1, depth: usize) -> Result<(), OrchestrationEr
             if variants.is_empty() || variants.len() > 256 {
                 return Err(invalid("type_bounds", "union must have 1..=256 variants"));
             }
-            validate_named_types(variants, depth)
+            validate_named_types(variants, depth)?;
+            for (tag, variant) in variants {
+                let OrchTypeV1::Record { fields } = variant else {
+                    return Err(invalid(
+                        "type_bounds",
+                        "union variants must be closed records containing the discriminant",
+                    ));
+                };
+                let Some(OrchTypeV1::String { max_bytes }) = fields.get(discriminant) else {
+                    return Err(invalid(
+                        "type_bounds",
+                        "union variant is missing its string discriminant field",
+                    ));
+                };
+                if tag.len() > *max_bytes as usize {
+                    return Err(invalid(
+                        "type_bounds",
+                        "union tag exceeds its discriminant string bound",
+                    ));
+                }
+            }
+            Ok(())
         }
         OrchTypeV1::Opaque {
             ref_kind,
@@ -823,6 +856,19 @@ fn validate_typed_value(
         // issuer provenance is checked when an admitted input is resolved.
         OrchTypeV1::Opaque { .. } if value.is_object() => Ok(()),
         _ => Err("value does not match its declared type".into()),
+    }
+}
+
+fn type_contains_opaque(value: &OrchTypeV1) -> bool {
+    match value {
+        OrchTypeV1::Opaque { .. } => true,
+        OrchTypeV1::List { item, .. } => type_contains_opaque(item),
+        OrchTypeV1::Record { fields } => fields.values().any(type_contains_opaque),
+        OrchTypeV1::Union { variants, .. } => variants.values().any(type_contains_opaque),
+        OrchTypeV1::Null
+        | OrchTypeV1::Bool
+        | OrchTypeV1::I64 { .. }
+        | OrchTypeV1::String { .. } => false,
     }
 }
 
@@ -1141,13 +1187,6 @@ fn validate_config(
         "OrchJoinV1" => {
             let config: JoinConfig = decode_config(node)?;
             validate_type(&config.value_type, 0)?;
-            if config.omit_inactive {
-                return Err(invalid_slot(
-                    node.slot,
-                    "unsupported_lowering",
-                    "omit_inactive requires validator-recognized map lowering",
-                ));
-            }
             let _ = config.mode;
             validate_region(&config.region, config.origin.as_ref())?;
         }
@@ -1214,6 +1253,13 @@ fn validate_value_operator(
                     node.slot,
                     "operand_config",
                     "literal requires only value",
+                ));
+            }
+            if type_contains_opaque(&config.value_type) {
+                return Err(invalid_slot(
+                    node.slot,
+                    "opaque_literal_provenance",
+                    "opaque capabilities cannot be constructed by a literal",
                 ));
             }
             validate_typed_value(&object["value"], &config.value_type, 0)
@@ -1439,7 +1485,587 @@ fn validate_graph_semantics(
         }
     }
     validate_branch_coverage(nodes)?;
+    validate_static_types(nodes)?;
     validate_call_ordering(nodes, read_groups)
+}
+
+fn validate_static_types(nodes: &[InlineNodeV1]) -> Result<(), OrchestrationError> {
+    let mut outputs = Vec::<Option<OrchTypeV1>>::with_capacity(nodes.len());
+    for node in nodes {
+        let output = match node.evidence_type.as_str() {
+            "OrchValueV1" => {
+                let config: ValueConfig = decode_config(node)?;
+                validate_value_types(node, &config, &outputs)?;
+                Some(config.value_type)
+            }
+            "OrchArgumentV1" => Some(data_source_type(node, "args", &outputs)?.clone()),
+            "OrchAwaitV1" => Some(tool_result_type()),
+            "OrchBranchV1" => {
+                let subject = data_source_type(node, "subject", &outputs)?;
+                if !matches!(subject, OrchTypeV1::Bool | OrchTypeV1::Union { .. })
+                    && nodes[port(node, OrchPortRoleV1::Data, "subject")
+                        .expect("port shape validated")
+                        .source_slot as usize]
+                        .evidence_type
+                        != "OrchAwaitV1"
+                {
+                    return Err(type_error(
+                        node,
+                        "branch subject must be bool, a finite tagged union, or an Await result",
+                    ));
+                }
+                None
+            }
+            "OrchJoinV1" => {
+                let config: JoinConfig = decode_config(node)?;
+                validate_join_types(node, &config, nodes, &outputs)?;
+                Some(config.value_type)
+            }
+            "OrchRetryPolicyV1" | "OrchAskPauseV1" | "OrchCallV1" | "OrchExitV1" => None,
+            _ => unreachable!("definition registry checked before static typing"),
+        };
+        outputs.push(output);
+    }
+    Ok(())
+}
+
+fn tool_result_type() -> OrchTypeV1 {
+    OrchTypeV1::Opaque {
+        ref_kind: "tool_result".into(),
+        issuer_version: "1".into(),
+        decoder_version: "1".into(),
+    }
+}
+
+fn type_error(node: &InlineNodeV1, message: impl Into<String>) -> OrchestrationError {
+    invalid_slot(node.slot, "static_type", message.into())
+}
+
+fn data_source_type<'a>(
+    node: &InlineNodeV1,
+    name: &str,
+    outputs: &'a [Option<OrchTypeV1>],
+) -> Result<&'a OrchTypeV1, OrchestrationError> {
+    let source = port(node, OrchPortRoleV1::Data, name)
+        .ok_or_else(|| type_error(node, format!("missing data port {name}")))?;
+    outputs
+        .get(source.source_slot as usize)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| type_error(node, format!("data port {name} has no typed value output")))
+}
+
+fn ordered_input_types<'a>(
+    node: &InlineNodeV1,
+    role: OrchPortRoleV1,
+    outputs: &'a [Option<OrchTypeV1>],
+) -> Result<Vec<&'a OrchTypeV1>, OrchestrationError> {
+    node.ports
+        .iter()
+        .filter(|port| port.role == role)
+        .map(|port| {
+            outputs
+                .get(port.source_slot as usize)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    type_error(
+                        node,
+                        format!("port {} has no typed value output", port.port),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn require_exact_type(
+    node: &InlineNodeV1,
+    actual: &OrchTypeV1,
+    expected: &OrchTypeV1,
+    context: &str,
+) -> Result<(), OrchestrationError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(type_error(
+            node,
+            format!("{context} has a different structural type than declared"),
+        ))
+    }
+}
+
+fn validate_value_types(
+    node: &InlineNodeV1,
+    config: &ValueConfig,
+    outputs: &[Option<OrchTypeV1>],
+) -> Result<(), OrchestrationError> {
+    let operands = ordered_input_types(node, OrchPortRoleV1::Data, outputs)?;
+    match config.operator {
+        ValueOperator::Literal | ValueOperator::Input => Ok(()),
+        ValueOperator::Get => {
+            let field = config.operand_config.0["field"]
+                .as_str()
+                .expect("operator config validated");
+            let source = operands[0];
+            let field_type = match source {
+                OrchTypeV1::Record { fields } => fields.get(field),
+                OrchTypeV1::Union { variants, .. } => {
+                    let mut common = None;
+                    for variant in variants.values() {
+                        let OrchTypeV1::Record { fields } = variant else {
+                            return Err(type_error(
+                                node,
+                                "get requires a common union record field",
+                            ));
+                        };
+                        let candidate = fields.get(field).ok_or_else(|| {
+                            type_error(node, "get field is not present in every union variant")
+                        })?;
+                        if common.is_some_and(|existing| existing != candidate) {
+                            return Err(type_error(
+                                node,
+                                "get field type differs across union variants",
+                            ));
+                        }
+                        common = Some(candidate);
+                    }
+                    common
+                }
+                _ => {
+                    return Err(type_error(
+                        node,
+                        "get operand is not a closed record or union",
+                    ));
+                }
+            }
+            .ok_or_else(|| type_error(node, format!("record field {field} does not exist")))?;
+            require_exact_type(node, &config.value_type, field_type, "get output")
+        }
+        ValueOperator::Index => {
+            let OrchTypeV1::List { item, .. } = operands[0] else {
+                return Err(type_error(node, "index first operand is not a list"));
+            };
+            if !matches!(operands[1], OrchTypeV1::I64 { .. }) {
+                return Err(type_error(node, "index second operand is not i64"));
+            }
+            require_exact_type(node, &config.value_type, item, "index output")
+        }
+        ValueOperator::Record => {
+            let fields = match &config.value_type {
+                OrchTypeV1::Record { fields } => fields,
+                OrchTypeV1::Union { variants, .. } => {
+                    let names = config.operand_config.0["fields"]
+                        .as_array()
+                        .expect("operator config validated");
+                    let names = names.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                    let matching = variants
+                        .values()
+                        .filter_map(|variant| match variant {
+                            OrchTypeV1::Record { fields }
+                                if fields.keys().map(String::as_str).eq(names.iter().copied()) =>
+                            {
+                                Some(fields)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if matching.len() != 1 {
+                        return Err(type_error(
+                            node,
+                            "union record operator must match exactly one closed variant",
+                        ));
+                    }
+                    matching[0]
+                }
+                _ => return Err(type_error(node, "record operator output is not a record")),
+            };
+            let names = config.operand_config.0["fields"]
+                .as_array()
+                .expect("operator config validated");
+            if fields.len() != names.len() {
+                return Err(type_error(
+                    node,
+                    "record field count differs from its output type",
+                ));
+            }
+            for ((name, operand), (declared_name, declared_type)) in
+                names.iter().zip(operands).zip(fields)
+            {
+                if name.as_str() != Some(declared_name) {
+                    return Err(type_error(
+                        node,
+                        "record fields are not in canonical sorted order",
+                    ));
+                }
+                require_exact_type(node, operand, declared_type, "record field")?;
+            }
+            Ok(())
+        }
+        ValueOperator::List => {
+            let OrchTypeV1::List { item, max_items } = &config.value_type else {
+                return Err(type_error(node, "list operator output is not a list"));
+            };
+            if operands.len() > *max_items as usize {
+                return Err(type_error(
+                    node,
+                    "list operator exceeds its declared item bound",
+                ));
+            }
+            for operand in operands {
+                require_exact_type(node, operand, item, "list item")?;
+            }
+            Ok(())
+        }
+        ValueOperator::Builtin => validate_builtin_types(node, config, &operands),
+    }
+}
+
+fn validate_builtin_types(
+    node: &InlineNodeV1,
+    config: &ValueConfig,
+    operands: &[&OrchTypeV1],
+) -> Result<(), OrchestrationError> {
+    let name = config.operand_config.0["name"]
+        .as_str()
+        .expect("operator config validated");
+    let all_i64 = || {
+        operands
+            .iter()
+            .all(|value| matches!(value, OrchTypeV1::I64 { .. }))
+    };
+    let all_bool = || {
+        operands
+            .iter()
+            .all(|value| matches!(value, OrchTypeV1::Bool))
+    };
+    let all_string = || {
+        operands
+            .iter()
+            .all(|value| matches!(value, OrchTypeV1::String { .. }))
+    };
+    let output_i64 = matches!(config.value_type, OrchTypeV1::I64 { .. });
+    let output_bool = matches!(config.value_type, OrchTypeV1::Bool);
+    let output_string = matches!(config.value_type, OrchTypeV1::String { .. });
+    let valid = match name {
+        "add" | "sub" | "mul" | "div" | "rem" => all_i64() && output_i64,
+        "lt" | "le" | "gt" | "ge" => all_i64() && output_bool,
+        "eq" => operands[0] == operands[1] && output_bool,
+        "and" | "or" => all_bool() && output_bool,
+        "not" => all_bool() && output_bool,
+        "len" => {
+            matches!(
+                operands[0],
+                OrchTypeV1::List { .. } | OrchTypeV1::String { .. }
+            ) && output_i64
+        }
+        "sha256" => {
+            all_string()
+                && matches!(config.value_type, OrchTypeV1::String { max_bytes } if max_bytes >= 64)
+        }
+        "concat" => all_string() && output_string,
+        "slice" => {
+            matches!(operands[0], OrchTypeV1::String { .. })
+                && matches!(operands[1], OrchTypeV1::I64 { .. })
+                && matches!(operands[2], OrchTypeV1::I64 { .. })
+                && output_string
+        }
+        "split" => {
+            all_string()
+                && matches!(config.value_type, OrchTypeV1::List { ref item, .. } if matches!(item.as_ref(), OrchTypeV1::String { .. }))
+        }
+        "repeat" => {
+            matches!(operands[0], OrchTypeV1::String { .. })
+                && matches!(operands[1], OrchTypeV1::I64 { .. })
+                && output_string
+        }
+        "parse_json" => {
+            matches!(operands[0], OrchTypeV1::String { .. })
+                && !type_contains_opaque(&config.value_type)
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(type_error(
+            node,
+            format!("builtin {name} operand/output types do not match its signature"),
+        ))
+    }
+}
+
+fn validate_join_types(
+    node: &InlineNodeV1,
+    config: &JoinConfig,
+    nodes: &[InlineNodeV1],
+    outputs: &[Option<OrchTypeV1>],
+) -> Result<(), OrchestrationError> {
+    match config.mode {
+        JoinMode::Select => {
+            for alternative in ordered_input_types(node, OrchPortRoleV1::Alternative, outputs)? {
+                require_exact_type(node, alternative, &config.value_type, "select alternative")?;
+            }
+            Ok(())
+        }
+        JoinMode::All => {
+            let operands = ordered_input_types(node, OrchPortRoleV1::Data, outputs)?;
+            if operands.is_empty() {
+                return if config.value_type == OrchTypeV1::Null {
+                    Ok(())
+                } else {
+                    Err(type_error(node, "an empty all join must have null type"))
+                };
+            }
+            let OrchTypeV1::List { item, max_items } = &config.value_type else {
+                return Err(type_error(
+                    node,
+                    "a value-producing all join must have list type",
+                ));
+            };
+            if operands.len() > *max_items as usize {
+                return Err(type_error(node, "all join exceeds its declared list bound"));
+            }
+            if config.omit_inactive {
+                validate_runtime_map_lowering(node, nodes, outputs, item, *max_items)?;
+            } else {
+                for operand in operands {
+                    require_exact_type(node, operand, item, "all-join item")?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_runtime_map_lowering(
+    node: &InlineNodeV1,
+    nodes: &[InlineNodeV1],
+    outputs: &[Option<OrchTypeV1>],
+    item: &OrchTypeV1,
+    max_items: u32,
+) -> Result<(), OrchestrationError> {
+    let data_ports = ports_with_role(node, OrchPortRoleV1::Data);
+    if data_ports.is_empty() || data_ports.len() > 256 || data_ports.len() != max_items as usize {
+        return Err(invalid_slot(
+            node.slot,
+            "unsupported_lowering",
+            "omit_inactive requires one recognized body for every bounded-list index",
+        ));
+    }
+    let mut source_list = None;
+    for (expected_index, data_port) in data_ports.iter().enumerate() {
+        let select = &nodes[data_port.source_slot as usize];
+        let select_config: JoinConfig = decode_config(select)?;
+        if select.evidence_type != "OrchJoinV1"
+            || !matches!(select_config.mode, JoinMode::Select)
+            || select_config.omit_inactive
+        {
+            return Err(map_lowering_error(
+                node,
+                "body output is not a plain select join",
+            ));
+        }
+        let OrchTypeV1::Union {
+            discriminant,
+            variants,
+        } = outputs[data_port.source_slot as usize]
+            .as_ref()
+            .ok_or_else(|| map_lowering_error(node, "body select has no typed output"))?
+        else {
+            return Err(map_lowering_error(
+                node,
+                "body select does not produce a present/absent union",
+            ));
+        };
+        validate_presence_union(node, discriminant, variants, item)?;
+
+        let choice = port(select, OrchPortRoleV1::Data, "choice")
+            .ok_or_else(|| map_lowering_error(node, "body select has no choice"))?;
+        let branch = &nodes[choice.source_slot as usize];
+        if branch.evidence_type != "OrchBranchV1"
+            || branch.config.0["cases"] != serde_json::json!(["true", "false"])
+        {
+            return Err(map_lowering_error(
+                node,
+                "body select is not controlled by an exact bool branch",
+            ));
+        }
+        let condition_port = port(branch, OrchPortRoleV1::Data, "subject")
+            .ok_or_else(|| map_lowering_error(node, "map branch has no condition"))?;
+        let condition = &nodes[condition_port.source_slot as usize];
+        if condition.evidence_type != "OrchValueV1"
+            || condition.config.0["operator"].as_str() != Some("builtin")
+            || condition.config.0["operand_config"]["name"].as_str() != Some("lt")
+        {
+            return Err(map_lowering_error(
+                node,
+                "map branch condition is not index < len(list)",
+            ));
+        }
+        let condition_inputs = ports_with_role(condition, OrchPortRoleV1::Data);
+        if condition_inputs.len() != 2 {
+            return Err(map_lowering_error(node, "map condition arity is invalid"));
+        }
+        let index_node = &nodes[condition_inputs[0].source_slot as usize];
+        if literal_i64(index_node) != Some(expected_index as i64) {
+            return Err(map_lowering_error(
+                node,
+                "map indices are not contiguous constants starting at zero",
+            ));
+        }
+        let length = &nodes[condition_inputs[1].source_slot as usize];
+        if length.evidence_type != "OrchValueV1"
+            || length.config.0["operator"].as_str() != Some("builtin")
+            || length.config.0["operand_config"]["name"].as_str() != Some("len")
+        {
+            return Err(map_lowering_error(node, "map bound is not len(list)"));
+        }
+        let list_port = port(length, OrchPortRoleV1::Data, "value")
+            .or_else(|| {
+                ports_with_role(length, OrchPortRoleV1::Data)
+                    .first()
+                    .copied()
+            })
+            .ok_or_else(|| map_lowering_error(node, "len has no list operand"))?;
+        let list_slot = list_port.source_slot;
+        if source_list
+            .replace(list_slot)
+            .is_some_and(|prior| prior != list_slot)
+        {
+            return Err(map_lowering_error(
+                node,
+                "map bodies do not inspect the same immutable list",
+            ));
+        }
+        let OrchTypeV1::List {
+            item: source_item,
+            max_items: source_max,
+        } = outputs[list_slot as usize]
+            .as_ref()
+            .ok_or_else(|| map_lowering_error(node, "map source has no typed output"))?
+        else {
+            return Err(map_lowering_error(node, "map source is not a list"));
+        };
+        if source_item.as_ref() != item || *source_max != max_items {
+            return Err(map_lowering_error(
+                node,
+                "map source bounds/item type differ from the result list",
+            ));
+        }
+
+        let true_source = select
+            .ports
+            .iter()
+            .find(|port| {
+                port.role == OrchPortRoleV1::Alternative && port.selector.as_deref() == Some("true")
+            })
+            .map(|port| port.source_slot)
+            .ok_or_else(|| map_lowering_error(node, "map body has no true producer"))?;
+        let false_source = select
+            .ports
+            .iter()
+            .find(|port| {
+                port.role == OrchPortRoleV1::Alternative
+                    && port.selector.as_deref() == Some("false")
+            })
+            .map(|port| port.source_slot)
+            .ok_or_else(|| map_lowering_error(node, "map body has no false producer"))?;
+        if union_constructor_tag(&nodes[true_source as usize], discriminant, nodes)
+            != Some("present")
+            || union_constructor_tag(&nodes[false_source as usize], discriminant, nodes)
+                != Some("absent")
+        {
+            return Err(map_lowering_error(
+                node,
+                "map true/false producers do not construct matching present/absent variants",
+            ));
+        }
+        let indexed = nodes.iter().any(|candidate| {
+            candidate.slot <= true_source
+                && candidate.evidence_type == "OrchValueV1"
+                && candidate.config.0["operator"].as_str() == Some("index")
+                && ports_with_role(candidate, OrchPortRoleV1::Data)
+                    .iter()
+                    .map(|port| port.source_slot)
+                    .eq([list_slot, index_node.slot])
+                && node_depends_on(true_source, candidate.slot, nodes)
+        });
+        if !indexed {
+            return Err(map_lowering_error(
+                node,
+                "map true producer does not consume the guarded checked index",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn union_constructor_tag<'a>(
+    node: &'a InlineNodeV1,
+    discriminant: &str,
+    nodes: &'a [InlineNodeV1],
+) -> Option<&'a str> {
+    if node.evidence_type != "OrchValueV1" {
+        return None;
+    }
+    match node.config.0["operator"].as_str()? {
+        "literal" => node.config.0["operand_config"]["value"][discriminant].as_str(),
+        "record" => {
+            let fields = node.config.0["operand_config"]["fields"].as_array()?;
+            let index = fields
+                .iter()
+                .position(|field| field.as_str() == Some(discriminant))?;
+            let source = ports_with_role(node, OrchPortRoleV1::Data)
+                .get(index)?
+                .source_slot;
+            nodes[source as usize].config.0["operand_config"]["value"].as_str()
+        }
+        _ => None,
+    }
+}
+
+fn validate_presence_union(
+    node: &InlineNodeV1,
+    discriminant: &str,
+    variants: &BTreeMap<String, OrchTypeV1>,
+    item: &OrchTypeV1,
+) -> Result<(), OrchestrationError> {
+    if discriminant != "kind"
+        || variants.len() != 2
+        || !variants.contains_key("present")
+        || !variants.contains_key("absent")
+    {
+        return Err(map_lowering_error(
+            node,
+            "map body union variants must be exactly absent/present",
+        ));
+    }
+    let OrchTypeV1::Record { fields: present } = &variants["present"] else {
+        return Err(map_lowering_error(node, "present variant is not a record"));
+    };
+    let OrchTypeV1::Record { fields: absent } = &variants["absent"] else {
+        return Err(map_lowering_error(node, "absent variant is not a record"));
+    };
+    if present.len() != 2
+        || absent.len() != 1
+        || present.get("value") != Some(item)
+        || !present.contains_key(discriminant)
+        || !absent.contains_key(discriminant)
+    {
+        return Err(map_lowering_error(
+            node,
+            "present/absent variants have the wrong closed fields",
+        ));
+    }
+    Ok(())
+}
+
+fn literal_i64(node: &InlineNodeV1) -> Option<i64> {
+    (node.evidence_type == "OrchValueV1" && node.config.0["operator"].as_str() == Some("literal"))
+        .then(|| node.config.0["operand_config"]["value"].as_i64())
+        .flatten()
+}
+
+fn map_lowering_error(node: &InlineNodeV1, message: impl Into<String>) -> OrchestrationError {
+    invalid_slot(node.slot, "unsupported_lowering", message.into())
 }
 
 fn ports_with_role(node: &InlineNodeV1, role: OrchPortRoleV1) -> Vec<&InlinePortV1> {
@@ -2234,6 +2860,308 @@ mod tests {
                 .expect_err("bool branch must cover both cases")
                 .code,
             "branch_coverage"
+        );
+    }
+
+    #[test]
+    fn static_types_reject_invalid_builtin_in_unchosen_branch() {
+        let guarded = |port_name: &str, case: &str| InlinePortV1 {
+            role: OrchPortRoleV1::Guard,
+            port: port_name.into(),
+            source_slot: 1,
+            output: "choice".into(),
+            selector: Some(case.into()),
+        };
+        let nodes = vec![
+            InlineNodeV1 {
+                slot: 0,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":{"kind":"bool"},
+                    "operand_config":{"value":true},"region":[]
+                })),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 1,
+                evidence_type: "OrchBranchV1".into(),
+                config: StrictJson(serde_json::json!({"cases":["true","false"],"region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "subject", 0, "value")],
+            },
+            InlineNodeV1 {
+                slot: 2,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":{"kind":"i64","min":0,"max":10},
+                    "operand_config":{"value":1},
+                    "region":[{"branch_slot":1,"case":"true"}]
+                })),
+                ports: vec![guarded("guard_true", "true")],
+            },
+            InlineNodeV1 {
+                slot: 3,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":{"kind":"string","max_bytes":8},
+                    "operand_config":{"value":"bad"},
+                    "region":[{"branch_slot":1,"case":"false"}]
+                })),
+                ports: vec![guarded("guard_false", "false")],
+            },
+            InlineNodeV1 {
+                slot: 4,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":{"kind":"i64","min":0,"max":10},
+                    "operand_config":{"value":2},
+                    "region":[{"branch_slot":1,"case":"false"}]
+                })),
+                ports: vec![guarded("guard_false", "false")],
+            },
+            InlineNodeV1 {
+                slot: 5,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"builtin","type":{"kind":"i64","min":0,"max":20},
+                    "operand_config":{"name":"add"},
+                    "region":[{"branch_slot":1,"case":"false"}]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "left", 3, "value"),
+                    port(OrchPortRoleV1::Data, "right", 4, "value"),
+                    guarded("guard_false", "false"),
+                ],
+            },
+            InlineNodeV1 {
+                slot: 6,
+                evidence_type: "OrchJoinV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "mode":"select","type":{"kind":"i64","min":0,"max":20},
+                    "omit_inactive":false,"region":[]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "choice", 1, "choice"),
+                    InlinePortV1 {
+                        role: OrchPortRoleV1::Alternative,
+                        port: "true_value".into(),
+                        source_slot: 2,
+                        output: "value".into(),
+                        selector: Some("true".into()),
+                    },
+                    InlinePortV1 {
+                        role: OrchPortRoleV1::Alternative,
+                        port: "false_value".into(),
+                        source_slot: 5,
+                        output: "value".into(),
+                        selector: Some("false".into()),
+                    },
+                ],
+            },
+            InlineNodeV1 {
+                slot: 7,
+                evidence_type: "OrchExitV1".into(),
+                config: StrictJson(serde_json::json!({"mode":"return","region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "value", 6, "value")],
+            },
+        ];
+        let error = validate_inline_dag(&[], &nodes, &[7], &[], None)
+            .expect_err("a type error in an unchosen arm must reject the whole graph");
+        assert_eq!(error.code, "static_type");
+        assert_eq!(error.slot, Some(5));
+    }
+
+    #[test]
+    fn opaque_values_require_daemon_issued_provenance() {
+        let opaque = OrchTypeV1::Opaque {
+            ref_kind: "tool_result".into(),
+            issuer_version: "1".into(),
+            decoder_version: "1".into(),
+        };
+        let mut nodes = one_call_graph();
+        assert_eq!(
+            validate_inline_dag(&[opaque.clone()], &nodes, &[6], &[], None)
+                .expect_err("raw request inputs cannot mint opaque capabilities")
+                .code,
+            "opaque_input_provenance"
+        );
+
+        nodes[0].config = StrictJson(serde_json::json!({
+            "operator":"literal","type":opaque,
+            "operand_config":{"value":{"fabricated":true}},"region":[]
+        }));
+        assert_eq!(
+            validate_inline_dag(&[], &nodes, &[6], &[], None)
+                .expect_err("literals cannot mint opaque capabilities")
+                .code,
+            "opaque_literal_provenance"
+        );
+    }
+
+    #[test]
+    fn omit_inactive_accepts_only_recognized_bounded_map_lowering() {
+        let scalar = serde_json::json!({"kind":"i64","min":0,"max":10});
+        let tag = serde_json::json!({"kind":"string","max_bytes":7});
+        let presence = serde_json::json!({
+            "kind":"union",
+            "discriminant":"kind",
+            "variants":{
+                "absent":{"kind":"record","fields":{"kind":tag}},
+                "present":{"kind":"record","fields":{"kind":tag,"value":scalar}}
+            }
+        });
+        let guard = |case: &str| InlinePortV1 {
+            role: OrchPortRoleV1::Guard,
+            port: format!("guard_{case}"),
+            source_slot: 4,
+            output: "choice".into(),
+            selector: Some(case.into()),
+        };
+        let nodes = vec![
+            InlineNodeV1 {
+                slot: 0,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal",
+                    "type":{"kind":"list","item":scalar,"max_items":1},
+                    "operand_config":{"value":[7]},"region":[]
+                })),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 1,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":{"kind":"i64","min":0,"max":0},
+                    "operand_config":{"value":0},"region":[]
+                })),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 2,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"builtin","type":{"kind":"i64","min":0,"max":1},
+                    "operand_config":{"name":"len"},"region":[]
+                })),
+                ports: vec![port(OrchPortRoleV1::Data, "value", 0, "value")],
+            },
+            InlineNodeV1 {
+                slot: 3,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"builtin","type":{"kind":"bool"},
+                    "operand_config":{"name":"lt"},"region":[]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "left", 1, "value"),
+                    port(OrchPortRoleV1::Data, "right", 2, "value"),
+                ],
+            },
+            InlineNodeV1 {
+                slot: 4,
+                evidence_type: "OrchBranchV1".into(),
+                config: StrictJson(serde_json::json!({"cases":["true","false"],"region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "subject", 3, "value")],
+            },
+            InlineNodeV1 {
+                slot: 5,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":tag,
+                    "operand_config":{"value":"present"},
+                    "region":[{"branch_slot":4,"case":"true"}]
+                })),
+                ports: vec![guard("true")],
+            },
+            InlineNodeV1 {
+                slot: 6,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"index","type":scalar,"operand_config":{},
+                    "region":[{"branch_slot":4,"case":"true"}]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "list", 0, "value"),
+                    port(OrchPortRoleV1::Data, "index", 1, "value"),
+                    guard("true"),
+                ],
+            },
+            InlineNodeV1 {
+                slot: 7,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"record","type":presence,
+                    "operand_config":{"fields":["kind","value"]},
+                    "region":[{"branch_slot":4,"case":"true"}]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "kind", 5, "value"),
+                    port(OrchPortRoleV1::Data, "value", 6, "value"),
+                    guard("true"),
+                ],
+            },
+            InlineNodeV1 {
+                slot: 8,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":presence,
+                    "operand_config":{"value":{"kind":"absent"}},
+                    "region":[{"branch_slot":4,"case":"false"}]
+                })),
+                ports: vec![guard("false")],
+            },
+            InlineNodeV1 {
+                slot: 9,
+                evidence_type: "OrchJoinV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "mode":"select","type":presence,"omit_inactive":false,"region":[]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "choice", 4, "choice"),
+                    InlinePortV1 {
+                        role: OrchPortRoleV1::Alternative,
+                        port: "present".into(),
+                        source_slot: 7,
+                        output: "value".into(),
+                        selector: Some("true".into()),
+                    },
+                    InlinePortV1 {
+                        role: OrchPortRoleV1::Alternative,
+                        port: "absent".into(),
+                        source_slot: 8,
+                        output: "value".into(),
+                        selector: Some("false".into()),
+                    },
+                ],
+            },
+            InlineNodeV1 {
+                slot: 10,
+                evidence_type: "OrchJoinV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "mode":"all",
+                    "type":{"kind":"list","item":scalar,"max_items":1},
+                    "omit_inactive":true,"region":[]
+                })),
+                ports: vec![port(OrchPortRoleV1::Data, "item_0", 9, "value")],
+            },
+            InlineNodeV1 {
+                slot: 11,
+                evidence_type: "OrchExitV1".into(),
+                config: StrictJson(serde_json::json!({"mode":"return","region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "value", 10, "value")],
+            },
+        ];
+        validate_inline_dag(&[], &nodes, &[11], &[], None)
+            .expect("the exact bounded runtime-map lowering is valid");
+
+        let mut forged = nodes;
+        forged[1].config.0["operand_config"]["value"] = Value::from(1);
+        forged[1].config.0["type"] = serde_json::json!({"kind":"i64","min":1,"max":1});
+        assert_eq!(
+            validate_inline_dag(&[], &forged, &[11], &[], None)
+                .expect_err("a non-contiguous guard index cannot authorize omission")
+                .code,
+            "unsupported_lowering"
         );
     }
 

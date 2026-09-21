@@ -3296,6 +3296,11 @@ impl HarnessActor {
         let mut response_boundary_seen = false;
         let mut reasoning: Option<TextAccumulator> = None;
         let mut tools: Vec<ToolAccumulator> = Vec::new();
+        let orchestration_cold_schema_discovery = !self
+            .config
+            .tool_definitions()
+            .iter()
+            .any(|tool| tool.name == "tool_script");
         // Recovery checkpoints carry canonical execution names. Recover the
         // original spelling from the already-durable provider Start markers
         // only on resume; ordinary turns perform no extra journal reads.
@@ -6428,8 +6433,11 @@ impl HarnessActor {
                                 transport: ORCHESTRATION_TRANSPORT.into(),
                                 generated_source_bytes: tool.raw_args_bytes,
                                 generated_source_tokens: tool.raw_args_bytes.saturating_add(3) / 4,
+                                token_basis: "estimated_utf8_bytes_div_4".into(),
+                                tokenizer_id: None,
+                                generating_request_ordinal: provider_request_ordinal,
                                 graph_mode,
-                                cold_schema_discovery: false,
+                                cold_schema_discovery: orchestration_cold_schema_discovery,
                             };
                             if let Some(usage) = request_usage.as_mut()
                                 && let Some(request) = usage.request.as_mut()
