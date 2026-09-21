@@ -207,6 +207,7 @@ async fn task_dispatcher_with_grant(
             cli_scope: None,
             typed_workflow_execution: None,
             loom_provider_fenced: false,
+            orchestration_child_tools: Vec::new(),
             web_search: None,
         },
     )
@@ -255,6 +256,7 @@ async fn task_dispatcher_with_monitor_policy(
             cli_scope: None,
             typed_workflow_execution: None,
             loom_provider_fenced: false,
+            orchestration_child_tools: Vec::new(),
             web_search: None,
         },
     )

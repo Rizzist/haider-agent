@@ -36,6 +36,8 @@ pub(crate) struct WrapperSnapshot {
 pub(crate) struct WrapperV1 {
     pub(crate) digest: String,
     pub(crate) repeat_safe: bool,
+    pub(crate) parallel_safe: bool,
+    pub(crate) input_schema: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +173,7 @@ pub(crate) async fn admit(
                     message: error.to_string(),
                 })?;
                 validate_wrappers(nodes, wrappers, &digest)?;
+                validate_read_group_wrappers(nodes, read_groups, wrappers, &digest)?;
                 let materialized =
                     materialize_inline(parameters, nodes, exits, read_groups, &request, store)
                         .await
@@ -210,6 +213,12 @@ pub(crate) async fn admit(
                     message: error.to_string(),
                 })?;
                 validate_wrappers(&imported.nodes, wrappers, &digest)?;
+                validate_read_group_wrappers(
+                    &imported.nodes,
+                    &imported.read_groups,
+                    wrappers,
+                    &digest,
+                )?;
                 (
                     imported.parameters,
                     imported.nodes,
@@ -235,6 +244,7 @@ pub(crate) async fn admit(
             message,
         })?;
     }
+    validate_preflight_arguments(&nodes, &request.inputs, wrappers, &digest)?;
     let mut input_refs = Vec::with_capacity(request.inputs.len());
     let mut total_bytes = canonical_bytes;
     for (ordinal, (value, value_type)) in request.inputs.iter().zip(&parameters).enumerate() {
@@ -611,6 +621,261 @@ fn validate_wrappers(
         }
     }
     Ok(())
+}
+
+fn validate_preflight_arguments(
+    nodes: &[InlineNodeV1],
+    inputs: &[StrictJson],
+    wrappers: &WrapperSnapshot,
+    request_digest: &str,
+) -> Result<(), AdmissionFailure> {
+    let mut values = vec![None; nodes.len()];
+    for node in nodes {
+        if matches!(
+            node.evidence_type.as_str(),
+            "OrchCallV1" | "OrchAwaitV1" | "OrchAskPauseV1"
+        ) || node.ports.iter().any(|port| {
+            matches!(port.role, OrchPortRoleV1::Data | OrchPortRoleV1::Guard)
+                && values
+                    .get(port.source_slot as usize)
+                    .and_then(Option::as_ref)
+                    .is_none()
+        }) {
+            continue;
+        }
+        let Ok(value) = evaluate_pure(node, &values, inputs) else {
+            // Pure evaluation failures remain runtime failures unless the
+            // value is needed to prove a concrete wrapper argument.
+            continue;
+        };
+        if node.evidence_type == "OrchArgumentV1"
+            && let Some(argument) = value.value()
+        {
+            let tool = node.config.0["tool"].as_str().unwrap_or_default();
+            let Some(wrapper) = wrappers.wrappers.get(tool) else {
+                return Err(AdmissionFailure {
+                    request_digest: request_digest.into(),
+                    code: "wrapper_unavailable".into(),
+                    message: format!("slot {} names unavailable tool `{tool}`", node.slot),
+                });
+            };
+            validate_wrapper_argument(wrapper, argument).map_err(|message| AdmissionFailure {
+                request_digest: request_digest.into(),
+                code: "wrapper_argument".into(),
+                message: format!("slot {} argument for `{tool}`: {message}", node.slot),
+            })?;
+        }
+        values[node.slot as usize] = Some(value);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_wrapper_argument(wrapper: &WrapperV1, value: &Value) -> Result<(), String> {
+    validate_schema_value(&wrapper.input_schema, value, "$", &wrapper.input_schema)
+}
+
+fn validate_schema_value(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    root: &Value,
+) -> Result<(), String> {
+    let Some(schema) = schema.as_object() else {
+        return Ok(());
+    };
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return Err(format!(
+                "{path}: external schema references are unsupported"
+            ));
+        };
+        let target = root
+            .pointer(pointer)
+            .ok_or_else(|| format!("{path}: unresolved schema reference `{reference}`"))?;
+        validate_schema_value(target, value, path, root)?;
+    }
+    if let Some(options) = schema.get("allOf").and_then(Value::as_array) {
+        for option in options {
+            validate_schema_value(option, value, path, root)?;
+        }
+    }
+    if let Some(options) = schema.get("anyOf").and_then(Value::as_array)
+        && !options
+            .iter()
+            .any(|option| validate_schema_value(option, value, path, root).is_ok())
+    {
+        return Err(format!("{path}: value does not match any allowed schema"));
+    }
+    if let Some(options) = schema.get("oneOf").and_then(Value::as_array)
+        && options
+            .iter()
+            .filter(|option| validate_schema_value(option, value, path, root).is_ok())
+            .count()
+            != 1
+    {
+        return Err(format!("{path}: value does not match exactly one schema"));
+    }
+    if let Some(condition) = schema.get("if") {
+        let branch = if validate_schema_value(condition, value, path, root).is_ok() {
+            schema.get("then")
+        } else {
+            schema.get("else")
+        };
+        if let Some(branch) = branch {
+            validate_schema_value(branch, value, path, root)?;
+        }
+    }
+    if let Some(expected) = schema.get("const")
+        && value != expected
+    {
+        return Err(format!(
+            "{path}: value does not match the required constant"
+        ));
+    }
+    if let Some(variants) = schema.get("enum").and_then(Value::as_array)
+        && !variants.contains(value)
+    {
+        return Err(format!("{path}: value is outside the allowed enum"));
+    }
+    if let Some(expected) = schema.get("type") {
+        let matches = |name: &str| match name {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => false,
+        };
+        let valid = expected.as_str().is_some_and(matches)
+            || expected
+                .as_array()
+                .is_some_and(|types| types.iter().filter_map(Value::as_str).any(matches));
+        if !valid {
+            return Err(format!("{path}: value has the wrong JSON type"));
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(format!("{path}: required field `{field}` is missing"));
+                }
+            }
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        for (field, child) in object {
+            if let Some(field_schema) = properties.and_then(|properties| properties.get(field)) {
+                validate_schema_value(field_schema, child, &format!("{path}.{field}"), root)?;
+            } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                return Err(format!("{path}: unexpected field `{field}`"));
+            }
+        }
+    }
+    if let Some(array) = value.as_array() {
+        if let Some(limit) = schema.get("minItems").and_then(Value::as_u64)
+            && array.len() < limit as usize
+        {
+            return Err(format!("{path}: array is shorter than {limit}"));
+        }
+        if let Some(limit) = schema.get("maxItems").and_then(Value::as_u64)
+            && array.len() > limit as usize
+        {
+            return Err(format!("{path}: array is longer than {limit}"));
+        }
+        if let Some(items) = schema.get("items") {
+            for (index, child) in array.iter().enumerate() {
+                validate_schema_value(items, child, &format!("{path}[{index}]"), root)?;
+            }
+        }
+    }
+    if let Some(text) = value.as_str() {
+        if let Some(limit) = schema.get("minLength").and_then(Value::as_u64)
+            && text.chars().count() < limit as usize
+        {
+            return Err(format!("{path}: string is shorter than {limit}"));
+        }
+        if let Some(limit) = schema.get("maxLength").and_then(Value::as_u64)
+            && text.chars().count() > limit as usize
+        {
+            return Err(format!("{path}: string is longer than {limit}"));
+        }
+    }
+    if let Some(integer) = value.as_i64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_i64)
+            && integer < minimum
+        {
+            return Err(format!("{path}: integer is below {minimum}"));
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_i64)
+            && integer > maximum
+        {
+            return Err(format!("{path}: integer is above {maximum}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_read_group_wrappers(
+    nodes: &[InlineNodeV1],
+    groups: &[ReadGroupV1],
+    wrappers: &WrapperSnapshot,
+    request_digest: &str,
+) -> Result<(), AdmissionFailure> {
+    for group in groups {
+        let mut region = None;
+        for slot in &group.members {
+            let node = &nodes[*slot as usize];
+            let tool = node.config.0["tool"].as_str().unwrap_or_default();
+            if wrappers
+                .wrappers
+                .get(tool)
+                .is_none_or(|wrapper| !wrapper.parallel_safe)
+            {
+                return Err(AdmissionFailure {
+                    request_digest: request_digest.into(),
+                    code: "read_group_tool".into(),
+                    message: format!(
+                        "read group {} contains non-parallel-safe tool `{tool}`",
+                        group.id
+                    ),
+                });
+            }
+            let current = node
+                .config
+                .0
+                .get("region")
+                .cloned()
+                .unwrap_or(Value::Array(vec![]));
+            if region.as_ref().is_some_and(|expected| expected != &current) {
+                return Err(AdmissionFailure {
+                    request_digest: request_digest.into(),
+                    code: "read_group_region".into(),
+                    message: format!("read group {} crosses structured regions", group.id),
+                });
+            }
+            region = Some(current);
+            for other in &group.members {
+                if slot != other && depends_on(*slot, *other, nodes) {
+                    return Err(AdmissionFailure {
+                        request_digest: request_digest.into(),
+                        code: "read_group_dependency".into(),
+                        message: format!("read group {} contains dependent calls", group.id),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn depends_on(slot: u32, ancestor: u32, nodes: &[InlineNodeV1]) -> bool {
+    nodes.get(slot as usize).is_some_and(|node| {
+        node.ports.iter().any(|port| {
+            port.source_slot == ancestor || depends_on(port.source_slot, ancestor, nodes)
+        })
+    })
 }
 
 struct ImportedShape {

@@ -1902,6 +1902,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             cli_scope: None,
             typed_workflow_execution: None,
             loom_provider_fenced: false,
+            orchestration_child_tools: Vec::new(),
             web_search: None,
         },
     )

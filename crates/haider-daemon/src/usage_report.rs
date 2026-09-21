@@ -43,6 +43,9 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{AgentId, CredentialAlias, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::orchestration::{
+    ORCHESTRATION_TERMINAL_EXTENSION, OrchestrationUsageV1, ScriptTerminalV1,
+};
 use haider_protocol::provider::{
     CacheCostEstimate, CacheStatAvailability, NormalizedUsage, RequestUsage, UsageRequestKind,
     UsageScope,
@@ -538,10 +541,14 @@ impl UsageReportService {
                 local: local.get(&descriptor.alias).cloned().unwrap_or_default(),
             });
         }
+        let mut orchestration = OrchestrationUsageV1::default();
+        for account in &accounts {
+            merge_orchestration_usage(&mut orchestration, &account.local.orchestration);
+        }
         Ok(UsageReportV1 {
             generated_at_ms: (self.clock)(),
             accounts,
-            orchestration: Default::default(),
+            orchestration,
         })
     }
 
@@ -699,6 +706,8 @@ pub(crate) struct SessionLocalStats {
     /// account).
     pub lines_added: u64,
     pub lines_removed: u64,
+    pub orchestration: OrchestrationUsageV1,
+    orchestration_artifacts: HashSet<haider_protocol::ids::ArtifactRef>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -710,6 +719,7 @@ pub(crate) struct TokenTotals {
     pub est_cost_usd: Option<f64>,
     pub api_equivalent_est_cost_usd: Option<f64>,
     pub cache: CacheUsageStatsV1,
+    pub orchestration: OrchestrationUsageV1,
     metered_cache_cost_missing: bool,
     api_equivalent_cache_cost_missing: bool,
     metered_cost_missing: bool,
@@ -750,6 +760,17 @@ impl TokenTotals {
             self.api_equivalent_cost_missing = true;
         }
         add_cache_stats(&mut self.cache, normalized, scope, cache_cost, request);
+        if let Some(orchestration) = request.and_then(|request| request.orchestration.as_ref()) {
+            self.orchestration.scripts = self.orchestration.scripts.saturating_add(1);
+            self.orchestration.generated_source_bytes = self
+                .orchestration
+                .generated_source_bytes
+                .saturating_add(orchestration.generated_source_bytes);
+            self.orchestration.generated_source_tokens = self
+                .orchestration
+                .generated_source_tokens
+                .saturating_add(orchestration.generated_source_tokens);
+        }
         if metered && normalized.is_some() && cache_cost.is_none() {
             self.metered_cache_cost_missing = true;
         }
@@ -1553,6 +1574,55 @@ impl SessionFolder {
                 self.chunks.insert(key, (usage, model, envelope.seq));
             }
             "item" => {
+                if let Ok(EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data },
+                    ..
+                })) = envelope.payload.decode_event()
+                    && kind == ORCHESTRATION_TERMINAL_EXTENSION
+                    && let Ok(terminal) = serde_json::from_value::<ScriptTerminalV1>(data)
+                {
+                    self.stats.orchestration.child_attempts = self
+                        .stats
+                        .orchestration
+                        .child_attempts
+                        .saturating_add(u64::from(terminal.counts.attempts));
+                    self.stats.orchestration.retries =
+                        self.stats.orchestration.retries.saturating_add(u64::from(
+                            terminal
+                                .counts
+                                .attempts
+                                .saturating_sub(terminal.counts.calls),
+                        ));
+                    self.stats.orchestration.wall_ms =
+                        self.stats.orchestration.wall_ms.saturating_add(
+                            terminal
+                                .finished_at_ms
+                                .saturating_sub(terminal.started_at_ms),
+                        );
+                    for evidence in terminal
+                        .final_checkpoint
+                        .iter()
+                        .chain(terminal.terminal_ref.iter())
+                        .chain(terminal.receipt_refs.iter())
+                    {
+                        self.stats.orchestration.canonical_bytes = self
+                            .stats
+                            .orchestration
+                            .canonical_bytes
+                            .saturating_add(evidence.byte_len);
+                        if self
+                            .stats
+                            .orchestration_artifacts
+                            .insert(evidence.artifact.clone())
+                        {
+                            self.stats.orchestration.unique_cas_bytes = self
+                                .stats
+                                .orchestration
+                                .unique_cas_bytes
+                                .saturating_add(evidence.byte_len);
+                        }
+                    }
+                }
                 if envelope
                     .payload
                     .get("item")
@@ -1934,6 +2004,7 @@ pub(crate) fn attribute_session(
         entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(tokens.reasoning);
         entry.cached_tokens = entry.cached_tokens.saturating_add(tokens.cached);
         merge_cache_stats(&mut entry.cache, &tokens.cache);
+        merge_orchestration_usage(&mut entry.orchestration, &tokens.orchestration);
         if let Some(cost) = tokens.est_cost_usd {
             *entry.est_cost_usd.get_or_insert(0.0) += cost;
         }
@@ -1953,7 +2024,29 @@ pub(crate) fn attribute_session(
             .saturating_add(stats.last_committed_at_ms.saturating_sub(created_at_ms));
         entry.lines_added = entry.lines_added.saturating_add(stats.lines_added);
         entry.lines_removed = entry.lines_removed.saturating_add(stats.lines_removed);
+        merge_orchestration_usage(&mut entry.orchestration, &stats.orchestration);
     }
+}
+
+fn merge_orchestration_usage(target: &mut OrchestrationUsageV1, source: &OrchestrationUsageV1) {
+    target.scripts = target.scripts.saturating_add(source.scripts);
+    target.generated_source_bytes = target
+        .generated_source_bytes
+        .saturating_add(source.generated_source_bytes);
+    target.generated_source_tokens = target
+        .generated_source_tokens
+        .saturating_add(source.generated_source_tokens);
+    target.child_attempts = target.child_attempts.saturating_add(source.child_attempts);
+    target.retries = target.retries.saturating_add(source.retries);
+    target.canonical_bytes = target
+        .canonical_bytes
+        .saturating_add(source.canonical_bytes);
+    target.unique_cas_bytes = target
+        .unique_cas_bytes
+        .saturating_add(source.unique_cas_bytes);
+    target.admission_us = target.admission_us.saturating_add(source.admission_us);
+    target.scheduling_us = target.scheduling_us.saturating_add(source.scheduling_us);
+    target.wall_ms = target.wall_ms.saturating_add(source.wall_ms);
 }
 
 fn merge_optional_cost(target: &mut Option<f64>, source: Option<f64>, target_had_input: bool) {

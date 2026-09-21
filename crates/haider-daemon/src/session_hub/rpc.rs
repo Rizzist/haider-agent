@@ -38,7 +38,7 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawPayload, RenderTargets, SCHEMA_VERSION, write_payload_json,
 };
 use haider_protocol::ids::{AgentId, ItemId, RunId};
-use haider_protocol::item::ItemEvent;
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
@@ -1321,6 +1321,7 @@ fn direct_ssh_session(sessions: &[SessionId]) -> DirectSshSession<'_> {
 struct ObservedRun {
     state: RunState,
     task_outcome: Option<TaskOutcomeV1>,
+    orchestration: Option<haider_protocol::orchestration::OrchestrationRunDigestV1>,
     seq: u64,
     branch_id: Option<BranchId>,
 }
@@ -1404,6 +1405,7 @@ struct ObserveFoldSnapshot {
     /// Identity of the run `run_state` describes; `None` when idle.
     run_id: Option<RunId>,
     task_outcome: Option<TaskOutcomeV1>,
+    orchestration: Option<haider_protocol::orchestration::OrchestrationRunDigestV1>,
     active_branch_id: Option<BranchId>,
     branches: Vec<haider_protocol::branch::BranchDescriptor>,
     main_head_node_id: Option<haider_protocol::ids::NodeId>,
@@ -1489,6 +1491,7 @@ impl ObserveFold {
         let run_id = selected.map(|(run_id, _)| run_id.clone());
         let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
         let task_outcome = selected.and_then(|(_, run)| run.task_outcome.clone());
+        let orchestration = selected.and_then(|(_, run)| run.orchestration.clone());
         let mut branches = self
             .projection
             .branches
@@ -1509,6 +1512,7 @@ impl ObserveFold {
             run_state,
             run_id,
             task_outcome,
+            orchestration,
             active_branch_id,
             branches,
             main_head_node_id: self.projection.main_head_node_id.clone(),
@@ -1761,7 +1765,7 @@ impl ObserveFoldSnapshot {
             run_id: self.run_id.clone(),
             task_outcome: self.task_outcome.clone(),
             task_outcome_version: self.task_outcome.as_ref().map(|_| 1),
-            orchestration: None,
+            orchestration: self.orchestration.clone(),
             active_branch_id: self.active_branch_id.clone(),
             branches: self.branches.clone(),
             main_head_node_id: self.main_head_node_id.clone(),
@@ -2958,11 +2962,16 @@ impl ObserveProjection {
                     } else {
                         None
                     };
+                    let orchestration = self
+                        .runs
+                        .get(&run_id)
+                        .and_then(|run| run.orchestration.clone());
                     self.runs.insert(
                         run_id,
                         ObservedRun {
                             state,
                             task_outcome,
+                            orchestration,
                             seq,
                             branch_id,
                         },
@@ -3121,6 +3130,23 @@ impl ObserveProjection {
                 if let Some(footprint) = ContextFootprint::from_extension_item(&item) {
                     self.footprint = Some(footprint);
                 }
+                if let (Some(run_id), TurnItem::Extension { kind, data }) = (run_id.as_ref(), &item)
+                    && kind == haider_protocol::orchestration::ORCHESTRATION_TERMINAL_EXTENSION
+                    && let Ok(terminal) = serde_json::from_value::<
+                        haider_protocol::orchestration::ScriptTerminalV1,
+                    >(data.clone())
+                    && let Some(run) = self.runs.get_mut(run_id)
+                {
+                    run.orchestration =
+                        Some(haider_protocol::orchestration::OrchestrationRunDigestV1 {
+                            script_id: terminal.script_id,
+                            status: terminal.status,
+                            shape_digest: terminal.shape_digest,
+                            source_digest: terminal.source_digest,
+                            terminal_ref: terminal.terminal_ref,
+                            counts: terminal.counts,
+                        });
+                }
             }
             EventPayload::NodeCommitted(node) => {
                 if let Some(branch_id) = branch_id {
@@ -3151,6 +3177,7 @@ impl ObserveProjection {
         let run_id = selected.map(|(run_id, _)| run_id.clone());
         let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
         let task_outcome = selected.and_then(|(_, run)| run.task_outcome.clone());
+        let orchestration = selected.and_then(|(_, run)| run.orchestration.clone());
         let title = self.title.unwrap_or_else(|| {
             metadata
                 .as_ref()
@@ -3181,7 +3208,7 @@ impl ObserveProjection {
             run_id,
             task_outcome_version: task_outcome.as_ref().map(|_| 1),
             task_outcome,
-            orchestration: None,
+            orchestration,
             active_branch_id,
             branches,
             main_head_node_id: self.main_head_node_id,

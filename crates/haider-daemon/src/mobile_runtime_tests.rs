@@ -372,6 +372,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
             cli_scope: None,
             typed_workflow_execution: None,
             loom_provider_fenced: false,
+            orchestration_child_tools: Vec::new(),
             web_search: None,
         },
     )

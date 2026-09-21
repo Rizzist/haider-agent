@@ -2566,6 +2566,10 @@ pub struct WorkerToolContext {
     /// The provider and static actor-owned tool pack were constructed with
     /// Loom's fail-closed restrictions before this turn started.
     pub(crate) loom_provider_fenced: bool,
+    /// Entry-time presentation ceiling for orchestration children. The
+    /// wrapper digest remains the published catalog revision, while source
+    /// names outside this snapshot fail admission before any child effect.
+    pub(crate) orchestration_child_tools: Vec<String>,
     /// W-B: the client web_search executor for this turn (None = typed
     /// unavailable result).
     pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
@@ -9196,6 +9200,17 @@ async fn start_turn(
         mobile_use_active,
         promoted_tools,
     } = setup_reduction.durable_tool_state();
+    let orchestration_grant = typed_workflow_execution
+        .as_ref()
+        .map(|execution| &execution.grant)
+        .or(delegation_grant.as_ref());
+    let orchestration_child_tools = orchestration_entry_child_tools(
+        dependencies.tool_factory.as_ref(),
+        orchestration_grant,
+        lockdown.is_some(),
+        &promoted_tools,
+        mobile_use_active,
+    );
     let effect_dispatched = Arc::new(AtomicBool::new(false));
     let dispatcher = if let Some(unavailable) = workspace_unavailable.clone() {
         Some(Arc::new(WorkspaceUnavailableToolDispatcher { unavailable }) as Arc<dyn ToolDispatcher>)
@@ -9223,6 +9238,7 @@ async fn start_turn(
                     cli_scope,
                     typed_workflow_execution,
                     loom_provider_fenced,
+                    orchestration_child_tools,
                     web_search: dependencies.web_search.clone(),
                     diagnostics: dependencies.diagnostics.clone(),
                     lockdown: lockdown.clone(),
@@ -14607,19 +14623,31 @@ fn orchestration_catalog_digest(entries: &[RegisteredTool]) -> String {
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
-fn orchestration_wrapper_snapshot() -> crate::orchestration::WrapperSnapshot {
+fn orchestration_wrapper_snapshot(child_tools: &[String]) -> crate::orchestration::WrapperSnapshot {
     let entries = registered_tools();
     crate::orchestration::WrapperSnapshot {
         catalog_digest: orchestration_catalog_digest(entries),
         wrappers: entries
             .iter()
-            .filter(|entry| orchestration_bindable(entry.route))
+            .filter(|entry| {
+                orchestration_bindable(entry.route)
+                    && child_tools.iter().any(|name| name == &entry.manifest.name)
+            })
             .map(|entry| {
                 (
                     entry.manifest.name.clone(),
                     crate::orchestration::WrapperV1 {
                         digest: orchestration_wrapper_digest(entry),
                         repeat_safe: orchestration_repeat_safe(entry.route),
+                        parallel_safe: matches!(
+                            entry.route,
+                            RegisteredToolRoute::FsRead
+                                | RegisteredToolRoute::FsGlob
+                                | RegisteredToolRoute::FsSearch
+                                | RegisteredToolRoute::WebFetch
+                                | RegisteredToolRoute::WebSearch
+                        ),
+                        input_schema: entry.manifest.input_schema.clone(),
                     },
                 )
             })
@@ -14721,6 +14749,37 @@ fn initial_tool_exposure_for_turn(
     let mut configured = factory.initial_tool_exposure()?;
     configured.extend(promoted);
     Some(configured)
+}
+
+fn orchestration_entry_child_tools(
+    factory: &dyn TurnToolFactory,
+    grant: Option<&Grant>,
+    lockdown: bool,
+    promoted: &[String],
+    mobile_use_active: bool,
+) -> Vec<String> {
+    let exposed = initial_tool_exposure_for_turn(factory, grant, lockdown, promoted.to_vec());
+    registered_tools()
+        .iter()
+        .filter(|entry| orchestration_bindable(entry.route))
+        .filter(|entry| entry.route != RegisteredToolRoute::Mobile || mobile_use_active)
+        .filter(|entry| {
+            grant.is_none_or(|grant| {
+                grant.tools.iter().any(|tool| tool == &entry.manifest.name)
+                    && grant_admits_tool_manifest(
+                        grant,
+                        &entry.manifest.name,
+                        &entry.manifest.effects,
+                    )
+            })
+        })
+        .filter(|entry| {
+            exposed
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| name == &entry.manifest.name))
+        })
+        .map(|entry| entry.manifest.name.clone())
+        .collect()
 }
 
 /// The single daemon-owned public tool registry. Provider definitions,
@@ -16652,6 +16711,7 @@ async fn create_broker_tool_dispatcher(
         lockdown: context.lockdown,
         deferred: Mutex::new(HashMap::new()),
         orchestrations: Mutex::new(HashMap::new()),
+        orchestration_wrappers: orchestration_wrapper_snapshot(&context.orchestration_child_tools),
         active_tool_name,
     })))
 }
@@ -16876,6 +16936,7 @@ struct BrokerToolDispatcher {
     lockdown: Option<crate::lockdown::LockdownTurn>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
     orchestrations: Mutex<HashMap<OrchestrationExecutionKey, crate::orchestration::RuntimeStateV1>>,
+    orchestration_wrappers: crate::orchestration::WrapperSnapshot,
     /// The journal sink reads this only while `broker` is held. Setting it
     /// after acquiring that mutex keeps concurrent tool calls correctly named.
     active_tool_name: Arc<StdMutex<Option<String>>>,
@@ -18942,7 +19003,7 @@ impl BrokerToolDispatcher {
             let admitted_at_ms = unix_time_ms();
             match crate::orchestration::admit(
                 raw,
-                &orchestration_wrapper_snapshot(),
+                &self.orchestration_wrappers,
                 &self.output.store,
                 script_id.clone(),
                 admitted_at_ms,
@@ -19121,6 +19182,29 @@ impl BrokerToolDispatcher {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
+                let wrapper = self
+                    .orchestration_wrappers
+                    .wrappers
+                    .get(&tool)
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "admitted orchestration wrapper disappeared",
+                            false,
+                        )
+                    })?;
+                if let Err(reason) = crate::orchestration::validate_wrapper_argument(wrapper, &args)
+                {
+                    let terminal = orchestration_terminal(
+                        &state,
+                        ScriptTerminalStatusV1::Failed,
+                        "wrapper_argument",
+                        format!("slot {} argument for `{tool}`: {reason}", node.slot),
+                    );
+                    return self
+                        .finish_orchestration(run_id, Some(&mut state), terminal)
+                        .await;
+                }
                 let pending = if let Some(pending) = state
                     .pending_call
                     .as_ref()
