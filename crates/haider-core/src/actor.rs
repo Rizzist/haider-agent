@@ -79,7 +79,7 @@ use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, NodeId,
     RunId, SessionId,
 };
-use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, ToolArgumentsFinalizedV1, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -8672,6 +8672,14 @@ impl HarnessActor {
                 false,
             ))));
         }
+        // This is the single arguments-finalization boundary for every tool
+        // path. The JSON object is complete and structurally valid here, but
+        // no actor-owned action, approval card, broker receipt, or external
+        // effect has begun. Keep execution on the raw in-memory object while
+        // publishing only its consumer-redacted copy.
+        let args = parse_tool_args(&tools[index])?;
+        self.commit_tool_arguments_finalized(run_id, &tools[index], args.as_ref())
+            .await?;
         if tools[index].name == "task_outcome" {
             return self
                 .prepare_task_outcome(run_id, tools, deferred, index)
@@ -8696,7 +8704,6 @@ impl HarnessActor {
                 .map(|message| CompletedTool::Continue(Some(message)));
         }
         if let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) {
-            let args = parse_tool_args(&tools[index])?;
             self.commit_state(run_id, RunState::RunningTool)
                 .await
                 .map_err(DriveError::Store)?;
@@ -8768,6 +8775,43 @@ impl HarnessActor {
             .await?;
         tools.remove(index);
         Ok(CompletedTool::Continue(None))
+    }
+
+    /// Publishes the additive arguments-finalized carrier as a hidden durable
+    /// item pair. It deliberately precedes `RunningTool` and dispatch: an
+    /// allow-path Effect Intent/Authorized/Dispatched batch therefore cannot
+    /// appear first, while a crash after this append exposes no effect receipt
+    /// and is safely interpreted as an unexecuted proposal. Ask-path menus are
+    /// also later because their contents are derived during dispatch.
+    async fn commit_tool_arguments_finalized(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        arguments: &serde_json::Value,
+    ) -> Result<(), DriveError> {
+        let carrier = ToolArgumentsFinalizedV1 {
+            tool_item_id: tool.item_id.clone(),
+            call_id: tool.call_id.clone(),
+            name: tool.name.clone(),
+            arguments: redact_tool_arguments(arguments, None),
+        };
+        let item = carrier.extension_item().map_err(|error| {
+            DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                format!("tool arguments-finalized carrier could not serialize: {error}"),
+                false,
+            ))
+        })?;
+        let TurnItem::Extension { kind, data } = item else {
+            return Err(DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                "tool arguments-finalized carrier did not use the extension item",
+                false,
+            )));
+        };
+        self.commit_extension_marker(run_id, &kind, data, hidden_prompt_omit_render())
+            .await
+            .map_err(DriveError::Store)
     }
 
     async fn execute_general_tool(
@@ -12672,6 +12716,49 @@ fn parse_tool_args(tool: &ToolAccumulator) -> Result<Arc<serde_json::Value>, Dri
                 [ErrorAction::Retry],
             )),
         )),
+    }
+}
+
+/// Applies the established tool-output redactor to every string leaf while
+/// retaining the argument object's typed JSON shape. Object-key context is
+/// included in classification so a low-entropy password/token value is still
+/// removed; the key itself stays available to typed consumers.
+fn redact_tool_arguments(
+    value: &serde_json::Value,
+    key_context: Option<&str>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            let directly_redacted = haider_tools::redact_output_text(text);
+            if directly_redacted != *text {
+                return serde_json::Value::String(directly_redacted);
+            }
+            let Some(key) = key_context else {
+                return value.clone();
+            };
+            let prefix = format!("{key}=");
+            let contextual = format!("{prefix}{text}");
+            let redacted = haider_tools::redact_output_text(&contextual);
+            serde_json::Value::String(
+                redacted
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&redacted)
+                    .to_owned(),
+            )
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|value| redact_tool_arguments(value, key_context))
+                .collect(),
+        ),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), redact_tool_arguments(value, Some(key))))
+                .collect(),
+        ),
+        _ => value.clone(),
     }
 }
 

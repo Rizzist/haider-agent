@@ -12,6 +12,7 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::item::{ItemEvent, ToolArgumentsFinalizedV1, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
 };
@@ -20,11 +21,13 @@ use haider_protocol::state::RunState;
 use haider_protocol::tool::{BoundedResult, ImageBlockRef};
 use haider_provider::{FakeProvider, FakeStep, Message, ToolDefinition};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct ApprovalDispatcher {
     approved: AtomicBool,
     menu: Menu,
+    seen_args: Mutex<Option<serde_json::Value>>,
 }
 
 struct FixedArtifactReader {
@@ -103,9 +106,10 @@ impl ToolDispatcher for ApprovalDispatcher {
         _item_id: &ItemId,
         _call_id: &str,
         _name: &str,
-        _args: serde_json::Value,
+        args: serde_json::Value,
         _cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
+        *self.seen_args.lock().expect("seen args lock") = Some(args);
         if self.approved.load(Ordering::Acquire) {
             Ok(ToolDispatchResult::Completed(BoundedResult {
                 preview: "approved".into(),
@@ -164,11 +168,19 @@ fn committed_answer(opening: RawEnvelope, menu: MenuId) -> RawEnvelope {
 async fn permission_menu_parks_in_permission_required_and_needs_committed_answer() {
     let session_id = SessionId::new("permission-required-session");
     let store = Arc::new(MemoryStore::new());
+    // Construct secret-shaped content at runtime so no scanner-shaped
+    // credential literal ever enters repository history (registry #154).
+    let secret = ["sk", "-", "abcdefghijklmnop", "QRSTUV"].concat();
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitToolCall {
             call_id: "write-1".into(),
             name: "fs_write".into(),
-            args: serde_json::json!({"path":"result.txt","content":"ok"}),
+            args: serde_json::json!({
+                "path":"result.txt",
+                "content":"ok",
+                "password":"short-secret",
+                "token": secret.clone(),
+            }),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -203,6 +215,7 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
     let dispatcher = Arc::new(ApprovalDispatcher {
         approved: AtomicBool::new(false),
         menu,
+        seen_args: Mutex::new(None),
     });
     let mut config =
         HarnessConfig::for_session(session_id.clone(), DeviceId::new("permission-device"), 3, 7);
@@ -211,8 +224,13 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
         description: "write".into(),
         input_schema: serde_json::json!({"type":"object"}),
     }];
-    let (actor, handle) =
-        HarnessActor::new_with_dispatcher(config, provider, store.clone(), Some(dispatcher));
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config,
+        provider,
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let mut live = handle.subscribe();
     tokio::spawn(actor.run());
     let turn = handle
         .submit_turn(SubmitTurn::new("write the result"))
@@ -249,6 +267,43 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
             )
         })
         .expect("opening is durable");
+    let carrier_envelope = store
+        .events(&session_id)
+        .await
+        .into_iter()
+        .find(|event| {
+            event.payload.decode_event().is_ok_and(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { ref kind, .. },
+                        ..
+                    }) if kind == haider_protocol::item::TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND
+                )
+            })
+        })
+        .expect("arguments-finalized carrier is durable before the Ask card");
+    assert!(
+        carrier_envelope.seq < opening.seq,
+        "finalized arguments must precede the approval card"
+    );
+    let EventPayload::Item(ItemEvent::Completed { item, .. }) = carrier_envelope
+        .payload
+        .decode_event()
+        .expect("typed carrier payload")
+    else {
+        panic!("carrier envelope shape")
+    };
+    let carrier = ToolArgumentsFinalizedV1::try_from_extension_item(&item)
+        .expect("valid typed carrier")
+        .expect("matching carrier kind");
+    assert_eq!(carrier.call_id, "write-1");
+    assert_eq!(carrier.name, "fs_write");
+    assert_eq!(carrier.arguments["path"], "result.txt");
+    assert_eq!(carrier.arguments["password"], "[REDACTED:secret_value]");
+    assert_eq!(carrier.arguments["token"], "[REDACTED:api_key]");
+    assert!(!carrier_envelope.render.ui);
+    assert_eq!(carrier_envelope.render.prompt, PromptRender::Omit);
     let mut answer = [committed_answer(opening, menu)];
     store.append(&mut answer).await.expect("commit answer");
     handle
@@ -257,6 +312,35 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
     assert_eq!(
         turn.wait().await.expect("turn completes").state,
         RunState::Done
+    );
+    let raw_args = dispatcher
+        .seen_args
+        .lock()
+        .expect("seen args lock")
+        .clone()
+        .expect("dispatcher receives arguments");
+    assert_eq!(raw_args["password"], "short-secret");
+    assert_eq!(raw_args["token"], secret);
+
+    let mut live_carrier = None;
+    loop {
+        match live.try_recv() {
+            Ok(event) if event.event_id == carrier_envelope.event_id => {
+                live_carrier = Some(event);
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("live carrier replay parity subscriber lagged by {skipped}")
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    assert_eq!(
+        live_carrier.as_ref(),
+        Some(&carrier_envelope),
+        "live publication and durable replay must expose identical carrier bytes"
     );
 }
 

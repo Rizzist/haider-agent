@@ -36,7 +36,10 @@ use haider_protocol::hook::HookEventPayload;
 #[cfg(windows)]
 use haider_protocol::ids::ItemId;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
-use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCommandOriginV1};
+use haider_protocol::item::{
+    ItemDelta, ItemEvent, OutputStream, TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND,
+    ToolArgumentsFinalizedV1, TurnItem, UserCommandOriginV1,
+};
 use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FinishReason, RequestUsage, Usage, UsageSource,
@@ -6627,6 +6630,7 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
 struct HoldingEffectFactory {
     calls: Arc<AtomicUsize>,
     effect: EffectId,
+    before_receipt: Option<Arc<Semaphore>>,
 }
 
 #[async_trait]
@@ -6651,6 +6655,7 @@ impl TurnToolFactory for HoldingEffectFactory {
             context,
             calls: self.calls.clone(),
             effect: self.effect.clone(),
+            before_receipt: self.before_receipt.clone(),
         })))
     }
 }
@@ -6659,6 +6664,7 @@ struct HoldingEffectDispatcher {
     context: WorkerToolContext,
     calls: Arc<AtomicUsize>,
     effect: EffectId,
+    before_receipt: Option<Arc<Semaphore>>,
 }
 
 #[async_trait]
@@ -6678,6 +6684,10 @@ impl ToolDispatcher for HoldingEffectDispatcher {
                 format!("unexpected test tool {name}"),
                 false,
             ));
+        }
+        if let Some(reached) = self.before_receipt.as_ref() {
+            reached.add_permits(1);
+            future::pending::<()>().await;
         }
         let payloads = [
             EventPayload::Effect(EffectPhase::Intent(EffectIntent {
@@ -6761,6 +6771,7 @@ async fn scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispa
     dependencies.tool_factory = Arc::new(HoldingEffectFactory {
         calls: calls.clone(),
         effect: effect.clone(),
+        before_receipt: None,
     });
     let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
     let mut first = UdsClient::connect_control(
@@ -6806,6 +6817,45 @@ async fn scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispa
     .await;
     attach_existing(&mut second, &config, session_id.clone(), 0, "effect-replay").await;
     let envelopes = read_session(&mut second, &config, session_id, "effect-read-terminal").await;
+    let ordered = envelopes
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            envelope
+                .payload
+                .decode_event()
+                .ok()
+                .map(|payload| (envelope.seq, payload))
+        })
+        .collect::<Vec<_>>();
+    let carrier_seq = ordered
+        .iter()
+        .find_map(|(seq, payload)| match payload {
+            EventPayload::Item(ItemEvent::Completed { item, .. })
+                if ToolArgumentsFinalizedV1::from_extension_item(item).is_some() =>
+            {
+                Some(*seq)
+            }
+            _ => None,
+        })
+        .expect("finalized arguments carrier replays");
+    let intent_seq = ordered
+        .iter()
+        .find_map(|(seq, payload)| matches!(payload, EventPayload::Effect(EffectPhase::Intent(intent)) if intent.effect == effect).then_some(*seq))
+        .expect("intent replays");
+    let authorized_seq = ordered
+        .iter()
+        .find_map(|(seq, payload)| matches!(payload, EventPayload::Effect(EffectPhase::Authorized { effect: found, verdict: AuthorizationVerdict::Allow }) if *found == effect).then_some(*seq))
+        .expect("authorization replays");
+    let dispatched_seq = ordered
+        .iter()
+        .find_map(|(seq, payload)| matches!(payload, EventPayload::Effect(EffectPhase::Dispatched { effect: found }) if *found == effect).then_some(*seq))
+        .expect("dispatch replays");
+    assert!(carrier_seq < intent_seq);
+    assert_eq!(
+        [intent_seq + 1, authorized_seq + 1],
+        [authorized_seq, dispatched_seq]
+    );
     assert_eq!(
         payloads_for_run(&envelopes, &run_id)
             .filter(|payload| matches!(
@@ -6820,6 +6870,140 @@ async fn scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispa
         1
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.requests().len(), 1);
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("daemon joins");
+}
+
+/// A hard daemon-task crash after the actor's carrier append but before the
+/// dispatcher writes its atomic receipt batch leaves a replayable finalized
+/// proposal and no effect phase. Recovery must not invent or redispatch the
+/// absent effect.
+#[tokio::test]
+async fn arguments_finalized_crash_before_receipt_batch_is_proposal_only() {
+    let root = test_root("arguments-finalized-pre-receipt-crash-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "arguments-finalized-pre-receipt-crash",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (mut dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "carrier-only-call".into(),
+            name: "hold_effect".into(),
+            args: serde_json::json!({"message": "final proposal"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let reached = Arc::new(Semaphore::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    dependencies.tool_factory = Arc::new(HoldingEffectFactory {
+        calls: calls.clone(),
+        effect: EffectId::new("carrier-only-effect"),
+        before_receipt: Some(reached.clone()),
+    });
+
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "arguments-finalized-test",
+        "carrier-before-crash",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut first, &config, &workspace).await;
+    send_request(
+        &mut first,
+        &config,
+        "carrier-submit",
+        submit_body(
+            "carrier-command",
+            session_id.clone(),
+            generation,
+            "pause before the effect receipt batch",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut first).await;
+    reached
+        .acquire()
+        .await
+        .expect("dispatcher reaches pre-receipt seam")
+        .forget();
+
+    let before = read_session(
+        &mut first,
+        &config,
+        session_id.clone(),
+        "carrier-before-crash-read",
+    )
+    .await;
+    let before_payloads = before
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| envelope.payload.decode_event().ok())
+        .collect::<Vec<_>>();
+    assert!(before_payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { kind, .. },
+            ..
+        }) if kind == TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND
+    )));
+    assert!(
+        before_payloads
+            .iter()
+            .all(|payload| !matches!(payload, EventPayload::Effect(_))),
+        "no receipt phase exists before the atomic batch"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    drop(first);
+    first_task.crash().await;
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "arguments-finalized-test",
+        "carrier-after-crash",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut second,
+        &config,
+        session_id.clone(),
+        0,
+        "carrier-after-crash-attach",
+    )
+    .await;
+    let replay = read_session(&mut second, &config, session_id, "carrier-after-crash-read").await;
+    let replay_payloads = replay
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| envelope.payload.decode_event().ok())
+        .collect::<Vec<_>>();
+    assert!(replay_payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { kind, .. },
+            ..
+        }) if kind == TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND
+    )));
+    assert!(
+        replay_payloads
+            .iter()
+            .all(|payload| !matches!(payload, EventPayload::Effect(_))),
+        "recovery must not invent an absent receipt batch"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(fake.requests().len(), 1);
 
     second_task.shutdown_handle().request("test complete");

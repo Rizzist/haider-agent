@@ -1128,6 +1128,24 @@ fn golden_item_lifecycle() {
             item: origin.extension_item().expect("serialize origin marker"),
         },
     );
+    let finalized = ToolArgumentsFinalizedV1 {
+        tool_item_id: ItemId::new("it-tool-finalized"),
+        call_id: "call-finalized-1".into(),
+        name: "fs_write".into(),
+        arguments: serde_json::json!({
+            "path": "notes.txt",
+            "content": "safe fixture content"
+        }),
+    };
+    additive_golden(
+        "item_completed_tool_arguments_finalized",
+        &ItemEvent::Completed {
+            item_id: ItemId::new("it-tool-arguments-carrier"),
+            item: finalized
+                .extension_item()
+                .expect("serialize finalized arguments carrier"),
+        },
+    );
     // ADDITIVE (TUI3b): compaction items may carry the before/after token
     // footprint — optional fields, absent = old shape (fixtures above are
     // untouched; this is a NEW fixture).

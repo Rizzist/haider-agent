@@ -113,6 +113,9 @@ fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
 
     if payload["type"] == "item" {
         payload["item_id"] = serde_json::Value::String("<item>".into());
+        if payload["item"]["kind"] == "tool_arguments_finalized_v1" {
+            payload["item"]["data"]["tool_item_id"] = serde_json::Value::String("<item>".into());
+        }
     }
     if payload["type"] == "node_committed" {
         payload["node"] = serde_json::Value::String("<node>".into());
@@ -724,6 +727,38 @@ async fn full_turn_commits_exact_projected_sequence() {
                         "call_id":"call-1",
                         "args_fragment":"{\"path\":\"src/lib.rs\"}"
                     }
+                }
+            }
+        }),
+        // ADDITIVE (972-P3): once streamed arguments close as a valid object,
+        // the hidden durable carrier is complete before any tool behavior.
+        serde_json::json!({
+            "type":"item",
+            "event":"started",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"tool_arguments_finalized_v1",
+                "data":{
+                    "tool_item_id":"<item>",
+                    "call_id":"call-1",
+                    "name":"inspect",
+                    "arguments":{"path":"src/lib.rs"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
+            "event":"completed",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"tool_arguments_finalized_v1",
+                "data":{
+                    "tool_item_id":"<item>",
+                    "call_id":"call-1",
+                    "name":"inspect",
+                    "arguments":{"path":"src/lib.rs"}
                 }
             }
         }),

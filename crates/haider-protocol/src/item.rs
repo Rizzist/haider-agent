@@ -25,6 +25,13 @@ const fn is_false(value: &bool) -> bool {
 /// consumers can distinguish a user `!` command from model-initiated exec.
 pub const USER_COMMAND_ORIGIN_EXTENSION_KIND: &str = "user_command_origin_v1";
 
+/// Durable extension kind published once a tool call's streamed arguments
+/// have closed as a valid JSON object and before any tool behavior begins.
+///
+/// This stays on [`TurnItem::Extension`] so pre-feature readers keep decoding
+/// the item lifecycle without a schema-version or RPC-method change.
+pub const TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND: &str = "tool_arguments_finalized_v1";
+
 /// Origin values carried by [`UserCommandOriginV1`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +71,46 @@ impl UserCommandOriginV1 {
             return Ok(None);
         };
         if kind != USER_COMMAND_ORIGIN_EXTENSION_KIND {
+            return Ok(None);
+        }
+        serde_json::from_value(data.clone()).map(Some)
+    }
+}
+
+/// Secret-safe, durable coordinates for one finalized tool invocation.
+///
+/// `tool_item_id` binds this supplemental fact to the already-open
+/// [`TurnItem::ToolCall`]. `arguments` contains the complete object after
+/// stream validation and consumer redaction; execution continues to use the
+/// unredacted in-memory object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolArgumentsFinalizedV1 {
+    pub tool_item_id: ItemId,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+impl ToolArgumentsFinalizedV1 {
+    pub fn extension_item(&self) -> Result<TurnItem, serde_json::Error> {
+        Ok(TurnItem::Extension {
+            kind: TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND.into(),
+            data: serde_json::to_value(self)?,
+        })
+    }
+
+    #[must_use]
+    pub fn from_extension_item(item: &TurnItem) -> Option<Self> {
+        Self::try_from_extension_item(item).ok().flatten()
+    }
+
+    /// Strict parser for durable client/audit consumers. Unknown extension
+    /// kinds are not this carrier; a malformed known carrier is an error.
+    pub fn try_from_extension_item(item: &TurnItem) -> Result<Option<Self>, serde_json::Error> {
+        let TurnItem::Extension { kind, data } = item else {
+            return Ok(None);
+        };
+        if kind != TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND {
             return Ok(None);
         }
         serde_json::from_value(data.clone()).map(Some)

@@ -21,6 +21,27 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.972 — finalized tool arguments carrier
+
+New additive extension kind `tool_arguments_finalized_v1` uses the existing
+`item:extension` carrier. Its typed payload binds `tool_item_id`, `call_id`,
+and tool `name` to the complete, consumer-redacted JSON `arguments` object.
+The actor commits its hidden durable Started/Completed pair after the provider
+argument stream closes as a valid object and before any actor-owned behavior,
+approval card, daemon dispatch, or effect receipt.
+
+For immediately allowed effects the order is therefore finalized carrier →
+`RunningTool` → the atomic Effect Intent/Authorized(Allow)/Dispatched batch.
+A crash between the carrier and that batch exposes only an unexecuted proposal;
+it cannot create an Intent-only or applied-without-Dispatched state. For Ask,
+the carrier precedes Intent/Authorized(Ask) and the resulting `menu_opened`
+card because the card is derived from already-final arguments. The carrier is
+prompt-omitted and UI-hidden, but remains available to raw/replay clients.
+Argument strings pass through the existing tool-output redaction consumer;
+execution retains the original in-memory object. Existing item bytes are
+unchanged when the supplemental event is absent. The RPC method pin remains
+136 and `schema_version` remains 1.
+
 ### v0.0.972 — permission-bound Edit/Write review
 
 `menu.kind = permission` gains optional `file_review`. The payload binds a

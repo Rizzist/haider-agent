@@ -1,0 +1,17 @@
+{
+  "event": "completed",
+  "item_id": "it-tool-arguments-carrier",
+  "item": {
+    "item": "extension",
+    "kind": "tool_arguments_finalized_v1",
+    "data": {
+      "arguments": {
+        "content": "safe fixture content",
+        "path": "notes.txt"
+      },
+      "call_id": "call-finalized-1",
+      "name": "fs_write",
+      "tool_item_id": "it-tool-finalized"
+    }
+  }
+}
