@@ -19023,8 +19023,8 @@ impl BrokerToolDispatcher {
             terminal.scheduling_us = state.scheduling_us;
             terminal.final_checkpoint = Some(checkpoint.clone());
             terminal.receipt_refs = state.receipt_refs.clone();
-            terminal.shape_digest = Some(state.admitted.shape_ref.ledger_digest.clone());
-            terminal.source_digest = Some(state.admitted.source_ref.ledger_digest.clone());
+            terminal.shape_digest = Some(state.admitted.shape_ref.artifact.to_string());
+            terminal.source_digest = Some(state.admitted.source_ref.artifact.to_string());
             let evidence_terminal = terminal.clone();
             let terminal_ref = crate::orchestration::persist_terminal(
                 &self.output.store,
@@ -19365,6 +19365,7 @@ impl BrokerToolDispatcher {
     ) -> Result<OrchestrationTerminalReason, HaiderError> {
         if let Some(ToolDispatchResult::Completed(mut result)) = settled {
             account_orchestration_interaction_result(state, pending, &mut result);
+            normalize_orchestration_permission_denial(&mut result);
             outcome_unknown |= result.status == ToolResultStatus::Unknown;
             match result.status {
                 ToolResultStatus::Completed => {
@@ -19582,11 +19583,15 @@ impl BrokerToolDispatcher {
                     }
                     ToolDispatchResult::Completed(mut result) => {
                         account_orchestration_interaction_result(state, &call, &mut result);
+                        let permission_denied =
+                            normalize_orchestration_permission_denial(&mut result);
                         let node = &state.admitted.nodes[call.slot as usize];
-                        let retry = matches!(
-                            result.status,
-                            ToolResultStatus::Failed | ToolResultStatus::Conflict
-                        ) && call.attempt < orchestration_retry_limit(state, node);
+                        let retry = !permission_denied
+                            && matches!(
+                                result.status,
+                                ToolResultStatus::Failed | ToolResultStatus::Conflict
+                            )
+                            && call.attempt < orchestration_retry_limit(state, node);
                         match result.status {
                             ToolResultStatus::Completed => {
                                 state.completed_calls = state.completed_calls.saturating_add(1);
@@ -19615,6 +19620,12 @@ impl BrokerToolDispatcher {
                         .await?;
                         if retry {
                             retry_slots.push((call.slot, call.attempt));
+                        } else if permission_denied {
+                            terminal_reason.get_or_insert(OrchestrationTerminalReason {
+                                status: ScriptTerminalStatusV1::Failed,
+                                code: "permission_denied",
+                                reason: "a read-group child tool permission request was denied",
+                            });
                         } else if status == ToolResultStatus::Rejected {
                             terminal_reason.get_or_insert(OrchestrationTerminalReason {
                                 status: ScriptTerminalStatusV1::Rejected,
@@ -19856,6 +19867,8 @@ impl BrokerToolDispatcher {
                 {
                     RecoveredOrchestrationChild::Completed(mut result) => {
                         account_orchestration_interaction_result(&mut state, &pending, &mut result);
+                        let permission_denied =
+                            normalize_orchestration_permission_denial(&mut result);
                         match result.status {
                             ToolResultStatus::Completed => {
                                 state.completed_calls = state.completed_calls.saturating_add(1);
@@ -19875,6 +19888,17 @@ impl BrokerToolDispatcher {
                             run_id, &mut state, &pending, result, None,
                         )
                         .await?;
+                        if permission_denied {
+                            let terminal = orchestration_terminal(
+                                &state,
+                                ScriptTerminalStatusV1::Failed,
+                                "permission_denied",
+                                "a child tool permission request was denied".into(),
+                            );
+                            return self
+                                .finish_orchestration(run_id, Some(&mut state), terminal)
+                                .await;
+                        }
                     }
                     RecoveredOrchestrationChild::SafeToRetry => {}
                     RecoveredOrchestrationChild::Interrupted { unknown } => {
@@ -20106,11 +20130,15 @@ impl BrokerToolDispatcher {
                     }
                     ToolDispatchResult::Completed(mut result) => {
                         account_orchestration_interaction_result(&mut state, &pending, &mut result);
+                        let permission_denied =
+                            normalize_orchestration_permission_denial(&mut result);
                         let retry_limit = orchestration_retry_limit(&state, &node);
-                        if matches!(
-                            result.status,
-                            ToolResultStatus::Failed | ToolResultStatus::Conflict
-                        ) && attempt < retry_limit
+                        if !permission_denied
+                            && matches!(
+                                result.status,
+                                ToolResultStatus::Failed | ToolResultStatus::Conflict
+                            )
+                            && attempt < retry_limit
                         {
                             state.failed_calls = state.failed_calls.saturating_add(1);
                             let backoff_ms = if attempt == 1 { 100 } else { 200 };
@@ -20127,6 +20155,22 @@ impl BrokerToolDispatcher {
                             // absolute backoff expiry are checkpointed together
                             // with the failed attempt.
                             continue;
+                        }
+                        if permission_denied {
+                            state.failed_calls = state.failed_calls.saturating_add(1);
+                            self.record_orchestration_call_result(
+                                run_id, &mut state, &pending, result, None,
+                            )
+                            .await?;
+                            let terminal = orchestration_terminal(
+                                &state,
+                                ScriptTerminalStatusV1::Failed,
+                                "permission_denied",
+                                "a child tool permission request was denied".into(),
+                            );
+                            return self
+                                .finish_orchestration(run_id, Some(&mut state), terminal)
+                                .await;
                         }
                         match result.status {
                             ToolResultStatus::Rejected => {
@@ -20496,6 +20540,20 @@ fn account_orchestration_interaction_result(
     {
         state.interaction_observation_invalidated = false;
     }
+}
+
+/// Permission denial is an uncatchable orchestration failure. The ordinary
+/// broker result supplies the typed denial code; the orchestration child and
+/// outer script must both settle as failed rather than rejected.
+fn normalize_orchestration_permission_denial(result: &mut BoundedResult) -> bool {
+    let permission_denied = result.status == ToolResultStatus::Rejected
+        && result.presentation.as_ref().is_some_and(|presentation| {
+            presentation.subcode.as_str() == ErrorCode::PermissionDenied.as_subcode()
+        });
+    if permission_denied {
+        result.status = ToolResultStatus::Failed;
+    }
+    permission_denied
 }
 
 fn stale_interaction_control_result(
@@ -24293,6 +24351,13 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
             serde_json::Value::Null,
         );
         result.reason = Some(bounded_failure_reason(reason));
+        result.presentation = Some(ErrorPresentation::new(
+            ErrorCode::PermissionDenied.as_subcode(),
+            "Permission denied",
+            reason,
+            ErrorScope::Tool,
+            [ErrorAction::None],
+        ));
         return Some(result);
     }
     let (status, kind) = match error {

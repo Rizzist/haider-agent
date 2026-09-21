@@ -3,6 +3,7 @@ use super::*;
 
 const EXCLUDED: &[&str] = &[
     "test_run",
+    "tool_script",
     "task_output",
     "task_kill",
     "workflow_author",

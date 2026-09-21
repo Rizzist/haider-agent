@@ -10,7 +10,9 @@ use haider_protocol::effect::{
 };
 use haider_protocol::ids::{DeviceId, EffectId, ItemId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuAnswer};
 use haider_protocol::orchestration::ScriptTerminalStatusV1;
+use haider_protocol::pipe::InstructEvidenceRef;
 use haider_protocol::tool::ToolResultStatus;
 use haider_tools::FakeMobileBackend;
 use std::sync::Arc;
@@ -376,6 +378,135 @@ fn retrying_fs_read_script(path: &str) -> String {
     request.to_string()
 }
 
+fn two_process_exec_script(first: &str, second: &str) -> String {
+    let entry = registered_tool_by_name("process_exec").expect("process_exec registry entry");
+    let wrapper_digest = orchestration_wrapper_digest(entry);
+    let factory = BrokerToolFactory::with_mobile_backend(Arc::new(FakeMobileBackend::default()));
+    let child_tools = orchestration_entry_child_tools(&factory, None, None, &[], false);
+    let catalog_digest =
+        orchestration_catalog_digest_for_names(registered_tools(), Some(&child_tools));
+    let mut nodes = Vec::new();
+    let mut awaits = Vec::new();
+    for (ordinal, command) in [first, second].into_iter().enumerate() {
+        let value_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot": value_slot,
+            "evidence_type": "OrchValueV1",
+            "config": {
+                "operator": "literal",
+                "type": {"kind":"record","fields":{
+                    "command":{"kind":"string","max_bytes":command.len()}
+                }},
+                "operand_config": {"value":{"command":command}},
+                "region": [],
+                "origin": [ordinal]
+            },
+            "ports": []
+        }));
+        let argument_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot": argument_slot,
+            "evidence_type": "OrchArgumentV1",
+            "config": {
+                "tool":"process_exec","wrapper_digest":wrapper_digest,
+                "region":[],"origin":[ordinal]
+            },
+            "ports":[{"role":"data","port":"args","source_slot":value_slot,"output":"value"}]
+        }));
+        let retry_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot":retry_slot,"evidence_type":"OrchRetryPolicyV1",
+            "config":{"max_attempts":1},"ports":[]
+        }));
+        let ask_slot = nodes.len();
+        let call_slot = ask_slot + 1;
+        let mut ask_ports = vec![serde_json::json!({
+            "role":"data","port":"args","source_slot":argument_slot,"output":"value"
+        })];
+        if let Some(previous) = awaits.last() {
+            ask_ports.push(serde_json::json!({
+                "role":"control","port":"after_prior","source_slot":previous,"output":"settled"
+            }));
+        }
+        nodes.push(serde_json::json!({
+            "slot":ask_slot,"evidence_type":"OrchAskPauseV1",
+            "config":{
+                "tool":"process_exec","wrapper_digest":wrapper_digest,
+                "owner_call_slot":call_slot,"wait_ms":120000,
+                "region":[],"origin":[ordinal]
+            },
+            "ports":ask_ports
+        }));
+        nodes.push(serde_json::json!({
+            "slot":call_slot,"evidence_type":"OrchCallV1",
+            "config":{
+                "tool":"process_exec","wrapper_digest":wrapper_digest,
+                "region":[],"origin":[ordinal]
+            },
+            "ports":[
+                {"role":"data","port":"args","source_slot":argument_slot,"output":"value"},
+                {"role":"control","port":"permit","source_slot":ask_slot,"output":"permit"},
+                {"role":"config","port":"retry","source_slot":retry_slot,"output":"policy"}
+            ]
+        }));
+        let await_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot":await_slot,"evidence_type":"OrchAwaitV1",
+            "config":{"on_error":"stop","region":[],"origin":[ordinal]},
+            "ports":[{"role":"data","port":"operation","source_slot":call_slot,"output":"operation"}]
+        }));
+        awaits.push(await_slot);
+    }
+    let join_slot = nodes.len();
+    nodes.push(serde_json::json!({
+        "slot":join_slot,"evidence_type":"OrchJoinV1",
+        "config":{
+            "mode":"all","type":{"kind":"list","item":{
+                "kind":"opaque","ref_kind":"tool_result",
+                "issuer_version":"1","decoder_version":"1"
+            },"max_items":2},
+            "omit_inactive":false,"region":[]
+        },
+        "ports":[
+            {"role":"data","port":"first","source_slot":awaits[0],"output":"value"},
+            {"role":"data","port":"second","source_slot":awaits[1],"output":"value"}
+        ]
+    }));
+    let exit_slot = nodes.len();
+    nodes.push(serde_json::json!({
+        "slot":exit_slot,"evidence_type":"OrchExitV1",
+        "config":{"mode":"return","region":[]},
+        "ports":[{"role":"data","port":"value","source_slot":join_slot,"output":"value"}]
+    }));
+    serde_json::json!({
+        "version":1,
+        "transport":haider_protocol::orchestration::ORCHESTRATION_TRANSPORT,
+        "catalog_digest":catalog_digest,
+        "graph":{
+            "kind":"inline","parameters":[],"nodes":nodes,
+            "exits":[exit_slot],"read_groups":[]
+        },
+        "inputs":[]
+    })
+    .to_string()
+}
+
+fn menu_answer(menu: &Menu, decision: DecisionKind) -> MenuAnswer {
+    let (index, option) = menu
+        .options
+        .iter()
+        .enumerate()
+        .find(|(_, option)| option.decision == Some(decision))
+        .expect("permission menu decision");
+    MenuAnswer {
+        menu: menu.id.clone(),
+        option_index: u32::try_from(index).expect("menu option index"),
+        option_key: Some(option.key.clone()),
+        value: None,
+        via: AnswerVia::Rpc,
+    }
+}
+
 async fn orchestration_journal_counts(
     fixture: &MobileDispatcherFixture,
 ) -> (usize, usize, usize, usize, usize) {
@@ -419,6 +550,50 @@ async fn orchestration_journal_counts(
         }
     }
     (intents, authorized, dispatched, outcomes, child_results)
+}
+
+async fn orchestration_child_statuses(fixture: &MobileDispatcherFixture) -> Vec<ToolResultStatus> {
+    fixture
+        .store
+        .read(&fixture.session_id, 0, 4_096)
+        .await
+        .expect("read child settlements")
+        .into_iter()
+        .filter_map(|envelope| match envelope.payload.decode_event() {
+            Ok(EventPayload::ToolResult { call_id, result }) if call_id.starts_with("orch:") => {
+                Some(result.status)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+async fn orchestration_admitted_refs(
+    fixture: &MobileDispatcherFixture,
+) -> (InstructEvidenceRef, InstructEvidenceRef) {
+    fixture
+        .store
+        .read(&fixture.session_id, 0, 4_096)
+        .await
+        .expect("read script admission")
+        .into_iter()
+        .find_map(|envelope| {
+            let Ok(EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind, data },
+                ..
+            })) = envelope.payload.decode_event()
+            else {
+                return None;
+            };
+            if kind != haider_protocol::orchestration::ORCHESTRATION_SCRIPT_EXTENSION {
+                return None;
+            }
+            Some((
+                serde_json::from_value(data.get("shape_ref")?.clone()).ok()?,
+                serde_json::from_value(data.get("source_ref")?.clone()).ok()?,
+            ))
+        })
+        .expect("admitted shape/source refs")
 }
 
 async fn orchestration_activation_clocks(
@@ -647,6 +822,19 @@ async fn tool_script_brokers_each_child_and_replays_committed_terminal_without_e
     assert_eq!(terminal.counts.calls, 1);
     assert_eq!(terminal.counts.attempts, 1);
     assert!(terminal.terminal_ref.is_some());
+    let (shape_ref, source_ref) = orchestration_admitted_refs(&fixture).await;
+    assert_eq!(
+        terminal.shape_digest.as_deref(),
+        Some(shape_ref.artifact.as_str()),
+        "shape_digest binds the root artifact domain"
+    );
+    assert_eq!(
+        terminal.source_digest.as_deref(),
+        Some(source_ref.artifact.as_str()),
+        "source_digest binds the concrete script artifact domain"
+    );
+    assert_ne!(terminal.shape_digest, Some(shape_ref.ledger_digest));
+    assert_ne!(terminal.source_digest, Some(source_ref.ledger_digest));
 
     let before = orchestration_journal_counts(&fixture).await;
     assert_eq!(before, (1, 1, 1, 1, 1));
@@ -668,6 +856,123 @@ async fn tool_script_brokers_each_child_and_replays_committed_terminal_without_e
     };
     assert_eq!(replay.status, ToolResultStatus::Completed);
     assert_eq!(orchestration_journal_counts(&fixture).await, before);
+}
+
+#[tokio::test]
+async fn runtime_permission_denial_fails_child_and_script_after_prior_effect() {
+    let fixture = mobile_dispatcher_fixture_with_policy(
+        "orchestration-permission-denial",
+        "exercise independent orchestration approvals",
+        Arc::new(FakeMobileBackend::default()),
+        None,
+        false,
+    )
+    .await;
+    let first_marker = std::path::Path::new(&fixture.cwd).join("first-marker.txt");
+    let second_marker = std::path::Path::new(&fixture.cwd).join("second-marker.txt");
+    let script = two_process_exec_script(
+        "printf first > first-marker.txt",
+        "printf second > second-marker.txt",
+    );
+    let item_id = ItemId::new("outer-permission-script-item");
+
+    let first = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &item_id,
+            "outer-permission-script-call",
+            "tool_script",
+            serde_json::Value::String(script.clone()),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("open first child approval");
+    let ToolDispatchResult::ApprovalRequired(first_menu) = first else {
+        panic!("first process child must ask independently");
+    };
+    assert!(!first_marker.exists());
+    assert!(!second_marker.exists());
+    fixture
+        .dispatcher
+        .resolve_approval(
+            &first_menu,
+            &menu_answer(&first_menu, DecisionKind::AllowOnce),
+        )
+        .await
+        .expect("approve first child once");
+
+    let second = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &item_id,
+            "outer-permission-script-call",
+            "tool_script",
+            serde_json::Value::String(script.clone()),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("execute first child and open second approval");
+    let ToolDispatchResult::ApprovalRequired(second_menu) = second else {
+        panic!("second process child must ask independently");
+    };
+    assert_ne!(first_menu.id, second_menu.id);
+    assert_eq!(
+        std::fs::read_to_string(&first_marker).expect("first child marker"),
+        "first"
+    );
+    assert!(!second_marker.exists());
+    fixture
+        .dispatcher
+        .resolve_approval(
+            &second_menu,
+            &menu_answer(&second_menu, DecisionKind::RejectOnce),
+        )
+        .await
+        .expect("deny second child once");
+
+    let denied = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &item_id,
+            "outer-permission-script-call",
+            "tool_script",
+            serde_json::Value::String(script),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("settle denied script");
+    let ToolDispatchResult::Completed(denied) = denied else {
+        panic!("denied child must terminate the script");
+    };
+    assert_eq!(
+        denied.status,
+        ToolResultStatus::Failed,
+        "{}",
+        denied.preview
+    );
+    let terminal = denied.orchestration.expect("permission denial terminal");
+    assert_eq!(terminal.status, ScriptTerminalStatusV1::Failed);
+    assert_eq!(terminal.reason_code.as_deref(), Some("permission_denied"));
+    assert_eq!(terminal.counts.completed, 1);
+    assert_eq!(terminal.counts.failed, 1);
+    assert_eq!(terminal.counts.rejected, 0);
+    assert_eq!(
+        orchestration_child_statuses(&fixture).await,
+        [ToolResultStatus::Completed, ToolResultStatus::Failed]
+    );
+    let (_, _, dispatched, outcomes, child_results) = orchestration_journal_counts(&fixture).await;
+    assert_eq!(dispatched, 1, "only the approved child may dispatch");
+    assert_eq!(outcomes, 1, "only the approved child may have an outcome");
+    assert_eq!(child_results, 2);
+    assert_eq!(
+        std::fs::read_to_string(&first_marker).expect("first child still executed once"),
+        "first"
+    );
+    assert!(!second_marker.exists(), "denied child must never dispatch");
+    close_fixture(fixture).await;
 }
 
 #[tokio::test]
