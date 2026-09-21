@@ -23503,6 +23503,10 @@ impl Cas for Store {
         self.cas.get(artifact)
     }
 
+    fn get_bounded(&self, artifact: &ArtifactRef, max_bytes: u64) -> StoreResult<Vec<u8>> {
+        self.cas.get_bounded(artifact, max_bytes)
+    }
+
     fn verify(&self, artifact: &ArtifactRef) -> bool {
         self.cas.verify(artifact)
     }

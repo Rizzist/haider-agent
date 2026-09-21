@@ -116,6 +116,7 @@ mod model_select;
 mod monitor;
 mod native_process;
 mod oauth;
+mod orchestration;
 mod peer;
 #[cfg(test)]
 #[path = "peer_tests.rs"]

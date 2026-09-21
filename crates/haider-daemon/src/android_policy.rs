@@ -13,6 +13,7 @@ pub(crate) const fn route_allowed(route: RegisteredToolRoute) -> bool {
             route,
             RegisteredToolRoute::RequestInput
                 | RegisteredToolRoute::ListTools
+                | RegisteredToolRoute::ToolScript
                 | RegisteredToolRoute::Plan
                 | RegisteredToolRoute::LoomRegister
                 | RegisteredToolRoute::TodoWrite

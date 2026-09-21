@@ -2662,6 +2662,19 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.get(&artifact))).await
     }
 
+    /// Reads and verifies an artifact while enforcing the bound before a
+    /// file-backed CAS allocates its result buffer.
+    pub async fn get_bounded(
+        &self,
+        artifact: &ArtifactRef,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let artifact = artifact.clone();
+        run_blocking(move || owner.with_store(|store| store.get_bounded(&artifact, max_bytes)))
+            .await
+    }
+
     /// Verifies an artifact on the blocking pool.
     pub async fn verify(&self, artifact: &ArtifactRef) -> Result<bool, HaiderError> {
         let owner = Arc::clone(&self.owner);

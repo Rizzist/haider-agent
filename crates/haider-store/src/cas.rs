@@ -890,6 +890,64 @@ impl Cas for FileCas {
         Ok(bytes)
     }
 
+    fn get_bounded(&self, artifact: &ArtifactRef, max_bytes: u64) -> StoreResult<Vec<u8>> {
+        let mut trace = haider_platform::phase_trace::cas_hash_scope(false);
+        let path = self.path_for(artifact)?;
+        let file = File::open(&path).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot read CAS object {}: {error}", path.display()),
+                    false,
+                )
+            } else {
+                io_error("read CAS object", &path, error)
+            }
+        })?;
+        let declared = file
+            .metadata()
+            .map_err(|error| io_error("inspect CAS object", &path, error))?
+            .len();
+        if declared > max_bytes {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("CAS object exceeds the {max_bytes}-byte read limit"),
+                false,
+            ));
+        }
+        let capacity = usize::try_from(declared).map_err(|_| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                "CAS object length does not fit this platform",
+                false,
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error("read CAS object", &path, error))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("CAS object exceeds the {max_bytes}-byte read limit"),
+                false,
+            ));
+        }
+        trace.note_bytes_read(bytes.len());
+        let actual = artifact_for(&bytes);
+        if actual != *artifact {
+            return Err(store_error(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "CAS object {} does not match its content address",
+                    path.display()
+                ),
+                false,
+            ));
+        }
+        Ok(bytes)
+    }
+
     fn verify(&self, artifact: &ArtifactRef) -> bool {
         self.path_for(artifact)
             .ok()

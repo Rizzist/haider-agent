@@ -8542,6 +8542,14 @@ impl HubStoreHandle {
         self.hub.inner.store.get(&artifact).await
     }
 
+    pub(crate) async fn get_artifact_bounded(
+        &self,
+        artifact: haider_protocol::ids::ArtifactRef,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, HaiderError> {
+        self.hub.inner.store.get_bounded(&artifact, max_bytes).await
+    }
+
     pub(crate) async fn settle_idle(
         &self,
         envelope: RawEnvelope,

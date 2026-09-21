@@ -640,6 +640,8 @@ fn repaired_tool_name_preserves_declared_json_and_text_result_provenance() {
         call_id: "call-repaired-toolshape".into(),
         name: "fs_read".into(),
         args: "{}".into(),
+        raw_args_bytes: 2,
+        args_overflowed: false,
         requested_name: Some("FsRead".into()),
         parsed_args: std::sync::OnceLock::new(),
     };

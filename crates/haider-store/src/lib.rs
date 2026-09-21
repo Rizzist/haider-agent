@@ -109,6 +109,22 @@ pub trait Cas: Send + Sync {
     /// Reads and verifies bytes. Hash mismatch is reported as store corruption.
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>>;
 
+    /// Reads and verifies bytes without allocating beyond a caller-owned cap.
+    /// Implementations backed by files should reject from metadata before
+    /// allocating the result buffer. The default preserves compatibility for
+    /// small in-memory/test stores while still enforcing the returned bound.
+    fn get_bounded(&self, artifact: &ArtifactRef, max_bytes: u64) -> StoreResult<Vec<u8>> {
+        let bytes = self.get(artifact)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("CAS object exceeds the {max_bytes}-byte read limit"),
+                false,
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// Returns whether the artifact exists and its bytes match its address.
     fn verify(&self, artifact: &ArtifactRef) -> bool;
 }

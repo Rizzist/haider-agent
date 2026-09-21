@@ -134,6 +134,11 @@ use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
     effect_recovery_menu,
 };
+use haider_protocol::orchestration::{
+    ORCHESTRATION_CALL_EXTENSION, ORCHESTRATION_CHECKPOINT_EXTENSION,
+    ORCHESTRATION_SCRIPT_EXTENSION, ORCHESTRATION_TERMINAL_EXTENSION, OrchPortRoleV1,
+    ScriptCountsV1, ScriptTerminalStatusV1, ScriptTerminalV1, StrictJson,
+};
 use haider_protocol::permission::{
     PermissionEventPayload, PermissionGrantAction, PermissionGrantNeeded,
     PermissionGrantResolution, PermissionGrantResolved,
@@ -13961,6 +13966,7 @@ impl BrokerToolFactory {
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
     ListTools,
+    ToolScript,
     Plan,
     LoomRegister,
     TodoWrite,
@@ -14231,7 +14237,7 @@ fn registered_manifest(
 }
 
 fn build_registered_tools() -> Vec<RegisteredTool> {
-    vec![
+    let mut tools = vec![
         registered_tool(
             ToolDefinition {
                 name: "list_tools".into(),
@@ -14485,7 +14491,202 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::SshShell,
         ),
-    ]
+    ];
+    let script = registered_tool(
+        tool_script_definition(&tools),
+        vec![],
+        DispatchMode::Await,
+        ToolPermissionDefault::NotApplicable,
+        RegisteredToolRoute::ToolScript,
+    );
+    // Keep discovery first. `tool_script` is intentionally not in any P3
+    // initial pack; list_tools publishes this bounded schema on demand.
+    tools.insert(1, script);
+    tools
+}
+
+fn orchestration_route_name(route: RegisteredToolRoute) -> &'static str {
+    match route {
+        RegisteredToolRoute::RequestInput => "request_input",
+        RegisteredToolRoute::ListTools => "list_tools",
+        RegisteredToolRoute::ToolScript => "tool_script",
+        RegisteredToolRoute::Plan => "plan",
+        RegisteredToolRoute::LoomRegister => "loom_register",
+        RegisteredToolRoute::TodoWrite => "todo_write",
+        RegisteredToolRoute::TaskOutcome => "task_outcome",
+        RegisteredToolRoute::GraphEvidence => "graph_evidence",
+        RegisteredToolRoute::FsRead => "fs_read",
+        RegisteredToolRoute::FsGlob => "fs_glob",
+        RegisteredToolRoute::FsSearch => "fs_search",
+        RegisteredToolRoute::FsWrite => "fs_write",
+        RegisteredToolRoute::FsEdit => "fs_edit",
+        RegisteredToolRoute::FsPath => "fs_path",
+        RegisteredToolRoute::ProcessExec => "process_exec",
+        RegisteredToolRoute::TestRun => "test_run",
+        RegisteredToolRoute::WorkflowAuthor => "workflow_author",
+        RegisteredToolRoute::SpawnSubagent => "spawn_subagent",
+        RegisteredToolRoute::MessageSubagent => "message_subagent",
+        RegisteredToolRoute::TaskOutput => "task_output",
+        RegisteredToolRoute::TaskKill => "task_kill",
+        RegisteredToolRoute::WebFetch => "web_fetch",
+        RegisteredToolRoute::WebSearch => "web_search",
+        RegisteredToolRoute::Computer => "computer",
+        RegisteredToolRoute::Mobile => "mobile",
+        RegisteredToolRoute::Monitor => "monitor",
+        RegisteredToolRoute::ListModels => "list_models",
+        RegisteredToolRoute::SessionTranscript => "session_transcript",
+        RegisteredToolRoute::PeerList => "peer_list",
+        RegisteredToolRoute::PeerSend => "peer_send",
+        RegisteredToolRoute::SshList => "ssh_list",
+        RegisteredToolRoute::SshShell => "ssh_shell",
+    }
+}
+
+fn orchestration_repeat_safe(route: RegisteredToolRoute) -> bool {
+    matches!(
+        route,
+        RegisteredToolRoute::FsRead
+            | RegisteredToolRoute::FsGlob
+            | RegisteredToolRoute::FsSearch
+            | RegisteredToolRoute::TaskOutput
+            | RegisteredToolRoute::WebFetch
+            | RegisteredToolRoute::WebSearch
+            | RegisteredToolRoute::ListModels
+            | RegisteredToolRoute::SessionTranscript
+            | RegisteredToolRoute::PeerList
+            | RegisteredToolRoute::SshList
+    )
+}
+
+fn orchestration_bindable(route: RegisteredToolRoute) -> bool {
+    !matches!(
+        route,
+        RegisteredToolRoute::RequestInput
+            | RegisteredToolRoute::ToolScript
+            | RegisteredToolRoute::Plan
+            | RegisteredToolRoute::LoomRegister
+            | RegisteredToolRoute::TaskOutcome
+            | RegisteredToolRoute::GraphEvidence
+            | RegisteredToolRoute::WorkflowAuthor
+            | RegisteredToolRoute::SpawnSubagent
+            | RegisteredToolRoute::MessageSubagent
+            | RegisteredToolRoute::TaskKill
+            | RegisteredToolRoute::Monitor
+    )
+}
+
+fn orchestration_wrapper_digest(entry: &RegisteredTool) -> String {
+    let bytes = haider_protocol::orchestration::canonical_json(&serde_json::json!({
+        "version": 1,
+        "name": entry.manifest.name,
+        "schema": entry.manifest.input_schema,
+        "effects": entry.manifest.effects,
+        "dispatch": entry.manifest.dispatch,
+        "default": entry.default,
+        "route": orchestration_route_name(entry.route),
+        "repeat_safe": orchestration_repeat_safe(entry.route),
+        "decoder": "bounded-result-v1",
+    }))
+    .unwrap_or_default();
+    format!("blake3:{}", blake3::hash(&bytes).to_hex())
+}
+
+fn orchestration_catalog_digest(entries: &[RegisteredTool]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider/orchestration/catalog/v1\0");
+    for entry in entries
+        .iter()
+        .filter(|entry| orchestration_bindable(entry.route))
+    {
+        let digest = orchestration_wrapper_digest(entry);
+        for part in [entry.manifest.name.as_bytes(), digest.as_bytes()] {
+            hasher.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(part);
+        }
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn orchestration_wrapper_snapshot() -> crate::orchestration::WrapperSnapshot {
+    let entries = registered_tools();
+    crate::orchestration::WrapperSnapshot {
+        catalog_digest: orchestration_catalog_digest(entries),
+        wrappers: entries
+            .iter()
+            .filter(|entry| orchestration_bindable(entry.route))
+            .map(|entry| {
+                (
+                    entry.manifest.name.clone(),
+                    crate::orchestration::WrapperV1 {
+                        digest: orchestration_wrapper_digest(entry),
+                        repeat_safe: orchestration_repeat_safe(entry.route),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn tool_script_definition(entries: &[RegisteredTool]) -> ToolDefinition {
+    let catalog_digest = orchestration_catalog_digest(entries);
+    let wrappers = entries
+        .iter()
+        .filter(|entry| orchestration_bindable(entry.route))
+        .map(|entry| {
+            serde_json::json!({
+                "tool": entry.manifest.name,
+                "wrapper_digest": orchestration_wrapper_digest(entry),
+                "input_schema": entry.manifest.input_schema,
+                "effects": entry.manifest.effects,
+                "repeat_safe": orchestration_repeat_safe(entry.route),
+                "max_concurrency": if orchestration_repeat_safe(entry.route) { 4 } else { 1 },
+            })
+        })
+        .collect::<Vec<_>>();
+    ToolDefinition {
+        name: "tool_script".into(),
+        description: "Execute one bounded typed Instruct-Pipe DAG after the complete provider response is buffered. Every child is independently authorized and dispatched through the ordinary broker; approvals are never batched.".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["version", "transport", "catalog_digest", "graph", "inputs"],
+            "properties": {
+                "version": {"const": 1},
+                "transport": {"const": haider_protocol::orchestration::ORCHESTRATION_TRANSPORT},
+                "catalog_digest": {"const": catalog_digest},
+                "graph": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["kind", "parameters", "nodes", "exits", "read_groups"],
+                            "properties": {
+                                "kind": {"const": "inline"},
+                                "parameters": {"type": "array", "maxItems": 256},
+                                "nodes": {"type": "array", "minItems": 1, "maxItems": 8192},
+                                "exits": {"type": "array", "minItems": 1, "maxItems": 8192},
+                                "read_groups": {"type": "array", "maxItems": 256}
+                            },
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "root"],
+                            "properties": {"kind": {"const": "ref"}, "root": {"type": "object"}},
+                            "additionalProperties": false
+                        }
+                    ]
+                },
+                "inputs": {"type": "array", "maxItems": 256},
+                "limits": {"type": "object"}
+            },
+            "additionalProperties": false,
+            "x-haider-orchestration": {
+                "codec": haider_protocol::orchestration::ORCHESTRATION_CODEC,
+                "semantics": haider_protocol::orchestration::ORCHESTRATION_SEMANTICS,
+                "raw_max_bytes": haider_protocol::orchestration::ORCHESTRATION_RAW_MAX_BYTES,
+                "wrappers": wrappers
+            }
+        }),
+    }
 }
 
 fn configured_tool_exposure(value: Option<&str>) -> Option<Vec<String>> {
@@ -16450,6 +16651,7 @@ async fn create_broker_tool_dispatcher(
         loom_provider_fenced: context.loom_provider_fenced,
         lockdown: context.lockdown,
         deferred: Mutex::new(HashMap::new()),
+        orchestrations: Mutex::new(HashMap::new()),
         active_tool_name,
     })))
 }
@@ -16673,9 +16875,17 @@ struct BrokerToolDispatcher {
     loom_provider_fenced: bool,
     lockdown: Option<crate::lockdown::LockdownTurn>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
+    orchestrations: Mutex<HashMap<OrchestrationExecutionKey, crate::orchestration::RuntimeStateV1>>,
     /// The journal sink reads this only while `broker` is held. Setting it
     /// after acquiring that mutex keeps concurrent tool calls correctly named.
     active_tool_name: Arc<StdMutex<Option<String>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OrchestrationExecutionKey {
+    run_id: RunId,
+    item_id: ItemId,
+    call_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -18521,6 +18731,928 @@ impl BrokerToolDispatcher {
     }
 }
 
+impl BrokerToolDispatcher {
+    async fn append_orchestration_payloads(
+        &self,
+        run_id: &RunId,
+        payloads: Vec<EventPayload>,
+    ) -> Result<(), HaiderError> {
+        let mut envelopes = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let mut envelope = supervisor_envelope(
+                &self.output.store,
+                &self.output.device_id,
+                self.branch_id.clone(),
+                Some(run_id.clone()),
+                self.output.event_ids.next(),
+                payload,
+            )?;
+            envelope.agent_id = self.parent_agent_id.clone();
+            envelope.render.ui = false;
+            envelopes.push(envelope);
+        }
+        StoreHandle::append(&self.output.store, &mut envelopes)
+            .await
+            .map(|_| ())
+    }
+
+    fn orchestration_extension(
+        &self,
+        kind: &str,
+        identity: &str,
+        data: serde_json::Value,
+    ) -> Vec<EventPayload> {
+        let item_id = ItemId::new(format!("orch-{kind}-{identity}"));
+        let item = TurnItem::Extension {
+            kind: kind.into(),
+            data,
+        };
+        vec![
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: item.clone(),
+            }),
+            EventPayload::Item(ItemEvent::Completed { item_id, item }),
+        ]
+    }
+
+    async fn checkpoint_orchestration(
+        &self,
+        run_id: &RunId,
+        state: &mut crate::orchestration::RuntimeStateV1,
+        suffix: &str,
+        mut prefix: Vec<EventPayload>,
+    ) -> Result<(), HaiderError> {
+        let checkpoint =
+            crate::orchestration::persist_checkpoint(&self.output.store, state).await?;
+        prefix.extend(self.orchestration_extension(
+            ORCHESTRATION_CHECKPOINT_EXTENSION,
+            &format!("{}-{suffix}", state.admitted.script_id),
+            serde_json::json!({
+                "version": 1,
+                "script_id": state.admitted.script_id,
+                "next_slot": state.next_slot,
+                "checkpoint_ref": checkpoint,
+            }),
+        ));
+        self.append_orchestration_payloads(run_id, prefix).await
+    }
+
+    async fn finish_orchestration(
+        &self,
+        run_id: &RunId,
+        mut state: Option<&mut crate::orchestration::RuntimeStateV1>,
+        mut terminal: ScriptTerminalV1,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        if let Some(state) = state.as_deref_mut() {
+            let checkpoint =
+                crate::orchestration::persist_checkpoint(&self.output.store, state).await?;
+            terminal.final_checkpoint = Some(checkpoint.clone());
+            terminal.receipt_refs = state.receipt_refs.clone();
+            terminal.shape_digest = Some(state.admitted.shape_ref.ledger_digest.clone());
+            terminal.source_digest = Some(state.admitted.source_ref.ledger_digest.clone());
+            let evidence_terminal = terminal.clone();
+            let terminal_ref = crate::orchestration::persist_terminal(
+                &self.output.store,
+                &evidence_terminal,
+                Some(&state.admitted.source_ref),
+            )
+            .await?;
+            terminal.terminal_ref = Some(terminal_ref);
+            let mut events = self.orchestration_extension(
+                ORCHESTRATION_CHECKPOINT_EXTENSION,
+                &format!("{}-final", state.admitted.script_id),
+                serde_json::json!({
+                    "version": 1,
+                    "script_id": state.admitted.script_id,
+                    "next_slot": state.next_slot,
+                    "checkpoint_ref": checkpoint,
+                }),
+            );
+            events.extend(self.orchestration_extension(
+                ORCHESTRATION_TERMINAL_EXTENSION,
+                &state.admitted.script_id,
+                serde_json::to_value(&terminal).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?,
+            ));
+            self.append_orchestration_payloads(run_id, events).await?;
+        } else {
+            let terminal_ref =
+                crate::orchestration::persist_terminal(&self.output.store, &terminal, None).await?;
+            terminal.terminal_ref = Some(terminal_ref);
+            self.append_orchestration_payloads(
+                run_id,
+                self.orchestration_extension(
+                    ORCHESTRATION_TERMINAL_EXTENSION,
+                    &terminal.script_id,
+                    serde_json::to_value(&terminal).map_err(|error| {
+                        HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                    })?,
+                ),
+            )
+            .await?;
+        }
+
+        let returned_limit = state
+            .as_deref()
+            .and_then(|state| state.admitted.limits.returned_bytes)
+            .unwrap_or(haider_protocol::orchestration::ORCHESTRATION_RETURN_DEFAULT_BYTES)
+            as usize;
+        let mut reported = terminal.clone();
+        let mut preview = serde_json::to_string(&reported)
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        if preview.len() > returned_limit {
+            reported.value = None;
+            if reported.reason.is_none() {
+                reported.reason = Some(
+                    "returned value is available through the terminal evidence reference".into(),
+                );
+            }
+            preview = serde_json::to_string(&reported)
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        }
+        let mut effects = Vec::new();
+        let mut images = Vec::new();
+        if let Some(state) = state.as_deref() {
+            for value in state
+                .values
+                .iter()
+                .flatten()
+                .filter_map(|value| value.value())
+            {
+                let Ok(result) = serde_json::from_value::<BoundedResult>(value.clone()) else {
+                    continue;
+                };
+                effects.extend(result.effects);
+                images.extend(result.images);
+            }
+        }
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview,
+            truncated: false,
+            truncation: None,
+            effects,
+            data: None,
+            artifact: terminal
+                .terminal_ref
+                .as_ref()
+                .map(|evidence| evidence.artifact.clone()),
+            images,
+            cursor: None,
+            status: terminal.status.outer_status(),
+            reason: terminal.reason.clone(),
+            presentation: None,
+            orchestration: Some(reported),
+        }))
+    }
+
+    async fn execute_tool_script(
+        &self,
+        run_id: &RunId,
+        item_id: &ItemId,
+        call_id: &str,
+        args: &serde_json::Value,
+        cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        let raw = match args.as_str() {
+            Some(raw) => raw.as_bytes(),
+            None => {
+                return model_tool_argument_failure(ToolError::invalid_argument(
+                    "tool_script requires the exact buffered JSON object",
+                ));
+            }
+        };
+        let script_id = orchestration_script_id(run_id, item_id, call_id);
+        let key = OrchestrationExecutionKey {
+            run_id: run_id.clone(),
+            item_id: item_id.clone(),
+            call_id: call_id.into(),
+        };
+        let mut recovered = false;
+        let in_memory = self.orchestrations.lock().await.remove(&key);
+        let mut state = if let Some(state) = in_memory {
+            state
+        } else if let Some(state) =
+            crate::orchestration::recover_checkpoint(&self.output.store, &script_id).await?
+        {
+            recovered = true;
+            state
+        } else {
+            let admitted_at_ms = unix_time_ms();
+            match crate::orchestration::admit(
+                raw,
+                &orchestration_wrapper_snapshot(),
+                &self.output.store,
+                script_id.clone(),
+                admitted_at_ms,
+            )
+            .await
+            {
+                Ok(mut state) => {
+                    let mut events = self.orchestration_extension(
+                        ORCHESTRATION_SCRIPT_EXTENSION,
+                        &script_id,
+                        serde_json::json!({
+                            "version": 1,
+                            "script_id": script_id,
+                            "run_id": run_id,
+                            "outer_item_id": item_id,
+                            "outer_call_id": call_id,
+                            "request_digest": state.admitted.request_digest,
+                            "shape_ref": state.admitted.shape_ref,
+                            "source_ref": state.admitted.source_ref,
+                        }),
+                    );
+                    let checkpoint =
+                        crate::orchestration::persist_checkpoint(&self.output.store, &mut state)
+                            .await?;
+                    events.extend(self.orchestration_extension(
+                        ORCHESTRATION_CHECKPOINT_EXTENSION,
+                        &format!("{script_id}-initial"),
+                        serde_json::json!({
+                            "version": 1,
+                            "script_id": script_id,
+                            "next_slot": 0,
+                            "checkpoint_ref": checkpoint,
+                        }),
+                    ));
+                    self.append_orchestration_payloads(run_id, events).await?;
+                    state
+                }
+                Err(failure) => {
+                    let terminal = orchestration_rejection(
+                        script_id,
+                        failure.request_digest,
+                        "admission_rejected",
+                        format!("{}: {}", failure.code, failure.message),
+                    );
+                    return self.finish_orchestration(run_id, None, terminal).await;
+                }
+            }
+        };
+
+        if state.admitted.request_digest != haider_protocol::orchestration::request_digest(raw) {
+            let mut terminal = orchestration_terminal(
+                &state,
+                ScriptTerminalStatusV1::Rejected,
+                "resume_request_mismatch",
+                "resumed tool_script bytes do not match the admitted request".into(),
+            );
+            terminal.script_id = script_id;
+            terminal.request_digest = haider_protocol::orchestration::request_digest(raw);
+            return self
+                .finish_orchestration(run_id, Some(&mut state), terminal)
+                .await;
+        }
+
+        if recovered && let Some(pending) = state.pending_call.clone() {
+            match recover_orchestration_child(
+                &self.output.store,
+                run_id,
+                &ItemId::new(pending.item_id.clone()),
+                &pending.call_id,
+            )
+            .await?
+            {
+                RecoveredOrchestrationChild::Completed(result) => {
+                    match result.status {
+                        ToolResultStatus::Completed => {
+                            state.completed_calls = state.completed_calls.saturating_add(1);
+                        }
+                        ToolResultStatus::Rejected => {
+                            state.rejected_calls = state.rejected_calls.saturating_add(1);
+                        }
+                        ToolResultStatus::Unknown => {
+                            state.unknown_calls = state.unknown_calls.saturating_add(1);
+                        }
+                        ToolResultStatus::Failed | ToolResultStatus::Conflict => {
+                            state.failed_calls = state.failed_calls.saturating_add(1);
+                        }
+                        ToolResultStatus::Cancelled => {}
+                    }
+                    self.record_orchestration_call_result(run_id, &mut state, &pending, result)
+                        .await?;
+                }
+                RecoveredOrchestrationChild::SafeToRetry => {}
+                RecoveredOrchestrationChild::Interrupted { unknown } => {
+                    state.unknown_calls = state.unknown_calls.saturating_add(u32::from(unknown));
+                    let status = if unknown {
+                        ScriptTerminalStatusV1::OutcomeUnknown
+                    } else {
+                        ScriptTerminalStatusV1::Interrupted
+                    };
+                    let terminal = orchestration_terminal(
+                        &state,
+                        status,
+                        if unknown {
+                            "effect_outcome_unknown"
+                        } else {
+                            "interrupted_after_effect"
+                        },
+                        "a child crossed its dispatch boundary without a durable orchestration result".into(),
+                    );
+                    return self
+                        .finish_orchestration(run_id, Some(&mut state), terminal)
+                        .await;
+                }
+            }
+        }
+
+        loop {
+            if cancel.is_cancelled() {
+                let terminal = orchestration_terminal(
+                    &state,
+                    ScriptTerminalStatusV1::Cancelled,
+                    "cancelled",
+                    "orchestration was cancelled".into(),
+                );
+                return self
+                    .finish_orchestration(run_id, Some(&mut state), terminal)
+                    .await;
+            }
+            if unix_time_ms().saturating_sub(state.admitted.admitted_at_ms)
+                >= state.admitted.limits.script_wall_ms.unwrap_or(120_000)
+            {
+                let terminal = orchestration_terminal(
+                    &state,
+                    ScriptTerminalStatusV1::TimedOut,
+                    "script_wall_timeout",
+                    "orchestration reached its wall-clock deadline".into(),
+                );
+                return self
+                    .finish_orchestration(run_id, Some(&mut state), terminal)
+                    .await;
+            }
+            let Some(node) = state.admitted.nodes.get(state.next_slot as usize).cloned() else {
+                let terminal = orchestration_terminal(
+                    &state,
+                    ScriptTerminalStatusV1::Failed,
+                    "no_exit",
+                    "orchestration completed its definitions without an active exit".into(),
+                );
+                return self
+                    .finish_orchestration(run_id, Some(&mut state), terminal)
+                    .await;
+            };
+
+            if node.evidence_type == "OrchCallV1" {
+                if !crate::orchestration::active(&node, &state.values) {
+                    state.values[node.slot as usize] =
+                        Some(crate::orchestration::RuntimeValueV1::Inactive);
+                    state.next_slot = state.next_slot.saturating_add(1);
+                    continue;
+                }
+                let args = crate::orchestration::input_value(
+                    &node,
+                    OrchPortRoleV1::Data,
+                    "args",
+                    &state.values,
+                )
+                .cloned()
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "admitted orchestration call arguments are not ready",
+                        false,
+                    )
+                })?;
+                let tool = node.config.0["tool"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let pending = if let Some(pending) = state
+                    .pending_call
+                    .as_ref()
+                    .filter(|pending| pending.slot == node.slot)
+                    .cloned()
+                {
+                    pending
+                } else {
+                    let attempts = state.attempts.entry(node.slot).or_insert(0);
+                    *attempts = attempts.saturating_add(1);
+                    let attempt = *attempts;
+                    let pending = crate::orchestration::PendingCallV1 {
+                        slot: node.slot,
+                        attempt,
+                        item_id: format!(
+                            "orch-call-{}-{}-{attempt}",
+                            state.admitted.script_id, node.slot
+                        ),
+                        call_id: format!(
+                            "orch:{}:{}:{attempt}",
+                            state.admitted.script_id, node.slot
+                        ),
+                        tool: tool.clone(),
+                        args: StrictJson(args.clone()),
+                        started: true,
+                    };
+                    state.pending_call = Some(pending.clone());
+                    let child_item_id = ItemId::new(pending.item_id.clone());
+                    let start = EventPayload::Item(ItemEvent::Started {
+                        item_id: child_item_id,
+                        item: TurnItem::ToolCall {
+                            call_id: pending.call_id.clone(),
+                            name: tool.clone(),
+                            args: args.clone(),
+                            status: haider_protocol::item::ToolStatus::InProgress,
+                        },
+                    });
+                    let mut prefix = vec![start];
+                    prefix.extend(self.orchestration_extension(
+                        ORCHESTRATION_CALL_EXTENSION,
+                        &format!("{}-{}-{attempt}-start", state.admitted.script_id, node.slot),
+                        serde_json::json!({
+                            "version": 1,
+                            "script_id": state.admitted.script_id,
+                            "slot": node.slot,
+                            "attempt": attempt,
+                            "tool": tool,
+                            "item_id": pending.item_id,
+                            "call_id": pending.call_id,
+                            "phase": "started",
+                        }),
+                    ));
+                    self.checkpoint_orchestration(
+                        run_id,
+                        &mut state,
+                        &format!("call-{}-{attempt}-start", node.slot),
+                        prefix,
+                    )
+                    .await?;
+                    pending
+                };
+                let attempt = pending.attempt;
+                let child_item_id = ItemId::new(pending.item_id.clone());
+                let child = Box::pin(self.execute_shared(
+                    run_id,
+                    &child_item_id,
+                    &pending.call_id,
+                    &pending.tool,
+                    Arc::new(args),
+                    cancel,
+                ))
+                .await?;
+                match child {
+                    ToolDispatchResult::ApprovalRequired(menu) => {
+                        self.orchestrations.lock().await.insert(key, state);
+                        return Ok(ToolDispatchResult::ApprovalRequired(menu));
+                    }
+                    ToolDispatchResult::Deferred(_) => {
+                        let terminal = orchestration_terminal(
+                            &state,
+                            ScriptTerminalStatusV1::Rejected,
+                            "deferred_child",
+                            "deferred tools are not script-bindable".into(),
+                        );
+                        return self
+                            .finish_orchestration(run_id, Some(&mut state), terminal)
+                            .await;
+                    }
+                    ToolDispatchResult::Completed(result) => {
+                        let retry_limit = orchestration_retry_limit(&state, &node);
+                        if matches!(
+                            result.status,
+                            ToolResultStatus::Failed | ToolResultStatus::Conflict
+                        ) && attempt < retry_limit
+                        {
+                            state.failed_calls = state.failed_calls.saturating_add(1);
+                            self.record_orchestration_call_result(
+                                run_id, &mut state, &pending, result,
+                            )
+                            .await?;
+                            // Re-run the call slot with a new stable attempt
+                            // identity; the original script deadline is never reset.
+                            state.next_slot = node.slot;
+                            tokio::time::sleep(Duration::from_millis(if attempt == 1 {
+                                100
+                            } else {
+                                200
+                            }))
+                            .await;
+                            continue;
+                        }
+                        match result.status {
+                            ToolResultStatus::Rejected => {
+                                state.rejected_calls = state.rejected_calls.saturating_add(1);
+                                self.record_orchestration_call_result(
+                                    run_id, &mut state, &pending, result,
+                                )
+                                .await?;
+                                let terminal = orchestration_terminal(
+                                    &state,
+                                    ScriptTerminalStatusV1::Rejected,
+                                    "child_rejected",
+                                    "a child tool call was rejected".into(),
+                                );
+                                return self
+                                    .finish_orchestration(run_id, Some(&mut state), terminal)
+                                    .await;
+                            }
+                            ToolResultStatus::Cancelled => {
+                                self.record_orchestration_call_result(
+                                    run_id, &mut state, &pending, result,
+                                )
+                                .await?;
+                                let terminal = orchestration_terminal(
+                                    &state,
+                                    ScriptTerminalStatusV1::Cancelled,
+                                    "child_cancelled",
+                                    "a child tool call was cancelled".into(),
+                                );
+                                return self
+                                    .finish_orchestration(run_id, Some(&mut state), terminal)
+                                    .await;
+                            }
+                            ToolResultStatus::Unknown => {
+                                state.unknown_calls = state.unknown_calls.saturating_add(1);
+                                self.record_orchestration_call_result(
+                                    run_id, &mut state, &pending, result,
+                                )
+                                .await?;
+                                let terminal = orchestration_terminal(
+                                    &state,
+                                    ScriptTerminalStatusV1::OutcomeUnknown,
+                                    "effect_outcome_unknown",
+                                    "a child tool call has an unknown outcome".into(),
+                                );
+                                return self
+                                    .finish_orchestration(run_id, Some(&mut state), terminal)
+                                    .await;
+                            }
+                            ToolResultStatus::Completed => {
+                                state.completed_calls = state.completed_calls.saturating_add(1);
+                            }
+                            ToolResultStatus::Failed | ToolResultStatus::Conflict => {
+                                state.failed_calls = state.failed_calls.saturating_add(1);
+                            }
+                        }
+                        self.record_orchestration_call_result(run_id, &mut state, &pending, result)
+                            .await?;
+                    }
+                }
+                continue;
+            }
+
+            if node.evidence_type == "OrchAwaitV1"
+                && crate::orchestration::active(&node, &state.values)
+            {
+                let child = crate::orchestration::input_value(
+                    &node,
+                    OrchPortRoleV1::Data,
+                    "operation",
+                    &state.values,
+                );
+                let child_status = child
+                    .and_then(|value| serde_json::from_value::<BoundedResult>(value.clone()).ok())
+                    .map(|result| result.status);
+                let catches = node
+                    .config
+                    .0
+                    .get("on_error")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("value");
+                if child_status.is_some_and(|status| !status.is_completed()) && !catches {
+                    let terminal = orchestration_terminal(
+                        &state,
+                        ScriptTerminalStatusV1::Failed,
+                        "child_failed",
+                        "a child tool call failed and its Await uses on_error=stop".into(),
+                    );
+                    return self
+                        .finish_orchestration(run_id, Some(&mut state), terminal)
+                        .await;
+                }
+            }
+
+            let value = match crate::orchestration::evaluate_pure(
+                &node,
+                &state.values,
+                &state.admitted.inputs,
+            ) {
+                Ok(value) => value,
+                Err(reason) => {
+                    let terminal = orchestration_terminal(
+                        &state,
+                        ScriptTerminalStatusV1::Failed,
+                        "evaluation_failed",
+                        reason,
+                    );
+                    return self
+                        .finish_orchestration(run_id, Some(&mut state), terminal)
+                        .await;
+                }
+            };
+            let is_inactive = matches!(value, crate::orchestration::RuntimeValueV1::Inactive);
+            state.values[node.slot as usize] = Some(value);
+            state.next_slot = state.next_slot.saturating_add(1);
+            if is_inactive {
+                continue;
+            }
+            if node.evidence_type == "OrchExitV1" {
+                let mode = node.config.0["mode"].as_str().unwrap_or("fail");
+                let status = match mode {
+                    "return" => ScriptTerminalStatusV1::Completed,
+                    "need_model" => ScriptTerminalStatusV1::NeedsModel,
+                    _ => ScriptTerminalStatusV1::Failed,
+                };
+                let value = state.values[node.slot as usize]
+                    .as_ref()
+                    .and_then(crate::orchestration::RuntimeValueV1::value)
+                    .cloned()
+                    .map(StrictJson);
+                let mut terminal = orchestration_terminal(
+                    &state,
+                    status,
+                    if mode == "fail" {
+                        "script_fail"
+                    } else {
+                        "exit"
+                    },
+                    if mode == "fail" {
+                        "orchestration selected a fail exit".into()
+                    } else {
+                        String::new()
+                    },
+                );
+                terminal.selected_exit = Some(node.slot);
+                terminal.value = value;
+                return self
+                    .finish_orchestration(run_id, Some(&mut state), terminal)
+                    .await;
+            }
+            if state.next_slot % 16 == 0 {
+                self.checkpoint_orchestration(
+                    run_id,
+                    &mut state,
+                    &format!("slot-{}", node.slot),
+                    Vec::new(),
+                )
+                .await?;
+            }
+        }
+    }
+
+    async fn record_orchestration_call_result(
+        &self,
+        run_id: &RunId,
+        state: &mut crate::orchestration::RuntimeStateV1,
+        pending: &crate::orchestration::PendingCallV1,
+        result: BoundedResult,
+    ) -> Result<(), HaiderError> {
+        let payload = serde_json::json!({
+            "version": 1,
+            "script_id": state.admitted.script_id,
+            "slot": pending.slot,
+            "attempt": pending.attempt,
+            "tool": pending.tool,
+            "call_id": pending.call_id,
+            "result": result,
+        });
+        let (receipt, _) = crate::orchestration::put_evidence(
+            &self.output.store,
+            "OrchResultV1",
+            &payload,
+            vec![
+                state.admitted.definition_refs[pending.slot as usize]
+                    .artifact
+                    .clone(),
+            ],
+        )
+        .await?;
+        state.receipt_refs.push(receipt.clone());
+        state.values[pending.slot as usize] = Some(crate::orchestration::RuntimeValueV1::Ready {
+            value: StrictJson(serde_json::to_value(&result).map_err(|error| {
+                HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+            })?),
+        });
+        state.next_slot = pending.slot.saturating_add(1);
+        state.pending_call = None;
+        let completed_item = TurnItem::ToolCall {
+            call_id: pending.call_id.clone(),
+            name: pending.tool.clone(),
+            args: pending.args.0.clone(),
+            status: result.status.item_status(),
+        };
+        let mut prefix = vec![
+            EventPayload::ToolResult {
+                call_id: pending.call_id.clone(),
+                result,
+            },
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(pending.item_id.clone()),
+                item: completed_item,
+            }),
+        ];
+        prefix.extend(self.orchestration_extension(
+            ORCHESTRATION_CALL_EXTENSION,
+            &format!(
+                "{}-{}-{}-done",
+                state.admitted.script_id, pending.slot, pending.attempt
+            ),
+            serde_json::json!({
+                "version": 1,
+                "script_id": state.admitted.script_id,
+                "slot": pending.slot,
+                "attempt": pending.attempt,
+                "tool": pending.tool,
+                "item_id": pending.item_id,
+                "call_id": pending.call_id,
+                "phase": "completed",
+                "receipt_ref": receipt,
+            }),
+        ));
+        self.checkpoint_orchestration(
+            run_id,
+            state,
+            &format!("call-{}-{}-done", pending.slot, pending.attempt),
+            prefix,
+        )
+        .await
+    }
+}
+
+fn orchestration_script_id(run_id: &RunId, item_id: &ItemId, call_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider/orchestration/script/v1\0");
+    for value in [run_id.as_str(), item_id.as_str(), call_id] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("script-{}", &hasher.finalize().to_hex()[..32])
+}
+
+fn orchestration_counts(state: &crate::orchestration::RuntimeStateV1) -> ScriptCountsV1 {
+    let inactive = state
+        .values
+        .iter()
+        .flatten()
+        .filter(|value| matches!(value, crate::orchestration::RuntimeValueV1::Inactive))
+        .count() as u32;
+    ScriptCountsV1 {
+        calls: state.attempts.len() as u32,
+        attempts: state
+            .attempts
+            .values()
+            .map(|attempts| u32::from(*attempts))
+            .sum(),
+        completed: state.completed_calls,
+        failed: state.failed_calls,
+        rejected: state.rejected_calls,
+        cancelled: 0,
+        unknown: state.unknown_calls,
+        inactive,
+        skipped: state.values.iter().filter(|value| value.is_none()).count() as u32,
+        unresolved_guard: 0,
+    }
+}
+
+fn orchestration_terminal(
+    state: &crate::orchestration::RuntimeStateV1,
+    status: ScriptTerminalStatusV1,
+    reason_code: &str,
+    reason: String,
+) -> ScriptTerminalV1 {
+    ScriptTerminalV1 {
+        version: 1,
+        script_id: state.admitted.script_id.clone(),
+        status,
+        request_digest: state.admitted.request_digest.clone(),
+        shape_digest: None,
+        source_digest: None,
+        final_checkpoint: None,
+        terminal_ref: None,
+        selected_exit: None,
+        value: None,
+        reason_code: Some(reason_code.into()),
+        reason: (!reason.is_empty()).then_some(reason),
+        counts: orchestration_counts(state),
+        receipt_refs: Vec::new(),
+        started_at_ms: state.admitted.admitted_at_ms,
+        finished_at_ms: unix_time_ms(),
+    }
+}
+
+fn orchestration_rejection(
+    script_id: String,
+    request_digest: String,
+    reason_code: &str,
+    reason: String,
+) -> ScriptTerminalV1 {
+    let now = unix_time_ms();
+    ScriptTerminalV1 {
+        version: 1,
+        script_id,
+        status: ScriptTerminalStatusV1::Rejected,
+        request_digest,
+        shape_digest: None,
+        source_digest: None,
+        final_checkpoint: None,
+        terminal_ref: None,
+        selected_exit: None,
+        value: None,
+        reason_code: Some(reason_code.into()),
+        reason: Some(reason),
+        counts: ScriptCountsV1::default(),
+        receipt_refs: Vec::new(),
+        started_at_ms: now,
+        finished_at_ms: now,
+    }
+}
+
+fn orchestration_retry_limit(
+    state: &crate::orchestration::RuntimeStateV1,
+    call: &haider_protocol::orchestration::InlineNodeV1,
+) -> u8 {
+    call.ports
+        .iter()
+        .find(|port| port.role == OrchPortRoleV1::Config && port.port == "retry")
+        .and_then(|port| state.admitted.nodes.get(port.source_slot as usize))
+        .and_then(|retry| retry.config.0.get("max_attempts"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|attempts| u8::try_from(attempts).ok())
+        .unwrap_or(1)
+}
+
+enum RecoveredOrchestrationChild {
+    Completed(BoundedResult),
+    SafeToRetry,
+    Interrupted { unknown: bool },
+}
+
+async fn recover_orchestration_child(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+    item_id: &ItemId,
+    call_id: &str,
+) -> Result<RecoveredOrchestrationChild, HaiderError> {
+    let mut cursor = 0;
+    let mut inside = false;
+    let mut phases = HashMap::<EffectId, (bool, bool)>::new();
+    let mut completed = None;
+    loop {
+        let page = StoreHandle::read_reducer_page_with_boundary(
+            store,
+            store.session_id(),
+            cursor,
+            1_024,
+            4 * 1_024 * 1_024,
+            &["item", "tool_result", "effect"],
+        )
+        .await?
+        .envelopes;
+        if page.is_empty() {
+            break;
+        }
+        for envelope in page {
+            cursor = envelope.seq;
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let Ok(payload) = envelope.payload.decode_event() else {
+                continue;
+            };
+            if matches!(
+                &payload,
+                EventPayload::Item(ItemEvent::Started { item_id: started, .. }) if started == item_id
+            ) {
+                inside = true;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            match payload {
+                EventPayload::ToolResult {
+                    call_id: completed_call,
+                    result,
+                } if completed_call == call_id => completed = Some(result),
+                EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                    phases.entry(intent.effect).or_insert((false, false));
+                }
+                EventPayload::Effect(EffectPhase::Dispatched { effect }) => {
+                    phases.entry(effect).or_insert((false, false)).0 = true;
+                }
+                EventPayload::Effect(EffectPhase::Outcome { effect, .. }) => {
+                    phases.entry(effect).or_insert((false, false)).1 = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(result) = completed {
+        return Ok(RecoveredOrchestrationChild::Completed(result));
+    }
+    let dispatched = phases.values().filter(|phase| phase.0).collect::<Vec<_>>();
+    if dispatched.is_empty() {
+        Ok(RecoveredOrchestrationChild::SafeToRetry)
+    } else {
+        Ok(RecoveredOrchestrationChild::Interrupted {
+            unknown: dispatched.iter().any(|phase| !phase.1),
+        })
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
     fn platform_tool_supported(&self, name: &str) -> bool {
@@ -18696,6 +19828,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 )));
             }
         };
+        // The wrapper is an interpreter only. Each child re-enters this same
+        // dispatcher below, so no second executor or batched authorization
+        // path can emerge beside the existing effect broker.
+        if route == RegisteredToolRoute::ToolScript {
+            return self
+                .execute_tool_script(run_id, item_id, call_id, args.as_ref(), cancel)
+                .await;
+        }
         if self
             .metadata
             .permission_overrides
@@ -21413,6 +22553,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::ListTools
+            | RegisteredToolRoute::ToolScript
             | RegisteredToolRoute::Plan
             | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::TaskOutcome

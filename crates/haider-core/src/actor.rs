@@ -83,6 +83,11 @@ use haider_protocol::item::{ItemDelta, ItemEvent, ToolArgumentsFinalizedV1, Tool
 use haider_protocol::menu::{
     ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
+use haider_protocol::orchestration::{
+    ORCHESTRATION_RAW_MAX_BYTES, ORCHESTRATION_TRANSPORT, OrchestrationGraphModeV1,
+    OrchestrationRequestAttributionV1, ScriptCountsV1, ScriptTerminalStatusV1, ScriptTerminalV1,
+    request_digest as orchestration_request_digest,
+};
 use haider_protocol::peer::PeerMessage;
 use haider_protocol::provider::{
     AccountUsage, Block, CacheBreakpointHashesV1, CacheBreakpointV1, CacheControlObservationV1,
@@ -3386,6 +3391,8 @@ impl HarnessActor {
                     item_id: tool.item_id.clone(),
                     call_id: tool.call_id.clone(),
                     name: tool.name.clone(),
+                    raw_args_bytes: u64::try_from(tool.args.len()).unwrap_or(u64::MAX),
+                    args_overflowed: tool.args.len() > ORCHESTRATION_RAW_MAX_BYTES,
                     args: tool.args.clone(),
                     requested_name: recovered_names.remove(&tool.call_id),
                     parsed_args: OnceLock::new(),
@@ -3441,6 +3448,8 @@ impl HarnessActor {
                 item_id: checkpoint.tool_item_id.clone(),
                 call_id: checkpoint.call_id.clone(),
                 name: checkpoint.tool_name.clone(),
+                raw_args_bytes: u64::try_from(checkpoint.args.len()).unwrap_or(u64::MAX),
+                args_overflowed: checkpoint.args.len() > ORCHESTRATION_RAW_MAX_BYTES,
                 args: checkpoint.args.clone(),
                 requested_name: recovered_names.remove(&checkpoint.call_id),
                 parsed_args: OnceLock::new(),
@@ -3555,6 +3564,8 @@ impl HarnessActor {
                     item_id: checkpoint.tool_item_id,
                     call_id: checkpoint.call_id.clone(),
                     name: checkpoint.tool_name,
+                    raw_args_bytes: u64::try_from(checkpoint.args.len()).unwrap_or(u64::MAX),
+                    args_overflowed: checkpoint.args.len() > ORCHESTRATION_RAW_MAX_BYTES,
                     args: checkpoint.args,
                     requested_name: recovered_names.remove(&checkpoint.call_id),
                     parsed_args: OnceLock::new(),
@@ -3781,6 +3792,11 @@ impl HarnessActor {
             })
         };
         let mut tool_results = Vec::new();
+        // `tool_script` is the one local tool whose streamed arguments are
+        // never executable at ToolCallEnd. The provider must first terminate
+        // the complete response, proving that this is the sole call and that
+        // no later argument prefix or sibling can alter admission.
+        let mut buffered_script_calls = Vec::<String>::new();
         let mut refusal_reason = replay.refusal.clone();
         if let Some(checkpoint) = route_wait.as_ref() {
             let mut completed_tools = checkpoint
@@ -5969,7 +5985,13 @@ impl HarnessActor {
                                     malformed_tool_pending_repair = false;
                                 }
                                 assistant_blocks.push(block);
-                                if !self.pending_subturns.is_empty() {
+                                let is_script = tools.iter().any(|tool| {
+                                    tool.call_id == call_id && tool.name == "tool_script"
+                                });
+                                if is_script {
+                                    buffered_script_calls.push(call_id);
+                                    Ok(None)
+                                } else if !self.pending_subturns.is_empty() {
                                     // A prior call in this same response may already
                                     // have executed, or be awaiting its deferred result.
                                     // Preserve those results before holding the new call.
@@ -6071,70 +6093,71 @@ impl HarnessActor {
                                     assistant_blocks.clear();
                                     tool_results.clear();
                                     continue 'requests;
-                                }
-                                match self
-                                    .complete_tool(
-                                        &run_id,
-                                        &mut tools,
-                                        &mut deferred,
-                                        &call_id,
-                                        &cancel,
-                                    )
-                                    .await
-                                {
-                                    Ok(CompletedTool::Continue(message)) => Ok(message),
-                                    Ok(CompletedTool::TaskOutcome(tool, outcome)) => {
-                                        // Keep the open call available to ordinary error/cancel
-                                        // cleanup until its acceptance and terminal are durable.
-                                        tools.push(tool);
-                                        let preparation = async {
-                                            self.commit_pending_usage(
-                                                &run_id,
-                                                &mut pending_usage_commit,
-                                            )
-                                            .await?;
-                                            self.complete_text(&run_id, &mut message, false)
-                                                .await?;
-                                            self.complete_text(&run_id, &mut reasoning, true)
-                                                .await?;
-                                            release_provider_budget_request(
-                                                self.config.provider_budget_guard.as_ref(),
-                                                &run_id,
-                                                &self.config.usage_scope.provider,
-                                                &self.config.model,
-                                                request_usage.is_some(),
-                                                &mut provider_budget_permit,
-                                            )
-                                            .await?;
-                                            if let Some(error) =
-                                                self.latched_terminal_failure().await
-                                            {
-                                                return Err(DriveError::Store(error));
-                                            }
-                                            if cancel.is_cancelled() {
-                                                return Err(DriveError::Cancelled);
-                                            }
-                                            self.finish_task_outcome(
-                                                &run_id, &tools[0], &outcome, &cancel,
-                                            )
-                                            .await
-                                        }
-                                        .await;
-                                        return match preparation {
-                                            Ok(outcome) => outcome,
-                                            Err(error) => {
-                                                self.drive_error_outcome_with_items(
+                                } else {
+                                    match self
+                                        .complete_tool(
+                                            &run_id,
+                                            &mut tools,
+                                            &mut deferred,
+                                            &call_id,
+                                            &cancel,
+                                        )
+                                        .await
+                                    {
+                                        Ok(CompletedTool::Continue(message)) => Ok(message),
+                                        Ok(CompletedTool::TaskOutcome(tool, outcome)) => {
+                                            // Keep the open call available to ordinary error/cancel
+                                            // cleanup until its acceptance and terminal are durable.
+                                            tools.push(tool);
+                                            let preparation = async {
+                                                self.commit_pending_usage(
                                                     &run_id,
-                                                    &mut message,
-                                                    &mut reasoning,
-                                                    &mut tools,
-                                                    error,
+                                                    &mut pending_usage_commit,
+                                                )
+                                                .await?;
+                                                self.complete_text(&run_id, &mut message, false)
+                                                    .await?;
+                                                self.complete_text(&run_id, &mut reasoning, true)
+                                                    .await?;
+                                                release_provider_budget_request(
+                                                    self.config.provider_budget_guard.as_ref(),
+                                                    &run_id,
+                                                    &self.config.usage_scope.provider,
+                                                    &self.config.model,
+                                                    request_usage.is_some(),
+                                                    &mut provider_budget_permit,
+                                                )
+                                                .await?;
+                                                if let Some(error) =
+                                                    self.latched_terminal_failure().await
+                                                {
+                                                    return Err(DriveError::Store(error));
+                                                }
+                                                if cancel.is_cancelled() {
+                                                    return Err(DriveError::Cancelled);
+                                                }
+                                                self.finish_task_outcome(
+                                                    &run_id, &tools[0], &outcome, &cancel,
                                                 )
                                                 .await
                                             }
-                                        };
+                                            .await;
+                                            return match preparation {
+                                                Ok(outcome) => outcome,
+                                                Err(error) => {
+                                                    self.drive_error_outcome_with_items(
+                                                        &run_id,
+                                                        &mut message,
+                                                        &mut reasoning,
+                                                        &mut tools,
+                                                        error,
+                                                    )
+                                                    .await
+                                                }
+                                            };
+                                        }
+                                        Err(error) => Err(error),
                                     }
-                                    Err(error) => Err(error),
                                 }
                             }
                             Err(DriveError::Provider(error))
@@ -6382,6 +6405,43 @@ impl HarnessActor {
                         // own idle interval; transport retries above do not.
                         operation_idle = haider_provider::ProviderIdleDeadline::default();
                         self.provider_finish_reason = Some(reason);
+                        if let Some(call_id) = buffered_script_calls.first()
+                            && let Some(tool) = tools.iter().find(|tool| &tool.call_id == call_id)
+                        {
+                            let graph_mode = serde_json::from_str::<serde_json::Value>(&tool.args)
+                                .ok()
+                                .and_then(|value| {
+                                    value
+                                        .get("graph")
+                                        .and_then(|graph| graph.get("kind"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(|kind| {
+                                            if kind == "ref" {
+                                                OrchestrationGraphModeV1::Ref
+                                            } else {
+                                                OrchestrationGraphModeV1::Inline
+                                            }
+                                        })
+                                })
+                                .unwrap_or(OrchestrationGraphModeV1::Inline);
+                            let attribution = OrchestrationRequestAttributionV1 {
+                                transport: ORCHESTRATION_TRANSPORT.into(),
+                                generated_source_bytes: tool.raw_args_bytes,
+                                generated_source_tokens: tool.raw_args_bytes.saturating_add(3) / 4,
+                                graph_mode,
+                                cold_schema_discovery: false,
+                            };
+                            if let Some(usage) = request_usage.as_mut()
+                                && let Some(request) = usage.request.as_mut()
+                            {
+                                request.orchestration = Some(attribution.clone());
+                            }
+                            if let Some(pending) = pending_usage_commit.as_mut()
+                                && let Some(request) = pending.usage.request.as_mut()
+                            {
+                                request.orchestration = Some(attribution);
+                            }
+                        }
                         if let (Some(trace), Some(started)) =
                             (&self.config.turn_trace, provider_stream_started)
                         {
@@ -6513,6 +6573,83 @@ impl HarnessActor {
                                         error,
                                     )
                                     .await;
+                            }
+                        }
+                        if !buffered_script_calls.is_empty() {
+                            let local_call_count = assistant_blocks
+                                .iter()
+                                .filter(|block| matches!(block, Block::ToolCall { .. }))
+                                .count();
+                            let lifecycle_valid = reason == FinishReason::ToolUse
+                                && buffered_script_calls.len() == 1
+                                && local_call_count == 1
+                                && deferred.is_empty()
+                                && server_calls.is_empty()
+                                && self.pending_subturns.is_empty();
+                            for call_id in std::mem::take(&mut buffered_script_calls) {
+                                let overflowed = tools
+                                    .iter()
+                                    .find(|tool| tool.call_id == call_id)
+                                    .is_some_and(|tool| tool.args_overflowed);
+                                let completed = if lifecycle_valid && !overflowed {
+                                    self.complete_tool(
+                                        &run_id,
+                                        &mut tools,
+                                        &mut deferred,
+                                        &call_id,
+                                        &cancel,
+                                    )
+                                    .await
+                                } else {
+                                    let (code, reason) = if overflowed {
+                                        (
+                                            "submission_size",
+                                            "tool_script arguments exceed the 128 KiB hard limit",
+                                        )
+                                    } else {
+                                        (
+                                            "orchestration_lifecycle",
+                                            "tool_script must be the sole tool call in a provider response, with no outstanding deferred or server-tool work",
+                                        )
+                                    };
+                                    self.reject_buffered_script(
+                                        &run_id, &mut tools, &call_id, code, reason,
+                                    )
+                                    .await
+                                    .map(|message| CompletedTool::Continue(Some(message)))
+                                };
+                                match completed {
+                                    Ok(CompletedTool::Continue(Some(result))) => {
+                                        tool_results.push(result)
+                                    }
+                                    Ok(CompletedTool::Continue(None)) => {}
+                                    Ok(CompletedTool::TaskOutcome(_, _)) => {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                DriveError::Store(HaiderError::new(
+                                                    ErrorCode::Internal,
+                                                    "tool_script resolved as task_outcome",
+                                                    false,
+                                                )),
+                                            )
+                                            .await;
+                                    }
+                                    Err(error) => {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                }
                             }
                         }
                         if !post_stream_batch
@@ -8511,6 +8648,8 @@ impl HarnessActor {
             call_id,
             name,
             args: String::new(),
+            raw_args_bytes: 0,
+            args_overflowed: false,
             requested_name,
             parsed_args: OnceLock::new(),
         });
@@ -8530,19 +8669,110 @@ impl HarnessActor {
             ))));
         };
         let _ = tool.parsed_args.take();
-        tool.args.push_str(&args_fragment);
+        tool.raw_args_bytes = tool
+            .raw_args_bytes
+            .saturating_add(u64::try_from(args_fragment.len()).unwrap_or(u64::MAX));
+        let stored_fragment = if tool.name == "tool_script" {
+            let remaining = ORCHESTRATION_RAW_MAX_BYTES.saturating_sub(tool.args.len());
+            if args_fragment.len() > remaining {
+                tool.args_overflowed = true;
+            }
+            let boundary = args_fragment
+                .char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= remaining)
+                .last()
+                .unwrap_or(0);
+            let boundary = if args_fragment.len() <= remaining {
+                args_fragment.len()
+            } else {
+                boundary
+            };
+            args_fragment[..boundary].to_owned()
+        } else {
+            args_fragment
+        };
+        tool.args.push_str(&stored_fragment);
         self.commit_item(
             run_id,
             ItemEvent::Delta {
                 item_id: tool.item_id.clone(),
                 delta: ItemDelta::ToolArgs {
-                    fragment: args_fragment,
+                    fragment: stored_fragment,
                 },
             },
         )
         .await
         .map_err(DriveError::Store)?;
         Ok(())
+    }
+
+    async fn reject_buffered_script(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        call_id: &str,
+        code: &str,
+        reason: &str,
+    ) -> Result<Message, DriveError> {
+        let index = tools
+            .iter()
+            .position(|tool| tool.call_id == call_id)
+            .ok_or_else(|| {
+                DriveError::Provider(provider_protocol_error(format!(
+                    "provider ended unknown tool call `{call_id}`",
+                )))
+            })?;
+        let now = unix_time_ms();
+        let request_digest = orchestration_request_digest(tools[index].args.as_bytes());
+        let terminal = ScriptTerminalV1 {
+            version: 1,
+            script_id: format!("rejected-{request_digest}"),
+            status: ScriptTerminalStatusV1::Rejected,
+            request_digest,
+            shape_digest: None,
+            source_digest: None,
+            final_checkpoint: None,
+            terminal_ref: None,
+            selected_exit: None,
+            value: None,
+            reason_code: Some(code.into()),
+            reason: Some(reason.into()),
+            counts: ScriptCountsV1::default(),
+            receipt_refs: Vec::new(),
+            started_at_ms: now,
+            finished_at_ms: now,
+        };
+        let result = BoundedResult {
+            preview: serde_json::to_string(&terminal).map_err(|error| {
+                DriveError::Store(HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot encode orchestration rejection: {error}"),
+                    false,
+                ))
+            })?,
+            truncated: false,
+            truncation: None,
+            effects: Vec::new(),
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: ToolResultStatus::Rejected,
+            reason: Some(reason.into()),
+            presentation: Some(tool_error_presentation(
+                code,
+                "Orchestration rejected",
+                reason,
+            )),
+            orchestration: Some(terminal),
+        };
+        let result = tools[index].correct_result(result);
+        let call_id = tools[index].call_id.clone();
+        self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
+            .await?;
+        tools.remove(index);
+        Ok(Message::tool_result(call_id, result.preview, false))
     }
 
     /// Closes a provider-authored tool call whose streamed argument buffer is
@@ -8622,12 +8852,18 @@ impl HarnessActor {
             ))));
         };
         // This is the single arguments-finalization boundary for every tool
-        // path. The JSON object is complete and structurally valid here, but
-        // no actor-owned action, dispatcher preflight, approval card, broker
-        // receipt, refusal, or external effect has begun. Keep execution on
-        // the raw in-memory object while publishing only its consumer-redacted
-        // display copy.
-        let args = parse_tool_args(&tools[index])?;
+        // path. Ordinary JSON arguments are complete and structurally valid
+        // here. `tool_script` instead retains the exact UTF-8 source in a JSON
+        // string so its stricter parser can still reject duplicate object
+        // keys. No actor-owned action, dispatcher preflight, approval card,
+        // broker receipt, refusal, or external effect has begun. Keep
+        // execution on the raw in-memory value while publishing only its
+        // consumer-redacted display copy.
+        let args = if tools[index].name == "tool_script" {
+            Arc::new(serde_json::Value::String(tools[index].args.clone()))
+        } else {
+            parse_tool_args(&tools[index])?
+        };
         let display_args = self
             .commit_tool_arguments_finalized(run_id, &tools[index], args.as_ref())
             .await?;
@@ -12655,6 +12891,8 @@ struct ToolAccumulator {
     call_id: String,
     name: String,
     args: String,
+    raw_args_bytes: u64,
+    args_overflowed: bool,
     requested_name: Option<String>,
     parsed_args: OnceLock<Result<Arc<serde_json::Value>, String>>,
 }
@@ -15314,6 +15552,8 @@ mod cu1_actor_tests {
             call_id: "call-malformed-args".into(),
             name: "shell".into(),
             args: r#"{"command":"#.into(),
+            raw_args_bytes: 12,
+            args_overflowed: false,
             requested_name: None,
             parsed_args: OnceLock::new(),
         };
@@ -15340,6 +15580,8 @@ mod cu1_actor_tests {
             call_id: "call-cached-args".into(),
             name: "shell".into(),
             args: r#"{"command":"pwd","nested":{"limit":2}}"#.into(),
+            raw_args_bytes: 38,
+            args_overflowed: false,
             requested_name: None,
             parsed_args: OnceLock::new(),
         };
