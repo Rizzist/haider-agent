@@ -52,6 +52,7 @@ L20_PROMPT = (
     "array containing each path and its full content. Do not modify files."
 )
 E8_PROMPT = "Complete the standardized AHRB harness-economy task exactly as scripted."
+INTER_SAMPLE_COOLDOWN_SECONDS = 2.0
 
 
 def canonical(value: Any) -> bytes:
@@ -1464,6 +1465,10 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
                                     sample_ordinal,
                                     False,
                                 )
+                                # Keep process churn from becoming its own
+                                # sustained machine load. This pause is outside
+                                # the timed sample and is disclosed below.
+                                time.sleep(INTER_SAMPLE_COOLDOWN_SECONDS)
                     measured: list[dict[str, Any]] = []
                     for arm in paired_schedule(left, right):
                         ensure_quiet(args)
@@ -1481,6 +1486,7 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
                         )
                         raw_samples.append(row)
                         measured.append(row)
+                        time.sleep(INTER_SAMPLE_COOLDOWN_SECONDS)
                     comparison_row = comparison_summary(
                         f"{fixture}-{delay}ms-{comparison}", measured
                     )
@@ -1503,6 +1509,7 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
             "measured_blocks": 5,
             "block_order": ["left", "right", "right", "left"],
             "delays_ms": [0, 100],
+            "inter_sample_cooldown_seconds": INTER_SAMPLE_COOLDOWN_SECONDS,
             "quiet_grant": str(args.quiet_grant),
             "quiet_grant_mtime_ns": args.quiet_grant.stat().st_mtime_ns,
             "quiet_request": str(args.quiet_request),
