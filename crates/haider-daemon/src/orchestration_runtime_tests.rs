@@ -25,6 +25,90 @@ enum CrashBoundary {
     ToolResult,
 }
 
+fn pending_interaction(action: &str) -> crate::orchestration::PendingCallV1 {
+    crate::orchestration::PendingCallV1 {
+        slot: 0,
+        attempt: 1,
+        item_id: "interaction-item".into(),
+        call_id: "interaction-call".into(),
+        tool: "mobile".into(),
+        args: StrictJson(serde_json::json!({"action": action, "x": 1, "y": 1})),
+        activation_ref: haider_protocol::pipe::InstructEvidenceRef::new(
+            haider_protocol::ids::ArtifactRef::new(format!("blake3:{}", "a".repeat(64))),
+            "OrchActivationV1",
+            1,
+            vec![],
+        ),
+        started_at_ms: 1,
+        deadline_ms: 2,
+        started: true,
+        approval_waiting: true,
+    }
+}
+
+fn screenshot_result(byte_len: u64) -> BoundedResult {
+    BoundedResult {
+        preview: "screenshot".into(),
+        truncated: false,
+        truncation: None,
+        effects: Vec::new(),
+        data: None,
+        artifact: None,
+        images: vec![ImageBlockRef {
+            artifact: haider_protocol::ids::ArtifactRef::new(format!("blake3:{}", "b".repeat(64))),
+            media_type: "image/png".into(),
+            width: 1,
+            height: 1,
+            byte_len,
+        }],
+        cursor: None,
+        status: ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+        orchestration: None,
+    }
+}
+
+#[test]
+fn stale_interaction_observation_rejects_control_before_dispatch() {
+    let stale = stale_interaction_control_result(&pending_interaction("tap"), true)
+        .expect("stale control must fail closed");
+    assert_eq!(stale.status, ToolResultStatus::Failed);
+    assert!(stale.images.is_empty());
+    assert!(stale_interaction_control_result(&pending_interaction("tap"), false).is_none());
+    assert!(stale_interaction_control_result(&pending_interaction("screenshot"), true).is_none());
+}
+
+#[test]
+fn orchestration_screenshot_retention_caps_exact_encoded_bytes() {
+    let mut count = 0;
+    let mut bytes = 0;
+    let mut exact =
+        screenshot_result(haider_protocol::orchestration::ORCHESTRATION_SCREENSHOT_BYTES_MAX);
+    assert!(bound_orchestration_screenshot_retention(
+        &mut count, &mut bytes, &mut exact,
+    ));
+    assert_eq!(count, 1);
+    assert_eq!(
+        bytes,
+        haider_protocol::orchestration::ORCHESTRATION_SCREENSHOT_BYTES_MAX
+    );
+
+    let mut overflow = screenshot_result(1);
+    assert!(!bound_orchestration_screenshot_retention(
+        &mut count,
+        &mut bytes,
+        &mut overflow,
+    ));
+    assert_eq!(count, 1);
+    assert_eq!(
+        bytes,
+        haider_protocol::orchestration::ORCHESTRATION_SCREENSHOT_BYTES_MAX
+    );
+    assert_eq!(overflow.status, ToolResultStatus::Failed);
+    assert!(overflow.images.is_empty());
+}
+
 #[test]
 fn orchestration_catalog_matches_initial_profile_and_durable_promotions() {
     let dependencies = DaemonDependencies::default()

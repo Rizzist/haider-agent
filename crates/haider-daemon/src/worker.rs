@@ -19275,8 +19275,16 @@ impl BrokerToolDispatcher {
         &self,
         run_id: &RunId,
         pending: &crate::orchestration::PendingCallV1,
+        interaction_observation_invalidated: bool,
         cancel: &CancelToken,
     ) -> Result<OrchestrationChildDispatch, HaiderError> {
+        if let Some(result) =
+            stale_interaction_control_result(pending, interaction_observation_invalidated)
+        {
+            return Ok(OrchestrationChildDispatch::Settled(
+                ToolDispatchResult::Completed(result),
+            ));
+        }
         let remaining_ms = pending.deadline_ms.saturating_sub(unix_time_ms());
         if remaining_ms == 0 {
             return Ok(OrchestrationChildDispatch::Interrupted {
@@ -19345,7 +19353,7 @@ impl BrokerToolDispatcher {
         mut outcome_unknown: bool,
     ) -> Result<OrchestrationTerminalReason, HaiderError> {
         if let Some(ToolDispatchResult::Completed(mut result)) = settled {
-            bound_orchestration_screenshot_retention(state, pending, &mut result);
+            account_orchestration_interaction_result(state, pending, &mut result);
             outcome_unknown |= result.status == ToolResultStatus::Unknown;
             match result.status {
                 ToolResultStatus::Completed => {
@@ -19505,10 +19513,16 @@ impl BrokerToolDispatcher {
         } else {
             usize::from(group.max_concurrency)
         };
+        let interaction_observation_invalidated = state.interaction_observation_invalidated;
         for wave in pending.chunks(width) {
             let outcomes = join_all(wave.iter().map(|(_, call)| async move {
                 let result = self
-                    .dispatch_orchestration_child(run_id, call, cancel)
+                    .dispatch_orchestration_child(
+                        run_id,
+                        call,
+                        interaction_observation_invalidated,
+                        cancel,
+                    )
                     .await;
                 (call.clone(), result)
             }))
@@ -19540,6 +19554,7 @@ impl BrokerToolDispatcher {
                 };
                 match outcome {
                     ToolDispatchResult::ApprovalRequired(menu) => {
+                        state.interaction_observation_invalidated = true;
                         if let Some(pending) = state.pending_calls.get_mut(&call.slot) {
                             pending.approval_waiting = true;
                         }
@@ -19555,7 +19570,7 @@ impl BrokerToolDispatcher {
                         });
                     }
                     ToolDispatchResult::Completed(mut result) => {
-                        bound_orchestration_screenshot_retention(state, &call, &mut result);
+                        account_orchestration_interaction_result(state, &call, &mut result);
                         let node = &state.admitted.nodes[call.slot as usize];
                         let retry = matches!(
                             result.status,
@@ -19804,6 +19819,7 @@ impl BrokerToolDispatcher {
         }
 
         if recovered {
+            state.interaction_observation_invalidated = true;
             let pending_calls = state.pending_calls.values().cloned().collect::<Vec<_>>();
             for pending in pending_calls {
                 let effectless_actor = self
@@ -19821,7 +19837,7 @@ impl BrokerToolDispatcher {
                 .await?
                 {
                     RecoveredOrchestrationChild::Completed(mut result) => {
-                        bound_orchestration_screenshot_retention(&mut state, &pending, &mut result);
+                        account_orchestration_interaction_result(&mut state, &pending, &mut result);
                         match result.status {
                             ToolResultStatus::Completed => {
                                 state.completed_calls = state.completed_calls.saturating_add(1);
@@ -20008,7 +20024,12 @@ impl BrokerToolDispatcher {
                 }
                 let attempt = pending.attempt;
                 let child = match self
-                    .dispatch_orchestration_child(run_id, &pending, cancel)
+                    .dispatch_orchestration_child(
+                        run_id,
+                        &pending,
+                        state.interaction_observation_invalidated,
+                        cancel,
+                    )
                     .await?
                 {
                     OrchestrationChildDispatch::Settled(child) => child,
@@ -20040,6 +20061,7 @@ impl BrokerToolDispatcher {
                 };
                 match child {
                     ToolDispatchResult::ApprovalRequired(menu) => {
+                        state.interaction_observation_invalidated = true;
                         if let Some(pending) = state.pending_calls.get_mut(&node.slot) {
                             pending.approval_waiting = true;
                         }
@@ -20065,7 +20087,7 @@ impl BrokerToolDispatcher {
                             .await;
                     }
                     ToolDispatchResult::Completed(mut result) => {
-                        bound_orchestration_screenshot_retention(&mut state, &pending, &mut result);
+                        account_orchestration_interaction_result(&mut state, &pending, &mut result);
                         let retry_limit = orchestration_retry_limit(&state, &node);
                         if matches!(
                             result.status,
@@ -20426,30 +20448,81 @@ fn orchestration_terminal(
     }
 }
 
-fn bound_orchestration_screenshot_retention(
+fn account_orchestration_interaction_result(
     state: &mut crate::orchestration::RuntimeStateV1,
     pending: &crate::orchestration::PendingCallV1,
     result: &mut BoundedResult,
 ) {
+    let action = crate::orchestration::interaction_action(&pending.tool, &pending.args.0);
+    if action == Some(crate::orchestration::InteractionActionV1::Control) {
+        state.interaction_observation_invalidated = true;
+    }
     if !matches!(pending.tool.as_str(), "computer" | "mobile") || result.images.is_empty() {
         return;
     }
+    if !bound_orchestration_screenshot_retention(
+        &mut state.retained_screenshot_count,
+        &mut state.retained_screenshot_bytes,
+        result,
+    ) {
+        return;
+    }
+    if result.status == ToolResultStatus::Completed
+        && action == Some(crate::orchestration::InteractionActionV1::Screenshot)
+    {
+        state.interaction_observation_invalidated = false;
+    }
+}
+
+fn stale_interaction_control_result(
+    pending: &crate::orchestration::PendingCallV1,
+    interaction_observation_invalidated: bool,
+) -> Option<BoundedResult> {
+    (interaction_observation_invalidated
+        && crate::orchestration::interaction_action(&pending.tool, &pending.args.0)
+            == Some(crate::orchestration::InteractionActionV1::Control))
+    .then(|| {
+        BoundedResult {
+        preview: "interaction observation became stale before control dispatch".into(),
+        truncated: false,
+        truncation: None,
+        effects: Vec::new(),
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Failed,
+        reason: Some(
+            "a permission pause or daemon restart invalidated the preceding interaction observation"
+                .into(),
+        ),
+        presentation: None,
+        orchestration: None,
+    }
+    })
+}
+
+fn bound_orchestration_screenshot_retention(
+    retained_count: &mut u32,
+    retained_bytes: &mut u64,
+    result: &mut BoundedResult,
+) -> bool {
     let added = result
         .images
         .iter()
         .fold(0_u64, |bytes, image| bytes.saturating_add(image.byte_len));
-    let retained = state.retained_screenshot_bytes.saturating_add(added);
+    let retained = retained_bytes.saturating_add(added);
     if retained > haider_protocol::orchestration::ORCHESTRATION_SCREENSHOT_BYTES_MAX {
         result.images.clear();
         result.status = ToolResultStatus::Failed;
         result.reason = Some("orchestration screenshot retention exceeds 32 MiB".into());
         result.preview = "orchestration screenshot retention limit exceeded".into();
-        return;
+        return false;
     }
-    state.retained_screenshot_count = state
-        .retained_screenshot_count
-        .saturating_add(u32::try_from(result.images.len()).unwrap_or(u32::MAX));
-    state.retained_screenshot_bytes = retained;
+    *retained_count =
+        retained_count.saturating_add(u32::try_from(result.images.len()).unwrap_or(u32::MAX));
+    *retained_bytes = retained;
+    true
 }
 
 fn orchestration_rejection(

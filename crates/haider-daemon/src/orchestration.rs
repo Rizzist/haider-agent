@@ -123,6 +123,8 @@ pub(crate) struct RuntimeStateV1 {
     pub(crate) retained_screenshot_count: u32,
     #[serde(default)]
     pub(crate) retained_screenshot_bytes: u64,
+    #[serde(default)]
+    pub(crate) interaction_observation_invalidated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +152,8 @@ struct DurableCheckpointV1 {
     retained_screenshot_count: u32,
     #[serde(default)]
     retained_screenshot_bytes: u64,
+    #[serde(default)]
+    interaction_observation_invalidated: bool,
 }
 
 #[derive(Debug)]
@@ -357,6 +361,7 @@ pub(crate) async fn admit(
         unknown_calls: 0,
         retained_screenshot_count: 0,
         retained_screenshot_bytes: 0,
+        interaction_observation_invalidated: false,
         admitted: AdmittedScriptV1 {
             version: ORCHESTRATION_VERSION,
             script_id,
@@ -644,6 +649,7 @@ pub(crate) async fn persist_checkpoint(
         unknown_calls: state.unknown_calls,
         retained_screenshot_count: state.retained_screenshot_count,
         retained_screenshot_bytes: state.retained_screenshot_bytes,
+        interaction_observation_invalidated: state.interaction_observation_invalidated,
     };
     let mut parents = vec![state.admitted.source_ref.artifact.clone()];
     if let Some(previous) = state.checkpoint_ref.as_ref() {
@@ -1072,6 +1078,7 @@ pub(crate) async fn recover_checkpoint(
         unknown_calls: durable.unknown_calls,
         retained_screenshot_count: durable.retained_screenshot_count,
         retained_screenshot_bytes: durable.retained_screenshot_bytes,
+        interaction_observation_invalidated: durable.interaction_observation_invalidated,
     }))
 }
 
@@ -1270,8 +1277,96 @@ fn preflight_values(nodes: &[InlineNodeV1], inputs: &[StrictJson]) -> Vec<Option
 struct InteractionCall<'a> {
     slot: u32,
     tool: &'a str,
-    action: &'a str,
+    action: String,
     region: &'a [Value],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteractionActionV1 {
+    Screenshot,
+    Observation,
+    Control,
+}
+
+pub(crate) fn interaction_action(tool: &str, arguments: &Value) -> Option<InteractionActionV1> {
+    let action = arguments.get("action")?.as_str()?;
+    classify_interaction_action(tool, action)
+}
+
+fn classify_interaction_action(tool: &str, action: &str) -> Option<InteractionActionV1> {
+    match (tool, action) {
+        ("computer", "screenshot" | "inspect") | ("mobile", "screenshot") => {
+            Some(InteractionActionV1::Screenshot)
+        }
+        ("computer", "cursor_position")
+        | ("mobile", "a11y_tree" | "inspect" | "list_apps" | "sms_read") => {
+            Some(InteractionActionV1::Observation)
+        }
+        (
+            "computer",
+            "left_click" | "right_click" | "middle_click" | "double_click" | "triple_click"
+            | "left_mouse_down" | "left_mouse_up" | "mouse_move" | "left_click_drag" | "type"
+            | "key" | "scroll" | "wait",
+        )
+        | ("mobile", "tap" | "long_press" | "swipe" | "type" | "key" | "open_app") => {
+            Some(InteractionActionV1::Control)
+        }
+        _ => None,
+    }
+}
+
+fn static_string_field(
+    nodes: &[InlineNodeV1],
+    values: &[Option<RuntimeValueV1>],
+    slot: usize,
+    field: &str,
+) -> Option<String> {
+    if let Some(value) = values
+        .get(slot)
+        .and_then(Option::as_ref)
+        .and_then(RuntimeValueV1::value)
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+    {
+        return Some(value.to_owned());
+    }
+    let node = nodes.get(slot)?;
+    if node.evidence_type == "OrchArgumentV1" {
+        return node
+            .ports
+            .iter()
+            .find(|port| port.role == OrchPortRoleV1::Data && port.port == "args")
+            .and_then(|port| static_string_field(nodes, values, port.source_slot as usize, field));
+    }
+    if node.evidence_type != "OrchValueV1" || node.config.0["operator"] != "record" {
+        return None;
+    }
+    let index = node.config.0["operand_config"]["fields"]
+        .as_array()?
+        .iter()
+        .position(|candidate| candidate.as_str() == Some(field))?;
+    let source = node
+        .ports
+        .iter()
+        .filter(|port| port.role == OrchPortRoleV1::Data)
+        .nth(index)?
+        .source_slot as usize;
+    values
+        .get(source)
+        .and_then(Option::as_ref)
+        .and_then(RuntimeValueV1::value)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            let source = nodes.get(source)?;
+            (source.evidence_type == "OrchValueV1" && source.config.0["operator"] == "literal")
+                .then(|| {
+                    source.config.0["operand_config"]["value"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
 }
 
 fn validate_interaction_sequences(
@@ -1302,6 +1397,10 @@ fn validate_interaction_sequences(
         let action = argument
             .and_then(|value| value.get("action"))
             .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                argument_slot.and_then(|slot| static_string_field(nodes, &values, slot, "action"))
+            })
             .ok_or_else(|| AdmissionFailure {
                 request_digest: request_digest.into(),
                 code: "interaction_argument".into(),
@@ -1364,34 +1463,37 @@ fn validate_interaction_sequences(
             let mut screenshots = 0_u32;
             let mut controls = 0_u32;
             for call in path_calls {
-                if call.action == "screenshot" || (tool == "computer" && call.action == "inspect") {
-                    screenshots = screenshots.saturating_add(1);
-                    screenshot_ready = true;
-                    continue;
+                match classify_interaction_action(tool, &call.action) {
+                    Some(InteractionActionV1::Screenshot) => {
+                        screenshots = screenshots.saturating_add(1);
+                        screenshot_ready = true;
+                    }
+                    Some(InteractionActionV1::Observation) => {}
+                    Some(InteractionActionV1::Control) => {
+                        controls = controls.saturating_add(1);
+                        if !screenshot_ready {
+                            return Err(AdmissionFailure {
+                                request_digest: request_digest.into(),
+                                code: "interaction_observation".into(),
+                                message: format!(
+                                    "slot {} `{tool}` control action requires a fresh preceding screenshot",
+                                    call.slot
+                                ),
+                            });
+                        }
+                        screenshot_ready = false;
+                    }
+                    None => {
+                        return Err(AdmissionFailure {
+                            request_digest: request_digest.into(),
+                            code: "interaction_argument".into(),
+                            message: format!(
+                                "slot {} `{tool}` has an unknown statically resolved action `{}`",
+                                call.slot, call.action
+                            ),
+                        });
+                    }
                 }
-                let observation = match tool {
-                    "computer" => call.action == "cursor_position",
-                    "mobile" => matches!(
-                        call.action,
-                        "a11y_tree" | "inspect" | "list_apps" | "sms_read"
-                    ),
-                    _ => false,
-                };
-                if observation {
-                    continue;
-                }
-                controls = controls.saturating_add(1);
-                if !screenshot_ready {
-                    return Err(AdmissionFailure {
-                        request_digest: request_digest.into(),
-                        code: "interaction_observation".into(),
-                        message: format!(
-                            "slot {} `{tool}` control action requires a fresh preceding screenshot",
-                            call.slot
-                        ),
-                    });
-                }
-                screenshot_ready = false;
             }
             if controls > 0 && !screenshot_ready {
                 return Err(AdmissionFailure {
@@ -2589,6 +2691,75 @@ mod tests {
                 "accepted invalid interaction sequence {actions:?}"
             );
         }
+    }
+
+    #[test]
+    fn interaction_action_is_provable_from_a_partially_dynamic_record() {
+        let nodes = vec![
+            InlineNodeV1 {
+                slot: 0,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal",
+                    "type":{"kind":"string","max_bytes":32},
+                    "operand_config":{"value":"tap"},
+                    "region":[]
+                })),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 1,
+                evidence_type: "OrchAwaitV1".into(),
+                config: StrictJson(serde_json::json!({"on_error":"stop","region":[]})),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 2,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"record",
+                    "type":{"kind":"record","fields":{
+                        "action":{"kind":"string","max_bytes":32},
+                        "x":{"kind":"i64"}
+                    }},
+                    "operand_config":{"fields":["action","x"]},
+                    "region":[]
+                })),
+                ports: vec![
+                    InlinePortV1 {
+                        role: OrchPortRoleV1::Data,
+                        port: "action".into(),
+                        source_slot: 0,
+                        output: "value".into(),
+                        selector: None,
+                    },
+                    InlinePortV1 {
+                        role: OrchPortRoleV1::Data,
+                        port: "x".into(),
+                        source_slot: 1,
+                        output: "value".into(),
+                        selector: None,
+                    },
+                ],
+            },
+            InlineNodeV1 {
+                slot: 3,
+                evidence_type: "OrchArgumentV1".into(),
+                config: StrictJson(serde_json::json!({"tool":"mobile","region":[]})),
+                ports: vec![InlinePortV1 {
+                    role: OrchPortRoleV1::Data,
+                    port: "args".into(),
+                    source_slot: 2,
+                    output: "value".into(),
+                    selector: None,
+                }],
+            },
+        ];
+        let values = vec![None; nodes.len()];
+        assert_eq!(
+            static_string_field(&nodes, &values, 3, "action").as_deref(),
+            Some("tap")
+        );
     }
 
     #[test]
