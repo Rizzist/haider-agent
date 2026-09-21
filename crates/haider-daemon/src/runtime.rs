@@ -403,7 +403,7 @@ impl StartupJournalVisitor for StartupHydration {
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::StartupHydration,
                     session_id,
-                    cursor,
+                    haider_core::ReducerPageCursor::after(cursor),
                     STARTUP_JOURNAL_PAGE_ENVELOPES,
                     STARTUP_JOURNAL_PAGE_BYTES,
                     STARTUP_VISITOR_PAYLOAD_KINDS,

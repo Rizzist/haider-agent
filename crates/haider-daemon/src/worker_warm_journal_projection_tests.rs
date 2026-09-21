@@ -29,6 +29,18 @@ impl MutableProjectionStore {
         head.event_id = EventId::new(event_id);
     }
 
+    fn replace_head(&self, session_id: &SessionId, mut replacement: RawEnvelope) {
+        let mut journal = self.journal.lock().expect("projection journal lock");
+        let head = journal
+            .iter_mut()
+            .filter(|envelope| &envelope.session_id == session_id)
+            .max_by_key(|envelope| envelope.seq)
+            .expect("session head");
+        replacement.seq = head.seq;
+        replacement.committed_at_ms = head.committed_at_ms;
+        *head = replacement;
+    }
+
     fn take_full_read_starts(&self) -> Vec<u64> {
         std::mem::take(
             &mut *self
@@ -103,7 +115,7 @@ impl StoreHandle for MutableProjectionStore {
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: haider_core::ReducerPageCursor,
         limit: usize,
         _byte_budget: usize,
         payload_kinds: &'static [&'static str],
@@ -111,18 +123,24 @@ impl StoreHandle for MutableProjectionStore {
         self.reducer_starts
             .lock()
             .expect("projection reducer counter")
-            .push(since_seq);
+            .push(cursor.after_seq);
         let journal = self.journal.lock().expect("projection journal lock");
         let observed_head = journal
             .iter()
             .filter(|envelope| &envelope.session_id == session_id)
             .max_by_key(|envelope| envelope.seq)
             .map(|envelope| (envelope.seq, envelope.event_id.clone()));
+        let observed_fence = cursor.fence_seq.and_then(|fence_seq| {
+            journal
+                .iter()
+                .find(|envelope| &envelope.session_id == session_id && envelope.seq == fence_seq)
+                .map(|envelope| (envelope.seq, envelope.event_id.clone()))
+        });
         let envelopes = journal
             .iter()
             .filter(|envelope| {
                 &envelope.session_id == session_id
-                    && envelope.seq > since_seq
+                    && envelope.seq > cursor.after_seq
                     && envelope
                         .payload
                         .get("type")
@@ -135,6 +153,7 @@ impl StoreHandle for MutableProjectionStore {
         Ok(haider_core::ReducerPage {
             envelopes,
             observed_head,
+            observed_fence,
         })
     }
 
@@ -488,6 +507,93 @@ async fn warm_projection_matches_oracles_across_every_session_lifecycle_edge() {
     let (restart_reads, _) =
         assert_projection_parity(&store, &restarted_cache, &session_id, &run_id).await;
     assert_eq!(restart_reads.first(), Some(&0));
+}
+
+#[tokio::test]
+async fn warm_projection_revalidates_an_advanced_cached_boundary() {
+    for appended_count in 1..=3_u64 {
+        let store = MutableProjectionStore::default();
+        let cache = WarmJournalProjectionCache::default();
+        let session_id = SessionId::new(format!(
+            "warm-projection-advanced-revision-{appended_count}"
+        ));
+        let run_id = RunId::new(format!(
+            "warm-projection-advanced-revision-run-{appended_count}"
+        ));
+        append(
+            &store,
+            vec![
+                projection_envelope(
+                    &session_id,
+                    Some(&run_id),
+                    None,
+                    "advanced-queued",
+                    serde_json::to_value(EventPayload::RunState(RunState::Queued))
+                        .expect("queued payload"),
+                ),
+                projection_envelope(
+                    &session_id,
+                    Some(&run_id),
+                    None,
+                    "advanced-configured",
+                    HeadlessRunEventPayload::HeadlessRunConfigured(test_headless_spec())
+                        .to_payload_value()
+                        .expect("headless payload"),
+                ),
+            ],
+        )
+        .await;
+        assert!(
+            cached_headless_run_context(&store, &session_id, &cache, &run_id)
+                .await
+                .expect("prime warm projection")
+                .is_some()
+        );
+
+        store.replace_head(
+            &session_id,
+            projection_envelope(
+                &session_id,
+                Some(&run_id),
+                None,
+                "advanced-replacement",
+                serde_json::to_value(EventPayload::RunState(RunState::Done))
+                    .expect("terminal replacement payload"),
+            ),
+        );
+        append(
+            &store,
+            (1..=appended_count)
+                .map(|ordinal| {
+                    projection_envelope(
+                        &session_id,
+                        Some(&run_id),
+                        None,
+                        &format!("advanced-irrelevant-{ordinal}"),
+                        serde_json::json!({
+                            "type": "branch_switched",
+                            "branch_id": format!("advanced-{ordinal}"),
+                        }),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        store.take_full_read_starts();
+        store.take_reducer_starts();
+
+        let (full_reads, reducer_reads) =
+            assert_projection_parity(&store, &cache, &session_id, &run_id).await;
+        assert!(
+            full_reads.contains(&0),
+            "an advanced warm projection must rebuild when its cached boundary event changes"
+        );
+        assert_eq!(
+            reducer_reads.first(),
+            Some(&2),
+            "the cached boundary must be checked before the authoritative replay"
+        );
+    }
 }
 
 #[tokio::test]

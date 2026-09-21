@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
+use haider_protocol::envelope::write_envelope_messagepack;
 
 #[derive(Clone)]
 struct CountingTurnSetupStore {
@@ -42,7 +43,7 @@ impl StoreHandle for CountingTurnSetupStore {
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: haider_core::ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
@@ -50,11 +51,11 @@ impl StoreHandle for CountingTurnSetupStore {
         self.reducer_starts
             .lock()
             .expect("counting reducer lock")
-            .push(since_seq);
+            .push(cursor.after_seq);
         StoreHandle::read_reducer_page_with_boundary(
             &self.inner,
             session_id,
-            since_seq,
+            cursor,
             limit,
             byte_budget,
             payload_kinds,
@@ -104,6 +105,25 @@ fn setup_reduction_envelope(
         },
         payload: payload.into(),
     }
+}
+
+fn replace_turn_setup_envelope(root: &std::path::Path, replacement: &RawEnvelope) {
+    let mut encoded_replacement = Vec::new();
+    write_envelope_messagepack(&mut encoded_replacement, replacement)
+        .expect("encode turn-setup replacement");
+    let raw =
+        rusqlite::Connection::open(root.join("store.sqlite")).expect("open raw turn-setup journal");
+    raw.execute(
+        "UPDATE events SET envelope_json = ?3, event_id = ?4
+         WHERE session_id = ?1 AND seq = ?2",
+        rusqlite::params![
+            replacement.session_id.as_str(),
+            i64::try_from(replacement.seq).expect("test seq fits SQLite"),
+            encoded_replacement,
+            replacement.event_id.as_str(),
+        ],
+    )
+    .expect("replace durable turn-setup envelope");
 }
 
 fn setup_reduction_usage(scope: UsageScope, history_message_count: u64) -> Usage {
@@ -651,6 +671,151 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         .close()
         .await
         .expect("close restarted daemon store");
+}
+
+#[tokio::test]
+async fn turn_setup_reduction_revalidates_an_advanced_cached_boundary() {
+    for appended_count in 1..=3_u64 {
+        let root = tempfile::tempdir().expect("turn-setup revision profile");
+        let sqlite = haider_core::SqliteStoreHandle::open(root.path())
+            .await
+            .expect("turn-setup revision store");
+        let worker_generation = sqlite.worker_generation();
+        let store = CountingTurnSetupStore::new(sqlite.clone());
+        let session_id = SessionId::new("setup-reduction-session");
+        let branch_id = BranchId::new(format!("setup-advanced-revision-branch-{appended_count}"));
+        let run_id = RunId::new(format!("setup-advanced-revision-run-{appended_count}"));
+        let selector = TurnSetupReductionSelector {
+            run_id: run_id.clone(),
+            branch_id: Some(branch_id.clone()),
+            agent_id: None,
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            account_scope: None,
+            auth_scope: "api_key".into(),
+        };
+        let original_fact = ProjectInstructionsLoaded {
+            files: vec![
+                haider_protocol::project_instructions::ProjectInstructionFileFact {
+                    path: "ORIGINAL.md".into(),
+                    digest: "original-digest".into(),
+                    bytes: 8,
+                    truncated: false,
+                },
+            ],
+        };
+        let mut original = [setup_reduction_envelope(
+            0,
+            Some(run_id.clone()),
+            Some(branch_id.clone()),
+            None,
+            1,
+            original_fact
+                .to_payload_value()
+                .expect("original instruction payload"),
+        )];
+        original[0].event_id = EventId::new(format!("setup-advanced-original-{appended_count}"));
+        original[0].worker_generation = worker_generation;
+        StoreHandle::append(&store, &mut original)
+            .await
+            .expect("append original turn-setup boundary");
+
+        let cache = TurnSetupReductionCache::default();
+        let primed =
+            reduce_turn_setup_journal_cached(&store, &session_id, &cache, selector.clone())
+                .await
+                .expect("prime turn-setup reduction");
+        assert_eq!(primed.latest_instruction_fact, Some(original_fact));
+        store.take_reducer_starts();
+        drop(store);
+        sqlite
+            .close()
+            .await
+            .expect("close before turn-setup replacement");
+
+        let replacement_fact = ProjectInstructionsLoaded {
+            files: vec![
+                haider_protocol::project_instructions::ProjectInstructionFileFact {
+                    path: "REPLACEMENT.md".into(),
+                    digest: "replacement-digest".into(),
+                    bytes: 11,
+                    truncated: false,
+                },
+            ],
+        };
+        let mut replacement = setup_reduction_envelope(
+            original[0].seq,
+            Some(run_id.clone()),
+            Some(branch_id.clone()),
+            None,
+            original[0].committed_at_ms,
+            replacement_fact
+                .to_payload_value()
+                .expect("replacement instruction payload"),
+        );
+        replacement.event_id = EventId::new(format!("setup-advanced-replacement-{appended_count}"));
+        replacement.worker_generation = worker_generation;
+        replace_turn_setup_envelope(root.path(), &replacement);
+
+        let reopened_sqlite = haider_core::SqliteStoreHandle::open(root.path())
+            .await
+            .expect("reopen replaced turn-setup store");
+        let reopened = CountingTurnSetupStore::new(reopened_sqlite.clone());
+        let mut appended = (1..=appended_count)
+            .map(|ordinal| {
+                let mut envelope = setup_reduction_envelope(
+                    0,
+                    Some(run_id.clone()),
+                    Some(branch_id.clone()),
+                    None,
+                    ordinal.saturating_add(1),
+                    serde_json::json!({
+                        "type": "branch_switched",
+                        "branch_id": format!("advanced-{ordinal}"),
+                    }),
+                );
+                envelope.event_id = EventId::new(format!(
+                    "setup-advanced-appended-{appended_count}-{ordinal}"
+                ));
+                envelope.worker_generation = reopened_sqlite.worker_generation();
+                envelope
+            })
+            .collect::<Vec<_>>();
+        StoreHandle::append(&reopened, &mut appended)
+            .await
+            .expect("append rows beyond replaced turn-setup boundary");
+
+        let repaired =
+            reduce_turn_setup_journal_cached(&reopened, &session_id, &cache, selector.clone())
+                .await
+                .expect("repair advanced turn-setup reduction");
+        let starts = reopened.take_reducer_starts();
+        assert_eq!(starts.first(), Some(&original[0].seq));
+        assert!(
+            starts.contains(&0),
+            "an advanced turn-setup boundary replacement must replay authority"
+        );
+
+        let oracle = reduce_turn_setup_journal_cached(
+            &reopened,
+            &session_id,
+            &TurnSetupReductionCache::default(),
+            selector,
+        )
+        .await
+        .expect("fresh turn-setup oracle");
+        assert_eq!(repaired.same_run_instruction_fact, Some(replacement_fact));
+        assert_eq!(
+            repaired.latest_instruction_fact, oracle.latest_instruction_fact,
+            "cached turn-setup reduction diverged with the replaced boundary {appended_count} rows behind the head"
+        );
+
+        drop(reopened);
+        reopened_sqlite
+            .close()
+            .await
+            .expect("close replaced turn-setup store");
+    }
 }
 
 #[test]

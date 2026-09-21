@@ -81,7 +81,7 @@ use haider_core::{
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
     ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit, ProviderDeadlineGuard,
     ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
-    ProviderViewAppendRequest, RequestInputCheckpoint, RouteWaitCheckpoint,
+    ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint, RouteWaitCheckpoint,
     SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
     SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
     SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult, ToolDispatcher, TurnHandle,
@@ -10074,26 +10074,35 @@ async fn reduce_warm_journal_projection_cached<T>(
         let mut final_revision = expected_revision.clone();
         let mut exact_boundary = true;
         loop {
+            let fence_seq = expected_revision.as_ref().map(|head| head.head_seq);
             let page = StoreHandle::read_reducer_page_with_boundary_for(
                 store,
                 haider_platform::phase_trace::StoreReadCaller::WarmJournalProjection,
                 session_id,
-                cursor,
+                ReducerPageCursor {
+                    after_seq: cursor,
+                    fence_seq,
+                },
                 256,
                 usize::MAX,
                 WARM_JOURNAL_PROJECTION_PAYLOAD_KINDS,
             )
             .await?;
+            let confirms_expected = expected_revision.as_ref().is_some_and(|expected| {
+                page.confirms_fence(expected.head_seq, &expected.head_event_id)
+            });
             let observed_revision = page.observed_head.map(WarmJournalRevision::from);
             if observed_revision.is_none() {
                 exact_boundary = false;
             }
             if let Some(expected) = expected_revision.take() {
-                let valid_suffix = observed_revision
-                    .as_ref()
-                    .map_or(!started_from_cached_revision, |observed| {
-                        observed.head_seq > expected.head_seq || observed == &expected
-                    });
+                let valid_suffix =
+                    observed_revision
+                        .as_ref()
+                        .map_or(!started_from_cached_revision, |observed| {
+                            observed == &expected
+                                || (observed.head_seq > expected.head_seq && confirms_expected)
+                        });
                 let impossible_exact_page =
                     observed_revision.as_ref() == Some(&expected) && !page.envelopes.is_empty();
                 if !valid_suffix || impossible_exact_page {
@@ -10716,23 +10725,31 @@ async fn reduce_turn_setup_journal_cached(
     let mut final_revision = None;
     let mut exact_boundary = true;
     loop {
+        let fence_seq = expected_revision.as_ref().map(|head| head.head_seq);
         let page = StoreHandle::read_reducer_page_with_boundary_for(
             store,
             haider_platform::phase_trace::StoreReadCaller::TurnSetupReduction,
             session_id,
-            cursor,
+            ReducerPageCursor {
+                after_seq: cursor,
+                fence_seq,
+            },
             256,
             usize::MAX,
             TURN_SETUP_REDUCTION_PAYLOAD_KINDS,
         )
         .await?;
+        let confirms_expected = expected_revision.as_ref().is_some_and(|expected| {
+            page.confirms_fence(expected.head_seq, &expected.head_event_id)
+        });
         let observed_revision = page.observed_head.map(TurnSetupJournalRevision::from);
         if observed_revision.is_none() {
             exact_boundary = false;
         }
         if let Some(expected) = expected_revision.take() {
             let valid_suffix = observed_revision.as_ref().is_some_and(|observed| {
-                observed.head_seq > expected.head_seq || observed == &expected
+                observed == &expected
+                    || (observed.head_seq > expected.head_seq && confirms_expected)
             });
             let impossible_exact_page =
                 observed_revision.as_ref() == Some(&expected) && !page.envelopes.is_empty();

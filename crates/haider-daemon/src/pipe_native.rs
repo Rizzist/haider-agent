@@ -19,7 +19,7 @@
 //! pointers to prove the complete reachable set before sweeping that debris;
 //! an uncertain chain always leaves every file untouched.
 
-use haider_core::{SqliteStoreHandle, StoreHandle};
+use haider_core::{ReducerPageCursor, SqliteStoreHandle, StoreHandle};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::HaiderError;
 use haider_protocol::ids::SessionId;
@@ -899,7 +899,7 @@ impl PipeNativeWriter {
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
-                    read_cursor,
+                    ReducerPageCursor::fenced(read_cursor, expected.head_seq),
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
                     PIPE_PROJECTION_PAYLOAD_KINDS,
@@ -916,12 +916,14 @@ impl PipeNativeWriter {
                     Ordering::Relaxed,
                 );
             }
+            let confirms_expected = page.confirms_fence(expected.head_seq, &expected.head_event_id);
             let Some(observed) = page.observed_head.map(PipeJournalRevision::from) else {
                 let cursor = state.cursor;
                 drop(state);
                 return self.reconcile_from(store, session_id, path, cursor).await;
             };
-            let valid_boundary = observed.head_seq > expected.head_seq || observed == expected;
+            let valid_boundary = observed == expected
+                || (observed.head_seq > expected.head_seq && confirms_expected);
             let impossible_exact_page =
                 first_page && observed == expected && !page.envelopes.is_empty();
             if !valid_boundary || impossible_exact_page {
@@ -1045,7 +1047,7 @@ impl PipeNativeWriter {
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
-                    read_cursor,
+                    ReducerPageCursor::after(read_cursor),
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
                     PIPE_PROJECTION_PAYLOAD_KINDS,
@@ -1138,7 +1140,7 @@ impl PipeNativeWriter {
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
-                    read_cursor,
+                    ReducerPageCursor::after(read_cursor),
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
                     PIPE_PROJECTION_PAYLOAD_KINDS,

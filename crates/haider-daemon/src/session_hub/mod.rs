@@ -8002,7 +8002,7 @@ impl StoreHandle for HubStoreHandle {
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: haider_core::ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
@@ -8011,13 +8011,7 @@ impl StoreHandle for HubStoreHandle {
         self.hub
             .inner
             .store
-            .read_reducer_page_with_boundary(
-                session_id,
-                since_seq,
-                limit,
-                byte_budget,
-                payload_kinds,
-            )
+            .read_reducer_page_with_boundary(session_id, cursor, limit, byte_budget, payload_kinds)
             .await
     }
 
@@ -8025,7 +8019,7 @@ impl StoreHandle for HubStoreHandle {
         &self,
         caller: haider_platform::phase_trace::StoreReadCaller,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: haider_core::ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
@@ -8037,7 +8031,7 @@ impl StoreHandle for HubStoreHandle {
             .read_reducer_page_with_boundary_for(
                 caller,
                 session_id,
-                since_seq,
+                cursor,
                 limit,
                 byte_budget,
                 payload_kinds,

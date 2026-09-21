@@ -1545,16 +1545,18 @@ async fn advance_cached_prompt_suffix(
             .read_reducer_page_with_boundary_for(
                 haider_platform::phase_trace::StoreReadCaller::PromptHistory,
                 session_id,
-                cursor,
+                crate::ReducerPageCursor::fenced(cursor, expected.head_seq),
                 HISTORY_PAGE,
                 PROMPT_SUFFIX_PAGE_BYTES,
                 PROMPT_PROJECTION_PAYLOAD_KINDS,
             )
             .await?;
+        let confirms_expected = page.confirms_fence(expected.head_seq, &expected.head_event_id);
         let Some(observed) = page.observed_head.map(PromptJournalRevision::from) else {
             return Ok(None);
         };
-        let valid_boundary = observed.head_seq > expected.head_seq || observed == expected;
+        let valid_boundary =
+            observed == expected || (observed.head_seq > expected.head_seq && confirms_expected);
         let impossible_exact_page =
             first_page && observed == expected && !page.envelopes.is_empty();
         if !valid_boundary || impossible_exact_page {

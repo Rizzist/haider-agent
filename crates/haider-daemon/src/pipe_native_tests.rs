@@ -152,6 +152,25 @@ fn remove_sidecar_chain(writer: &PipeNativeWriter, session_id: &SessionId) {
     }
 }
 
+fn replace_durable_envelope(root: &std::path::Path, replacement: &RawEnvelope) {
+    let mut encoded_replacement = Vec::new();
+    write_envelope_messagepack(&mut encoded_replacement, replacement)
+        .expect("encode replacement envelope");
+    let raw = rusqlite::Connection::open(root.join("store.sqlite"))
+        .expect("open raw journal for replacement");
+    raw.execute(
+        "UPDATE events SET envelope_json = ?3, event_id = ?4
+         WHERE session_id = ?1 AND seq = ?2",
+        rusqlite::params![
+            replacement.session_id.as_str(),
+            i64::try_from(replacement.seq).expect("test seq fits SQLite"),
+            encoded_replacement,
+            replacement.event_id.as_str(),
+        ],
+    )
+    .expect("replace durable journal envelope");
+}
+
 async fn create_branch(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
@@ -421,23 +440,7 @@ async fn cached_revision_rebuilds_on_same_sequence_replacement_and_truncation() 
     replacement.seq = events[2].seq;
     replacement.event_id = EventId::new("pipe-revision-replacement-event");
     replacement.committed_at_ms = events[2].committed_at_ms;
-    let mut encoded_replacement = Vec::new();
-    write_envelope_messagepack(&mut encoded_replacement, &replacement)
-        .expect("encode replacement envelope");
-    let raw = rusqlite::Connection::open(root.path().join("store.sqlite"))
-        .expect("open raw journal for replacement");
-    raw.execute(
-        "UPDATE events SET envelope_json = ?3, event_id = ?4
-         WHERE session_id = ?1 AND seq = ?2",
-        rusqlite::params![
-            session_id.as_str(),
-            i64::try_from(events[2].seq).expect("test seq fits SQLite"),
-            encoded_replacement,
-            replacement.event_id.as_str(),
-        ],
-    )
-    .expect("replace journal head at the same sequence");
-    drop(raw);
+    replace_durable_envelope(root.path(), &replacement);
     let replaced = SqliteStoreHandle::open(root.path())
         .await
         .expect("reopen replaced store");
@@ -496,6 +499,89 @@ async fn cached_revision_rebuilds_on_same_sequence_replacement_and_truncation() 
     );
     drop(writer);
     reopened.close().await.expect("close truncated store");
+}
+
+#[tokio::test]
+async fn cached_pipe_revalidates_an_advanced_boundary() {
+    for appended_count in 1..=3_u64 {
+        let root = tempfile::tempdir().expect("temp profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let writer = PipeNativeWriter::new(root.path());
+        let session_id = SessionId::new(format!("pipe-advanced-revision-{appended_count}"));
+        let mut original = [user_node_envelope(
+            &session_id,
+            1,
+            None,
+            "original terminal row",
+        )];
+        store
+            .append(&mut original)
+            .await
+            .expect("append original terminal row");
+        writer
+            .maintain(&store, &session_id, &original, original[0].seq)
+            .await
+            .expect("prime native-pipe projection");
+        let initial_generation = writer
+            .confirmed_coverage(&session_id)
+            .expect("initial coverage")
+            .1;
+
+        store.close().await.expect("close before replacement");
+        let mut replacement = user_node_envelope(&session_id, 1, None, "replacement terminal row");
+        replacement.seq = original[0].seq;
+        replacement.event_id = EventId::new(format!("pipe-advanced-replacement-{appended_count}"));
+        replacement.committed_at_ms = original[0].committed_at_ms;
+        replace_durable_envelope(root.path(), &replacement);
+
+        let reopened = SqliteStoreHandle::open(root.path())
+            .await
+            .expect("reopen replaced store");
+        let mut appended = (1..=appended_count)
+            .map(|ordinal| {
+                user_node_envelope(
+                    &session_id,
+                    ordinal.saturating_add(1),
+                    None,
+                    &format!("immediate next row {ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        reopened
+            .append(&mut appended)
+            .await
+            .expect("append rows beyond replaced boundary");
+        let observed_head = appended.last().expect("at least one appended row").seq;
+        writer
+            .maintain(&reopened, &session_id, &[], observed_head)
+            .await
+            .expect("advance native-pipe projection");
+        assert!(
+            writer
+                .confirmed_coverage(&session_id)
+                .expect("advanced coverage")
+                .1
+                > initial_generation,
+            "an advanced boundary replacement must force a new sidecar generation"
+        );
+        let cached = projected_sidecar_values(&writer, &session_id);
+
+        writer.release_clean(&session_id);
+        remove_sidecar_chain(&writer, &session_id);
+        let oracle = PipeNativeWriter::new(root.path());
+        oracle
+            .maintain(&reopened, &session_id, &[], observed_head)
+            .await
+            .expect("build native-pipe oracle");
+        assert_eq!(
+            cached,
+            projected_sidecar_values(&oracle, &session_id),
+            "cached native-pipe projection diverged with the replaced boundary {appended_count} rows behind the head"
+        );
+        drop(oracle);
+        drop(writer);
+        reopened.close().await.expect("close replaced store");
+    }
 }
 
 #[tokio::test]

@@ -75,9 +75,9 @@ pub use haider_store::{
     PROVIDER_SET_TRUST_METHOD, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome,
     QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
     QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RecordedGraphEvidence,
-    RecordedProcessSignal, ReducerPage, RenamedSession, RunRetryCommand, RunRetryOutcome,
-    SUBAGENT_LIVE_LIMIT, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast,
-    SelectedModel, SelectedWorkspace, SessionCreateCommand, SessionCreateOutcome,
+    RecordedProcessSignal, ReducerPage, ReducerPageCursor, RenamedSession, RunRetryCommand,
+    RunRetryOutcome, SUBAGENT_LIVE_LIMIT, SeenSession, SelectedAgentType, SelectedEffort,
+    SelectedFast, SelectedModel, SelectedWorkspace, SessionCreateCommand, SessionCreateOutcome,
     SessionForkCommand, SessionForkOutcome, SessionLaunchOriginCommand, SessionLaunchOriginOutcome,
     SessionMetaforkCommit, SessionProjectionCheckpoint, SessionPromptForkCommand,
     SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
@@ -278,43 +278,45 @@ pub trait StoreHandle: Send + Sync {
     }
 
     /// Reads a filtered page together with a transactionally compatible
-    /// journal-head observation when the store can provide one. Journal-only
-    /// adapters return no head and remain correct by retaining their reducer
-    /// cursor at the last decoded relevant envelope.
+    /// journal-head observation and optional exact-sequence fence when the
+    /// store can provide them. Journal-only adapters return neither and remain
+    /// correct by retaining their reducer cursor at the last decoded relevant
+    /// envelope.
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
     ) -> Result<ReducerPage, HaiderError> {
-        self.read_reducer_page(session_id, since_seq, limit, byte_budget, payload_kinds)
-            .await
-            .map(|envelopes| ReducerPage {
-                envelopes,
-                observed_head: None,
-            })
+        self.read_reducer_page(
+            session_id,
+            cursor.after_seq,
+            limit,
+            byte_budget,
+            payload_kinds,
+        )
+        .await
+        .map(|envelopes| ReducerPage {
+            envelopes,
+            observed_head: None,
+            observed_fence: None,
+        })
     }
 
     async fn read_reducer_page_with_boundary_for(
         &self,
         caller: haider_platform::phase_trace::StoreReadCaller,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
     ) -> Result<ReducerPage, HaiderError> {
         let _ = caller;
-        self.read_reducer_page_with_boundary(
-            session_id,
-            since_seq,
-            limit,
-            byte_budget,
-            payload_kinds,
-        )
-        .await
+        self.read_reducer_page_with_boundary(session_id, cursor, limit, byte_budget, payload_kinds)
+            .await
     }
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError>;

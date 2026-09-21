@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
-use crate::{CommittedRange, MemoryStore, ReducerPage, StoreHandle};
+use crate::{CommittedRange, MemoryStore, ReducerPage, ReducerPageCursor, StoreHandle};
 use async_trait::async_trait;
 use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{EventEnvelope, RenderTargets, SCHEMA_VERSION};
@@ -104,7 +104,7 @@ impl StoreHandle for RevisionStore {
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
@@ -116,11 +116,17 @@ impl StoreHandle for RevisionStore {
             .rev()
             .find(|envelope| envelope.session_id == *session_id)
             .map(|envelope| (envelope.seq, envelope.event_id.clone()));
+        let observed_fence = cursor.fence_seq.and_then(|fence_seq| {
+            stored
+                .iter()
+                .find(|envelope| envelope.session_id == *session_id && envelope.seq == fence_seq)
+                .map(|envelope| (envelope.seq, envelope.event_id.clone()))
+        });
         let mut spent = 0_usize;
         let mut selected = Vec::new();
         for envelope in stored.iter().filter(|envelope| {
             envelope.session_id == *session_id
-                && envelope.seq > since_seq
+                && envelope.seq > cursor.after_seq
                 && payload_kinds.contains(&crate::envelope_payload_kind(envelope))
         }) {
             let weight = envelope_weight_bytes(envelope);
@@ -136,6 +142,7 @@ impl StoreHandle for RevisionStore {
         Ok(ReducerPage {
             envelopes: selected,
             observed_head,
+            observed_fence,
         })
     }
 
@@ -367,6 +374,97 @@ async fn same_sequence_replacement_and_truncation_rebuild_from_journal_authority
         store.full_read_count() > 0,
         "journal rewind must discard the terminal projection"
     );
+}
+
+#[tokio::test]
+async fn advanced_boundary_revalidates_the_cached_terminal_event() {
+    for appended_count in 1..=3_u64 {
+        let store = RevisionStore::default();
+        let session = SessionId::new(format!(
+            "prompt-terminal-advanced-revision-{appended_count}"
+        ));
+        let run = RunId::new(format!(
+            "prompt-terminal-advanced-revision-run-{appended_count}"
+        ));
+        let mut initial = [visible_user(
+            &session,
+            &run,
+            "advanced-revision-original",
+            "original terminal prompt",
+        )];
+        store
+            .append(&mut initial)
+            .await
+            .expect("append original terminal prompt");
+
+        let cache = PromptHistoryCache::default();
+        cache
+            .compile_provider_projection_with_artifacts(
+                &store,
+                &NoArtifacts,
+                &session,
+                None,
+                None,
+                &run,
+            )
+            .await
+            .expect("prime terminal projection");
+        cache.compact_session_history(&session).await;
+
+        store.replace_head(visible_user(
+            &session,
+            &run,
+            "advanced-revision-replacement",
+            "replacement terminal prompt",
+        ));
+        let mut appended = (1..=appended_count)
+            .map(|ordinal| {
+                visible_user(
+                    &session,
+                    &run,
+                    &format!("advanced-revision-appended-{ordinal}"),
+                    &format!("immediate next turn {ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .append(&mut appended)
+            .await
+            .expect("append rows after replaced terminal prompt");
+        store.reset_read_counts();
+
+        let projected = cache
+            .compile_provider_projection_with_artifacts(
+                &store,
+                &NoArtifacts,
+                &session,
+                None,
+                None,
+                &run,
+            )
+            .await
+            .expect("advance terminal projection");
+        let rebuild_reads = store.full_read_count();
+        let oracle = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("compile fresh journal oracle");
+
+        assert_eq!(
+            projected, oracle,
+            "cached projection diverged with the replaced boundary {appended_count} rows behind the head"
+        );
+        assert!(
+            rebuild_reads > 0,
+            "an advanced boundary must rebuild after its cached event id changes"
+        );
+    }
 }
 
 #[tokio::test]

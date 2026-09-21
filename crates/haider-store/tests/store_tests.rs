@@ -6,7 +6,9 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, SessionId};
-use haider_store::{Cas, EventStore, SessionCreateCommand, SessionProjectionCheckpoint, Store};
+use haider_store::{
+    Cas, EventStore, ReducerPageCursor, SessionCreateCommand, SessionProjectionCheckpoint, Store,
+};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::fmt::Debug;
@@ -1174,8 +1176,13 @@ fn reducer_page_observes_an_irrelevant_suffix_without_materializing_it() {
     ];
     must(store.append(&mut batch));
 
-    let first =
-        must(store.read_reducer_page_with_boundary(&session, 0, 16, usize::MAX, &["run_state"]));
+    let first = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::after(0),
+        16,
+        usize::MAX,
+        &["run_state"],
+    ));
     assert_eq!(first.envelopes, vec![batch[0].clone()]);
     assert_eq!(
         first.observed_head,
@@ -1184,7 +1191,7 @@ fn reducer_page_observes_an_irrelevant_suffix_without_materializing_it() {
 
     let suffix = must(store.read_reducer_page_with_boundary(
         &session,
-        batch[0].seq,
+        ReducerPageCursor::fenced(batch[0].seq, batch[0].seq),
         16,
         usize::MAX,
         &["run_state"],
@@ -1193,6 +1200,10 @@ fn reducer_page_observes_an_irrelevant_suffix_without_materializing_it() {
     assert_eq!(
         suffix.observed_head,
         Some((batch[1].seq, batch[1].event_id.clone()))
+    );
+    assert_eq!(
+        suffix.observed_fence,
+        Some((batch[0].seq, batch[0].event_id.clone()))
     );
 }
 
