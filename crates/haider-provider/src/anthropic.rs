@@ -899,7 +899,7 @@ impl AnthropicProvider {
         self.request_body_prepared(crate::PreparedWire {
             payload,
             history_boundary: None,
-            reply_bindings: Vec::new(),
+            reply_bindings: crate::PreparedReplyBindings::default(),
         })
         .await
     }
@@ -1010,7 +1010,7 @@ impl AnthropicProvider {
             None => crate::PreparedWire {
                 payload: self.request_payload(request)?,
                 history_boundary: None,
-                reply_bindings: Vec::new(),
+                reply_bindings: crate::PreparedReplyBindings::default(),
             },
         };
         let request = self.request_body_prepared(prepared).await?;
@@ -1286,6 +1286,7 @@ impl AnthropicProvider {
         self.validate_model(request).ok()?;
         let (rendered_payload, reply_bindings) =
             self.render_payload_inner(request, tools, None, true).ok()?;
+        let reply_bindings = crate::PreparedReplyBindings::try_new(reply_bindings)?;
         let mut full_payload =
             crate::AttachmentMovePayload::new(rendered_payload, attachment_moves);
         let metadata = request.cache_metadata.as_ref()?;

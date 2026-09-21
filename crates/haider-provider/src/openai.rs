@@ -835,7 +835,7 @@ impl OpenAiProvider {
             None => crate::PreparedWire {
                 payload: self.request_payload(request)?,
                 history_boundary: None,
-                reply_bindings: Vec::new(),
+                reply_bindings: crate::PreparedReplyBindings::default(),
             },
         };
         refresh_openai_cache_routing(
@@ -938,7 +938,7 @@ impl Provider for OpenAiProvider {
         let previous_wire_end = rendered.previous_wire_end;
         let message_wire_ends = rendered.message_wire_ends;
         let mut full_payload = rendered.payload;
-        let reply_bindings = rendered.reply_bindings;
+        let reply_bindings = crate::PreparedReplyBindings::try_new(rendered.reply_bindings)?;
         let rendered_system = if self.http.codex_responses_lite {
             request.system_prompt.as_ref().and_then(|_| {
                 full_payload
@@ -1783,7 +1783,7 @@ impl OpenAiCompatibleProvider {
             None => crate::PreparedWire {
                 payload: self.request_payload(request)?,
                 history_boundary: None,
-                reply_bindings: Vec::new(),
+                reply_bindings: crate::PreparedReplyBindings::default(),
             },
         };
         if matches!(
@@ -1917,6 +1917,7 @@ impl Provider for OpenAiCompatibleProvider {
                 true,
             )
             .ok()?;
+        let reply_bindings = crate::PreparedReplyBindings::try_new(reply_bindings)?;
         // Kimi's prefix key is a routing overlay, not prompt content. Remove
         // it from the only render until M4's exact provider view is frozen.
         if matches!(
