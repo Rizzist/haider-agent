@@ -52,7 +52,7 @@ L20_PROMPT = (
     "array containing each path and its full content. Do not modify files."
 )
 E8_PROMPT = "Complete the standardized AHRB harness-economy task exactly as scripted."
-INTER_SAMPLE_COOLDOWN_SECONDS = 2.0
+INTER_SAMPLE_COOLDOWN_SECONDS = 4.0
 
 
 def canonical(value: Any) -> bytes:
