@@ -53,6 +53,7 @@ use haider_core::{
     ROUTE_REPLAY_EVENT_EXTENSION_KIND, RequestInputCheckpoint, RouteWaitCheckpoint,
     RouteWaitCompletedToolCheckpoint, RouteWaitTextCheckpoint, RouteWaitToolCheckpoint,
     SessionProjectionCheckpoint, SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
+    tool_arguments_display_json,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::cache::{CacheRequestAttemptV1, ProviderRequestAttemptV1};
@@ -736,7 +737,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 recovered.push(RecoveredWork::WorkflowContinuation(Box::new(continuation)));
                 continue;
             }
-            if let Some(checkpoint) = pending_checkpoint(&reduction)
+            if let Some(checkpoint) = pending_checkpoint(&reduction)?
                 && checkpoint_state_matches(&state, &checkpoint)
             {
                 let committed_answer = reduction.menu_answers.get(&checkpoint.menu.id).cloned();
@@ -1682,36 +1683,58 @@ fn canonicalize_completed_reply(item: &mut TurnItem, open: &OpenItem) {
     }
 }
 
-fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint> {
-    let open_menu = reduction.menu.clone()?;
-    reduction
-        .open_items
-        .iter()
-        .find_map(|(item_id, open)| match &open.item {
-            TurnItem::ToolCall { call_id, name, .. }
-                if !reduction.tool_results.contains(call_id)
-                    && match &open_menu.menu.kind {
-                        haider_protocol::menu::MenuKind::Permission { .. } => {
-                            name != "request_input" && name != "plan"
-                        }
-                        // `request_input` parks; an interrupted autonomous
-                        // `plan` uses the same checkpoint carrier so recovery
-                        // can journal its acceptance and continue.
-                        _ => name == "request_input" || name == "plan",
-                    } =>
-            {
-                Some(RequestInputCheckpoint {
-                    menu: open_menu.menu.clone(),
-                    request_seq: open_menu.request_seq,
-                    opening_generation: open_menu.opening_generation,
-                    tool_item_id: item_id.clone(),
-                    call_id: call_id.clone(),
-                    tool_name: name.clone(),
-                    args: open.args.clone(),
-                })
+fn pending_checkpoint(
+    reduction: &RunReduction,
+) -> Result<Option<RequestInputCheckpoint>, HaiderError> {
+    let Some(open_menu) = reduction.menu.clone() else {
+        return Ok(None);
+    };
+    for (item_id, open) in &reduction.open_items {
+        let TurnItem::ToolCall { call_id, name, .. } = &open.item else {
+            continue;
+        };
+        let matching_tool = match &open_menu.menu.kind {
+            haider_protocol::menu::MenuKind::Permission { .. } => {
+                name != "request_input" && name != "plan"
             }
-            _ => None,
-        })
+            // `request_input` parks; an interrupted autonomous `plan` uses the
+            // same checkpoint carrier so recovery can journal its acceptance
+            // and continue.
+            _ => name == "request_input" || name == "plan",
+        };
+        if reduction.tool_results.contains(call_id) || !matching_tool {
+            continue;
+        }
+        let arguments = if open.args.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&open.args).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("checkpoint tool arguments could not decode: {error}"),
+                    false,
+                )
+            })?
+        };
+        let display_args = tool_arguments_display_json(&arguments).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("checkpoint display arguments could not serialize: {error}"),
+                false,
+            )
+        })?;
+        return Ok(Some(RequestInputCheckpoint {
+            menu: open_menu.menu,
+            request_seq: open_menu.request_seq,
+            opening_generation: open_menu.opening_generation,
+            tool_item_id: item_id.clone(),
+            call_id: call_id.clone(),
+            tool_name: name.clone(),
+            args: open.args.clone(),
+            display_args,
+        }));
+    }
+    Ok(None)
 }
 
 fn pending_partial_stream_checkpoint(reduction: &RunReduction) -> Option<PartialStreamCheckpoint> {
@@ -2799,7 +2822,9 @@ mod plan_recovery_tests {
             reduce(&mut reductions, envelope);
         }
         let reduction = reductions.get(&run_id).expect("reduced run");
-        let checkpoint = pending_checkpoint(reduction).expect("plan checkpoint reconstructs");
+        let checkpoint = pending_checkpoint(reduction)
+            .expect("checkpoint decode")
+            .expect("plan checkpoint reconstructs");
         assert_eq!(checkpoint.tool_name, "plan");
         assert_eq!(checkpoint.call_id, "plan-call");
         assert_eq!(checkpoint.menu.id, menu_id);
@@ -2869,7 +2894,9 @@ mod plan_recovery_tests {
             reduce(&mut reductions, envelope);
         }
         let reduction = reductions.get(&run_id).expect("reduced run");
-        let checkpoint = pending_checkpoint(reduction).expect("request checkpoint reconstructs");
+        let checkpoint = pending_checkpoint(reduction)
+            .expect("checkpoint decode")
+            .expect("request checkpoint reconstructs");
         assert_eq!(checkpoint.tool_name, "request_input");
         assert_eq!(checkpoint.call_id, "request-input-call");
         assert_eq!(checkpoint.menu.id, menu_id);

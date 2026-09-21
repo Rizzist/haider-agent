@@ -3,8 +3,9 @@
 use async_trait::async_trait;
 use base64::Engine as _;
 use haider_core::{
-    ArtifactReader, CancelToken, HarnessActor, HarnessConfig, MemoryStore, RequestInputCheckpoint,
-    StoreHandle, SubmitCheckpointTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
+    ArtifactReader, CancelToken, HarnessActor, HarnessConfig, MemoryStore, PromptHistoryCompiler,
+    RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn, SubmitTurn, ToolDispatchResult,
+    ToolDispatcher,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
@@ -28,6 +29,7 @@ struct ApprovalDispatcher {
     approved: AtomicBool,
     menu: Menu,
     seen_args: Mutex<Option<serde_json::Value>>,
+    seen_card_args: Mutex<Option<String>>,
 }
 
 struct FixedArtifactReader {
@@ -129,6 +131,16 @@ impl ToolDispatcher for ApprovalDispatcher {
         }
     }
 
+    async fn activate_approval(
+        &self,
+        _run_id: &RunId,
+        checkpoint: &RequestInputCheckpoint,
+    ) -> Result<(), HaiderError> {
+        *self.seen_card_args.lock().expect("card args lock") =
+            Some(checkpoint.display_args.clone());
+        Ok(())
+    }
+
     async fn resolve_approval(&self, menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
         if menu.id != self.menu.id || answer.menu != menu.id {
             return Err(HaiderError::new(
@@ -216,6 +228,7 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
         approved: AtomicBool::new(false),
         menu,
         seen_args: Mutex::new(None),
+        seen_card_args: Mutex::new(None),
     });
     let mut config =
         HarnessConfig::for_session(session_id.clone(), DeviceId::new("permission-device"), 3, 7);
@@ -226,7 +239,7 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
     }];
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         config,
-        provider,
+        provider.clone(),
         store.clone(),
         Some(dispatcher.clone()),
     );
@@ -321,6 +334,81 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
         .expect("dispatcher receives arguments");
     assert_eq!(raw_args["password"], "short-secret");
     assert_eq!(raw_args["token"], secret);
+    let card_args = dispatcher
+        .seen_card_args
+        .lock()
+        .expect("card args lock")
+        .clone()
+        .expect("approval checkpoint carries display arguments");
+    assert_eq!(
+        card_args.as_bytes(),
+        serde_json::to_string(&carrier.arguments)
+            .expect("carrier arguments serialize")
+            .as_bytes(),
+        "permission-card display bytes must equal the carrier's redacted argument bytes"
+    );
+    assert!(!card_args.contains("short-secret"));
+    assert!(!card_args.contains(&secret));
+
+    let run_id = carrier_envelope.run_id.clone().expect("carrier run id");
+    let journal = store.events(&session_id).await;
+    let carrier_positions = journal
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            event
+                .payload
+                .decode_event()
+                .is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::Item(ItemEvent::Started {
+                            item: TurnItem::Extension { ref kind, .. },
+                            ..
+                        } | ItemEvent::Completed {
+                            item: TurnItem::Extension { ref kind, .. },
+                            ..
+                        }) if kind == haider_protocol::item::TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND
+                    )
+                })
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(carrier_positions.len(), 2, "one carrier item pair");
+    assert_eq!(carrier_positions[1], carrier_positions[0] + 1);
+    let projection_store = MemoryStore::new();
+    let mut before_carrier_journal = journal[..carrier_positions[0]].to_vec();
+    StoreHandle::append(&projection_store, &mut before_carrier_journal)
+        .await
+        .expect("copy journal prefix before carrier");
+    let before_messages =
+        PromptHistoryCompiler::compile(&projection_store, &session_id, None, None, &run_id)
+            .await
+            .expect("compile provider request before carrier");
+    let mut carrier_pair = journal[carrier_positions[0]..=carrier_positions[1]].to_vec();
+    StoreHandle::append(&projection_store, &mut carrier_pair)
+        .await
+        .expect("append carrier pair");
+    let after_messages =
+        PromptHistoryCompiler::compile(&projection_store, &session_id, None, None, &run_id)
+            .await
+            .expect("compile provider request after carrier");
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "approval fixture has one follow-up request"
+    );
+    assert_eq!(before_messages, requests[0].messages);
+    let mut before_carrier = requests[0].clone();
+    before_carrier.messages = before_messages;
+    let mut after_carrier = before_carrier.clone();
+    after_carrier.messages = after_messages;
+    assert_eq!(
+        serde_json::to_vec(&before_carrier).expect("serialize request without carrier"),
+        serde_json::to_vec(&after_carrier).expect("serialize request after carrier"),
+        "appending the hidden carrier must not change any provider-request byte"
+    );
 
     let mut live_carrier = None;
     loop {
@@ -432,6 +520,7 @@ async fn recovered_approval_preserves_image_ref_and_resolves_it_for_continuation
                 call_id: "capture-after-restart".into(),
                 tool_name: "capture".into(),
                 args: "{}".into(),
+                display_args: "{}".into(),
             },
         })
         .await

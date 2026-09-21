@@ -28,7 +28,8 @@ New additive extension kind `tool_arguments_finalized_v1` uses the existing
 and tool `name` to the complete, consumer-redacted JSON `arguments` object.
 The actor commits its hidden durable Started/Completed pair after the provider
 argument stream closes as a valid object and before any actor-owned behavior,
-approval card, daemon dispatch, or effect receipt.
+dispatcher preflight, grant-ceiling refusal, approval card, daemon dispatch, or
+effect receipt.
 
 For immediately allowed effects the order is therefore finalized carrier →
 `RunningTool` → the atomic Effect Intent/Authorized(Allow)/Dispatched batch.
@@ -38,9 +39,11 @@ the carrier precedes Intent/Authorized(Ask) and the resulting `menu_opened`
 card because the card is derived from already-final arguments. The carrier is
 prompt-omitted and UI-hidden, but remains available to raw/replay clients.
 Argument strings pass through the existing tool-output redaction consumer;
-execution retains the original in-memory object. Existing item bytes are
-unchanged when the supplemental event is absent. The RPC method pin remains
-136 and `schema_version` remains 1.
+the permission checkpoint's display serialization is byte-identical to the
+carrier's redacted `arguments`. Execution and broker approval retain the raw
+object because approval binds effect identity, not display bytes. Existing item
+bytes are unchanged when the supplemental event is absent. The RPC method pin
+remains 136 and `schema_version` remains 1.
 
 ### v0.0.972 — permission-bound Edit/Write review
 

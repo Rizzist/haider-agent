@@ -1204,6 +1204,33 @@ fn golden_item_lifecycle() {
     );
 }
 
+/// Old journals contain neither the finalized-arguments kind nor its fields.
+/// The strict helper must distinguish absence from a malformed matching kind.
+#[test]
+fn finalized_arguments_decode_ignores_pre_feature_and_nonmatching_items() {
+    use haider_protocol::item::ToolArgumentsFinalizedV1;
+
+    let pre_feature: TurnItem = serde_json::from_str(
+        r#"{"item":"tool_call","call_id":"legacy-call","name":"fs_read","args":{"path":"notes.txt"},"status":"completed"}"#,
+    )
+    .expect("pre-feature journal item decodes");
+    assert_eq!(
+        ToolArgumentsFinalizedV1::try_from_extension_item(&pre_feature)
+            .expect("pre-feature item is not an error"),
+        None
+    );
+
+    let nonmatching = TurnItem::Extension {
+        kind: "future_tool_fact_v1".into(),
+        data: serde_json::json!({"unknown": true}),
+    };
+    assert_eq!(
+        ToolArgumentsFinalizedV1::try_from_extension_item(&nonmatching)
+            .expect("nonmatching extension is not an error"),
+        None
+    );
+}
+
 #[test]
 fn golden_full_envelope() {
     golden(

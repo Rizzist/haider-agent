@@ -1389,7 +1389,14 @@ pub struct RequestInputCheckpoint {
     /// or the mutating tool whose broker approval is waiting on the same
     /// durable menu CAS.
     pub tool_name: String,
+    /// Raw arguments retained only for effect execution and recovery. Approval
+    /// binds the broker's effect identity, not the display serialization; card
+    /// surfaces must use `display_args` instead.
     pub args: String,
+    /// Secret-safe JSON object bytes shown with the checkpoint. For broker
+    /// approval this is byte-identical to the serialized `arguments` value in
+    /// the preceding `ToolArgumentsFinalizedV1` carrier.
+    pub display_args: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -8606,6 +8613,16 @@ impl HarnessActor {
                 "provider ended unknown tool call `{call_id}`",
             ))));
         };
+        // This is the single arguments-finalization boundary for every tool
+        // path. The JSON object is complete and structurally valid here, but
+        // no actor-owned action, dispatcher preflight, approval card, broker
+        // receipt, refusal, or external effect has begun. Keep execution on
+        // the raw in-memory object while publishing only its consumer-redacted
+        // display copy.
+        let args = parse_tool_args(&tools[index])?;
+        let display_args = self
+            .commit_tool_arguments_finalized(run_id, &tools[index], args.as_ref())
+            .await?;
         if let Some(dispatcher) = self.dispatcher.as_ref() {
             dispatcher
                 .preflight_tool_call(&tools[index].name)
@@ -8672,14 +8689,6 @@ impl HarnessActor {
                 false,
             ))));
         }
-        // This is the single arguments-finalization boundary for every tool
-        // path. The JSON object is complete and structurally valid here, but
-        // no actor-owned action, approval card, broker receipt, or external
-        // effect has begun. Keep execution on the raw in-memory object while
-        // publishing only its consumer-redacted copy.
-        let args = parse_tool_args(&tools[index])?;
-        self.commit_tool_arguments_finalized(run_id, &tools[index], args.as_ref())
-            .await?;
         if tools[index].name == "task_outcome" {
             return self
                 .prepare_task_outcome(run_id, tools, deferred, index)
@@ -8708,7 +8717,14 @@ impl HarnessActor {
                 .await
                 .map_err(DriveError::Store)?;
             let outcome = self
-                .execute_general_tool(run_id, &tools[index], args, cancel, &dispatcher)
+                .execute_general_tool(
+                    run_id,
+                    &tools[index],
+                    args,
+                    &display_args,
+                    cancel,
+                    &dispatcher,
+                )
                 .await?;
             let result = match outcome {
                 GeneralToolOutcome::Completed(result) => result,
@@ -8782,18 +8798,29 @@ impl HarnessActor {
     /// allow-path Effect Intent/Authorized/Dispatched batch therefore cannot
     /// appear first, while a crash after this append exposes no effect receipt
     /// and is safely interpreted as an unexecuted proposal. Ask-path menus are
-    /// also later because their contents are derived during dispatch.
+    /// also later because their contents are derived during dispatch. The
+    /// returned JSON bytes are the card-safe display representation: approval
+    /// still binds the broker's raw effect identity, while neither this carrier
+    /// nor the permission-card display exposes those raw execution bytes.
     async fn commit_tool_arguments_finalized(
         &mut self,
         run_id: &RunId,
         tool: &ToolAccumulator,
         arguments: &serde_json::Value,
-    ) -> Result<(), DriveError> {
+    ) -> Result<String, DriveError> {
+        let arguments = redact_tool_arguments(arguments, None);
+        let display_args = serde_json::to_string(&arguments).map_err(|error| {
+            DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                format!("tool arguments display could not serialize: {error}"),
+                false,
+            ))
+        })?;
         let carrier = ToolArgumentsFinalizedV1 {
             tool_item_id: tool.item_id.clone(),
             call_id: tool.call_id.clone(),
             name: tool.name.clone(),
-            arguments: redact_tool_arguments(arguments, None),
+            arguments,
         };
         let item = carrier.extension_item().map_err(|error| {
             DriveError::Store(HaiderError::new(
@@ -8811,7 +8838,8 @@ impl HarnessActor {
         };
         self.commit_extension_marker(run_id, &kind, data, hidden_prompt_omit_render())
             .await
-            .map_err(DriveError::Store)
+            .map_err(DriveError::Store)?;
+        Ok(display_args)
     }
 
     async fn execute_general_tool(
@@ -8819,6 +8847,7 @@ impl HarnessActor {
         run_id: &RunId,
         tool: &ToolAccumulator,
         args: Arc<serde_json::Value>,
+        display_args: &str,
         cancel: &CancelToken,
         dispatcher: &Arc<dyn ToolDispatcher>,
     ) -> Result<GeneralToolOutcome, DriveError> {
@@ -8932,6 +8961,7 @@ impl HarnessActor {
                                 false,
                             ))
                         })?,
+                        display_args: display_args.to_owned(),
                     };
                     dispatcher
                         .activate_approval(run_id, &checkpoint)
@@ -9655,7 +9685,14 @@ impl HarnessActor {
             .map_err(DriveError::Store)?;
         let args = parse_tool_args(&tools[index])?;
         let outcome = self
-            .execute_general_tool(run_id, &tools[index], args, cancel, &dispatcher)
+            .execute_general_tool(
+                run_id,
+                &tools[index],
+                args,
+                &checkpoint.display_args,
+                cancel,
+                &dispatcher,
+            )
             .await?;
         let GeneralToolOutcome::Completed(result) = outcome else {
             return Err(DriveError::Store(HaiderError::new(
@@ -12760,6 +12797,14 @@ fn redact_tool_arguments(
         ),
         _ => value.clone(),
     }
+}
+
+/// Serializes the secret-safe tool-argument representation shared by the
+/// durable finalized-arguments carrier and approval-card checkpoints.
+pub fn tool_arguments_display_json(
+    arguments: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&redact_tool_arguments(arguments, None))
 }
 
 fn validate_permission_selection(menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {

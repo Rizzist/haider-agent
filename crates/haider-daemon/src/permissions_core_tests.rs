@@ -1205,6 +1205,7 @@ fn autonomous_recovery_cas_selects_typed_allow_once() {
         call_id: "recovered-call".into(),
         tool_name: "fs_write".into(),
         args: "{}".into(),
+        display_args: "{}".into(),
     };
     let command = autonomous_permission_resolution_command(
         &SessionId::new("autonomous-session"),

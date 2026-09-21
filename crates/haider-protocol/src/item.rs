@@ -81,8 +81,10 @@ impl UserCommandOriginV1 {
 ///
 /// `tool_item_id` binds this supplemental fact to the already-open
 /// [`TurnItem::ToolCall`]. `arguments` contains the complete object after
-/// stream validation and consumer redaction; execution continues to use the
-/// unredacted in-memory object.
+/// stream validation and consumer redaction. Its serialization is also the
+/// permission card's display representation. Dispatch and approval continue
+/// to use the unredacted object for effect identity and execution; display
+/// bytes are never substituted for those raw arguments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolArgumentsFinalizedV1 {
     pub tool_item_id: ItemId,

@@ -31,7 +31,7 @@ use haider_protocol::ids::{
     ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, GraphId, ItemId, MenuId, NodeId,
     RunId, SessionId,
 };
-use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::item::{ItemEvent, ToolArgumentsFinalizedV1, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::{RunState, WaitReason};
@@ -80,6 +80,37 @@ fn completed_extension(envelope: &RawEnvelope, expected_kind: &str) -> bool {
             ..
         }) if kind == expected_kind
     )
+}
+
+fn assert_single_arguments_finalized_pair(events: &[RawEnvelope], call_id: &str) -> (usize, usize) {
+    let mut started = Vec::new();
+    let mut completed = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        match typed(event) {
+            EventPayload::Item(ItemEvent::Started { item_id, item })
+                if ToolArgumentsFinalizedV1::from_extension_item(&item)
+                    .is_some_and(|carrier| carrier.call_id == call_id) =>
+            {
+                started.push((index, item_id));
+            }
+            EventPayload::Item(ItemEvent::Completed { item_id, item })
+                if ToolArgumentsFinalizedV1::from_extension_item(&item)
+                    .is_some_and(|carrier| carrier.call_id == call_id) =>
+            {
+                completed.push((index, item_id));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started.len(), 1, "exactly one carrier Started is durable");
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly one carrier Completed is durable"
+    );
+    assert_eq!(started[0].1, completed[0].1);
+    assert!(started[0].0 < completed[0].0);
+    (started[0].0, completed[0].0)
 }
 
 fn completed_footprint(envelope: &RawEnvelope) -> Option<ContextFootprint> {
@@ -2349,6 +2380,38 @@ struct CountingCompletingDispatcher {
     calls: AtomicUsize,
 }
 
+struct PreflightRejectingDispatcher {
+    execute_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ToolDispatcher for PreflightRejectingDispatcher {
+    async fn preflight_tool_call(&self, _name: &str) -> Result<(), HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::RevisionConflict,
+            "fixture authority changed after request assembly",
+            true,
+        ))
+    }
+
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        Err(HaiderError::new(
+            ErrorCode::Internal,
+            "preflight-rejected tool reached execution",
+            false,
+        ))
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for CountingCompletingDispatcher {
     async fn execute(
@@ -3147,6 +3210,63 @@ fn toolrepair_config(names: &[&str]) -> HarnessConfig {
 }
 
 #[tokio::test]
+async fn finalized_arguments_precede_preflight_failure_without_effect_receipts() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "preflight-denied".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path": "notes.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let dispatcher = Arc::new(PreflightRejectingDispatcher {
+        execute_calls: AtomicUsize::new(0),
+    });
+    let mut cfg = config();
+    cfg.tools = vec![haider_provider::ToolDefinition {
+        name: "inspect".into(),
+        description: "inspect fixture".into(),
+        input_schema: serde_json::json!({"type":"object"}),
+    }];
+    let (actor, handle) =
+        HarnessActor::new_with_dispatcher(cfg, provider, store.clone(), Some(dispatcher.clone()));
+    let task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("exercise preflight refusal"))
+        .await
+        .expect("submit")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("preflight error").code,
+        ErrorCode::RevisionConflict
+    );
+    assert_eq!(dispatcher.execute_calls.load(Ordering::SeqCst), 0);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let (_, carrier_completed) =
+        assert_single_arguments_finalized_pair(&events, "preflight-denied");
+    let failure = events
+        .iter()
+        .position(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
+        .expect("preflight failure is durable");
+    assert!(carrier_completed < failure);
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(typed(event), EventPayload::Effect(_))),
+        "preflight refusal must not create an effect receipt"
+    );
+    assert_items_closed_before_terminal(&events);
+    handle.stop().await.expect("stop");
+    task.await.expect("actor joined");
+}
+
+#[tokio::test]
 async fn tool_name_case_and_underscore_repair_is_reported_in_durable_and_live_result() {
     for requested in ["FS_READ", "FsRead", "fs__read"] {
         let (outcome, events, requests, calls) = toolrepair_run(
@@ -3216,9 +3336,20 @@ async fn tool_name_repair_does_not_resolve_ambiguous_or_unadvertised_names() {
         )
         .await;
         assert_eq!(calls, 0);
-        assert!(events.iter().any(|event| matches!(typed(event), EventPayload::ToolResult { result, .. }
-            if result.status == haider_protocol::tool::ToolResultStatus::Rejected && result.preview.contains("grant_ceiling_violation")
-        )));
+        let (_, carrier_completed) = assert_single_arguments_finalized_pair(&events, "denied");
+        let rejection = events
+            .iter()
+            .position(|event| matches!(typed(event), EventPayload::ToolResult { result, .. }
+                if result.status == haider_protocol::tool::ToolResultStatus::Rejected && result.preview.contains("grant_ceiling_violation")
+            ))
+            .expect("grant-ceiling rejection is durable");
+        assert!(carrier_completed < rejection);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(typed(event), EventPayload::Effect(_))),
+            "grant-ceiling refusal must not create an effect receipt"
+        );
     }
     let (_, events, _, calls) = toolrepair_run(
         toolrepair_config(&["fs_read", "fsread"]),

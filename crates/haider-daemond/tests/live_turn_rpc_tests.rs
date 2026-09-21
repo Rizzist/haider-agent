@@ -37,8 +37,7 @@ use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::ItemId;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::item::{
-    ItemDelta, ItemEvent, OutputStream, TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND,
-    ToolArgumentsFinalizedV1, TurnItem, UserCommandOriginV1,
+    ItemDelta, ItemEvent, OutputStream, ToolArgumentsFinalizedV1, TurnItem, UserCommandOriginV1,
 };
 use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{
@@ -2252,6 +2251,42 @@ fn payloads_for_run<'a>(
         .iter()
         .filter(move |envelope| envelope.run_id.as_ref() == Some(run_id))
         .filter_map(|envelope| serde_json::from_value(envelope.payload.clone().into()).ok())
+}
+
+fn assert_single_arguments_finalized_pair(payloads: &[EventPayload], call_id: &str) {
+    let mut started = Vec::new();
+    let mut completed = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        match payload {
+            EventPayload::Item(ItemEvent::Started { item_id, item })
+                if ToolArgumentsFinalizedV1::from_extension_item(item)
+                    .is_some_and(|carrier| carrier.call_id == call_id) =>
+            {
+                started.push((index, item_id.clone()));
+            }
+            EventPayload::Item(ItemEvent::Completed { item_id, item })
+                if ToolArgumentsFinalizedV1::from_extension_item(item)
+                    .is_some_and(|carrier| carrier.call_id == call_id) =>
+            {
+                completed.push((index, item_id.clone()));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started.len(), 1, "exactly one carrier Started is durable");
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly one carrier Completed is durable"
+    );
+    assert_eq!(
+        started[0].1, completed[0].1,
+        "carrier lifecycle uses one item id"
+    );
+    assert!(
+        started[0].0 < completed[0].0,
+        "carrier Started precedes Completed"
+    );
 }
 
 #[cfg(unix)]
@@ -6949,13 +6984,7 @@ async fn arguments_finalized_crash_before_receipt_batch_is_proposal_only() {
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| envelope.payload.decode_event().ok())
         .collect::<Vec<_>>();
-    assert!(before_payloads.iter().any(|payload| matches!(
-        payload,
-        EventPayload::Item(ItemEvent::Completed {
-            item: TurnItem::Extension { kind, .. },
-            ..
-        }) if kind == TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND
-    )));
+    assert_single_arguments_finalized_pair(&before_payloads, "carrier-only-call");
     assert!(
         before_payloads
             .iter()
@@ -6990,13 +7019,7 @@ async fn arguments_finalized_crash_before_receipt_batch_is_proposal_only() {
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| envelope.payload.decode_event().ok())
         .collect::<Vec<_>>();
-    assert!(replay_payloads.iter().any(|payload| matches!(
-        payload,
-        EventPayload::Item(ItemEvent::Completed {
-            item: TurnItem::Extension { kind, .. },
-            ..
-        }) if kind == TOOL_ARGUMENTS_FINALIZED_EXTENSION_KIND
-    )));
+    assert_single_arguments_finalized_pair(&replay_payloads, "carrier-only-call");
     assert!(
         replay_payloads
             .iter()

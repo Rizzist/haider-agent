@@ -238,6 +238,12 @@ async fn autonomous_request_input_checkpoint_resumes_after_restart_without_waiti
                     "options": [{"key": "only", "label": "Only option"}]
                 })
                 .to_string(),
+                display_args: serde_json::json!({
+                    "kind": "choice",
+                    "title": "Choose target",
+                    "options": [{"key": "only", "label": "Only option"}]
+                })
+                .to_string(),
             },
         })
         .await
