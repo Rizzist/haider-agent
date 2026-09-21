@@ -28489,7 +28489,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v30 and reopen.
+    /// v23's run-head backfill remains untouched through v31 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -28505,8 +28505,12 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TRIGGER events_authority_updated;
+            "DROP TRIGGER events_authority_inserted;
+             DROP TRIGGER events_authority_updated;
              DROP TRIGGER events_authority_deleted;
+             DROP TRIGGER sessions_authority_advanced;
+             DROP TABLE event_authority_keys;
+             ALTER TABLE sessions DROP COLUMN journal_event_seq_high_water;
              ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
              DROP TABLE workspace_unavailable_runs;
              ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
@@ -28536,7 +28540,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 30);
+            assert_eq!(store.schema_version().expect("schema version"), 31);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

@@ -47,7 +47,12 @@ fn authority_trigger_count(connection: &Connection) -> i64 {
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
               WHERE type = 'trigger'
-                AND name IN ('events_authority_updated', 'events_authority_deleted')",
+                AND name IN (
+                    'events_authority_inserted',
+                    'events_authority_updated',
+                    'events_authority_deleted',
+                    'sessions_authority_advanced'
+                )",
             [],
             |row| row.get(0),
         )
@@ -153,14 +158,18 @@ fn open_repairs_rebuild_lost_triggers_and_invalidates_projection_authority_once(
              COMMIT;",
         )
         .expect("rebuild events without recreating triggers");
-    assert_eq!(authority_trigger_count(&connection), 0);
+    assert_eq!(
+        authority_trigger_count(&connection),
+        1,
+        "the session-owned invalidation trigger survives an events rebuild"
+    );
     assert_eq!(mutation_generation(&connection, &session_id), 0);
     drop(connection);
 
     let repaired = Store::open(root.path()).expect("reopen rebuilt store");
     let repaired_connection =
         Connection::open(repaired.database_path()).expect("inspect repaired store");
-    assert_eq!(authority_trigger_count(&repaired_connection), 2);
+    assert_eq!(authority_trigger_count(&repaired_connection), 4);
     assert_eq!(
         mutation_generation(&repaired_connection, &session_id),
         1,

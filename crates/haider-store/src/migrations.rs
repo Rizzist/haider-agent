@@ -19,8 +19,8 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 30;
-const LATEST_SCHEMA_VERSION: u32 = 30;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 31;
+const LATEST_SCHEMA_VERSION: u32 = 31;
 
 struct Migration {
     version: u32,
@@ -768,6 +768,114 @@ const MIGRATIONS: &[Migration] = &[
             END;
         ",
     },
+    Migration {
+        version: 31,
+        sql: "
+            -- This key-only shadow survives SQLite's implicit REPLACE delete
+            -- when recursive_triggers is disabled. The insert trigger can
+            -- therefore distinguish a successful conflict replacement from
+            -- an ordinary append or an ignored insert.
+            ALTER TABLE sessions ADD COLUMN journal_event_seq_high_water INTEGER
+                NOT NULL DEFAULT 0 CHECK (journal_event_seq_high_water >= 0);
+            CREATE TABLE event_authority_keys (
+                session_id TEXT NOT NULL,
+                seq        INTEGER NOT NULL CHECK (seq > 0),
+                event_id   TEXT NOT NULL,
+                PRIMARY KEY (session_id, seq),
+                UNIQUE (event_id)
+            );
+            INSERT INTO event_authority_keys(session_id, seq, event_id)
+            SELECT session_id, seq, event_id FROM events;
+            UPDATE sessions
+               SET journal_event_seq_high_water = COALESCE(
+                   (SELECT MAX(seq) FROM events WHERE events.session_id = sessions.id),
+                   0
+               );
+
+            DROP TRIGGER events_authority_updated;
+            DROP TRIGGER events_authority_deleted;
+
+            CREATE TRIGGER events_authority_inserted
+            AFTER INSERT ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation +
+                       CASE WHEN NEW.seq <= journal_event_seq_high_water
+                                  OR EXISTS (
+                                      SELECT 1 FROM event_authority_keys
+                                       WHERE event_id = NEW.event_id
+                                  )
+                            THEN 1 ELSE 0 END,
+                       journal_event_seq_high_water = MAX(
+                           journal_event_seq_high_water,
+                           NEW.seq
+                       )
+                 WHERE id = NEW.session_id;
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = (
+                     SELECT session_id FROM event_authority_keys
+                      WHERE event_id = NEW.event_id
+                 )
+                   AND id <> NEW.session_id;
+                INSERT OR REPLACE INTO event_authority_keys(session_id, seq, event_id)
+                VALUES (NEW.session_id, NEW.seq, NEW.event_id);
+            END;
+
+            CREATE TRIGGER events_authority_updated
+            AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+            ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1,
+                       journal_event_seq_high_water = CASE
+                           WHEN id = NEW.session_id THEN MAX(
+                               journal_event_seq_high_water,
+                               NEW.seq
+                           )
+                           ELSE journal_event_seq_high_water
+                       END
+                 WHERE id IN (
+                     OLD.session_id,
+                     NEW.session_id,
+                     (SELECT session_id FROM event_authority_keys
+                       WHERE session_id = NEW.session_id AND seq = NEW.seq),
+                     (SELECT session_id FROM event_authority_keys
+                       WHERE event_id = NEW.event_id)
+                 );
+                DELETE FROM event_authority_keys
+                 WHERE session_id = OLD.session_id
+                   AND seq = OLD.seq
+                   AND event_id = OLD.event_id;
+                INSERT OR REPLACE INTO event_authority_keys(session_id, seq, event_id)
+                VALUES (NEW.session_id, NEW.seq, NEW.event_id);
+            END;
+
+            CREATE TRIGGER events_authority_deleted
+            AFTER DELETE ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = OLD.session_id;
+                DELETE FROM event_authority_keys
+                 WHERE session_id = OLD.session_id AND seq = OLD.seq AND event_id = OLD.event_id;
+            END;
+
+            CREATE TRIGGER sessions_authority_advanced
+            AFTER UPDATE OF journal_mutation_generation ON sessions
+            WHEN NEW.journal_mutation_generation <> OLD.journal_mutation_generation
+            BEGIN
+                DELETE FROM session_projection_checkpoints
+                 WHERE session_id = NEW.id;
+            END;
+
+            -- Version 30 could not observe implicit REPLACE deletes. Treat
+            -- every upgraded prefix as unknown once, then rebuild normally.
+            UPDATE sessions
+               SET journal_mutation_generation = journal_mutation_generation + 1;
+            DELETE FROM session_projection_checkpoints;
+        ",
+    },
 ];
 
 // The direct schema for an empty profile. The equivalence pin in
@@ -866,6 +974,14 @@ CREATE TABLE delegations (
                 UNIQUE (parent_session_id, parent_run_id, call_id),
                 FOREIGN KEY (child_session_id) REFERENCES sessions(id),
                 FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+            );
+
+CREATE TABLE event_authority_keys (
+                session_id TEXT NOT NULL,
+                seq        INTEGER NOT NULL CHECK (seq > 0),
+                event_id   TEXT NOT NULL,
+                PRIMARY KEY (session_id, seq),
+                UNIQUE (event_id)
             );
 
 CREATE TABLE events (
@@ -1163,7 +1279,8 @@ CREATE TABLE sessions (
                 meta_json       TEXT NOT NULL
             , seen_at_ms INTEGER
                 CHECK (seen_at_ms IS NULL OR seen_at_ms >= 0), journal_mutation_generation INTEGER
-                NOT NULL DEFAULT 0 CHECK (journal_mutation_generation >= 0));
+                NOT NULL DEFAULT 0 CHECK (journal_mutation_generation >= 0), journal_event_seq_high_water INTEGER
+                NOT NULL DEFAULT 0 CHECK (journal_event_seq_high_water >= 0));
 
 CREATE TABLE workflow_graph_instances (
                 session_id       TEXT NOT NULL,
@@ -1251,8 +1368,35 @@ CREATE TRIGGER events_authority_deleted
                 UPDATE sessions
                    SET journal_mutation_generation = journal_mutation_generation + 1
                  WHERE id = OLD.session_id;
-                DELETE FROM session_projection_checkpoints
-                 WHERE session_id = OLD.session_id;
+                DELETE FROM event_authority_keys
+                 WHERE session_id = OLD.session_id AND seq = OLD.seq AND event_id = OLD.event_id;
+            END;
+
+CREATE TRIGGER events_authority_inserted
+            AFTER INSERT ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation +
+                       CASE WHEN NEW.seq <= journal_event_seq_high_water
+                                  OR EXISTS (
+                                      SELECT 1 FROM event_authority_keys
+                                       WHERE event_id = NEW.event_id
+                                  )
+                            THEN 1 ELSE 0 END,
+                       journal_event_seq_high_water = MAX(
+                           journal_event_seq_high_water,
+                           NEW.seq
+                       )
+                 WHERE id = NEW.session_id;
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = (
+                     SELECT session_id FROM event_authority_keys
+                      WHERE event_id = NEW.event_id
+                 )
+                   AND id <> NEW.session_id;
+                INSERT OR REPLACE INTO event_authority_keys(session_id, seq, event_id)
+                VALUES (NEW.session_id, NEW.seq, NEW.event_id);
             END;
 
 CREATE TRIGGER events_authority_updated
@@ -1260,13 +1404,36 @@ CREATE TRIGGER events_authority_updated
             ON events
             BEGIN
                 UPDATE sessions
-                   SET journal_mutation_generation = journal_mutation_generation + 1
-                 WHERE id = OLD.session_id;
-                UPDATE sessions
-                   SET journal_mutation_generation = journal_mutation_generation + 1
-                 WHERE id = NEW.session_id AND NEW.session_id <> OLD.session_id;
+                   SET journal_mutation_generation = journal_mutation_generation + 1,
+                       journal_event_seq_high_water = CASE
+                           WHEN id = NEW.session_id THEN MAX(
+                               journal_event_seq_high_water,
+                               NEW.seq
+                           )
+                           ELSE journal_event_seq_high_water
+                       END
+                 WHERE id IN (
+                     OLD.session_id,
+                     NEW.session_id,
+                     (SELECT session_id FROM event_authority_keys
+                       WHERE session_id = NEW.session_id AND seq = NEW.seq),
+                     (SELECT session_id FROM event_authority_keys
+                       WHERE event_id = NEW.event_id)
+                 );
+                DELETE FROM event_authority_keys
+                 WHERE session_id = OLD.session_id
+                   AND seq = OLD.seq
+                   AND event_id = OLD.event_id;
+                INSERT OR REPLACE INTO event_authority_keys(session_id, seq, event_id)
+                VALUES (NEW.session_id, NEW.seq, NEW.event_id);
+            END;
+
+CREATE TRIGGER sessions_authority_advanced
+            AFTER UPDATE OF journal_mutation_generation ON sessions
+            WHEN NEW.journal_mutation_generation <> OLD.journal_mutation_generation
+            BEGIN
                 DELETE FROM session_projection_checkpoints
-                 WHERE session_id IN (OLD.session_id, NEW.session_id);
+                 WHERE session_id = NEW.id;
             END;
 
 INSERT OR IGNORE INTO profile_meta(singleton, worker_generation) VALUES (1, 0);
@@ -1310,10 +1477,11 @@ pub(crate) fn migrate(connection: &mut Connection) -> StoreResult<MigrationOutco
 /// Restores the journal-mutation authority after an out-of-band table rebuild.
 ///
 /// SQLite drops table-owned triggers when `events` is dropped. A current-schema
-/// database can therefore lose both triggers without re-entering the migration
-/// chain. Trigger absence makes the time since the last trusted open
-/// unverifiable, so repair also advances every session's authority once and
-/// discards durable projection checkpoints in the same transaction.
+/// database can therefore lose its authority triggers without re-entering the
+/// migration chain. Trigger or shadow-key absence makes the time since the last
+/// trusted open unverifiable, so repair rebuilds the key shadow, advances every
+/// session's authority once, and discards durable projection checkpoints in the
+/// same transaction.
 pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> StoreResult<bool> {
     if event_authority_triggers_are_current(connection)? {
         return Ok(false);
@@ -1329,8 +1497,48 @@ pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> St
 
     transaction
         .execute_batch(
-            "DROP TRIGGER IF EXISTS events_authority_updated;
+            "DROP TRIGGER IF EXISTS events_authority_inserted;
+             DROP TRIGGER IF EXISTS events_authority_updated;
              DROP TRIGGER IF EXISTS events_authority_deleted;
+             DROP TRIGGER IF EXISTS sessions_authority_advanced;
+
+             CREATE TABLE IF NOT EXISTS event_authority_keys (
+                 session_id TEXT NOT NULL,
+                 seq        INTEGER NOT NULL CHECK (seq > 0),
+                 event_id   TEXT NOT NULL,
+                 PRIMARY KEY (session_id, seq),
+                 UNIQUE (event_id)
+             );
+             DELETE FROM event_authority_keys;
+             INSERT INTO event_authority_keys(session_id, seq, event_id)
+             SELECT session_id, seq, event_id FROM events;
+
+             CREATE TRIGGER events_authority_inserted
+             AFTER INSERT ON events
+             BEGIN
+                 UPDATE sessions
+                    SET journal_mutation_generation = journal_mutation_generation +
+                        CASE WHEN NEW.seq <= journal_event_seq_high_water
+                                   OR EXISTS (
+                                       SELECT 1 FROM event_authority_keys
+                                        WHERE event_id = NEW.event_id
+                                   )
+                             THEN 1 ELSE 0 END,
+                        journal_event_seq_high_water = MAX(
+                            journal_event_seq_high_water,
+                            NEW.seq
+                        )
+                  WHERE id = NEW.session_id;
+                 UPDATE sessions
+                    SET journal_mutation_generation = journal_mutation_generation + 1
+                  WHERE id = (
+                      SELECT session_id FROM event_authority_keys
+                       WHERE event_id = NEW.event_id
+                  )
+                    AND id <> NEW.session_id;
+                 INSERT OR REPLACE INTO event_authority_keys(session_id, seq, event_id)
+                 VALUES (NEW.session_id, NEW.seq, NEW.event_id);
+             END;
 
              CREATE TRIGGER events_authority_updated
              AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms,
@@ -1338,13 +1546,28 @@ pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> St
              ON events
              BEGIN
                  UPDATE sessions
-                    SET journal_mutation_generation = journal_mutation_generation + 1
-                  WHERE id = OLD.session_id;
-                 UPDATE sessions
-                    SET journal_mutation_generation = journal_mutation_generation + 1
-                  WHERE id = NEW.session_id AND NEW.session_id <> OLD.session_id;
-                 DELETE FROM session_projection_checkpoints
-                  WHERE session_id IN (OLD.session_id, NEW.session_id);
+                    SET journal_mutation_generation = journal_mutation_generation + 1,
+                        journal_event_seq_high_water = CASE
+                            WHEN id = NEW.session_id THEN MAX(
+                                journal_event_seq_high_water,
+                                NEW.seq
+                            )
+                            ELSE journal_event_seq_high_water
+                        END
+                  WHERE id IN (
+                      OLD.session_id,
+                      NEW.session_id,
+                      (SELECT session_id FROM event_authority_keys
+                        WHERE session_id = NEW.session_id AND seq = NEW.seq),
+                      (SELECT session_id FROM event_authority_keys
+                        WHERE event_id = NEW.event_id)
+                  );
+                 DELETE FROM event_authority_keys
+                  WHERE session_id = OLD.session_id
+                    AND seq = OLD.seq
+                    AND event_id = OLD.event_id;
+                 INSERT OR REPLACE INTO event_authority_keys(session_id, seq, event_id)
+                 VALUES (NEW.session_id, NEW.seq, NEW.event_id);
              END;
 
              CREATE TRIGGER events_authority_deleted
@@ -1353,12 +1576,28 @@ pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> St
                  UPDATE sessions
                     SET journal_mutation_generation = journal_mutation_generation + 1
                   WHERE id = OLD.session_id;
+                 DELETE FROM event_authority_keys
+                  WHERE session_id = OLD.session_id AND seq = OLD.seq AND event_id = OLD.event_id;
+             END;
+
+             CREATE TRIGGER sessions_authority_advanced
+             AFTER UPDATE OF journal_mutation_generation ON sessions
+             WHEN NEW.journal_mutation_generation <> OLD.journal_mutation_generation
+             BEGIN
                  DELETE FROM session_projection_checkpoints
-                  WHERE session_id = OLD.session_id;
+                  WHERE session_id = NEW.id;
              END;
 
              UPDATE sessions
-                SET journal_mutation_generation = journal_mutation_generation + 1;
+                SET journal_mutation_generation = journal_mutation_generation + 1,
+                    journal_event_seq_high_water = MAX(
+                        journal_event_seq_high_water,
+                        COALESCE(
+                            (SELECT MAX(seq) FROM events
+                              WHERE events.session_id = sessions.id),
+                            0
+                        )
+                    );
              DELETE FROM session_projection_checkpoints;",
         )
         .map_err(sqlite_error)?;
@@ -1369,14 +1608,35 @@ pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> St
 fn event_authority_triggers_are_current(connection: &Connection) -> StoreResult<bool> {
     connection
         .query_row(
-            "SELECT COUNT(*) = 2
-               FROM sqlite_master
-              WHERE type = 'trigger'
-                AND tbl_name = 'events'
-                AND (
-                    (name = 'events_authority_updated' AND instr(sql, 'payload_kind') > 0)
-                    OR name = 'events_authority_deleted'
-                )",
+            "SELECT
+                 EXISTS (
+                     SELECT 1 FROM sqlite_master
+                      WHERE type = 'table' AND name = 'event_authority_keys'
+                 )
+                 AND (
+                     SELECT COUNT(*) = 3
+                       FROM sqlite_master
+                      WHERE type = 'trigger'
+                        AND tbl_name = 'events'
+                        AND (
+                            (name = 'events_authority_inserted'
+                             AND instr(sql, 'event_authority_keys') > 0
+                             AND instr(sql, 'journal_event_seq_high_water') > 0)
+                            OR (name = 'events_authority_updated'
+                                AND instr(sql, 'payload_kind') > 0
+                                AND instr(sql, 'event_authority_keys') > 0
+                                AND instr(sql, 'journal_event_seq_high_water') > 0)
+                            OR (name = 'events_authority_deleted'
+                                AND instr(sql, 'event_authority_keys') > 0)
+                        )
+                 )
+                 AND EXISTS (
+                     SELECT 1 FROM sqlite_master
+                      WHERE type = 'trigger'
+                        AND tbl_name = 'sessions'
+                        AND name = 'sessions_authority_advanced'
+                        AND instr(sql, 'journal_mutation_generation') > 0
+                 )",
             [],
             |row| row.get(0),
         )

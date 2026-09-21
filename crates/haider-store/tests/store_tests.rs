@@ -367,6 +367,499 @@ fn journal_mutation_generation_covers_authoritative_rewrites_and_deletes_only() 
     assert_eq!(generation(), 3, "later appends preserve mutation authority");
 }
 
+#[test]
+fn trigger_matrix_vacuum_and_backup_restore_preserve_authority() {
+    let root = test_root();
+    let session = SessionId::new("verifier-trigger-matrix");
+    let store = must(Store::open(root.path()));
+    let mut batch = (1..=4)
+        .map(|ordinal| {
+            envelope(
+                &session,
+                &format!("verifier-trigger-{ordinal}"),
+                json!({"type": "user_message", "text": format!("row {ordinal}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    must(store.append(&mut batch));
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.pragma_update(None, "foreign_keys", false));
+    let generation = || {
+        must(connection.query_row(
+            "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+            [session.as_str()],
+            |row| row.get::<_, i64>(0),
+        ))
+    };
+    let mut expected = 0_i64;
+    for column in [
+        "session_id",
+        "seq",
+        "envelope_json",
+        "event_id",
+        "committed_at_ms",
+    ] {
+        must(connection.execute(
+            &format!("UPDATE events SET {column} = {column} WHERE session_id = ?1 AND seq = 1"),
+            [session.as_str()],
+        ));
+        expected += 1;
+        assert_eq!(
+            generation(),
+            expected,
+            "UPDATE OF {column} advances authority"
+        );
+    }
+    must(connection.execute(
+        "UPDATE events SET payload_kind = payload_kind WHERE session_id = ?1 AND seq = 1",
+        [session.as_str()],
+    ));
+    expected += 1;
+    assert_eq!(
+        generation(),
+        expected,
+        "projection-visible payload_kind advances authority"
+    );
+    must(connection.execute(
+        "DELETE FROM events WHERE session_id = ?1 AND seq >= 3",
+        [session.as_str()],
+    ));
+    expected += 2;
+    assert_eq!(
+        generation(),
+        expected,
+        "range truncation advances once per deleted row"
+    );
+    drop(connection);
+    drop(store);
+
+    let database_path = root.path().join("store.sqlite");
+    let vacuumed = must(Connection::open(&database_path));
+    must(vacuumed.execute_batch("VACUUM;"));
+    assert_eq!(
+        must(vacuumed.query_row(
+            "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+            [session.as_str()],
+            |row| row.get::<_, i64>(0),
+        )),
+        expected,
+        "VACUUM preserves durable generation"
+    );
+    let backup_path = root.path().join("store-backup.sqlite");
+    must(vacuumed.execute("VACUUM INTO ?1", [backup_path.to_string_lossy().as_ref()]));
+    drop(vacuumed);
+
+    let restored_root = test_root();
+    must(fs::copy(
+        &backup_path,
+        restored_root.path().join("store.sqlite"),
+    ));
+    let restored = must(Store::open(restored_root.path()));
+    let restored_connection = must(Connection::open(restored.database_path()));
+    assert_eq!(
+        must(restored_connection.query_row(
+            "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+            [session.as_str()],
+            |row| row.get::<_, i64>(0),
+        )),
+        expected,
+        "backup restore preserves durable generation"
+    );
+    let triggers: i64 = must(restored_connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger' AND name IN (
+             'events_authority_inserted',
+             'events_authority_updated',
+             'events_authority_deleted',
+             'sessions_authority_advanced'
+         )",
+        [],
+        |row| row.get(0),
+    ));
+    assert_eq!(
+        triggers, 4,
+        "backup restore preserves every authority trigger"
+    );
+    must(restored_connection.execute(
+        "UPDATE events SET committed_at_ms = committed_at_ms WHERE session_id = ?1 AND seq = 1",
+        [session.as_str()],
+    ));
+    assert_eq!(
+        must(restored_connection.query_row(
+            "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+            [session.as_str()],
+            |row| row.get::<_, i64>(0),
+        )),
+        expected + 1,
+        "restored trigger remains live"
+    );
+}
+
+#[test]
+fn sigkill_cannot_commit_event_without_generation_or_generation_without_event() {
+    const CHILD_DB: &str = "HAIDER_VERIFY_TRIGGER_CRASH_DB";
+    const CHILD_MARKER: &str = "HAIDER_VERIFY_TRIGGER_CRASH_MARKER";
+    const CHILD_MODE: &str = "HAIDER_VERIFY_TRIGGER_CRASH_MODE";
+    if let (Ok(database_path), Ok(marker_path), Ok(mode)) = (
+        std::env::var(CHILD_DB),
+        std::env::var(CHILD_MARKER),
+        std::env::var(CHILD_MODE),
+    ) {
+        let connection = must(Connection::open(database_path));
+        must(connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE events SET committed_at_ms = committed_at_ms + 1
+              WHERE session_id = 'verifier-trigger-crash' AND seq = 1;",
+        ));
+        if mode == "committed" {
+            must(connection.execute_batch("COMMIT;"));
+        }
+        must(fs::write(marker_path, b"ready"));
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
+
+    let root = test_root();
+    let session = SessionId::new("verifier-trigger-crash");
+    let store = must(Store::open(root.path()));
+    let mut batch = [envelope(
+        &session,
+        "verifier-trigger-crash-event",
+        json!({"type": "user_message", "text": "atomic"}),
+    )];
+    must(store.append(&mut batch));
+    let initial_committed_at = batch[0].committed_at_ms;
+    let database_path = store.database_path().to_path_buf();
+    drop(store);
+
+    let run_child = |mode: &str, expected_committed_at: u64, expected_generation: i64| {
+        let marker = root.path().join(format!("crash-{mode}.ready"));
+        let mut child = must(
+            std::process::Command::new(must(std::env::current_exe()))
+                .arg("--exact")
+                .arg("sigkill_cannot_commit_event_without_generation_or_generation_without_event")
+                .arg("--nocapture")
+                .env(CHILD_DB, &database_path)
+                .env(CHILD_MARKER, &marker)
+                .env(CHILD_MODE, mode)
+                .spawn(),
+        );
+        for _ in 0..1_000 {
+            if marker.exists() {
+                break;
+            }
+            if let Some(status) = must(child.try_wait()) {
+                panic!("crash child exited before marker: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "crash child never reached injection point");
+        must(child.kill());
+        let status = must(child.wait());
+        assert!(
+            !status.success(),
+            "SIGKILL child must not exit successfully"
+        );
+
+        let reopened = must(Store::open(root.path()));
+        let connection = must(Connection::open(reopened.database_path()));
+        let (committed_at, generation): (i64, i64) = must(connection.query_row(
+            "SELECT e.committed_at_ms, s.journal_mutation_generation
+               FROM events e JOIN sessions s ON s.id = e.session_id
+              WHERE e.session_id = ?1 AND e.seq = 1",
+            [session.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ));
+        assert_eq!(
+            u64::try_from(committed_at).expect("nonnegative committed time"),
+            expected_committed_at
+        );
+        assert_eq!(generation, expected_generation);
+        drop(connection);
+        drop(reopened);
+    };
+
+    run_child("uncommitted", initial_committed_at, 0);
+    run_child("committed", initial_committed_at + 1, 1);
+}
+
+#[test]
+fn event_insert_conflict_resolution_preserves_authority() {
+    let root = test_root();
+    let session = SessionId::new("verifier-replace-authority");
+    let store = must(Store::open(root.path()));
+    let mut batch = (1..=3)
+        .map(|ordinal| {
+            envelope(
+                &session,
+                &format!("verifier-replace-{ordinal}"),
+                json!({"type": "user_message", "text": format!("original {ordinal}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    must(store.append(&mut batch));
+    let before = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::fenced(3, 3),
+        1,
+        usize::MAX,
+        &["user_message"],
+    ));
+    let encode = |envelope: &RawEnvelope| {
+        let mut bytes = Vec::new();
+        must(write_envelope_messagepack(&mut bytes, envelope));
+        bytes
+    };
+    let mut replacement = batch[0].clone();
+    replacement.payload = json!({"type": "user_message", "text": "replacement 1"}).into();
+    let replacement_bytes = encode(&replacement);
+    let connection = must(Connection::open(store.database_path()));
+    let recursive_triggers: i64 =
+        must(connection.pragma_query_value(None, "recursive_triggers", |row| row.get(0)));
+    assert_eq!(
+        recursive_triggers, 0,
+        "raw SQLite default is part of this attack"
+    );
+    must(connection.execute(
+        "INSERT OR REPLACE INTO events(
+             session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            session.as_str(),
+            1_i64,
+            replacement_bytes,
+            replacement.event_id.as_str(),
+            i64::try_from(replacement.committed_at_ms).expect("test time fits SQLite"),
+            "user_message",
+        ],
+    ));
+    drop(connection);
+    let after_replace = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::fenced(3, 3),
+        1,
+        usize::MAX,
+        &["user_message"],
+    ));
+    assert_ne!(
+        after_replace.observed_mutation_generation, before.observed_mutation_generation,
+        "same-seq/same-id INSERT OR REPLACE changed authoritative bytes without advancing generation"
+    );
+
+    let mut ignored = replacement.clone();
+    ignored.payload = json!({"type": "user_message", "text": "must stay ignored"}).into();
+    let connection = must(Connection::open(store.database_path()));
+    assert_eq!(
+        must(connection.execute(
+            "INSERT OR IGNORE INTO events(
+                 session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session.as_str(),
+                1_i64,
+                encode(&ignored),
+                ignored.event_id.as_str(),
+                i64::try_from(ignored.committed_at_ms).expect("test time fits SQLite"),
+                "user_message",
+            ],
+        )),
+        0,
+        "the conflicting INSERT OR IGNORE is a no-op"
+    );
+    drop(connection);
+    let after_ignore = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::fenced(3, 3),
+        1,
+        usize::MAX,
+        &["user_message"],
+    ));
+    assert_eq!(
+        after_ignore.observed_mutation_generation, after_replace.observed_mutation_generation,
+        "an ignored insert must not advance authority"
+    );
+
+    let mut upsert = batch[1].clone();
+    upsert.payload = json!({"type": "user_message", "text": "upsert 2"}).into();
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute(
+        "INSERT INTO events(
+             session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id, seq) DO UPDATE SET
+             envelope_json = excluded.envelope_json,
+             event_id = excluded.event_id,
+             committed_at_ms = excluded.committed_at_ms,
+             payload_kind = excluded.payload_kind",
+        params![
+            session.as_str(),
+            2_i64,
+            encode(&upsert),
+            upsert.event_id.as_str(),
+            i64::try_from(upsert.committed_at_ms).expect("test time fits SQLite"),
+            "user_message",
+        ],
+    ));
+    drop(connection);
+    let after_upsert = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::fenced(3, 3),
+        1,
+        usize::MAX,
+        &["user_message"],
+    ));
+    assert_ne!(
+        after_upsert.observed_mutation_generation, after_ignore.observed_mutation_generation,
+        "ON CONFLICT DO UPDATE must take the update authority path"
+    );
+
+    let mut head_replacement = batch[2].clone();
+    head_replacement.payload = json!({"type": "user_message", "text": "replacement head"}).into();
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute(
+        "INSERT OR REPLACE INTO events(
+             session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            session.as_str(),
+            3_i64,
+            encode(&head_replacement),
+            head_replacement.event_id.as_str(),
+            i64::try_from(head_replacement.committed_at_ms).expect("test time fits SQLite"),
+            "user_message",
+        ],
+    ));
+    drop(connection);
+    let after_head_replace = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::fenced(3, 3),
+        1,
+        usize::MAX,
+        &["user_message"],
+    ));
+    assert_ne!(
+        after_head_replace.observed_mutation_generation, after_upsert.observed_mutation_generation,
+        "replacing the current head must also advance authority"
+    );
+
+    let other_session = SessionId::new("verifier-replace-authority-other");
+    let mut other_batch = [envelope(
+        &other_session,
+        "verifier-replace-other-1",
+        json!({"type": "user_message", "text": "other row"}),
+    )];
+    must(store.append(&mut other_batch));
+    let before_cross_session = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::after(0),
+        usize::MAX,
+        usize::MAX,
+        &["user_message"],
+    ));
+    let before_cross_other = must(store.read_reducer_page_with_boundary(
+        &other_session,
+        ReducerPageCursor::after(0),
+        usize::MAX,
+        usize::MAX,
+        &["user_message"],
+    ));
+    let mut cross_session_replacement = replacement.clone();
+    cross_session_replacement.session_id = other_session.clone();
+    cross_session_replacement.seq = 2;
+    cross_session_replacement.payload =
+        json!({"type": "user_message", "text": "moved unique event id"}).into();
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.pragma_update(None, "foreign_keys", false));
+    must(connection.execute(
+        "INSERT OR REPLACE INTO events(
+             session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            other_session.as_str(),
+            2_i64,
+            encode(&cross_session_replacement),
+            cross_session_replacement.event_id.as_str(),
+            i64::try_from(cross_session_replacement.committed_at_ms)
+                .expect("test time fits SQLite"),
+            "user_message",
+        ],
+    ));
+    drop(connection);
+    let after_cross_session = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::after(0),
+        usize::MAX,
+        usize::MAX,
+        &["user_message"],
+    ));
+    let after_cross_other = must(store.read_reducer_page_with_boundary(
+        &other_session,
+        ReducerPageCursor::after(0),
+        usize::MAX,
+        usize::MAX,
+        &["user_message"],
+    ));
+    assert_ne!(
+        after_cross_session.observed_mutation_generation,
+        before_cross_session.observed_mutation_generation,
+        "a unique-event-id REPLACE must invalidate the source session"
+    );
+    assert_ne!(
+        after_cross_other.observed_mutation_generation,
+        before_cross_other.observed_mutation_generation,
+        "a unique-event-id REPLACE must invalidate the destination session"
+    );
+}
+
+#[test]
+fn payload_kind_mutation_must_not_change_projection_without_authority() {
+    let root = test_root();
+    let session = SessionId::new("verifier-payload-kind-authority");
+    let store = must(Store::open(root.path()));
+    let mut batch = (1..=2)
+        .map(|ordinal| {
+            envelope(
+                &session,
+                &format!("verifier-payload-kind-{ordinal}"),
+                json!({"type": "user_message", "text": format!("row {ordinal}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    must(store.append(&mut batch));
+    let before = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::after(0),
+        usize::MAX,
+        usize::MAX,
+        &["user_message"],
+    ));
+    assert_eq!(before.envelopes.len(), 2);
+
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute(
+        "UPDATE events SET payload_kind = 'verifier_hidden_kind'
+         WHERE session_id = ?1 AND seq = 1",
+        [session.as_str()],
+    ));
+    drop(connection);
+    let after = must(store.read_reducer_page_with_boundary(
+        &session,
+        ReducerPageCursor::after(0),
+        usize::MAX,
+        usize::MAX,
+        &["user_message"],
+    ));
+    assert_eq!(
+        after.envelopes.len(),
+        1,
+        "payload_kind feeds projection selection"
+    );
+    assert_ne!(
+        after.observed_mutation_generation, before.observed_mutation_generation,
+        "projection-visible payload_kind mutation changed selected output without authority"
+    );
+}
+
 /// MUTATION CHECK: remove `timeline_key = ?3` from the checkpoint lookup.
 /// Expected runtime failure: the branch-B cache miss returns branch A's row.
 #[test]
@@ -735,12 +1228,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 30);
+        assert_eq!(must(store.schema_version()), 31);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 30);
+    assert_eq!(must(reopened.schema_version()), 31);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -751,6 +1244,7 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     for table in [
         "sessions",
         "events",
+        "event_authority_keys",
         "schema_migrations",
         "profile_meta",
         "menu_resolutions",
@@ -813,16 +1307,37 @@ fn mutation_generation_migration_discards_unauthenticated_checkpoints() {
 
     let legacy = must(Connection::open(&database_path));
     must(legacy.execute_batch(
-        "DROP TRIGGER events_authority_updated;
+        "DROP TRIGGER events_authority_inserted;
+         DROP TRIGGER events_authority_updated;
          DROP TRIGGER events_authority_deleted;
+         DROP TRIGGER sessions_authority_advanced;
+         DROP TABLE event_authority_keys;
+         ALTER TABLE sessions DROP COLUMN journal_event_seq_high_water;
          ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
-         DELETE FROM schema_migrations WHERE version = 30;
+         DELETE FROM schema_migrations WHERE version >= 30;
          PRAGMA user_version = 29;",
     ));
     drop(legacy);
 
     let migrated = must(Store::open(root.path()));
-    assert_eq!(must(migrated.schema_version()), 30);
+    assert_eq!(must(migrated.schema_version()), 31);
+    let connection = must(Connection::open(migrated.database_path()));
+    let migrated_generation: i64 = must(connection.query_row(
+        "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+        [session.as_str()],
+        |row| row.get(0),
+    ));
+    assert_eq!(
+        migrated_generation, 1,
+        "v30 replacement history is unknown and advances once at v31"
+    );
+    let authority_keys: i64 = must(connection.query_row(
+        "SELECT COUNT(*) FROM event_authority_keys WHERE session_id = ?1",
+        [session.as_str()],
+        |row| row.get(0),
+    ));
+    assert_eq!(authority_keys, 1, "v31 rebuilds the conflict shadow");
+    drop(connection);
     assert_eq!(
         must(migrated.session_projection_checkpoint(&session, "prompt_history", "main-agentless",)),
         None,
@@ -845,7 +1360,7 @@ fn sqlite_master_schema(database_path: &std::path::Path) -> Vec<(String, String,
 
 /// OWNER UPGRADE LAW: 0.0.962 shipped schema v24. Migrating that exact table,
 /// index, and column shape must converge byte-for-byte in `sqlite_master` with
-/// a freshly migrated store; v25-v30 are additive and must not fork schemas.
+/// a freshly migrated store; v25-v31 are additive and must not fork schemas.
 ///
 /// MUTATION CHECK: omit a guarded v26 column addition or create a different
 /// definition on either migration route. Expected RUNTIME failure: the exact
@@ -866,8 +1381,12 @@ fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
 
     let legacy = must(Connection::open(&legacy_path));
     must(legacy.execute_batch(
-        "DROP TRIGGER events_authority_updated;
+        "DROP TRIGGER events_authority_inserted;
+         DROP TRIGGER events_authority_updated;
          DROP TRIGGER events_authority_deleted;
+         DROP TRIGGER sessions_authority_advanced;
+         DROP TABLE event_authority_keys;
+         ALTER TABLE sessions DROP COLUMN journal_event_seq_high_water;
          ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
          DROP TABLE workspace_unavailable_runs;
          ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
@@ -893,7 +1412,7 @@ fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
     drop(legacy);
 
     let migrated = must(Store::open(legacy_root.path()));
-    assert_eq!(must(migrated.schema_version()), 30);
+    assert_eq!(must(migrated.schema_version()), 31);
     drop(migrated);
     assert_eq!(
         sqlite_master_schema(&legacy_path),
@@ -947,7 +1466,7 @@ fn typed_agent_install_job_schema_is_durable_and_bounded() {
     drop(connection);
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 30);
+    assert_eq!(must(reopened.schema_version()), 31);
     let connection = must(Connection::open(reopened.database_path()));
     let retained: (String, u32, u32) = must(connection.query_row(
         "SELECT state, completed, total FROM loom_cli_install_jobs WHERE job_id = ?1",
