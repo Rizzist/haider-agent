@@ -1599,6 +1599,16 @@ impl SessionFolder {
                                 .finished_at_ms
                                 .saturating_sub(terminal.started_at_ms),
                         );
+                    self.stats.orchestration.admission_us = self
+                        .stats
+                        .orchestration
+                        .admission_us
+                        .saturating_add(terminal.admission_us);
+                    self.stats.orchestration.scheduling_us = self
+                        .stats
+                        .orchestration
+                        .scheduling_us
+                        .saturating_add(terminal.scheduling_us);
                     self.stats.orchestration.screenshot_count = self
                         .stats
                         .orchestration

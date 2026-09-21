@@ -18986,6 +18986,7 @@ impl BrokerToolDispatcher {
         suffix: &str,
         mut prefix: Vec<EventPayload>,
     ) -> Result<(), HaiderError> {
+        let scheduling_started = Instant::now();
         let checkpoint =
             crate::orchestration::persist_checkpoint(&self.output.store, state).await?;
         prefix.extend(self.orchestration_extension(
@@ -18998,7 +18999,11 @@ impl BrokerToolDispatcher {
                 "checkpoint_ref": checkpoint,
             }),
         ));
-        self.append_orchestration_payloads(run_id, prefix).await
+        self.append_orchestration_payloads(run_id, prefix).await?;
+        state.scheduling_us = state
+            .scheduling_us
+            .saturating_add(elapsed_us(scheduling_started));
+        Ok(())
     }
 
     async fn finish_orchestration(
@@ -19008,8 +19013,14 @@ impl BrokerToolDispatcher {
         mut terminal: ScriptTerminalV1,
     ) -> Result<ToolDispatchResult, HaiderError> {
         if let Some(state) = state.as_deref_mut() {
+            let scheduling_started = Instant::now();
             let checkpoint =
                 crate::orchestration::persist_checkpoint(&self.output.store, state).await?;
+            state.scheduling_us = state
+                .scheduling_us
+                .saturating_add(elapsed_us(scheduling_started));
+            terminal.admission_us = state.admission_us;
+            terminal.scheduling_us = state.scheduling_us;
             terminal.final_checkpoint = Some(checkpoint.clone());
             terminal.receipt_refs = state.receipt_refs.clone();
             terminal.shape_digest = Some(state.admitted.shape_ref.ledger_digest.clone());
@@ -19752,6 +19763,7 @@ impl BrokerToolDispatcher {
             state
         } else {
             let admitted_at_ms = unix_time_ms();
+            let admission_started = Instant::now();
             match crate::orchestration::admit(
                 raw,
                 &self.orchestration_wrappers,
@@ -19762,6 +19774,7 @@ impl BrokerToolDispatcher {
             .await
             {
                 Ok(mut state) => {
+                    state.admission_us = elapsed_us(admission_started);
                     let mut events = self.orchestration_extension(
                         ORCHESTRATION_SCRIPT_EXTENSION,
                         &script_id,
@@ -19776,9 +19789,13 @@ impl BrokerToolDispatcher {
                             "source_ref": state.admitted.source_ref,
                         }),
                     );
+                    let scheduling_started = Instant::now();
                     let checkpoint =
                         crate::orchestration::persist_checkpoint(&self.output.store, &mut state)
                             .await?;
+                    state.scheduling_us = state
+                        .scheduling_us
+                        .saturating_add(elapsed_us(scheduling_started));
                     events.extend(self.orchestration_extension(
                         ORCHESTRATION_CHECKPOINT_EXTENSION,
                         &format!("{script_id}-initial"),
@@ -19793,12 +19810,13 @@ impl BrokerToolDispatcher {
                     state
                 }
                 Err(failure) => {
-                    let terminal = orchestration_rejection(
+                    let mut terminal = orchestration_rejection(
                         script_id,
                         failure.request_digest,
                         "admission_rejected",
                         format!("{}: {}", failure.code, failure.message),
                     );
+                    terminal.admission_us = elapsed_us(admission_started);
                     return self.finish_orchestration(run_id, None, terminal).await;
                 }
             }
@@ -20216,6 +20234,7 @@ impl BrokerToolDispatcher {
                 }
             }
 
+            let scheduling_started = Instant::now();
             let value = match crate::orchestration::evaluate_pure(
                 &node,
                 &state.admitted.nodes,
@@ -20246,6 +20265,9 @@ impl BrokerToolDispatcher {
             state.values[node.slot as usize] = Some(value);
             state.value_refs[node.slot as usize] = value_ref;
             state.next_slot = state.next_slot.saturating_add(1);
+            state.scheduling_us = state
+                .scheduling_us
+                .saturating_add(elapsed_us(scheduling_started));
             if is_inactive {
                 continue;
             }
@@ -20440,6 +20462,8 @@ fn orchestration_terminal(
         reason_code: Some(reason_code.into()),
         reason: (!reason.is_empty()).then_some(reason),
         counts: orchestration_counts(state),
+        admission_us: state.admission_us,
+        scheduling_us: state.scheduling_us,
         screenshot_count: state.retained_screenshot_count,
         screenshot_bytes: state.retained_screenshot_bytes,
         receipt_refs: Vec::new(),
@@ -20546,12 +20570,18 @@ fn orchestration_rejection(
         reason_code: Some(reason_code.into()),
         reason: Some(reason),
         counts: ScriptCountsV1::default(),
+        admission_us: 0,
+        scheduling_us: 0,
         screenshot_count: 0,
         screenshot_bytes: 0,
         receipt_refs: Vec::new(),
         started_at_ms: now,
         finished_at_ms: now,
     }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn orchestration_retry_limit(

@@ -20758,6 +20758,8 @@ mod run_identity_tests {
                 completed: 1,
                 ..Default::default()
             },
+            admission_us: 0,
+            scheduling_us: 0,
             screenshot_count: 0,
             screenshot_bytes: 0,
             receipt_refs: Vec::new(),

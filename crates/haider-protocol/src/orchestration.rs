@@ -435,6 +435,10 @@ pub struct ScriptTerminalV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub counts: ScriptCountsV1,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub admission_us: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub scheduling_us: u64,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub screenshot_count: u32,
     #[serde(default, skip_serializing_if = "is_zero_u64")]

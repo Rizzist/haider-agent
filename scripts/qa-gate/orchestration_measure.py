@@ -969,8 +969,8 @@ def orchestration_row(
         ),
         "wrapper_preexposed": True,
         "shape_cache_hit": False,
-        "admission_type_check_us": None,
-        "scheduling_checkpoint_us": None,
+        "admission_type_check_us": terminal_data.get("admission_us"),
+        "scheduling_checkpoint_us": terminal_data.get("scheduling_us"),
     }
 
 

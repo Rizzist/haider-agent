@@ -120,6 +120,10 @@ pub(crate) struct RuntimeStateV1 {
     pub(crate) rejected_calls: u32,
     pub(crate) unknown_calls: u32,
     #[serde(default)]
+    pub(crate) admission_us: u64,
+    #[serde(default)]
+    pub(crate) scheduling_us: u64,
+    #[serde(default)]
     pub(crate) retained_screenshot_count: u32,
     #[serde(default)]
     pub(crate) retained_screenshot_bytes: u64,
@@ -148,6 +152,10 @@ struct DurableCheckpointV1 {
     failed_calls: u32,
     rejected_calls: u32,
     unknown_calls: u32,
+    #[serde(default)]
+    admission_us: u64,
+    #[serde(default)]
+    scheduling_us: u64,
     #[serde(default)]
     retained_screenshot_count: u32,
     #[serde(default)]
@@ -359,6 +367,8 @@ pub(crate) async fn admit(
         failed_calls: 0,
         rejected_calls: 0,
         unknown_calls: 0,
+        admission_us: 0,
+        scheduling_us: 0,
         retained_screenshot_count: 0,
         retained_screenshot_bytes: 0,
         interaction_observation_invalidated: false,
@@ -647,6 +657,8 @@ pub(crate) async fn persist_checkpoint(
         failed_calls: state.failed_calls,
         rejected_calls: state.rejected_calls,
         unknown_calls: state.unknown_calls,
+        admission_us: state.admission_us,
+        scheduling_us: state.scheduling_us,
         retained_screenshot_count: state.retained_screenshot_count,
         retained_screenshot_bytes: state.retained_screenshot_bytes,
         interaction_observation_invalidated: state.interaction_observation_invalidated,
@@ -1076,6 +1088,8 @@ pub(crate) async fn recover_checkpoint(
         failed_calls: durable.failed_calls,
         rejected_calls: durable.rejected_calls,
         unknown_calls: durable.unknown_calls,
+        admission_us: durable.admission_us,
+        scheduling_us: durable.scheduling_us,
         retained_screenshot_count: durable.retained_screenshot_count,
         retained_screenshot_bytes: durable.retained_screenshot_bytes,
         interaction_observation_invalidated: durable.interaction_observation_invalidated,

@@ -2194,6 +2194,8 @@ fn orchestration_usage_reconciles_source_attempts_wall_and_unique_cas() {
             failed: 1,
             ..ScriptCountsV1::default()
         },
+        admission_us: 250,
+        scheduling_us: 750,
         screenshot_count: 2,
         screenshot_bytes: 30,
         receipt_refs: vec![receipt],
@@ -2226,6 +2228,8 @@ fn orchestration_usage_reconciles_source_attempts_wall_and_unique_cas() {
     assert_eq!(orchestration.child_attempts, 3);
     assert_eq!(orchestration.retries, 1);
     assert_eq!(orchestration.wall_ms, 125);
+    assert_eq!(orchestration.admission_us, 250);
+    assert_eq!(orchestration.scheduling_us, 750);
     assert_eq!(orchestration.canonical_bytes, 40);
     assert_eq!(orchestration.unique_cas_bytes, 30);
     assert_eq!(orchestration.screenshot_count, 2);
