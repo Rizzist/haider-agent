@@ -9820,7 +9820,7 @@ const WARM_JOURNAL_PROJECTION_PAYLOAD_KINDS: &[&str] = &[
     "item",
 ];
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WarmJournalRevision {
     head_seq: u64,
     head_event_id: EventId,
@@ -9982,20 +9982,28 @@ struct WarmJournalProjectionEntries {
 }
 
 const WARM_JOURNAL_PROJECTION_CACHE_LIMIT: usize = 16;
+const WARM_JOURNAL_PROJECTION_REDUCTION_STRIPES: usize = 16;
 
 /// Daemon-lifetime incremental projection for the two unconditional warm
-/// journal reads. The journal remains the sole authority: a cold entry is
-/// rebuilt by decoding every durable envelope, and every cached entry is
-/// checked against the store's transactionally sampled mutation generation
-/// and `(head_seq, event_id)` before use. Rewinds and retained-prefix mutations
-/// therefore replay from zero; ordinary head advances decode only indexed
-/// projection-bearing rows.
+/// journal reads. The journal remains the sole authority: a cold entry folds
+/// indexed projection-bearing rows from zero and adopts only the reducer's
+/// transactionally sampled mutation generation and `(head_seq, event_id)`
+/// boundary. Every cached entry is checked against that same authority sample
+/// before use. Rewinds and retained-prefix mutations therefore rebuild from
+/// zero; ordinary head advances decode only the relevant suffix.
 #[derive(Default)]
 pub(crate) struct WarmJournalProjectionCache {
     entries: StdMutex<WarmJournalProjectionEntries>,
+    reduction_gates: [tokio::sync::Mutex<()>; WARM_JOURNAL_PROJECTION_REDUCTION_STRIPES],
 }
 
 impl WarmJournalProjectionCache {
+    fn reduction_gate(&self, session_id: &SessionId) -> &tokio::sync::Mutex<()> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        session_id.hash(&mut hasher);
+        &self.reduction_gates[hasher.finish() as usize % WARM_JOURNAL_PROJECTION_REDUCTION_STRIPES]
+    }
+
     fn take(&self, session_id: &SessionId) -> Option<CachedWarmJournalProjection> {
         self.entries
             .lock()
@@ -10052,7 +10060,13 @@ impl WarmJournalProjectionCache {
                 .as_ref()
                 .is_some_and(|head| head.head_seq.saturating_add(1) == envelope.seq);
             if !contiguous {
-                entries.projections.remove(&envelope.session_id);
+                // Keep the last reducer-verified prefix. A publication gap can
+                // mean an append reached durable storage through a path that
+                // did not carry this process-local hint. Folding the later
+                // envelope would skip unknown facts, while dropping the
+                // prefix would force a replay from zero. The next lookup's
+                // exact-boundary reducer page safely catches up the complete
+                // suffix or rejects a rewind/same-sequence replacement.
                 continue;
             }
             cached
@@ -10126,6 +10140,11 @@ async fn reduce_warm_journal_projection_cached<T>(
     cache: &WarmJournalProjectionCache,
     select: impl Fn(&WarmJournalProjection) -> T,
 ) -> Result<T, HaiderError> {
+    // Turn start can overlap with the headless budget watcher. Serialize
+    // reductions for one session so only one caller can take the verified
+    // entry; a follower reuses the exact boundary installed by its leader
+    // instead of mistaking an in-flight entry for a cold cache.
+    let _reduction_guard = cache.reduction_gate(session_id).lock().await;
     let mut cached = cache.take(session_id).unwrap_or_default();
     'replay: loop {
         let started_from_cached_revision = cached.revision.is_some();
@@ -10136,98 +10155,10 @@ async fn reduce_warm_journal_projection_cached<T>(
             .map(|revision| revision.mutation_generation);
         if expected_revision.is_none() {
             cached.projection = WarmJournalProjection::default();
-            let suggested_head = store.latest_seq(session_id).await?;
-            let initial_boundary = StoreHandle::read_reducer_page_with_boundary_for(
-                store,
-                haider_platform::phase_trace::StoreReadCaller::WarmJournalProjection,
-                session_id,
-                if suggested_head == 0 {
-                    ReducerPageCursor::after(0)
-                } else {
-                    ReducerPageCursor::fenced(suggested_head, suggested_head)
-                },
-                1,
-                1,
-                WARM_JOURNAL_PROJECTION_PAYLOAD_KINDS,
-            )
-            .await?;
-            let target_head = initial_boundary
-                .observed_head
-                .as_ref()
-                .map_or(suggested_head, |(seq, _)| *seq);
-            mutation_generation = initial_boundary.observed_mutation_generation;
-            let mut last_revision = None;
-            while cursor < target_head {
-                let page = store
-                    .read_for(
-                        haider_platform::phase_trace::StoreReadCaller::WarmJournalProjection,
-                        session_id,
-                        cursor,
-                        256,
-                    )
-                    .await?;
-                if page.is_empty() {
-                    break;
-                }
-                let next_cursor = page
-                    .iter()
-                    .take_while(|envelope| envelope.seq <= target_head)
-                    .last()
-                    .map_or(cursor, |envelope| envelope.seq);
-                if next_cursor <= cursor {
-                    return Err(warm_projection_corrupt(
-                        "warm journal replay did not advance its sequence cursor",
-                    ));
-                }
-                for envelope in page
-                    .iter()
-                    .take_while(|envelope| envelope.seq <= target_head)
-                {
-                    cached.projection.observe_envelope(envelope)?;
-                }
-                cursor = next_cursor;
-                last_revision = page
-                    .iter()
-                    .take_while(|envelope| envelope.seq <= target_head)
-                    .last()
-                    .map(|envelope| WarmJournalRevision {
-                        head_seq: envelope.seq,
-                        head_event_id: envelope.event_id.clone(),
-                        mutation_generation: mutation_generation.unwrap_or(0),
-                    });
-            }
-            let final_boundary = StoreHandle::read_reducer_page_with_boundary_for(
-                store,
-                haider_platform::phase_trace::StoreReadCaller::WarmJournalProjection,
-                session_id,
-                if target_head == 0 {
-                    ReducerPageCursor::after(0)
-                } else {
-                    ReducerPageCursor::fenced(target_head, target_head)
-                },
-                1,
-                1,
-                WARM_JOURNAL_PROJECTION_PAYLOAD_KINDS,
-            )
-            .await?;
-            let stable = mutation_generation.is_some()
-                && final_boundary.observed_mutation_generation == mutation_generation
-                && match last_revision.as_ref() {
-                    Some(revision) => final_boundary.confirms_fence(
-                        revision.head_seq,
-                        &revision.head_event_id,
-                        revision.mutation_generation,
-                    ),
-                    None => target_head == 0 && final_boundary.observed_head.is_none(),
-                };
-            if mutation_generation.is_some() && !stable {
-                cached = CachedWarmJournalProjection::default();
-                continue 'replay;
-            }
-            expected_revision = stable.then_some(last_revision).flatten();
         }
 
         let mut final_revision = expected_revision.clone();
+        let mut prior_observed_revision: Option<WarmJournalRevision> = None;
         let mut exact_boundary = true;
         loop {
             let fence_seq = expected_revision.as_ref().map(|head| head.head_seq);
@@ -10276,6 +10207,18 @@ async fn reduce_warm_journal_projection_cached<T>(
                     cached = CachedWarmJournalProjection::default();
                     continue 'replay;
                 }
+            }
+            if let (Some(prior), Some(observed)) =
+                (prior_observed_revision.as_ref(), observed_revision.as_ref())
+            {
+                let compatible = observed.head_seq > prior.head_seq || observed == prior;
+                if !compatible {
+                    cached = CachedWarmJournalProjection::default();
+                    continue 'replay;
+                }
+            }
+            if observed_revision.is_some() {
+                prior_observed_revision = observed_revision.clone();
             }
             if page.envelopes.is_empty() {
                 final_revision = observed_revision.or(final_revision);

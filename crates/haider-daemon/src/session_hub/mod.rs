@@ -1085,8 +1085,8 @@ struct HubInner {
     /// from journal authority before installing a new revision.
     turn_setup_reductions: TurnSetupReductionCache,
     /// Small daemon-lifetime heads for unconditional turn-start projections.
-    /// Every use verifies the durable journal boundary; restart and revision
-    /// mismatch rebuild by decoding the authoritative journal from zero.
+    /// Every use verifies the durable journal boundary and mutation generation;
+    /// restart and authority mismatch rebuild from the same reducer sample.
     warm_journal_projections: Arc<WarmJournalProjectionCache>,
 }
 
