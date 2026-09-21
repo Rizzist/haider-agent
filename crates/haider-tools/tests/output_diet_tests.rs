@@ -39,7 +39,10 @@ fn output_type_adapters_keep_semantics_and_drop_deterministic_noise() {
     assert!(reduced.text.contains("error[E0308]"));
     assert!(reduced.text.contains("src/lib.rs:7:9"));
     assert!(reduced.text.contains("^^^^^"));
-    assert!(!reduced.text.contains("For more information"));
+    assert!(
+        reduced.text.contains("For more information"),
+        "sub-retention-window diagnostics stay byte-complete after ANSI stripping"
+    );
     assert!(!reduced.text.contains("\u{1b}["));
 
     let plain_rust = concat!(
@@ -82,8 +85,8 @@ fn output_type_adapters_keep_semantics_and_drop_deterministic_noise() {
 
     let github = format!(
         r#"[{{"id":42,"number":7,"title":"Keep me","state":"OPEN","author":{{"login":"octo","avatar_url":"{}"}},"url":"https://example/7","createdAt":"{}","node_id":"drop"}}]"#,
-        "drop".repeat(200),
-        "drop".repeat(200)
+        "drop".repeat(600),
+        "drop".repeat(600)
     );
     let reduced = reduce_tool_output("process_exec", &github, false);
     assert_eq!(reduced.adapter, OutputAdapter::GithubJson);
@@ -109,7 +112,7 @@ fn output_type_adapters_keep_semantics_and_drop_deterministic_noise() {
     assert!(reduced.text.contains("-old\n+new"));
     let log = format!(
         "commit abcdef\nAuthor: Example <example.invalid>\n{}\n    keep the subject\n",
-        "Date: yesterday\n".repeat(100)
+        "Date: yesterday\n".repeat(200)
     );
     let reduced = reduce_tool_output("process_exec", &log, false);
     assert!(reduced.text.contains("Author: Example"));
@@ -129,7 +132,7 @@ fn output_type_adapters_keep_semantics_and_drop_deterministic_noise() {
     assert!(!reduced.text.contains("Downloading"));
 
     let mut stack = String::from("RuntimeError: boom\nCaused by: root\n");
-    for index in 0..30 {
+    for index in 0..80 {
         stack.push_str(&format!("  at frame{index} (src/app.js:{index}:1)\n"));
     }
     let reduced = reduce_tool_output("process_exec", &stack, true);
@@ -139,20 +142,20 @@ fn output_type_adapters_keep_semantics_and_drop_deterministic_noise() {
     assert!(reduced.text.contains("Caused by: root"));
     assert!(reduced.text.contains("src/app.js:3:1"));
     assert!(!reduced.text.contains("src/app.js:10:1"));
-    assert!(reduced.text.contains("src/app.js:29:1"));
+    assert!(reduced.text.contains("src/app.js:79:1"));
 
-    let listing = (0..60)
+    let listing = (0..120)
         .map(|index| format!("src/file-{index:02}.rs"))
-        .chain((0..20).map(|index| format!("node_modules/pkg-{index}/index.js")))
+        .chain((0..40).map(|index| format!("node_modules/pkg-{index}/index.js")))
         .collect::<Vec<_>>()
         .join("\n");
     let reduced = reduce_tool_output("process_exec", &listing, false);
     assert_eq!(reduced.adapter, OutputAdapter::Directory);
     assert_eq!(reduced.before_tokens, estimated_text_tokens(&listing));
     assert!(reduced.after_tokens < reduced.before_tokens);
-    assert!(reduced.text.contains(".rs: 60"));
-    assert!(reduced.text.contains("node_modules/: 20 paths collapsed"));
-    assert!(!reduced.text.contains("pkg-19"));
+    assert!(reduced.text.contains(".rs: 120"));
+    assert!(reduced.text.contains("node_modules/: 40 paths collapsed"));
+    assert!(!reduced.text.contains("pkg-39"));
 }
 
 #[test]
@@ -205,7 +208,7 @@ fn fixture_token_estimates_cover_listing_grep_cargo_and_three_kib_read() {
         );
         let expected = match name {
             "listing" => (900, 57),
-            "grep" => (421, 55),
+            "grep" => (421, 421),
             "cargo" => (62, 62),
             "3kb-file" => (821, 60),
             _ => unreachable!("fixture names are closed"),
@@ -218,9 +221,9 @@ fn fixture_token_estimates_cover_listing_grep_cargo_and_three_kib_read() {
     let saved_per_million_input_tokens = total_saved.saturating_mul(1_000_000) / total_before;
     assert_eq!(
         (total_before, total_after, total_saved),
-        (2_204, 234, 1_970)
+        (2_204, 600, 1_604)
     );
-    assert_eq!(saved_per_million_input_tokens, 893_829);
+    assert_eq!(saved_per_million_input_tokens, 727_767);
     eprintln!(
         "output-diet cumulative measurement=provider_request_bytes_div_four_v1 before_tokens_estimate={total_before} after_tokens_estimate={total_after} saved_tokens_estimate={total_saved} saved_per_1m_input_tokens_estimate={saved_per_million_input_tokens}"
     );

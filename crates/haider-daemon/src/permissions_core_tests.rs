@@ -823,6 +823,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             .collect::<Vec<_>>(),
         [
             "list_tools",
+            "tool_script",
             "request_input",
             "plan",
             "loom_register",
@@ -1635,8 +1636,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     let registry = registered_tools();
     assert_eq!(
         authorized.len(),
-        30,
-        "27 former tools plus session_transcript, task_outcome, and test_run"
+        31,
+        "27 former tools plus session_transcript, task_outcome, test_run, and tool_script"
     );
     let full_prefix: usize = authorized
         .iter()
@@ -1652,18 +1653,18 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
                     .len()
         })
         .sum();
-    // Union full-pack pin: 971 redaction (+98), 972 task_outcome (+515),
-    // 972 output-ergonomics task_output capture-alias wording (+47), and
-    // 972-ax-testrun's platform-invariant `test_run` manifest (+974). The
-    // default instruct-pipe pack is unchanged: test_run is discovery-only.
+    // Union full-pack pin: 971 redaction, 972 task_outcome/output ergonomics,
+    // 972-ax-testrun, and the frozen typed `tool_script` DAG schema. The
+    // default instruct-pipe pack is unchanged: the large orchestration schema
+    // remains discovery-only until explicitly promoted.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_637;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_403;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_588;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_354;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_587;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_353;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 24_582;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_348;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1682,7 +1683,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         - 2;
     let expected_pipe_bytes =
         EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
-    assert_eq!(registered_tools().len(), 33);
+    assert_eq!(registered_tools().len(), 34);
     assert_eq!(
         tools.len(),
         10,

@@ -5719,6 +5719,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
         names,
         [
             "list_tools",
+            "tool_script",
             "request_input",
             // D4/E2 (v0.0.925): the actor-owned plan surface and the
             // plan-gated loom_register sit with request_input —

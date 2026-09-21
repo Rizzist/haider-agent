@@ -845,14 +845,14 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
     assert!(total_net > 0);
     let saved_per_million_input_tokens = total_net.saturating_mul(1_000_000)
         / i64::try_from(total_before).expect("fixture tokens fit i64");
-    // 972 output-ergonomics: the durable `capture` field (null here — no
-    // artifact in these fixtures) adds 16 bytes to each serialized preview;
-    // the net savings are unchanged.
+    // 972 orchestration output fidelity: sub-retention-window process output
+    // remains byte-complete, so the two short fixtures no longer earn an
+    // adapter elision. Keep this signed aggregate pinned at the model boundary.
     assert_eq!(
         (total_before, total_after, total_net),
-        (2_803, 1_057, 1_746)
+        (2_803, 1_347, 1_456)
     );
-    assert_eq!(saved_per_million_input_tokens, 622_904);
+    assert_eq!(saved_per_million_input_tokens, 519_443);
     eprintln!(
         "process-boundary cumulative measurement=provider_request_bytes_div_four_v1 before_tokens_estimate={total_before} after_tokens_estimate={total_after} net_tokens_saved_estimate={total_net} saved_per_1m_input_tokens_estimate={saved_per_million_input_tokens}"
     );

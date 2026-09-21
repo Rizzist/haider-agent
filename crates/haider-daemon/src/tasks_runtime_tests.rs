@@ -945,7 +945,7 @@ async fn completion_event_arrives_with_digest_and_paging_handle() {
         "task-digest-spawn",
         "process_exec",
         serde_json::json!({
-            "command": "i=0; while [ $i -lt 60 ]; do echo repeated-line; i=$((i+1)); done; \
+            "command": "i=0; while [ $i -lt 800 ]; do echo repeated-line; i=$((i+1)); done; \
                         echo done-marker",
             "background": true,
             "name": "digested",
@@ -969,7 +969,7 @@ async fn completion_event_arrives_with_digest_and_paging_handle() {
         "outcome arrives with the event: {notice}"
     );
     assert!(
-        notice.contains("852 output bytes"),
+        notice.contains("11212 output bytes"),
         "byte count arrives with the event: {notice}"
     );
     // The digest is the SAME reduced inline view a foreground process_exec
@@ -980,7 +980,7 @@ async fn completion_event_arrives_with_digest_and_paging_handle() {
         "digest section arrives with the event: {notice}"
     );
     assert!(
-        notice.contains("repeated-line [repeated 60×]"),
+        notice.contains("repeated-line [repeated 800×]"),
         "reduced view arrives with the event: {notice}"
     );
     assert!(
@@ -997,24 +997,37 @@ async fn completion_event_arrives_with_digest_and_paging_handle() {
         notice.contains(&hint),
         "paging handle arrives with the event: {notice}"
     );
-    let page = dispatch(
-        &dispatcher,
-        &run_id,
-        "task-digest-page",
-        "task_output",
-        serde_json::json!({"task_id": task.as_str(), "cursor": 0}),
-    )
-    .await;
     let artifact_bytes = store
         .get(&completed.artifact.clone().expect("completion artifact"))
         .await
         .expect("read completion artifact");
+    let mut cursor = 0;
+    let mut paged = String::new();
+    let mut pages = 0;
+    loop {
+        let page = dispatch(
+            &dispatcher,
+            &run_id,
+            &format!("task-digest-page-{pages}"),
+            "task_output",
+            serde_json::json!({"task_id": task.as_str(), "cursor": cursor}),
+        )
+        .await;
+        paged.push_str(page["chunk"].as_str().expect("page chunk"));
+        pages += 1;
+        if page["exhausted"] == true {
+            break;
+        }
+        let next = page["next_cursor"].as_u64().expect("next cursor");
+        assert!(next > cursor, "paging cursor advances");
+        cursor = next;
+    }
+    assert!(pages >= 2, "fixture crosses the paging boundary");
     assert_eq!(
-        page["chunk"],
-        String::from_utf8_lossy(&artifact_bytes).into_owned(),
+        paged,
+        String::from_utf8_lossy(&artifact_bytes),
         "the event's handle pages the full secret-redacted capture"
     );
-    assert_eq!(page["exhausted"], true);
 
     dispatcher.close().await.expect("dispatcher close");
     hub.shutdown().await.expect("hub shutdown");
@@ -1067,7 +1080,7 @@ async fn run_task_to_completion(label: &str, command: &str) -> (TaskCompleted, V
 #[tokio::test]
 async fn completion_digest_is_deterministic_and_matches_the_inline_reduction() {
     let command =
-        "i=0; while [ $i -lt 60 ]; do echo repeated-line; i=$((i+1)); done; echo done-marker";
+        "i=0; while [ $i -lt 800 ]; do echo repeated-line; i=$((i+1)); done; echo done-marker";
     let (first, first_bytes) = run_task_to_completion("task-digest-a", command).await;
     let (second, _) = run_task_to_completion("task-digest-b", command).await;
     assert_ne!(
