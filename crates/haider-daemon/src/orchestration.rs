@@ -37,6 +37,7 @@ pub(crate) struct WrapperV1 {
     pub(crate) digest: String,
     pub(crate) repeat_safe: bool,
     pub(crate) parallel_safe: bool,
+    pub(crate) effectless_actor: bool,
     pub(crate) input_schema: Value,
 }
 
@@ -84,6 +85,7 @@ pub(crate) struct PendingCallV1 {
     pub(crate) call_id: String,
     pub(crate) tool: String,
     pub(crate) args: StrictJson,
+    pub(crate) activation_ref: InstructEvidenceRef,
     pub(crate) started: bool,
 }
 
@@ -92,15 +94,40 @@ pub(crate) struct PendingCallV1 {
 pub(crate) struct RuntimeStateV1 {
     pub(crate) admitted: AdmittedScriptV1,
     pub(crate) values: Vec<Option<RuntimeValueV1>>,
+    pub(crate) value_refs: Vec<Option<InstructEvidenceRef>>,
     pub(crate) next_slot: u32,
     pub(crate) attempts: BTreeMap<u32, u8>,
-    pub(crate) pending_call: Option<PendingCallV1>,
+    pub(crate) pending_calls: BTreeMap<u32, PendingCallV1>,
     pub(crate) receipt_refs: Vec<InstructEvidenceRef>,
     pub(crate) checkpoint_ref: Option<InstructEvidenceRef>,
     pub(crate) completed_calls: u32,
     pub(crate) failed_calls: u32,
     pub(crate) rejected_calls: u32,
     pub(crate) unknown_calls: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum CheckpointValueV1 {
+    Ready { evidence_ref: InstructEvidenceRef },
+    Inactive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableCheckpointV1 {
+    version: u32,
+    admitted: AdmittedScriptV1,
+    values: Vec<Option<CheckpointValueV1>>,
+    next_slot: u32,
+    attempts: BTreeMap<u32, u8>,
+    pending_calls: BTreeMap<u32, PendingCallV1>,
+    receipt_refs: Vec<InstructEvidenceRef>,
+    checkpoint_ref: Option<InstructEvidenceRef>,
+    completed_calls: u32,
+    failed_calls: u32,
+    rejected_calls: u32,
+    unknown_calls: u32,
 }
 
 #[derive(Debug)]
@@ -129,7 +156,7 @@ struct ScriptManifest<'a> {
     catalog_digest: &'a str,
     shape: &'a InstructEvidenceRef,
     inputs: Vec<InstructEvidenceRef>,
-    limits: &'a Option<haider_protocol::orchestration::OrchestrationLimitsV1>,
+    limits: &'a haider_protocol::orchestration::OrchestrationLimitsV1,
 }
 
 pub(crate) async fn admit(
@@ -160,9 +187,11 @@ pub(crate) async fn admit(
                 exits,
                 read_groups,
             } => {
+                let mut nodes = nodes.clone();
+                normalize_node_configs(&mut nodes);
                 validate_inline_dag(
                     parameters,
-                    nodes,
+                    &nodes,
                     exits,
                     read_groups,
                     request.limits.as_ref(),
@@ -172,15 +201,15 @@ pub(crate) async fn admit(
                     code: error.code.into(),
                     message: error.to_string(),
                 })?;
-                validate_wrappers(nodes, wrappers, &digest)?;
-                validate_read_group_wrappers(nodes, read_groups, wrappers, &digest)?;
+                validate_wrappers(&nodes, wrappers, &digest)?;
+                validate_read_group_wrappers(&nodes, read_groups, wrappers, &digest)?;
                 let materialized =
-                    materialize_inline(parameters, nodes, exits, read_groups, &request, store)
+                    materialize_inline(parameters, &nodes, exits, read_groups, &request, store)
                         .await
                         .map_err(|error| admission_store_failure(&digest, error))?;
                 (
                     parameters.clone(),
-                    nodes.clone(),
+                    nodes,
                     exits.clone(),
                     read_groups.clone(),
                     materialized.definition_refs,
@@ -200,6 +229,16 @@ pub(crate) async fn admit(
                     });
                 }
                 let imported = import_shape(root, store, &digest).await?;
+                let mut normalized = imported.nodes.clone();
+                normalize_node_configs(&mut normalized);
+                if normalized != imported.nodes {
+                    return Err(AdmissionFailure {
+                        request_digest: digest,
+                        code: "non_normalized_config".into(),
+                        message: "referenced definitions omit canonical default config fields"
+                            .into(),
+                    });
+                }
                 validate_inline_dag(
                     &imported.parameters,
                     &imported.nodes,
@@ -261,6 +300,7 @@ pub(crate) async fn admit(
         total_bytes = total_bytes.saturating_add(bytes);
         input_refs.push(evidence_ref);
     }
+    let limits = effective_limits(request.limits.clone());
     let manifest = ScriptManifest {
         version: ORCHESTRATION_VERSION,
         transport: ORCHESTRATION_TRANSPORT,
@@ -269,7 +309,7 @@ pub(crate) async fn admit(
         catalog_digest: &request.catalog_digest,
         shape: &shape_ref,
         inputs: input_refs.clone(),
-        limits: &request.limits,
+        limits: &limits,
     };
     let mut parents = Vec::with_capacity(input_refs.len() + 1);
     parents.push(shape_ref.artifact.clone());
@@ -280,9 +320,10 @@ pub(crate) async fn admit(
     total_bytes = total_bytes.saturating_add(bytes);
     Ok(RuntimeStateV1 {
         values: vec![None; nodes.len()],
+        value_refs: vec![None; nodes.len()],
         next_slot: 0,
         attempts: BTreeMap::new(),
-        pending_call: None,
+        pending_calls: BTreeMap::new(),
         receipt_refs: Vec::new(),
         checkpoint_ref: None,
         completed_calls: 0,
@@ -301,11 +342,51 @@ pub(crate) async fn admit(
             exits,
             read_groups,
             inputs: request.inputs,
-            limits: effective_limits(request.limits),
+            limits,
             admitted_at_ms,
             canonical_bytes: total_bytes,
         },
     })
+}
+
+fn normalize_node_configs(nodes: &mut [InlineNodeV1]) {
+    for node in nodes {
+        let Some(config) = node.config.0.as_object_mut() else {
+            continue;
+        };
+        match node.evidence_type.as_str() {
+            "OrchValueV1" | "OrchArgumentV1" | "OrchAskPauseV1" | "OrchCallV1" | "OrchAwaitV1"
+            | "OrchBranchV1" | "OrchJoinV1" | "OrchExitV1" => {
+                config
+                    .entry("region")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+            }
+            _ => {}
+        }
+        match node.evidence_type.as_str() {
+            "OrchRetryPolicyV1" => {
+                config
+                    .entry("max_attempts")
+                    .or_insert_with(|| Value::from(1));
+            }
+            "OrchAskPauseV1" => {
+                config
+                    .entry("wait_ms")
+                    .or_insert_with(|| Value::from(120_000));
+            }
+            "OrchAwaitV1" => {
+                config
+                    .entry("on_error")
+                    .or_insert_with(|| Value::String("stop".into()));
+            }
+            "OrchJoinV1" => {
+                config
+                    .entry("omit_inactive")
+                    .or_insert_with(|| Value::Bool(false));
+            }
+            _ => {}
+        }
+    }
 }
 
 struct Materialized {
@@ -428,20 +509,100 @@ pub(crate) async fn put_evidence<T: Serialize>(
     ))
 }
 
+pub(crate) async fn persist_runtime_value(
+    store: &HubStoreHandle,
+    state: &RuntimeStateV1,
+    node: &InlineNodeV1,
+    value: &RuntimeValueV1,
+) -> Result<Option<InstructEvidenceRef>, haider_protocol::error::HaiderError> {
+    let RuntimeValueV1::Ready { value } = value else {
+        return Ok(None);
+    };
+    let kind = match node.evidence_type.as_str() {
+        "OrchValueV1" => "value",
+        "OrchArgumentV1" => "argument",
+        "OrchRetryPolicyV1" => "retry",
+        "OrchAskPauseV1" => "ask",
+        "OrchAwaitV1" => "await",
+        "OrchBranchV1" => "branch",
+        "OrchJoinV1" => "join",
+        "OrchExitV1" => "value",
+        _ => "value",
+    };
+    let payload = serde_json::json!({
+        "version": ORCHESTRATION_VERSION,
+        "kind": kind,
+        "script_id": state.admitted.script_id,
+        "slot": node.slot,
+        "value": value,
+    });
+    let mut parents = vec![
+        state.admitted.source_ref.artifact.clone(),
+        state.admitted.definition_refs[node.slot as usize]
+            .artifact
+            .clone(),
+    ];
+    parents.extend(node.ports.iter().filter_map(|port| {
+        state
+            .value_refs
+            .get(port.source_slot as usize)
+            .and_then(Option::as_ref)
+            .map(|evidence| evidence.artifact.clone())
+    }));
+    put_evidence(store, "OrchResultV1", &payload, parents)
+        .await
+        .map(|(evidence_ref, _)| Some(evidence_ref))
+}
+
 pub(crate) async fn persist_checkpoint(
     store: &HubStoreHandle,
     state: &mut RuntimeStateV1,
 ) -> Result<InstructEvidenceRef, haider_protocol::error::HaiderError> {
-    // The previous checkpoint is deliberately not a parent. Checkpoints are
-    // complete replay states, not a chain a recovery reader must chase.
+    let values = state
+        .values
+        .iter()
+        .zip(&state.value_refs)
+        .map(|(value, evidence_ref)| match value {
+            None => Ok(None),
+            Some(RuntimeValueV1::Inactive) => Ok(Some(CheckpointValueV1::Inactive)),
+            Some(RuntimeValueV1::Ready { .. }) => evidence_ref
+                .clone()
+                .map(|evidence_ref| Some(CheckpointValueV1::Ready { evidence_ref }))
+                .ok_or_else(|| {
+                    haider_protocol::error::HaiderError::new(
+                        haider_protocol::error::ErrorCode::Internal,
+                        "ready orchestration value has no immutable evidence ref",
+                        false,
+                    )
+                }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let durable = DurableCheckpointV1 {
+        version: ORCHESTRATION_VERSION,
+        admitted: state.admitted.clone(),
+        values,
+        next_slot: state.next_slot,
+        attempts: state.attempts.clone(),
+        pending_calls: state.pending_calls.clone(),
+        receipt_refs: state.receipt_refs.clone(),
+        checkpoint_ref: state.checkpoint_ref.clone(),
+        completed_calls: state.completed_calls,
+        failed_calls: state.failed_calls,
+        rejected_calls: state.rejected_calls,
+        unknown_calls: state.unknown_calls,
+    };
     let mut parents = vec![state.admitted.source_ref.artifact.clone()];
+    if let Some(previous) = state.checkpoint_ref.as_ref() {
+        parents.push(previous.artifact.clone());
+    }
     parents.extend(
         state
-            .receipt_refs
+            .value_refs
             .iter()
-            .map(|receipt| receipt.artifact.clone()),
+            .flatten()
+            .map(|value| value.artifact.clone()),
     );
-    let (checkpoint, _) = put_evidence(store, "OrchCheckpointV1", state, parents).await?;
+    let (checkpoint, _) = put_evidence(store, "OrchCheckpointV1", &durable, parents).await?;
     state.checkpoint_ref = Some(checkpoint.clone());
     Ok(checkpoint)
 }
@@ -522,21 +683,135 @@ pub(crate) async fn recover_checkpoint(
                 false,
             )
         })?;
-    let state = serde_json::from_slice::<RuntimeStateV1>(&bytes).map_err(|error| {
+    let durable = serde_json::from_slice::<DurableCheckpointV1>(&bytes).map_err(|error| {
         haider_protocol::error::HaiderError::new(
             haider_protocol::error::ErrorCode::StoreCorrupt,
             format!("orchestration checkpoint is malformed: {error}"),
             false,
         )
     })?;
-    if state.admitted.script_id != script_id {
+    if durable.version != ORCHESTRATION_VERSION || durable.admitted.script_id != script_id {
         return Err(haider_protocol::error::HaiderError::new(
             haider_protocol::error::ErrorCode::StoreCorrupt,
             "orchestration checkpoint identity changed",
             false,
         ));
     }
-    Ok(Some(state))
+    if durable.values.len() != durable.admitted.nodes.len() {
+        return Err(haider_protocol::error::HaiderError::new(
+            haider_protocol::error::ErrorCode::StoreCorrupt,
+            "orchestration checkpoint value directory length changed",
+            false,
+        ));
+    }
+    let mut values = Vec::with_capacity(durable.values.len());
+    let mut value_refs = Vec::with_capacity(durable.values.len());
+    for value in &durable.values {
+        match value {
+            None => {
+                values.push(None);
+                value_refs.push(None);
+            }
+            Some(CheckpointValueV1::Inactive) => {
+                values.push(Some(RuntimeValueV1::Inactive));
+                value_refs.push(None);
+            }
+            Some(CheckpointValueV1::Ready { evidence_ref }) => {
+                let payload = read_evidence(store, evidence_ref, "OrchResultV1", script_id)
+                    .await
+                    .map_err(|failure| {
+                        haider_protocol::error::HaiderError::new(
+                            haider_protocol::error::ErrorCode::StoreCorrupt,
+                            failure.message,
+                            false,
+                        )
+                    })?;
+                let payload: Value = serde_json::from_slice(&payload).map_err(|error| {
+                    haider_protocol::error::HaiderError::new(
+                        haider_protocol::error::ErrorCode::StoreCorrupt,
+                        format!("orchestration value evidence is malformed: {error}"),
+                        false,
+                    )
+                })?;
+                let value = payload
+                    .get("value")
+                    .or_else(|| payload.get("result"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        haider_protocol::error::HaiderError::new(
+                            haider_protocol::error::ErrorCode::StoreCorrupt,
+                            "orchestration value evidence has no value/result",
+                            false,
+                        )
+                    })?;
+                values.push(Some(RuntimeValueV1::Ready {
+                    value: StrictJson(value),
+                }));
+                value_refs.push(Some(evidence_ref.clone()));
+            }
+        }
+    }
+    Ok(Some(RuntimeStateV1 {
+        admitted: durable.admitted,
+        values,
+        value_refs,
+        next_slot: durable.next_slot,
+        attempts: durable.attempts,
+        pending_calls: durable.pending_calls,
+        receipt_refs: durable.receipt_refs,
+        checkpoint_ref: durable.checkpoint_ref,
+        completed_calls: durable.completed_calls,
+        failed_calls: durable.failed_calls,
+        rejected_calls: durable.rejected_calls,
+        unknown_calls: durable.unknown_calls,
+    }))
+}
+
+pub(crate) async fn recover_terminal(
+    store: &HubStoreHandle,
+    script_id: &str,
+) -> Result<Option<ScriptTerminalV1>, haider_protocol::error::HaiderError> {
+    let mut cursor = 0;
+    let mut terminal = None;
+    loop {
+        let page = StoreHandle::read_reducer_page_with_boundary(
+            store,
+            store.session_id(),
+            cursor,
+            REF_SCAN_PAGE,
+            REF_SCAN_BYTES,
+            &["item"],
+        )
+        .await?
+        .envelopes;
+        if page.is_empty() {
+            break;
+        }
+        for envelope in page {
+            cursor = envelope.seq;
+            let Ok(EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind, data },
+                ..
+            })) = envelope.payload.decode_event()
+            else {
+                continue;
+            };
+            if kind != haider_protocol::orchestration::ORCHESTRATION_TERMINAL_EXTENSION
+                || data.get("script_id").and_then(Value::as_str) != Some(script_id)
+            {
+                continue;
+            }
+            let decoded = serde_json::from_value::<ScriptTerminalV1>(data).map_err(|error| {
+                haider_protocol::error::HaiderError::new(
+                    haider_protocol::error::ErrorCode::StoreCorrupt,
+                    format!("orchestration terminal is malformed: {error}"),
+                    false,
+                )
+            })?;
+            terminal = Some(decoded);
+        }
+    }
+    Ok(terminal)
 }
 
 fn effective_limits(requested: Option<OrchestrationLimitsV1>) -> OrchestrationLimitsV1 {
@@ -871,11 +1146,23 @@ fn validate_read_group_wrappers(
 }
 
 fn depends_on(slot: u32, ancestor: u32, nodes: &[InlineNodeV1]) -> bool {
-    nodes.get(slot as usize).is_some_and(|node| {
-        node.ports.iter().any(|port| {
-            port.source_slot == ancestor || depends_on(port.source_slot, ancestor, nodes)
-        })
-    })
+    let mut stack = vec![slot];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(slot) = stack.pop() {
+        if !visited.insert(slot) {
+            continue;
+        }
+        let Some(node) = nodes.get(slot as usize) else {
+            continue;
+        };
+        for port in &node.ports {
+            if port.source_slot == ancestor {
+                return true;
+            }
+            stack.push(port.source_slot);
+        }
+    }
+    false
 }
 
 struct ImportedShape {

@@ -669,8 +669,9 @@ pub fn validate_inline_dag(
             ));
         }
         validate_ports(node)?;
-        validate_config(node, parameters.len(), &mut retry_attempts)?;
+        validate_config(node, parameters, &mut retry_attempts)?;
     }
+    validate_graph_semantics(nodes, read_groups)?;
     if exits.is_empty() {
         return Err(invalid("exit_count", "at least one exit is required"));
     }
@@ -758,6 +759,70 @@ fn validate_type(value: &OrchTypeV1, depth: usize) -> Result<(), OrchestrationEr
             validate_name(decoder_version, "opaque decoder_version")
         }
         _ => Ok(()),
+    }
+}
+
+fn validate_typed_value(
+    value: &Value,
+    value_type: &OrchTypeV1,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 32 {
+        return Err("value nesting exceeds 32".into());
+    }
+    match value_type {
+        OrchTypeV1::Null if value.is_null() => Ok(()),
+        OrchTypeV1::Bool if value.is_boolean() => Ok(()),
+        OrchTypeV1::I64 { min, max } => value
+            .as_i64()
+            .filter(|value| value >= min && value <= max)
+            .map(|_| ())
+            .ok_or_else(|| "value is outside declared i64 bounds".into()),
+        OrchTypeV1::String { max_bytes } => value
+            .as_str()
+            .filter(|value| value.len() <= *max_bytes as usize)
+            .map(|_| ())
+            .ok_or_else(|| "value is outside declared string bounds".into()),
+        OrchTypeV1::List { item, max_items } => {
+            let list = value
+                .as_array()
+                .filter(|list| list.len() <= *max_items as usize)
+                .ok_or("value is outside declared list bounds")?;
+            for value in list {
+                validate_typed_value(value, item, depth + 1)?;
+            }
+            Ok(())
+        }
+        OrchTypeV1::Record { fields } => {
+            let record = value
+                .as_object()
+                .filter(|record| record.len() == fields.len())
+                .ok_or("value is not the declared closed record")?;
+            for (field, field_type) in fields {
+                validate_typed_value(
+                    record.get(field).ok_or("record field missing")?,
+                    field_type,
+                    depth + 1,
+                )?;
+            }
+            Ok(())
+        }
+        OrchTypeV1::Union {
+            discriminant,
+            variants,
+        } => {
+            let record = value.as_object().ok_or("union value is not an object")?;
+            let tag = record
+                .get(discriminant)
+                .and_then(Value::as_str)
+                .ok_or("union discriminant missing")?;
+            let variant = variants.get(tag).ok_or("union variant unknown")?;
+            validate_typed_value(value, variant, depth + 1)
+        }
+        // Opaque values are daemon-issued capabilities. Shape is checked here;
+        // issuer provenance is checked when an admitted input is resolved.
+        OrchTypeV1::Opaque { .. } if value.is_object() => Ok(()),
+        _ => Err("value does not match its declared type".into()),
     }
 }
 
@@ -985,7 +1050,7 @@ fn decode_config<T: for<'de> Deserialize<'de>>(
 
 fn validate_config(
     node: &InlineNodeV1,
-    parameter_count: usize,
+    parameters: &[OrchTypeV1],
     retries: &mut BTreeMap<u32, u8>,
 ) -> Result<(), OrchestrationError> {
     let validate_region = |region: &[RegionStepV1], origin: Option<&Vec<u32>>| {
@@ -1048,7 +1113,7 @@ fn validate_config(
         "OrchValueV1" => {
             let config: ValueConfig = decode_config(node)?;
             validate_type(&config.value_type, 0)?;
-            validate_value_operator(node, &config, parameter_count)?;
+            validate_value_operator(node, &config, parameters)?;
             validate_region(&config.region, config.origin.as_ref())?;
         }
         "OrchBranchV1" => {
@@ -1133,7 +1198,7 @@ fn validate_digest(value: &str, slot: u32, name: &str) -> Result<(), Orchestrati
 fn validate_value_operator(
     node: &InlineNodeV1,
     config: &ValueConfig,
-    parameter_count: usize,
+    parameters: &[OrchTypeV1],
 ) -> Result<(), OrchestrationError> {
     let object = config.operand_config.0.as_object().ok_or_else(|| {
         invalid_slot(
@@ -1151,6 +1216,8 @@ fn validate_value_operator(
                     "literal requires only value",
                 ));
             }
+            validate_typed_value(&object["value"], &config.value_type, 0)
+                .map_err(|message| invalid_slot(node.slot, "literal_type", message))?;
         }
         ValueOperator::Input => {
             let parameter = object
@@ -1163,11 +1230,18 @@ fn validate_value_operator(
                         "input requires unsigned parameter",
                     )
                 })?;
-            if object.len() != 1 || parameter as usize >= parameter_count {
+            if object.len() != 1 || parameter as usize >= parameters.len() {
                 return Err(invalid_slot(
                     node.slot,
                     "operand_config",
                     "input parameter is not declared",
+                ));
+            }
+            if parameters.get(parameter as usize) != Some(&config.value_type) {
+                return Err(invalid_slot(
+                    node.slot,
+                    "input_type",
+                    "input value type does not match its parameter descriptor",
                 ));
             }
         }
@@ -1322,9 +1396,451 @@ fn validate_call_families(
                 "call must have exactly one Await",
             ));
         }
+        let await_config: AwaitConfig = decode_config(matching_awaits[0])?;
+        if call_config.region != arg_config.region
+            || call_config.region != ask_config.region
+            || call_config.region != await_config.region
+        {
+            return Err(invalid_slot(
+                node.slot,
+                "call_region",
+                "Argument/Ask/Call/Await regions must be identical",
+            ));
+        }
         *attempts = attempts
             .checked_add(u32::from(*retries.get(&retry.source_slot).unwrap_or(&1)))
             .ok_or_else(|| invalid("resource_overflow", "attempt count overflow"))?;
+    }
+    Ok(())
+}
+
+fn validate_graph_semantics(
+    nodes: &[InlineNodeV1],
+    read_groups: &[ReadGroupV1],
+) -> Result<(), OrchestrationError> {
+    for node in nodes {
+        if node
+            .ports
+            .iter()
+            .any(|port| port.role == OrchPortRoleV1::Index)
+        {
+            return Err(invalid_slot(
+                node.slot,
+                "index_port",
+                "inline definitions cannot contain index ports",
+            ));
+        }
+        validate_node_port_shape(node, nodes)?;
+        validate_region_guards(node, nodes)?;
+        for port in &node.ports {
+            let producer = &nodes[port.source_slot as usize];
+            validate_producer_output(node, port, producer)?;
+            validate_region_flow(node, port, producer)?;
+        }
+    }
+    validate_branch_coverage(nodes)?;
+    validate_call_ordering(nodes, read_groups)
+}
+
+fn ports_with_role(node: &InlineNodeV1, role: OrchPortRoleV1) -> Vec<&InlinePortV1> {
+    node.ports.iter().filter(|port| port.role == role).collect()
+}
+
+fn require_named_ports(
+    node: &InlineNodeV1,
+    role: OrchPortRoleV1,
+    expected: &[&str],
+) -> Result<(), OrchestrationError> {
+    let actual = ports_with_role(node, role);
+    if actual.len() != expected.len()
+        || actual
+            .iter()
+            .zip(expected)
+            .any(|(port, expected)| port.port != *expected)
+    {
+        return Err(invalid_slot(
+            node.slot,
+            "port_shape",
+            format!("{role:?} ports must be exactly {expected:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_roles(node: &InlineNodeV1, roles: &[OrchPortRoleV1]) -> Result<(), OrchestrationError> {
+    if node.ports.iter().any(|port| roles.contains(&port.role)) {
+        Err(invalid_slot(
+            node.slot,
+            "port_shape",
+            "node contains a port role excluded by its registry schema",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_node_port_shape(
+    node: &InlineNodeV1,
+    nodes: &[InlineNodeV1],
+) -> Result<(), OrchestrationError> {
+    use OrchPortRoleV1::{Alternative, Config, Control, Data};
+    match node.evidence_type.as_str() {
+        "OrchValueV1" => {
+            reject_roles(node, &[Alternative, Config])?;
+            let config: ValueConfig = decode_config(node)?;
+            let data = ports_with_role(node, Data);
+            let expected = match config.operator {
+                ValueOperator::Literal | ValueOperator::Input => Some(0),
+                ValueOperator::Get => Some(1),
+                ValueOperator::Index => Some(2),
+                ValueOperator::Record => config
+                    .operand_config
+                    .0
+                    .get("fields")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+                ValueOperator::List => None,
+                ValueOperator::Builtin => config
+                    .operand_config
+                    .0
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| match name {
+                        "not" | "len" | "sha256" | "parse_json" => 1,
+                        "slice" => 3,
+                        _ => 2,
+                    }),
+            };
+            if expected.is_some_and(|expected| data.len() != expected)
+                || matches!(config.value_type, OrchTypeV1::List { max_items, .. } if data.len() > max_items as usize)
+            {
+                return Err(invalid_slot(
+                    node.slot,
+                    "value_arity",
+                    "value operator data-port arity does not match its config",
+                ));
+            }
+            Ok(())
+        }
+        "OrchArgumentV1" => {
+            require_named_ports(node, Data, &["args"])?;
+            if ports_with_role(node, Control).len() > 1 {
+                return Err(invalid_slot(
+                    node.slot,
+                    "port_shape",
+                    "argument accepts at most one control port",
+                ));
+            }
+            reject_roles(node, &[Alternative, Config])
+        }
+        "OrchRetryPolicyV1" => {
+            if node.ports.is_empty() {
+                Ok(())
+            } else {
+                Err(invalid_slot(
+                    node.slot,
+                    "port_shape",
+                    "retry policy cannot have parents",
+                ))
+            }
+        }
+        "OrchAskPauseV1" => {
+            require_named_ports(node, Data, &["args"])?;
+            if ports_with_role(node, Control).len() > 1 {
+                return Err(invalid_slot(
+                    node.slot,
+                    "port_shape",
+                    "ask accepts at most one prior-settlement control port",
+                ));
+            }
+            reject_roles(node, &[Alternative, Config])
+        }
+        "OrchCallV1" => {
+            require_named_ports(node, Data, &["args"])?;
+            require_named_ports(node, Control, &["permit"])?;
+            require_named_ports(node, Config, &["retry"])?;
+            reject_roles(node, &[Alternative])
+        }
+        "OrchAwaitV1" => {
+            require_named_ports(node, Data, &["operation"])?;
+            reject_roles(node, &[Control, Alternative, Config])
+        }
+        "OrchBranchV1" => {
+            require_named_ports(node, Data, &["subject"])?;
+            if ports_with_role(node, Control).len() > 1 {
+                return Err(invalid_slot(
+                    node.slot,
+                    "port_shape",
+                    "branch accepts at most one control port",
+                ));
+            }
+            reject_roles(node, &[Alternative, Config])
+        }
+        "OrchJoinV1" => {
+            let mode = node.config.0["mode"].as_str().unwrap_or_default();
+            reject_roles(node, &[Config])?;
+            if mode == "select" {
+                require_named_ports(node, Data, &["choice"])?;
+                let alternatives = ports_with_role(node, Alternative);
+                let choice = &nodes[node.ports[0].source_slot as usize];
+                let cases = choice.config.0["cases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>();
+                if choice.evidence_type != "OrchBranchV1"
+                    || alternatives.len() != cases.len()
+                    || alternatives
+                        .iter()
+                        .zip(cases)
+                        .any(|(port, case)| port.selector.as_deref() != Some(case))
+                {
+                    return Err(invalid_slot(
+                        node.slot,
+                        "select_join",
+                        "select join alternatives must cover its branch cases in order",
+                    ));
+                }
+            } else if !ports_with_role(node, Alternative).is_empty() {
+                return Err(invalid_slot(
+                    node.slot,
+                    "all_join",
+                    "all join cannot contain alternatives",
+                ));
+            }
+            Ok(())
+        }
+        "OrchExitV1" => {
+            require_named_ports(node, Data, &["value"])?;
+            if ports_with_role(node, Control).len() > 1 {
+                return Err(invalid_slot(
+                    node.slot,
+                    "port_shape",
+                    "exit accepts at most one all-settled control port",
+                ));
+            }
+            reject_roles(node, &[Alternative, Config])
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_producer_output(
+    consumer: &InlineNodeV1,
+    port: &InlinePortV1,
+    producer: &InlineNodeV1,
+) -> Result<(), OrchestrationError> {
+    let allowed = match port.role {
+        OrchPortRoleV1::Data => match producer.evidence_type.as_str() {
+            "OrchValueV1" | "OrchArgumentV1" | "OrchAwaitV1" | "OrchJoinV1" => {
+                port.output == "value"
+            }
+            "OrchCallV1" => port.output == "operation",
+            "OrchBranchV1" => port.output == "choice",
+            _ => false,
+        },
+        OrchPortRoleV1::Control => match producer.evidence_type.as_str() {
+            "OrchValueV1" | "OrchArgumentV1" | "OrchAwaitV1" | "OrchJoinV1" | "OrchBranchV1" => {
+                port.output == "settled"
+            }
+            "OrchAskPauseV1" => port.output == "permit",
+            _ => false,
+        },
+        OrchPortRoleV1::Guard => {
+            producer.evidence_type == "OrchBranchV1" && port.output == "choice"
+        }
+        OrchPortRoleV1::Alternative => {
+            matches!(port.output.as_str(), "value" | "settled")
+                && matches!(
+                    producer.evidence_type.as_str(),
+                    "OrchValueV1" | "OrchArgumentV1" | "OrchAwaitV1" | "OrchJoinV1"
+                )
+        }
+        OrchPortRoleV1::Config => {
+            producer.evidence_type == "OrchRetryPolicyV1" && port.output == "policy"
+        }
+        OrchPortRoleV1::Index => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(invalid_slot(
+            consumer.slot,
+            "producer_output",
+            format!(
+                "{}:{} cannot consume {}.{} as {:?}",
+                consumer.evidence_type, port.port, producer.evidence_type, port.output, port.role
+            ),
+        ))
+    }
+}
+
+fn node_region(node: &InlineNodeV1) -> Vec<RegionStepV1> {
+    node.config
+        .0
+        .get("region")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn validate_region_guards(
+    node: &InlineNodeV1,
+    nodes: &[InlineNodeV1],
+) -> Result<(), OrchestrationError> {
+    let region = node_region(node);
+    let guards = ports_with_role(node, OrchPortRoleV1::Guard);
+    if guards.len() != region.len() {
+        return Err(invalid_slot(
+            node.slot,
+            "region_guard",
+            "region path and guard ports must have identical lengths",
+        ));
+    }
+    for (guard, step) in guards.iter().zip(&region) {
+        let producer = &nodes[guard.source_slot as usize];
+        let cases = producer.config.0["cases"].as_array();
+        if guard.source_slot != step.branch_slot
+            || guard.selector.as_deref() != Some(step.case.as_str())
+            || producer.evidence_type != "OrchBranchV1"
+            || cases.is_none_or(|cases| {
+                !cases
+                    .iter()
+                    .any(|case| case.as_str() == Some(step.case.as_str()))
+            })
+        {
+            return Err(invalid_slot(
+                node.slot,
+                "region_guard",
+                "guard does not prove the declared enclosing branch case",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_region_flow(
+    consumer: &InlineNodeV1,
+    port: &InlinePortV1,
+    producer: &InlineNodeV1,
+) -> Result<(), OrchestrationError> {
+    if matches!(port.role, OrchPortRoleV1::Guard | OrchPortRoleV1::Config) {
+        return Ok(());
+    }
+    let consumer_region = node_region(consumer);
+    let producer_region = node_region(producer);
+    let ordinary = consumer_region.starts_with(&producer_region);
+    let selected_escape = port.role == OrchPortRoleV1::Alternative
+        && producer_region.len() == consumer_region.len() + 1
+        && producer_region.starts_with(&consumer_region)
+        && port.selector.as_deref() == producer_region.last().map(|step| step.case.as_str());
+    if ordinary || selected_escape {
+        Ok(())
+    } else {
+        Err(invalid_slot(
+            consumer.slot,
+            "region_leak",
+            format!("port {} leaks a value across structured regions", port.port),
+        ))
+    }
+}
+
+fn validate_branch_coverage(nodes: &[InlineNodeV1]) -> Result<(), OrchestrationError> {
+    for node in nodes
+        .iter()
+        .filter(|node| node.evidence_type == "OrchBranchV1")
+    {
+        let subject = port(node, OrchPortRoleV1::Data, "subject")
+            .map(|port| &nodes[port.source_slot as usize]);
+        let expected = subject.and_then(|producer| match producer.evidence_type.as_str() {
+            "OrchValueV1" => serde_json::from_value::<ValueConfig>(producer.config.0.clone())
+                .ok()
+                .and_then(|config| match config.value_type {
+                    OrchTypeV1::Bool => Some(vec!["true".to_owned(), "false".to_owned()]),
+                    OrchTypeV1::Union { variants, .. } => {
+                        Some(variants.into_keys().collect::<Vec<_>>())
+                    }
+                    _ => None,
+                }),
+            "OrchAwaitV1" => Some(if producer.config.0["on_error"].as_str() == Some("value") {
+                vec!["completed".into(), "recoverable_error".into()]
+            } else {
+                vec!["completed".into()]
+            }),
+            _ => None,
+        });
+        let actual = node.config.0["cases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if expected.is_none_or(|expected| expected != actual) {
+            return Err(invalid_slot(
+                node.slot,
+                "branch_coverage",
+                "branch cases are not the exact exhaustive subject variants",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn regions_are_exclusive(left: &[RegionStepV1], right: &[RegionStepV1]) -> bool {
+    left.iter()
+        .zip(right)
+        .any(|(left, right)| left.branch_slot == right.branch_slot && left.case != right.case)
+}
+
+fn validate_call_ordering(
+    nodes: &[InlineNodeV1],
+    read_groups: &[ReadGroupV1],
+) -> Result<(), OrchestrationError> {
+    let calls = nodes
+        .iter()
+        .filter(|node| node.evidence_type == "OrchCallV1")
+        .collect::<Vec<_>>();
+    for (index, earlier) in calls.iter().enumerate() {
+        for later in calls.iter().skip(index + 1) {
+            if read_groups.iter().any(|group| {
+                group.members.contains(&earlier.slot) && group.members.contains(&later.slot)
+            }) {
+                continue;
+            }
+            if regions_are_exclusive(&node_region(earlier), &node_region(later)) {
+                continue;
+            }
+            let earlier_await = nodes.iter().find(|node| {
+                node.evidence_type == "OrchAwaitV1"
+                    && port(node, OrchPortRoleV1::Data, "operation")
+                        .is_some_and(|operation| operation.source_slot == earlier.slot)
+            });
+            let later_ask = port(later, OrchPortRoleV1::Control, "permit")
+                .map(|permit| &nodes[permit.source_slot as usize]);
+            let ordered = earlier_await.is_some_and(|settled| {
+                later_ask.is_some_and(|ask| {
+                    ports_with_role(ask, OrchPortRoleV1::Control)
+                        .into_iter()
+                        .any(|control| {
+                            control.output == "settled"
+                                && (control.source_slot == settled.slot
+                                    || node_depends_on(control.source_slot, settled.slot, nodes))
+                        })
+                })
+            });
+            if !ordered {
+                return Err(invalid_slot(
+                    later.slot,
+                    "unordered_calls",
+                    format!(
+                        "potentially co-active calls {} and {} require an Await-settled ordering edge or one read group",
+                        earlier.slot, later.slot
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1345,6 +1861,8 @@ fn validate_read_groups(
             return Err(invalid("read_group", "invalid or duplicate read group"));
         }
         let mut previous = None;
+        let first = group.members[0];
+        let mut awaits = Vec::new();
         for member in &group.members {
             if previous.is_some_and(|previous| previous >= *member) || !members.insert(*member) {
                 return Err(invalid(
@@ -1362,10 +1880,79 @@ fn validate_read_groups(
                     "only call definitions may be grouped",
                 ));
             }
+            if node.ports.iter().any(|port| port.source_slot >= first) {
+                return Err(invalid_slot(
+                    *member,
+                    "read_group_preflight",
+                    "every group member dependency must be ready before the first call slot",
+                ));
+            }
+            let await_slot = nodes
+                .iter()
+                .find(|candidate| {
+                    candidate.evidence_type == "OrchAwaitV1"
+                        && port(candidate, OrchPortRoleV1::Data, "operation")
+                            .is_some_and(|operation| operation.source_slot == *member)
+                })
+                .map(|node| node.slot)
+                .ok_or_else(|| {
+                    invalid_slot(*member, "read_group_barrier", "group call has no Await")
+                })?;
+            awaits.push(await_slot);
             previous = Some(*member);
+        }
+        let group_region = node_region(&nodes[first as usize]);
+        let barrier = nodes.iter().find(|candidate| {
+            candidate.evidence_type == "OrchJoinV1"
+                && candidate.config.0["mode"].as_str() == Some("all")
+                && node_region(candidate) == group_region
+                && awaits.iter().all(|await_slot| {
+                    candidate
+                        .ports
+                        .iter()
+                        .any(|port| port.source_slot == *await_slot)
+                })
+        });
+        let Some(barrier) = barrier else {
+            return Err(invalid(
+                "read_group_barrier",
+                format!("read group {} has no all-join over every Await", group.id),
+            ));
+        };
+        for exit in nodes.iter().filter(|candidate| {
+            candidate.evidence_type == "OrchExitV1"
+                && !regions_are_exclusive(&node_region(candidate), &group_region)
+        }) {
+            if !node_depends_on(exit.slot, barrier.slot, nodes) {
+                return Err(invalid_slot(
+                    exit.slot,
+                    "read_group_barrier",
+                    format!("exit does not depend on read group {} barrier", group.id),
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn node_depends_on(slot: u32, ancestor: u32, nodes: &[InlineNodeV1]) -> bool {
+    let mut stack = vec![slot];
+    let mut visited = HashSet::new();
+    while let Some(slot) = stack.pop() {
+        if !visited.insert(slot) {
+            continue;
+        }
+        let Some(node) = nodes.get(slot as usize) else {
+            continue;
+        };
+        for port in &node.ports {
+            if port.source_slot == ancestor {
+                return true;
+            }
+            stack.push(port.source_slot);
+        }
+    }
+    false
 }
 
 /// Pinned canonical JSON encoding for pipe rows.  Object keys are sorted by
@@ -1458,6 +2045,80 @@ pub fn request_digest(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn port(role: OrchPortRoleV1, port: &str, source_slot: u32, output: &str) -> InlinePortV1 {
+        InlinePortV1 {
+            role,
+            port: port.into(),
+            source_slot,
+            output: output.into(),
+            selector: None,
+        }
+    }
+
+    fn one_call_graph() -> Vec<InlineNodeV1> {
+        let digest = format!("blake3:{}", "0".repeat(64));
+        vec![
+            InlineNodeV1 {
+                slot: 0,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator": "literal",
+                    "type": {"kind":"record","fields":{}},
+                    "operand_config": {"value": {}},
+                    "region": []
+                })),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 1,
+                evidence_type: "OrchArgumentV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,"region":[]
+                })),
+                ports: vec![port(OrchPortRoleV1::Data, "args", 0, "value")],
+            },
+            InlineNodeV1 {
+                slot: 2,
+                evidence_type: "OrchRetryPolicyV1".into(),
+                config: StrictJson(serde_json::json!({"max_attempts":1})),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 3,
+                evidence_type: "OrchAskPauseV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,
+                    "owner_call_slot":4,"wait_ms":120000,"region":[]
+                })),
+                ports: vec![port(OrchPortRoleV1::Data, "args", 1, "value")],
+            },
+            InlineNodeV1 {
+                slot: 4,
+                evidence_type: "OrchCallV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,"region":[]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "args", 1, "value"),
+                    port(OrchPortRoleV1::Control, "permit", 3, "permit"),
+                    port(OrchPortRoleV1::Config, "retry", 2, "policy"),
+                ],
+            },
+            InlineNodeV1 {
+                slot: 5,
+                evidence_type: "OrchAwaitV1".into(),
+                config: StrictJson(serde_json::json!({"on_error":"stop","region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "operation", 4, "operation")],
+            },
+            InlineNodeV1 {
+                slot: 6,
+                evidence_type: "OrchExitV1".into(),
+                config: StrictJson(serde_json::json!({"mode":"return","region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "value", 5, "value")],
+            },
+        ]
+    }
+
     #[test]
     fn strict_json_rejects_nested_duplicates_and_floats() {
         let duplicate = br#"{"version":1,"transport":"instruct-pipe-dag-v1","catalog_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000","graph":{"kind":"inline","parameters":[],"nodes":[{"slot":0,"evidence_type":"OrchValueV1","config":{"a":1,"a":2},"ports":[]}],"exits":[0],"read_groups":[]},"inputs":[]}"#;
@@ -1495,6 +2156,149 @@ mod tests {
                 .expect_err("non-dense graph must reject")
                 .code,
             "non_dense_slot"
+        );
+    }
+
+    #[test]
+    fn one_call_family_has_exact_typed_ports_and_settlement() {
+        let nodes = one_call_graph();
+        let validated = validate_inline_dag(&[], &nodes, &[6], &[], None)
+            .expect("one complete call family is valid");
+        assert_eq!(validated.call_attempt_bound, 1);
+        assert_eq!(validated.parent_entries, 7);
+    }
+
+    #[test]
+    fn producer_outputs_and_branch_coverage_fail_closed() {
+        let mut wrong_output = one_call_graph();
+        wrong_output[6].ports[0].output = "operation".into();
+        assert_eq!(
+            validate_inline_dag(&[], &wrong_output, &[6], &[], None)
+                .expect_err("Await.operation is not a declared output")
+                .code,
+            "producer_output"
+        );
+
+        let branch = vec![
+            InlineNodeV1 {
+                slot: 0,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":{"kind":"bool"},
+                    "operand_config":{"value":true},"region":[]
+                })),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 1,
+                evidence_type: "OrchBranchV1".into(),
+                config: StrictJson(serde_json::json!({"cases":["true"],"region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "subject", 0, "value")],
+            },
+            InlineNodeV1 {
+                slot: 2,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal","type":{"kind":"null"},
+                    "operand_config":{"value":null},
+                    "region":[{"branch_slot":1,"case":"true"}]
+                })),
+                ports: vec![InlinePortV1 {
+                    role: OrchPortRoleV1::Guard,
+                    port: "guard_true".into(),
+                    source_slot: 1,
+                    output: "choice".into(),
+                    selector: Some("true".into()),
+                }],
+            },
+            InlineNodeV1 {
+                slot: 3,
+                evidence_type: "OrchExitV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "mode":"return","region":[{"branch_slot":1,"case":"true"}]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "value", 2, "value"),
+                    InlinePortV1 {
+                        role: OrchPortRoleV1::Guard,
+                        port: "guard_true".into(),
+                        source_slot: 1,
+                        output: "choice".into(),
+                        selector: Some("true".into()),
+                    },
+                ],
+            },
+        ];
+        assert_eq!(
+            validate_inline_dag(&[], &branch, &[3], &[], None)
+                .expect_err("bool branch must cover both cases")
+                .code,
+            "branch_coverage"
+        );
+    }
+
+    #[test]
+    fn two_coactive_calls_require_explicit_await_to_ask_ordering() {
+        let mut nodes = one_call_graph();
+        nodes.pop();
+        let digest = format!("blake3:{}", "0".repeat(64));
+        nodes.extend([
+            InlineNodeV1 {
+                slot: 6,
+                evidence_type: "OrchArgumentV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,"region":[]
+                })),
+                ports: vec![port(OrchPortRoleV1::Data, "args", 0, "value")],
+            },
+            InlineNodeV1 {
+                slot: 7,
+                evidence_type: "OrchRetryPolicyV1".into(),
+                config: StrictJson(serde_json::json!({"max_attempts":1})),
+                ports: vec![],
+            },
+            InlineNodeV1 {
+                slot: 8,
+                evidence_type: "OrchAskPauseV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,
+                    "owner_call_slot":9,"wait_ms":120000,"region":[]
+                })),
+                ports: vec![port(OrchPortRoleV1::Data, "args", 6, "value")],
+            },
+            InlineNodeV1 {
+                slot: 9,
+                evidence_type: "OrchCallV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,"region":[]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "args", 6, "value"),
+                    port(OrchPortRoleV1::Control, "permit", 8, "permit"),
+                    port(OrchPortRoleV1::Config, "retry", 7, "policy"),
+                ],
+            },
+            InlineNodeV1 {
+                slot: 10,
+                evidence_type: "OrchAwaitV1".into(),
+                config: StrictJson(serde_json::json!({"on_error":"stop","region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "operation", 9, "operation")],
+            },
+            InlineNodeV1 {
+                slot: 11,
+                evidence_type: "OrchExitV1".into(),
+                config: StrictJson(serde_json::json!({"mode":"return","region":[]})),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "value", 10, "value"),
+                    port(OrchPortRoleV1::Control, "after_first", 5, "settled"),
+                ],
+            },
+        ]);
+        assert_eq!(
+            validate_inline_dag(&[], &nodes, &[11], &[], None)
+                .expect_err("data reachability is not effect ordering")
+                .code,
+            "unordered_calls"
         );
     }
 

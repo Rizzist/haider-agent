@@ -232,6 +232,7 @@ pub(super) struct MobileDispatcherFixture {
     pub(super) session_id: SessionId,
     pub(super) run_id: RunId,
     pub(super) dispatcher: Arc<dyn ToolDispatcher>,
+    pub(super) cwd: String,
 }
 
 async fn mobile_dispatcher_fixture(
@@ -328,6 +329,8 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
         .expect("mobile activation snapshot")
         .mobile_use_active;
     let factory = BrokerToolFactory::with_mobile_backend(backend);
+    let orchestration_child_tools =
+        orchestration_entry_child_tools(&factory, grant.as_ref(), None, &[], mobile_use_active);
     let dispatcher = TurnToolFactory::create(
         &factory,
         WorkerToolContext {
@@ -338,7 +341,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
                 workspace_allocation: None,
                 provider_base_url: None,
                 provider_rebind_id: None,
-                cwd,
+                cwd: cwd.clone(),
                 provider: "fake".into(),
                 account_alias: None,
                 model: "fake-model".into(),
@@ -372,7 +375,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
             cli_scope: None,
             typed_workflow_execution: None,
             loom_provider_fenced: false,
-            orchestration_child_tools: Vec::new(),
+            orchestration_child_tools,
             web_search: None,
         },
     )
@@ -387,6 +390,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
         session_id,
         run_id,
         dispatcher,
+        cwd,
     }
 }
 
