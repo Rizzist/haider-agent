@@ -55,13 +55,17 @@ model-facing result appends a deterministic conversation-local alias,
 `capture:<effect>` handle in its `capture` field for surfaces. Call
 `task_output(task_id="cap:…", cursor=0)` (or the `capture:…` form) and follow
 `next_cursor` until `exhausted` is true.
+A successful `web_fetch` whose reduced result exceeds its 16 KiB model-inline
+budget uses that same `cap:<call_id>` alias and stores it in the result's
+`cursor` field. Its complete producer-bounded result remains pageable even
+though the provider sees only the symmetric head/tail projection.
 A reused call id re-points its alias at the most recent capture; effect
 handles stay unique. Cursors count bytes in the stable secret-redacted UTF-8
 capture. Invalid UTF-8 boundaries are rejected. Handles are scoped to the
-session, with durable lookup through the recorded process signal and tool
-result after restart. A process terminated by an output or time bound can
-have uncaptured output; the execution result and its paging hint disclose
-that limit separately.
+session, with durable lookup through the recorded process signal or the fetch
+tool result after restart. A process terminated by an output or time bound can
+have uncaptured output; the execution result and its paging hint disclose that
+limit separately.
 `exhausted` means the retained capture has been read. Cursor pages from
 `task_output` reach the model intact even when the source stream was truncated;
 the cursor never advances past content removed by a second preview reducer.

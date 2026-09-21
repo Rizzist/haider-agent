@@ -1,16 +1,15 @@
 # Web extraction token economics
 
-This report measures the landed phase 0/1 extraction stack with the estimator
+This report measures the phase-3 fix candidate with the estimator
 that Haider uses for provider-bound text:
 `ceil(serialized JSON-string bytes / 4)`. It is a stable provider-neutral
 estimate, not a model tokenizer result.
 
-The measurement verdict is **HOLD** against the complete phase-3 brief. The
-bloated static page meets both estimates, but the four-fixture aggregate saves
-only 19.0% versus the legacy reducer and 59.3% versus bounded passthrough. The
-JS-shell result has no honest shell marker, the selected subtree does not
-preserve the table as a Markdown table, and a live `cap:<id>` retrieval of a
-model-capped fetch fails.
+The fix candidate closes all three measured correctness gaps. Script-only
+pages carry the documented marker, the table-heavy fixture is a real Markdown
+table and narrowly beats legacy, and a live result above the 16 KiB model cap
+pages through its standard `cap:<call_id>` alias. Across all four fixtures the
+current reducer saves 22.1% versus legacy and 60.9% versus bounded passthrough.
 
 ## Method
 
@@ -43,20 +42,20 @@ a regression.
 | Fixture | Current | Legacy | Bounded passthrough | Current vs legacy | Current vs passthrough |
 |---|---:|---:|---:|---:|---:|
 | Bloated static | 1,730 | 4,861 | 24,645 | 64.4% | 93.0% |
-| JS shell | 13 | 13 | 15,141 | 0.0% | 99.9%[^js] |
-| Table-heavy | 9,352 | 8,118 | 13,096 | -15.2% | 28.6% |
+| JS shell | 32 | 13 | 15,141 | -146.2% | 99.8%[^js] |
+| Table-heavy | 8,093 | 8,118 | 13,096 | 0.3% | 38.2% |
 | JSON API | 21,534 | 27,311 | 27,311 | 21.2% | 21.2% |
-| **Total** | **32,629** | **40,303** | **80,193** | **19.0%** | **59.3%** |
+| **Total** | **31,389** | **40,303** | **80,193** | **22.1%** | **60.9%** |
 
-[^js]: The current JS-shell payload is only the 47-byte fetch header. The
-    extractor returned no readable body and emitted neither `haider_js_shell`
-    nor another `js-shell` marker. This is not a usable 99.9% optimization.
+[^js]: The 19-token increase versus legacy is intentional honesty: the current
+    result includes `[haider_js_shell: no readable static content; JavaScript
+    rendering required]` instead of silently returning only the fetch header.
 
 The brief estimated about 50–70% savings versus the then-current reducer and
 about 90% versus untruncated passthrough. The bloated static fixture lands in
-both bands. The aggregate misses both bands; only the comparison with
-passthrough is directionally close. JSON reduction is modest, and the
-table-heavy result is larger than legacy.
+both bands. The aggregate remains below those illustrative bands; there is no
+aggregate hard gate. JSON reduction is modest, while the corrected table path
+beats legacy by 25 estimated tokens without losing table structure.
 
 ## Provider-bound model tokens
 
@@ -69,10 +68,10 @@ savings.
 | Fixture | Current | Legacy | Bounded passthrough | Current vs legacy | Current vs passthrough |
 |---|---:|---:|---:|---:|---:|
 | Bloated static | 1,730 | 4,141 | 2,103 | 58.2% | 17.7% |
-| JS shell | 13 | 13 | 4,108 | 0.0% | 99.7%[^js] |
-| Table-heavy | 4,479 | 4,143 | 4,108 | -8.1% | -9.0% |
+| JS shell | 32 | 13 | 4,108 | -146.2% | 99.2%[^js] |
+| Table-heavy | 4,143 | 4,143 | 4,108 | 0.0% | -0.9% |
 | JSON API | 4,334 | 4,752 | 4,752 | 8.8% | 8.8% |
-| **Total** | **10,556** | **13,049** | **15,071** | **19.1%** | **30.0%** |
+| **Total** | **10,239** | **13,049** | **15,071** | **21.5%** | **32.1%** |
 
 ## What the landed producer cap saves
 
@@ -90,23 +89,18 @@ bloated static response crosses that cap.
 ## Content and paging checks
 
 The current extraction arm records two semantic checks beside the token
-counts:
+counts, and both are green:
 
-- `js_shell_marker=false`: the empty JS shell does not degrade with the marker
-  required by the brief.
-- `table_preserved=false`: the current main-content selection emits rows but
-  not the fixture's Markdown header and separator. Its 9,352-token result is
-  therefore both larger than legacy and not structurally preserved.
+- `js_shell_marker=true`: the script-only fixture degrades with the documented
+  marker instead of a silently empty body.
+- `table_preserved=true`: the selected table root emits its header, GFM
+  separator, and all rows as a Markdown table.
 
-A measurement-only live daemon probe fetched a 63,000-byte loopback document
-in a real session. The durable `ToolResult` had a 63,049-byte preview,
-`truncated=false`, `cursor=null`, and `artifact=null`. Paging
-`cap:fetch-page` through the existing task-output capture path failed with
-`unknown capture in this session`. The model projection is capped transiently,
-but the fetch never registers the promised conversation-local capture alias.
-The probe was removed after recording evidence because phase 3 is measurement
-only. Paged retrieval is therefore **not verified working**; it is a blocking
-contract gap.
+A live daemon regression fetches a 63,000-byte loopback document in a real
+session, verifies that the durable result has `cursor="cap:fetch-page"` and a
+capture artifact, and reads the complete start/end-delimited result through
+the actual `task_output` route. It then evicts the volatile alias and rebuilds
+it from the durable fetch result, pinning restart lookup as well as live paging.
 
 ## Reproduction
 
@@ -136,7 +130,6 @@ The recorded raw reports have these SHA-256 digests:
 
 | Evidence | SHA-256 |
 |---|---|
-| `current.json` | `65933a7b35df9e5674b6a0ef54d7570b507af01b8c89ba6a31a4f3e7f31589ae` |
+| `current.json` | `7f865e4cae2e4996876b32d7448099f77463c34179755eaceb5d94bfeea487a1` |
 | `legacy.json` | `cc7a4614cc29d8240c8445209a24b89fc27b1436f0f9bda5e0c835e7311344ac` |
 | `passthrough.json` | `b9c92bddb29c656806ecff049b168b4c7902ed0e9334b0050af35888f1a7eae9` |
-| `paging-live.json` | `3abe605ac9562c8bdbf4f4c1b03b1402b970dd89961920cefdad66bb4cfa967b` |

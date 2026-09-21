@@ -19,7 +19,11 @@ pub(crate) fn render(dom: &Dom, root: usize, base_url: &str) -> Rendered {
         pruned: false,
     };
     let mut output = String::new();
-    renderer.render_blocks(root, &mut output);
+    if let Some(name) = dom.name(root).filter(|name| score::is_block(name)) {
+        renderer.render_block(root, name, &mut output);
+    } else {
+        renderer.render_blocks(root, &mut output);
+    }
     let markdown = output.trim_matches('\n').to_owned();
     Rendered {
         markdown,
@@ -276,6 +280,7 @@ impl Renderer<'_> {
     }
 
     fn render_table(&mut self, id: usize, out: &mut String) {
+        const COMPACT_TABLE_BODY_MIN_ROWS: usize = 32;
         let mut header: Option<Vec<String>> = None;
         let mut rows: Vec<Vec<String>> = Vec::new();
         self.collect_table_rows(id, &mut header, &mut rows);
@@ -297,7 +302,11 @@ impl Renderer<'_> {
         table.push_str(&format!("|{}", " --- |".repeat(columns)));
         for row in &all_rows {
             table.push('\n');
-            push_table_row(&mut table, row, columns);
+            if all_rows.len() >= COMPACT_TABLE_BODY_MIN_ROWS {
+                push_compact_table_row(&mut table, row, columns);
+            } else {
+                push_table_row(&mut table, row, columns);
+            }
         }
         push_block(out, &table);
     }
@@ -356,6 +365,33 @@ fn push_table_row(table: &mut String, cells: &[String], columns: usize) {
         table.push(' ');
         table.push_str(cells.get(index).map_or("", String::as_str));
         table.push_str(" |");
+    }
+}
+
+/// GFM permits body rows without outer pipes or padding. Keeping the friendly
+/// header form while compacting a large body preserves cell boundaries and
+/// avoids spending more tokens than the legacy space-joined representation.
+fn push_compact_table_row(table: &mut String, cells: &[String], columns: usize) {
+    if cells.first().is_none_or(String::is_empty) {
+        table.push('|');
+    }
+    for index in 0..columns {
+        if index > 0 {
+            table.push('|');
+        }
+        let cell = cells.get(index).map_or("", String::as_str);
+        let compact = cell
+            .strip_prefix('`')
+            .and_then(|text| text.strip_suffix('`'))
+            .filter(|text| !text.contains('`'))
+            .unwrap_or(cell);
+        table.push_str(compact);
+    }
+    if cells
+        .get(columns.saturating_sub(1))
+        .is_none_or(String::is_empty)
+    {
+        table.push('|');
     }
 }
 

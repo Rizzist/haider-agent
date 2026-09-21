@@ -2,11 +2,46 @@
 //! holds only session-scoped CAS references; raw captures never become pages.
 
 use super::tasks::TaskFacade;
+use base64::Engine as _;
 use haider_protocol::ids::SessionId;
+use haider_protocol::item::OutputStream;
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_tools::{ProcessOutputChunk, ProcessResult, ToolError, ToolResult};
 
 impl TaskFacade {
+    /// Retains already-produced text in the same CAS chunk format and alias
+    /// registry as foreground processes. Each safe projection uses one
+    /// stateful output-redactor consumer across all synthetic chunk edges.
+    pub(crate) async fn retain_foreground_text_capture(
+        &self,
+        session: &SessionId,
+        call_id: &str,
+        text: &str,
+    ) -> ToolResult<(haider_protocol::ids::ArtifactRef, usize)> {
+        let chunks = text
+            .as_bytes()
+            .chunks(haider_tools::PROCESS_OUTPUT_CHUNK_BYTES)
+            .map(|bytes| ProcessOutputChunk {
+                stream: OutputStream::Stdout,
+                chunk_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            })
+            .collect::<Vec<_>>();
+        let safe_bytes = haider_tools::redact_process_output(&chunks)?.len();
+        let bytes =
+            serde_json::to_vec(&chunks).map_err(|error| ToolError::cas(error.to_string()))?;
+        let artifact = self
+            .hub
+            .put_internal_artifact(bytes)
+            .await
+            .map_err(|error| ToolError::cas(error.message))?;
+        self.hub.task_registry().retain_capture(
+            session,
+            format!("cap:{call_id}"),
+            artifact.clone(),
+        );
+        Ok((artifact, safe_bytes))
+    }
+
     pub(crate) async fn retain_foreground_capture(
         &self,
         session: &SessionId,
@@ -137,12 +172,16 @@ impl TaskFacade {
                             signal = Some((record.run_id, record.call_id));
                         }
                     }
-                    haider_protocol::EventPayload::ToolResult { call_id, result }
-                        if signal.as_ref().is_some_and(|(run, call)| {
+                    haider_protocol::EventPayload::ToolResult { call_id, result } => {
+                        let direct_alias = alias_call.is_some_and(|call| {
+                            call_id == call && result.cursor.as_deref() == Some(handle)
+                        });
+                        let process_capture = signal.as_ref().is_some_and(|(run, call)| {
                             envelope.run_id.as_ref() == Some(run) && &call_id == call
-                        }) =>
-                    {
-                        if let Some(artifact) = result.artifact {
+                        });
+                        if (direct_alias || process_capture)
+                            && let Some(artifact) = result.artifact
+                        {
                             latest = Some(artifact);
                             signal = None;
                         }

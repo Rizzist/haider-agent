@@ -302,12 +302,11 @@ fn model_tool_payload_projection(
     result: &BoundedResult,
 ) -> ModelToolResultProjection {
     const INVENTORY_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
-    /// 972 symmetric cap: UNTRUNCATED results above this byte threshold get a
-    /// head/tail projection at the provider boundary too — a producer that
-    /// never set `truncated` (e.g. a `web_fetch` page inside its own output
-    /// cap) no longer ships tens of KiB to the model verbatim. Full bytes stay
-    /// in the durable result for paging/replay.
-    const OVERSIZE_MODEL_PREVIEW_MAX_BYTES: usize = 16 * 1024;
+    // 972 symmetric cap: UNTRUNCATED results above this byte threshold get a
+    // head/tail projection at the provider boundary too — a producer that
+    // never set `truncated` (e.g. a `web_fetch` page inside its own output
+    // cap) no longer ships tens of KiB to the model verbatim. Full bytes stay
+    // in the durable result for paging/replay.
     if result.truncation.is_some() && result.payload_text() != result.preview {
         // A producer already bounded this output and declared the exact raw
         // byte provenance. Keep the final marker intact on first send/replay.
@@ -427,12 +426,14 @@ fn model_tool_payload_projection(
             // (web_fetch prose survives a head/tail cut better than logs).
             // The durable BoundedResult keeps the full bytes for paged reads
             // and replay; only the provider-bound projection shrinks.
-            if tool_name == "web_fetch" && result.preview.len() > OVERSIZE_MODEL_PREVIEW_MAX_BYTES {
+            if tool_name == "web_fetch"
+                && result.preview.len() > haider_tools::WEB_FETCH_MODEL_PREVIEW_MAX_BYTES
+            {
                 let elided = disclosed_omission.map_or_else(
                     || {
                         haider_tools::elide_text_head_tail(
                             &result.preview,
-                            OVERSIZE_MODEL_PREVIEW_MAX_BYTES,
+                            haider_tools::WEB_FETCH_MODEL_PREVIEW_MAX_BYTES,
                             "oversize_tool_result_model_boundary",
                         )
                         .unwrap_or_else(|| {
@@ -448,7 +449,7 @@ fn model_tool_payload_projection(
                     |(omitted_bytes_at_least, omitted_bytes_exact)| {
                         haider_tools::mark_text_elision(
                             &result.preview,
-                            OVERSIZE_MODEL_PREVIEW_MAX_BYTES,
+                            haider_tools::WEB_FETCH_MODEL_PREVIEW_MAX_BYTES,
                             "oversize_tool_result_model_boundary",
                             omitted_bytes_at_least,
                             omitted_bytes_exact,

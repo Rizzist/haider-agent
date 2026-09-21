@@ -320,8 +320,21 @@ pub(crate) fn select_content_root(dom: &Dom, metrics: &TextMetrics) -> usize {
             best = Some((*id, adjusted));
         }
     }
-    match best {
+    let selected = match best {
         Some((id, score)) if score > 0.0 && metrics.text_len(id) >= MIN_CANDIDATE_TEXT => id,
         _ => body,
+    };
+    enclosing_table(dom, selected).unwrap_or(selected)
+}
+
+/// A table descendant may win density scoring, but rendering that fragment as
+/// ordinary blocks destroys the header/cell relationship. Keep the nearest
+/// table as the semantic extraction root whenever the winner lives inside it.
+fn enclosing_table(dom: &Dom, mut id: usize) -> Option<usize> {
+    loop {
+        if dom.name(id) == Some("table") {
+            return Some(id);
+        }
+        id = dom.parent(id)?;
     }
 }

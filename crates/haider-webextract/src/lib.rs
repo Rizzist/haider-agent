@@ -16,6 +16,11 @@ mod markdown;
 mod score;
 mod text;
 
+/// Honest extraction result for a document whose useful content is available
+/// only after client-side JavaScript runs.
+pub const JS_SHELL_MARKER: &str =
+    "[haider_js_shell: no readable static content; JavaScript rendering required]";
+
 /// The extracted readable view of one HTML document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedDoc {
@@ -42,15 +47,30 @@ pub fn extract(html: &str, url: &str) -> ExtractedDoc {
     let title = extract_title(&dom);
     let byline = extract_byline(&dom);
     let body = dom.find_first(&["body"]).unwrap_or(dom::DOCUMENT);
+    let markdown = if rendered.markdown.is_empty() && is_script_shell(&dom) {
+        JS_SHELL_MARKER.to_owned()
+    } else {
+        rendered.markdown
+    };
     // Honest elision flag: pruned boilerplate inside the root, or a root
     // that excludes part of the document's visible text.
     let elided = rendered.pruned || metrics.text_len(root) < metrics.text_len(body);
     ExtractedDoc {
         title,
         byline,
-        markdown: rendered.markdown,
+        markdown,
         elided,
     }
+}
+
+fn is_script_shell(dom: &dom::Dom) -> bool {
+    dom.element_ids().any(|id| {
+        dom.name(id) == Some("script")
+            && (!dom.raw_text(id).trim().is_empty()
+                || dom
+                    .attr(id, "src")
+                    .is_some_and(|src| !src.trim().is_empty()))
+    })
 }
 
 fn extract_title(dom: &dom::Dom) -> Option<String> {

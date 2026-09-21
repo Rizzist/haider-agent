@@ -20698,7 +20698,39 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     }),
                                     presentation: None,
                                 };
-                                if let Some(truncation) = outcome.truncation { result.declare_truncation(truncation); }
+                                if let Some(truncation) = outcome.truncation {
+                                    result.declare_truncation(truncation);
+                                }
+                                if result.preview.len()
+                                    > haider_tools::WEB_FETCH_MODEL_PREVIEW_MAX_BYTES
+                                {
+                                    let captured = result.preview.clone();
+                                    let (artifact, captured_bytes) = self
+                                        .tasks
+                                        .retain_foreground_text_capture(
+                                            &self.session_id,
+                                            call_id,
+                                            &captured,
+                                        )
+                                        .await
+                                        .map_err(tool_error)?;
+                                    let payload = result.payload_text().to_owned();
+                                    let truncation = result.truncation.take();
+                                    result.preview = payload;
+                                    if !result.preview.ends_with('\n') {
+                                        result.preview.push('\n');
+                                    }
+                                    result.preview.push_str(&haider_tools::capture_paging_hint(
+                                        call_id,
+                                        u64::try_from(captured_bytes).unwrap_or(u64::MAX),
+                                        0,
+                                    ));
+                                    if let Some(truncation) = truncation {
+                                        result.declare_truncation(truncation);
+                                    }
+                                    result.artifact = Some(artifact);
+                                    result.cursor = Some(format!("cap:{call_id}"));
+                                }
                                 Ok(result)
                             }
                             Err(error) => {

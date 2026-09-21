@@ -18,6 +18,7 @@ const TABLE_HEAVY_TEMPLATE: &str =
     include_str!("../tests/fixtures/webextract-tokens/table-heavy.html.tmpl");
 const JSON_API_TEMPLATE: &str =
     include_str!("../tests/fixtures/webextract-tokens/api-response.json.tmpl");
+const TABLE_HEAVY_LEGACY_FETCH_TOKENS: usize = 8_118;
 
 #[derive(Clone)]
 struct Fixture {
@@ -251,6 +252,41 @@ fn webextract_token_fixture_set_is_deterministic_and_meaningful() {
     let json = &fixtures[3].body;
     let parsed: serde_json::Value = serde_json::from_str(json).expect("expanded JSON fixture");
     assert_eq!(parsed["items"].as_array().map(Vec::len), Some(360));
+}
+
+#[test]
+fn js_shell_fixture_degrades_with_an_honest_marker() {
+    let fixture = &fixtures()[1];
+    let reduced = haider_provider::reduce_html_to_text(&fixture.body);
+    assert!(
+        reduced.contains("haider_js_shell"),
+        "script-only pages must not silently reduce to an empty body: {reduced:?}"
+    );
+}
+
+#[test]
+fn table_heavy_fixture_is_markdown_and_beats_legacy_tokens() {
+    let fixture = &fixtures()[2];
+    let reduced = haider_provider::reduce_html_to_text(&fixture.body);
+    assert!(
+        reduced.contains("| Package | Status | Latency | Owner | Digest |"),
+        "missing Markdown header: {reduced:?}"
+    );
+    assert!(
+        reduced.contains("| --- | --- | --- | --- | --- |"),
+        "missing Markdown separator: {reduced:?}"
+    );
+    assert!(
+        reduced.contains("pkg-320|healthy|20|Owner 14|sha256:"),
+        "missing final table row"
+    );
+
+    let fetch_result = format!("[http://127.0.0.1:12345/table-heavy · text/html]\n{reduced}");
+    let tokens = haider_tools::estimated_text_tokens(&fetch_result);
+    assert!(
+        tokens < TABLE_HEAVY_LEGACY_FETCH_TOKENS,
+        "table-heavy result must beat the measured legacy result: {tokens} >= {TABLE_HEAVY_LEGACY_FETCH_TOKENS}"
+    );
 }
 
 /// Measurement harness, deliberately ignored by ordinary suites. It serves

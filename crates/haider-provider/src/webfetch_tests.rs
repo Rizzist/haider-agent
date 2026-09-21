@@ -182,14 +182,15 @@ fn html_reducer_is_bounded_on_adversarial_nested_drop_tags() {
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(reduce_html_to_text(&html).len());
+        let _ = tx.send(reduce_html_to_text(&html));
     });
-    let reduced_len = rx
+    let reduced = rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("adversarial reduce must finish within the bound — an O(N^2) impl would not");
     assert_eq!(
-        reduced_len, 0,
-        "every character sits inside a dropped element, so nothing survives"
+        reduced,
+        haider_webextract::JS_SHELL_MARKER,
+        "dropped script content leaves only the honest JS-shell marker"
     );
 }
 

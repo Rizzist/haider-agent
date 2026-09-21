@@ -46,6 +46,11 @@ mod workspace_receipt;
 /// preview plus its artifact reference.
 pub const TOOL_RESULT_INLINE_MAX_BYTES: usize = 8 * 1024;
 
+/// Provider-bound inline budget for a readable web fetch. Larger fetches keep
+/// their complete reduced result in the session capture store and project a
+/// symmetric head/tail view to the model.
+pub const WEB_FETCH_MODEL_PREVIEW_MAX_BYTES: usize = 16 * 1024;
+
 /// A 1 MiB orchestration capture fits in 16 reads, half of the core's default
 /// 32-request soft tranche (and a quarter of its 64-request hard ceiling).
 /// Share this allowance across file pages, shell previews and capture pages.

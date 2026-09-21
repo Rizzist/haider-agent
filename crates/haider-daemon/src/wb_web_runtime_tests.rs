@@ -228,7 +228,11 @@ impl WebWorld {
                 // This fixture exercises both provider-selected web routes.
                 // Exposure still intersects the provider and lockdown gates.
                 tool_factory: crate::worker::DaemonDependencies::default()
-                    .with_tool_exposure(Some(vec!["web_fetch".into(), "web_search".into()]))
+                    .with_tool_exposure(Some(vec![
+                        "web_fetch".into(),
+                        "web_search".into(),
+                        "task_output".into(),
+                    ]))
                     .tool_factory,
                 delegation: None,
                 web_search,
@@ -521,6 +525,103 @@ async fn live_web_fetch_is_brokered_journaled_and_refusals_stay_typed_results() 
         outcomes[1].1,
         EffectOutcome::Failed { error } if error.contains(evil_url)
     ));
+}
+
+/// A fetch above the actor's inline model cap retains its complete reduced
+/// result under the standard conversation-local capture alias. The next tool
+/// round pages that alias through the real `task_output` route.
+#[tokio::test]
+async fn live_web_fetch_above_inline_cap_pages_through_capture_alias() {
+    let body = format!("fetch-start\n{}\nfetch-end", "p".repeat(63_000));
+    let base = spawn_loopback_server(&body).await;
+    let url = format!("{base}/large");
+    let script = vec![
+        FakeStep::EmitToolCall {
+            call_id: "fetch-page".into(),
+            name: "web_fetch".into(),
+            args: serde_json::json!({ "url": url }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "fetch-page".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "fetch-page-read".into(),
+            name: "task_output".into(),
+            args: serde_json::json!({ "task_id": "cap:fetch-page", "cursor": 0 }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "fetch-page-read".into(),
+        },
+        FakeStep::EmitText {
+            text: "done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ];
+    let world = WebWorld::boot("wb-fetch-page", Arc::new(FakeProvider::new(script))).await;
+    world
+        .run_turn("wb-fetch-page", "fetch and page the large result")
+        .await;
+    let payloads = world.typed_payloads().await;
+
+    let fetch = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "fetch-page" => Some(result),
+            _ => None,
+        })
+        .expect("durable fetch result");
+    assert!(fetch.preview.contains("cap:fetch-page"));
+    assert_eq!(fetch.cursor.as_deref(), Some("cap:fetch-page"));
+    assert!(fetch.artifact.is_some());
+
+    let page = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "fetch-page-read" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("capture page result");
+    let page: serde_json::Value =
+        serde_json::from_str(page.payload_text()).expect("capture page JSON");
+    assert_eq!(page["task_id"], "cap:fetch-page");
+    assert_eq!(page["exhausted"], true);
+    let chunk = page["chunk"].as_str().expect("capture chunk");
+    assert!(chunk.contains("fetch-start"));
+    assert!(chunk.contains("fetch-end"));
+    assert!(chunk.len() > 63_000);
+
+    let artifact = fetch.artifact.clone().expect("capture artifact");
+    // Force the alias out of the bounded volatile registry so this lookup
+    // must rebuild it from the durable fetch ToolResult.
+    for index in 0..256 {
+        world.hub.task_registry().retain_capture(
+            &world.session_id,
+            format!("evict-fetch-page-{index}"),
+            artifact.clone(),
+        );
+    }
+    assert!(
+        world
+            .hub
+            .task_registry()
+            .capture(&world.session_id, "cap:fetch-page")
+            .is_none()
+    );
+    let restored = crate::tasks::TaskFacade::new(world.hub.clone())
+        .restore_foreground_capture(&world.session_id, "cap:fetch-page")
+        .await
+        .expect("capture alias restores from the durable fetch result");
+    assert_eq!(restored, artifact);
 }
 
 /// LAW (LW8 half, advertisement): the local `web_fetch` client tool joins
