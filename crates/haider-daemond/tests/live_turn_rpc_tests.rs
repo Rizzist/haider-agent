@@ -177,6 +177,7 @@ fn expected_request_usage(ordinal: u64, usage: &Usage) -> RequestUsage {
         // The daemon supplies the request diagnostic from the rendered
         // provider call; these fixtures only own the response-local usage.
         cache: None,
+        orchestration: None,
     }
 }
 

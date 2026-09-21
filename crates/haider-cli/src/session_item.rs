@@ -482,6 +482,7 @@ mod tests {
             status: Default::default(),
             reason: None,
             presentation: None,
+            orchestration: None,
         }
     }
 

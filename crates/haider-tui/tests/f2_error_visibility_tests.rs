@@ -440,6 +440,7 @@ fn failed_result(reason: &str) -> haider_protocol::tool::BoundedResult {
         status: haider_protocol::tool::ToolResultStatus::Failed,
         reason: Some(reason.to_owned()),
         presentation: None,
+        orchestration: None,
     }
 }
 

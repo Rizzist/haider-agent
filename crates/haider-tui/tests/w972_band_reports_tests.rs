@@ -474,6 +474,7 @@ fn usage_report() -> UsageReportV1 {
                 local: LocalUsageStatsV1::default(),
             },
         ],
+        orchestration: Default::default(),
     }
 }
 

@@ -113,6 +113,7 @@ fn digest(
         run_id: None,
         task_outcome: None,
         task_outcome_version: None,
+        orchestration: None,
         active_branch_id: Some(BranchId::new("branch-review")),
         branches: vec![BranchDescriptor {
             branch_id: BranchId::new("branch-review"),

@@ -4939,6 +4939,7 @@ fn append_tool_attempt(
                     status: result_status,
                     reason: (!result_status.is_completed()).then(|| "typed rejection".into()),
                     presentation: None,
+                    orchestration: None,
                 },
             },
         ),

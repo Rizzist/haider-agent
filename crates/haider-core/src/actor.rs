@@ -6242,6 +6242,7 @@ impl HarnessActor {
                                         "The provider-hosted tool reported an error.",
                                     )
                                 }),
+                                orchestration: None,
                             };
                             self.commit_server_tool_row(
                                 &run_id, &call_id, name, args, status, &result,
@@ -6308,6 +6309,7 @@ impl HarnessActor {
                             normalized: usage.normalized.clone(),
                             cache_cost: usage.cache_cost,
                             cache: Some(cache_diagnostic.clone()),
+                            orchestration: None,
                         });
                         pending_previous_cache_request = Some(PreviousCacheRequest {
                             history_message_count: request_cacheable_history_end,
@@ -8590,6 +8592,7 @@ impl HarnessActor {
                 "Invalid tool call",
                 &error.message,
             )),
+            orchestration: None,
         };
         let result = tool.correct_result(result);
         self.commit_tool_result_and_completion(run_id, tool, &result)
@@ -8682,6 +8685,7 @@ impl HarnessActor {
                     "Tool grant denied",
                     &format!("This {authority} is not allowed to use the requested tool."),
                 )),
+                orchestration: None,
             };
             let result = tools[index].correct_result(result);
             let call_id = tools[index].call_id.clone();
@@ -8918,6 +8922,7 @@ impl HarnessActor {
                                     status: ToolResultStatus::Failed,
                                     reason: Some(sanitized_failure_message(&error.message)),
                                     presentation: None,
+                                    orchestration: None,
                                 },
                             },
                             prompt_verbatim_render(),
@@ -9248,6 +9253,7 @@ impl HarnessActor {
                     status: ToolResultStatus::Completed,
                     reason: None,
                     presentation: None,
+                    orchestration: None,
                 }
             }
             Err(error @ haider_tools::ToolError::InvalidArgument { .. }) => BoundedResult {
@@ -9273,6 +9279,7 @@ impl HarnessActor {
                     "Tool arguments were rejected",
                     "The tool could not accept the supplied arguments.",
                 )),
+                orchestration: None,
             },
             Err(error) => return Err(tool_error_to_drive(error)),
         };
@@ -9446,6 +9453,7 @@ impl HarnessActor {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         };
         let bounded = tools[index].correct_result(bounded);
         self.commit_tool_settlement_and_streaming(run_id, &tools[index], &bounded)
@@ -9588,6 +9596,7 @@ impl HarnessActor {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         };
         let bounded = tools[index].correct_result(bounded);
         self.commit_tool_settlement_and_streaming(run_id, &tools[index], &bounded)
@@ -9629,6 +9638,7 @@ impl HarnessActor {
                 ErrorScope::Tool,
                 [ErrorAction::None],
             )),
+            orchestration: None,
         });
         self.commit_payload(
             run_id,
@@ -10124,6 +10134,7 @@ impl HarnessActor {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             };
             let bounded = tools[index].correct_result(bounded);
             if let Err(error) = self
@@ -10239,6 +10250,7 @@ impl HarnessActor {
                         "The delegated child ended without a successful result.",
                     )
                 }),
+                orchestration: None,
             };
             if let Some(truncation) = completion.truncation {
                 result.declare_truncation(truncation);
@@ -14780,6 +14792,7 @@ mod usage_tests {
             normalized: None,
             cache_cost: None,
             cache: Some(diagnostic),
+            orchestration: None,
         };
         let records = serde_json::to_string(&(attempt, response)).expect("records serialize");
         for secret in [SYSTEM_SECRET, TOOL_SECRET, ARG_SECRET, USER_SECRET] {

@@ -2137,6 +2137,7 @@ impl ContextCompactor for DaemonContextCompactor {
                         normalized: usage.normalized.clone(),
                         cache_cost: usage.cache_cost,
                         cache: Some(cache_diagnostic),
+                        orchestration: None,
                     });
                     // Provider streaming usage is cumulative within this
                     // request; the latest snapshot replaces earlier ones.
@@ -16059,6 +16060,7 @@ impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
                 ErrorScope::Tool,
                 [ErrorAction::None],
             )),
+            orchestration: None,
         }))
     }
 }
@@ -16723,6 +16725,7 @@ fn ssh_tool_refusal(
             status,
             reason: Some(error.to_string()),
             presentation: None,
+            orchestration: None,
         }),
         false,
     )
@@ -18403,6 +18406,7 @@ impl BrokerToolDispatcher {
                             .map(|code| format!("remote command exited with status {code}"))
                     },
                     presentation: None,
+                    orchestration: None,
                 };
                 if let Some(truncation) = result.truncation {
                     bounded.declare_truncation(truncation);
@@ -18445,6 +18449,7 @@ impl BrokerToolDispatcher {
                         status: ToolResultStatus::Failed,
                         reason: Some(error.to_string()),
                         presentation: None,
+                        orchestration: None,
                     }),
                     false,
                 ))
@@ -19057,6 +19062,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             status: ToolResultStatus::Rejected,
                             reason: Some(error.to_string()),
                             presentation: None,
+                            orchestration: None,
                         }));
                     }
                 },
@@ -19315,6 +19321,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             }));
         }
         if route == RegisteredToolRoute::WorkflowAuthor {
@@ -19352,6 +19359,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     status: ToolResultStatus::Rejected,
                     reason: Some("delegated workflows cannot contain a human-confirm gate".into()),
                     presentation: None,
+                    orchestration: None,
                 }));
             }
             let current = self
@@ -19420,6 +19428,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             }));
         }
         let mut broker_guard = self.broker.lock().await;
@@ -19481,6 +19490,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
+                    orchestration: None,
                     }));
                 };
                 let install_job = self
@@ -19519,6 +19529,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             status: ToolResultStatus::Completed,
                             reason: None,
                             presentation: None,
+                            orchestration: None,
                         }));
                     }
                 };
@@ -19718,6 +19729,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Rejected,
                         reason: Some(error.message.clone()),
                         presentation: None,
+                        orchestration: None,
                     }));
                 }
                 Err(error) => return Err(error),
@@ -19741,6 +19753,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             }));
         }
         if route == RegisteredToolRoute::SshList {
@@ -19803,6 +19816,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             }));
         }
         if route == RegisteredToolRoute::SshShell {
@@ -19858,6 +19872,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             }));
         }
         if route == RegisteredToolRoute::ListModels {
@@ -19913,6 +19928,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             };
             if let Some(original) = original {
                 result.declare_truncation(haider_protocol::tool::ToolTruncation::from_bytes(
@@ -19973,6 +19989,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             }));
         }
         if route == RegisteredToolRoute::PeerSend {
@@ -20050,6 +20067,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
+                        orchestration: None,
                     }));
                 }
                 Err(message) => {
@@ -20085,6 +20103,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             ErrorScope::Tool,
                             [ErrorAction::Retry],
                         )),
+                        orchestration: None,
                     }));
                 }
             }
@@ -20195,6 +20214,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     .into(),
                             ),
                             presentation: None,
+                        orchestration: None,
                         }));
                     }
                     let remote = SshShellOperation {
@@ -20238,6 +20258,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
+                    orchestration: None,
                     }));
                 }
                 if *background {
@@ -20439,6 +20460,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     status: ToolResultStatus::Completed,
                     reason: None,
                     presentation: None,
+                orchestration: None,
                 };
                 let refusal = |error: String| {
                     completed(serde_json::json!({ "ok": false, "error": error }))
@@ -20633,6 +20655,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
+                    orchestration: None,
                     }));
                 }
                 match broker.begin_web_fetch(operation, &policy).await {
@@ -20697,6 +20720,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         "transient web_fetch failure — retry 2/2 succeeded".into()
                                     }),
                                     presentation: None,
+                                orchestration: None,
                                 };
                                 if let Some(truncation) = outcome.truncation {
                                     result.declare_truncation(truncation);
@@ -20773,6 +20797,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     } else {
                                         error.presentation
                                     }),
+                                    orchestration: None,
                                 })
                             }
                         }
@@ -20888,6 +20913,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         status: ToolResultStatus::Failed,
                         reason: Some("web_search is unavailable in this session".into()),
                         presentation: None,
+                    orchestration: None,
                     }),
                     Some(executor) => {
                         let attempt = self.record_side_request_attempt(run_id).await?;
@@ -20915,6 +20941,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     status: ToolResultStatus::Completed,
                                     reason: None,
                                     presentation: None,
+                                orchestration: None,
                                 };
                                 if truncated { result.declare_truncation(original); }
                                 Ok(result)
@@ -20938,6 +20965,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     status: ToolResultStatus::Failed,
                                     reason: Some(bounded_failure_reason(&failure.message)),
                                     presentation: None,
+                                orchestration: None,
                                 })
                             }
                         }
@@ -21085,6 +21113,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                             status: ToolResultStatus::Completed,
                                             reason: None,
                                             presentation: None,
+                                        orchestration: None,
                                         })
                                     }
                                 }
@@ -21117,6 +21146,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 status: ToolResultStatus::Completed,
                                 reason: None,
                                 presentation: None,
+                            orchestration: None,
                             })
                         }
                         Ok(ComputerOutput::Inspection {
@@ -21193,6 +21223,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                             status: ToolResultStatus::Completed,
                                             reason: None,
                                             presentation: None,
+                                        orchestration: None,
                                         })
                                     }
                                 }
@@ -21226,6 +21257,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 status: ToolResultStatus::Completed,
                                 reason: None,
                                 presentation: None,
+                            orchestration: None,
                             })
                         }
                         Err(ComputerError::Cancelled) => {
@@ -21295,6 +21327,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         status: ToolResultStatus::Completed,
                                         reason: None,
                                         presentation: None,
+                                    orchestration: None,
                                     })
                                 }
                                 Err(ToolError::Mobile(MobileError::Cancelled)) => {
@@ -21354,6 +21387,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 status: ToolResultStatus::Completed,
                                 reason: None,
                                 presentation: None,
+                            orchestration: None,
                             })
                         }
                         Err(MobileError::Cancelled) => {
@@ -22175,6 +22209,7 @@ fn computer_failure_result(error: &ComputerError) -> BoundedResult {
         status,
         reason: Some(bounded_failure_reason(&reason)),
         presentation,
+        orchestration: None,
     }
 }
 
@@ -22241,6 +22276,7 @@ fn mobile_failure_result(error: &MobileError) -> BoundedResult {
             ErrorScope::Tool,
             actions,
         )),
+        orchestration: None,
     }
 }
 
@@ -22276,6 +22312,7 @@ fn typed_error_result(
         },
         reason: Some(bounded_failure_reason(&error.to_string())),
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22303,6 +22340,7 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
         status: ToolResultStatus::Rejected,
         reason: Some(bounded_failure_reason(&refusal.message())),
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22327,6 +22365,7 @@ fn recursion_limit_result() -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(crate::delegation::RECURSION_LIMIT_MESSAGE.into()),
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22356,6 +22395,7 @@ fn subagent_limit_result(error: &HaiderError) -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(bounded_failure_reason(&error.message)),
         presentation,
+        orchestration: None,
     }
 }
 
@@ -22381,6 +22421,7 @@ fn typed_workflow_boundary_result(message: &str) -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(reason),
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22408,6 +22449,7 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(reason),
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22449,6 +22491,7 @@ fn lockdown_refusal_result(
         status: ToolResultStatus::Rejected,
         reason: Some(message),
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22492,6 +22535,7 @@ fn lockdown_write_result(
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22532,6 +22576,7 @@ fn lockdown_quota_result(
         status: ToolResultStatus::Rejected,
         reason: Some(message),
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -22580,6 +22625,7 @@ fn lockdown_read_result(text: &str, offset: Option<usize>, limit: Option<usize>)
         status: ToolResultStatus::Completed,
         reason: Some("lockdown secret redaction forced on".to_owned()),
         presentation: None,
+        orchestration: None,
     };
     if truncated {
         result.declare_truncation(haider_protocol::tool::ToolTruncation::from_bytes(
@@ -22620,6 +22666,7 @@ fn mobile_capability_denied_result() -> BoundedResult {
             ErrorScope::Tool,
             [ErrorAction::None],
         )),
+        orchestration: None,
     }
 }
 
@@ -22654,6 +22701,7 @@ fn graph_evidence_rejection(
             ErrorScope::Tool,
             [ErrorAction::Retry],
         )),
+        orchestration: None,
     }
 }
 
@@ -23395,6 +23443,7 @@ fn process_result_with_signal(
         },
         reason,
         presentation: None,
+        orchestration: None,
     };
     if truncated {
         bounded.declare_truncation(haider_protocol::tool::ToolTruncation {
@@ -23519,6 +23568,7 @@ fn test_run_result_with_signal(
         },
         reason,
         presentation: None,
+        orchestration: None,
     }
 }
 

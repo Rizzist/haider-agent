@@ -54,6 +54,7 @@ impl ToolDispatcher for StatusDispatcher {
             status: self.status,
             reason: self.reason.clone(),
             presentation: None,
+            orchestration: None,
         }))
     }
 }

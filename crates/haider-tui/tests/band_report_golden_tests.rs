@@ -113,6 +113,7 @@ fn usage_report_frames() {
                 local: LocalUsageStatsV1::default(),
             },
         ],
+        orchestration: Default::default(),
     });
     pin("report_usage", &model);
 }

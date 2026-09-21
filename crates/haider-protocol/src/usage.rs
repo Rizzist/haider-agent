@@ -298,6 +298,12 @@ pub struct UsageReportV1 {
     pub generated_at_ms: u64,
     #[serde(default)]
     pub accounts: Vec<AccountUsageReportV1>,
+    /// Device-local orchestration totals reduced from durable terminal facts.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::orchestration::OrchestrationUsageV1::is_empty"
+    )]
+    pub orchestration: crate::orchestration::OrchestrationUsageV1,
 }
 
 /// Per-account entry: descriptor coordinates (never secrets), the provider
@@ -383,6 +389,12 @@ pub struct LocalUsageStatsV1 {
     /// Additive cache/pricing detail for the journal-derived counters.
     #[serde(default, skip_serializing_if = "CacheUsageStatsV1::is_empty")]
     pub cache: CacheUsageStatsV1,
+    /// Account-attributed orchestration generation and execution costs.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::orchestration::OrchestrationUsageV1::is_empty"
+    )]
+    pub orchestration: crate::orchestration::OrchestrationUsageV1,
 }
 
 /// Cache-aware local totals. Costs are input-only because output cost is

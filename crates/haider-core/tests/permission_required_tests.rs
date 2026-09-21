@@ -84,6 +84,7 @@ impl ToolDispatcher for RecoveredImageApprovalDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 
@@ -125,6 +126,7 @@ impl ToolDispatcher for ApprovalDispatcher {
                 status: haider_protocol::tool::ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             }))
         } else {
             Ok(ToolDispatchResult::ApprovalRequired(self.menu.clone()))

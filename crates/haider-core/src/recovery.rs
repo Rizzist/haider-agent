@@ -949,6 +949,7 @@ mod reducer_filter_tests {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             },
         }
     }

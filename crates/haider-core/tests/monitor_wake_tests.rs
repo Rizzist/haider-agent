@@ -62,6 +62,7 @@ impl ToolDispatcher for RegistrationDispatcher {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }

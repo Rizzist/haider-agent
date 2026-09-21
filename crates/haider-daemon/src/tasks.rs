@@ -667,6 +667,7 @@ impl TaskFacade {
                 status: ToolResultStatus::Rejected,
                 reason: Some("background task concurrency cap reached".into()),
                 presentation: None,
+            orchestration: None,
             });
         }
         let name = name.unwrap_or_else(|| default_task_name(&command));
@@ -819,6 +820,7 @@ impl TaskFacade {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         })
     }
 
@@ -1139,6 +1141,7 @@ impl TaskFacade {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         };
         if truncated && let Some((original_bytes, sha256)) = provenance {
             result.declare_truncation(ToolTruncation {
@@ -1186,6 +1189,7 @@ impl TaskFacade {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             });
         }
         let operation = TaskKillEffect {
@@ -1213,6 +1217,7 @@ impl TaskFacade {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         })
     }
 
@@ -1596,6 +1601,7 @@ fn unknown_task_result(task_id: &str) -> BoundedResult {
         status: ToolResultStatus::Unknown,
         reason: Some("no background task with this id exists in this session".into()),
         presentation: None,
+        orchestration: None,
     }
 }
 

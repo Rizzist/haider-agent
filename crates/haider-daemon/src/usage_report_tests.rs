@@ -1177,6 +1177,7 @@ fn cache_requests_fold_by_ordinal_with_response_local_counters() {
         }),
         cache_cost: None,
         cache: None,
+        orchestration: None,
     };
     let cumulative = |logical: u64, output: u64, request: RequestUsage| Usage {
         input: logical,
@@ -1348,6 +1349,7 @@ fn cancelled_cache_reread_metric_snapshot(requests: &[(u64, u64, u64)]) -> Agent
             normalized: usage.normalized.clone(),
             cache_cost: usage.cache_cost,
             cache: None,
+            orchestration: None,
         });
 
         // The actor journals a cumulative turn snapshot while `request`

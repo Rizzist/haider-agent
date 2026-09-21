@@ -1340,6 +1340,7 @@ fn only_an_uneventful_success_folds() {
                 status: haider_protocol::tool::ToolResultStatus::Completed,
                 reason: Some("transient web_fetch failure — retry 2/2 succeeded".to_owned()),
                 presentation: None,
+                orchestration: None,
             },
         },
     );

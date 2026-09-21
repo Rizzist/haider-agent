@@ -21,6 +21,7 @@ fn result(preview: String) -> BoundedResult {
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     }
 }
 

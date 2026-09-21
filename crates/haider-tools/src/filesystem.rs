@@ -4136,6 +4136,7 @@ mod read_memo_tests {
                 status: haider_protocol::tool::ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             },
             freshness: None,
             footprint: ReadFootprint::new(Vec::new()),
@@ -5062,6 +5063,7 @@ fn apply_windows_write(
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         },
         paths: vec![operation.path.clone()],
         post_digest: post_digest.clone(),
@@ -5167,6 +5169,7 @@ fn apply_windows_edit(
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         },
         paths: vec![operation.path.clone()],
         post_digest: post_digest.clone(),
@@ -6669,6 +6672,7 @@ fn apply_write_at(
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         },
         paths: vec![operation.path.clone()],
         post_digest: post_digest.clone(),
@@ -6883,6 +6887,7 @@ fn apply_edit_at_with_commit_hooks(
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         },
         paths: vec![operation.path.clone()],
         post_digest: post_digest.clone(),
@@ -7380,6 +7385,7 @@ fn mutation_result(preview: String) -> BoundedResult {
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     }
 }
 
@@ -8406,6 +8412,7 @@ where
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     if let Some(truncation) = truncation {
         result.declare_truncation(truncation);
@@ -8465,6 +8472,7 @@ where
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     if result.truncated {
         result.declare_truncation(truncation.clone());
@@ -8551,6 +8559,7 @@ where
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     if let Some(truncation) = truncation {
         result.declare_truncation(truncation);

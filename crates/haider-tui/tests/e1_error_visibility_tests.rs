@@ -41,6 +41,7 @@ fn apply_tool(
             status,
             reason: reason.map(str::to_owned),
             presentation: None,
+            orchestration: None,
         },
     });
     projection.apply(&EventPayload::Item(ItemEvent::Completed {

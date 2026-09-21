@@ -2407,6 +2407,9 @@ pub struct SessionObserveDigest {
     /// Version of `task_outcome`; emitted together with a recognized outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_outcome_version: Option<u32>,
+    /// Latest orchestration terminal from this selected run only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<haider_protocol::orchestration::OrchestrationRunDigestV1>,
     /// `None` names the implicit main branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_branch_id: Option<BranchId>,

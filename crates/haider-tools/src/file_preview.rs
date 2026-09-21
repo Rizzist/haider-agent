@@ -96,6 +96,7 @@ pub(crate) async fn bounded_file_read<C: CasSink>(
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     if let Some(truncation) = truncation {
         result.declare_truncation(truncation);

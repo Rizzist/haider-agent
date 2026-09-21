@@ -261,6 +261,7 @@ impl HarnessConfig {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         };
         let filter = match parsed {
             Ok(filter) => filter,

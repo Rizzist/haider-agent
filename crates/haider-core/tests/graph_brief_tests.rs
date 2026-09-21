@@ -143,6 +143,7 @@ impl ToolDispatcher for CountingSnapshotDispatcher {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }

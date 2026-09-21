@@ -1848,6 +1848,7 @@ mod tests {
                     status: ToolResultStatus::Completed,
                     reason: None,
                     presentation: None,
+                    orchestration: None,
                 },
             },
         );
@@ -1881,6 +1882,7 @@ mod tests {
             status: Default::default(),
             reason: None,
             presentation: None,
+            orchestration: None,
         };
         let genuine = envelope(
             7,

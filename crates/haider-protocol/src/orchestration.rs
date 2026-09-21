@@ -440,6 +440,41 @@ pub struct OrchestrationUsageV1 {
     pub wall_ms: u64,
 }
 
+impl OrchestrationUsageV1 {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.scripts == 0
+            && self.generated_source_bytes == 0
+            && self.generated_source_tokens == 0
+            && self.child_attempts == 0
+            && self.retries == 0
+            && self.canonical_bytes == 0
+            && self.unique_cas_bytes == 0
+            && self.admission_us == 0
+            && self.scheduling_us == 0
+            && self.wall_ms == 0
+    }
+}
+
+/// Attribution carried on the physical provider request that generated an
+/// orchestration submission. Child operations never create provider requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationRequestAttributionV1 {
+    pub transport: String,
+    pub generated_source_bytes: u64,
+    pub generated_source_tokens: u64,
+    pub graph_mode: OrchestrationGraphModeV1,
+    pub cold_schema_discovery: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationGraphModeV1 {
+    Inline,
+    Ref,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestrationRunDigestV1 {

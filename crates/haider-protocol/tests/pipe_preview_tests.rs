@@ -56,6 +56,7 @@ fn result_preview_is_bounded_and_absent_when_empty() {
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     let preview = result_preview(&result).expect("result preview");
     assert!(preview.chars().count() <= 160);
@@ -73,6 +74,7 @@ fn result_preview_is_bounded_and_absent_when_empty() {
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     assert_eq!(
         result_preview(&empty),

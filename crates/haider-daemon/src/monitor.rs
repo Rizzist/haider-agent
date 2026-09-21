@@ -7592,6 +7592,7 @@ fn tool_result(
         status,
         reason,
         presentation: None,
+        orchestration: None,
     }
 }
 

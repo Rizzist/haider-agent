@@ -91,6 +91,7 @@ fn stats(sessions: u64, est_cost_usd: Option<f64>) -> LocalUsageStatsV1 {
         lines_added: 1240,
         lines_removed: 380,
         cache: haider_protocol::usage::CacheUsageStatsV1::default(),
+        orchestration: Default::default(),
     }
 }
 
@@ -163,6 +164,7 @@ fn report() -> UsageReportV1 {
                 local: stats(3, Some(0.57)),
             },
         ],
+        orchestration: Default::default(),
     }
 }
 

@@ -136,6 +136,10 @@ pub struct BoundedResult {
     /// only for backward-compatible decoding of pre-E2 journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ErrorPresentation>,
+    /// Structured report-first terminal for an orchestration wrapper. The
+    /// ordinary result status above remains authoritative for old readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<crate::orchestration::ScriptTerminalV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

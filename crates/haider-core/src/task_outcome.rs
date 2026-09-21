@@ -135,5 +135,6 @@ fn task_outcome_result(value: serde_json::Value, rejection: Option<String>) -> B
         },
         reason: rejection,
         presentation: None,
+        orchestration: None,
     }
 }

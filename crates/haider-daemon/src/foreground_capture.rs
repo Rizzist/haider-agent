@@ -240,6 +240,7 @@ fn capture_page(handle: &str, safe: &str, cursor: u64) -> ToolResult<BoundedResu
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     })
 }
 

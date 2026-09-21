@@ -129,6 +129,7 @@ fn usage_model_from(accounts: Vec<AccountUsageReportV1>, scope: UsageScope) -> A
     model.usage.apply_report(UsageReportV1 {
         generated_at_ms: GENERATED_AT_MS,
         accounts,
+        orchestration: Default::default(),
     });
     // The `s` ring has five scopes; bounded so a ring change fails loudly
     // instead of hanging the suite.

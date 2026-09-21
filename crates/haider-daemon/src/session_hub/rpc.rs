@@ -1761,6 +1761,7 @@ impl ObserveFoldSnapshot {
             run_id: self.run_id.clone(),
             task_outcome: self.task_outcome.clone(),
             task_outcome_version: self.task_outcome.as_ref().map(|_| 1),
+            orchestration: None,
             active_branch_id: self.active_branch_id.clone(),
             branches: self.branches.clone(),
             main_head_node_id: self.main_head_node_id.clone(),
@@ -3180,6 +3181,7 @@ impl ObserveProjection {
             run_id,
             task_outcome_version: task_outcome.as_ref().map(|_| 1),
             task_outcome,
+            orchestration: None,
             active_branch_id,
             branches,
             main_head_node_id: self.main_head_node_id,
@@ -15528,6 +15530,7 @@ impl HubConnection {
                     report: haider_protocol::usage::UsageReportV1 {
                         generated_at_ms: 0,
                         accounts: Vec::new(),
+                        orchestration: Default::default(),
                     },
                     availability: Some(haider_rpc::SnapshotAvailabilityWire::Unavailable {
                         reason: "usage subsystem is not configured".into(),

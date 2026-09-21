@@ -303,6 +303,7 @@ impl ToolDispatcher for ImageFixtureDispatcher {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }

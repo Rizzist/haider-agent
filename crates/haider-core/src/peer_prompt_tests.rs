@@ -87,6 +87,7 @@ fn peer_list_model_view_compacts_without_rewriting_the_raw_journal_value() {
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     let (model_preview, model_truncated) = model_tool_result_preview("peer_list", &result);
     assert!(model_preview.len() < result.preview.len());

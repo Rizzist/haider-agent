@@ -162,6 +162,7 @@ fn setup_reduction_usage(scope: UsageScope, history_message_count: u64) -> Usage
                 rewarm: None,
                 classification: None,
             }),
+            orchestration: None,
         }),
     }
 }

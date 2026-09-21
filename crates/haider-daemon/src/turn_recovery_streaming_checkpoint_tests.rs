@@ -157,6 +157,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     let request_attempt = CacheRequestAttemptV1 {
         ordinal: 11,

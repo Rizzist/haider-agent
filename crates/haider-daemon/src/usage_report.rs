@@ -541,6 +541,7 @@ impl UsageReportService {
         Ok(UsageReportV1 {
             generated_at_ms: (self.clock)(),
             accounts,
+            orchestration: Default::default(),
         })
     }
 

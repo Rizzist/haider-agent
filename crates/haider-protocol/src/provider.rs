@@ -386,6 +386,10 @@ pub struct RequestUsage {
     pub cache_cost: Option<CacheCostEstimate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheRequestDiagnosticV1>,
+    /// Source-generation attribution for the orchestration request emitted by
+    /// this physical provider response, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<crate::orchestration::OrchestrationRequestAttributionV1>,
 }
 
 /// Keyed cumulative hashes at the provider-visible cache breakpoints.

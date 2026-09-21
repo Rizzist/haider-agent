@@ -638,6 +638,7 @@ fn golden_error_presentation_contract() {
                     ErrorScope::Tool,
                     [ErrorAction::Retry],
                 )),
+                orchestration: None,
             },
         },
     );
@@ -721,6 +722,7 @@ fn golden_image_bearing_tool_result_is_additive_and_legacy_decodes_empty() {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
+                orchestration: None,
             },
         },
     );
@@ -768,6 +770,7 @@ fn structured_search_result_wire_is_additive_and_legacy_decodes() {
         status: ToolResultStatus::Completed,
         reason: None,
         presentation: None,
+        orchestration: None,
     };
     assert_eq!(
         serde_json::to_value(&result).expect("structured search wire"),
@@ -1595,6 +1598,7 @@ fn golden_usage_report_v1() {
                         lines_added: 240,
                         lines_removed: 60,
                         cache: CacheUsageStatsV1::default(),
+                        orchestration: Default::default(),
                     },
                 },
                 AccountUsageReportV1 {
@@ -1616,9 +1620,11 @@ fn golden_usage_report_v1() {
                         lines_added: 12,
                         lines_removed: 4,
                         cache: CacheUsageStatsV1::default(),
+                        orchestration: Default::default(),
                     },
                 },
             ],
+            orchestration: Default::default(),
         },
     );
     golden(

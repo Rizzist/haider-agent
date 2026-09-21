@@ -110,6 +110,7 @@ fn calendar_report() -> UsageReportV1 {
                 },
             ),
         ],
+        orchestration: Default::default(),
     }
 }
 
@@ -199,6 +200,7 @@ fn calendar_projects_the_existing_provider_fixtures_exactly() {
                     windows: openai.windows,
                 },
             )],
+            orchestration: Default::default(),
         }),
         118,
         36,
@@ -232,6 +234,7 @@ fn calendar_projects_the_existing_provider_fixtures_exactly() {
                     windows: anthropic.windows,
                 },
             )],
+            orchestration: Default::default(),
         }),
         118,
         36,

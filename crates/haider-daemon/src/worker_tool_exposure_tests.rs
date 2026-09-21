@@ -40,6 +40,7 @@ fn discovery_result(call_id: &str, status: ToolResultStatus) -> EventPayload {
             status,
             reason: None,
             presentation: None,
+            orchestration: None,
         },
     }
 }
@@ -729,6 +730,7 @@ impl ToolDispatcher for ProfileFixtureDispatcher {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }

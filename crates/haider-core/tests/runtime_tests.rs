@@ -2372,6 +2372,7 @@ impl ToolDispatcher for CompletingDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
@@ -2436,6 +2437,7 @@ impl ToolDispatcher for CountingCompletingDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
@@ -2468,6 +2470,7 @@ impl ToolDispatcher for DelayedCompletingDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
@@ -2574,6 +2577,7 @@ impl ToolDispatcher for LargeResultDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
@@ -2605,6 +2609,7 @@ impl ToolDispatcher for ForgedImageDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
@@ -4403,6 +4408,7 @@ async fn recovered_route_wait_restores_completed_effect_without_redispatch() {
                         status: haider_protocol::tool::ToolResultStatus::Completed,
                         reason: None,
                         presentation: None,
+                        orchestration: None,
                     }),
                 }],
                 structured_events: vec![
@@ -5927,6 +5933,7 @@ impl ToolDispatcher for BoundaryRecordingDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
@@ -6476,6 +6483,7 @@ impl ToolDispatcher for TruncatedToolDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
@@ -6512,6 +6520,7 @@ impl ToolDispatcher for DurableRunningToolDispatcher {
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
+            orchestration: None,
         }))
     }
 }
