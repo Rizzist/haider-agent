@@ -489,6 +489,7 @@ class SampleConfig:
     arm: str
     delay_ms: int
     fixture_binary: Path
+    shape_ref: Mapping[str, Any] | None = None
 
 
 class RecorderState:
@@ -574,6 +575,7 @@ def validate_result_context(
     script: bool,
     cold_script: bool = False,
     allow_truncated: bool = False,
+    expected_tool_messages: int | None = None,
 ) -> list[str]:
     def strings(value: Any, depth: int = 0) -> list[str]:
         if depth > 8:
@@ -611,7 +613,13 @@ def validate_result_context(
         for message in message_values
         if isinstance(message, Mapping) and message.get("role") == "tool"
     ]
-    expected_count = (2 if cold_script else 1) if script else (20 if fixture == "l20" else 17)
+    expected_count = expected_tool_messages
+    if expected_count is None:
+        expected_count = (
+            (2 if cold_script else 1)
+            if script
+            else (20 if fixture == "l20" else 17)
+        )
     if len(tool_messages) != expected_count:
         raise ProofError(
             f"{fixture} result context tool messages expected={expected_count} "
@@ -702,7 +710,7 @@ def response_for(
     body: Mapping[str, Any],
     state: RecorderState,
 ) -> tuple[list[bytes], dict[str, Any]]:
-    script = config.arm in ("script", "cold_script")
+    script = config.arm in ("script", "cold_script", "ref_script")
     if config.arm == "cold_script" and request_number == 1:
         tool_spec(body, "list_tools")
         return function_chunks(
@@ -710,12 +718,29 @@ def response_for(
         )
     script_request = request_number - (1 if config.arm == "cold_script" else 0)
     if script and script_request == 1:
-        source = sequential_script(body, script_operations(config, body))
+        if config.arm == "ref_script":
+            if config.shape_ref is None:
+                raise ProofError("cached-ref arm has no admitted shape handle")
+            digest, _ = tool_script_schema(body)
+            source = {
+                "version": 1,
+                "transport": "instruct-pipe-dag-v1",
+                "catalog_digest": digest,
+                "graph": {"kind": "ref", "root": dict(config.shape_ref)},
+                "inputs": [],
+                "limits": {"returned_bytes": 65536},
+            }
+        else:
+            source = sequential_script(body, script_operations(config, body))
         state.generated_source = canonical(source)
         return function_chunks([("measure-script", "tool_script", source)])
     if script:
         issues = validate_result_context(
-            config.fixture, body, True, config.arm == "cold_script"
+            config.fixture,
+            body,
+            True,
+            config.arm == "cold_script",
+            expected_tool_messages=2 if config.arm == "ref_script" else None,
         )
         state.fidelity_issues.extend(issues)
         return text_chunks(expected_final(config.fixture))
@@ -799,7 +824,7 @@ class RecorderServer:
 def expected_requests(fixture: str, arm: str) -> int:
     if arm == "cold_script":
         return 3
-    if arm in ("script", "batch"):
+    if arm in ("script", "ref_script", "batch"):
         return 2
     return 21 if fixture == "l20" else 8
 
@@ -931,7 +956,7 @@ def orchestration_row(
     started_at_ms = terminal_data.get("started_at_ms")
     finished_at_ms = terminal_data.get("finished_at_ms")
     return {
-        "graph_mode": "inline",
+        "graph_mode": graph.get("kind") if isinstance(graph, Mapping) else None,
         "shape_digest": terminal_data.get("shape_digest"),
         "source_digest": terminal_data.get("source_digest"),
         "shape_ref": script_data.get("shape_ref"),
@@ -968,7 +993,9 @@ def orchestration_row(
             else None
         ),
         "wrapper_preexposed": True,
-        "shape_cache_hit": False,
+        "shape_cache_hit": (
+            isinstance(graph, Mapping) and graph.get("kind") == "ref"
+        ),
         "admission_type_check_us": terminal_data.get("admission_us"),
         "scheduling_checkpoint_us": terminal_data.get("scheduling_us"),
     }
@@ -1160,6 +1187,151 @@ def run_sample(
         profile.dispose()
 
 
+def run_cached_shape_ref(
+    bin_dir: Path,
+    server: RecorderServer,
+    tokenizer: ReferenceTokenizer,
+    fixture_binary: Path,
+) -> dict[str, Any]:
+    """Populate one L20 shape, then execute its ref in the same real session."""
+
+    profile = ThrowawayProfile(
+        bin_dir,
+        server.url,
+        root=Path(tempfile.mkdtemp(prefix="orch-ref-measure-", dir="/tmp")),
+    )
+    profile.env["HAIDER_TOOL_PROFILE"] = "inspection"
+    profile.env["HAIDER_TOOL_EXPOSURE"] = "tool_script"
+    before = seed_workspace("l20", profile.workspace)
+
+    def execute(
+        config: SampleConfig, session_id: str | None
+    ) -> tuple[dict[str, Any], str]:
+        server.state.begin(config)
+        command = ["run", "-p", L20_PROMPT, "--output", "jsonl", "--timeout", "120s"]
+        if session_id is None:
+            command.extend(
+                [
+                    "--provider",
+                    PROVIDER_ID,
+                    "--model",
+                    MODEL_ID,
+                    "--auto-allow",
+                    "--allow-writes",
+                    "--allow-exec",
+                ]
+            )
+        else:
+            command.extend(["--session", session_id])
+        run = profile.command(command, timeout=150)
+        requests, generated, provider_errors, fidelity_issues = server.state.finish()
+        if run.returncode != 0 or run.timed_out:
+            raise ProofError(
+                f"l20/{config.arm} failed exit={run.returncode} "
+                f"timeout={run.timed_out} stdout={run.stdout[-300:]!r} "
+                f"stderr={run.stderr[-300:]!r}"
+            )
+        documents = parse_json_lines(run.stdout, f"l20/{config.arm} cached-ref proof")
+        accepted = next(
+            (row for row in documents if row.get("event") == "accepted"), None
+        )
+        if not isinstance(accepted, Mapping) or not isinstance(
+            accepted.get("session_id"), str
+        ):
+            raise ProofError(f"l20/{config.arm} omitted accepted session identity")
+        actual_session = str(accepted["session_id"])
+        if session_id is not None and actual_session != session_id:
+            raise ProofError("cached-ref continuation changed session identity")
+        events = documents[1:]
+        if provider_errors:
+            raise ProofError("; ".join(provider_errors))
+        if fidelity_issues:
+            raise ProofError("; ".join(fidelity_issues))
+        if len(requests) != 2:
+            raise ProofError(
+                f"l20/{config.arm} provider requests expected=2 actual={len(requests)}"
+            )
+        children = child_rows(events, True)
+        if len(children) != 20 or any(
+            child["status"] != "completed" for child in children
+        ):
+            raise ProofError(
+                f"l20/{config.arm} child results expected=20 actual={len(children)}"
+            )
+        terminals = [
+            event
+            for event in events
+            if isinstance(event.get("payload"), Mapping)
+            and event["payload"].get("terminal_kind") is not None
+        ]
+        if len(terminals) != 1 or terminals[0]["payload"].get("terminal_kind") != "success":
+            raise ProofError(f"l20/{config.arm} has no unique success terminal")
+        orchestration = orchestration_row(events, generated)
+        if orchestration is None:
+            raise ProofError(f"l20/{config.arm} has no orchestration evidence")
+        input_tokens = sum(
+            tokenizer.count(canonical(request["body"])) for request in requests
+        )
+        output_tokens = sum(
+            tokenizer.count(canonical(request["response_semantic"]))
+            for request in requests
+        )
+        return (
+            {
+                "arm": config.arm,
+                "wall_ms": run.wall_ms,
+                "provider_requests": len(requests),
+                "child_attempts": len(children),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "generated_source_bytes": len(generated),
+                "generated_source_tokens": tokenizer.count(generated),
+                "generated_source_sha256": sha256_bytes(generated),
+                "orchestration": orchestration,
+                "terminal_seq": terminals[0].get("seq"),
+                "fidelity_passed": True,
+            },
+            actual_session,
+        )
+
+    try:
+        profile.ready()
+        inline, session_id = execute(
+            SampleConfig("l20", "script", 0, fixture_binary), None
+        )
+        shape_ref = inline["orchestration"].get("shape_ref")
+        if not isinstance(shape_ref, Mapping):
+            raise ProofError("inline cache-population turn omitted its shape ref")
+        cached, continued_session = execute(
+            SampleConfig("l20", "ref_script", 0, fixture_binary, shape_ref),
+            session_id,
+        )
+        if continued_session != session_id:
+            raise ProofError("cached-ref execution did not use the population session")
+        if cached["orchestration"].get("shape_digest") != inline[
+            "orchestration"
+        ].get("shape_digest"):
+            raise ProofError("cached-ref execution changed the admitted shape digest")
+        after = verify_workspace("l20", profile.workspace, before)
+        return {
+            "fixture": "l20",
+            "session_id_sha256": sha256_bytes(session_id.encode("utf-8")),
+            "workspace_before_sha256": before,
+            "workspace_after_sha256": after,
+            "cache_population": inline,
+            "cached_shape_ref": cached,
+            "passed": True,
+        }
+    finally:
+        if server.state.config is not None:
+            server.state.finish()
+        stop = profile.stop()
+        if stop.returncode != 0:
+            raise ProofError("cached-ref daemon stop failed")
+        profile.dispose()
+
+
 def paired_schedule(left: str, right: str) -> list[str]:
     return [value for _ in range(5) for value in (left, right, right, left)]
 
@@ -1238,6 +1410,7 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
     raw_samples: list[dict[str, Any]] = []
     comparisons: list[dict[str, Any]] = []
     sample_ordinal = 0
+    cached_shape_ref: dict[str, Any] | None = None
     with RecorderServer() as server:
         for fixture in ("e8", "l20"):
             for delay in (0, 100):
@@ -1316,6 +1489,10 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
                         right_metrics = comparison_row["arms"][right]
                         comparison_row["right_vs_left"] = savings(left_metrics, right_metrics)
                     comparisons.append(comparison_row)
+        ensure_quiet(args)
+        cached_shape_ref = run_cached_shape_ref(
+            args.bin_dir, server, tokenizer, args.fixture_binary
+        )
     if any(sample["load_1m"] >= 2 for sample in raw_samples):
         raise ProofError("a measured sample exceeded the required load(1m) < 2 quiet bound")
     return {
@@ -1356,6 +1533,7 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
             "l20": fixture_manifest("l20"),
         },
         "comparisons": comparisons,
+        "cached_shape_ref": cached_shape_ref,
         "samples": raw_samples,
         "all_execution_passed": all(sample["passed"] for sample in raw_samples),
         "implementation_fidelity_passed": all(
