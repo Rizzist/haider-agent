@@ -20737,6 +20737,68 @@ mod run_identity_tests {
         assert!(digest.task_outcome.is_none());
     }
 
+    fn orchestration_terminal(run: &str, seq: u64, script_id: &str) -> RawEnvelope {
+        let mut envelope = state_envelope(run, seq, RunState::Streaming);
+        let terminal = haider_protocol::orchestration::ScriptTerminalV1 {
+            version: 1,
+            script_id: script_id.into(),
+            status: haider_protocol::orchestration::ScriptTerminalStatusV1::Completed,
+            request_digest: format!("blake3:{}", "a".repeat(64)),
+            shape_digest: Some(format!("blake3:{}", "b".repeat(64))),
+            source_digest: Some(format!("blake3:{}", "c".repeat(64))),
+            final_checkpoint: None,
+            terminal_ref: None,
+            selected_exit: Some(7),
+            value: None,
+            reason_code: Some("exit".into()),
+            reason: None,
+            counts: haider_protocol::orchestration::ScriptCountsV1 {
+                calls: 1,
+                attempts: 1,
+                completed: 1,
+                ..Default::default()
+            },
+            receipt_refs: Vec::new(),
+            started_at_ms: 10,
+            finished_at_ms: 20,
+        };
+        envelope.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new(format!("terminal-{script_id}")),
+            item: TurnItem::Extension {
+                kind: haider_protocol::orchestration::ORCHESTRATION_TERMINAL_EXTENSION.into(),
+                data: serde_json::to_value(terminal).expect("terminal serializes"),
+            },
+        }))
+        .expect("item serializes")
+        .into();
+        envelope
+    }
+
+    #[test]
+    fn observed_orchestration_terminal_is_scoped_to_the_selected_run() {
+        let digest = digest_of(vec![
+            state_envelope("old-run", 1, RunState::Streaming),
+            orchestration_terminal("old-run", 2, "old-script"),
+            state_envelope("old-run", 3, RunState::Done),
+            state_envelope("live-run", 4, RunState::Streaming),
+        ]);
+        assert_eq!(digest.run_id, Some(RunId::new("live-run")));
+        assert!(
+            digest.orchestration.is_none(),
+            "a previous run terminal must never leak into the live run"
+        );
+
+        let digest = digest_of(vec![
+            state_envelope("live-run", 1, RunState::Streaming),
+            orchestration_terminal("live-run", 2, "live-script"),
+        ]);
+        let orchestration = digest
+            .orchestration
+            .expect("selected run exposes its orchestration terminal");
+        assert_eq!(orchestration.script_id, "live-script");
+        assert_eq!(orchestration.counts.completed, 1);
+    }
+
     #[test]
     fn observe_ignores_unversioned_unknown_and_nonterminal_task_metadata() {
         let terminal = task_terminal("failure", 1, "branch");

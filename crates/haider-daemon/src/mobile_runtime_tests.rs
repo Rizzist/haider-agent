@@ -228,6 +228,7 @@ pub(super) struct MobileDispatcherFixture {
     _profile: tempfile::TempDir,
     _workspace: tempfile::TempDir,
     pub(super) store: SqliteStoreHandle,
+    pub(super) worker_store: HubStoreHandle,
     hub: SessionHub,
     pub(super) session_id: SessionId,
     pub(super) run_id: RunId,
@@ -324,6 +325,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
         .acquire_worker_lease(session_id.clone())
         .await
         .expect("mobile tool lease");
+    let worker_store = lease.clone();
     let mobile_use_active = durable_session_tool_state(&lease, &session_id)
         .await
         .expect("mobile activation snapshot")
@@ -386,6 +388,7 @@ pub(super) async fn mobile_dispatcher_fixture_with_policy(
         _profile: profile,
         _workspace: workspace,
         store,
+        worker_store,
         hub,
         session_id,
         run_id,

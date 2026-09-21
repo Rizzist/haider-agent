@@ -86,6 +86,8 @@ pub(crate) struct PendingCallV1 {
     pub(crate) tool: String,
     pub(crate) args: StrictJson,
     pub(crate) activation_ref: InstructEvidenceRef,
+    pub(crate) started_at_ms: u64,
+    pub(crate) deadline_ms: u64,
     pub(crate) started: bool,
 }
 

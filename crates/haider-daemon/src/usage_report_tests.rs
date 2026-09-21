@@ -17,7 +17,14 @@ use haider_protocol::credential::{
     AccountIdentity, AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
-use haider_protocol::ids::{AgentId, CredentialAlias, DeviceId, EventId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, ArtifactRef, CredentialAlias, DeviceId, EventId, RunId, SessionId,
+};
+use haider_protocol::orchestration::{
+    OrchestrationGraphModeV1, OrchestrationRequestAttributionV1, ScriptCountsV1,
+    ScriptTerminalStatusV1, ScriptTerminalV1,
+};
+use haider_protocol::pipe::InstructEvidenceRef;
 use haider_protocol::provider::{
     AccountUsage, CacheCostEstimate, CacheStatAvailability, NormalizedUsage, RequestUsage, Usage,
     UsageRequestKind, UsageScope, UsageSource,
@@ -2119,4 +2126,101 @@ fn a_supervised_agent_keeps_the_typed_credential_reasons() {
         "impossible",
         AuthMethod::ApiKey
     )));
+}
+
+#[test]
+fn orchestration_usage_reconciles_source_attempts_wall_and_unique_cas() {
+    let mut folder = SessionFolder::new("gpt-5.2");
+    let mut usage = plain_usage(100, 20, "billing-key");
+    usage.request = Some(RequestUsage {
+        ordinal: 1,
+        input: 100,
+        output: 20,
+        reasoning: None,
+        cached: None,
+        source: UsageSource::ProviderReported,
+        account: Some(CredentialAlias::new("billing-key")),
+        normalized: None,
+        cache_cost: None,
+        cache: None,
+        orchestration: Some(OrchestrationRequestAttributionV1 {
+            transport: "instruct-pipe-dag-v1".into(),
+            generated_source_bytes: 200,
+            generated_source_tokens: 50,
+            graph_mode: OrchestrationGraphModeV1::Inline,
+            cold_schema_discovery: false,
+        }),
+    });
+    folder.push(&envelope(
+        1,
+        Some("orch-run"),
+        None,
+        1_000,
+        usage_payload(usage),
+    ));
+
+    let shared = InstructEvidenceRef::new(
+        ArtifactRef::new(format!("blake3:{}", "a".repeat(64))),
+        "OrchCheckpointV1",
+        10,
+        vec![],
+    );
+    let receipt = InstructEvidenceRef::new(
+        ArtifactRef::new(format!("blake3:{}", "b".repeat(64))),
+        "OrchResultV1",
+        20,
+        vec![],
+    );
+    let terminal = ScriptTerminalV1 {
+        version: 1,
+        script_id: "script-usage".into(),
+        status: ScriptTerminalStatusV1::Completed,
+        request_digest: format!("blake3:{}", "c".repeat(64)),
+        shape_digest: Some(format!("blake3:{}", "d".repeat(64))),
+        source_digest: Some(format!("blake3:{}", "e".repeat(64))),
+        final_checkpoint: Some(shared.clone()),
+        terminal_ref: Some(shared),
+        selected_exit: Some(9),
+        value: None,
+        reason_code: Some("exit".into()),
+        reason: None,
+        counts: ScriptCountsV1 {
+            calls: 2,
+            attempts: 3,
+            completed: 2,
+            failed: 1,
+            ..ScriptCountsV1::default()
+        },
+        receipt_refs: vec![receipt],
+        started_at_ms: 1_000,
+        finished_at_ms: 1_125,
+    };
+    folder.push(&envelope(
+        2,
+        Some("orch-run"),
+        None,
+        1_125,
+        serde_json::to_value(EventPayload::Item(
+            haider_protocol::item::ItemEvent::Completed {
+                item_id: haider_protocol::ids::ItemId::new("orch-terminal"),
+                item: haider_protocol::item::TurnItem::Extension {
+                    kind: haider_protocol::orchestration::ORCHESTRATION_TERMINAL_EXTENSION.into(),
+                    data: serde_json::to_value(terminal).expect("terminal payload"),
+                },
+            },
+        ))
+        .expect("item payload"),
+    ));
+
+    let mut totals = HashMap::new();
+    attribute_session(&mut totals, 1_000, folder.finish());
+    let orchestration = &totals[&CredentialAlias::new("billing-key")].orchestration;
+    assert_eq!(orchestration.scripts, 1);
+    assert_eq!(orchestration.generated_source_bytes, 200);
+    assert_eq!(orchestration.generated_source_tokens, 50);
+    assert_eq!(orchestration.child_attempts, 3);
+    assert_eq!(orchestration.retries, 1);
+    assert_eq!(orchestration.wall_ms, 125);
+    assert_eq!(orchestration.canonical_bytes, 40);
+    assert_eq!(orchestration.unique_cas_bytes, 30);
 }

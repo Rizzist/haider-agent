@@ -17060,6 +17060,27 @@ struct OrchestrationExecutionKey {
     call_id: String,
 }
 
+enum OrchestrationChildDispatch {
+    Settled(ToolDispatchResult),
+    Interrupted {
+        kind: OrchestrationChildInterruption,
+        settled: Option<ToolDispatchResult>,
+        outcome_unknown: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum OrchestrationChildInterruption {
+    Cancelled,
+    Deadline,
+}
+
+struct OrchestrationTerminalReason {
+    status: ScriptTerminalStatusV1,
+    code: &'static str,
+    reason: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ParsedToolOperationKey {
     run_id: RunId,
@@ -19097,6 +19118,27 @@ impl BrokerToolDispatcher {
             state.admitted.script_id, node.slot
         );
         let call_id = format!("orch:{}:{}:{attempt}", state.admitted.script_id, node.slot);
+        let started_at_ms = unix_time_ms();
+        let script_deadline_ms = state
+            .admitted
+            .admitted_at_ms
+            .saturating_add(state.admitted.limits.script_wall_ms.unwrap_or(120_000));
+        let child_limit_ms = state
+            .admitted
+            .limits
+            .child_wall_ms
+            .unwrap_or(30_000)
+            .min(state.admitted.limits.no_progress_ms.unwrap_or(30_000));
+        let ask_limit_ms = node
+            .ports
+            .iter()
+            .find(|port| port.role == OrchPortRoleV1::Control && port.port == "permit")
+            .and_then(|port| state.admitted.nodes.get(port.source_slot as usize))
+            .and_then(|ask| ask.config.0.get("wait_ms"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120_000);
+        let deadline_ms =
+            script_deadline_ms.min(started_at_ms.saturating_add(child_limit_ms.min(ask_limit_ms)));
         let mut activation_parents = vec![
             state.admitted.source_ref.artifact.clone(),
             state.admitted.definition_refs[node.slot as usize]
@@ -19121,10 +19163,9 @@ impl BrokerToolDispatcher {
                 "tool": tool,
                 "item_id": item_id,
                 "call_id": call_id,
-                "activated_at_ms": unix_time_ms(),
-                "script_deadline_ms": state.admitted.admitted_at_ms.saturating_add(
-                    state.admitted.limits.script_wall_ms.unwrap_or(120_000)
-                ),
+                "activated_at_ms": started_at_ms,
+                "deadline_ms": deadline_ms,
+                "script_deadline_ms": script_deadline_ms,
             }),
             activation_parents,
         )
@@ -19137,6 +19178,8 @@ impl BrokerToolDispatcher {
             tool: tool.to_owned(),
             args: StrictJson(args.clone()),
             activation_ref,
+            started_at_ms,
+            deadline_ms,
             started: true,
         };
         state.pending_calls.insert(node.slot, pending.clone());
@@ -19166,6 +19209,122 @@ impl BrokerToolDispatcher {
             }),
         ));
         Ok((pending, events))
+    }
+
+    async fn dispatch_orchestration_child(
+        &self,
+        run_id: &RunId,
+        pending: &crate::orchestration::PendingCallV1,
+        cancel: &CancelToken,
+    ) -> Result<OrchestrationChildDispatch, HaiderError> {
+        let remaining_ms = pending.deadline_ms.saturating_sub(unix_time_ms());
+        if remaining_ms == 0 {
+            return Ok(OrchestrationChildDispatch::Interrupted {
+                kind: OrchestrationChildInterruption::Deadline,
+                settled: None,
+                outcome_unknown: false,
+            });
+        }
+
+        let child_cancel = CancelToken::new();
+        let child_item_id = ItemId::new(pending.item_id.clone());
+        let child = self.execute_shared(
+            run_id,
+            &child_item_id,
+            &pending.call_id,
+            &pending.tool,
+            Arc::new(pending.args.0.clone()),
+            &child_cancel,
+        );
+        tokio::pin!(child);
+        let deadline = tokio::time::sleep(Duration::from_millis(remaining_ms));
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            result = &mut child => Ok(OrchestrationChildDispatch::Settled(result?)),
+            _ = cancel.cancelled() => {
+                child_cancel.cancel();
+                match child.await {
+                    Ok(settled) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::Cancelled,
+                        outcome_unknown: orchestration_dispatch_outcome_unknown(&settled),
+                        settled: Some(settled),
+                    }),
+                    Err(_) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::Cancelled,
+                        settled: None,
+                        outcome_unknown: true,
+                    }),
+                }
+            }
+            _ = &mut deadline => {
+                child_cancel.cancel();
+                match child.await {
+                    Ok(settled) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::Deadline,
+                        outcome_unknown: orchestration_dispatch_outcome_unknown(&settled),
+                        settled: Some(settled),
+                    }),
+                    Err(_) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::Deadline,
+                        settled: None,
+                        outcome_unknown: true,
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn record_orchestration_child_interruption(
+        &self,
+        run_id: &RunId,
+        state: &mut crate::orchestration::RuntimeStateV1,
+        pending: &crate::orchestration::PendingCallV1,
+        kind: OrchestrationChildInterruption,
+        settled: Option<ToolDispatchResult>,
+        mut outcome_unknown: bool,
+    ) -> Result<OrchestrationTerminalReason, HaiderError> {
+        if let Some(ToolDispatchResult::Completed(result)) = settled {
+            outcome_unknown |= result.status == ToolResultStatus::Unknown;
+            match result.status {
+                ToolResultStatus::Completed => {
+                    state.completed_calls = state.completed_calls.saturating_add(1);
+                }
+                ToolResultStatus::Rejected => {
+                    state.rejected_calls = state.rejected_calls.saturating_add(1);
+                }
+                ToolResultStatus::Failed | ToolResultStatus::Conflict => {
+                    state.failed_calls = state.failed_calls.saturating_add(1);
+                }
+                ToolResultStatus::Unknown => {
+                    state.unknown_calls = state.unknown_calls.saturating_add(1);
+                }
+                ToolResultStatus::Cancelled => {}
+            }
+            self.record_orchestration_call_result(run_id, state, pending, result)
+                .await?;
+        }
+        let terminal = if outcome_unknown {
+            OrchestrationTerminalReason {
+                status: ScriptTerminalStatusV1::OutcomeUnknown,
+                code: "effect_outcome_unknown",
+                reason: "a child interruption could not prove the effect outcome",
+            }
+        } else {
+            match kind {
+                OrchestrationChildInterruption::Cancelled => OrchestrationTerminalReason {
+                    status: ScriptTerminalStatusV1::Cancelled,
+                    code: "cancelled",
+                    reason: "orchestration was cancelled while a child call was active",
+                },
+                OrchestrationChildInterruption::Deadline => OrchestrationTerminalReason {
+                    status: ScriptTerminalStatusV1::TimedOut,
+                    code: "child_wall_timeout",
+                    reason: "a child call reached its persisted wall-clock deadline",
+                },
+            }
+        };
+        Ok(terminal)
     }
 
     async fn execute_orchestration_read_group(
@@ -19254,40 +19413,49 @@ impl BrokerToolDispatcher {
         let width = usize::from(group.max_concurrency);
         for wave in pending.chunks(width) {
             let outcomes = join_all(wave.iter().map(|(_, call)| async move {
-                let item_id = ItemId::new(call.item_id.clone());
                 let result = self
-                    .execute_shared(
-                        run_id,
-                        &item_id,
-                        &call.call_id,
-                        &call.tool,
-                        Arc::new(call.args.0.clone()),
-                        cancel,
-                    )
+                    .dispatch_orchestration_child(run_id, call, cancel)
                     .await;
                 (call.clone(), result)
             }))
             .await;
             let mut approval = None;
             let mut retry_slots = Vec::new();
+            let mut terminal_reason = None;
             for (call, outcome) in outcomes {
-                match outcome? {
+                let outcome = match outcome? {
+                    OrchestrationChildDispatch::Settled(outcome) => outcome,
+                    OrchestrationChildDispatch::Interrupted {
+                        kind,
+                        settled,
+                        outcome_unknown,
+                    } => {
+                        let reason = self
+                            .record_orchestration_child_interruption(
+                                run_id,
+                                state,
+                                &call,
+                                kind,
+                                settled,
+                                outcome_unknown,
+                            )
+                            .await?;
+                        terminal_reason.get_or_insert(reason);
+                        continue;
+                    }
+                };
+                match outcome {
                     ToolDispatchResult::ApprovalRequired(menu) => {
                         if approval.is_none() {
                             approval = Some(menu);
                         }
                     }
                     ToolDispatchResult::Deferred(_) => {
-                        let terminal = orchestration_terminal(
-                            state,
-                            ScriptTerminalStatusV1::Rejected,
-                            "deferred_child",
-                            "deferred tools are not script-bindable".into(),
-                        );
-                        return self
-                            .finish_orchestration(run_id, Some(state), terminal)
-                            .await
-                            .map(Some);
+                        terminal_reason.get_or_insert(OrchestrationTerminalReason {
+                            status: ScriptTerminalStatusV1::Rejected,
+                            code: "deferred_child",
+                            reason: "deferred tools are not script-bindable",
+                        });
                     }
                     ToolDispatchResult::Completed(result) => {
                         let node = &state.admitted.nodes[call.slot as usize];
@@ -19318,41 +19486,34 @@ impl BrokerToolDispatcher {
                             state.value_refs[call.slot as usize] = None;
                             retry_slots.push((call.slot, call.attempt));
                         } else if status == ToolResultStatus::Rejected {
-                            let terminal = orchestration_terminal(
-                                state,
-                                ScriptTerminalStatusV1::Rejected,
-                                "child_rejected",
-                                "a read-group child tool call was rejected".into(),
-                            );
-                            return self
-                                .finish_orchestration(run_id, Some(state), terminal)
-                                .await
-                                .map(Some);
+                            terminal_reason.get_or_insert(OrchestrationTerminalReason {
+                                status: ScriptTerminalStatusV1::Rejected,
+                                code: "child_rejected",
+                                reason: "a read-group child tool call was rejected",
+                            });
                         } else if status == ToolResultStatus::Cancelled {
-                            let terminal = orchestration_terminal(
-                                state,
-                                ScriptTerminalStatusV1::Cancelled,
-                                "child_cancelled",
-                                "a read-group child tool call was cancelled".into(),
-                            );
-                            return self
-                                .finish_orchestration(run_id, Some(state), terminal)
-                                .await
-                                .map(Some);
+                            terminal_reason.get_or_insert(OrchestrationTerminalReason {
+                                status: ScriptTerminalStatusV1::Cancelled,
+                                code: "child_cancelled",
+                                reason: "a read-group child tool call was cancelled",
+                            });
                         } else if status == ToolResultStatus::Unknown {
-                            let terminal = orchestration_terminal(
-                                state,
-                                ScriptTerminalStatusV1::OutcomeUnknown,
-                                "effect_outcome_unknown",
-                                "a read-group child tool call has an unknown outcome".into(),
-                            );
-                            return self
-                                .finish_orchestration(run_id, Some(state), terminal)
-                                .await
-                                .map(Some);
+                            terminal_reason.get_or_insert(OrchestrationTerminalReason {
+                                status: ScriptTerminalStatusV1::OutcomeUnknown,
+                                code: "effect_outcome_unknown",
+                                reason: "a read-group child tool call has an unknown outcome",
+                            });
                         }
                     }
                 }
+            }
+            if let Some(reason) = terminal_reason {
+                let terminal =
+                    orchestration_terminal(state, reason.status, reason.code, reason.reason.into());
+                return self
+                    .finish_orchestration(run_id, Some(state), terminal)
+                    .await
+                    .map(Some);
             }
             if let Some(menu) = approval {
                 state.next_slot = state
@@ -19720,16 +19881,37 @@ impl BrokerToolDispatcher {
                     .await?;
                 }
                 let attempt = pending.attempt;
-                let child_item_id = ItemId::new(pending.item_id.clone());
-                let child = Box::pin(self.execute_shared(
-                    run_id,
-                    &child_item_id,
-                    &pending.call_id,
-                    &pending.tool,
-                    Arc::new(args),
-                    cancel,
-                ))
-                .await?;
+                let child = match self
+                    .dispatch_orchestration_child(run_id, &pending, cancel)
+                    .await?
+                {
+                    OrchestrationChildDispatch::Settled(child) => child,
+                    OrchestrationChildDispatch::Interrupted {
+                        kind,
+                        settled,
+                        outcome_unknown,
+                    } => {
+                        let reason = self
+                            .record_orchestration_child_interruption(
+                                run_id,
+                                &mut state,
+                                &pending,
+                                kind,
+                                settled,
+                                outcome_unknown,
+                            )
+                            .await?;
+                        let terminal = orchestration_terminal(
+                            &state,
+                            reason.status,
+                            reason.code,
+                            reason.reason.into(),
+                        );
+                        return self
+                            .finish_orchestration(run_id, Some(&mut state), terminal)
+                            .await;
+                    }
+                };
                 match child {
                     ToolDispatchResult::ApprovalRequired(menu) => {
                         self.orchestrations.lock().await.insert(key, state);
@@ -20116,6 +20298,14 @@ fn orchestration_retry_limit(
         .unwrap_or(1)
 }
 
+fn orchestration_dispatch_outcome_unknown(result: &ToolDispatchResult) -> bool {
+    matches!(
+        result,
+        ToolDispatchResult::Completed(result) if result.status == ToolResultStatus::Unknown
+    )
+}
+
+#[derive(Debug)]
 enum RecoveredOrchestrationChild {
     Completed(BoundedResult),
     SafeToRetry,
@@ -20140,7 +20330,7 @@ async fn recover_orchestration_child(
             cursor,
             1_024,
             4 * 1_024 * 1_024,
-            &["item", "tool_result", "effect"],
+            &["item_tool_call", "tool_result", "effect"],
         )
         .await?
         .envelopes;
