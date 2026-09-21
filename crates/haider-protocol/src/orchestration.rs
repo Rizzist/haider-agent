@@ -1553,12 +1553,12 @@ fn validate_static_types(nodes: &[InlineNodeV1]) -> Result<(), OrchestrationErro
             "OrchAwaitV1" => Some(tool_result_type()),
             "OrchBranchV1" => {
                 let subject = data_source_type(node, "subject", &outputs)?;
+                let subject_port = port(node, OrchPortRoleV1::Data, "subject")
+                    .ok_or_else(|| type_error(node, "branch subject port is missing"))?;
                 if !matches!(subject, OrchTypeV1::Bool | OrchTypeV1::Union { .. })
-                    && nodes[port(node, OrchPortRoleV1::Data, "subject")
-                        .expect("port shape validated")
-                        .source_slot as usize]
-                        .evidence_type
-                        != "OrchAwaitV1"
+                    && nodes
+                        .get(subject_port.source_slot as usize)
+                        .is_none_or(|source| source.evidence_type != "OrchAwaitV1")
                 {
                     return Err(type_error(
                         node,
@@ -1654,7 +1654,7 @@ fn validate_value_types(
         ValueOperator::Get => {
             let field = config.operand_config.0["field"]
                 .as_str()
-                .expect("operator config validated");
+                .ok_or_else(|| type_error(node, "get operator field config is missing"))?;
             let source = operands[0];
             let field_type = match source {
                 OrchTypeV1::Record { fields } => fields.get(field),
@@ -1700,12 +1700,12 @@ fn validate_value_types(
             require_exact_type(node, &config.value_type, item, "index output")
         }
         ValueOperator::Record => {
+            let names = config.operand_config.0["fields"]
+                .as_array()
+                .ok_or_else(|| type_error(node, "record operator fields config is missing"))?;
             let fields = match &config.value_type {
                 OrchTypeV1::Record { fields } => fields,
                 OrchTypeV1::Union { variants, .. } => {
-                    let names = config.operand_config.0["fields"]
-                        .as_array()
-                        .expect("operator config validated");
                     let names = names.iter().filter_map(Value::as_str).collect::<Vec<_>>();
                     let matching = variants
                         .values()
@@ -1728,9 +1728,6 @@ fn validate_value_types(
                 }
                 _ => return Err(type_error(node, "record operator output is not a record")),
             };
-            let names = config.operand_config.0["fields"]
-                .as_array()
-                .expect("operator config validated");
             if fields.len() != names.len() {
                 return Err(type_error(
                     node,
@@ -1776,7 +1773,7 @@ fn validate_builtin_types(
 ) -> Result<(), OrchestrationError> {
     let name = config.operand_config.0["name"]
         .as_str()
-        .expect("operator config validated");
+        .ok_or_else(|| type_error(node, "builtin operator name config is missing"))?;
     let all_i64 = || {
         operands
             .iter()
@@ -3061,7 +3058,7 @@ mod tests {
         };
         let mut nodes = one_call_graph();
         assert_eq!(
-            validate_inline_dag(&[opaque.clone()], &nodes, &[6], &[], None)
+            validate_inline_dag(std::slice::from_ref(&opaque), &nodes, &[6], &[], None)
                 .expect_err("raw request inputs cannot mint opaque capabilities")
                 .code,
             "opaque_input_provenance"
