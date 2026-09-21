@@ -249,6 +249,28 @@ fn fs_read_group_script(first_path: &str, second_path: &str) -> String {
     .to_string()
 }
 
+fn hidden_mobile_script() -> String {
+    let mut request: serde_json::Value =
+        serde_json::from_str(&fs_read_script("unused")).expect("base script JSON");
+    let mobile = registered_tool_by_name("mobile").expect("mobile registry entry");
+    let wrapper_digest = orchestration_wrapper_digest(mobile);
+    let nodes = request["graph"]["nodes"]
+        .as_array_mut()
+        .expect("inline nodes");
+    for slot in [1usize, 3, 4] {
+        nodes[slot]["config"]["tool"] = serde_json::Value::String("mobile".into());
+        nodes[slot]["config"]["wrapper_digest"] = serde_json::Value::String(wrapper_digest.clone());
+    }
+    request.to_string()
+}
+
+fn retrying_fs_read_script(path: &str) -> String {
+    let mut request: serde_json::Value =
+        serde_json::from_str(&fs_read_script(path)).expect("base script JSON");
+    request["graph"]["nodes"][2]["config"]["max_attempts"] = serde_json::Value::from(3);
+    request.to_string()
+}
+
 async fn orchestration_journal_counts(
     fixture: &MobileDispatcherFixture,
 ) -> (usize, usize, usize, usize, usize) {
@@ -292,6 +314,65 @@ async fn orchestration_journal_counts(
         }
     }
     (intents, authorized, dispatched, outcomes, child_results)
+}
+
+async fn orchestration_activation_clocks(
+    fixture: &MobileDispatcherFixture,
+) -> Vec<(u64, u64, u64)> {
+    let mut cursor = 0;
+    let mut clocks = Vec::new();
+    loop {
+        let page = StoreHandle::read_reducer_page_with_boundary(
+            &fixture.store,
+            &fixture.session_id,
+            cursor,
+            1_024,
+            4 * 1_024 * 1_024,
+            &["item"],
+        )
+        .await
+        .expect("read activation journal")
+        .envelopes;
+        if page.is_empty() {
+            break;
+        }
+        for envelope in page {
+            cursor = envelope.seq;
+            let Ok(EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind, data },
+                ..
+            })) = envelope.payload.decode_event()
+            else {
+                continue;
+            };
+            if kind != haider_protocol::orchestration::ORCHESTRATION_CALL_EXTENSION
+                || data.get("phase").and_then(serde_json::Value::as_str) != Some("started")
+            {
+                continue;
+            }
+            let activation: haider_protocol::pipe::InstructEvidenceRef = serde_json::from_value(
+                data.get("activation_ref")
+                    .cloned()
+                    .expect("activation ref field"),
+            )
+            .expect("activation ref");
+            let bytes = fixture
+                .worker_store
+                .get_artifact_bounded(activation.artifact, activation.byte_len)
+                .await
+                .expect("read activation evidence");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("activation payload");
+            clocks.push((
+                value["activated_at_ms"].as_u64().expect("activation time"),
+                value["operation_started_at_ms"]
+                    .as_u64()
+                    .expect("operation start"),
+                value["deadline_ms"].as_u64().expect("deadline"),
+            ));
+        }
+    }
+    clocks
 }
 
 async fn assert_recovery_boundary(label: &str, boundary: CrashBoundary, effectless_actor: bool) {
@@ -551,6 +632,103 @@ async fn read_group_brokers_every_member_and_returns_source_order() {
         orchestration_journal_counts(&fixture).await,
         (2, 2, 2, 2, 2)
     );
+}
+
+#[tokio::test]
+async fn hidden_child_tool_is_rejected_before_any_broker_effect() {
+    let fixture = mobile_dispatcher_fixture_with_policy(
+        "orchestration-hidden-child",
+        "exercise hidden child rejection",
+        Arc::new(FakeMobileBackend::default()),
+        None,
+        true,
+    )
+    .await;
+    let result = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new("outer-hidden-item"),
+            "outer-hidden-call",
+            "tool_script",
+            serde_json::Value::String(hidden_mobile_script()),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("reject hidden child script");
+    let ToolDispatchResult::Completed(result) = result else {
+        panic!("hidden child unexpectedly reached approval");
+    };
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    let terminal = result.orchestration.expect("rejection terminal");
+    assert_eq!(terminal.status, ScriptTerminalStatusV1::Rejected);
+    assert!(
+        terminal
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("wrapper_unavailable")),
+        "{terminal:?}"
+    );
+    assert_eq!(
+        orchestration_journal_counts(&fixture).await,
+        (0, 0, 0, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn repeat_safe_retries_use_fresh_attempts_one_deadline_and_durable_backoff() {
+    let fixture = mobile_dispatcher_fixture_with_policy(
+        "orchestration-retry",
+        "exercise bounded retries",
+        Arc::new(FakeMobileBackend::default()),
+        None,
+        true,
+    )
+    .await;
+    let missing = std::path::Path::new(&fixture.cwd).join("missing.txt");
+    let started = std::time::Instant::now();
+    let result = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new("outer-retry-item"),
+            "outer-retry-call",
+            "tool_script",
+            serde_json::Value::String(retrying_fs_read_script(&missing.to_string_lossy())),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("execute retrying script");
+    let elapsed = started.elapsed();
+    let ToolDispatchResult::Completed(result) = result else {
+        panic!("retrying script unexpectedly requested approval");
+    };
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Failed,
+        "{}",
+        result.preview
+    );
+    let terminal = result.orchestration.expect("retry terminal");
+    assert_eq!(terminal.status, ScriptTerminalStatusV1::Failed);
+    assert_eq!(terminal.counts.calls, 1);
+    assert_eq!(terminal.counts.attempts, 3);
+    assert_eq!(terminal.counts.failed, 3);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(290),
+        "{elapsed:?}"
+    );
+    assert_eq!(
+        orchestration_journal_counts(&fixture).await,
+        (0, 0, 0, 0, 3),
+        "path resolution fails before the effect boundary, but each attempt still settles"
+    );
+
+    let clocks = orchestration_activation_clocks(&fixture).await;
+    assert_eq!(clocks.len(), 3);
+    assert!(clocks.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    assert!(clocks.iter().all(|clock| clock.1 == clocks[0].1));
+    assert!(clocks.iter().all(|clock| clock.2 == clocks[0].2));
 }
 
 #[tokio::test]

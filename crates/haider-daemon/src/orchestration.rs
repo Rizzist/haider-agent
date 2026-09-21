@@ -11,11 +11,11 @@ use haider_protocol::ids::ArtifactRef;
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::orchestration::{
     InlineNodeV1, InlinePortV1, MaterializedDefinitionV1, MaterializedPortV1, ORCHESTRATION_CODEC,
-    ORCHESTRATION_SCRIPT_EXTENSION, ORCHESTRATION_SEMANTICS, ORCHESTRATION_TRANSPORT,
-    ORCHESTRATION_VERSION, OrchIndexDomainV1, OrchIndexEntryV1, OrchIndexV1, OrchPortRoleV1,
-    OrchShapeV1, OrchTypeV1, OrchestrationError, OrchestrationLimitsV1, ReadGroupV1, ScriptGraphV1,
-    ScriptRequestV1, ScriptTerminalV1, StrictJson, canonical_json, parse_script_request,
-    request_digest, validate_inline_dag,
+    ORCHESTRATION_NODE_MAX, ORCHESTRATION_SCRIPT_EXTENSION, ORCHESTRATION_SEMANTICS,
+    ORCHESTRATION_TRANSPORT, ORCHESTRATION_VERSION, OrchIndexDomainV1, OrchIndexEntryV1,
+    OrchIndexV1, OrchPortRoleV1, OrchShapeV1, OrchTypeV1, OrchestrationError,
+    OrchestrationLimitsV1, ReadGroupV1, ScriptGraphV1, ScriptRequestV1, ScriptTerminalV1,
+    StrictJson, canonical_json, parse_script_request, request_digest, validate_inline_dag,
 };
 use haider_protocol::pipe::{INSTRUCT_EVIDENCE_MAX_BYTES, InstructEvidenceRef};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,7 @@ pub(crate) struct WrapperV1 {
     pub(crate) repeat_safe: bool,
     pub(crate) parallel_safe: bool,
     pub(crate) effectless_actor: bool,
+    pub(crate) may_ask: bool,
     pub(crate) input_schema: Value,
 }
 
@@ -89,6 +90,17 @@ pub(crate) struct PendingCallV1 {
     pub(crate) started_at_ms: u64,
     pub(crate) deadline_ms: u64,
     pub(crate) started: bool,
+    #[serde(default)]
+    pub(crate) approval_waiting: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CallClockV1 {
+    pub(crate) started_at_ms: u64,
+    pub(crate) deadline_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_not_before_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +111,7 @@ pub(crate) struct RuntimeStateV1 {
     pub(crate) value_refs: Vec<Option<InstructEvidenceRef>>,
     pub(crate) next_slot: u32,
     pub(crate) attempts: BTreeMap<u32, u8>,
+    pub(crate) call_clocks: BTreeMap<u32, CallClockV1>,
     pub(crate) pending_calls: BTreeMap<u32, PendingCallV1>,
     pub(crate) receipt_refs: Vec<InstructEvidenceRef>,
     pub(crate) checkpoint_ref: Option<InstructEvidenceRef>,
@@ -109,20 +122,19 @@ pub(crate) struct RuntimeStateV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-enum CheckpointValueV1 {
-    Ready { evidence_ref: InstructEvidenceRef },
-    Inactive,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DurableCheckpointV1 {
     version: u32,
-    admitted: AdmittedScriptV1,
-    values: Vec<Option<CheckpointValueV1>>,
+    script_id: String,
+    request_digest: String,
+    source_ref: InstructEvidenceRef,
+    admitted_at_ms: u64,
+    canonical_bytes: u64,
+    value_indexes: Vec<InstructEvidenceRef>,
+    inactive_slots: Vec<u32>,
     next_slot: u32,
     attempts: BTreeMap<u32, u8>,
+    call_clocks: BTreeMap<u32, CallClockV1>,
     pending_calls: BTreeMap<u32, PendingCallV1>,
     receipt_refs: Vec<InstructEvidenceRef>,
     checkpoint_ref: Option<InstructEvidenceRef>,
@@ -149,16 +161,17 @@ impl From<OrchestrationError> for AdmissionFailure {
     }
 }
 
-#[derive(Serialize)]
-struct ScriptManifest<'a> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptManifestV1 {
     version: u32,
-    transport: &'static str,
-    codec: &'static str,
-    semantics: &'static str,
-    catalog_digest: &'a str,
-    shape: &'a InstructEvidenceRef,
+    transport: String,
+    codec: String,
+    semantics: String,
+    catalog_digest: String,
+    shape: InstructEvidenceRef,
     inputs: Vec<InstructEvidenceRef>,
-    limits: &'a haider_protocol::orchestration::OrchestrationLimitsV1,
+    limits: haider_protocol::orchestration::OrchestrationLimitsV1,
 }
 
 pub(crate) async fn admit(
@@ -230,7 +243,7 @@ pub(crate) async fn admit(
                         message: "the session has no committed access to this shape ref".into(),
                     });
                 }
-                let imported = import_shape(root, store, &digest).await?;
+                let imported = import_shape(root, &request.catalog_digest, store, &digest).await?;
                 let mut normalized = imported.nodes.clone();
                 normalize_node_configs(&mut normalized);
                 if normalized != imported.nodes {
@@ -303,15 +316,15 @@ pub(crate) async fn admit(
         input_refs.push(evidence_ref);
     }
     let limits = effective_limits(request.limits.clone());
-    let manifest = ScriptManifest {
+    let manifest = ScriptManifestV1 {
         version: ORCHESTRATION_VERSION,
-        transport: ORCHESTRATION_TRANSPORT,
-        codec: ORCHESTRATION_CODEC,
-        semantics: ORCHESTRATION_SEMANTICS,
-        catalog_digest: &request.catalog_digest,
-        shape: &shape_ref,
+        transport: ORCHESTRATION_TRANSPORT.into(),
+        codec: ORCHESTRATION_CODEC.into(),
+        semantics: ORCHESTRATION_SEMANTICS.into(),
+        catalog_digest: request.catalog_digest.clone(),
+        shape: shape_ref.clone(),
         inputs: input_refs.clone(),
-        limits: &limits,
+        limits: limits.clone(),
     };
     let mut parents = Vec::with_capacity(input_refs.len() + 1);
     parents.push(shape_ref.artifact.clone());
@@ -325,6 +338,7 @@ pub(crate) async fn admit(
         value_refs: vec![None; nodes.len()],
         next_slot: 0,
         attempts: BTreeMap::new(),
+        call_clocks: BTreeMap::new(),
         pending_calls: BTreeMap::new(),
         receipt_refs: Vec::new(),
         checkpoint_ref: None,
@@ -560,31 +574,56 @@ pub(crate) async fn persist_checkpoint(
     store: &HubStoreHandle,
     state: &mut RuntimeStateV1,
 ) -> Result<InstructEvidenceRef, haider_protocol::error::HaiderError> {
-    let values = state
-        .values
-        .iter()
-        .zip(&state.value_refs)
-        .map(|(value, evidence_ref)| match value {
-            None => Ok(None),
-            Some(RuntimeValueV1::Inactive) => Ok(Some(CheckpointValueV1::Inactive)),
-            Some(RuntimeValueV1::Ready { .. }) => evidence_ref
-                .clone()
-                .map(|evidence_ref| Some(CheckpointValueV1::Ready { evidence_ref }))
-                .ok_or_else(|| {
+    let mut ready = Vec::new();
+    let mut inactive_slots = Vec::new();
+    for (slot, (value, evidence_ref)) in state.values.iter().zip(&state.value_refs).enumerate() {
+        match value {
+            None => {}
+            Some(RuntimeValueV1::Inactive) => {
+                inactive_slots.push(u32::try_from(slot).unwrap_or(u32::MAX));
+            }
+            Some(RuntimeValueV1::Ready { .. }) => {
+                let evidence_ref = evidence_ref.clone().ok_or_else(|| {
                     haider_protocol::error::HaiderError::new(
                         haider_protocol::error::ErrorCode::Internal,
                         "ready orchestration value has no immutable evidence ref",
                         false,
                     )
-                }),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                })?;
+                ready.push(OrchIndexEntryV1 {
+                    slot: u32::try_from(slot).unwrap_or(u32::MAX),
+                    evidence_ref,
+                });
+            }
+        }
+    }
+    let mut value_indexes = Vec::new();
+    for page in ready.chunks(256) {
+        let index = OrchIndexV1 {
+            version: ORCHESTRATION_VERSION,
+            domain: OrchIndexDomainV1::Execution,
+            script_id: Some(state.admitted.script_id.clone()),
+            entries: page.to_vec(),
+        };
+        let parents = page
+            .iter()
+            .map(|entry| entry.evidence_ref.artifact.clone())
+            .collect();
+        let (index_ref, _) = put_evidence(store, "OrchIndexV1", &index, parents).await?;
+        value_indexes.push(index_ref);
+    }
     let durable = DurableCheckpointV1 {
         version: ORCHESTRATION_VERSION,
-        admitted: state.admitted.clone(),
-        values,
+        script_id: state.admitted.script_id.clone(),
+        request_digest: state.admitted.request_digest.clone(),
+        source_ref: state.admitted.source_ref.clone(),
+        admitted_at_ms: state.admitted.admitted_at_ms,
+        canonical_bytes: state.admitted.canonical_bytes,
+        value_indexes: value_indexes.clone(),
+        inactive_slots,
         next_slot: state.next_slot,
         attempts: state.attempts.clone(),
+        call_clocks: state.call_clocks.clone(),
         pending_calls: state.pending_calls.clone(),
         receipt_refs: state.receipt_refs.clone(),
         checkpoint_ref: state.checkpoint_ref.clone(),
@@ -597,12 +636,12 @@ pub(crate) async fn persist_checkpoint(
     if let Some(previous) = state.checkpoint_ref.as_ref() {
         parents.push(previous.artifact.clone());
     }
+    parents.extend(value_indexes.iter().map(|index| index.artifact.clone()));
     parents.extend(
         state
-            .value_refs
+            .receipt_refs
             .iter()
-            .flatten()
-            .map(|value| value.artifact.clone()),
+            .map(|receipt| receipt.artifact.clone()),
     );
     let (checkpoint, _) = put_evidence(store, "OrchCheckpointV1", &durable, parents).await?;
     state.checkpoint_ref = Some(checkpoint.clone());
@@ -635,6 +674,7 @@ pub(crate) async fn persist_terminal(
 pub(crate) async fn recover_checkpoint(
     store: &HubStoreHandle,
     script_id: &str,
+    wrappers: Option<&WrapperSnapshot>,
 ) -> Result<Option<RuntimeStateV1>, haider_protocol::error::HaiderError> {
     let mut cursor = 0;
     let mut latest = None;
@@ -692,73 +732,324 @@ pub(crate) async fn recover_checkpoint(
             false,
         )
     })?;
-    if durable.version != ORCHESTRATION_VERSION || durable.admitted.script_id != script_id {
+    if durable.version != ORCHESTRATION_VERSION || durable.script_id != script_id {
         return Err(haider_protocol::error::HaiderError::new(
             haider_protocol::error::ErrorCode::StoreCorrupt,
             "orchestration checkpoint identity changed",
             false,
         ));
     }
-    if durable.values.len() != durable.admitted.nodes.len() {
+    let corrupt = |message: String| {
+        haider_protocol::error::HaiderError::new(
+            haider_protocol::error::ErrorCode::StoreCorrupt,
+            message,
+            false,
+        )
+    };
+    let source_bytes = read_evidence(store, &durable.source_ref, "OrchScriptV1", script_id)
+        .await
+        .map_err(|failure| corrupt(failure.message))?;
+    let manifest = serde_json::from_slice::<ScriptManifestV1>(&source_bytes)
+        .map_err(|error| corrupt(format!("orchestration source is malformed: {error}")))?;
+    verify_canonical(&manifest, &source_bytes, script_id)
+        .map_err(|failure| corrupt(failure.message))?;
+    let expected_source_parents = std::iter::once(manifest.shape.artifact.clone())
+        .chain(manifest.inputs.iter().map(|input| input.artifact.clone()))
+        .collect::<Vec<_>>();
+    if manifest.version != ORCHESTRATION_VERSION
+        || manifest.transport != ORCHESTRATION_TRANSPORT
+        || manifest.codec != ORCHESTRATION_CODEC
+        || manifest.semantics != ORCHESTRATION_SEMANTICS
+        || wrappers.is_some_and(|wrappers| manifest.catalog_digest != wrappers.catalog_digest)
+        || durable.source_ref.parents != expected_source_parents
+    {
+        return Err(corrupt(
+            "orchestration source identity or catalog changed".into(),
+        ));
+    }
+    let imported = import_shape(&manifest.shape, &manifest.catalog_digest, store, script_id)
+        .await
+        .map_err(|failure| corrupt(failure.message))?;
+    validate_inline_dag(
+        &imported.parameters,
+        &imported.nodes,
+        &imported.exits,
+        &imported.read_groups,
+        Some(&manifest.limits),
+    )
+    .map_err(|error| corrupt(format!("recovered orchestration graph is invalid: {error}")))?;
+    if let Some(wrappers) = wrappers {
+        validate_wrappers(&imported.nodes, wrappers, script_id)
+            .map_err(|failure| corrupt(failure.message))?;
+        validate_read_group_wrappers(&imported.nodes, &imported.read_groups, wrappers, script_id)
+            .map_err(|failure| corrupt(failure.message))?;
+    }
+    if manifest.inputs.len() != imported.parameters.len() {
+        return Err(corrupt(
+            "orchestration source input directory length changed".into(),
+        ));
+    }
+    let mut inputs = Vec::with_capacity(manifest.inputs.len());
+    let mut canonical_bytes = imported
+        .canonical_bytes
+        .saturating_add(source_bytes.len() as u64);
+    for (ordinal, (input_ref, parameter)) in
+        manifest.inputs.iter().zip(&imported.parameters).enumerate()
+    {
+        let input_bytes = read_evidence(store, input_ref, "OrchResultV1", script_id)
+            .await
+            .map_err(|failure| corrupt(failure.message))?;
+        let payload: Value = serde_json::from_slice(&input_bytes)
+            .map_err(|error| corrupt(format!("orchestration input is malformed: {error}")))?;
+        verify_canonical(&payload, &input_bytes, script_id)
+            .map_err(|failure| corrupt(failure.message))?;
+        let payload_type = payload
+            .get("type")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<OrchTypeV1>(value).ok());
+        let value = payload.get("value").cloned();
+        if payload.get("version").and_then(Value::as_u64) != Some(u64::from(ORCHESTRATION_VERSION))
+            || payload.get("kind").and_then(Value::as_str) != Some("input")
+            || payload.get("ordinal").and_then(Value::as_u64) != Some(ordinal as u64)
+            || payload_type.as_ref() != Some(parameter)
+            || value
+                .as_ref()
+                .is_none_or(|value| validate_value(value, parameter, 0).is_err())
+        {
+            return Err(corrupt(format!(
+                "orchestration input {ordinal} identity or type changed"
+            )));
+        }
+        canonical_bytes = canonical_bytes.saturating_add(input_bytes.len() as u64);
+        inputs.push(StrictJson(value.unwrap_or(Value::Null)));
+    }
+    if let Some(wrappers) = wrappers {
+        validate_preflight_arguments(&imported.nodes, &inputs, wrappers, script_id)
+            .map_err(|failure| corrupt(failure.message))?;
+    }
+    if durable.canonical_bytes != canonical_bytes {
+        return Err(corrupt(
+            "orchestration canonical byte accounting changed".into(),
+        ));
+    }
+    let node_count = imported.nodes.len();
+    if durable.next_slot as usize > node_count
+        || durable.value_indexes.len() > node_count.div_ceil(256)
+        || durable.attempts.iter().any(|(slot, attempts)| {
+            *slot as usize >= node_count
+                || imported.nodes[*slot as usize].evidence_type != "OrchCallV1"
+                || !(1..=3).contains(attempts)
+        })
+        || durable.call_clocks.iter().any(|(slot, clock)| {
+            *slot as usize >= node_count
+                || imported.nodes[*slot as usize].evidence_type != "OrchCallV1"
+                || clock.deadline_ms < clock.started_at_ms
+                || clock
+                    .retry_not_before_ms
+                    .is_some_and(|retry| retry < clock.started_at_ms)
+        })
+        || durable.pending_calls.iter().any(|(slot, pending)| {
+            slot != &pending.slot
+                || *slot as usize >= node_count
+                || pending.deadline_ms < pending.started_at_ms
+                || durable.attempts.get(slot) != Some(&pending.attempt)
+                || durable
+                    .call_clocks
+                    .get(slot)
+                    .is_none_or(|clock| clock.deadline_ms != pending.deadline_ms)
+                || !pending.started
+                || imported.nodes[*slot as usize].config.0["tool"].as_str()
+                    != Some(pending.tool.as_str())
+                || pending.item_id
+                    != format!(
+                        "orch-call-{}-{}-{}",
+                        durable.script_id, pending.slot, pending.attempt
+                    )
+                || pending.call_id
+                    != format!(
+                        "orch:{}:{}:{}",
+                        durable.script_id, pending.slot, pending.attempt
+                    )
+        })
+    {
         return Err(haider_protocol::error::HaiderError::new(
             haider_protocol::error::ErrorCode::StoreCorrupt,
-            "orchestration checkpoint value directory length changed",
+            "orchestration checkpoint frontier or clock is invalid",
             false,
         ));
     }
-    let mut values = Vec::with_capacity(durable.values.len());
-    let mut value_refs = Vec::with_capacity(durable.values.len());
-    for value in &durable.values {
-        match value {
-            None => {
-                values.push(None);
-                value_refs.push(None);
+    let mut values = vec![None; node_count];
+    let mut value_refs = vec![None; node_count];
+    let mut previous_inactive = None;
+    for slot in &durable.inactive_slots {
+        if *slot as usize >= node_count
+            || previous_inactive.is_some_and(|previous| previous >= *slot)
+        {
+            return Err(corrupt(
+                "orchestration inactive slot directory is invalid".into(),
+            ));
+        }
+        values[*slot as usize] = Some(RuntimeValueV1::Inactive);
+        previous_inactive = Some(*slot);
+    }
+    let mut previous_ready = None;
+    for index_ref in &durable.value_indexes {
+        let index_bytes = read_evidence(store, index_ref, "OrchIndexV1", script_id)
+            .await
+            .map_err(|failure| corrupt(failure.message))?;
+        let index = serde_json::from_slice::<OrchIndexV1>(&index_bytes)
+            .map_err(|error| corrupt(format!("orchestration value index is malformed: {error}")))?;
+        verify_canonical(&index, &index_bytes, script_id)
+            .map_err(|failure| corrupt(failure.message))?;
+        if index.version != ORCHESTRATION_VERSION
+            || index.domain != OrchIndexDomainV1::Execution
+            || index.script_id.as_deref() != Some(script_id)
+            || index.entries.is_empty()
+            || index.entries.len() > 256
+            || index_ref.parents
+                != index
+                    .entries
+                    .iter()
+                    .map(|entry| entry.evidence_ref.artifact.clone())
+                    .collect::<Vec<_>>()
+        {
+            return Err(corrupt("orchestration value index identity changed".into()));
+        }
+        for entry in index.entries {
+            if entry.slot as usize >= node_count
+                || previous_ready.is_some_and(|previous| previous >= entry.slot)
+                || values[entry.slot as usize].is_some()
+            {
+                return Err(corrupt(
+                    "orchestration value index slots are invalid".into(),
+                ));
             }
-            Some(CheckpointValueV1::Inactive) => {
-                values.push(Some(RuntimeValueV1::Inactive));
-                value_refs.push(None);
-            }
-            Some(CheckpointValueV1::Ready { evidence_ref }) => {
-                let payload = read_evidence(store, evidence_ref, "OrchResultV1", script_id)
+            let payload_bytes =
+                read_evidence(store, &entry.evidence_ref, "OrchResultV1", script_id)
                     .await
-                    .map_err(|failure| {
-                        haider_protocol::error::HaiderError::new(
-                            haider_protocol::error::ErrorCode::StoreCorrupt,
-                            failure.message,
-                            false,
-                        )
-                    })?;
-                let payload: Value = serde_json::from_slice(&payload).map_err(|error| {
-                    haider_protocol::error::HaiderError::new(
-                        haider_protocol::error::ErrorCode::StoreCorrupt,
-                        format!("orchestration value evidence is malformed: {error}"),
-                        false,
-                    )
-                })?;
-                let value = payload
-                    .get("value")
-                    .or_else(|| payload.get("result"))
-                    .cloned()
-                    .ok_or_else(|| {
-                        haider_protocol::error::HaiderError::new(
-                            haider_protocol::error::ErrorCode::StoreCorrupt,
-                            "orchestration value evidence has no value/result",
-                            false,
-                        )
-                    })?;
-                values.push(Some(RuntimeValueV1::Ready {
-                    value: StrictJson(value),
-                }));
-                value_refs.push(Some(evidence_ref.clone()));
+                    .map_err(|failure| corrupt(failure.message))?;
+            let payload: Value = serde_json::from_slice(&payload_bytes).map_err(|error| {
+                corrupt(format!(
+                    "orchestration value evidence is malformed: {error}"
+                ))
+            })?;
+            if payload.get("script_id").and_then(Value::as_str) != Some(script_id)
+                || payload.get("slot").and_then(Value::as_u64) != Some(u64::from(entry.slot))
+            {
+                return Err(corrupt(
+                    "orchestration value evidence identity changed".into(),
+                ));
             }
+            let value = payload
+                .get("value")
+                .or_else(|| payload.get("result"))
+                .cloned()
+                .ok_or_else(|| {
+                    corrupt("orchestration value evidence has no value/result".into())
+                })?;
+            values[entry.slot as usize] = Some(RuntimeValueV1::Ready {
+                value: StrictJson(value),
+            });
+            value_refs[entry.slot as usize] = Some(entry.evidence_ref);
+            previous_ready = Some(entry.slot);
         }
     }
+    for receipt in &durable.receipt_refs {
+        receipt
+            .validate()
+            .map_err(|error| corrupt(format!("orchestration receipt ref is invalid: {error}")))?;
+        if receipt.evidence_type != "OrchResultV1" {
+            return Err(corrupt(
+                "orchestration receipt ref has the wrong evidence type".into(),
+            ));
+        }
+    }
+    if let Some(previous) = &durable.checkpoint_ref {
+        previous.validate().map_err(|error| {
+            corrupt(format!(
+                "previous orchestration checkpoint ref is invalid: {error}"
+            ))
+        })?;
+        if previous.evidence_type != "OrchCheckpointV1" {
+            return Err(corrupt(
+                "previous orchestration checkpoint ref has the wrong evidence type".into(),
+            ));
+        }
+    }
+    for (slot, pending) in &durable.pending_calls {
+        pending.activation_ref.validate().map_err(|error| {
+            corrupt(format!(
+                "orchestration activation ref for slot {slot} is invalid: {error}"
+            ))
+        })?;
+        let expected_activation_prefix = [
+            durable.source_ref.artifact.clone(),
+            imported.definition_refs[*slot as usize].artifact.clone(),
+        ];
+        if pending.activation_ref.evidence_type != "OrchActivationV1"
+            || !pending
+                .activation_ref
+                .parents
+                .starts_with(&expected_activation_prefix)
+            || wrappers.is_some_and(|wrappers| {
+                wrappers.wrappers.get(&pending.tool).is_none_or(|wrapper| {
+                    validate_wrapper_argument(wrapper, &pending.args.0).is_err()
+                })
+            })
+        {
+            return Err(corrupt(format!(
+                "orchestration pending call {slot} identity changed"
+            )));
+        }
+    }
+    let expected_checkpoint_parents = std::iter::once(durable.source_ref.artifact.clone())
+        .chain(
+            durable
+                .checkpoint_ref
+                .iter()
+                .map(|previous| previous.artifact.clone()),
+        )
+        .chain(
+            durable
+                .value_indexes
+                .iter()
+                .map(|index| index.artifact.clone()),
+        )
+        .chain(
+            durable
+                .receipt_refs
+                .iter()
+                .map(|receipt| receipt.artifact.clone()),
+        )
+        .collect::<Vec<_>>();
+    if checkpoint.parents != expected_checkpoint_parents {
+        return Err(corrupt(
+            "orchestration checkpoint ordered parents changed".into(),
+        ));
+    }
+    let admitted = AdmittedScriptV1 {
+        version: ORCHESTRATION_VERSION,
+        script_id: durable.script_id,
+        request_digest: durable.request_digest,
+        shape_ref: manifest.shape,
+        source_ref: durable.source_ref,
+        definition_refs: imported.definition_refs,
+        parameters: imported.parameters,
+        nodes: imported.nodes,
+        exits: imported.exits,
+        read_groups: imported.read_groups,
+        inputs,
+        limits: manifest.limits,
+        admitted_at_ms: durable.admitted_at_ms,
+        canonical_bytes,
+    };
     Ok(Some(RuntimeStateV1 {
-        admitted: durable.admitted,
+        admitted,
         values,
         value_refs,
         next_slot: durable.next_slot,
         attempts: durable.attempts,
+        call_clocks: durable.call_clocks,
         pending_calls: durable.pending_calls,
         receipt_refs: durable.receipt_refs,
         checkpoint_ref: durable.checkpoint_ref,
@@ -1178,6 +1469,7 @@ struct ImportedShape {
 
 async fn import_shape(
     root: &InstructEvidenceRef,
+    expected_catalog_digest: &str,
     store: &HubStoreHandle,
     request_digest: &str,
 ) -> Result<ImportedShape, AdmissionFailure> {
@@ -1193,6 +1485,7 @@ async fn import_shape(
         || shape.transport != ORCHESTRATION_TRANSPORT
         || shape.codec != ORCHESTRATION_CODEC
         || shape.semantics != ORCHESTRATION_SEMANTICS
+        || shape.catalog_digest != expected_catalog_digest
         || root.parents
             != shape
                 .indexes
@@ -1206,9 +1499,21 @@ async fn import_shape(
             message: "shape metadata or ordered index parents do not match".into(),
         });
     }
+    let definition_count = shape.definition_count as usize;
+    let expected_indexes = definition_count.div_ceil(256);
+    if definition_count == 0
+        || definition_count > ORCHESTRATION_NODE_MAX
+        || shape.indexes.len() != expected_indexes
+    {
+        return Err(AdmissionFailure {
+            request_digest: request_digest.into(),
+            code: "shape_bounds".into(),
+            message: "shape definition/index directory is outside frozen bounds".into(),
+        });
+    }
     let mut definition_refs = Vec::new();
     let mut total = root_bytes.len() as u64;
-    for index_ref in &shape.indexes {
+    for (page_ordinal, index_ref) in shape.indexes.iter().enumerate() {
         let bytes = read_evidence(store, index_ref, "OrchIndexV1", request_digest).await?;
         let index: OrchIndexV1 =
             serde_json::from_slice(&bytes).map_err(|error| AdmissionFailure {
@@ -1217,9 +1522,17 @@ async fn import_shape(
                 message: error.to_string(),
             })?;
         verify_canonical(&index, &bytes, request_digest)?;
-        if index.domain != OrchIndexDomainV1::Definition
+        let first_slot = page_ordinal * 256;
+        let expected_entries = (definition_count - first_slot).min(256);
+        if index.version != ORCHESTRATION_VERSION
+            || index.domain != OrchIndexDomainV1::Definition
             || index.script_id.is_some()
-            || index.entries.len() > 256
+            || index.entries.len() != expected_entries
+            || index
+                .entries
+                .iter()
+                .enumerate()
+                .any(|(offset, entry)| entry.slot as usize != first_slot.saturating_add(offset))
             || index_ref.parents
                 != index
                     .entries
@@ -1236,7 +1549,7 @@ async fn import_shape(
         total = total.saturating_add(bytes.len() as u64);
         definition_refs.extend(index.entries.into_iter().map(|entry| entry.evidence_ref));
     }
-    if definition_refs.len() != shape.definition_count as usize {
+    if definition_refs.len() != definition_count {
         return Err(AdmissionFailure {
             request_digest: request_digest.into(),
             code: "definition_count".into(),
@@ -1419,9 +1732,10 @@ async fn session_has_shape_access(
             if kind == ORCHESTRATION_SCRIPT_EXTENSION
                 && data
                     .get("shape_ref")
-                    .and_then(|value| value.get("artifact"))
-                    .and_then(Value::as_str)
-                    == Some(root.artifact.as_str())
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<InstructEvidenceRef>(value).ok())
+                    .as_ref()
+                    == Some(root)
             {
                 return Ok(true);
             }

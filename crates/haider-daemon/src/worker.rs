@@ -14597,6 +14597,17 @@ fn orchestration_repeat_safe(route: RegisteredToolRoute) -> bool {
     )
 }
 
+fn orchestration_parallel_safe(route: RegisteredToolRoute) -> bool {
+    matches!(
+        route,
+        RegisteredToolRoute::FsRead
+            | RegisteredToolRoute::FsGlob
+            | RegisteredToolRoute::FsSearch
+            | RegisteredToolRoute::WebFetch
+            | RegisteredToolRoute::WebSearch
+    )
+}
+
 fn orchestration_bindable(route: RegisteredToolRoute) -> bool {
     !matches!(
         route,
@@ -14637,14 +14648,7 @@ fn orchestration_wrapper_digest(entry: &RegisteredTool) -> String {
         "default": entry.default,
         "route": orchestration_route_name(entry.route),
         "repeat_safe": orchestration_repeat_safe(entry.route),
-        "parallel_safe": matches!(
-            entry.route,
-            RegisteredToolRoute::FsRead
-                | RegisteredToolRoute::FsGlob
-                | RegisteredToolRoute::FsSearch
-                | RegisteredToolRoute::WebFetch
-                | RegisteredToolRoute::WebSearch
-        ),
+        "parallel_safe": orchestration_parallel_safe(entry.route),
         "effectless_actor": orchestration_effectless_actor(entry.route),
         "decoder": "bounded-result-v1",
     }))
@@ -14690,15 +14694,9 @@ fn orchestration_wrapper_snapshot(child_tools: &[String]) -> crate::orchestratio
                     crate::orchestration::WrapperV1 {
                         digest: orchestration_wrapper_digest(entry),
                         repeat_safe: orchestration_repeat_safe(entry.route),
-                        parallel_safe: matches!(
-                            entry.route,
-                            RegisteredToolRoute::FsRead
-                                | RegisteredToolRoute::FsGlob
-                                | RegisteredToolRoute::FsSearch
-                                | RegisteredToolRoute::WebFetch
-                                | RegisteredToolRoute::WebSearch
-                        ),
+                        parallel_safe: orchestration_parallel_safe(entry.route),
                         effectless_actor: orchestration_effectless_actor(entry.route),
+                        may_ask: entry.default == ToolPermissionDefault::Ask,
                         input_schema: entry.manifest.input_schema.clone(),
                     },
                 )
@@ -14729,8 +14727,10 @@ fn tool_script_definition_for_names(
                 "input_schema": entry.manifest.input_schema,
                 "effects": entry.manifest.effects,
                 "repeat_safe": orchestration_repeat_safe(entry.route),
+                "parallel_safe": orchestration_parallel_safe(entry.route),
                 "effectless_actor": orchestration_effectless_actor(entry.route),
-                "max_concurrency": if orchestration_repeat_safe(entry.route) { 4 } else { 1 },
+                "approval_may_pause": entry.default == ToolPermissionDefault::Ask,
+                "max_concurrency": if orchestration_parallel_safe(entry.route) { 4 } else { 1 },
             })
         })
         .collect::<Vec<_>>();
@@ -19137,8 +19137,30 @@ impl BrokerToolDispatcher {
             .and_then(|ask| ask.config.0.get("wait_ms"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(120_000);
-        let deadline_ms =
-            script_deadline_ms.min(started_at_ms.saturating_add(child_limit_ms.min(ask_limit_ms)));
+        let run_deadline_ms = self.run_deadline.map(|deadline| {
+            started_at_ms.saturating_add(
+                u64::try_from(
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+            )
+        });
+        let operation_deadline_ms = started_at_ms
+            .saturating_add(child_limit_ms.min(ask_limit_ms))
+            .min(script_deadline_ms)
+            .min(run_deadline_ms.unwrap_or(u64::MAX));
+        let clock = state.call_clocks.entry(node.slot).or_insert_with(|| {
+            crate::orchestration::CallClockV1 {
+                started_at_ms,
+                deadline_ms: operation_deadline_ms,
+                retry_not_before_ms: None,
+            }
+        });
+        let operation_started_at_ms = clock.started_at_ms;
+        let deadline_ms = clock.deadline_ms;
+        clock.retry_not_before_ms = None;
         let mut activation_parents = vec![
             state.admitted.source_ref.artifact.clone(),
             state.admitted.definition_refs[node.slot as usize]
@@ -19164,6 +19186,7 @@ impl BrokerToolDispatcher {
                 "item_id": item_id,
                 "call_id": call_id,
                 "activated_at_ms": started_at_ms,
+                "operation_started_at_ms": operation_started_at_ms,
                 "deadline_ms": deadline_ms,
                 "script_deadline_ms": script_deadline_ms,
             }),
@@ -19181,6 +19204,7 @@ impl BrokerToolDispatcher {
             started_at_ms,
             deadline_ms,
             started: true,
+            approval_waiting: false,
         };
         state.pending_calls.insert(node.slot, pending.clone());
         let start = EventPayload::Item(ItemEvent::Started {
@@ -19209,6 +19233,32 @@ impl BrokerToolDispatcher {
             }),
         ));
         Ok((pending, events))
+    }
+
+    async fn wait_orchestration_retry_backoff(
+        &self,
+        state: &mut crate::orchestration::RuntimeStateV1,
+        slot: u32,
+        cancel: &CancelToken,
+    ) -> bool {
+        let Some(not_before_ms) = state
+            .call_clocks
+            .get(&slot)
+            .and_then(|clock| clock.retry_not_before_ms)
+        else {
+            return false;
+        };
+        let remaining_ms = not_before_ms.saturating_sub(unix_time_ms());
+        if remaining_ms > 0 {
+            tokio::select! {
+                _ = cancel.cancelled() => return true,
+                _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => {}
+            }
+        }
+        if let Some(clock) = state.call_clocks.get_mut(&slot) {
+            clock.retry_not_before_ms = None;
+        }
+        false
     }
 
     async fn dispatch_orchestration_child(
@@ -19301,7 +19351,7 @@ impl BrokerToolDispatcher {
                 }
                 ToolResultStatus::Cancelled => {}
             }
-            self.record_orchestration_call_result(run_id, state, pending, result)
+            self.record_orchestration_call_result(run_id, state, pending, result, None)
                 .await?;
         }
         let terminal = if outcome_unknown {
@@ -19319,8 +19369,16 @@ impl BrokerToolDispatcher {
                 },
                 OrchestrationChildInterruption::Deadline => OrchestrationTerminalReason {
                     status: ScriptTerminalStatusV1::TimedOut,
-                    code: "child_wall_timeout",
-                    reason: "a child call reached its persisted wall-clock deadline",
+                    code: if pending.approval_waiting {
+                        "permission_wait_timeout"
+                    } else {
+                        "child_wall_timeout"
+                    },
+                    reason: if pending.approval_waiting {
+                        "a pending child permission request reached its persisted deadline"
+                    } else {
+                        "a child call reached its persisted wall-clock deadline"
+                    },
                 },
             }
         };
@@ -19351,6 +19409,21 @@ impl BrokerToolDispatcher {
             if !crate::orchestration::active(&node, &state.values) {
                 state.values[*slot as usize] = Some(crate::orchestration::RuntimeValueV1::Inactive);
                 continue;
+            }
+            if self
+                .wait_orchestration_retry_backoff(state, node.slot, cancel)
+                .await
+            {
+                let terminal = orchestration_terminal(
+                    state,
+                    ScriptTerminalStatusV1::Cancelled,
+                    "cancelled",
+                    "orchestration was cancelled during retry backoff".into(),
+                );
+                return self
+                    .finish_orchestration(run_id, Some(state), terminal)
+                    .await
+                    .map(Some);
             }
             let args = crate::orchestration::input_value(
                 &node,
@@ -19410,7 +19483,17 @@ impl BrokerToolDispatcher {
             .await?;
         }
 
-        let width = usize::from(group.max_concurrency);
+        let approval_may_pause = pending.iter().any(|(_, call)| {
+            self.orchestration_wrappers
+                .wrappers
+                .get(&call.tool)
+                .is_some_and(|wrapper| wrapper.may_ask)
+        });
+        let width = if approval_may_pause {
+            1
+        } else {
+            usize::from(group.max_concurrency)
+        };
         for wave in pending.chunks(width) {
             let outcomes = join_all(wave.iter().map(|(_, call)| async move {
                 let result = self
@@ -19446,6 +19529,9 @@ impl BrokerToolDispatcher {
                 };
                 match outcome {
                     ToolDispatchResult::ApprovalRequired(menu) => {
+                        if let Some(pending) = state.pending_calls.get_mut(&call.slot) {
+                            pending.approval_waiting = true;
+                        }
                         if approval.is_none() {
                             approval = Some(menu);
                         }
@@ -19479,11 +19565,17 @@ impl BrokerToolDispatcher {
                             ToolResultStatus::Cancelled => {}
                         }
                         let status = result.status;
-                        self.record_orchestration_call_result(run_id, state, &call, result)
-                            .await?;
+                        let retry_backoff_ms =
+                            retry.then_some(if call.attempt == 1 { 100 } else { 200 });
+                        self.record_orchestration_call_result(
+                            run_id,
+                            state,
+                            &call,
+                            result,
+                            retry_backoff_ms,
+                        )
+                        .await?;
                         if retry {
-                            state.values[call.slot as usize] = None;
-                            state.value_refs[call.slot as usize] = None;
                             retry_slots.push((call.slot, call.attempt));
                         } else if status == ToolResultStatus::Rejected {
                             terminal_reason.get_or_insert(OrchestrationTerminalReason {
@@ -19522,6 +19614,13 @@ impl BrokerToolDispatcher {
                     .copied()
                     .min()
                     .unwrap_or(resume_slot);
+                self.checkpoint_orchestration(
+                    run_id,
+                    state,
+                    &format!("group-{}-approval", group.id),
+                    Vec::new(),
+                )
+                .await?;
                 self.orchestrations
                     .lock()
                     .await
@@ -19534,13 +19633,7 @@ impl BrokerToolDispatcher {
                     .map(|(slot, _)| *slot)
                     .min()
                     .unwrap_or(state.next_slot);
-                let delay = retry_slots
-                    .iter()
-                    .map(|(_, attempt)| if *attempt == 1 { 100 } else { 200 })
-                    .max()
-                    .unwrap_or(100);
                 state.next_slot = next;
-                tokio::time::sleep(Duration::from_millis(delay)).await;
                 return Ok(None);
             }
         }
@@ -19579,7 +19672,7 @@ impl BrokerToolDispatcher {
                 ));
             }
             let returned_limit =
-                crate::orchestration::recover_checkpoint(&self.output.store, &script_id)
+                crate::orchestration::recover_checkpoint(&self.output.store, &script_id, None)
                     .await?
                     .and_then(|state| state.admitted.limits.returned_bytes)
                     .unwrap_or(haider_protocol::orchestration::ORCHESTRATION_RETURN_DEFAULT_BYTES)
@@ -19621,8 +19714,12 @@ impl BrokerToolDispatcher {
         let in_memory = self.orchestrations.lock().await.remove(&key);
         let mut state = if let Some(state) = in_memory {
             state
-        } else if let Some(state) =
-            crate::orchestration::recover_checkpoint(&self.output.store, &script_id).await?
+        } else if let Some(state) = crate::orchestration::recover_checkpoint(
+            &self.output.store,
+            &script_id,
+            Some(&self.orchestration_wrappers),
+        )
+        .await?
         {
             recovered = true;
             state
@@ -19727,8 +19824,10 @@ impl BrokerToolDispatcher {
                             }
                             ToolResultStatus::Cancelled => {}
                         }
-                        self.record_orchestration_call_result(run_id, &mut state, &pending, result)
-                            .await?;
+                        self.record_orchestration_call_result(
+                            run_id, &mut state, &pending, result, None,
+                        )
+                        .await?;
                     }
                     RecoveredOrchestrationChild::SafeToRetry => {}
                     RecoveredOrchestrationChild::Interrupted { unknown } => {
@@ -19868,6 +19967,20 @@ impl BrokerToolDispatcher {
                         .finish_orchestration(run_id, Some(&mut state), terminal)
                         .await;
                 }
+                if self
+                    .wait_orchestration_retry_backoff(&mut state, node.slot, cancel)
+                    .await
+                {
+                    let terminal = orchestration_terminal(
+                        &state,
+                        ScriptTerminalStatusV1::Cancelled,
+                        "cancelled",
+                        "orchestration was cancelled during retry backoff".into(),
+                    );
+                    return self
+                        .finish_orchestration(run_id, Some(&mut state), terminal)
+                        .await;
+                }
                 let (pending, prefix) = self
                     .prepare_orchestration_call(&mut state, &node, &tool, &args)
                     .await?;
@@ -19914,6 +20027,16 @@ impl BrokerToolDispatcher {
                 };
                 match child {
                     ToolDispatchResult::ApprovalRequired(menu) => {
+                        if let Some(pending) = state.pending_calls.get_mut(&node.slot) {
+                            pending.approval_waiting = true;
+                        }
+                        self.checkpoint_orchestration(
+                            run_id,
+                            &mut state,
+                            &format!("call-{}-approval", node.slot),
+                            Vec::new(),
+                        )
+                        .await?;
                         self.orchestrations.lock().await.insert(key, state);
                         return Ok(ToolDispatchResult::ApprovalRequired(menu));
                     }
@@ -19936,26 +20059,26 @@ impl BrokerToolDispatcher {
                         ) && attempt < retry_limit
                         {
                             state.failed_calls = state.failed_calls.saturating_add(1);
+                            let backoff_ms = if attempt == 1 { 100 } else { 200 };
                             self.record_orchestration_call_result(
-                                run_id, &mut state, &pending, result,
+                                run_id,
+                                &mut state,
+                                &pending,
+                                result,
+                                Some(backoff_ms),
                             )
                             .await?;
                             // Re-run the call slot with a new stable attempt
-                            // identity; the original script deadline is never reset.
-                            state.next_slot = node.slot;
-                            tokio::time::sleep(Duration::from_millis(if attempt == 1 {
-                                100
-                            } else {
-                                200
-                            }))
-                            .await;
+                            // identity; the original child/script deadline and
+                            // absolute backoff expiry are checkpointed together
+                            // with the failed attempt.
                             continue;
                         }
                         match result.status {
                             ToolResultStatus::Rejected => {
                                 state.rejected_calls = state.rejected_calls.saturating_add(1);
                                 self.record_orchestration_call_result(
-                                    run_id, &mut state, &pending, result,
+                                    run_id, &mut state, &pending, result, None,
                                 )
                                 .await?;
                                 let terminal = orchestration_terminal(
@@ -19970,7 +20093,7 @@ impl BrokerToolDispatcher {
                             }
                             ToolResultStatus::Cancelled => {
                                 self.record_orchestration_call_result(
-                                    run_id, &mut state, &pending, result,
+                                    run_id, &mut state, &pending, result, None,
                                 )
                                 .await?;
                                 let terminal = orchestration_terminal(
@@ -19986,7 +20109,7 @@ impl BrokerToolDispatcher {
                             ToolResultStatus::Unknown => {
                                 state.unknown_calls = state.unknown_calls.saturating_add(1);
                                 self.record_orchestration_call_result(
-                                    run_id, &mut state, &pending, result,
+                                    run_id, &mut state, &pending, result, None,
                                 )
                                 .await?;
                                 let terminal = orchestration_terminal(
@@ -20006,8 +20129,10 @@ impl BrokerToolDispatcher {
                                 state.failed_calls = state.failed_calls.saturating_add(1);
                             }
                         }
-                        self.record_orchestration_call_result(run_id, &mut state, &pending, result)
-                            .await?;
+                        self.record_orchestration_call_result(
+                            run_id, &mut state, &pending, result, None,
+                        )
+                        .await?;
                     }
                 }
                 continue;
@@ -20126,6 +20251,7 @@ impl BrokerToolDispatcher {
         state: &mut crate::orchestration::RuntimeStateV1,
         pending: &crate::orchestration::PendingCallV1,
         result: BoundedResult,
+        retry_backoff_ms: Option<u64>,
     ) -> Result<(), HaiderError> {
         let payload = serde_json::json!({
             "version": 1,
@@ -20144,13 +20270,28 @@ impl BrokerToolDispatcher {
         )
         .await?;
         state.receipt_refs.push(receipt.clone());
-        state.values[pending.slot as usize] = Some(crate::orchestration::RuntimeValueV1::Ready {
-            value: StrictJson(serde_json::to_value(&result).map_err(|error| {
-                HaiderError::new(ErrorCode::Internal, error.to_string(), false)
-            })?),
-        });
-        state.value_refs[pending.slot as usize] = Some(receipt.clone());
-        state.next_slot = pending.slot.saturating_add(1);
+        if let Some(backoff_ms) = retry_backoff_ms {
+            state.values[pending.slot as usize] = None;
+            state.value_refs[pending.slot as usize] = None;
+            state.next_slot = pending.slot;
+            let clock = state.call_clocks.get_mut(&pending.slot).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "orchestration retry has no original call clock",
+                    false,
+                )
+            })?;
+            clock.retry_not_before_ms = Some(unix_time_ms().saturating_add(backoff_ms));
+        } else {
+            state.values[pending.slot as usize] =
+                Some(crate::orchestration::RuntimeValueV1::Ready {
+                    value: StrictJson(serde_json::to_value(&result).map_err(|error| {
+                        HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                    })?),
+                });
+            state.value_refs[pending.slot as usize] = Some(receipt.clone());
+            state.next_slot = pending.slot.saturating_add(1);
+        }
         state.pending_calls.remove(&pending.slot);
         let completed_item = TurnItem::ToolCall {
             call_id: pending.call_id.clone(),

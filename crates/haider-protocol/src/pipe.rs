@@ -2443,4 +2443,67 @@ mod tests {
             "the domain-separated encoding is deterministic"
         );
     }
+
+    #[test]
+    fn instruct_evidence_accepts_and_rejects_every_frozen_size_boundary() {
+        let artifact = ArtifactRef::new(format!("blake3:{}", "a".repeat(64)));
+        let evidence = |evidence_type: String, byte_len: u64, parents: Vec<ArtifactRef>| {
+            InstructEvidenceRef::new(artifact.clone(), evidence_type, byte_len, parents)
+        };
+        assert_eq!(
+            evidence("T".into(), 0, vec![]).validate(),
+            Err(InstructEvidenceError::InvalidLength)
+        );
+        evidence("T".into(), 1, vec![])
+            .validate()
+            .expect("one byte is valid");
+        evidence("T".into(), INSTRUCT_EVIDENCE_MAX_BYTES, vec![])
+            .validate()
+            .expect("one MiB is valid");
+        assert_eq!(
+            evidence(
+                "T".into(),
+                INSTRUCT_EVIDENCE_MAX_BYTES.saturating_add(1),
+                vec![],
+            )
+            .validate(),
+            Err(InstructEvidenceError::InvalidLength)
+        );
+
+        let type_256 = format!(
+            "{}+{}+{}+{}",
+            "A".repeat(64),
+            "B".repeat(64),
+            "C".repeat(64),
+            "D".repeat(61)
+        );
+        assert_eq!(type_256.len(), INSTRUCT_EVIDENCE_TYPE_MAX_BYTES);
+        evidence(type_256.clone(), 1, vec![])
+            .validate()
+            .expect("256-byte type expression is valid");
+        let type_257 = format!("{type_256}E");
+        assert_eq!(type_257.len(), INSTRUCT_EVIDENCE_TYPE_MAX_BYTES + 1);
+        assert_eq!(
+            evidence(type_257, 1, vec![]).validate(),
+            Err(InstructEvidenceError::InvalidType)
+        );
+
+        let parent = ArtifactRef::new(format!("blake3:{}", "b".repeat(64)));
+        evidence(
+            "T".into(),
+            1,
+            vec![parent.clone(); INSTRUCT_EVIDENCE_MAX_PARENTS],
+        )
+        .validate()
+        .expect("4096 parents are valid");
+        assert_eq!(
+            evidence(
+                "T".into(),
+                1,
+                vec![parent; INSTRUCT_EVIDENCE_MAX_PARENTS + 1],
+            )
+            .validate(),
+            Err(InstructEvidenceError::TooManyParents)
+        );
+    }
 }
