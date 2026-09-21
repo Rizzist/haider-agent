@@ -114,7 +114,7 @@ export HAIDER_WEBEXTRACT_TOKEN_ARM=current
 export HAIDER_WEBEXTRACT_TOKEN_OUTPUT=/tmp/webextract-current.json
 /Users/rizzist/Developer/haiderharness/runtime/build-slot.sh webextract-current -- \
   cargo test -p haider-core --lib --locked \
-  webextract_token_harness_tests::measure_webextract_token_economics -- \
+  actor::webextract_token_harness_tests::measure_webextract_token_economics -- \
   --ignored --exact --nocapture
 ```
 
