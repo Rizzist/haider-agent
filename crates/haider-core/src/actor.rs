@@ -609,6 +609,10 @@ mod actor_request_attempt_tests;
 mod actor_tool_result_tests;
 
 #[cfg(test)]
+#[path = "webextract_token_harness_tests.rs"]
+mod webextract_token_harness_tests;
+
+#[cfg(test)]
 #[path = "actor_context_economy_tests.rs"]
 mod actor_context_economy_tests;
 
