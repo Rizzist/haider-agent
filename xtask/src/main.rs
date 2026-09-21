@@ -2,7 +2,14 @@
 //! - `xtask loc-lint`     — soft 10k-LOC cap per source file (warns, never fails).
 //! - `xtask test-count`   — fails CI if the workspace test count DROPS below the
 //!   committed baseline (`test-baseline.txt`); `--update` rewrites the baseline.
-//! - `xtask check`        — both.
+//! - `xtask platform-goldens` — rejects target-sensitive fixtures without an
+//!   explicit target-qualified selection path.
+//! - `xtask race-catalog` — keeps named race/concurrency tests in the stress
+//!   catalog.
+//! - `xtask check`        — all repo guards.
+
+mod platform_goldens;
+mod race_catalog;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,17 +23,26 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("loc-lint") => loc_lint(),
         Some("test-count") => test_count(args.iter().any(|a| a == "--update")),
+        Some("platform-goldens") => platform_goldens::check(&workspace_root()),
+        Some("race-catalog") => race_catalog::check(&workspace_root()),
         Some("check") => {
             let a = loc_lint();
             let b = test_count(false);
-            if a == ExitCode::SUCCESS && b == ExitCode::SUCCESS {
+            let c = platform_goldens::check(&workspace_root());
+            let d = race_catalog::check(&workspace_root());
+            if [a, b, c, d]
+                .into_iter()
+                .all(|status| status == ExitCode::SUCCESS)
+            {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
             }
         }
         _ => {
-            eprintln!("usage: xtask <loc-lint|test-count [--update]|check>");
+            eprintln!(
+                "usage: xtask <loc-lint|test-count [--update]|platform-goldens|race-catalog|check>"
+            );
             ExitCode::from(2)
         }
     }

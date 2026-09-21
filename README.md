@@ -220,11 +220,14 @@ outcome and the authenticated process identity has exited.
 
 ## 🚀 Development
 
+Repository testing policy, including the required loaded iteration loop for
+timing and concurrency tests, is documented in [docs/TESTING.md](docs/TESTING.md).
+
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace
-cargo run -p xtask -- test-count
+cargo run -p xtask -- check
 ```
 
 Repository rules live in [CONVENTIONS.md](CONVENTIONS.md). CI enforces formatting, workspace-wide Clippy with warnings denied, and the checked-in workspace test-count floor.
