@@ -2606,7 +2606,8 @@ mod tests {
             }),
         ];
         assert_eq!(
-            evaluate_join(&nodes[2], &nodes, &values).expect("recognized map values evaluate"),
+            evaluate_join(&nodes[2], &nodes, &values)
+                .unwrap_or_else(|error| panic!("recognized map values must evaluate: {error}")),
             serde_json::json!([7])
         );
     }
@@ -2794,13 +2795,15 @@ mod tests {
                 "screenshot",
             ],
         );
-        let error = validate_interaction_sequences(
+        let error = match validate_interaction_sequences(
             &nodes,
             &[],
             &OrchestrationLimitsV1::default(),
             "request",
-        )
-        .expect_err("five decisions exceed the default bound");
+        ) {
+            Err(error) => error,
+            Ok(()) => panic!("five decisions must exceed the default bound"),
+        };
         assert_eq!(error.code, "interaction_limit");
     }
 }
