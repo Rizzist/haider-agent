@@ -52,13 +52,13 @@ pub fn unlock_file(file: &File) -> io::Result<()> {
 /// `flock` conflicts with record locks but does not expose an owning PID.
 #[cfg(unix)]
 pub fn lock_file_owner_record(file: &File) -> io::Result<()> {
-    fcntl_record_lock(file, libc::F_SETLK, libc::F_WRLCK).map(|_| ())
+    fcntl_record_lock(file, libc::F_SETLK, libc::F_WRLCK as libc::c_int).map(|_| ())
 }
 
 /// Attempts to add the POSIX owner-record lock without blocking.
 #[cfg(unix)]
 pub fn try_lock_file_owner_record(file: &File) -> Result<(), TryLockError> {
-    fcntl_record_lock(file, libc::F_SETLK, libc::F_WRLCK)
+    fcntl_record_lock(file, libc::F_SETLK, libc::F_WRLCK as libc::c_int)
         .map(|_| ())
         .map_err(|error| match error.raw_os_error() {
             Some(libc::EACCES | libc::EAGAIN) => TryLockError::WouldBlock,
@@ -69,7 +69,7 @@ pub fn try_lock_file_owner_record(file: &File) -> Result<(), TryLockError> {
 /// Releases the companion POSIX owner-record lock.
 #[cfg(unix)]
 pub fn unlock_file_owner_record(file: &File) -> io::Result<()> {
-    fcntl_record_lock(file, libc::F_SETLK, libc::F_UNLCK).map(|_| ())
+    fcntl_record_lock(file, libc::F_SETLK, libc::F_UNLCK as libc::c_int).map(|_| ())
 }
 
 /// Returns the process holding the companion POSIX owner-record lock.
@@ -79,8 +79,8 @@ pub fn unlock_file_owner_record(file: &File) -> io::Result<()> {
 /// monitor plus a second lock-owner query before signaling.
 #[cfg(unix)]
 pub fn file_owner_record_pid(file: &File) -> io::Result<Option<u32>> {
-    let lock = fcntl_record_lock(file, libc::F_GETLK, libc::F_WRLCK)?;
-    if lock.l_type == libc::F_UNLCK {
+    let lock = fcntl_record_lock(file, libc::F_GETLK, libc::F_WRLCK as libc::c_int)?;
+    if libc::c_int::from(lock.l_type) == libc::F_UNLCK as libc::c_int {
         return Ok(None);
     }
     u32::try_from(lock.l_pid)
@@ -95,13 +95,16 @@ pub fn file_owner_record_pid(file: &File) -> io::Result<Option<u32>> {
 fn fcntl_record_lock(
     file: &File,
     command: libc::c_int,
-    lock_type: libc::c_short,
+    lock_type: libc::c_int,
 ) -> io::Result<libc::flock> {
     let mut lock = libc::flock {
         l_start: 0,
         l_len: 0,
         l_pid: 0,
-        l_type: lock_type,
+        // `F_WRLCK`/`F_UNLCK` are `c_short` on macOS/Linux but `c_int` on
+        // Android; `flock.l_type` follows the same per-target width, so the
+        // constant is taken as `c_int` and narrowed to the field's type here.
+        l_type: lock_type as _,
         l_whence: libc::SEEK_SET as _,
     };
     // SAFETY: `file` keeps the descriptor live, and `lock` is a fully
