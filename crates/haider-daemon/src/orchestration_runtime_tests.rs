@@ -25,6 +25,27 @@ enum CrashBoundary {
     ToolResult,
 }
 
+#[test]
+fn orchestration_catalog_matches_initial_profile_and_durable_promotions() {
+    let dependencies = DaemonDependencies::default()
+        .with_tool_exposure(Some(Vec::new()))
+        .with_tool_capability_profile(haider_core::ToolCapabilityProfile::Coding);
+    let initial =
+        orchestration_entry_child_tools(dependencies.tool_factory.as_ref(), None, None, &[], false);
+    assert!(initial.iter().any(|name| name == "fs_read"));
+    assert!(initial.iter().any(|name| name == "process_exec"));
+    assert!(!initial.iter().any(|name| name == "test_run"));
+
+    let promoted = orchestration_entry_child_tools(
+        dependencies.tool_factory.as_ref(),
+        None,
+        None,
+        &["test_run".into()],
+        false,
+    );
+    assert!(promoted.iter().any(|name| name == "test_run"));
+}
+
 fn fs_read_script(path: &str) -> String {
     let entry = registered_tool_by_name("fs_read").expect("fs_read registry entry");
     let wrapper_digest = orchestration_wrapper_digest(entry);

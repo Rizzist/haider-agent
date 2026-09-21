@@ -49,7 +49,11 @@ impl ToolCapabilityProfile {
         }
     }
 
-    fn initial_tools(self) -> &'static [&'static str] {
+    /// Stable names in the profile's first advertised request. Downstream
+    /// capability projections (including orchestration child catalogs) must
+    /// use this same list so presentation and execution ceilings cannot
+    /// disagree.
+    pub fn initial_tools(self) -> &'static [&'static str] {
         match self {
             Self::Coding => CODING_TOOLS,
             Self::Inspection => &["list_tools", "fs_read", "fs_glob", "fs_search"],

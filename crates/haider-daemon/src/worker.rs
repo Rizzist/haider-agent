@@ -14822,7 +14822,17 @@ fn orchestration_entry_child_tools(
     mobile_use_active: bool,
 ) -> Vec<String> {
     let exposed =
-        initial_tool_exposure_for_turn(factory, grant, lockdown_tools.is_some(), promoted.to_vec());
+        initial_tool_exposure_for_turn(factory, grant, lockdown_tools.is_some(), promoted.to_vec())
+            .map(|mut names| {
+                names.extend(
+                    factory
+                        .tool_capability_profile()
+                        .initial_tools()
+                        .iter()
+                        .map(|name| (*name).to_owned()),
+                );
+                names
+            });
     registered_tools()
         .iter()
         .filter(|entry| orchestration_bindable(entry.route))
