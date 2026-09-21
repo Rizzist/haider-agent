@@ -1430,6 +1430,10 @@ async fn run_inner(
             &drain_receiver,
             &mut shutdown,
             &mut crash,
+            EndpointRecoveryPolicy {
+                disable_endpoint_loss_recovery: config.inject_disable_endpoint_loss_recovery,
+                disable_degraded_idle_reap: config.inject_disable_degraded_idle_reap,
+            },
         )
         .await;
 
@@ -1807,6 +1811,12 @@ enum RuntimeStop {
     Crash,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EndpointRecoveryPolicy {
+    disable_endpoint_loss_recovery: bool,
+    disable_degraded_idle_reap: bool,
+}
+
 impl ConnectionRuntime {
     fn new(
         max_connections: usize,
@@ -1831,11 +1841,15 @@ impl ConnectionRuntime {
         drain_receiver: &watch::Receiver<Option<DrainNotice>>,
         shutdown: &mut watch::Receiver<ShutdownRequest>,
         crash: &mut watch::Receiver<bool>,
+        recovery_policy: EndpointRecoveryPolicy,
     ) -> (RuntimeStop, Option<DaemonError>) {
         let mut listener_error = None;
         let mut idle_wait_logged = None;
         let mut idle_linger_deadline = None;
         let mut idle_waiting_for_durable_quiescence = false;
+        let mut endpoint_degraded = false;
+        let mut endpoint_health = tokio::time::interval(Duration::from_millis(100));
+        endpoint_health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut durable_activity = context.hub.subscribe_peer_reconcile();
         #[cfg(unix)]
         let accept_operation = "accept Unix connection";
@@ -1853,6 +1867,19 @@ impl ConnectionRuntime {
                 ShutdownRequest::GracefulWhenIdle { reason } => {
                     idle_linger_deadline = None;
                     let attached_clients = self.connections.len();
+                    if attached_clients == 0
+                        && endpoint_degraded
+                        && !recovery_policy.disable_degraded_idle_reap
+                    {
+                        eprintln!(
+                            "haiderd: ephemeral-lifecycle event=shutdown_decision reason=degraded_endpoint_idle_deadline attached_clients=0 decision=shutdown idle_linger_ms=0"
+                        );
+                        tracing::warn!(
+                            idle_linger_ms = 0,
+                            "degraded endpoint reached its immediate idle deadline"
+                        );
+                        break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                    }
                     if attached_clients == 0 && !idle_waiting_for_durable_quiescence {
                         match context
                             .hub
@@ -1909,39 +1936,61 @@ impl ConnectionRuntime {
                     if attached_clients == 0 {
                         let deadline = *idle_linger_deadline
                             .get_or_insert_with(|| tokio::time::Instant::now() + idle_ttl);
-                        if tokio::time::Instant::now() >= deadline
-                            && !idle_waiting_for_durable_quiescence
-                        {
-                            match context
+                        if tokio::time::Instant::now() >= deadline {
+                            let durable_quiescent = match context
                                 .hub
                                 .daemon_is_durably_quiescent_with_monitors()
                                 .await
                             {
-                                Ok(true) => {
-                                    eprintln!(
-                                        "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown idle_linger_ms={}",
-                                        duration_ms(idle_ttl)
-                                    );
-                                    tracing::info!(
-                                        attached_clients,
-                                        reason = %reason,
-                                        idle_linger_ms = duration_ms(idle_ttl),
-                                        durable_quiescent = true,
-                                        decision = "shutdown",
-                                        "lingering daemon reached its idle shutdown deadline"
-                                    );
-                                    break RuntimeStop::Shutdown(ShutdownRequest::Graceful {
-                                        reason,
-                                    });
-                                }
-                                Ok(false) => {
-                                    idle_waiting_for_durable_quiescence = true;
-                                }
+                                Ok(quiescent) => Some(quiescent),
                                 Err(error) => {
-                                    idle_waiting_for_durable_quiescence = true;
-                                    tracing::warn!(%error, "idle retirement could not prove durable quiescence");
+                                    tracing::warn!(
+                                        %error,
+                                        "absolute launcher linger deadline could not inspect durable quiescence"
+                                    );
+                                    None
                                 }
+                            };
+                            if endpoint_degraded && !recovery_policy.disable_degraded_idle_reap {
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=degraded_endpoint_idle_deadline attached_clients=0 durable_quiescent={} decision=shutdown idle_linger_ms={}",
+                                    durable_quiescent.map_or("unknown", |value| if value {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    }),
+                                    duration_ms(idle_ttl),
+                                );
+                                tracing::warn!(
+                                    idle_linger_ms = duration_ms(idle_ttl),
+                                    ?durable_quiescent,
+                                    "degraded endpoint reached its absolute idle deadline"
+                                );
+                            } else {
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_linger_deadline attached_clients=0 endpoint_degraded={endpoint_degraded} durable_quiescent={} decision=shutdown idle_linger_ms={}",
+                                    durable_quiescent.map_or("unknown", |value| if value {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    }),
+                                    duration_ms(idle_ttl),
+                                );
+                                tracing::info!(
+                                    attached_clients,
+                                    reason = %reason,
+                                    idle_linger_ms = duration_ms(idle_ttl),
+                                    endpoint_degraded,
+                                    ?durable_quiescent,
+                                    decision = "shutdown",
+                                    "launcher linger reached its absolute deadline"
+                                );
                             }
+                            // The configured linger is the one grace period.
+                            // Durable quiescence can authorize earlier idle
+                            // retirement elsewhere, but neither a live run nor
+                            // a failed quiescence read may extend this deadline.
+                            break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
                         }
                     } else {
                         idle_linger_deadline = None;
@@ -1957,6 +2006,39 @@ impl ConnectionRuntime {
                 changed = crash.changed() => {
                     if changed.is_err() || *crash.borrow() {
                         break RuntimeStop::Crash;
+                    }
+                }
+                _ = endpoint_health.tick() => {
+                    match endpoint.coordinate_is_owned() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if !endpoint_degraded {
+                                endpoint_degraded = true;
+                                // Re-evaluate an already-expired linger deadline:
+                                // endpoint loss changes the safe retirement rule.
+                                idle_waiting_for_durable_quiescence = false;
+                                eprintln!(
+                                    "haiderd: endpoint-health event=coordinate_lost action={} path={}",
+                                    if recovery_policy.disable_endpoint_loss_recovery { "await_degraded_idle_or_operator" } else { "shutdown" },
+                                    endpoint.path().display()
+                                );
+                                tracing::warn!(
+                                    path = %endpoint.path().display(),
+                                    "daemon endpoint coordinate was lost while the listener remained open"
+                                );
+                            }
+                            if !recovery_policy.disable_endpoint_loss_recovery {
+                                break RuntimeStop::Shutdown(ShutdownRequest::Graceful {
+                                    reason: "endpoint coordinate lost".into(),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            listener_error = Some(error);
+                            break RuntimeStop::Shutdown(ShutdownRequest::Graceful {
+                                reason: "endpoint health check failed".into(),
+                            });
+                        }
                     }
                 }
                 changed = shutdown.changed() => {
@@ -2030,7 +2112,7 @@ impl ConnectionRuntime {
                         }
                     }
                 }
-                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() && !idle_waiting_for_durable_quiescence => {}
+                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() => {}
             }
         };
         (stop, listener_error)

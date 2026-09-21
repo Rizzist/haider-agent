@@ -366,6 +366,12 @@ impl BoundEndpoint {
         Ok(())
     }
 
+    /// Named-pipe availability is owned by the pending kernel instance; an
+    /// accept failure is the authoritative health signal on Windows.
+    pub fn coordinate_is_owned(&self) -> Result<bool, EndpointError> {
+        Ok(true)
+    }
+
     /// Windows named-pipe rendezvous names have no filesystem entry inside
     /// the runtime directory.
     pub fn owned_runtime_paths(&self) -> Result<Vec<std::path::PathBuf>, EndpointError> {

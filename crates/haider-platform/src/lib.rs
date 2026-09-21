@@ -45,6 +45,11 @@ pub use directory::{
     WorkspaceDirectory, WorkspaceDirectoryError, duplicate_workspace_directory,
     open_workspace_directory, open_workspace_file,
 };
+#[cfg(unix)]
+pub use file_lock::{
+    file_owner_record_pid, lock_file_owner_record, try_lock_file_owner_record,
+    unlock_file_owner_record,
+};
 pub use file_lock::{lock_file_exclusive, try_lock_file_exclusive, unlock_file};
 #[cfg(windows)]
 pub use fs::replace_file_with_backup;
@@ -82,6 +87,8 @@ pub use process::{
     release_process_group, signal_process, signal_process_group, signal_process_group_id,
     wait_for_child_exit,
 };
+#[cfg(unix)]
+pub use process::{UnixProcessIdentity, unix_process_identity};
 #[cfg(windows)]
 pub use process::{
     WindowsProcessState, process_exists, windows_command_interpreter, windows_powershell,

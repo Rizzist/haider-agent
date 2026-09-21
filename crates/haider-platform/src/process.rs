@@ -1,5 +1,10 @@
 use std::process::ExitStatus;
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::path::PathBuf;
+
 /// Asks the platform allocator to return currently reclaimable dirty pages.
 /// The value is the allocator's best-effort byte count, not a guarantee that
 /// the process footprint falls by the same amount.
@@ -33,6 +38,151 @@ pub enum ProcessSignal {
     Kill,
     User1,
     User2,
+}
+
+/// Executable and argument vector read from the kernel for one live process.
+///
+/// Recovery callers must compare both fields against release-owned values;
+/// this is never a process-name lookup.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnixProcessIdentity {
+    pub executable: PathBuf,
+    pub arguments: Vec<OsString>,
+}
+
+/// Reads the kernel-owned executable and argv for `pid`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn unix_process_identity(pid: ProcessId) -> std::io::Result<UnixProcessIdentity> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = PathBuf::from(format!("/proc/{}/", pid.id()));
+    let executable = std::fs::read_link(root.join("exe"))?;
+    let bytes = std::fs::read(root.join("cmdline"))?;
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process command line is empty",
+        ));
+    }
+    let arguments = bytes
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| OsString::from_vec(argument.to_vec()))
+        .collect::<Vec<_>>();
+    if arguments.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process argument vector is empty",
+        ));
+    }
+    Ok(UnixProcessIdentity {
+        executable,
+        arguments,
+    })
+}
+
+/// macOS exposes the exact exec path and argv through `KERN_PROCARGS2`.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn unix_process_identity(pid: ProcessId) -> std::io::Result<UnixProcessIdentity> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let raw_pid = i32::try_from(pid.id())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid PID"))?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, raw_pid];
+    let mut length = 0_usize;
+    // SAFETY: both calls use a valid three-element MIB; the first requests
+    // only the required size, and the second writes at most `length` bytes to
+    // the live allocation. `sysctl` updates `length` to the initialized size.
+    let buffer = unsafe {
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buffer = vec![0_u8; length];
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        buffer.truncate(length);
+        buffer
+    };
+    let argc_bytes = buffer
+        .get(..std::mem::size_of::<libc::c_int>())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process arguments header is truncated",
+            )
+        })?;
+    let argc = libc::c_int::from_ne_bytes(argc_bytes.try_into().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid process argc")
+    })?);
+    let argc = usize::try_from(argc)
+        .ok()
+        .filter(|argc| *argc > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid process argc")
+        })?;
+    let strings = &buffer[std::mem::size_of::<libc::c_int>()..];
+    let executable_end = strings.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process executable is unterminated",
+        )
+    })?;
+    let executable = PathBuf::from(OsString::from_vec(strings[..executable_end].to_vec()));
+    let mut cursor = executable_end;
+    while strings.get(cursor) == Some(&0) {
+        cursor += 1;
+    }
+    let mut arguments = Vec::with_capacity(argc);
+    while arguments.len() < argc && cursor < strings.len() {
+        let relative_end = strings[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(strings.len() - cursor);
+        arguments.push(OsString::from_vec(
+            strings[cursor..cursor + relative_end].to_vec(),
+        ));
+        cursor += relative_end + usize::from(cursor + relative_end < strings.len());
+    }
+    if arguments.len() != argc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process argument vector is truncated",
+        ));
+    }
+    Ok(UnixProcessIdentity {
+        executable,
+        arguments,
+    })
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+pub fn unix_process_identity(_pid: ProcessId) -> std::io::Result<UnixProcessIdentity> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "kernel process argv inspection is unsupported on this Unix target",
+    ))
 }
 
 impl std::fmt::Debug for ProcessSignal {

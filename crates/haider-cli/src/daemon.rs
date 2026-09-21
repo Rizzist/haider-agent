@@ -1,6 +1,10 @@
 //! Scriptable daemon lifecycle controls.
 
+#[cfg(unix)]
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write as _};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -39,6 +43,8 @@ struct StopOptions {
 #[serde(rename_all = "snake_case")]
 enum StopOutcome {
     StoppedCleanly,
+    #[cfg(unix)]
+    RecoveredBySignal,
     NotRunning,
     DidNotStop,
 }
@@ -50,9 +56,56 @@ struct StopReport {
     elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon: Option<StoppedDaemon>,
+    #[cfg(unix)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PidFileOutcome {
+    Matching,
+    Absent,
+    Stale,
+    Unreadable,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Serialize)]
+struct PidFileCorroboration {
+    outcome: PidFileOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Serialize)]
+struct RecoveryReport {
+    owner_source: &'static str,
+    pid: u32,
+    binary_and_profile_verified: bool,
+    pid_file: PidFileCorroboration,
+    signal: &'static str,
+    process_exited: bool,
+    profile_lock_released: bool,
+}
+
+#[cfg(unix)]
+struct RecoveryCompletionReport {
+    outcome: StopOutcome,
+    started: Instant,
+    pid: u32,
+    pid_file: PidFileCorroboration,
+    process_exited: bool,
+    profile_lock_released: bool,
+    phase: Option<&'static str>,
     reason: Option<String>,
 }
 
@@ -134,6 +187,8 @@ pub(crate) async fn daemon_command(rest: &[String]) -> ExitCode {
         Ok(report) => {
             let code = match report.outcome {
                 StopOutcome::StoppedCleanly => 0,
+                #[cfg(unix)]
+                StopOutcome::RecoveredBySignal => 0,
                 StopOutcome::NotRunning => EX_UNAVAILABLE,
                 StopOutcome::DidNotStop => EX_TIMEOUT,
             };
@@ -248,6 +303,11 @@ async fn stop_daemon(
                         None,
                         None,
                     ));
+                }
+                #[cfg(unix)]
+                if let Some(report) = recover_unreachable_daemon(profile, started, deadline).await?
+                {
+                    return Ok(report);
                 }
                 if !wait_to_retry(deadline).await {
                     return Ok(terminal_report(
@@ -466,6 +526,216 @@ async fn stop_daemon(
     }))
 }
 
+#[cfg(unix)]
+async fn recover_unreachable_daemon(
+    profile: &ResolvedProfile,
+    started: Instant,
+    deadline: Instant,
+) -> Result<Option<StopReport>, StopFailure> {
+    validate_owned_profile_directory(&profile.store_dir)?;
+    let Some(pid) = haider_client::profile_lock::profile_lock_owner_pid(&profile.store_dir)
+        .map_err(StopFailure::io)?
+    else {
+        // Pre-owner-record daemons retain the ordinary flock contract. Keep
+        // polling for their endpoint instead of guessing from diagnostics.
+        return Ok(None);
+    };
+    let Some(process_id) = haider_platform::process_id(Some(pid)) else {
+        return Ok(Some(terminal_report(
+            StopOutcome::DidNotStop,
+            started,
+            Some("lock_owner"),
+            Some("kernel profile lock owner PID was invalid".into()),
+        )));
+    };
+    let process_exit = match haider_platform::ProcessExitMonitor::capture(process_id) {
+        Ok(monitor) => monitor,
+        Err(error) if haider_platform::process_error_is_missing(&error) => return Ok(None),
+        Err(error) => {
+            return Err(StopFailure::io(format!(
+                "cannot retain kernel profile lock owner {pid}: {error}"
+            )));
+        }
+    };
+    let identity = haider_platform::unix_process_identity(process_id).map_err(|error| {
+        StopFailure::io(format!(
+            "cannot inspect kernel profile lock owner {pid}: {error}"
+        ))
+    })?;
+    let expected_binary = expected_daemon_binary()?;
+    let actual_binary = std::fs::canonicalize(&identity.executable).map_err(|error| {
+        StopFailure::io(format!(
+            "cannot canonicalize kernel profile lock owner executable {}: {error}",
+            identity.executable.display()
+        ))
+    })?;
+    if actual_binary != expected_binary || !arguments_match_profile(&identity.arguments, profile) {
+        return Ok(Some(terminal_report(
+            StopOutcome::DidNotStop,
+            started,
+            Some("owner_verification"),
+            Some(format!(
+                "kernel profile lock owner {pid} did not match the exact sibling daemon binary and profile arguments"
+            )),
+        )));
+    }
+    let current_owner = haider_client::profile_lock::profile_lock_owner_pid(&profile.store_dir)
+        .map_err(StopFailure::io)?;
+    if current_owner != Some(pid) {
+        return Ok(None);
+    }
+
+    let pid_file = match haider_client::profile_lock::pid_file_identity(&profile.runtime_dir) {
+        Ok(Some(identity)) if identity.pid == pid => PidFileCorroboration {
+            outcome: PidFileOutcome::Matching,
+            pid: Some(identity.pid),
+            reason: None,
+        },
+        Ok(Some(identity)) => PidFileCorroboration {
+            outcome: PidFileOutcome::Stale,
+            pid: Some(identity.pid),
+            reason: Some("PID file did not name the kernel profile lock owner".into()),
+        },
+        Ok(None) => PidFileCorroboration {
+            outcome: PidFileOutcome::Absent,
+            pid: None,
+            reason: None,
+        },
+        Err(reason) => PidFileCorroboration {
+            outcome: PidFileOutcome::Unreadable,
+            pid: None,
+            reason: Some(reason),
+        },
+    };
+
+    // Close the final numeric-PID race as far as portable Unix permits: the
+    // retained exit monitor is already armed and the kernel must still report
+    // this same PID as the profile lock owner immediately before signaling.
+    let final_owner = haider_client::profile_lock::profile_lock_owner_pid(&profile.store_dir)
+        .map_err(StopFailure::io)?;
+    if final_owner != Some(pid) {
+        return Ok(None);
+    }
+    haider_platform::signal_process(pid, haider_platform::ProcessSignal::Terminate).map_err(
+        |error| StopFailure::io(format!("cannot SIGTERM verified daemon PID {pid}: {error}")),
+    )?;
+
+    let process_exited = match timeout_at(deadline, process_exit.wait()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            return Ok(Some(recovery_report(RecoveryCompletionReport {
+                outcome: StopOutcome::DidNotStop,
+                started,
+                pid,
+                pid_file,
+                process_exited: false,
+                profile_lock_released: false,
+                phase: Some("recovery_process_exit"),
+                reason: Some(format!("verified daemon exit observation failed: {error}")),
+            })));
+        }
+        Err(_) => {
+            return Ok(Some(recovery_report(RecoveryCompletionReport {
+                outcome: StopOutcome::DidNotStop,
+                started,
+                pid,
+                pid_file,
+                process_exited: false,
+                profile_lock_released: false,
+                phase: Some("recovery_process_exit"),
+                reason: Some("SIGTERM'd daemon remained alive past the caller deadline".into()),
+            })));
+        }
+    };
+    let lock_released = wait_for_profile_lock(profile, deadline).await?.is_none();
+    let (outcome, phase, reason) = if lock_released {
+        (StopOutcome::RecoveredBySignal, None, None)
+    } else {
+        (
+            StopOutcome::DidNotStop,
+            Some("recovery_profile_lock_release"),
+            Some("SIGTERM'd daemon exited without releasing the current profile lock".into()),
+        )
+    };
+    Ok(Some(recovery_report(RecoveryCompletionReport {
+        outcome,
+        started,
+        pid,
+        pid_file,
+        process_exited,
+        profile_lock_released: lock_released,
+        phase,
+        reason,
+    })))
+}
+
+#[cfg(unix)]
+fn validate_owned_profile_directory(store_dir: &Path) -> Result<(), StopFailure> {
+    let metadata = std::fs::symlink_metadata(store_dir).map_err(|error| {
+        StopFailure::io(format!(
+            "cannot inspect current profile directory {}: {error}",
+            store_dir.display()
+        ))
+    })?;
+    if !metadata.is_dir() || !haider_platform::metadata_is_current_user(&metadata) {
+        return Err(StopFailure::protocol(format!(
+            "refusing recovery for a profile directory not owned by the current user: {}",
+            store_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn expected_daemon_binary() -> Result<PathBuf, StopFailure> {
+    let current = std::env::current_exe()
+        .map_err(|error| StopFailure::io(format!("cannot locate current executable: {error}")))?;
+    let sibling = current.with_file_name(format!("haiderd{}", std::env::consts::EXE_SUFFIX));
+    std::fs::canonicalize(&sibling).map_err(|error| {
+        StopFailure::io(format!(
+            "cannot resolve sibling daemon executable {}: {error}",
+            sibling.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn arguments_match_profile(arguments: &[OsString], profile: &ResolvedProfile) -> bool {
+    exact_argument(arguments, "--profile") == Some(OsStr::new(&profile.profile_id))
+        && exact_argument(arguments, "--store-dir") == Some(profile.store_dir.as_os_str())
+}
+
+#[cfg(unix)]
+fn exact_argument<'a>(arguments: &'a [OsString], name: &str) -> Option<&'a OsStr> {
+    let mut matches = arguments
+        .windows(2)
+        .filter(|pair| pair[0] == OsStr::new(name))
+        .map(|pair| pair[1].as_os_str());
+    let value = matches.next()?;
+    matches.next().is_none().then_some(value)
+}
+
+#[cfg(unix)]
+fn recovery_report(report: RecoveryCompletionReport) -> StopReport {
+    StopReport {
+        schema: STOP_SCHEMA,
+        outcome: report.outcome,
+        elapsed_ms: elapsed_ms(report.started),
+        daemon: None,
+        recovery: Some(RecoveryReport {
+            owner_source: "kernel_profile_lock_f_getlk",
+            pid: report.pid,
+            binary_and_profile_verified: true,
+            pid_file: report.pid_file,
+            signal: "sigterm",
+            process_exited: report.process_exited,
+            profile_lock_released: report.profile_lock_released,
+        }),
+        phase: report.phase.map(str::to_owned),
+        reason: report.reason,
+    }
+}
+
 async fn wait_for_stop_receipt(
     path: &std::path::Path,
     identity: &StopIdentity,
@@ -577,6 +847,8 @@ fn terminal_report(
         outcome,
         elapsed_ms: elapsed_ms(started),
         daemon: None,
+        #[cfg(unix)]
+        recovery: None,
         phase: phase.map(str::to_owned),
         reason,
     }
@@ -596,6 +868,8 @@ fn stop_completion_report(report: StopCompletionReport<'_>) -> StopReport {
             completion: report.completion,
             process_exited: report.process_exited,
         }),
+        #[cfg(unix)]
+        recovery: None,
         phase: report.phase.map(str::to_owned),
         reason: report.reason,
     }
@@ -630,6 +904,12 @@ fn write_report(report: &StopReport, json: bool) -> io::Result<()> {
             StopOutcome::StoppedCleanly => {
                 writeln!(output, "daemon stopped cleanly in {} ms", report.elapsed_ms)?
             }
+            #[cfg(unix)]
+            StopOutcome::RecoveredBySignal => writeln!(
+                output,
+                "unreachable daemon recovered by verified SIGTERM in {} ms",
+                report.elapsed_ms
+            )?,
             StopOutcome::NotRunning => writeln!(output, "daemon was not running")?,
             StopOutcome::DidNotStop => writeln!(
                 output,

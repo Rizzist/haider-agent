@@ -426,12 +426,16 @@ fn built_status_json_honors_private_xdg_with_enabled_discovery() {
         wedged.spawn().expect("start bounded wedged stop"),
         STATUS_TIMEOUT,
     );
-    drop(lease);
     assert_eq!(output.status.code(), Some(124));
     let wedged: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("wedged stop stdout is JSON");
     assert_eq!(wedged["outcome"], "did_not_stop");
-    assert_eq!(wedged["phase"], "connect");
+    assert_eq!(wedged["phase"], "owner_verification");
+    assert!(
+        daemon_pid(&wedged_profile).is_some(),
+        "daemon stop must not signal a non-daemon profile lock owner"
+    );
+    drop(lease);
 }
 
 /// MUTATION CHECK (explicit runtime reporting): ignore HAIDER_RUNTIME_DIR or

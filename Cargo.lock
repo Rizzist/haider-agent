@@ -1786,6 +1786,7 @@ dependencies = [
  "haider-platform",
  "haider-protocol",
  "haider-rpc",
+ "libc",
  "rustix 1.1.4",
  "serde",
  "serde_json",
