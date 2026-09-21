@@ -1937,49 +1937,60 @@ impl ConnectionRuntime {
                         let deadline = *idle_linger_deadline
                             .get_or_insert_with(|| tokio::time::Instant::now() + idle_ttl);
                         if tokio::time::Instant::now() >= deadline {
+                            let durable_quiescent = match context
+                                .hub
+                                .daemon_is_durably_quiescent_with_monitors()
+                                .await
+                            {
+                                Ok(quiescent) => Some(quiescent),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "absolute launcher linger deadline could not inspect durable quiescence"
+                                    );
+                                    None
+                                }
+                            };
                             if endpoint_degraded && !recovery_policy.disable_degraded_idle_reap {
                                 eprintln!(
-                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=degraded_endpoint_idle_deadline attached_clients=0 decision=shutdown idle_linger_ms={}",
-                                    duration_ms(idle_ttl)
+                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=degraded_endpoint_idle_deadline attached_clients=0 durable_quiescent={} decision=shutdown idle_linger_ms={}",
+                                    durable_quiescent.map_or("unknown", |value| if value {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    }),
+                                    duration_ms(idle_ttl),
                                 );
                                 tracing::warn!(
                                     idle_linger_ms = duration_ms(idle_ttl),
+                                    ?durable_quiescent,
                                     "degraded endpoint reached its absolute idle deadline"
                                 );
-                                break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                            } else {
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_linger_deadline attached_clients=0 endpoint_degraded={endpoint_degraded} durable_quiescent={} decision=shutdown idle_linger_ms={}",
+                                    durable_quiescent.map_or("unknown", |value| if value {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    }),
+                                    duration_ms(idle_ttl),
+                                );
+                                tracing::info!(
+                                    attached_clients,
+                                    reason = %reason,
+                                    idle_linger_ms = duration_ms(idle_ttl),
+                                    endpoint_degraded,
+                                    ?durable_quiescent,
+                                    decision = "shutdown",
+                                    "launcher linger reached its absolute deadline"
+                                );
                             }
-                            if !idle_waiting_for_durable_quiescence {
-                                match context
-                                    .hub
-                                    .daemon_is_durably_quiescent_with_monitors()
-                                    .await
-                                {
-                                    Ok(true) => {
-                                        eprintln!(
-                                            "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown idle_linger_ms={}",
-                                            duration_ms(idle_ttl)
-                                        );
-                                        tracing::info!(
-                                            attached_clients,
-                                            reason = %reason,
-                                            idle_linger_ms = duration_ms(idle_ttl),
-                                            durable_quiescent = true,
-                                            decision = "shutdown",
-                                            "lingering daemon reached its idle shutdown deadline"
-                                        );
-                                        break RuntimeStop::Shutdown(ShutdownRequest::Graceful {
-                                            reason,
-                                        });
-                                    }
-                                    Ok(false) => {
-                                        idle_waiting_for_durable_quiescence = true;
-                                    }
-                                    Err(error) => {
-                                        idle_waiting_for_durable_quiescence = true;
-                                        tracing::warn!(%error, "idle retirement could not prove durable quiescence");
-                                    }
-                                }
-                            }
+                            // The configured linger is the one grace period.
+                            // Durable quiescence can authorize earlier idle
+                            // retirement elsewhere, but neither a live run nor
+                            // a failed quiescence read may extend this deadline.
+                            break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
                         }
                     } else {
                         idle_linger_deadline = None;
@@ -2101,7 +2112,7 @@ impl ConnectionRuntime {
                         }
                     }
                 }
-                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() && !idle_waiting_for_durable_quiescence => {}
+                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() => {}
             }
         };
         (stop, listener_error)

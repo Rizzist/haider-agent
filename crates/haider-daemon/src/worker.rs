@@ -202,6 +202,25 @@ pub(crate) fn turn_trace_enabled() -> bool {
 const SUPERVISOR_IDLE_TTL: Duration = Duration::from_secs(30);
 const COMPUTER_PERMISSION_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPUTER_PERMISSION_MENU_ORIGIN: &str = "computer-os-permission";
+const TEST_CANCEL_SETTLE_DELAY_ENV: &str = "HAIDER_TEST_CANCEL_SETTLE_DELAY_MS";
+const MAX_TEST_CANCEL_SETTLE_DELAY_MS: u64 = 10_000;
+
+async fn delay_fake_provider_cancellation_settlement() {
+    let delay_ms = std::env::var(TEST_CANCEL_SETTLE_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|delay| {
+            *delay > 0
+                && *delay <= MAX_TEST_CANCEL_SETTLE_DELAY_MS
+                && std::env::var_os("HAIDER_TEST_FAKE_PROVIDER").is_some()
+        });
+    if let Some(delay_ms) = delay_ms {
+        // Real-process lifecycle tests use a stalled fake-provider turn to
+        // hold the committed Cancelling state across a short launcher linger.
+        // Production providers never enter this explicit test-only boundary.
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
 
 #[cfg(windows)]
 fn windows_test_process_trace_enabled() -> bool {
@@ -5565,6 +5584,7 @@ async fn run_supervisor(
                         let cancelled =
                             idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
                         if cancelled {
+                            delay_fake_provider_cancellation_settlement().await;
                             // Reduce durable lifecycle truth again after the
                             // harness stops. If core cancellation itself
                             // failed while closing an item/menu, finish those

@@ -384,18 +384,110 @@ fn wait_for_daemon_exit(profile: &ResolvedProfile, pid: u32, boundary: &str) {
     );
 }
 
+#[derive(Debug)]
+struct ObservedRun {
+    run_id: String,
+}
+
+fn observe_active_run(launcher: &mut Child) -> (ObservedRun, std::thread::JoinHandle<()>) {
+    let stdout = launcher.stdout.take().expect("launcher stdout");
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut observation_pending = Some(observed_tx);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    if let Some(sender) = observation_pending.take() {
+                        let _ = sender.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "launcher exited before publishing the provider-active thinking state",
+                        )));
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    let Ok(document) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let payload = document.get("payload");
+                    let active = payload.and_then(|value| value.get("type"))
+                        == Some(&serde_json::Value::String("run_state".into()))
+                        && payload
+                            .and_then(|value| value.get("state"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("thinking");
+                    if active && let Some(sender) = observation_pending.take() {
+                        let observation = (|| {
+                            Ok(ObservedRun {
+                                run_id: document["run_id"]
+                                    .as_str()
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "thinking envelope has no run id",
+                                        )
+                                    })?
+                                    .to_owned(),
+                            })
+                        })();
+                        let _ = sender.send(observation);
+                    }
+                }
+                Err(error) => {
+                    if let Some(sender) = observation_pending.take() {
+                        let _ = sender.send(Err(error));
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    let observed = observed_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("provider-active thinking state within daemon startup budget")
+        .expect("read provider-active thinking state");
+    (observed, reader)
+}
+
+fn durable_run_head(store: &Path, observed: &ObservedRun) -> (String, bool) {
+    let connection = rusqlite::Connection::open_with_flags(
+        store.join("store.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open live store read-only");
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .expect("set live-store read timeout");
+    let (state_json, terminal): (String, bool) = connection
+        .query_row(
+            "SELECT state_json, terminal FROM run_heads \
+             WHERE run_id = ?1",
+            [observed.run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load durable run head");
+    let state = serde_json::from_str::<serde_json::Value>(&state_json)
+        .expect("durable run state JSON")["state"]
+        .as_str()
+        .expect("durable run state tag")
+        .to_owned();
+    (state, terminal)
+}
+
 /// Registry #158 signal matrix: a second client interrupt takes the immediate
-/// exit path while the provider turn is stalled. The harness teardown then
-/// unlinks the runtime endpoint, reproducing the observed live-lock-owner with
-/// no connectable UDS. The normal health path exits immediately; with that
-/// path disabled, the degraded endpoint's absolute idle deadline still exits.
+/// exit path after its durable `Cancelling` receipt. Test-only fake-provider
+/// settlement is held past the 250 ms linger so the run cannot terminalize
+/// first. Both the intact coordinate and a deliberately degraded coordinate
+/// must reach the same absolute launcher deadline, then durably cancel during
+/// graceful drain.
 #[test]
-fn sigint_twice_endpoint_loss_self_recovers_or_honors_degraded_idle_linger() {
+fn sigint_twice_with_nonterminal_run_honors_absolute_linger_for_both_endpoints() {
+    const IDLE_TTL_MS: u64 = 250;
+
     ensure_haiderd_built();
-    for (case, disable_endpoint_recovery, idle_ttl_ms) in [
-        ("endpoint_recovery", false, 30_000_u64),
-        ("degraded_idle", true, 250_u64),
-    ] {
+    for (case, remove_endpoint) in [("endpoint_intact", false), ("endpoint_absent", true)] {
         let store = tempfile::tempdir().expect("store dir");
         let profile = resolved_for(store.path());
         let guard = DaemonGuard {
@@ -415,26 +507,41 @@ fn sigint_twice_endpoint_loss_self_recovers_or_honors_degraded_idle_linger() {
                 "hold for double interrupt",
             ])
             .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
-            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", idle_ttl_ms.to_string());
-        if disable_endpoint_recovery {
+            .env("HAIDER_TEST_CANCEL_SETTLE_DELAY_MS", "500")
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string());
+        if remove_endpoint {
             launcher.env("HAIDER_TEST_DISABLE_ENDPOINT_LOSS_RECOVERY", "1");
         }
-        let launcher = launcher.spawn().expect("spawn stalled run launcher");
+        let mut launcher = launcher.spawn().expect("spawn stalled run launcher");
         let daemon_pid = wait_for_daemon_ready(&profile, &guard);
-        std::thread::sleep(Duration::from_millis(100));
+        let (observed, stdout_reader) = observe_active_run(&mut launcher);
 
         haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
             .expect("first SIGINT to run client");
-        std::thread::sleep(Duration::from_millis(10));
+        let cancellation_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (state, terminal) = durable_run_head(store.path(), &observed);
+            if state == "cancelling" && !terminal {
+                break;
+            }
+            assert!(
+                Instant::now() < cancellation_deadline,
+                "{case} first SIGINT did not retain a durable nonterminal cancellation: \
+                 state={state} terminal={terminal}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         haider_platform::signal_process(launcher.id(), haider_platform::ProcessSignal::Interrupt)
             .expect("second SIGINT to run client");
-        std::fs::remove_file(&profile.endpoint_path)
-            .expect("unlink daemon endpoint during double-interrupt teardown");
+        if remove_endpoint {
+            std::fs::remove_file(&profile.endpoint_path)
+                .expect("unlink daemon endpoint during double-interrupt teardown");
+        }
         let client = wait_for_output(launcher, &format!("{case} double-interrupt client"));
+        stdout_reader.join().expect("join launcher stdout reader");
         assert!(
             !client.status.success(),
-            "double-interrupted client unexpectedly succeeded: stdout={} stderr={}",
-            String::from_utf8_lossy(&client.stdout),
+            "double-interrupted client unexpectedly succeeded: stderr={}",
             String::from_utf8_lossy(&client.stderr)
         );
 
@@ -442,15 +549,28 @@ fn sigint_twice_endpoint_loss_self_recovers_or_honors_degraded_idle_linger() {
         let log = std::fs::read_to_string(profile.store_dir.join(haider_client::DAEMON_LOG_FILE))
             .expect("read daemon recovery log");
         assert!(
-            log.contains("endpoint-health event=coordinate_lost"),
-            "{case} did not observe the lost endpoint: {log}"
+            log.contains("durable_quiescent=false decision=shutdown"),
+            "{case} deadline did not prove the stalled run was still nonterminal: {log}"
         );
-        if disable_endpoint_recovery {
+        if remove_endpoint {
+            assert!(
+                log.contains("endpoint-health event=coordinate_lost"),
+                "{case} did not observe the lost endpoint: {log}"
+            );
             assert!(
                 log.contains("reason=degraded_endpoint_idle_deadline"),
                 "degraded linger did not own the shutdown decision: {log}"
             );
+        } else {
+            assert!(
+                log.contains("reason=launcher_linger_deadline")
+                    && log.contains("endpoint_degraded=false"),
+                "intact endpoint did not reach the absolute launcher deadline: {log}"
+            );
         }
+        let (final_state, terminal) = durable_run_head(store.path(), &observed);
+        assert!(terminal, "{case} graceful drain left the run nonterminal");
+        assert_eq!(final_state, "cancelled");
     }
 }
 
@@ -701,25 +821,20 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     );
 }
 
-/// Launcher death may expire the idle TTL while its accepted run is still
-/// non-terminal. The daemon must hold its exact process identity until the
-/// a durable cancellation terminalizes the turn, then the already-expired
-/// idle arm may drain it.
+/// Abrupt launcher death leaves no cancellation receipt, so a hanging fake
+/// provider pins a genuinely nonterminal run through the launcher linger. The
+/// deadline must still start graceful drain, whose worker-aware cancellation
+/// becomes durable before the store and profile lock close.
 ///
-/// MUTATION CHECK: deleting the durable-quiescence check in the daemon accept
-/// loop makes the process disappear during the 750 ms hold observation.
+/// MUTATION CHECK: restoring the durable-quiescence guard around the expired
+/// linger timer leaves the daemon and profile lock alive past the exit budget.
 #[test]
-fn idle_ttl_never_retires_a_daemon_with_a_nonterminal_run() {
+fn absolute_idle_linger_durably_settles_a_nonterminal_run() {
     const IDLE_TTL_MS: u64 = 250;
-    const NONTERMINAL_HOLD_OBSERVATION: Duration = Duration::from_millis(750);
-    const RUN_DEADLINE_MS: u64 = 5_000;
     const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
     const PROCESS_EXIT_GRACE_MS: u64 = 2_000;
-    // Registry #94: the 5,000 ms durable run deadline bounding cancellation + 5,000 ms daemon
-    // drain + 2,000 ms process-observation grace = 12,000 ms. The 250 ms idle
-    // TTL has already elapsed inside the run deadline and is not added twice.
     const EXIT_DEADLINE: Duration =
-        Duration::from_millis(RUN_DEADLINE_MS + DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
+        Duration::from_millis(IDLE_TTL_MS + DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
 
     ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
@@ -743,80 +858,15 @@ fn idle_ttl_never_retires_a_daemon_with_a_nonterminal_run() {
         .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string())
         .spawn()
         .expect("spawn hanging run launcher");
-    let stdout = launcher.stdout.take().expect("launcher stdout");
-    let (nonterminal_tx, nonterminal_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut stdout = std::io::BufReader::new(stdout);
-        let result = loop {
-            let mut line = String::new();
-            match stdout.read_line(&mut line) {
-                Ok(0) => {
-                    break Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "launcher exited before publishing a non-terminal run state",
-                    ));
-                }
-                Ok(_) => {
-                    let Ok(document) = serde_json::from_str::<serde_json::Value>(&line) else {
-                        continue;
-                    };
-                    let payload = document.get("payload");
-                    if payload.and_then(|value| value.get("type"))
-                        == Some(&serde_json::Value::String("run_state".into()))
-                        && payload
-                            .and_then(|value| value.get("state"))
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|state| !matches!(state, "done" | "errored" | "cancelled"))
-                    {
-                        break Ok(line);
-                    }
-                }
-                Err(error) => break Err(error),
-            }
-        };
-        let _ = nonterminal_tx.send(result);
-    });
-    let nonterminal = nonterminal_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("non-terminal run state within daemon startup budget")
-        .expect("read non-terminal run state");
-    let nonterminal: serde_json::Value =
-        serde_json::from_str(&nonterminal).expect("non-terminal run state is JSON");
-    assert_eq!(nonterminal["payload"]["type"], "run_state");
-    let run_id = nonterminal["run_id"]
-        .as_str()
-        .expect("non-terminal envelope run id")
-        .to_owned();
+    let (observed, stdout_reader) = observe_active_run(&mut launcher);
     let daemon_pid = guard.pid().expect("spawned daemon PID");
 
     launcher.kill().expect("SIGKILL run launcher");
-    let status = launcher.wait().expect("reap run launcher");
+    let output = wait_for_output(launcher, "SIGKILLed nonterminal run launcher");
+    stdout_reader.join().expect("join launcher stdout reader");
     assert!(
-        !status.success(),
+        !output.status.success(),
         "killed launcher must not exit successfully"
-    );
-    reader.join().expect("join accepted-line reader");
-
-    std::thread::sleep(NONTERMINAL_HOLD_OBSERVATION);
-    let daemon_log = std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
-        .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"));
-    assert!(
-        process_exists(daemon_pid),
-        "daemon {daemon_pid} retired after the idle TTL while its run was non-terminal\n{daemon_log}"
-    );
-
-    let cancelled = output_with_timeout(
-        haider_command(store.path())
-            .args(["run", "--stop", &run_id, "--json"])
-            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string()),
-        "durably cancel non-terminal idle-TTL run",
-    );
-    assert!(
-        cancelled.status.success(),
-        "run stop failed: status={} stdout={} stderr={}",
-        cancelled.status,
-        String::from_utf8_lossy(&cancelled.stdout),
-        String::from_utf8_lossy(&cancelled.stderr)
     );
 
     let deadline = Instant::now() + EXIT_DEADLINE;
@@ -827,13 +877,32 @@ fn idle_ttl_never_retires_a_daemon_with_a_nonterminal_run() {
     }
     assert!(
         !process_exists(daemon_pid),
-        "daemon {daemon_pid} did not retire after the durable run deadline\n{}",
+        "daemon {daemon_pid} did not retire after the absolute launcher linger\n{}",
         std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
             .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"))
     );
     assert!(
         !profile.endpoint_path.exists(),
-        "post-terminal idle exit must remove the profile endpoint"
+        "absolute linger exit must remove the profile endpoint"
+    );
+    assert_eq!(
+        haider_client::profile_lock::profile_lock_owner_pid(&profile.store_dir)
+            .expect("query profile lock after absolute linger"),
+        None,
+        "absolute linger exit must release the kernel profile lock"
+    );
+    let (state, terminal) = durable_run_head(store.path(), &observed);
+    assert!(terminal, "graceful linger drain left the run nonterminal");
+    assert_eq!(
+        state, "cancelled",
+        "graceful drain preserves a replayable terminal"
+    );
+    let daemon_log = std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
+        .expect("read absolute linger daemon log");
+    assert!(
+        daemon_log.contains("reason=launcher_linger_deadline")
+            && daemon_log.contains("durable_quiescent=false decision=shutdown"),
+        "absolute linger did not observe and drain the nonterminal run: {daemon_log}"
     );
 }
 
