@@ -19,8 +19,8 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 29;
-const LATEST_SCHEMA_VERSION: u32 = 29;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 30;
+const LATEST_SCHEMA_VERSION: u32 = 30;
 
 struct Migration {
     version: u32,
@@ -733,6 +733,40 @@ const MIGRATIONS: &[Migration] = &[
             UPDATE profile_meta SET boot_publication_pending = 0;
         ",
     },
+    Migration {
+        version: 30,
+        sql: "
+            ALTER TABLE sessions ADD COLUMN journal_mutation_generation INTEGER
+                NOT NULL DEFAULT 0 CHECK (journal_mutation_generation >= 0);
+
+            -- Existing checkpoint payloads predate mutation generations, so
+            -- their retained prefixes cannot be authenticated at migration.
+            DELETE FROM session_projection_checkpoints;
+
+            CREATE TRIGGER events_authority_updated
+            AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = OLD.session_id;
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = NEW.session_id AND NEW.session_id <> OLD.session_id;
+                DELETE FROM session_projection_checkpoints
+                 WHERE session_id IN (OLD.session_id, NEW.session_id);
+            END;
+
+            CREATE TRIGGER events_authority_deleted
+            AFTER DELETE ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = OLD.session_id;
+                DELETE FROM session_projection_checkpoints
+                 WHERE session_id = OLD.session_id;
+            END;
+        ",
+    },
 ];
 
 // The direct schema for an empty profile. The equivalence pin in
@@ -1127,7 +1161,8 @@ CREATE TABLE sessions (
                 created_at_ms   INTEGER NOT NULL,
                 meta_json       TEXT NOT NULL
             , seen_at_ms INTEGER
-                CHECK (seen_at_ms IS NULL OR seen_at_ms >= 0));
+                CHECK (seen_at_ms IS NULL OR seen_at_ms >= 0), journal_mutation_generation INTEGER
+                NOT NULL DEFAULT 0 CHECK (journal_mutation_generation >= 0));
 
 CREATE TABLE workflow_graph_instances (
                 session_id       TEXT NOT NULL,
@@ -1208,6 +1243,29 @@ CREATE INDEX workflow_graph_instances_session_input
 
 CREATE INDEX workflow_node_states_session_phase
             ON workflow_node_states(session_id, phase, updated_seq DESC);
+
+CREATE TRIGGER events_authority_deleted
+            AFTER DELETE ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = OLD.session_id;
+                DELETE FROM session_projection_checkpoints
+                 WHERE session_id = OLD.session_id;
+            END;
+
+CREATE TRIGGER events_authority_updated
+            AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = OLD.session_id;
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = NEW.session_id AND NEW.session_id <> OLD.session_id;
+                DELETE FROM session_projection_checkpoints
+                 WHERE session_id IN (OLD.session_id, NEW.session_id);
+            END;
 
 INSERT OR IGNORE INTO profile_meta(singleton, worker_generation) VALUES (1, 0);
 "#;

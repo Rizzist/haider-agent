@@ -414,7 +414,11 @@ impl StartupJournalVisitor for StartupHydration {
                     self.hooks
                         .advance_through(session_id, through_seq, &boundary_event_id);
                     if let Some(pipe_session) = &mut self.pipe_session {
-                        pipe_session.advance_through(through_seq, &boundary_event_id);
+                        pipe_session.advance_through(
+                            through_seq,
+                            &boundary_event_id,
+                            page.observed_mutation_generation,
+                        );
                     }
                 }
                 break;

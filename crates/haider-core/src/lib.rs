@@ -302,6 +302,7 @@ pub trait StoreHandle: Send + Sync {
             envelopes,
             observed_head: None,
             observed_fence: None,
+            observed_mutation_generation: None,
         })
     }
 

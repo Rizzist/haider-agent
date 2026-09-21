@@ -245,14 +245,16 @@ pub struct PendingHookDispatchMetadata {
 
 /// One payload-kind-filtered reducer page plus journal revisions observed
 /// under the same connection lock. The head and optional caller-requested
-/// fence carry only indexed coordinates, so a reducer can verify its prior
-/// boundary and advance across an irrelevant suffix without fetching or
-/// decoding those envelopes.
+/// fence carry only indexed coordinates, while the mutation generation covers
+/// every authoritative row in the retained prefix. A reducer can therefore
+/// verify its prior boundary and advance across an irrelevant suffix without
+/// fetching or decoding those envelopes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReducerPage {
     pub envelopes: Vec<RawEnvelope>,
     pub observed_head: Option<(u64, EventId)>,
     pub observed_fence: Option<(u64, EventId)>,
+    pub observed_mutation_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,12 +280,14 @@ impl ReducerPageCursor {
 }
 
 impl ReducerPage {
-    pub fn confirms_fence(&self, seq: u64, event_id: &EventId) -> bool {
-        self.observed_fence
-            .as_ref()
-            .is_some_and(|(observed_seq, observed_id)| {
-                *observed_seq == seq && observed_id == event_id
-            })
+    pub fn confirms_fence(&self, seq: u64, event_id: &EventId, mutation_generation: u64) -> bool {
+        self.observed_mutation_generation == Some(mutation_generation)
+            && self
+                .observed_fence
+                .as_ref()
+                .is_some_and(|(observed_seq, observed_id)| {
+                    *observed_seq == seq && observed_id == event_id
+                })
     }
 }
 
@@ -14418,6 +14422,7 @@ impl Store {
                 envelopes: Vec::new(),
                 observed_head: None,
                 observed_fence: None,
+                observed_mutation_generation: None,
             });
         }
         let mut query_phase = haider_platform::phase_trace::store_scope_for(
@@ -14427,6 +14432,8 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(map_sqlite_error)?;
         let boundary = journal_boundary_with_connection(&transaction, session)?;
+        let mutation_generation =
+            journal_mutation_generation_with_connection(&transaction, session)?;
         let fence = cursor
             .fence_seq
             .map(|seq| journal_revision_with_connection(&transaction, session, seq))
@@ -14451,6 +14458,7 @@ impl Store {
                 envelopes,
                 observed_head: boundary,
                 observed_fence: fence,
+                observed_mutation_generation: mutation_generation,
             }),
             Err(FilteredReadError::Decode) => self
                 .read_page_for(caller, session, cursor.after_seq, limit, byte_budget)
@@ -14458,6 +14466,7 @@ impl Store {
                     envelopes,
                     observed_head: None,
                     observed_fence: None,
+                    observed_mutation_generation: None,
                 }),
             Err(FilteredReadError::Store(error)) => Err(error),
         }
@@ -25761,6 +25770,25 @@ fn journal_boundary_with_connection(
         .transpose()
 }
 
+fn journal_mutation_generation_with_connection(
+    connection: &Connection,
+    session: &SessionId,
+) -> StoreResult<Option<u64>> {
+    connection
+        .query_row(
+            "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+            [session.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(|generation| {
+            u64::try_from(generation)
+                .map_err(|_| corrupt("database contains a negative journal mutation generation"))
+        })
+        .transpose()
+}
+
 fn journal_revision_with_connection(
     connection: &Connection,
     session: &SessionId,
@@ -28460,7 +28488,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v29 and reopen.
+    /// v23's run-head backfill remains untouched through v30 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -28476,7 +28504,10 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE workspace_unavailable_runs;
+            "DROP TRIGGER events_authority_updated;
+             DROP TRIGGER events_authority_deleted;
+             ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
+             DROP TABLE workspace_unavailable_runs;
              ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
              ALTER TABLE hook_dispatch_outbox DROP COLUMN run_id;
              DROP TABLE checkpoints;
@@ -28504,7 +28535,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 29);
+            assert_eq!(store.schema_version().expect("schema version"), 30);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

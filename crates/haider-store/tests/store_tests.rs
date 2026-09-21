@@ -3,6 +3,7 @@
 use haider_protocol::context::{ContextCompactionTier, ContextEconomy};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
+    write_envelope_messagepack,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, SessionId};
@@ -275,6 +276,95 @@ fn projection_checkpoint_write_leaves_journal_bytes_unchanged() {
     );
     assert_eq!(after, before);
     assert_eq!(must(store.latest_seq(&session)), 1);
+}
+
+#[test]
+fn journal_mutation_generation_covers_authoritative_rewrites_and_deletes_only() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("journal-mutation-generation");
+    let mut batch = (1..=3)
+        .map(|ordinal| {
+            envelope(
+                &session,
+                &format!("journal-generation-{ordinal}"),
+                json!({"type": "generation_fixture", "ordinal": ordinal}),
+            )
+        })
+        .collect::<Vec<_>>();
+    must(store.append(&mut batch));
+    must(
+        store.put_session_projection_checkpoint(&SessionProjectionCheckpoint {
+            session_id: session.clone(),
+            projection: "prompt_history".into(),
+            timeline_key: "generation-fixture".into(),
+            through_seq: batch[2].seq,
+            boundary_event_id: batch[2].event_id.clone(),
+            payload: b"generation-fixture".to_vec(),
+        }),
+    );
+    let connection = must(Connection::open(store.database_path()));
+    let generation = || {
+        must(connection.query_row(
+            "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+            [session.as_str()],
+            |row| row.get::<_, i64>(0),
+        ))
+    };
+    assert_eq!(generation(), 0, "ordinary appends do not advance authority");
+
+    must(connection.execute(
+        "UPDATE events SET payload_kind = 'generation_fixture_index'
+         WHERE session_id = ?1 AND seq = 1",
+        [session.as_str()],
+    ));
+    assert_eq!(
+        generation(),
+        0,
+        "derived payload-kind maintenance is not an authoritative rewrite"
+    );
+
+    let mut replacement = batch[0].clone();
+    replacement.payload = json!({"type": "generation_fixture", "ordinal": "replacement"}).into();
+    let mut replacement_bytes = Vec::new();
+    must(write_envelope_messagepack(
+        &mut replacement_bytes,
+        &replacement,
+    ));
+    must(connection.execute(
+        "UPDATE events SET envelope_json = ?3
+         WHERE session_id = ?1 AND seq = ?2",
+        params![session.as_str(), 1_i64, replacement_bytes],
+    ));
+    assert_eq!(
+        generation(),
+        1,
+        "same-id payload rewrite advances authority"
+    );
+    let checkpoints: i64 = must(connection.query_row(
+        "SELECT COUNT(*) FROM session_projection_checkpoints WHERE session_id = ?1",
+        [session.as_str()],
+        |row| row.get(0),
+    ));
+    assert_eq!(
+        checkpoints, 0,
+        "journal rewrites invalidate durable projections"
+    );
+
+    must(connection.pragma_update(None, "foreign_keys", false));
+    must(connection.execute(
+        "DELETE FROM events WHERE session_id = ?1 AND seq = 2",
+        [session.as_str()],
+    ));
+    assert_eq!(generation(), 2, "journal deletion advances authority");
+
+    let mut appended = [envelope(
+        &session,
+        "journal-generation-appended",
+        json!({"type": "generation_fixture", "ordinal": 4}),
+    )];
+    must(store.append(&mut appended));
+    assert_eq!(generation(), 2, "later appends preserve mutation authority");
 }
 
 /// MUTATION CHECK: remove `timeline_key = ?3` from the checkpoint lookup.
@@ -645,12 +735,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 29);
+        assert_eq!(must(store.schema_version()), 30);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 29);
+    assert_eq!(must(reopened.schema_version()), 30);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -696,6 +786,50 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     }
 }
 
+#[test]
+fn mutation_generation_migration_discards_unauthenticated_checkpoints() {
+    let root = test_root();
+    let session = SessionId::new("generation-migration-checkpoint");
+    let database_path = {
+        let store = must(Store::open(root.path()));
+        let mut batch = [envelope(
+            &session,
+            "generation-migration-boundary",
+            json!({"type": "generation_migration_fixture"}),
+        )];
+        must(store.append(&mut batch));
+        must(
+            store.put_session_projection_checkpoint(&SessionProjectionCheckpoint {
+                session_id: session.clone(),
+                projection: "prompt_history".into(),
+                timeline_key: "main-agentless".into(),
+                through_seq: batch[0].seq,
+                boundary_event_id: batch[0].event_id.clone(),
+                payload: b"pre-generation-checkpoint".to_vec(),
+            }),
+        );
+        store.database_path().to_path_buf()
+    };
+
+    let legacy = must(Connection::open(&database_path));
+    must(legacy.execute_batch(
+        "DROP TRIGGER events_authority_updated;
+         DROP TRIGGER events_authority_deleted;
+         ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
+         DELETE FROM schema_migrations WHERE version = 30;
+         PRAGMA user_version = 29;",
+    ));
+    drop(legacy);
+
+    let migrated = must(Store::open(root.path()));
+    assert_eq!(must(migrated.schema_version()), 30);
+    assert_eq!(
+        must(migrated.session_projection_checkpoint(&session, "prompt_history", "main-agentless",)),
+        None,
+        "v29 checkpoints lack prefix authority and must be rebuilt"
+    );
+}
+
 fn sqlite_master_schema(database_path: &std::path::Path) -> Vec<(String, String, String, String)> {
     let connection = must(Connection::open(database_path));
     let mut statement = must(connection.prepare(
@@ -711,7 +845,7 @@ fn sqlite_master_schema(database_path: &std::path::Path) -> Vec<(String, String,
 
 /// OWNER UPGRADE LAW: 0.0.962 shipped schema v24. Migrating that exact table,
 /// index, and column shape must converge byte-for-byte in `sqlite_master` with
-/// a freshly migrated store; v25-v29 are additive and must not fork schemas.
+/// a freshly migrated store; v25-v30 are additive and must not fork schemas.
 ///
 /// MUTATION CHECK: omit a guarded v26 column addition or create a different
 /// definition on either migration route. Expected RUNTIME failure: the exact
@@ -732,7 +866,10 @@ fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
 
     let legacy = must(Connection::open(&legacy_path));
     must(legacy.execute_batch(
-        "DROP TABLE workspace_unavailable_runs;
+        "DROP TRIGGER events_authority_updated;
+         DROP TRIGGER events_authority_deleted;
+         ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
+         DROP TABLE workspace_unavailable_runs;
          ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
          ALTER TABLE hook_dispatch_outbox DROP COLUMN run_id;
          DROP TABLE checkpoints;
@@ -756,7 +893,7 @@ fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
     drop(legacy);
 
     let migrated = must(Store::open(legacy_root.path()));
-    assert_eq!(must(migrated.schema_version()), 29);
+    assert_eq!(must(migrated.schema_version()), 30);
     drop(migrated);
     assert_eq!(
         sqlite_master_schema(&legacy_path),
@@ -810,7 +947,7 @@ fn typed_agent_install_job_schema_is_durable_and_bounded() {
     drop(connection);
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 29);
+    assert_eq!(must(reopened.schema_version()), 30);
     let connection = must(Connection::open(reopened.database_path()));
     let retained: (String, u32, u32) = must(connection.query_row(
         "SELECT state, completed, total FROM loom_cli_install_jobs WHERE job_id = ?1",

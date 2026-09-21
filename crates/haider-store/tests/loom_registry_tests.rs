@@ -820,7 +820,10 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     )
     .expect("plant pre-stamp row");
     raw.execute_batch(
-        "DROP TABLE workspace_unavailable_runs;
+        "DROP TRIGGER events_authority_updated;
+         DROP TRIGGER events_authority_deleted;
+         ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
+         DROP TABLE workspace_unavailable_runs;
          ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
          ALTER TABLE hook_dispatch_outbox DROP COLUMN run_id;
          DROP TABLE checkpoints;
@@ -843,7 +846,7 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     drop(raw);
 
     let store = Store::open(root.path()).expect("migrate legacy database");
-    assert_eq!(store.schema_version().expect("schema version"), 29);
+    assert_eq!(store.schema_version().expect("schema version"), 30);
     let legacy = store
         .loom_workflow("legacy-retained")
         .expect("read migrated current")

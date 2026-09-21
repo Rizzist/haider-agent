@@ -3,10 +3,12 @@
 use super::*;
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_protocol::state::RunState;
+use std::sync::atomic::AtomicU64;
 
 #[derive(Default)]
 struct MutableProjectionStore {
     journal: StdMutex<Vec<RawEnvelope>>,
+    mutation_generation: AtomicU64,
     full_read_starts: StdMutex<Vec<u64>>,
     reducer_starts: StdMutex<Vec<u64>>,
 }
@@ -17,6 +19,7 @@ impl MutableProjectionStore {
             .lock()
             .expect("projection journal lock")
             .retain(|envelope| &envelope.session_id != session_id || envelope.seq <= through_seq);
+        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn replace_head_event_id(&self, session_id: &SessionId, event_id: &str) {
@@ -27,6 +30,7 @@ impl MutableProjectionStore {
             .max_by_key(|envelope| envelope.seq)
             .expect("session head");
         head.event_id = EventId::new(event_id);
+        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn replace_head(&self, session_id: &SessionId, mut replacement: RawEnvelope) {
@@ -39,6 +43,28 @@ impl MutableProjectionStore {
         replacement.seq = head.seq;
         replacement.committed_at_ms = head.committed_at_ms;
         *head = replacement;
+        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn replace_at(
+        &self,
+        session_id: &SessionId,
+        seq: u64,
+        mut replacement: RawEnvelope,
+        preserve_event_id: bool,
+    ) {
+        let mut journal = self.journal.lock().expect("projection journal lock");
+        let retained = journal
+            .iter_mut()
+            .find(|envelope| &envelope.session_id == session_id && envelope.seq == seq)
+            .expect("retained projection row");
+        replacement.seq = retained.seq;
+        replacement.committed_at_ms = retained.committed_at_ms;
+        if preserve_event_id {
+            replacement.event_id = retained.event_id.clone();
+        }
+        *retained = replacement;
+        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn take_full_read_starts(&self) -> Vec<u64> {
@@ -154,6 +180,7 @@ impl StoreHandle for MutableProjectionStore {
             envelopes,
             observed_head,
             observed_fence,
+            observed_mutation_generation: Some(self.mutation_generation.load(Ordering::Relaxed)),
         })
     }
 
@@ -594,6 +621,104 @@ async fn warm_projection_revalidates_an_advanced_cached_boundary() {
             "the cached boundary must be checked before the authoritative replay"
         );
     }
+}
+
+async fn assert_warm_prefix_mutation_replays(replaced_seq: u64, preserve_event_id: bool) {
+    let store = MutableProjectionStore::default();
+    let cache = WarmJournalProjectionCache::default();
+    let session_id = SessionId::new(format!(
+        "warm-prefix-mutation-{replaced_seq}-{preserve_event_id}"
+    ));
+    let run_id = RunId::new(format!(
+        "warm-prefix-mutation-run-{replaced_seq}-{preserve_event_id}"
+    ));
+    append(
+        &store,
+        vec![
+            projection_envelope(
+                &session_id,
+                Some(&run_id),
+                None,
+                "prefix-queued",
+                serde_json::to_value(EventPayload::RunState(RunState::Queued))
+                    .expect("queued payload"),
+            ),
+            projection_envelope(
+                &session_id,
+                Some(&run_id),
+                None,
+                "prefix-configured",
+                HeadlessRunEventPayload::HeadlessRunConfigured(test_headless_spec())
+                    .to_payload_value()
+                    .expect("headless payload"),
+            ),
+            projection_envelope(
+                &session_id,
+                None,
+                None,
+                "prefix-stable-head",
+                serde_json::json!({"type":"branch_switched","branch_id":"stable"}),
+            ),
+        ],
+    )
+    .await;
+    assert_projection_parity(&store, &cache, &session_id, &run_id).await;
+
+    let replacement = if replaced_seq == 1 {
+        let mut replacement = projection_envelope(
+            &session_id,
+            Some(&run_id),
+            None,
+            "prefix-replacement-state",
+            serde_json::to_value(EventPayload::RunState(RunState::Queued))
+                .expect("queued replacement payload"),
+        );
+        replacement.branch_id = Some(BranchId::new("replacement-branch"));
+        replacement
+    } else {
+        let mut spec = test_headless_spec();
+        spec.max_output_tokens = 128;
+        projection_envelope(
+            &session_id,
+            Some(&run_id),
+            None,
+            "prefix-replacement-config",
+            HeadlessRunEventPayload::HeadlessRunConfigured(spec)
+                .to_payload_value()
+                .expect("replacement headless payload"),
+        )
+    };
+    store.replace_at(&session_id, replaced_seq, replacement, preserve_event_id);
+    append(
+        &store,
+        vec![projection_envelope(
+            &session_id,
+            None,
+            None,
+            "prefix-appended",
+            serde_json::json!({"type":"branch_switched","branch_id":"appended"}),
+        )],
+    )
+    .await;
+    store.take_full_read_starts();
+    store.take_reducer_starts();
+
+    let (full_reads, _) = assert_projection_parity(&store, &cache, &session_id, &run_id).await;
+    assert!(
+        full_reads.contains(&0),
+        "retained-prefix mutation at seq {replaced_seq} must replay"
+    );
+}
+
+#[tokio::test]
+async fn warm_projection_revalidates_every_retained_position_below_head() {
+    assert_warm_prefix_mutation_replays(1, false).await;
+    assert_warm_prefix_mutation_replays(2, false).await;
+}
+
+#[tokio::test]
+async fn warm_projection_revalidates_same_id_payload_mutation() {
+    assert_warm_prefix_mutation_replays(2, true).await;
 }
 
 #[tokio::test]

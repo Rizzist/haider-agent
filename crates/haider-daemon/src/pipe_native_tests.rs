@@ -246,6 +246,7 @@ fn queued_head_delays_unresolved_tool_eof_flush() {
         pending_seq: 0,
         generation: 0,
         segment: 0,
+        authority_generation: 0,
     };
     let mut projector = TranscriptProjector::default();
 
@@ -584,6 +585,121 @@ async fn cached_pipe_revalidates_an_advanced_boundary() {
     }
 }
 
+async fn assert_native_pipe_prefix_mutation_rebuilds(
+    replaced_seq: u64,
+    preserve_event_id: bool,
+    restart_writer: bool,
+) {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut writer = Some(PipeNativeWriter::new(root.path()));
+    let session_id = SessionId::new(format!(
+        "pipe-prefix-mutation-{replaced_seq}-{preserve_event_id}"
+    ));
+    let mut initial = (1..=3_u64)
+        .map(|ordinal| {
+            user_node_envelope(&session_id, ordinal, None, &format!("original {ordinal}"))
+        })
+        .collect::<Vec<_>>();
+    store
+        .append(&mut initial)
+        .await
+        .expect("append retained native-pipe prefix");
+    writer
+        .as_ref()
+        .expect("native-pipe writer")
+        .maintain(&store, &session_id, &initial, initial[2].seq)
+        .await
+        .expect("prime native-pipe prefix");
+    let initial_generation = writer
+        .as_ref()
+        .expect("native-pipe writer")
+        .confirmed_coverage(&session_id)
+        .expect("initial native-pipe coverage")
+        .1;
+    if restart_writer {
+        drop(writer.take());
+    }
+
+    store
+        .close()
+        .await
+        .expect("close before prefix replacement");
+    let mut replacement = user_node_envelope(
+        &session_id,
+        replaced_seq,
+        None,
+        &format!("replacement {replaced_seq}"),
+    );
+    replacement.seq = initial[usize::try_from(replaced_seq - 1).expect("replacement index")].seq;
+    replacement.committed_at_ms =
+        initial[usize::try_from(replaced_seq - 1).expect("replacement index")].committed_at_ms;
+    if preserve_event_id {
+        replacement.event_id = initial
+            [usize::try_from(replaced_seq - 1).expect("replacement index")]
+        .event_id
+        .clone();
+    } else {
+        replacement.event_id = EventId::new(format!("pipe-prefix-replacement-{replaced_seq}"));
+    }
+    replace_durable_envelope(root.path(), &replacement);
+
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen replaced journal");
+    let mut appended = [user_node_envelope(&session_id, 4, None, "appended four")];
+    reopened
+        .append(&mut appended)
+        .await
+        .expect("append beyond retained-prefix mutation");
+    let writer = writer.unwrap_or_else(|| PipeNativeWriter::new(root.path()));
+    writer
+        .maintain(&reopened, &session_id, &appended, appended[0].seq)
+        .await
+        .expect("reconcile retained-prefix mutation");
+    assert!(
+        writer
+            .confirmed_coverage(&session_id)
+            .expect("reconciled native-pipe coverage")
+            .1
+            > initial_generation,
+        "retained-prefix mutation must force a new sidecar generation"
+    );
+    let cached = projected_sidecar_values(&writer, &session_id);
+
+    writer.release_clean(&session_id);
+    remove_sidecar_chain(&writer, &session_id);
+    let oracle = PipeNativeWriter::new(root.path());
+    oracle
+        .maintain(&reopened, &session_id, &[], appended[0].seq)
+        .await
+        .expect("build retained-prefix native-pipe oracle");
+    assert_eq!(
+        cached,
+        projected_sidecar_values(&oracle, &session_id),
+        "native-pipe projection diverged after mutation at seq {replaced_seq}"
+    );
+    drop(oracle);
+    drop(writer);
+    reopened.close().await.expect("close replaced store");
+}
+
+#[tokio::test]
+async fn cached_pipe_revalidates_every_retained_position_below_head() {
+    assert_native_pipe_prefix_mutation_rebuilds(1, false, true).await;
+    assert_native_pipe_prefix_mutation_rebuilds(2, false, true).await;
+}
+
+#[tokio::test]
+async fn cached_pipe_revalidates_same_id_payload_mutation() {
+    assert_native_pipe_prefix_mutation_rebuilds(2, true, true).await;
+}
+
+#[tokio::test]
+async fn hot_append_revalidates_same_id_payload_mutation() {
+    assert_native_pipe_prefix_mutation_rebuilds(2, true, false).await;
+}
+
 #[tokio::test]
 async fn cached_and_cold_projection_refuse_the_same_corrupt_matching_envelope() {
     let root = tempfile::tempdir().expect("temp profile");
@@ -727,7 +843,7 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     // the dirty branch were accidentally removed.
     std::fs::write(
         &path,
-        b"{\"pipe\":\"haider.session.jsonl\",\"version\":6,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"stale\",\"at_ms\":999,\"seq\":1}\n{\"coverage\":1,\"generation\":9}\n",
+        b"{\"pipe\":\"haider.session.jsonl\",\"version\":7,\"session_id\":\"native-pipe-io-failure\",\"generation\":9,\"authority_generation\":0}\n{\"role\":\"user\",\"text\":\"stale\",\"at_ms\":999,\"seq\":1}\n{\"coverage\":1,\"generation\":9}\n",
     )
     .expect("stale sidecar writes");
     let hub = SessionHub::new_with_pipe_native(
@@ -743,7 +859,7 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
         .expect("retry trigger commits");
     hub.shutdown().await.expect("retry writer joins");
 
-    let mut expected = header_line(&session_id, 10, 0, 0).expect("header renders");
+    let mut expected = header_line(&session_id, 10, 0, 0, 0).expect("header renders");
     expected
         .push_str(&haider_protocol::pipe::sidecar_row_line(&events[0]).expect("durable user row"));
     expected.push('\n');
@@ -930,6 +1046,7 @@ fn native_pipe_coalesces_255_non_rows_and_covers_the_256th() {
         pending_seq: 1,
         generation: 1,
         segment: 0,
+        authority_generation: 0,
     };
     let mut projector = TranscriptProjector::default();
     let (before, cursor) = render_hot_batch(&deltas[..255], 256, cursor, &mut projector)

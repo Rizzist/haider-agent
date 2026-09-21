@@ -11,7 +11,7 @@ use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
 use haider_protocol::verify::VerifyVerdict;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
 struct NoArtifacts;
 
@@ -29,6 +29,7 @@ impl ArtifactReader for NoArtifacts {
 #[derive(Default)]
 struct RevisionStore {
     envelopes: StdMutex<Vec<RawEnvelope>>,
+    mutation_generation: AtomicU64,
     full_reads: AtomicUsize,
     suffix_reads: AtomicUsize,
 }
@@ -53,6 +54,24 @@ impl RevisionStore {
         replacement.seq = head.seq;
         replacement.committed_at_ms = head.committed_at_ms;
         *head = replacement;
+        self.mutation_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn replace_at(&self, seq: u64, mut replacement: RawEnvelope, preserve_event_id: bool) {
+        let mut envelopes = self.envelopes.lock().expect("revision journal");
+        let retained = envelopes
+            .iter_mut()
+            .find(|envelope| envelope.seq == seq)
+            .expect("retained revision row");
+        replacement.seq = retained.seq;
+        replacement.committed_at_ms = retained.committed_at_ms;
+        if preserve_event_id {
+            replacement.event_id = retained.event_id.clone();
+        }
+        *retained = replacement;
+        self.mutation_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     fn truncate(&self, through_seq: u64) {
@@ -60,6 +79,8 @@ impl RevisionStore {
             .lock()
             .expect("revision journal")
             .retain(|envelope| envelope.seq <= through_seq);
+        self.mutation_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 }
 
@@ -143,6 +164,9 @@ impl StoreHandle for RevisionStore {
             envelopes: selected,
             observed_head,
             observed_fence,
+            observed_mutation_generation: Some(
+                self.mutation_generation.load(AtomicOrdering::Relaxed),
+            ),
         })
     }
 
@@ -465,6 +489,168 @@ async fn advanced_boundary_revalidates_the_cached_terminal_event() {
             "an advanced boundary must rebuild after its cached event id changes"
         );
     }
+}
+
+#[tokio::test]
+async fn retained_prefix_mutations_rebuild_from_journal_authority() {
+    for replaced_seq in 1..=2_u64 {
+        let store = RevisionStore::default();
+        let session = SessionId::new(format!("prompt-prefix-replacement-{replaced_seq}"));
+        let run = RunId::new(format!("prompt-prefix-replacement-run-{replaced_seq}"));
+        let mut initial = (1..=3_u64)
+            .map(|ordinal| {
+                visible_user(
+                    &session,
+                    &run,
+                    &format!("prompt-prefix-original-{ordinal}"),
+                    &format!("original {ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .append(&mut initial)
+            .await
+            .expect("append retained prefix");
+        let cache = PromptHistoryCache::default();
+        cache
+            .compile_provider_projection_with_artifacts(
+                &store,
+                &NoArtifacts,
+                &session,
+                None,
+                None,
+                &run,
+            )
+            .await
+            .expect("prime retained prefix");
+        cache.compact_session_history(&session).await;
+
+        store.replace_at(
+            replaced_seq,
+            visible_user(
+                &session,
+                &run,
+                &format!("prompt-prefix-replacement-{replaced_seq}"),
+                &format!("replacement {replaced_seq}"),
+            ),
+            false,
+        );
+        let mut appended = [visible_user(
+            &session,
+            &run,
+            "prompt-prefix-appended",
+            "appended",
+        )];
+        store
+            .append(&mut appended)
+            .await
+            .expect("append after replacement");
+        store.reset_read_counts();
+
+        let projected = cache
+            .compile_provider_projection_with_artifacts(
+                &store,
+                &NoArtifacts,
+                &session,
+                None,
+                None,
+                &run,
+            )
+            .await
+            .expect("rebuild retained prefix");
+        let rebuild_reads = store.full_read_count();
+        let oracle = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("compile retained-prefix oracle");
+        assert_eq!(
+            projected, oracle,
+            "replacement at retained seq {replaced_seq}"
+        );
+        assert!(rebuild_reads > 0, "retained-prefix replacement must replay");
+    }
+
+    let store = RevisionStore::default();
+    let session = SessionId::new("prompt-prefix-same-id");
+    let run = RunId::new("prompt-prefix-same-id-run");
+    let mut initial = (1..=3_u64)
+        .map(|ordinal| {
+            visible_user(
+                &session,
+                &run,
+                &format!("prompt-same-id-{ordinal}"),
+                &format!("original {ordinal}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    store
+        .append(&mut initial)
+        .await
+        .expect("append same-id prefix");
+    let cache = PromptHistoryCache::default();
+    cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("prime same-id prefix");
+    cache.compact_session_history(&session).await;
+    store.replace_at(
+        3,
+        visible_user(
+            &session,
+            &run,
+            "ignored-replacement-id",
+            "replacement three",
+        ),
+        true,
+    );
+    let mut appended = [visible_user(
+        &session,
+        &run,
+        "prompt-same-id-appended",
+        "appended",
+    )];
+    store
+        .append(&mut appended)
+        .await
+        .expect("append after same-id mutation");
+    store.reset_read_counts();
+    let projected = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("rebuild same-id prefix");
+    let rebuild_reads = store.full_read_count();
+    let oracle = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &NoArtifacts,
+        &session,
+        None,
+        None,
+        &run,
+    )
+    .await
+    .expect("compile same-id oracle");
+    assert_eq!(projected, oracle, "same-id payload mutation");
+    assert!(rebuild_reads > 0, "same-id payload mutation must replay");
 }
 
 #[tokio::test]

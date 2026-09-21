@@ -150,6 +150,7 @@ struct CachedPromptSession {
     retained_envelope_bytes: usize,
     head_seq: u64,
     revision: Option<PromptJournalRevision>,
+    mutation_generation: Option<u64>,
     journal_prefix_compacted: bool,
     compaction_epochs: HashMap<PromptTimelineKey, u64>,
     envelopes: Vec<RawEnvelope>,
@@ -1055,7 +1056,7 @@ impl PromptHistoryCache {
                 {
                     return Ok(None);
                 }
-                if advance_cached_prompt_suffix(store, session_id, &mut cached)
+                if advance_cached_prompt_suffix(store, session_id, &timeline, &mut cached)
                     .await?
                     .is_none()
                 {
@@ -1112,14 +1113,29 @@ impl PromptHistoryCache {
             .remove(session_id)
             .unwrap_or_default();
         let transactionally_observed_head = if !cached.bodies_evicted && cached.revision.is_some() {
-            advance_cached_prompt_suffix(store, session_id, &mut cached).await?
+            advance_cached_prompt_suffix(store, session_id, &timeline, &mut cached).await?
         } else {
             None
         };
+        let mut cold_mutation_generation = None;
         let head_seq = match transactionally_observed_head {
             Some(head_seq) => head_seq,
-            None => store.latest_seq(session_id).await?,
+            None => {
+                let latest = store.latest_seq(session_id).await?;
+                let boundary = prompt_authority_probe(store, session_id, latest).await?;
+                cold_mutation_generation = boundary.observed_mutation_generation;
+                boundary
+                    .observed_head
+                    .as_ref()
+                    .map_or(latest, |(seq, _)| *seq)
+            }
         };
+        if transactionally_observed_head.is_none()
+            && cached.revision.is_some()
+            && cached.mutation_generation.is_none()
+        {
+            cached = CachedPromptSession::default();
+        }
         if cached.head_seq > head_seq {
             cached = CachedPromptSession::default();
         } else if cached.bodies_evicted {
@@ -1247,6 +1263,30 @@ impl PromptHistoryCache {
                         agent_id: key.agent_id.clone(),
                     })
                 });
+            }
+        }
+        if cached.mutation_generation.is_none()
+            && let Some(expected_generation) = cold_mutation_generation
+        {
+            let boundary = prompt_authority_probe(store, session_id, cached.head_seq).await?;
+            let confirms_revision = match cached.revision.as_ref() {
+                Some(revision) => boundary.confirms_fence(
+                    revision.head_seq,
+                    &revision.head_event_id,
+                    expected_generation,
+                ),
+                None => cached.head_seq == 0 && boundary.observed_head.is_none(),
+            };
+            if boundary.observed_mutation_generation == Some(expected_generation)
+                && confirms_revision
+            {
+                cached.mutation_generation = Some(expected_generation);
+            } else {
+                let replay_head = boundary
+                    .observed_head
+                    .as_ref()
+                    .map_or(cached.head_seq, |(seq, _)| *seq);
+                cached = replay_cached_session(store, session_id, replay_head).await?;
             }
         }
 
@@ -1460,16 +1500,12 @@ impl PromptHistoryCache {
             .saturating_add(1);
         cached.last_touched = last_touched;
         let mut sessions = self.sessions.lock().await;
-        if let Some(current) = sessions.get_mut(&session_id)
-            && current.head_seq > cached.head_seq
-        {
-            current.last_touched = last_touched;
-            return;
-        }
-        if sessions
-            .get(&session_id)
-            .is_none_or(|current| current.head_seq <= cached.head_seq)
-        {
+        let candidate_is_current = sessions.get(&session_id).is_none_or(|current| {
+            cached.mutation_generation > current.mutation_generation
+                || (cached.mutation_generation == current.mutation_generation
+                    && cached.head_seq >= current.head_seq)
+        });
+        if candidate_is_current {
             if !sessions.contains_key(&session_id)
                 && sessions.len() >= PROMPT_CACHE_SESSION_LIMIT
                 && let Some(evicted) = sessions
@@ -1516,6 +1552,8 @@ impl PromptHistoryCache {
                     entry.evict_bodies();
                 }
             }
+        } else if let Some(current) = sessions.get_mut(&session_id) {
+            current.last_touched = last_touched;
         }
     }
 }
@@ -1527,9 +1565,13 @@ impl PromptHistoryCache {
 async fn advance_cached_prompt_suffix(
     store: &dyn StoreHandle,
     session_id: &SessionId,
+    timeline: &PromptTimelineKey,
     cached: &mut CachedPromptSession,
 ) -> Result<Option<u64>, HaiderError> {
     let Some(mut expected) = cached.revision.clone() else {
+        return Ok(None);
+    };
+    let Some(expected_mutation_generation) = cached.mutation_generation else {
         return Ok(None);
     };
     if expected.head_seq != cached.head_seq {
@@ -1551,12 +1593,20 @@ async fn advance_cached_prompt_suffix(
                 PROMPT_PROJECTION_PAYLOAD_KINDS,
             )
             .await?;
-        let confirms_expected = page.confirms_fence(expected.head_seq, &expected.head_event_id);
+        let confirms_expected = page.confirms_fence(
+            expected.head_seq,
+            &expected.head_event_id,
+            expected_mutation_generation,
+        );
+        let Some(observed_mutation_generation) = page.observed_mutation_generation else {
+            return Ok(None);
+        };
         let Some(observed) = page.observed_head.map(PromptJournalRevision::from) else {
             return Ok(None);
         };
-        let valid_boundary =
-            observed == expected || (observed.head_seq > expected.head_seq && confirms_expected);
+        let valid_boundary = observed_mutation_generation == expected_mutation_generation
+            && (observed == expected
+                || (observed.head_seq > expected.head_seq && confirms_expected));
         let impossible_exact_page =
             first_page && observed == expected && !page.envelopes.is_empty();
         if !valid_boundary || impossible_exact_page {
@@ -1579,6 +1629,7 @@ async fn advance_cached_prompt_suffix(
             } else {
                 cached.head_seq = observed.head_seq;
                 cached.revision = Some(observed.clone());
+                cached.mutation_generation = Some(observed_mutation_generation);
             }
             return Ok(Some(observed.head_seq));
         }
@@ -1591,22 +1642,79 @@ async fn advance_cached_prompt_suffix(
             return Err(corrupt("prompt suffix projection did not advance"));
         }
         for envelope in page.envelopes {
+            let changed_timeline = PromptTimelineKey {
+                branch_id: envelope.branch_id.clone(),
+                agent_id: envelope.agent_id.clone(),
+            };
+            let affects_checkpoint_timeline = changed_timeline == *timeline;
             if cached.push_envelope(envelope) {
-                // Compaction, context editing, and retraction can revise a
-                // previously compiled body. Keep the decoded journal/indexes
-                // when complete, but never retain an exact compiled answer.
-                cached.append_prefixes.clear();
-                cached.projections.clear();
-                invalidates_omitted_prefix = true;
+                cached.append_prefixes.retain(|scope, _| {
+                    scope.branch_id != changed_timeline.branch_id
+                        || scope.agent_id != changed_timeline.agent_id
+                });
+                cached.projections.retain(|key, _| {
+                    key.branch_id != changed_timeline.branch_id
+                        || key.agent_id != changed_timeline.agent_id
+                });
+                invalidates_omitted_prefix |= affects_checkpoint_timeline;
             }
         }
         cursor = next_cursor;
+        if cursor == observed.head_seq {
+            cached.flush_boundary_rows();
+            if omitted_prefix && invalidates_omitted_prefix {
+                *cached = replay_cached_session(store, session_id, observed.head_seq).await?;
+            } else {
+                cached.head_seq = observed.head_seq;
+                cached.revision = Some(observed.clone());
+                cached.mutation_generation = Some(observed_mutation_generation);
+            }
+            return Ok(Some(observed.head_seq));
+        }
         expected = observed;
         first_page = false;
     }
 }
 
 async fn replay_cached_session(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    mut head_seq: u64,
+) -> Result<CachedPromptSession, HaiderError> {
+    loop {
+        let initial = prompt_authority_probe(store, session_id, head_seq).await?;
+        let Some(initial_generation) = initial.observed_mutation_generation else {
+            return replay_cached_session_without_authority(store, session_id, head_seq).await;
+        };
+        head_seq = initial
+            .observed_head
+            .as_ref()
+            .map_or(head_seq, |(seq, _)| *seq);
+        let mut cached =
+            replay_cached_session_without_authority(store, session_id, head_seq).await?;
+        let final_boundary = prompt_authority_probe(store, session_id, head_seq).await?;
+        let confirms_revision = match cached.revision.as_ref() {
+            Some(revision) => final_boundary.confirms_fence(
+                revision.head_seq,
+                &revision.head_event_id,
+                initial_generation,
+            ),
+            None => head_seq == 0 && final_boundary.observed_head.is_none(),
+        };
+        if final_boundary.observed_mutation_generation == Some(initial_generation)
+            && confirms_revision
+        {
+            cached.mutation_generation = Some(initial_generation);
+            return Ok(cached);
+        }
+        head_seq = final_boundary
+            .observed_head
+            .as_ref()
+            .map_or(head_seq, |(seq, _)| *seq);
+    }
+}
+
+async fn replay_cached_session_without_authority(
     store: &dyn StoreHandle,
     session_id: &SessionId,
     head_seq: u64,
@@ -1639,6 +1747,27 @@ async fn replay_cached_session(
     cached.flush_boundary_rows();
     cached.head_seq = head_seq;
     Ok(cached)
+}
+
+async fn prompt_authority_probe(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    head_seq: u64,
+) -> Result<crate::ReducerPage, HaiderError> {
+    store
+        .read_reducer_page_with_boundary_for(
+            haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+            session_id,
+            if head_seq == 0 {
+                crate::ReducerPageCursor::after(0)
+            } else {
+                crate::ReducerPageCursor::fenced(head_seq, head_seq)
+            },
+            1,
+            1,
+            PROMPT_PROJECTION_PAYLOAD_KINDS,
+        )
+        .await
 }
 
 /// Rebinds independently decoded reply facts to one arena while any replay

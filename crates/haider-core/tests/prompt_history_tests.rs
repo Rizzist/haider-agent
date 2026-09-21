@@ -5,8 +5,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_core::{
     ArtifactReader, CommittedRange, MemoryStore, PromptCompactionPlanRequest,
-    PromptHistoryCompiler, SessionCreateCommand, SessionProjectionCheckpoint, SqliteStoreHandle,
-    StoreHandle, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
+    PromptHistoryCompiler, ReducerPage, ReducerPageCursor, SessionCreateCommand,
+    SessionProjectionCheckpoint, SqliteStoreHandle, StoreHandle, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -204,6 +204,31 @@ impl<S: StoreHandle + ?Sized> StoreHandle for RecordingStore<'_, S> {
         session_id: &SessionId,
     ) -> Result<u64, haider_protocol::error::HaiderError> {
         StoreHandle::latest_seq(self.inner, session_id).await
+    }
+
+    async fn read_reducer_page_with_boundary_for(
+        &self,
+        caller: haider_platform::phase_trace::StoreReadCaller,
+        session_id: &SessionId,
+        cursor: ReducerPageCursor,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<ReducerPage, haider_protocol::error::HaiderError> {
+        self.reads
+            .lock()
+            .expect("read ledger")
+            .push(cursor.after_seq);
+        StoreHandle::read_reducer_page_with_boundary_for(
+            self.inner,
+            caller,
+            session_id,
+            cursor,
+            limit,
+            byte_budget,
+            payload_kinds,
+        )
+        .await
     }
 
     async fn projection_checkpoint(
