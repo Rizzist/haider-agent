@@ -320,8 +320,8 @@ fn journal_mutation_generation_covers_authoritative_rewrites_and_deletes_only() 
     ));
     assert_eq!(
         generation(),
-        0,
-        "derived payload-kind maintenance is not an authoritative rewrite"
+        1,
+        "payload-kind changes alter reducer membership and advance authority"
     );
 
     let mut replacement = batch[0].clone();
@@ -338,7 +338,7 @@ fn journal_mutation_generation_covers_authoritative_rewrites_and_deletes_only() 
     ));
     assert_eq!(
         generation(),
-        1,
+        2,
         "same-id payload rewrite advances authority"
     );
     let checkpoints: i64 = must(connection.query_row(
@@ -356,7 +356,7 @@ fn journal_mutation_generation_covers_authoritative_rewrites_and_deletes_only() 
         "DELETE FROM events WHERE session_id = ?1 AND seq = 2",
         [session.as_str()],
     ));
-    assert_eq!(generation(), 2, "journal deletion advances authority");
+    assert_eq!(generation(), 3, "journal deletion advances authority");
 
     let mut appended = [envelope(
         &session,
@@ -364,7 +364,7 @@ fn journal_mutation_generation_covers_authoritative_rewrites_and_deletes_only() 
         json!({"type": "generation_fixture", "ordinal": 4}),
     )];
     must(store.append(&mut appended));
-    assert_eq!(generation(), 2, "later appends preserve mutation authority");
+    assert_eq!(generation(), 3, "later appends preserve mutation authority");
 }
 
 /// MUTATION CHECK: remove `timeline_key = ?3` from the checkpoint lookup.

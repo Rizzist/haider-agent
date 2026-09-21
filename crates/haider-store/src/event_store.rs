@@ -2381,6 +2381,7 @@ impl Store {
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection_with(&database_path, synchronous)?;
         let migration = migrations::migrate(&mut connection)?;
+        migrations::ensure_event_authority_triggers(&mut connection)?;
         let publication_pending = boot_publication_pending(&connection)?;
         backfill_payload_kinds(&mut connection)?;
         backfill_run_head_projections(&mut connection)?;

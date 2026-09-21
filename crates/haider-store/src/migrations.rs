@@ -744,7 +744,8 @@ const MIGRATIONS: &[Migration] = &[
             DELETE FROM session_projection_checkpoints;
 
             CREATE TRIGGER events_authority_updated
-            AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms ON events
+            AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+            ON events
             BEGIN
                 UPDATE sessions
                    SET journal_mutation_generation = journal_mutation_generation + 1
@@ -1255,7 +1256,8 @@ CREATE TRIGGER events_authority_deleted
             END;
 
 CREATE TRIGGER events_authority_updated
-            AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms ON events
+            AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+            ON events
             BEGIN
                 UPDATE sessions
                    SET journal_mutation_generation = journal_mutation_generation + 1
@@ -1303,6 +1305,82 @@ pub(crate) fn migrate(connection: &mut Connection) -> StoreResult<MigrationOutco
 
     validate_registry(connection)?;
     Ok(outcome)
+}
+
+/// Restores the journal-mutation authority after an out-of-band table rebuild.
+///
+/// SQLite drops table-owned triggers when `events` is dropped. A current-schema
+/// database can therefore lose both triggers without re-entering the migration
+/// chain. Trigger absence makes the time since the last trusted open
+/// unverifiable, so repair also advances every session's authority once and
+/// discards durable projection checkpoints in the same transaction.
+pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> StoreResult<bool> {
+    if event_authority_triggers_are_current(connection)? {
+        return Ok(false);
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    if event_authority_triggers_are_current(&transaction)? {
+        transaction.commit().map_err(sqlite_error)?;
+        return Ok(false);
+    }
+
+    transaction
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS events_authority_updated;
+             DROP TRIGGER IF EXISTS events_authority_deleted;
+
+             CREATE TRIGGER events_authority_updated
+             AFTER UPDATE OF session_id, seq, envelope_json, event_id, committed_at_ms,
+                             payload_kind
+             ON events
+             BEGIN
+                 UPDATE sessions
+                    SET journal_mutation_generation = journal_mutation_generation + 1
+                  WHERE id = OLD.session_id;
+                 UPDATE sessions
+                    SET journal_mutation_generation = journal_mutation_generation + 1
+                  WHERE id = NEW.session_id AND NEW.session_id <> OLD.session_id;
+                 DELETE FROM session_projection_checkpoints
+                  WHERE session_id IN (OLD.session_id, NEW.session_id);
+             END;
+
+             CREATE TRIGGER events_authority_deleted
+             AFTER DELETE ON events
+             BEGIN
+                 UPDATE sessions
+                    SET journal_mutation_generation = journal_mutation_generation + 1
+                  WHERE id = OLD.session_id;
+                 DELETE FROM session_projection_checkpoints
+                  WHERE session_id = OLD.session_id;
+             END;
+
+             UPDATE sessions
+                SET journal_mutation_generation = journal_mutation_generation + 1;
+             DELETE FROM session_projection_checkpoints;",
+        )
+        .map_err(sqlite_error)?;
+    transaction.commit().map_err(sqlite_error)?;
+    Ok(true)
+}
+
+fn event_authority_triggers_are_current(connection: &Connection) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) = 2
+               FROM sqlite_master
+              WHERE type = 'trigger'
+                AND tbl_name = 'events'
+                AND (
+                    (name = 'events_authority_updated' AND instr(sql, 'payload_kind') > 0)
+                    OR name = 'events_authority_deleted'
+                )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)
 }
 
 fn database_has_no_schema(connection: &Connection) -> StoreResult<bool> {
