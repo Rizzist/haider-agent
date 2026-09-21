@@ -3952,8 +3952,21 @@ async fn run_command(
         crate::native_process::NativeTask::spawn(read_limited(stderr, MAX_STREAM_OUTPUT_BYTES));
     let leader = async {
         if let Some(mut stdin) = stdin.take() {
-            stdin.write_all(input).await?;
-            stdin.shutdown().await?;
+            // Hooks may intentionally ignore the event body and exit after
+            // emitting their answer. Under scheduler pressure that legitimate
+            // exit can win the stdin write, producing EPIPE even though stdout
+            // and the exit status contain a complete result. Preserve those
+            // authoritative channels; other I/O errors remain failures.
+            if let Err(error) = stdin.write_all(input).await
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(error);
+            }
+            if let Err(error) = stdin.shutdown().await
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(error);
+            }
         }
         child.observe_exit().await
     };
