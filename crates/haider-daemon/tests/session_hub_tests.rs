@@ -805,7 +805,7 @@ fn expected_sidecar_batches(
     batches: &[&[RawEnvelope]],
 ) -> String {
     let mut expected = format!(
-        "{{\"pipe\":\"haider.session.jsonl\",\"version\":6,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
+        "{{\"pipe\":\"haider.session.jsonl\",\"version\":7,\"session_id\":\"{session_id}\",\"generation\":{generation},\"authority_generation\":0}}\n"
     );
     for batch in batches {
         expected.push_str(&expected_sidecar_body(batch));
@@ -2882,7 +2882,7 @@ async fn a_stale_v4_file_rebuilds_with_the_reasoning_compat_flag_cleared() {
     let rebuilt = std::fs::read_to_string(&path).expect("rebuilt reads");
     let header: serde_json::Value =
         serde_json::from_str(rebuilt.lines().next().expect("header")).expect("header JSON");
-    assert_eq!(header["version"], 6, "the bump forced a rebuild");
+    assert_eq!(header["version"], 7, "the bump forced a rebuild");
 
     let reasoning_row: serde_json::Value = rebuilt
         .lines()
@@ -2968,7 +2968,7 @@ async fn a_stale_v5_file_rebuilds_with_rejected_tool_status() {
     let rebuilt = std::fs::read_to_string(&path).expect("rebuilt reads");
     let header: serde_json::Value =
         serde_json::from_str(rebuilt.lines().next().expect("header")).expect("header JSON");
-    assert_eq!(header["version"], 6, "the bump forced a rebuild");
+    assert_eq!(header["version"], 7, "the bump forced a rebuild");
     let tool_row: serde_json::Value = rebuilt
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -10347,7 +10347,7 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     std::fs::write(
         &path,
         format!(
-            "{{\"pipe\":\"haider.session.jsonl\",\"version\":6,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":7,\"session_id\":\"{session_id}\",\"generation\":1,\"authority_generation\":0}}\ngarbage\n"
         ),
     )
     .expect("corruption writes");
@@ -10451,7 +10451,7 @@ async fn native_pipe_version_rebuild_sweeps_previous_generation_successor() {
     assert!(old_successor.exists(), "old successor fixture exists");
     std::fs::write(
         &base,
-        old_root.replacen("\"version\":6", "\"version\":5", 1),
+        old_root.replacen("\"version\":7", "\"version\":6", 1),
     )
     .expect("old-version root fixture writes");
 
@@ -10524,7 +10524,7 @@ async fn native_pipe_orphan_sweep_preserves_every_reachable_segment() {
     std::fs::write(
         &orphan,
         format!(
-            "{{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"{session_id}\",\"generation\":77,\"segment\":1}}\n{{\"coverage\":0,\"generation\":77}}\n"
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":7,\"session_id\":\"{session_id}\",\"generation\":77,\"authority_generation\":0,\"segment\":1}}\n{{\"coverage\":0,\"generation\":77}}\n"
         ),
     )
     .expect("owned orphan fixture writes");
@@ -10667,7 +10667,7 @@ async fn native_pipe_v3_header_rebuilds_to_current_with_generation_bump() {
     let root_segment = std::fs::read_to_string(&path).expect("rebuilt root reads");
     let header: serde_json::Value =
         serde_json::from_str(root_segment.lines().next().expect("v4 header")).expect("header JSON");
-    assert_eq!(header["version"], 6);
+    assert_eq!(header["version"], 7);
     assert_eq!(header["generation"], 5);
     assert!(root_segment.contains("\"reasoning\":\"sealed v3 summary\""));
     assert!(!root_segment.contains("v3 partial"));

@@ -412,7 +412,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::TurnRecovery,
                     &session_id,
-                    cursor,
+                    haider_core::ReducerPageCursor::after(cursor),
                     PAGE_SIZE,
                     PAGE_BYTES,
                     STARTUP_HYDRATION_PAYLOAD_KINDS,

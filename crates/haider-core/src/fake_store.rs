@@ -4,7 +4,10 @@
 //! starting at 1, one `committed_at_ms` per batch, batches never span
 //! sessions. The durable store must preserve exactly these observable rules.
 
-use crate::{CommittedRange, SessionProjectionCheckpoint, StoreHandle, unix_time_ms};
+use crate::{
+    CommittedRange, ReducerPage, ReducerPageCursor, SessionProjectionCheckpoint, StoreHandle,
+    envelope_payload_kind, unix_time_ms,
+};
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
@@ -119,6 +122,56 @@ impl StoreHandle for MemoryStore {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    async fn read_reducer_page_with_boundary(
+        &self,
+        session_id: &SessionId,
+        cursor: ReducerPageCursor,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<ReducerPage, HaiderError> {
+        let sessions = self.sessions.lock().await;
+        let journal = sessions
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let observed_head = journal
+            .last()
+            .map(|envelope| (envelope.seq, envelope.event_id.clone()));
+        let observed_fence = cursor.fence_seq.and_then(|fence_seq| {
+            journal
+                .iter()
+                .find(|envelope| envelope.seq == fence_seq)
+                .map(|envelope| (envelope.seq, envelope.event_id.clone()))
+        });
+        let mut envelopes = Vec::new();
+        let mut spent = 0_usize;
+        if limit > 0 && !payload_kinds.is_empty() {
+            for envelope in journal.iter().filter(|envelope| {
+                envelope.seq > cursor.after_seq
+                    && payload_kinds.contains(&envelope_payload_kind(envelope))
+            }) {
+                let weight = haider_protocol::envelope::envelope_weight_bytes(envelope);
+                if !envelopes.is_empty() && spent.saturating_add(weight) > byte_budget {
+                    break;
+                }
+                spent = spent.saturating_add(weight);
+                envelopes.push(envelope.clone());
+                if envelopes.len() >= limit || spent >= byte_budget {
+                    break;
+                }
+            }
+        }
+        Ok(ReducerPage {
+            envelopes,
+            observed_head,
+            observed_fence,
+            // This store exposes no rewrite/delete surface; its journal is
+            // append-only for the lifetime of the in-memory session.
+            observed_mutation_generation: Some(0),
+        })
     }
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {

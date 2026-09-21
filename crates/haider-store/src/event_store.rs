@@ -243,14 +243,52 @@ pub struct PendingHookDispatchMetadata {
     pub workspace_unavailable: bool,
 }
 
-/// One payload-kind-filtered reducer page plus the committed journal head
-/// observed under the same connection lock. The head carries only indexed
-/// coordinates, so a reducer can advance across an irrelevant suffix without
-/// fetching or decoding that suffix's envelopes.
+/// One payload-kind-filtered reducer page plus journal revisions observed
+/// under the same connection lock. The head and optional caller-requested
+/// fence carry only indexed coordinates, while the mutation generation covers
+/// every authoritative row in the retained prefix. A reducer can therefore
+/// verify its prior boundary and advance across an irrelevant suffix without
+/// fetching or decoding those envelopes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReducerPage {
     pub envelopes: Vec<RawEnvelope>,
     pub observed_head: Option<(u64, EventId)>,
+    pub observed_fence: Option<(u64, EventId)>,
+    pub observed_mutation_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReducerPageCursor {
+    pub after_seq: u64,
+    pub fence_seq: Option<u64>,
+}
+
+impl ReducerPageCursor {
+    pub const fn after(after_seq: u64) -> Self {
+        Self {
+            after_seq,
+            fence_seq: None,
+        }
+    }
+
+    pub const fn fenced(after_seq: u64, fence_seq: u64) -> Self {
+        Self {
+            after_seq,
+            fence_seq: Some(fence_seq),
+        }
+    }
+}
+
+impl ReducerPage {
+    pub fn confirms_fence(&self, seq: u64, event_id: &EventId, mutation_generation: u64) -> bool {
+        self.observed_mutation_generation == Some(mutation_generation)
+            && self
+                .observed_fence
+                .as_ref()
+                .is_some_and(|(observed_seq, observed_id)| {
+                    *observed_seq == seq && observed_id == event_id
+                })
+    }
 }
 
 /// Opaque, rebuildable projection state anchored to one immutable journal
@@ -2344,6 +2382,7 @@ impl Store {
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection_with(&database_path, synchronous)?;
         let migration = migrations::migrate(&mut connection)?;
+        migrations::ensure_event_authority_triggers(&mut connection)?;
         let publication_pending = boot_publication_pending(&connection)?;
         backfill_payload_kinds(&mut connection)?;
         backfill_run_head_projections(&mut connection)?;
@@ -2861,7 +2900,7 @@ impl Store {
                 let page = self.read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::UsageBackfill,
                     &session_id,
-                    cursor,
+                    ReducerPageCursor::after(cursor),
                     REPLAY_PAGE_SIZE,
                     USAGE_REPLAY_PAGE_BYTES,
                     USAGE_REDUCER_PAYLOAD_KINDS,
@@ -14376,13 +14415,13 @@ impl Store {
     }
 
     /// Byte-bounded variant used by durable streamed reducers. The journal
-    /// boundary is sampled while the same connection lock guards the filtered
-    /// read, so callers may checkpoint an empty filtered suffix without
-    /// racing a committed append whose relevant fact was not folded.
+    /// head, requested fence, and filtered page share one read transaction, so
+    /// callers may checkpoint an empty filtered suffix without racing a
+    /// committed append or replacement whose relevant fact was not folded.
     pub fn read_reducer_page_with_boundary(
         &self,
         session: &SessionId,
-        since_seq: u64,
+        cursor: ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &[&str],
@@ -14390,7 +14429,7 @@ impl Store {
         self.read_reducer_page_with_boundary_for(
             haider_platform::phase_trace::StoreReadCaller::Unattributed,
             session,
-            since_seq,
+            cursor,
             limit,
             byte_budget,
             payload_kinds,
@@ -14401,7 +14440,7 @@ impl Store {
         &self,
         caller: haider_platform::phase_trace::StoreReadCaller,
         session: &SessionId,
-        since_seq: u64,
+        cursor: ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &[&str],
@@ -14410,37 +14449,52 @@ impl Store {
             return Ok(ReducerPage {
                 envelopes: Vec::new(),
                 observed_head: None,
+                observed_fence: None,
+                observed_mutation_generation: None,
             });
         }
         let mut query_phase = haider_platform::phase_trace::store_scope_for(
             haider_platform::phase_trace::Phase::StoreQueryReducer,
             caller,
         );
-        let connection = self.connection()?;
-        let boundary = journal_boundary_with_connection(&connection, session)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(map_sqlite_error)?;
+        let boundary = journal_boundary_with_connection(&transaction, session)?;
+        let mutation_generation =
+            journal_mutation_generation_with_connection(&transaction, session)?;
+        let fence = cursor
+            .fence_seq
+            .map(|seq| journal_revision_with_connection(&transaction, session, seq))
+            .transpose()?
+            .flatten();
         let filtered = read_reducer_page_with_connection(
-            &connection,
+            &transaction,
             ReducerPageQuery {
                 caller,
                 session,
-                since_seq,
+                since_seq: cursor.after_seq,
                 limit,
                 byte_budget,
                 payload_kinds,
             },
             &mut query_phase,
         );
+        transaction.commit().map_err(map_sqlite_error)?;
         drop(connection);
         match filtered {
             Ok(envelopes) => Ok(ReducerPage {
                 envelopes,
                 observed_head: boundary,
+                observed_fence: fence,
+                observed_mutation_generation: mutation_generation,
             }),
             Err(FilteredReadError::Decode) => self
-                .read_page_for(caller, session, since_seq, limit, byte_budget)
+                .read_page_for(caller, session, cursor.after_seq, limit, byte_budget)
                 .map(|envelopes| ReducerPage {
                     envelopes,
                     observed_head: None,
+                    observed_fence: None,
+                    observed_mutation_generation: None,
                 }),
             Err(FilteredReadError::Store(error)) => Err(error),
         }
@@ -25744,6 +25798,51 @@ fn journal_boundary_with_connection(
         .transpose()
 }
 
+fn journal_mutation_generation_with_connection(
+    connection: &Connection,
+    session: &SessionId,
+) -> StoreResult<Option<u64>> {
+    connection
+        .query_row(
+            "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
+            [session.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(|generation| {
+            u64::try_from(generation)
+                .map_err(|_| corrupt("database contains a negative journal mutation generation"))
+        })
+        .transpose()
+}
+
+fn journal_revision_with_connection(
+    connection: &Connection,
+    session: &SessionId,
+    seq: u64,
+) -> StoreResult<Option<(u64, EventId)>> {
+    let seq = i64::try_from(seq)
+        .map_err(|_| corrupt("journal revision sequence exceeds SQLite's integer range"))?;
+    connection
+        .query_row(
+            "SELECT seq, event_id FROM events
+             WHERE session_id = ?1 AND seq = ?2",
+            rusqlite::params![session.as_str(), seq],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(|(seq, event_id)| {
+            let seq = u64::try_from(seq)
+                .ok()
+                .filter(|seq| *seq > 0)
+                .ok_or_else(|| corrupt("database contains an invalid event sequence"))?;
+            Ok((seq, EventId::new(event_id)))
+        })
+        .transpose()
+}
+
 fn reducer_page_sql(payload_kind_count: usize) -> Result<(String, usize), FilteredReadError> {
     let parameter_capacity = payload_kind_count.checked_add(3).ok_or_else(|| {
         FilteredReadError::Store(store_error(
@@ -28417,7 +28516,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v29 and reopen.
+    /// v23's run-head backfill remains untouched through v31 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -28433,7 +28532,14 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE workspace_unavailable_runs;
+            "DROP TRIGGER events_authority_inserted;
+             DROP TRIGGER events_authority_updated;
+             DROP TRIGGER events_authority_deleted;
+             DROP TRIGGER sessions_authority_advanced;
+             DROP TABLE event_authority_keys;
+             ALTER TABLE sessions DROP COLUMN journal_event_seq_high_water;
+             ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
+             DROP TABLE workspace_unavailable_runs;
              ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
              ALTER TABLE hook_dispatch_outbox DROP COLUMN run_id;
              DROP TABLE checkpoints;
@@ -28461,7 +28567,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 29);
+            assert_eq!(store.schema_version().expect("schema version"), 31);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

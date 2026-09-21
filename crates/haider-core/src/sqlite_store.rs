@@ -6,7 +6,7 @@
 
 use crate::{
     ArtifactReader, CommittedRange, ProviderViewAppendOutcome, ProviderViewAppendRequest,
-    ReducerPage, StoreHandle,
+    ReducerPage, ReducerPageCursor, StoreHandle,
 };
 use async_trait::async_trait;
 use haider_protocol::agent::ChildReport;
@@ -3012,7 +3012,7 @@ impl StoreHandle for SqliteStoreHandle {
     async fn read_reducer_page_with_boundary(
         &self,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
@@ -3023,7 +3023,7 @@ impl StoreHandle for SqliteStoreHandle {
             owner.with_store(|store| {
                 store.read_reducer_page_with_boundary(
                     &session_id,
-                    since_seq,
+                    cursor,
                     limit,
                     byte_budget,
                     payload_kinds,
@@ -3037,7 +3037,7 @@ impl StoreHandle for SqliteStoreHandle {
         &self,
         caller: haider_platform::phase_trace::StoreReadCaller,
         session_id: &SessionId,
-        since_seq: u64,
+        cursor: ReducerPageCursor,
         limit: usize,
         byte_budget: usize,
         payload_kinds: &'static [&'static str],
@@ -3049,7 +3049,7 @@ impl StoreHandle for SqliteStoreHandle {
                 store.read_reducer_page_with_boundary_for(
                     caller,
                     &session_id,
-                    since_seq,
+                    cursor,
                     limit,
                     byte_budget,
                     payload_kinds,

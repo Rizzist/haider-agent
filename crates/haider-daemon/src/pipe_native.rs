@@ -19,7 +19,7 @@
 //! pointers to prove the complete reachable set before sweeping that debris;
 //! an uncertain chain always leaves every file untouched.
 
-use haider_core::{SqliteStoreHandle, StoreHandle};
+use haider_core::{ReducerPageCursor, SqliteStoreHandle, StoreHandle};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::HaiderError;
 use haider_protocol::ids::SessionId;
@@ -60,6 +60,8 @@ const SIDECAR_MAGIC: &str = "haider.session.jsonl";
 // rows, and physical segments. V5 carries no new row shape at all — it exists
 // solely to REWRITE what v4 already wrote. V6 adds typed tool status and
 // rewrites older rows so rejected/conflicted outcomes stop looking successful.
+// V7 adds the journal mutation generation that authenticates the retained
+// prefix represented by every segment in the chain.
 //
 // v0.0.940 stopped marking reasoning-bearing rows `compat` (a row whose loss
 // costs data is not redundant), but a producer-side contract fix does not
@@ -72,7 +74,8 @@ const SIDECAR_MAGIC: &str = "haider.session.jsonl";
 // Every bump intentionally forces existing at-head files (including every
 // sealed segment) through a journal rebuild so old projections cannot remain
 // silently "current" at EOF.
-const SIDECAR_VERSION: u64 = 6;
+const SIDECAR_VERSION: u64 = 7;
+const MISSING_AUTHORITY_GENERATION: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarCursor {
@@ -83,6 +86,7 @@ struct SidecarCursor {
     pending_seq: u64,
     generation: u64,
     segment: u64,
+    authority_generation: u64,
 }
 
 struct ReconciledSidecar {
@@ -102,14 +106,17 @@ struct ReconciledSidecar {
 struct PipeJournalRevision {
     head_seq: u64,
     head_event_id: haider_protocol::ids::EventId,
+    mutation_generation: u64,
 }
 
-impl From<(u64, haider_protocol::ids::EventId)> for PipeJournalRevision {
-    fn from((head_seq, head_event_id): (u64, haider_protocol::ids::EventId)) -> Self {
-        Self {
+impl PipeJournalRevision {
+    fn observed(page: &haider_core::ReducerPage) -> Option<Self> {
+        let (head_seq, head_event_id) = page.observed_head.clone()?;
+        Some(Self {
             head_seq,
             head_event_id,
-        }
+            mutation_generation: page.observed_mutation_generation?,
+        })
     }
 }
 
@@ -127,6 +134,8 @@ pub(crate) struct PipeBootSession {
     base_path: PathBuf,
     read_cursor: u64,
     revision: Option<PipeJournalRevision>,
+    authority_generation: u64,
+    authority_valid: bool,
     mode: PipeBootMode,
 }
 
@@ -193,11 +202,14 @@ impl PipeBootSession {
         &mut self,
         through_seq: u64,
         boundary_event_id: &haider_protocol::ids::EventId,
+        mutation_generation: Option<u64>,
     ) {
+        self.authority_valid &= mutation_generation == Some(self.authority_generation);
         self.read_cursor = self.read_cursor.max(through_seq);
         self.revision = Some(PipeJournalRevision {
             head_seq: through_seq,
             head_event_id: boundary_event_id.clone(),
+            mutation_generation: self.authority_generation,
         });
     }
 
@@ -207,6 +219,7 @@ impl PipeBootSession {
             self.revision = Some(PipeJournalRevision {
                 head_seq: last.seq,
                 head_event_id: last.event_id.clone(),
+                mutation_generation: self.authority_generation,
             });
         }
         match &mut self.mode {
@@ -235,6 +248,7 @@ impl PipeBootSession {
                         &self.base_path,
                         &self.session_id,
                         durable_cursor.generation,
+                        durable_cursor.authority_generation,
                         *segment,
                         false,
                         sealed_root,
@@ -263,6 +277,7 @@ impl PipeBootSession {
                         &self.base_path,
                         &self.session_id,
                         *generation,
+                        self.authority_generation,
                         *segment,
                         true,
                         sealed_root,
@@ -277,6 +292,11 @@ impl PipeBootSession {
     }
 
     async fn finish(self) -> Result<ReconciledSidecar, PipeNativeError> {
+        if !self.authority_valid {
+            return Err(PipeNativeError::other(
+                "journal mutated while the native-pipe boot projection was rebuilding".into(),
+            ));
+        }
         let session_id = self.session_id;
         let base_path = self.base_path;
         let read_cursor = self.read_cursor;
@@ -301,6 +321,7 @@ impl PipeBootSession {
                         &base_path,
                         &session_id,
                         durable_cursor.generation,
+                        durable_cursor.authority_generation,
                         segment,
                         false,
                         &mut sealed_root,
@@ -319,6 +340,7 @@ impl PipeBootSession {
                         pending_seq: read_cursor,
                         generation: durable_cursor.generation,
                         segment,
+                        authority_generation: self.authority_generation,
                     },
                     revision,
                     projector,
@@ -345,6 +367,7 @@ impl PipeBootSession {
                         &base_path,
                         &session_id,
                         generation,
+                        self.authority_generation,
                         segment,
                         true,
                         &mut sealed_root,
@@ -377,6 +400,7 @@ impl PipeBootSession {
                         pending_seq: read_cursor,
                         generation,
                         segment,
+                        authority_generation: self.authority_generation,
                     },
                     revision,
                     projector,
@@ -394,10 +418,16 @@ struct SidecarHeader {
     version: u64,
     session_id: String,
     generation: u64,
+    #[serde(default = "missing_authority_generation")]
+    authority_generation: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     segment: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     starts_after: u64,
+}
+
+fn missing_authority_generation() -> u64 {
+    MISSING_AUTHORITY_GENERATION
 }
 
 /// A durable proof that all journal envelopes through `coverage` were
@@ -548,6 +578,28 @@ impl PipeNativeWriter {
             .map_err(|error| PipeNativeError::store("journal head inspection failed", error))
     }
 
+    async fn journal_authority(
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+        head_seq: u64,
+    ) -> Result<haider_core::ReducerPage, PipeNativeError> {
+        store
+            .read_reducer_page_with_boundary_for(
+                haider_platform::phase_trace::StoreReadCaller::NativePipe,
+                session_id,
+                if head_seq == 0 {
+                    ReducerPageCursor::after(0)
+                } else {
+                    ReducerPageCursor::fenced(head_seq, head_seq)
+                },
+                1,
+                1,
+                PIPE_PROJECTION_PAYLOAD_KINDS,
+            )
+            .await
+            .map_err(|error| PipeNativeError::store("journal authority inspection failed", error))
+    }
+
     /// Forgets an in-memory cursor after an asynchronous writer exits before
     /// draining its post-commit queue. The next touch must reconcile from the
     /// journal instead of advancing from a cursor that may have missed a batch.
@@ -570,10 +622,20 @@ impl PipeNativeWriter {
         let path = self.sidecar_path(session_id)?;
         let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
         let latest_seq = self.journal_head(store, session_id).await?;
+        let authority = Self::journal_authority(store, session_id, latest_seq).await?;
+        let latest_seq = authority
+            .observed_head
+            .as_ref()
+            .map_or(latest_seq, |(seq, _)| *seq);
+        let authority_generation = authority.observed_mutation_generation.ok_or_else(|| {
+            PipeNativeError::other("journal mutation generation is unavailable".into())
+        })?;
         let (retracted_nodes, retracted_seq) = retracted_prompt_nodes(store, session_id, 0).await?;
         match state {
             SidecarState::Ready(cursor)
-                if cursor.seq <= latest_seq && cursor.seq >= retracted_seq =>
+                if cursor.seq <= latest_seq
+                    && cursor.seq >= retracted_seq
+                    && cursor.authority_generation == authority_generation =>
             {
                 let prewarm_start = cursor.seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
                 let active_path = segment_path(&path, cursor.generation, cursor.segment)?;
@@ -583,6 +645,8 @@ impl PipeNativeWriter {
                     base_path: path,
                     read_cursor: prewarm_start,
                     revision: None,
+                    authority_generation,
+                    authority_valid: true,
                     mode: PipeBootMode::Reconcile {
                         durable_cursor: cursor,
                         prewarm_start,
@@ -602,12 +666,18 @@ impl PipeNativeWriter {
                     .ok_or_else(|| PipeNativeError::other("sidecar generation exhausted".into()))?;
                 let (mut file, temp_path) = create_temp(path.clone()).await?;
                 let temporary = RebuildTemporary::new(temp_path);
-                file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
+                file = write_temp(
+                    file,
+                    header_line(session_id, generation, authority_generation, 0, 0)?,
+                )
+                .await?;
                 Ok(PipeBootSession {
                     session_id: session_id.clone(),
                     base_path: path,
                     read_cursor: 0,
                     revision: None,
+                    authority_generation,
+                    authority_valid: true,
                     mode: PipeBootMode::Rebuild {
                         generation,
                         file: Some(file),
@@ -803,34 +873,50 @@ impl PipeNativeWriter {
                     }
                 }
             } else {
-                let (data, mut next_cursor) = render_hot_batch(
-                    committed,
-                    known_committed_head,
-                    state.cursor,
-                    &mut state.projector,
-                )?;
-                if !data.is_empty() {
-                    let mut sealed_root = None;
-                    let (file, segment) = write_segmented_open(
-                        state.file,
-                        data,
-                        &state.base_path,
-                        session_id,
-                        state.cursor.generation,
-                        state.cursor.segment,
-                        false,
-                        &mut sealed_root,
-                    )
-                    .await?;
-                    state.file = file;
-                    next_cursor.segment = segment;
+                let authority =
+                    Self::journal_authority(store, session_id, known_committed_head).await?;
+                let authority_is_current = authority.observed_mutation_generation
+                    == Some(state.cursor.authority_generation)
+                    && authority
+                        .observed_head
+                        .as_ref()
+                        .is_some_and(|(seq, _)| *seq >= known_committed_head);
+                if !authority_is_current {
+                    let generation = state.cursor.generation;
+                    drop(state);
+                    self.rebuild(store, session_id, path, generation).await?
+                } else {
+                    let (data, mut next_cursor) = render_hot_batch(
+                        committed,
+                        known_committed_head,
+                        state.cursor,
+                        &mut state.projector,
+                    )?;
+                    if !data.is_empty() {
+                        let mut sealed_root = None;
+                        let (file, segment) = write_segmented_open(
+                            state.file,
+                            data,
+                            &state.base_path,
+                            session_id,
+                            state.cursor.generation,
+                            state.cursor.authority_generation,
+                            state.cursor.segment,
+                            false,
+                            &mut sealed_root,
+                        )
+                        .await?;
+                        state.file = file;
+                        next_cursor.segment = segment;
+                    }
+                    state.cursor = next_cursor;
+                    state.revision = committed.last().map(|envelope| PipeJournalRevision {
+                        head_seq: envelope.seq,
+                        head_event_id: envelope.event_id.clone(),
+                        mutation_generation: state.cursor.authority_generation,
+                    });
+                    state
                 }
-                state.cursor = next_cursor;
-                state.revision = committed.last().map(|envelope| PipeJournalRevision {
-                    head_seq: envelope.seq,
-                    head_event_id: envelope.event_id.clone(),
-                });
-                state
             }
         } else {
             let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
@@ -870,9 +956,9 @@ impl PipeNativeWriter {
 
     /// Advances a verified in-memory projector from the journal suffix. The
     /// sidecar is derived output only: the transactionally sampled journal
-    /// boundary fences every reuse, and any rewind, same-sequence replacement,
-    /// retraction, or missing boundary discards the candidate and rebuilds
-    /// from durable authority.
+    /// generation and boundary fence every reuse. Any retained-prefix mutation,
+    /// rewind, retraction, or missing boundary discards the candidate and
+    /// rebuilds from durable authority.
     async fn reconcile_cached_suffix(
         &self,
         store: &SqliteStoreHandle,
@@ -899,7 +985,7 @@ impl PipeNativeWriter {
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
-                    read_cursor,
+                    ReducerPageCursor::fenced(read_cursor, expected.head_seq),
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
                     PIPE_PROJECTION_PAYLOAD_KINDS,
@@ -916,12 +1002,18 @@ impl PipeNativeWriter {
                     Ordering::Relaxed,
                 );
             }
-            let Some(observed) = page.observed_head.map(PipeJournalRevision::from) else {
+            let confirms_expected = page.confirms_fence(
+                expected.head_seq,
+                &expected.head_event_id,
+                expected.mutation_generation,
+            );
+            let Some(observed) = PipeJournalRevision::observed(&page) else {
                 let cursor = state.cursor;
                 drop(state);
                 return self.reconcile_from(store, session_id, path, cursor).await;
             };
-            let valid_boundary = observed.head_seq > expected.head_seq || observed == expected;
+            let valid_boundary = observed == expected
+                || (observed.head_seq > expected.head_seq && confirms_expected);
             let impossible_exact_page =
                 first_page && observed == expected && !page.envelopes.is_empty();
             if !valid_boundary || impossible_exact_page {
@@ -962,6 +1054,7 @@ impl PipeNativeWriter {
                         &state.base_path,
                         session_id,
                         state.cursor.generation,
+                        state.cursor.authority_generation,
                         state.cursor.segment,
                         false,
                         &mut sealed_root,
@@ -999,6 +1092,7 @@ impl PipeNativeWriter {
                     &state.base_path,
                     session_id,
                     state.cursor.generation,
+                    state.cursor.authority_generation,
                     state.cursor.segment,
                     false,
                     &mut sealed_root,
@@ -1024,6 +1118,13 @@ impl PipeNativeWriter {
         path: PathBuf,
         cursor: SidecarCursor,
     ) -> Result<ReconciledSidecar, PipeNativeError> {
+        let latest_seq = self.journal_head(store, session_id).await?;
+        let authority = Self::journal_authority(store, session_id, latest_seq).await?;
+        if authority.observed_mutation_generation != Some(cursor.authority_generation) {
+            return self
+                .rebuild(store, session_id, path, cursor.generation)
+                .await;
+        }
         if retracted_prompt_nodes(store, session_id, cursor.seq)
             .await?
             .1
@@ -1045,18 +1146,20 @@ impl PipeNativeWriter {
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
-                    read_cursor,
+                    ReducerPageCursor::after(read_cursor),
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
                     PIPE_PROJECTION_PAYLOAD_KINDS,
                 )
                 .await
                 .map_err(|error| PipeNativeError::store("journal reconciliation failed", error))?;
-            revision = page
-                .observed_head
-                .clone()
-                .map(PipeJournalRevision::from)
-                .or(revision);
+            if page.observed_mutation_generation != Some(cursor.authority_generation) {
+                drop(file);
+                return self
+                    .rebuild(store, session_id, path, cursor.generation)
+                    .await;
+            }
+            revision = PipeJournalRevision::observed(&page).or(revision);
             let Some(last) = page.envelopes.last() else {
                 if let Some((through_seq, _)) = page.observed_head {
                     read_cursor = read_cursor.max(through_seq);
@@ -1072,6 +1175,7 @@ impl PipeNativeWriter {
                     &path,
                     session_id,
                     cursor.generation,
+                    cursor.authority_generation,
                     segment,
                     false,
                     &mut sealed_root,
@@ -1087,6 +1191,7 @@ impl PipeNativeWriter {
                 &path,
                 session_id,
                 cursor.generation,
+                cursor.authority_generation,
                 segment,
                 false,
                 &mut sealed_root,
@@ -1122,11 +1227,20 @@ impl PipeNativeWriter {
         path: PathBuf,
         generation: u64,
     ) -> Result<ReconciledSidecar, PipeNativeError> {
+        let latest_seq = self.journal_head(store, session_id).await?;
+        let authority = Self::journal_authority(store, session_id, latest_seq).await?;
+        let authority_generation = authority.observed_mutation_generation.ok_or_else(|| {
+            PipeNativeError::other("journal mutation generation is unavailable".into())
+        })?;
         let (mut file, temp_path) = create_temp(path.clone()).await?;
         let generation = generation
             .checked_add(1)
             .ok_or_else(|| PipeNativeError::other("sidecar generation exhausted".into()))?;
-        file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
+        file = write_temp(
+            file,
+            header_line(session_id, generation, authority_generation, 0, 0)?,
+        )
+        .await?;
         let mut segment = 0;
         let mut sealed_root = None;
         let mut read_cursor = 0;
@@ -1138,18 +1252,19 @@ impl PipeNativeWriter {
                 .read_reducer_page_with_boundary_for(
                     haider_platform::phase_trace::StoreReadCaller::NativePipe,
                     session_id,
-                    read_cursor,
+                    ReducerPageCursor::after(read_cursor),
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
                     PIPE_PROJECTION_PAYLOAD_KINDS,
                 )
                 .await
                 .map_err(|error| PipeNativeError::store("journal rebuild failed", error))?;
-            revision = page
-                .observed_head
-                .clone()
-                .map(PipeJournalRevision::from)
-                .or(revision);
+            if page.observed_mutation_generation != Some(authority_generation) {
+                return Err(PipeNativeError::other(
+                    "journal mutated while the native-pipe projection was rebuilding".into(),
+                ));
+            }
+            revision = PipeJournalRevision::observed(&page).or(revision);
             let Some(last) = page.envelopes.last() else {
                 if let Some((through_seq, _)) = page.observed_head {
                     read_cursor = read_cursor.max(through_seq);
@@ -1164,6 +1279,7 @@ impl PipeNativeWriter {
                 &path,
                 session_id,
                 generation,
+                authority_generation,
                 segment,
                 true,
                 &mut sealed_root,
@@ -1176,6 +1292,7 @@ impl PipeNativeWriter {
             &path,
             session_id,
             generation,
+            authority_generation,
             segment,
             true,
             &mut sealed_root,
@@ -1203,6 +1320,7 @@ impl PipeNativeWriter {
                 pending_seq: read_cursor,
                 generation,
                 segment,
+                authority_generation,
             },
             revision,
             projector,
@@ -1363,6 +1481,7 @@ fn coverage_line(coverage: u64, generation: u64) -> Result<String, PipeNativeErr
 fn header_line(
     session_id: &SessionId,
     generation: u64,
+    authority_generation: u64,
     segment: u64,
     starts_after: u64,
 ) -> Result<String, PipeNativeError> {
@@ -1371,6 +1490,7 @@ fn header_line(
         version: SIDECAR_VERSION,
         session_id: session_id.as_str().to_owned(),
         generation,
+        authority_generation,
         segment,
         starts_after,
     })
@@ -1597,6 +1717,7 @@ fn reachable_sidecar_paths(
     let mut expected_segment = 0_u64;
     let mut expected_starts_after = 0_u64;
     let mut chain_generation = None;
+    let mut chain_authority_generation = None;
     loop {
         if !reachable.insert(current_path.clone()) {
             return Err(PipeNativeError::other(
@@ -1630,11 +1751,15 @@ fn reachable_sidecar_paths(
             ))
         })?;
         let generation = chain_generation.unwrap_or(header.generation);
+        let authority_generation =
+            chain_authority_generation.unwrap_or(header.authority_generation);
         if header.pipe != SIDECAR_MAGIC
             || header.version != SIDECAR_VERSION
             || header.session_id != session_id.as_str()
             || header.generation == 0
             || header.generation != generation
+            || header.authority_generation == MISSING_AUTHORITY_GENERATION
+            || header.authority_generation != authority_generation
             || header.segment != expected_segment
             || header.starts_after != expected_starts_after
         {
@@ -1644,6 +1769,7 @@ fn reachable_sidecar_paths(
             )));
         }
         chain_generation = Some(generation);
+        chain_authority_generation = Some(authority_generation);
 
         let body = lines
             .map(|line| {
@@ -1894,6 +2020,7 @@ async fn create_successor_segment(
     base_path: &Path,
     session_id: &SessionId,
     generation: u64,
+    authority_generation: u64,
     segment: u64,
     starts_after: u64,
 ) -> Result<(File, PathBuf), PipeNativeError> {
@@ -1901,7 +2028,13 @@ async fn create_successor_segment(
     let (mut file, temp_path) = create_temp(path.clone()).await?;
     file = write_temp(
         file,
-        header_line(session_id, generation, segment, starts_after)?,
+        header_line(
+            session_id,
+            generation,
+            authority_generation,
+            segment,
+            starts_after,
+        )?,
     )
     .await?;
     finish_temp(file, temp_path, path.clone()).await?;
@@ -1918,6 +2051,7 @@ async fn write_segmented_open(
     base_path: &Path,
     session_id: &SessionId,
     generation: u64,
+    authority_generation: u64,
     mut segment: u64,
     hold_root: bool,
     sealed_root: &mut Option<File>,
@@ -1937,6 +2071,7 @@ async fn write_segmented_open(
             base_path,
             session_id,
             generation,
+            authority_generation,
             successor_segment,
             boundary_seq,
         )
@@ -2097,6 +2232,7 @@ fn inspect_sidecar_blocking(
     let mut expected_segment = 0_u64;
     let mut expected_starts_after = 0_u64;
     let mut chain_generation = None;
+    let mut chain_authority_generation = None;
     loop {
         let mut file = match open_sidecar_for_inspection(&current_path) {
             Ok(file) => file,
@@ -2140,11 +2276,15 @@ fn inspect_sidecar_blocking(
             });
         };
         let generation = chain_generation.unwrap_or(header.generation);
+        let authority_generation =
+            chain_authority_generation.unwrap_or(header.authority_generation);
         if header.pipe != SIDECAR_MAGIC
             || header.version != SIDECAR_VERSION
             || header.session_id != session_id.as_str()
             || header.generation == 0
             || header.generation != generation
+            || header.authority_generation == MISSING_AUTHORITY_GENERATION
+            || header.authority_generation != authority_generation
             || header.segment != expected_segment
             || header.starts_after != expected_starts_after
         {
@@ -2153,12 +2293,14 @@ fn inspect_sidecar_blocking(
             });
         }
         chain_generation = Some(generation);
+        chain_authority_generation = Some(authority_generation);
         if len == header_len {
             return Ok(SidecarState::Ready(SidecarCursor {
                 seq: header.starts_after,
                 pending_seq: header.starts_after,
                 generation,
                 segment: header.segment,
+                authority_generation,
             }));
         }
 
@@ -2238,6 +2380,7 @@ fn inspect_sidecar_blocking(
             pending_seq: seq,
             generation,
             segment: expected_segment,
+            authority_generation,
         }));
     }
 }
@@ -2435,6 +2578,26 @@ mod tests {
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
         let writer = PipeNativeWriter::new(root.path());
         let session_id = SessionId::new("pipe-boot-orphan-sweep");
+        store
+            .create_session(haider_core::SessionCreateCommand {
+                command_id: "create-pipe-boot-orphan-sweep".into(),
+                request_digest: "create-pipe-boot-orphan-sweep-digest".into(),
+                request_json: r#"{"session":"pipe-boot-orphan-sweep"}"#.into(),
+                session_id: session_id.clone(),
+                cwd: root.path().to_string_lossy().into_owned(),
+                provider: "fake".into(),
+                model: "fake-model".into(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                effort: None,
+                fast: false,
+                cache_policy: Default::default(),
+                system_prompt_version: "pipe-native-test-v1".into(),
+                event_id: haider_protocol::ids::EventId::new("pipe-boot-orphan-sweep-created"),
+                device_id: haider_protocol::ids::DeviceId::new("pipe-boot-orphan-sweep-device"),
+            })
+            .await
+            .expect("create owned session");
         let base = writer.sidecar_path(&session_id).expect("sidecar path");
         std::fs::create_dir_all(base.parent().expect("pipe directory"))
             .expect("pipe directory creates");
@@ -2442,7 +2605,7 @@ mod tests {
             &base,
             format!(
                 "{}{}",
-                header_line(&session_id, 7, 0, 0).expect("root header serializes"),
+                header_line(&session_id, 7, 0, 0, 0).expect("root header serializes"),
                 coverage_line(0, 7).expect("root coverage serializes")
             ),
         )
@@ -2452,7 +2615,7 @@ mod tests {
             &orphan,
             format!(
                 "{}{}",
-                header_line(&session_id, 6, 1, 0).expect("orphan header serializes"),
+                header_line(&session_id, 6, 0, 1, 0).expect("orphan header serializes"),
                 coverage_line(0, 6).expect("orphan coverage serializes")
             ),
         )
@@ -2491,7 +2654,7 @@ mod tests {
             &base,
             format!(
                 "{}{}",
-                header_line(&session_id, 7, 0, 0).expect("root header serializes"),
+                header_line(&session_id, 7, 0, 0, 0).expect("root header serializes"),
                 coverage_line(0, 7).expect("root coverage serializes")
             ),
         )
@@ -2501,7 +2664,7 @@ mod tests {
             &candidate,
             format!(
                 "{}{}",
-                header_line(&session_id, 6, 1, 0).expect("candidate header serializes"),
+                header_line(&session_id, 6, 0, 1, 0).expect("candidate header serializes"),
                 coverage_line(0, 6).expect("candidate coverage serializes")
             ),
         )
@@ -2513,7 +2676,7 @@ mod tests {
 
         let foreign_contents = format!(
             "{}{}",
-            header_line(&foreign_session, 6, 1, 0).expect("foreign header serializes"),
+            header_line(&foreign_session, 6, 0, 1, 0).expect("foreign header serializes"),
             coverage_line(0, 6).expect("foreign coverage serializes")
         );
         std::fs::write(&candidate, &foreign_contents).expect("candidate replacement writes");
@@ -2537,7 +2700,8 @@ mod tests {
         let session_id = SessionId::new("pipe-torn-sweep");
         let base = root.path().join("pipe-torn-sweep.pipe");
         let reachable_successor = segment_path(&base, 7, 1).expect("successor path");
-        let mut root_segment = header_line(&session_id, 7, 0, 0).expect("root header serializes");
+        let mut root_segment =
+            header_line(&session_id, 7, 0, 0, 0).expect("root header serializes");
         root_segment.push_str("{\"kind\":\"compaction_boundary\",\"seq\":4}\n");
         root_segment.push_str(
             &segment_end_line(4, 7, &reachable_successor).expect("terminator serializes"),
@@ -2545,7 +2709,7 @@ mod tests {
         std::fs::write(&base, root_segment).expect("root fixture writes");
         std::fs::write(
             &reachable_successor,
-            header_line(&session_id, 7, 1, 4).expect("successor header serializes"),
+            header_line(&session_id, 7, 0, 1, 4).expect("successor header serializes"),
         )
         .expect("successor fixture writes");
         OpenOptions::new()
@@ -2559,7 +2723,7 @@ mod tests {
             &orphan,
             format!(
                 "{}{}",
-                header_line(&session_id, 6, 1, 0).expect("orphan header serializes"),
+                header_line(&session_id, 6, 0, 1, 0).expect("orphan header serializes"),
                 coverage_line(0, 6).expect("orphan coverage serializes")
             ),
         )

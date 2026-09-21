@@ -39,13 +39,39 @@ use tokio::sync::Mutex;
 mod prompt_history_cache_tests;
 
 const HISTORY_PAGE: usize = 256;
-const PROMPT_CACHE_SESSION_LIMIT: usize = 8;
+const PROMPT_CACHE_SESSION_LIMIT: usize = 16;
+const PROMPT_SUFFIX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Every outer journal kind read by prompt reconstruction.
+///
+/// This is an invalidation matrix, not a second schema. The journal remains
+/// authoritative and filtered reads fall back to the ordinary full decoder
+/// when an eligible row is malformed. Keep this list in lockstep with
+/// `JournalFacts::push`, `render_journal_with_facts`, `legacy_journal_only`,
+/// and `TreeProjection::push`.
+const PROMPT_PROJECTION_PAYLOAD_KINDS: &[&str] = &[
+    "branch_created",
+    "item",
+    "item_tool_call",
+    "menu_answered",
+    "menu_opened",
+    "node_committed",
+    "peer.message",
+    "process_signal_recorded",
+    "prompt_retracted",
+    "run_state",
+    "task_completed",
+    "task_started",
+    "tool_result",
+    "user_message",
+];
 /// Estimated retained heap across all prompt-cache sessions. In particular,
 /// `RawEnvelope` JSON value trees commonly retain about 3–4× their serialized
 /// body for short deltas; `envelope_weight_bytes` walks the actual owned IDs,
 /// arrays, objects, and strings instead of applying a wire-size multiplier.
-/// Durable journals remain authoritative; over-cap LRU entries keep only
-/// replay/checkpoint cursors and rebuild their bodies on the next touch.
+/// Durable journals remain authoritative. Over-cap LRU entries first retain a
+/// compiled terminal prefix plus its revision and node spine; if those derived
+/// bodies alone still exceed the cap, the entry falls back to a cursor shell
+/// and rebuilds from the journal on the next touch.
 const PROMPT_CACHE_RETAINED_BYTES_LIMIT: usize = 32 * 1024 * 1024;
 const PROMPT_CHECKPOINT_PROJECTION: &str = "prompt_history";
 const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
@@ -123,6 +149,9 @@ struct CachedPromptSession {
     bodies_evicted: bool,
     retained_envelope_bytes: usize,
     head_seq: u64,
+    revision: Option<PromptJournalRevision>,
+    mutation_generation: Option<u64>,
+    journal_prefix_compacted: bool,
     compaction_epochs: HashMap<PromptTimelineKey, u64>,
     envelopes: Vec<RawEnvelope>,
     projections: HashMap<PromptProjectionKey, CachedExactProjection>,
@@ -137,6 +166,21 @@ struct CachedPromptSession {
     saved_boundaries: HashMap<PromptTimelineKey, u64>,
     active_reply_arenas: HashMap<ReplyActiveKey, (u8, ReplyArenaWriter)>,
     completed_reply_arenas: HashMap<ReplyCompletedKey, (u64, ReplyText)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PromptJournalRevision {
+    head_seq: u64,
+    head_event_id: EventId,
+}
+
+impl From<(u64, EventId)> for PromptJournalRevision {
+    fn from((head_seq, head_event_id): (u64, EventId)) -> Self {
+        Self {
+            head_seq,
+            head_event_id,
+        }
+    }
 }
 
 type ReplyScope = (Option<RunId>, Option<BranchId>, Option<AgentId>);
@@ -983,6 +1027,59 @@ impl PromptHistoryCache {
         before.saturating_sub(cached.retained_heap_bytes())
     }
 
+    /// Resolves the latest selected tree node from the same transactionally
+    /// advanced projection used to compile provider history. `None` means the
+    /// caller must use the journal oracle because no usable resident revision
+    /// exists; `Some(None)` proves that the selected timeline is node-less.
+    pub async fn latest_tree_head(
+        &self,
+        store: &dyn StoreHandle,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+    ) -> Result<Option<Option<NodeId>>, HaiderError> {
+        let Some(mut cached) = self.sessions.lock().await.remove(session_id) else {
+            return Ok(None);
+        };
+        let timeline = PromptTimelineKey {
+            branch_id: branch_id.cloned(),
+            agent_id: agent_id.cloned(),
+        };
+        let resolved: Result<Option<Option<NodeId>>, HaiderError> =
+            async {
+                if cached.bodies_evicted
+                    || cached.revision.is_none()
+                    || cached
+                        .checkpoint_base
+                        .as_ref()
+                        .is_some_and(|base| base.timeline != timeline)
+                {
+                    return Ok(None);
+                }
+                if advance_cached_prompt_suffix(store, session_id, &timeline, &mut cached)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                if legacy_journal_only(&cached.envelopes, branch_id, agent_id) {
+                    return Ok(Some(None));
+                }
+                let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+                cached
+                    .tree_index
+                    .latest_ancestry(&cached.envelopes, &lineage, agent_id, lineage.head.as_ref())
+                    .map(|ancestry| {
+                        Some(ancestry.and_then(|ancestry| {
+                            ancestry.last().map(|entry| entry.node.node.clone())
+                        }))
+                    })
+            }
+            .await;
+        self.install(session_id.clone(), cached).await;
+        resolved
+    }
+
     /// Drops journal-reconstructible bodies and compiled cursor shells for one
     /// quiescent session. The daemon calls this only after proving the journal
     /// is still at the same idle head.
@@ -1005,7 +1102,6 @@ impl PromptHistoryCache {
         agent_id: Option<&AgentId>,
         current_run: &RunId,
     ) -> Result<CompiledPromptProjection, HaiderError> {
-        let head_seq = store.latest_seq(session_id).await?;
         let timeline = PromptTimelineKey {
             branch_id: branch_id.cloned(),
             agent_id: agent_id.cloned(),
@@ -1016,6 +1112,30 @@ impl PromptHistoryCache {
             .await
             .remove(session_id)
             .unwrap_or_default();
+        let transactionally_observed_head = if !cached.bodies_evicted && cached.revision.is_some() {
+            advance_cached_prompt_suffix(store, session_id, &timeline, &mut cached).await?
+        } else {
+            None
+        };
+        let mut cold_mutation_generation = None;
+        let head_seq = match transactionally_observed_head {
+            Some(head_seq) => head_seq,
+            None => {
+                let latest = store.latest_seq(session_id).await?;
+                let boundary = prompt_authority_probe(store, session_id, latest).await?;
+                cold_mutation_generation = boundary.observed_mutation_generation;
+                boundary
+                    .observed_head
+                    .as_ref()
+                    .map_or(latest, |(seq, _)| *seq)
+            }
+        };
+        if transactionally_observed_head.is_none()
+            && cached.revision.is_some()
+            && cached.mutation_generation.is_none()
+        {
+            cached = CachedPromptSession::default();
+        }
         if cached.head_seq > head_seq {
             cached = CachedPromptSession::default();
         } else if cached.bodies_evicted {
@@ -1055,6 +1175,10 @@ impl PromptHistoryCache {
                 agent_id: timeline.agent_id.clone(),
             };
             cached.head_seq = loaded.prefix.head_seq;
+            cached.revision = Some(PromptJournalRevision {
+                head_seq: loaded.prefix.head_seq,
+                head_event_id: loaded.boundary_event_id,
+            });
             cached
                 .compaction_epochs
                 .insert(timeline.clone(), loaded.compaction_epoch);
@@ -1071,7 +1195,7 @@ impl PromptHistoryCache {
 
         let previous_compaction_epochs = cached.compaction_epochs.clone();
         let mut cursor = cached.head_seq;
-        let mut compaction_after_checkpoint = false;
+        let mut invalidation_after_omitted_prefix = false;
         'read_suffix: while cursor < head_seq {
             let page = store
                 .read_for(
@@ -1098,8 +1222,8 @@ impl PromptHistoryCache {
                 let affects_checkpoint_timeline = envelope.branch_id == timeline.branch_id
                     && envelope.agent_id == timeline.agent_id;
                 if cached.push_envelope(envelope) {
-                    compaction_after_checkpoint |=
-                        cached.checkpoint_base.is_some() && affects_checkpoint_timeline;
+                    invalidation_after_omitted_prefix |=
+                        cached.has_omitted_journal_prefix() && affects_checkpoint_timeline;
                 }
             }
             if cached.envelopes.len() == before {
@@ -1113,7 +1237,7 @@ impl PromptHistoryCache {
         // A later compaction resets the model context again. The prior
         // checkpoint cannot derive the new overlay without its omitted tree;
         // replay once from zero, then install the newer boundary checkpoint.
-        if compaction_after_checkpoint || cached.checkpoint_node_collision {
+        if invalidation_after_omitted_prefix || cached.checkpoint_node_collision {
             cached = replay_cached_session(store, session_id, head_seq).await?;
         }
         if cached.head_seq < head_seq {
@@ -1141,6 +1265,30 @@ impl PromptHistoryCache {
                 });
             }
         }
+        if cached.mutation_generation.is_none()
+            && let Some(expected_generation) = cold_mutation_generation
+        {
+            let boundary = prompt_authority_probe(store, session_id, cached.head_seq).await?;
+            let confirms_revision = match cached.revision.as_ref() {
+                Some(revision) => boundary.confirms_fence(
+                    revision.head_seq,
+                    &revision.head_event_id,
+                    expected_generation,
+                ),
+                None => cached.head_seq == 0 && boundary.observed_head.is_none(),
+            };
+            if boundary.observed_mutation_generation == Some(expected_generation)
+                && confirms_revision
+            {
+                cached.mutation_generation = Some(expected_generation);
+            } else {
+                let replay_head = boundary
+                    .observed_head
+                    .as_ref()
+                    .map_or(cached.head_seq, |(seq, _)| *seq);
+                cached = replay_cached_session(store, session_id, replay_head).await?;
+            }
+        }
 
         let compaction_epoch = cached.compaction_epoch(&timeline);
         let scope = PromptProjectionScope {
@@ -1148,7 +1296,7 @@ impl PromptHistoryCache {
             branch_id: branch_id.cloned(),
             agent_id: agent_id.cloned(),
         };
-        if cached.checkpoint_base.is_some() && !cached.append_prefixes.contains_key(&scope) {
+        if cached.has_omitted_journal_prefix() && !cached.append_prefixes.contains_key(&scope) {
             // A decoded checkpoint that cannot enter the existing suffix
             // extension seam proves nothing; rebuild with the oracle.
             cached = replay_cached_session(store, session_id, head_seq).await?;
@@ -1204,7 +1352,7 @@ impl PromptHistoryCache {
             {
                 extended
             } else {
-                if cached.checkpoint_base.is_some() {
+                if cached.has_omitted_journal_prefix() {
                     cached = replay_cached_session(store, session_id, head_seq).await?;
                 }
                 compile_projection_from_cache(
@@ -1232,7 +1380,7 @@ impl PromptHistoryCache {
             )? {
                 extended
             } else {
-                if cached.checkpoint_base.is_some() {
+                if cached.has_omitted_journal_prefix() {
                     cached = replay_cached_session(store, session_id, head_seq).await?;
                 }
                 compile_projection_from_cache(
@@ -1352,16 +1500,12 @@ impl PromptHistoryCache {
             .saturating_add(1);
         cached.last_touched = last_touched;
         let mut sessions = self.sessions.lock().await;
-        if let Some(current) = sessions.get_mut(&session_id)
-            && current.head_seq > cached.head_seq
-        {
-            current.last_touched = last_touched;
-            return;
-        }
-        if sessions
-            .get(&session_id)
-            .is_none_or(|current| current.head_seq <= cached.head_seq)
-        {
+        let candidate_is_current = sessions.get(&session_id).is_none_or(|current| {
+            cached.mutation_generation > current.mutation_generation
+                || (cached.mutation_generation == current.mutation_generation
+                    && cached.head_seq >= current.head_seq)
+        });
+        if candidate_is_current {
             if !sessions.contains_key(&session_id)
                 && sessions.len() >= PROMPT_CACHE_SESSION_LIMIT
                 && let Some(evicted) = sessions
@@ -1372,6 +1516,24 @@ impl PromptHistoryCache {
                 sessions.remove(&evicted);
             }
             sessions.insert(session_id, cached);
+            while sessions
+                .values()
+                .map(CachedPromptSession::retained_heap_bytes)
+                .fold(0_usize, usize::saturating_add)
+                > PROMPT_CACHE_RETAINED_BYTES_LIMIT
+            {
+                let Some(compacted) = sessions
+                    .iter()
+                    .filter(|(_, entry)| !entry.bodies_evicted && !entry.journal_prefix_compacted)
+                    .min_by_key(|(_, entry)| entry.last_touched)
+                    .map(|(session_id, _)| session_id.clone())
+                else {
+                    break;
+                };
+                if let Some(entry) = sessions.get_mut(&compacted) {
+                    entry.compact_to_append_prefixes();
+                }
+            }
             while sessions
                 .values()
                 .map(CachedPromptSession::retained_heap_bytes)
@@ -1390,11 +1552,169 @@ impl PromptHistoryCache {
                     entry.evict_bodies();
                 }
             }
+        } else if let Some(current) = sessions.get_mut(&session_id) {
+            current.last_touched = last_touched;
         }
     }
 }
 
+/// Advances a resident compiled projection from one transactionally bounded
+/// prompt-relevant suffix. A revision mismatch, rewind, retraction, or an
+/// event that invalidates an omitted prefix discards the candidate and
+/// rebuilds from journal authority.
+async fn advance_cached_prompt_suffix(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    timeline: &PromptTimelineKey,
+    cached: &mut CachedPromptSession,
+) -> Result<Option<u64>, HaiderError> {
+    let Some(mut expected) = cached.revision.clone() else {
+        return Ok(None);
+    };
+    let Some(expected_mutation_generation) = cached.mutation_generation else {
+        return Ok(None);
+    };
+    if expected.head_seq != cached.head_seq {
+        return Ok(None);
+    }
+
+    let omitted_prefix = cached.has_omitted_journal_prefix();
+    let mut cursor = cached.head_seq;
+    let mut first_page = true;
+    let mut invalidates_omitted_prefix = false;
+    loop {
+        let page = store
+            .read_reducer_page_with_boundary_for(
+                haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+                session_id,
+                crate::ReducerPageCursor::fenced(cursor, expected.head_seq),
+                HISTORY_PAGE,
+                PROMPT_SUFFIX_PAGE_BYTES,
+                PROMPT_PROJECTION_PAYLOAD_KINDS,
+            )
+            .await?;
+        let confirms_expected = page.confirms_fence(
+            expected.head_seq,
+            &expected.head_event_id,
+            expected_mutation_generation,
+        );
+        let Some(observed_mutation_generation) = page.observed_mutation_generation else {
+            return Ok(None);
+        };
+        let Some(observed) = page.observed_head.map(PromptJournalRevision::from) else {
+            return Ok(None);
+        };
+        let valid_boundary = observed_mutation_generation == expected_mutation_generation
+            && (observed == expected
+                || (observed.head_seq > expected.head_seq && confirms_expected));
+        let impossible_exact_page =
+            first_page && observed == expected && !page.envelopes.is_empty();
+        if !valid_boundary || impossible_exact_page {
+            *cached = replay_cached_session(store, session_id, observed.head_seq).await?;
+            return Ok(Some(observed.head_seq));
+        }
+
+        for envelope in &page.envelopes {
+            if haider_protocol::retraction::PromptRetractedV1::from_payload_value(&envelope.payload)
+                .is_some_and(|fact| fact.prompt_seq <= cached.head_seq)
+            {
+                *cached = replay_cached_session(store, session_id, observed.head_seq).await?;
+                return Ok(Some(observed.head_seq));
+            }
+        }
+        if page.envelopes.is_empty() {
+            cached.flush_boundary_rows();
+            if omitted_prefix && invalidates_omitted_prefix {
+                *cached = replay_cached_session(store, session_id, observed.head_seq).await?;
+            } else {
+                cached.head_seq = observed.head_seq;
+                cached.revision = Some(observed.clone());
+                cached.mutation_generation = Some(observed_mutation_generation);
+            }
+            return Ok(Some(observed.head_seq));
+        }
+
+        let next_cursor = page
+            .envelopes
+            .last()
+            .map_or(cursor, |envelope| envelope.seq);
+        if next_cursor <= cursor || next_cursor > observed.head_seq {
+            return Err(corrupt("prompt suffix projection did not advance"));
+        }
+        for envelope in page.envelopes {
+            let changed_timeline = PromptTimelineKey {
+                branch_id: envelope.branch_id.clone(),
+                agent_id: envelope.agent_id.clone(),
+            };
+            let affects_checkpoint_timeline = changed_timeline == *timeline;
+            if cached.push_envelope(envelope) {
+                cached.append_prefixes.retain(|scope, _| {
+                    scope.branch_id != changed_timeline.branch_id
+                        || scope.agent_id != changed_timeline.agent_id
+                });
+                cached.projections.retain(|key, _| {
+                    key.branch_id != changed_timeline.branch_id
+                        || key.agent_id != changed_timeline.agent_id
+                });
+                invalidates_omitted_prefix |= affects_checkpoint_timeline;
+            }
+        }
+        cursor = next_cursor;
+        if cursor == observed.head_seq {
+            cached.flush_boundary_rows();
+            if omitted_prefix && invalidates_omitted_prefix {
+                *cached = replay_cached_session(store, session_id, observed.head_seq).await?;
+            } else {
+                cached.head_seq = observed.head_seq;
+                cached.revision = Some(observed.clone());
+                cached.mutation_generation = Some(observed_mutation_generation);
+            }
+            return Ok(Some(observed.head_seq));
+        }
+        expected = observed;
+        first_page = false;
+    }
+}
+
 async fn replay_cached_session(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    mut head_seq: u64,
+) -> Result<CachedPromptSession, HaiderError> {
+    loop {
+        let initial = prompt_authority_probe(store, session_id, head_seq).await?;
+        let Some(initial_generation) = initial.observed_mutation_generation else {
+            return replay_cached_session_without_authority(store, session_id, head_seq).await;
+        };
+        head_seq = initial
+            .observed_head
+            .as_ref()
+            .map_or(head_seq, |(seq, _)| *seq);
+        let mut cached =
+            replay_cached_session_without_authority(store, session_id, head_seq).await?;
+        let final_boundary = prompt_authority_probe(store, session_id, head_seq).await?;
+        let confirms_revision = match cached.revision.as_ref() {
+            Some(revision) => final_boundary.confirms_fence(
+                revision.head_seq,
+                &revision.head_event_id,
+                initial_generation,
+            ),
+            None => head_seq == 0 && final_boundary.observed_head.is_none(),
+        };
+        if final_boundary.observed_mutation_generation == Some(initial_generation)
+            && confirms_revision
+        {
+            cached.mutation_generation = Some(initial_generation);
+            return Ok(cached);
+        }
+        head_seq = final_boundary
+            .observed_head
+            .as_ref()
+            .map_or(head_seq, |(seq, _)| *seq);
+    }
+}
+
+async fn replay_cached_session_without_authority(
     store: &dyn StoreHandle,
     session_id: &SessionId,
     head_seq: u64,
@@ -1427,6 +1747,27 @@ async fn replay_cached_session(
     cached.flush_boundary_rows();
     cached.head_seq = head_seq;
     Ok(cached)
+}
+
+async fn prompt_authority_probe(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    head_seq: u64,
+) -> Result<crate::ReducerPage, HaiderError> {
+    store
+        .read_reducer_page_with_boundary_for(
+            haider_platform::phase_trace::StoreReadCaller::PromptHistory,
+            session_id,
+            if head_seq == 0 {
+                crate::ReducerPageCursor::after(0)
+            } else {
+                crate::ReducerPageCursor::fenced(head_seq, head_seq)
+            },
+            1,
+            1,
+            PROMPT_PROJECTION_PAYLOAD_KINDS,
+        )
+        .await
 }
 
 /// Rebinds independently decoded reply facts to one arena while any replay
@@ -1524,6 +1865,10 @@ fn canonicalize_reply_envelope(
 }
 
 impl CachedPromptSession {
+    fn has_omitted_journal_prefix(&self) -> bool {
+        self.checkpoint_base.is_some() || self.journal_prefix_compacted
+    }
+
     fn retained_envelope_allocation_bytes(&self) -> usize {
         if self.bodies_evicted {
             return 0;
@@ -1583,6 +1928,7 @@ impl CachedPromptSession {
         self.tree_index = TreeProjection::default();
         self.lineage_scopes.clear();
         self.checkpoint_base = None;
+        self.journal_prefix_compacted = false;
         self.checkpoint_node_collision = false;
         self.boundary_projector = TranscriptProjector::default();
         self.boundaries.clear();
@@ -1602,6 +1948,7 @@ impl CachedPromptSession {
             self.evict_bodies();
             return;
         };
+        self.journal_prefix_compacted = true;
 
         // Most exact projections name the completed run and cannot answer the
         // next run. Manual retry is the exception: a fresh run deliberately
@@ -1675,6 +2022,10 @@ impl CachedPromptSession {
     /// Returns whether the envelope starts a new compaction epoch.
     fn push_envelope(&mut self, mut envelope: RawEnvelope) -> bool {
         self.canonicalize_reply_envelope(&mut envelope);
+        let revision = PromptJournalRevision {
+            head_seq: envelope.seq,
+            head_event_id: envelope.event_id.clone(),
+        };
         self.retained_envelope_bytes = self
             .retained_envelope_bytes
             .saturating_add(envelope_weight_bytes(&envelope));
@@ -1741,6 +2092,7 @@ impl CachedPromptSession {
             .push(envelope_index, &envelope, payload.as_ref());
         let rows = self.boundary_projector.push(&envelope);
         self.envelopes.push(envelope);
+        self.revision = Some(revision);
         self.note_boundary_rows(rows);
         is_compaction || is_context_savings || is_retraction
     }
@@ -1873,6 +2225,7 @@ impl CachedPromptSession {
 
 struct LoadedPromptCheckpoint {
     compaction_epoch: u64,
+    boundary_event_id: EventId,
     prefix_node_ids: Vec<NodeId>,
     prefix_run_ids: Vec<RunId>,
     prefix: CachedCompiledPrefix,
@@ -2071,6 +2424,7 @@ async fn load_prompt_checkpoint(
     };
     Some(LoadedPromptCheckpoint {
         compaction_epoch: decoded.compaction_epoch,
+        boundary_event_id: decoded.boundary_event_id,
         prefix_node_ids,
         prefix_run_ids,
         prefix: CachedCompiledPrefix {
@@ -4907,7 +5261,7 @@ mod cache_bound_tests {
     }
 
     #[tokio::test]
-    async fn body_cap_retains_replay_cursors_while_dropping_lru_bodies() {
+    async fn body_cap_retains_the_compiled_terminal_projection() {
         let cache = PromptHistoryCache::default();
         let timeline = PromptTimelineKey {
             branch_id: None,
@@ -4964,19 +5318,14 @@ mod cache_bound_tests {
         let sessions = cache.sessions.lock().await;
         let cached = sessions
             .get(&SessionId::new("oversized-session"))
-            .expect("cursor shell remains resident");
-        assert!(cached.bodies_evicted);
-        assert_eq!(cached.retained_heap_bytes(), 0);
+            .expect("terminal projection remains resident");
+        assert!(!cached.bodies_evicted);
+        assert!(cached.journal_prefix_compacted);
+        assert!(cached.retained_heap_bytes() < PROMPT_CACHE_RETAINED_BYTES_LIMIT);
         assert_eq!(cached.head_seq, 42);
         assert_eq!(cached.compaction_epochs.get(&timeline), Some(&17));
         assert_eq!(cached.saved_boundaries.get(&timeline), Some(&31));
-        assert!(
-            cached.projections.is_empty(),
-            "body-cap eviction must release exact-key map capacity"
-        );
-        assert!(
-            cached.append_prefixes.is_empty(),
-            "body-cap eviction must release append-prefix map capacity"
-        );
+        assert_eq!(cached.projections.len(), 1);
+        assert_eq!(cached.append_prefixes.len(), 1);
     }
 }
