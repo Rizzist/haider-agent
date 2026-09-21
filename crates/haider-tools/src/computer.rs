@@ -10,12 +10,12 @@
 #[path = "computer/macos.rs"]
 mod macos;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, not(target_os = "android"))))]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 #[path = "computer/linux.rs"]
 mod linux;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, not(target_os = "android"))))]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 #[path = "computer/wayland.rs"]
 mod wayland;

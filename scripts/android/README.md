@@ -7,10 +7,20 @@ native task; no stub `.so`, skipped native task, or stale artifact is substitute
 ```sh
 source /Users/rizzist/Developer/haiderharness/env.sh
 /Users/rizzist/Developer/haiderharness/runtime/build-slot.sh android-rpc -- cargo test -p haider-rpc --locked
+/Users/rizzist/Developer/haiderharness/runtime/build-slot.sh android-all-targets -- \
+  cargo run --locked -p xtask -- android-standalone-check
 /Users/rizzist/Developer/haiderharness/runtime/build-slot.sh android-jvm -- gradle -p android :app:testPhoneDebugUnitTest :app:testPhoneReleaseUnitTest \
   :app:testEmulatorDebugUnitTest --no-daemon -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2
 python3 -m unittest discover -s scripts/android -p 'test_*.py'
 ```
+
+`android-standalone-check` cross-checks every test, bench and example target in
+`haider-webextract`, `haider-tools`, `haider-daemon`, `haider-core` and
+`haider-rpc` for arm64/API 26 with the standalone feature policy. Core and RPC
+are included explicitly because their Android test targets are reachable; a
+normal dependency build alone does not compile those test targets. The native
+Android workflow runs the same xtask target so desktop-only test dependencies
+cannot silently return.
 
 On the shared Mac, wrap every Cargo, Gradle and xtask invocation with the machine-wide
 `runtime/build-slot.sh <label> -- <command...>` helper. It owns admission, quiet markers,

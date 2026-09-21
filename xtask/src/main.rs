@@ -6,6 +6,8 @@
 //!   explicit target-qualified selection path.
 //! - `xtask race-catalog` — keeps named race/concurrency tests in the stress
 //!   catalog.
+//! - `xtask android-standalone-check` — cross-checks Android test and example
+//!   targets for the standalone runtime policy.
 //! - `xtask check`        — all repo guards.
 
 mod platform_goldens;
@@ -13,7 +15,7 @@ mod race_catalog;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 const LOC_SOFT_CAP: usize = 10_000;
 const BASELINE_FILE: &str = "test-baseline.txt";
@@ -25,6 +27,7 @@ fn main() -> ExitCode {
         Some("test-count") => test_count(args.iter().any(|a| a == "--update")),
         Some("platform-goldens") => platform_goldens::check(&workspace_root()),
         Some("race-catalog") => race_catalog::check(&workspace_root()),
+        Some("android-standalone-check") => android_standalone_check(),
         Some("check") => {
             let a = loc_lint();
             let b = test_count(false);
@@ -41,9 +44,58 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xtask <loc-lint|test-count [--update]|platform-goldens|race-catalog|check>"
+                "usage: xtask <loc-lint|test-count [--update]|platform-goldens|race-catalog|android-standalone-check|check>"
             );
             ExitCode::from(2)
+        }
+    }
+}
+
+fn android_standalone_check_args() -> Vec<&'static str> {
+    vec![
+        "ndk",
+        "-t",
+        "arm64-v8a",
+        "-P",
+        "26",
+        "check",
+        "-p",
+        "haider-webextract",
+        "-p",
+        "haider-tools",
+        "-p",
+        "haider-daemon",
+        "-p",
+        "haider-core",
+        "-p",
+        "haider-rpc",
+        "--no-default-features",
+        "--features",
+        "haider-daemon/android-standalone",
+        "--all-targets",
+        "--locked",
+    ]
+}
+
+fn android_standalone_check() -> ExitCode {
+    let args = android_standalone_check_args();
+    println!("android-standalone-check: cargo {}", args.join(" "));
+    match Command::new("cargo")
+        .args(args)
+        .current_dir(workspace_root())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            println!("android-standalone-check: PASS");
+            ExitCode::SUCCESS
+        }
+        Ok(status) => {
+            eprintln!("android-standalone-check: FAIL ({status})");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("android-standalone-check: could not start cargo-ndk: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -228,6 +280,36 @@ mod tests {
             found, 2,
             "inline #[test] and #[tokio::test] must count, and prose mentioning \
              a marker must not"
+        );
+    }
+
+    #[test]
+    fn android_standalone_check_covers_reachable_test_targets() {
+        assert_eq!(
+            android_standalone_check_args(),
+            [
+                "ndk",
+                "-t",
+                "arm64-v8a",
+                "-P",
+                "26",
+                "check",
+                "-p",
+                "haider-webextract",
+                "-p",
+                "haider-tools",
+                "-p",
+                "haider-daemon",
+                "-p",
+                "haider-core",
+                "-p",
+                "haider-rpc",
+                "--no-default-features",
+                "--features",
+                "haider-daemon/android-standalone",
+                "--all-targets",
+                "--locked",
+            ]
         );
     }
 }

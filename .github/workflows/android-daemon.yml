@@ -4,9 +4,9 @@ name: android-daemon
 on:
   push:
     branches: [main]
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/android/**', '.github/workflows/android-daemon.yml']
+    paths: ['crates/**', 'xtask/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/android/**', '.github/workflows/android-daemon.yml']
   pull_request:
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/android/**', '.github/workflows/android-daemon.yml']
+    paths: ['crates/**', 'xtask/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'scripts/android/**', '.github/workflows/android-daemon.yml']
   workflow_dispatch:
     inputs:
       legacy_termux:
@@ -43,6 +43,8 @@ jobs:
         run: |
           sdkmanager 'ndk;28.2.13676358'
           cargo install cargo-ndk --version 4.1.2 --locked
+      - name: standalone Android all-targets check
+        run: cargo run --locked -p xtask -- android-standalone-check
       - name: host Android policy, vault, lifecycle and RPC tests
         run: cargo test --locked -p haider-android -p haider-daemon -p haider-accounts -p haider-platform -p haider-rpc
       - name: compile and verify both native libraries

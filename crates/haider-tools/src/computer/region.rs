@@ -123,6 +123,9 @@ pub fn crop_screenshot_png(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "region_tests.rs"]
 mod tests;

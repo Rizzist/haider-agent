@@ -2726,7 +2726,12 @@ mod windows_monitor_command_tests {
 mod shell_command_tests {
     #![allow(clippy::expect_used)]
 
-    use super::{AdapterTranscript, OutputStream, shell_command};
+    #[cfg(any(
+        windows,
+        all(unix, not(all(target_os = "android", feature = "android-standalone")))
+    ))]
+    use super::shell_command;
+    use super::{AdapterTranscript, OutputStream};
 
     fn retained_with_chunks(input: &[u8], chunk_bytes: usize) -> Vec<u8> {
         let mut transcript = AdapterTranscript::default();
@@ -2756,7 +2761,7 @@ mod shell_command_tests {
         assert_eq!(different_pipe_partition, expected);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(all(target_os = "android", feature = "android-standalone"))))]
     #[test]
     fn unix_shell_command_prefers_zsh_with_sh_fallback_and_preserves_script_bytes() {
         let script = "printf ' exact bytes é\n'";
@@ -2785,7 +2790,7 @@ mod shell_command_tests {
     /// MUTATION CHECK: replace the configured-shell return with `"sh"`.
     /// Expected runtime failure: the first assertion receives `"sh"` instead
     /// of the executable Termux-style `$SHELL` path.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(all(target_os = "android", feature = "android-standalone"))))]
     #[test]
     fn unix_shell_resolution_falls_back_to_path_sh_when_bin_shells_are_absent() {
         let configured = std::path::PathBuf::from("/data/data/com.termux/files/usr/bin/bash");

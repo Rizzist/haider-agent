@@ -28,7 +28,7 @@ mod evidence_selection;
 #[cfg(test)]
 #[path = "cu1_image_runtime_tests.rs"]
 mod cu1_image_runtime_tests;
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 #[path = "cu2_computer_runtime_tests.rs"]
 mod cu2_computer_runtime_tests;
 #[cfg(test)]
@@ -13908,7 +13908,7 @@ mod manager_law_tests {
 
 pub(crate) struct BrokerToolFactory;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 pub(crate) struct InjectedComputerBrokerToolFactory {
     backend: Arc<dyn ComputerBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
@@ -13923,6 +13923,7 @@ pub(crate) struct InjectedMobileBrokerToolFactory {
 impl BrokerToolFactory {
     /// Test/integration seam for deterministic computer actions. Production
     /// continues to use the unit factory and the cfg-selected platform backend.
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn with_computer_backend(
         backend: Arc<dyn ComputerBackend>,
     ) -> InjectedComputerBrokerToolFactory {
@@ -13935,6 +13936,7 @@ impl BrokerToolFactory {
     /// Test seam that pins the production ordering: redact before CU-1 image
     /// admission, then reuse that exact admitted reference for provider context
     /// and daemon-authored convergence-graph evidence.
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn with_computer_backend_and_redaction(
         backend: Arc<dyn ComputerBackend>,
         screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
@@ -16181,7 +16183,7 @@ impl TurnToolFactory for BrokerToolFactory {
 }
 
 #[async_trait]
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 impl TurnToolFactory for InjectedComputerBrokerToolFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
         registered_provider_definitions().as_ref().to_vec()
