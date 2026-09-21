@@ -106,7 +106,7 @@ use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{BranchId, SessionId};
+use haider_protocol::ids::{AgentId, BranchId, NodeId, SessionId};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -318,6 +318,20 @@ pub trait StoreHandle: Send + Sync {
     }
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError>;
+
+    /// Returns a revision-checked tree head from a shared prompt projection.
+    ///
+    /// The outer option distinguishes stores without a shared projection from
+    /// a projection that proves the selected timeline has no tree head. The
+    /// actor falls back to the journal oracle only for the former.
+    async fn cached_prompt_tree_head(
+        &self,
+        _session_id: &SessionId,
+        _branch_id: Option<&BranchId>,
+        _agent_id: Option<&AgentId>,
+    ) -> Result<Option<Option<NodeId>>, HaiderError> {
+        Ok(None)
+    }
 
     /// Loads rebuildable projection state for one exact timeline. Stores that
     /// do not implement the optimization behave as an ordinary cache miss.

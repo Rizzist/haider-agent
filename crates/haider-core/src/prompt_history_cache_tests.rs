@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
-use crate::{MemoryStore, StoreHandle};
+use crate::{CommittedRange, MemoryStore, ReducerPage, StoreHandle};
 use async_trait::async_trait;
 use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{EventEnvelope, RenderTargets, SCHEMA_VERSION};
@@ -10,6 +10,8 @@ use haider_protocol::ids::{DeviceId, NodeId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
 use haider_protocol::verify::VerifyVerdict;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 struct NoArtifacts;
 
@@ -21,6 +23,146 @@ impl ArtifactReader for NoArtifacts {
             format!("unexpected artifact read for {artifact:?}"),
             false,
         ))
+    }
+}
+
+#[derive(Default)]
+struct RevisionStore {
+    envelopes: StdMutex<Vec<RawEnvelope>>,
+    full_reads: AtomicUsize,
+    suffix_reads: AtomicUsize,
+}
+
+impl RevisionStore {
+    fn reset_read_counts(&self) {
+        self.full_reads.store(0, AtomicOrdering::Relaxed);
+        self.suffix_reads.store(0, AtomicOrdering::Relaxed);
+    }
+
+    fn full_read_count(&self) -> usize {
+        self.full_reads.load(AtomicOrdering::Relaxed)
+    }
+
+    fn suffix_read_count(&self) -> usize {
+        self.suffix_reads.load(AtomicOrdering::Relaxed)
+    }
+
+    fn replace_head(&self, mut replacement: RawEnvelope) {
+        let mut envelopes = self.envelopes.lock().expect("revision journal");
+        let head = envelopes.last_mut().expect("revision head");
+        replacement.seq = head.seq;
+        replacement.committed_at_ms = head.committed_at_ms;
+        *head = replacement;
+    }
+
+    fn truncate(&self, through_seq: u64) {
+        self.envelopes
+            .lock()
+            .expect("revision journal")
+            .retain(|envelope| envelope.seq <= through_seq);
+    }
+}
+
+#[async_trait]
+impl StoreHandle for RevisionStore {
+    async fn append(&self, envelopes: &mut [RawEnvelope]) -> Result<CommittedRange, HaiderError> {
+        let mut stored = self.envelopes.lock().expect("revision journal");
+        let first_seq = u64::try_from(stored.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        for envelope in envelopes.iter_mut() {
+            envelope.seq = u64::try_from(stored.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            envelope.committed_at_ms = envelope.seq;
+            stored.push(envelope.clone());
+        }
+        Ok(CommittedRange {
+            first_seq: if envelopes.is_empty() { 0 } else { first_seq },
+            last_seq: envelopes.last().map_or(0, |envelope| envelope.seq),
+        })
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.full_reads.fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(self
+            .envelopes
+            .lock()
+            .expect("revision journal")
+            .iter()
+            .filter(|envelope| envelope.session_id == *session_id && envelope.seq > since_seq)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn read_reducer_page_with_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<ReducerPage, HaiderError> {
+        self.suffix_reads.fetch_add(1, AtomicOrdering::Relaxed);
+        let stored = self.envelopes.lock().expect("revision journal");
+        let observed_head = stored
+            .iter()
+            .rev()
+            .find(|envelope| envelope.session_id == *session_id)
+            .map(|envelope| (envelope.seq, envelope.event_id.clone()));
+        let mut spent = 0_usize;
+        let mut selected = Vec::new();
+        for envelope in stored.iter().filter(|envelope| {
+            envelope.session_id == *session_id
+                && envelope.seq > since_seq
+                && payload_kinds.contains(&crate::envelope_payload_kind(envelope))
+        }) {
+            let weight = envelope_weight_bytes(envelope);
+            if !selected.is_empty() && spent.saturating_add(weight) > byte_budget {
+                break;
+            }
+            spent = spent.saturating_add(weight);
+            selected.push(envelope.clone());
+            if selected.len() >= limit || spent >= byte_budget {
+                break;
+            }
+        }
+        Ok(ReducerPage {
+            envelopes: selected,
+            observed_head,
+        })
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        Ok(self
+            .envelopes
+            .lock()
+            .expect("revision journal")
+            .iter()
+            .rev()
+            .find(|envelope| envelope.session_id == *session_id)
+            .map_or(0, |envelope| envelope.seq))
+    }
+
+    async fn branch_lineage(
+        &self,
+        _session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+        if branch_id.is_some() {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "revision fixture has no named branches",
+                false,
+            ));
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -55,11 +197,323 @@ fn pressure_envelope(session_id: &SessionId, ordinal: u64) -> RawEnvelope {
     }
 }
 
-/// MUTATION CHECK: restore serialized-journal accounting or replace
-/// `Vec::new()` with `clear()`. The retained estimate crosses the cap while
-/// the serialized body does not, and the body-owning capacity must be gone.
+fn visible_user(session_id: &SessionId, run_id: &RunId, event_id: &str, text: &str) -> RawEnvelope {
+    let mut envelope = pressure_envelope(session_id, 0);
+    envelope.event_id = EventId::new(event_id);
+    envelope.run_id = Some(run_id.clone());
+    envelope.render.prompt = PromptRender::Verbatim;
+    envelope.payload = serde_json::to_value(EventPayload::UserMessage {
+        text: text.into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+    })
+    .expect("user payload")
+    .into();
+    envelope
+}
+
 #[tokio::test]
-async fn retained_value_trees_evict_and_the_next_hit_recompiles() {
+async fn terminal_projection_skips_irrelevant_rows_and_decodes_only_the_suffix() {
+    let store = RevisionStore::default();
+    let session = SessionId::new("prompt-terminal-suffix");
+    let run = RunId::new("prompt-terminal-suffix-run");
+    let mut initial = [visible_user(&session, &run, "terminal-user-1", "first")];
+    store.append(&mut initial).await.expect("append first user");
+
+    let cache = PromptHistoryCache::default();
+    let first = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("compile initial projection");
+    cache.compact_session_history(&session).await;
+    store.reset_read_counts();
+
+    let mut irrelevant = [pressure_envelope(&session, 10)];
+    store
+        .append(&mut irrelevant)
+        .await
+        .expect("append irrelevant durable row");
+    let unchanged = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("advance across irrelevant row");
+    assert_eq!(unchanged, first);
+    assert_eq!(store.full_read_count(), 0);
+    assert!(store.suffix_read_count() > 0);
+
+    store.reset_read_counts();
+    let mut suffix = [visible_user(&session, &run, "terminal-user-2", "second")];
+    store
+        .append(&mut suffix)
+        .await
+        .expect("append visible suffix");
+    let extended = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("extend terminal projection");
+    assert_eq!(store.full_read_count(), 0, "suffix path must stay bounded");
+    assert_eq!(
+        extended.messages,
+        vec![Message::user_text("first"), Message::user_text("second")]
+    );
+}
+
+#[tokio::test]
+async fn same_sequence_replacement_and_truncation_rebuild_from_journal_authority() {
+    let store = RevisionStore::default();
+    let session = SessionId::new("prompt-terminal-revision");
+    let run = RunId::new("prompt-terminal-revision-run");
+    let mut initial = [visible_user(&session, &run, "revision-user-1", "first")];
+    store
+        .append(&mut initial)
+        .await
+        .expect("append initial head");
+    let cache = PromptHistoryCache::default();
+    cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("prime revision cache");
+    cache.compact_session_history(&session).await;
+
+    store.reset_read_counts();
+    store.replace_head(visible_user(
+        &session,
+        &run,
+        "revision-user-replaced",
+        "replacement",
+    ));
+    let replaced = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("replacement rebuild");
+    assert_eq!(replaced.messages, vec![Message::user_text("replacement")]);
+    assert!(
+        store.full_read_count() > 0,
+        "same-sequence event-id replacement must discard the terminal projection"
+    );
+
+    let mut appended = [visible_user(
+        &session,
+        &run,
+        "revision-user-appended",
+        "later",
+    )];
+    store
+        .append(&mut appended)
+        .await
+        .expect("append later user");
+    cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("cache later head");
+    cache.compact_session_history(&session).await;
+    store.reset_read_counts();
+    store.truncate(1);
+    let truncated = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &run,
+        )
+        .await
+        .expect("truncation rebuild");
+    assert_eq!(truncated.messages, vec![Message::user_text("replacement")]);
+    assert!(
+        store.full_read_count() > 0,
+        "journal rewind must discard the terminal projection"
+    );
+}
+
+#[tokio::test]
+async fn compacted_retraction_and_context_corruption_match_the_full_oracle() {
+    use haider_protocol::retraction::PromptRetractedV1;
+
+    let store = RevisionStore::default();
+    let session = SessionId::new("prompt-terminal-invalidation");
+    let first_run = RunId::new("prompt-terminal-invalidation-first");
+    let next_run = RunId::new("prompt-terminal-invalidation-next");
+    let mut initial = [visible_user(
+        &session,
+        &first_run,
+        "invalidation-first-user",
+        "draft",
+    )];
+    store.append(&mut initial).await.expect("append draft");
+    let cache = PromptHistoryCache::default();
+    cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &first_run,
+        )
+        .await
+        .expect("prime invalidation cache");
+    cache.compact_session_history(&session).await;
+    store.reset_read_counts();
+
+    let mut retraction = pressure_envelope(&session, 20);
+    retraction.event_id = EventId::new("invalidation-retraction");
+    retraction.run_id = Some(first_run.clone());
+    retraction.payload = PromptRetractedV1 {
+        prompt_seq: initial[0].seq,
+        prompt_node_id: NodeId::new("invalidation-draft-node"),
+        text: "draft".into(),
+        attachments: Vec::new(),
+    }
+    .to_payload_value()
+    .expect("retraction payload")
+    .into();
+    let mut terminal = pressure_envelope(&session, 21);
+    terminal.event_id = EventId::new("invalidation-terminal");
+    terminal.run_id = Some(first_run);
+    terminal.payload = serde_json::to_value(EventPayload::RunState(RunState::Cancelled))
+        .expect("terminal payload")
+        .into();
+    let replacement = visible_user(
+        &session,
+        &next_run,
+        "invalidation-replacement-user",
+        "replacement",
+    );
+    store
+        .append(&mut [retraction, terminal, replacement])
+        .await
+        .expect("append retraction replacement");
+    let projected = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &next_run,
+        )
+        .await
+        .expect("retraction rebuild");
+    assert_eq!(projected.messages, vec![Message::user_text("replacement")]);
+    assert!(store.full_read_count() > 0);
+
+    cache.compact_session_history(&session).await;
+    store.reset_read_counts();
+    let mut malformed = pressure_envelope(&session, 22);
+    malformed.event_id = EventId::new("invalidation-malformed-context");
+    malformed.run_id = Some(next_run.clone());
+    malformed.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("invalidation-malformed-context-item"),
+        item: TurnItem::Extension {
+            kind: CONTEXT_SAVINGS_EXTENSION_KIND.into(),
+            data: serde_json::json!({"operation_count": "not-a-number"}),
+        },
+    }))
+    .expect("malformed context payload")
+    .into();
+    store
+        .append(std::slice::from_mut(&mut malformed))
+        .await
+        .expect("append malformed context event");
+    let cached_error = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &next_run,
+        )
+        .await
+        .expect_err("cached malformed context must fail closed");
+    let fresh_error = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &NoArtifacts,
+        &session,
+        None,
+        None,
+        &next_run,
+    )
+    .await
+    .expect_err("fresh malformed context must fail closed");
+    assert_eq!(cached_error.code, fresh_error.code);
+    assert_eq!(cached_error.message, fresh_error.message);
+    assert!(store.full_read_count() > 0);
+}
+
+#[test]
+fn prompt_suffix_kind_matrix_covers_every_compiler_input_family() {
+    assert_eq!(
+        PROMPT_PROJECTION_PAYLOAD_KINDS,
+        [
+            "branch_created",
+            "item",
+            "item_tool_call",
+            "menu_answered",
+            "menu_opened",
+            "node_committed",
+            "peer.message",
+            "process_signal_recorded",
+            "prompt_retracted",
+            "run_state",
+            "task_completed",
+            "task_started",
+            "tool_result",
+            "user_message",
+        ]
+    );
+}
+
+/// MUTATION CHECK: restore serialized-journal accounting or evict the compiled
+/// terminal prefix with the decoded bodies. The retained estimate crosses the
+/// cap while the serialized body does not; the large value trees must leave
+/// without forcing the next hit to decode them again.
+#[tokio::test]
+async fn retained_value_trees_compact_to_the_terminal_projection() {
     const ENVELOPE_COUNT: u64 = 225;
 
     let store = MemoryStore::new();
@@ -112,11 +566,14 @@ async fn retained_value_trees_evict_and_the_next_hit_recompiles() {
     assert_eq!(first.messages, expected);
     {
         let sessions = cache.sessions.lock().await;
-        let cached = sessions.get(&session_id).expect("cursor shell retained");
-        assert!(cached.bodies_evicted);
+        let cached = sessions
+            .get(&session_id)
+            .expect("terminal projection retained");
+        assert!(!cached.bodies_evicted);
+        assert!(cached.journal_prefix_compacted);
         assert_eq!(cached.envelopes.capacity(), 0);
-        assert!(cached.append_prefixes.is_empty());
-        assert!(cached.projections.is_empty());
+        assert_eq!(cached.append_prefixes.len(), 1);
+        assert_eq!(cached.projections.len(), 1);
     }
 
     let recompiled = cache
@@ -129,7 +586,7 @@ async fn retained_value_trees_evict_and_the_next_hit_recompiles() {
             &current_run,
         )
         .await
-        .expect("evicted hit recompiles");
+        .expect("compacted hit reuses the terminal projection");
     assert_eq!(recompiled.messages, expected);
 }
 
@@ -433,6 +890,116 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
             matches!(block, Block::Text { text } if text == "answer retained through suffix extension")
         })
     }));
+}
+
+/// MUTATION CHECK: bypassing the resident prompt projection here restores one
+/// complete journal replay per actor, even though provider prompt compilation
+/// itself advances only the filtered suffix.
+#[tokio::test]
+async fn cached_tree_head_uses_the_revision_checked_terminal_projection() {
+    let store = RevisionStore::default();
+    let session = SessionId::new("prompt-cached-tree-head");
+    let first_run = RunId::new("prompt-cached-tree-head-first");
+    let next_run = RunId::new("prompt-cached-tree-head-next");
+    let first_node_id = NodeId::new("prompt-cached-tree-head-first-node");
+    let answer_node_id = NodeId::new("prompt-cached-tree-head-answer-node");
+    let next_node_id = NodeId::new("prompt-cached-tree-head-next-node");
+
+    let mut first_node = pressure_envelope(&session, 2);
+    first_node.run_id = Some(first_run.clone());
+    *first_node.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+        node: first_node_id.clone(),
+        parent: None,
+        kind: NodeKind::UserTurn {
+            text: "first turn".into(),
+            attachments: Vec::new(),
+        },
+    }))
+    .expect("first node");
+    store
+        .append(&mut [
+            visible_user(
+                &session,
+                &first_run,
+                "prompt-cached-tree-head-user",
+                "first turn",
+            ),
+            first_node,
+        ])
+        .await
+        .expect("append initial tree");
+
+    let cache = PromptHistoryCache::default();
+    cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session,
+            None,
+            None,
+            &first_run,
+        )
+        .await
+        .expect("compile terminal projection");
+    cache.compact_session_history(&session).await;
+
+    let mut answer_node = pressure_envelope(&session, 3);
+    answer_node.run_id = Some(first_run.clone());
+    *answer_node.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+        node: answer_node_id.clone(),
+        parent: Some(first_node_id),
+        kind: NodeKind::AssistantCommit {
+            text: "first answer".into(),
+            verdict: VerifyVerdict::NotApplicable,
+        },
+    }))
+    .expect("answer node");
+    let mut terminal = pressure_envelope(&session, 4);
+    terminal.run_id = Some(first_run);
+    *terminal.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("terminal state");
+    let mut next_node = pressure_envelope(&session, 6);
+    next_node.run_id = Some(next_run.clone());
+    *next_node.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+        node: next_node_id.clone(),
+        parent: Some(answer_node_id),
+        kind: NodeKind::UserTurn {
+            text: "next turn".into(),
+            attachments: Vec::new(),
+        },
+    }))
+    .expect("next node");
+    store
+        .append(&mut [
+            answer_node,
+            terminal,
+            visible_user(
+                &session,
+                &next_run,
+                "prompt-cached-tree-head-next-user",
+                "next turn",
+            ),
+            next_node,
+        ])
+        .await
+        .expect("append tree suffix");
+    store.reset_read_counts();
+
+    let cached = cache
+        .latest_tree_head(&store, &session, None, None)
+        .await
+        .expect("resolve cached tree head");
+    assert_eq!(cached, Some(Some(next_node_id.clone())));
+    assert_eq!(store.full_read_count(), 0, "cache path must not replay");
+    assert!(
+        store.suffix_read_count() > 0,
+        "cache path must verify revision"
+    );
+
+    let oracle = PromptHistoryCompiler::latest_head(&store, &session, None, None)
+        .await
+        .expect("journal tree-head oracle");
+    assert_eq!(cached.flatten(), oracle);
 }
 
 /// MUTATION: omit the retraction fact index or preserve a pre-retraction

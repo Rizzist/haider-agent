@@ -11654,13 +11654,26 @@ impl HarnessActor {
 
     async fn tree_parent(&mut self) -> Result<Option<NodeId>, HaiderError> {
         if !self.tree_head_initialized {
-            self.tree_head = PromptHistoryCompiler::latest_head(
-                self.store.as_ref(),
-                &self.config.session_id,
-                self.config.branch_id.as_ref(),
-                self.config.agent_id.as_ref(),
-            )
-            .await?;
+            self.tree_head = match self
+                .store
+                .cached_prompt_tree_head(
+                    &self.config.session_id,
+                    self.config.branch_id.as_ref(),
+                    self.config.agent_id.as_ref(),
+                )
+                .await?
+            {
+                Some(head) => head,
+                None => {
+                    PromptHistoryCompiler::latest_head(
+                        self.store.as_ref(),
+                        &self.config.session_id,
+                        self.config.branch_id.as_ref(),
+                        self.config.agent_id.as_ref(),
+                    )
+                    .await?
+                }
+            };
             self.tree_head_initialized = true;
         }
         Ok(self.tree_head.clone())

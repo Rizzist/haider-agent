@@ -2359,7 +2359,13 @@ impl SessionHub {
             return;
         }
 
-        let prompt_bytes = inner.prompt_history.evict_session_bodies(session_id).await;
+        // The terminal compiled prompt is the bounded warm-start state for the
+        // next turn. Release decoded journal bodies while retaining that
+        // projection; close/delete paths still evict the session outright.
+        let prompt_bytes = inner
+            .prompt_history
+            .compact_session_history(session_id)
+            .await;
         let turn_setup_entries = inner.turn_setup_reductions.remove_session(session_id).await;
         let observe_bytes = inner
             .observe_digests
@@ -8042,6 +8048,20 @@ impl StoreHandle for HubStoreHandle {
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.ensure_session(session_id)?;
         self.hub.inner.store.latest_seq(session_id).await
+    }
+
+    async fn cached_prompt_tree_head(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&haider_protocol::ids::AgentId>,
+    ) -> Result<Option<Option<haider_protocol::ids::NodeId>>, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .prompt_history
+            .latest_tree_head(self, session_id, branch_id, agent_id)
+            .await
     }
 
     async fn projection_checkpoint(
