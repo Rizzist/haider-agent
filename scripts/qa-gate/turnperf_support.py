@@ -355,6 +355,198 @@ def _tool_response(model: str, body: Mapping[str, Any], effect_token: str) -> li
     ]
 
 
+def _function_response(
+    model: str, name: str, arguments: Mapping[str, Any], call_id: str
+) -> list[bytes]:
+    call = {
+        "index": 0,
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments, separators=(",", ":")),
+        },
+    }
+    return [
+        chat_chunk(model, {"role": "assistant"}),
+        chat_chunk(model, {"tool_calls": [call]}),
+        chat_chunk(model, {}, "tool_calls"),
+        b"data: [DONE]\n\n",
+    ]
+
+
+def _orchestration_value_type(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"kind": "null"}
+    if isinstance(value, bool):
+        return {"kind": "bool"}
+    if isinstance(value, int):
+        return {"kind": "i64", "min": value, "max": value}
+    if isinstance(value, str):
+        return {"kind": "string", "max_bytes": max(1, len(value.encode("utf-8")))}
+    if isinstance(value, list):
+        if not value:
+            raise ProofError("orchestration fixture does not encode an empty untyped list")
+        item = _orchestration_value_type(value[0])
+        if any(_orchestration_value_type(member) != item for member in value[1:]):
+            raise ProofError("orchestration fixture list is not homogeneous")
+        return {"kind": "list", "item": item, "max_items": len(value)}
+    if isinstance(value, Mapping):
+        return {
+            "kind": "record",
+            "fields": {
+                str(key): _orchestration_value_type(member)
+                for key, member in sorted(value.items())
+            },
+        }
+    raise ProofError(f"orchestration fixture cannot type {type(value).__name__}")
+
+
+def _orchestration_script(body: Mapping[str, Any], effect_token: str) -> dict[str, Any]:
+    specifications = _tool_specifications(body)
+    script = next(
+        (spec for spec in specifications if spec.get("name") == "tool_script"), None
+    )
+    if script is None:
+        raise ProofError("discovery did not advertise tool_script")
+    schema = script.get("parameters")
+    if not isinstance(schema, Mapping):
+        schema = script.get("input_schema")
+    if not isinstance(schema, Mapping):
+        raise ProofError("tool_script schema is unavailable")
+    properties = schema.get("properties")
+    extension = schema.get("x-haider-orchestration")
+    if not isinstance(properties, Mapping) or not isinstance(extension, Mapping):
+        raise ProofError("tool_script schema omits its frozen orchestration extension")
+    catalog = properties.get("catalog_digest")
+    catalog_digest = catalog.get("const") if isinstance(catalog, Mapping) else None
+    wrappers = extension.get("wrappers")
+    wrapper_values = wrappers if isinstance(wrappers, list) else []
+    wrapper = next(
+        (
+            value
+            for value in wrapper_values
+            if isinstance(value, Mapping) and value.get("tool") == "process_exec"
+        ),
+        None,
+    )
+    if not isinstance(catalog_digest, str) or not isinstance(wrapper, Mapping):
+        raise ProofError("tool_script catalog does not expose process_exec")
+    wrapper_digest = wrapper.get("wrapper_digest")
+    if not isinstance(wrapper_digest, str):
+        raise ProofError("process_exec wrapper digest is unavailable")
+    tool, arguments = _select_exec_tool(body, effect_token)
+    if tool != "process_exec":
+        raise ProofError(f"orchestration fixture selected unexpected tool {tool!r}")
+    tool_config = {
+        "tool": tool,
+        "wrapper_digest": wrapper_digest,
+        "region": [],
+    }
+    nodes = [
+        {
+            "slot": 0,
+            "evidence_type": "OrchValueV1",
+            "config": {
+                "operator": "literal",
+                "type": _orchestration_value_type(arguments),
+                "operand_config": {"value": arguments},
+                "region": [],
+            },
+            "ports": [],
+        },
+        {
+            "slot": 1,
+            "evidence_type": "OrchArgumentV1",
+            "config": tool_config,
+            "ports": [
+                {"role": "data", "port": "args", "source_slot": 0, "output": "value"}
+            ],
+        },
+        {
+            "slot": 2,
+            "evidence_type": "OrchRetryPolicyV1",
+            "config": {"max_attempts": 1},
+            "ports": [],
+        },
+        {
+            "slot": 3,
+            "evidence_type": "OrchAskPauseV1",
+            "config": {
+                "tool": tool,
+                "wrapper_digest": wrapper_digest,
+                "owner_call_slot": 4,
+                "wait_ms": 120000,
+                "region": [],
+            },
+            "ports": [
+                {"role": "data", "port": "args", "source_slot": 1, "output": "value"}
+            ],
+        },
+        {
+            "slot": 4,
+            "evidence_type": "OrchCallV1",
+            "config": tool_config,
+            "ports": [
+                {"role": "data", "port": "args", "source_slot": 1, "output": "value"},
+                {"role": "control", "port": "permit", "source_slot": 3, "output": "permit"},
+                {"role": "config", "port": "retry", "source_slot": 2, "output": "policy"},
+            ],
+        },
+        {
+            "slot": 5,
+            "evidence_type": "OrchAwaitV1",
+            "config": {"on_error": "stop", "region": []},
+            "ports": [
+                {
+                    "role": "data",
+                    "port": "operation",
+                    "source_slot": 4,
+                    "output": "operation",
+                }
+            ],
+        },
+        {
+            "slot": 6,
+            "evidence_type": "OrchExitV1",
+            "config": {"mode": "return", "region": []},
+            "ports": [
+                {"role": "data", "port": "value", "source_slot": 5, "output": "value"}
+            ],
+        },
+    ]
+    return {
+        "version": 1,
+        "transport": "instruct-pipe-dag-v1",
+        "catalog_digest": catalog_digest,
+        "graph": {
+            "kind": "inline",
+            "parameters": [],
+            "nodes": nodes,
+            "exits": [6],
+            "read_groups": [],
+        },
+        "inputs": [],
+    }
+
+
+def _orchestration_response(
+    model: str, body: Mapping[str, Any], effect_token: str, request_number: int
+) -> list[bytes]:
+    if request_number == 1:
+        return _function_response(
+            model, "list_tools", {"filter": "tool_script"}, "orch-discover-1"
+        )
+    if request_number == 2:
+        return _function_response(
+            model,
+            "tool_script",
+            _orchestration_script(body, effect_token),
+            "orch-script-1",
+        )
+    return _text_response(model)
+
+
 class ProxyState:
     """Case-resettable provider state with a proxy-owned immutable ledger."""
 
@@ -371,7 +563,7 @@ class ProxyState:
         self._gate_released = False
 
     def begin_case(self, shape: str, gate: tuple[int, str] | None = None) -> int:
-        if shape not in ("single", "tool"):
+        if shape not in ("single", "tool", "orchestration"):
             raise ProofError(f"unknown provider shape {shape!r}")
         with self._condition:
             if self._active_handlers != 0:
@@ -506,11 +698,17 @@ class _Handler(BaseHTTPRequestHandler):
                 raw,
             )
             self.state.gate(request_number, "after_post")
-            chunks = (
-                _tool_response(MODEL_ID, body, f"turnperf-effect-{case_id}")
-                if shape == "tool" and request_number == 1
-                else _text_response(MODEL_ID)
-            )
+            if shape == "tool" and request_number == 1:
+                chunks = _tool_response(MODEL_ID, body, f"turnperf-effect-{case_id}")
+            elif shape == "orchestration":
+                chunks = _orchestration_response(
+                    MODEL_ID,
+                    body,
+                    f"turnperf-effect-{case_id}",
+                    request_number,
+                )
+            else:
+                chunks = _text_response(MODEL_ID)
             payload = b"".join(chunks)
             self.state.gate(request_number, "before_headers")
             self.send_response(200)
@@ -769,7 +967,7 @@ def run_arguments(shape: str) -> list[str]:
         "--timeout",
         "20s",
     ]
-    if shape == "tool":
+    if shape in ("tool", "orchestration"):
         arguments.extend(("--auto-allow", "--allow-writes", "--allow-exec"))
     return arguments
 
@@ -1163,7 +1361,7 @@ def _process_usage(pid: int) -> tuple[float, int, int] | None:
 
 
 def assert_provider_ledger(entries: Sequence[Mapping[str, Any]], shape: str) -> None:
-    expected = 1 if shape == "single" else 2
+    expected = {"single": 1, "tool": 2, "orchestration": 3}[shape]
     if len(entries) != expected:
         raise ProofError(f"{shape} provider requests expected={expected} actual={len(entries)}")
     prefixes: set[tuple[str, str, int]] = set()

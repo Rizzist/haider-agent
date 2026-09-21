@@ -268,7 +268,11 @@ def _assert_store_integrity(profile: ThrowawayProfile) -> None:
 def _assert_no_duplicate_provider_request(
     ledger: Sequence[Mapping[str, Any]], shape: str
 ) -> None:
-    allowed = {1} if shape == "single" else {1, 2}
+    allowed = {
+        "single": {1},
+        "tool": {1, 2},
+        "orchestration": {1, 2, 3},
+    }[shape]
     counts: dict[int, int] = {}
     for entry in ledger:
         ordinal = entry.get("request_ordinal")
@@ -633,11 +637,30 @@ def _run_kill_case(
         tool_results = sum(
             isinstance(event.get("payload"), Mapping)
             and event["payload"].get("type") == "tool_result"
+            and (
+                shape != "orchestration"
+                or str(event["payload"].get("call_id", "")).startswith("orch:")
+            )
             for event in source_events
         )
         effects = tool_effect_count(profile.root, case_id)
-        if shape == "tool":
+        if shape in ("tool", "orchestration"):
             _assert_tool_effect_result_bounds(effects, tool_results)
+        if shape == "orchestration":
+            orchestration_terminals = [
+                event
+                for event in source_events
+                if isinstance(event.get("payload"), Mapping)
+                and event["payload"].get("type") == "item"
+                and event["payload"].get("event") == "completed"
+                and isinstance(event["payload"].get("item"), Mapping)
+                and event["payload"]["item"].get("kind") == "orchestration_terminal_v1"
+            ]
+            if len(orchestration_terminals) > 1:
+                raise ProofError(
+                    "duplicate orchestration terminal extensions detected "
+                    f"actual={len(orchestration_terminals)}"
+                )
         terminal_kind = terminals[0]["payload"].get("terminal_kind")
         expected_exit_zero = terminal_kind == "success"
         if (returncode == 0) != expected_exit_zero:
@@ -687,14 +710,14 @@ def _run_kill_case(
         profile.dispose()
 
 
-def run_matrix(bin_dir: Path) -> dict[str, Any]:
+def run_matrix(bin_dir: Path, shapes: Sequence[str] = ("single", "tool")) -> dict[str, Any]:
     if os.name != "posix" or not hasattr(signal, "SIGKILL"):
         raise ProofError("SIGKILL boundary matrix requires POSIX")
     root = Path(tempfile.mkdtemp(prefix="htp-matrix-", dir="/tmp"))
     cases: list[dict[str, Any]] = []
     failures: list[str] = []
     with FakeProvider(root / "provider-ledger.jsonl") as proxy:
-        discovery = [discover(bin_dir, proxy, shape) for shape in ("single", "tool")]
+        discovery = [discover(bin_dir, proxy, shape) for shape in shapes]
         specifications: list[dict[str, Any]] = []
         for item in discovery:
             shape = item["shape"]
@@ -707,7 +730,7 @@ def run_matrix(bin_dir: Path) -> dict[str, Any]:
                         "expected_through_seq": boundary["through_seq"],
                     }
                 )
-            requests = 1 if shape == "single" else 2
+            requests = {"single": 1, "tool": 2, "orchestration": 3}[shape]
             for request in range(1, requests + 1):
                 for phase in ("after_post", "before_headers", "between_chunks"):
                     specifications.append(
@@ -770,9 +793,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--shape",
+        action="append",
+        choices=("single", "tool", "orchestration"),
+        help="shape to sweep (repeatable; default: single and tool)",
+    )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        report = run_matrix(args.bin_dir)
+        report = run_matrix(args.bin_dir, tuple(args.shape or ("single", "tool")))
     except Exception as error:
         print(f"SIGKILL matrix failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
