@@ -416,6 +416,7 @@ fn receipts_append_and_hook_ack_share_one_outer_commit() {
             command: session_create_command(&created_session, "grouped"),
             interaction_mode: SessionInteractionModeV1::Interactive,
             account_alias: None,
+            workspace_allocation: None,
         },
         JournalCommitBatch::AcceptTurn {
             command: turn_command(&store, &accepted_session, "grouped"),

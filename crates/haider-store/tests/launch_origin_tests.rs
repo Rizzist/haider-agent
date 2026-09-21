@@ -114,6 +114,9 @@ fn origin_registers_once_and_identical_retry_replays_receipt() {
     let session = SessionId::new("session-origin-once");
     seed_legacy_session(&store, &session);
     let seq_before = must(store.latest_seq(&session));
+    let activity_before = must(store.session_recencies(std::slice::from_ref(&session)))[0]
+        .key
+        .last_activity_ms;
 
     let command = origin_command(
         &store,
@@ -139,6 +142,13 @@ fn origin_registers_once_and_identical_retry_replays_receipt() {
     assert_eq!(first.revision, 1);
     assert_eq!(first.path.display.as_deref(), Some("~/dev"));
     assert_eq!(must(store.latest_seq(&session)), seq_before + 1);
+    assert_eq!(
+        must(store.session_recencies(std::slice::from_ref(&session)))[0]
+            .key
+            .last_activity_ms,
+        activity_before,
+        "origin config must not advance roster activity"
+    );
 
     let replay = match must(store.register_session_launch_origin(&command)) {
         SessionLaunchOriginOutcome::IdempotentReplay { origin } => origin,

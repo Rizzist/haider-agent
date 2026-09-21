@@ -131,6 +131,8 @@ async fn front_door_with_options(options: BareTuiOptions) -> ExitCode {
         session: initial_session,
         no_update_check,
         browse_sessions,
+        workspace,
+        workspace_mode,
     } = options;
     let env = haider_client::ProfileEnv::capture();
     let profile = match haider_client::resolve_profile(&env) {
@@ -141,7 +143,15 @@ async fn front_door_with_options(options: BareTuiOptions) -> ExitCode {
         }
     };
     let interactive = std::io::IsTerminal::is_terminal(&io::stdout());
-    let mut ensure_options = haider_client::EnsureOptions::default();
+    // The initial connection and every reconnect must negotiate the same
+    // surface identity. Launch-origin registration is intentionally denied
+    // to generic CLI clients, so applying this only in `run_live` would make
+    // the first create -> attach stall until a reconnect changed the kind.
+    let live_client = live_client_config();
+    let mut ensure_options = haider_client::EnsureOptions {
+        client: live_client.clone(),
+        ..haider_client::EnsureOptions::default()
+    };
     if !interactive {
         ensure_options
             .required_features
@@ -216,6 +226,19 @@ async fn front_door_with_options(options: BareTuiOptions) -> ExitCode {
                 );
             }
             let mut model = live_model(&profile);
+            if initial_session.is_none()
+                && !browse_sessions
+                && let Err(error) = apply_interactive_workspace(
+                    &mut model,
+                    &profile,
+                    workspace.as_deref(),
+                    workspace_mode.as_deref(),
+                )
+            {
+                eprintln!("haider: {error}");
+                let _ = ensured.client.close();
+                return ExitCode::from(2);
+            }
             model.initial_session = initial_session.map(haider_protocol::ids::SessionId::new);
             if browse_sessions {
                 model.enter_sessions();
@@ -224,15 +247,7 @@ async fn front_door_with_options(options: BareTuiOptions) -> ExitCode {
                 profile.store_dir.clone(),
                 no_update_check || suppress_update,
             );
-            match run_live(
-                model,
-                ensured.client,
-                profile,
-                live_client_config(),
-                updates,
-            )
-            .await
-            {
+            match run_live(model, ensured.client, profile, live_client, updates).await {
                 Ok(LiveExit::Quit) => ExitCode::SUCCESS,
                 Ok(LiveExit::UpdateInstalled) => {
                     let executable = match std::env::current_exe() {
@@ -389,6 +404,8 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     let mut plain = false;
     let mut theme: Option<ThemeChoice> = None;
     let mut session: Option<String> = None;
+    let mut workspace: Option<String> = None;
+    let mut workspace_mode: Option<String> = None;
     let mut no_update_check = false;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
@@ -410,6 +427,34 @@ async fn tui_command(rest: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--workspace" if workspace.is_none() => match iter
+                .next()
+                .filter(|path| !path.is_empty() && !path.starts_with('-'))
+            {
+                Some(path) => workspace = Some(path.clone()),
+                None => {
+                    eprintln!("haider tui: --workspace requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--workspace" => {
+                eprintln!("haider tui: --workspace was supplied twice");
+                return ExitCode::from(2);
+            }
+            "--workspace-mode" if workspace_mode.is_none() => match iter
+                .next()
+                .filter(|mode| !mode.is_empty() && !mode.starts_with('-'))
+            {
+                Some(mode) => workspace_mode = Some(mode.clone()),
+                None => {
+                    eprintln!("haider tui: --workspace-mode requires auto|cwd|dated");
+                    return ExitCode::from(2);
+                }
+            },
+            "--workspace-mode" => {
+                eprintln!("haider tui: --workspace-mode was supplied twice");
+                return ExitCode::from(2);
+            }
             "--theme" => match iter.next().and_then(|name| ThemeChoice::parse(name)) {
                 Some(key) => theme = Some(key),
                 None => {
@@ -422,6 +467,14 @@ async fn tui_command(rest: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+    if workspace.is_some() && workspace_mode.is_some() {
+        eprintln!("haider tui: --workspace and --workspace-mode are mutually exclusive");
+        return ExitCode::from(2);
+    }
+    if session.is_some() && (workspace.is_some() || workspace_mode.is_some()) {
+        eprintln!("haider tui: workspace selectors apply only when creating a new session");
+        return ExitCode::from(2);
     }
     if !demo {
         // W3c3: `haider tui` is the LIVE TUI, exactly like bare `haider`.
@@ -436,6 +489,8 @@ async fn tui_command(rest: &[String]) -> ExitCode {
             session,
             no_update_check,
             browse_sessions: false,
+            workspace,
+            workspace_mode,
         })
         .await;
     }
@@ -447,6 +502,10 @@ async fn tui_command(rest: &[String]) -> ExitCode {
         // Demo sessions are fabricated locally — a daemon session id has
         // no meaning there; reject rather than silently ignore.
         eprintln!("haider tui: --session is live-only; drop --demo");
+        return ExitCode::from(2);
+    }
+    if workspace.is_some() || workspace_mode.is_some() {
+        eprintln!("haider tui: workspace selectors are live-only; drop --demo");
         return ExitCode::from(2);
     }
     let interactive = !plain && io::stdout().is_terminal();
@@ -534,6 +593,11 @@ fn live_client_config() -> haider_client::ClientConfig {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_nanos())
         ),
+        client_kind: if cfg!(target_os = "android") {
+            haider_rpc::ClientKind::Gui
+        } else {
+            haider_rpc::ClientKind::Tui
+        },
         ..haider_client::ClientConfig::default()
     }
 }
@@ -556,6 +620,7 @@ fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
         model.sanctum_tier = SanctumTier::Translit;
     }
     apply_cwd(&mut model);
+    apply_launch_origin(&mut model);
     // W-C M1: load custom slash commands from `.haider/commands` (project,
     // walked up from cwd) + `~/.haider/commands` (global). This is shell-owned
     // IO at construction — the reducer never touches disk; a malformed file is
@@ -573,6 +638,116 @@ fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
         .unwrap_or_default();
     model.apply_theme_choice(choice);
     model
+}
+
+fn apply_interactive_workspace(
+    model: &mut AppModel,
+    profile: &haider_client::ResolvedProfile,
+    explicit_workspace: Option<&str>,
+    explicit_mode: Option<&str>,
+) -> Result<(), String> {
+    use haider_client::workspace::{
+        WorkspaceConfig, WorkspaceEnvironment, WorkspaceInvocation, WorkspaceMode,
+        WorkspaceRequest, WorkspaceSelection,
+    };
+
+    let launch_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    let environment = WorkspaceEnvironment::capture();
+    let config = WorkspaceConfig::load(&profile.store_dir).map_err(|error| error.to_string())?;
+    let sample = haider_client::workspace::sample_civil_date(&environment, &config)
+        .map_err(|error| error.to_string())?;
+    let explicit_mode = explicit_mode
+        .map(WorkspaceMode::parse)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let selection = haider_client::workspace::resolve_workspace(&WorkspaceRequest {
+        invocation: WorkspaceInvocation::Interactive,
+        explicit_workspace,
+        explicit_mode,
+        launch_cwd: launch_cwd.as_deref(),
+        environment: &environment,
+        config: &config,
+        store_dir: &profile.store_dir,
+        sample,
+        allocation_entropy: haider_client::workspace::allocation_entropy()
+            .map_err(|error| error.to_string())?,
+    })
+    .map_err(|error| error.to_string())?;
+    let (workspace, allocation) = match selection {
+        WorkspaceSelection::LaunchCwd { path, .. } => {
+            let canonical = std::fs::canonicalize(&path).map_err(|error| {
+                format!("cannot canonicalize workspace {}: {error}", path.display())
+            })?;
+            (canonical, None)
+        }
+        WorkspaceSelection::Dated(plan) => {
+            haider_client::workspace::materialize_daily_root(&plan)
+                .map_err(|error| error.to_string())?;
+            let allocation = haider_client::workspace::workspace_allocation(&plan)
+                .map_err(|error| error.to_string())?;
+            let allocation = haider_client::workspace::available_workspace_allocation(allocation)
+                .map_err(|error| error.to_string())?;
+            (PathBuf::from(&allocation.leaf), Some(allocation))
+        }
+    };
+    let workspace_text = workspace
+        .to_str()
+        .ok_or_else(|| format!("workspace path is not valid UTF-8: {}", workspace.display()))?
+        .to_owned();
+    model.cwd = workspace_text;
+    model.pending_workspace_allocation = allocation;
+    model.session_dir = abbreviate_path(&workspace, environment.home.as_deref());
+
+    Ok(())
+}
+
+/// Capture the process launch directory independently of workspace selection.
+/// Existing-session opens skip the resolver, but still register this TUI open.
+fn apply_launch_origin(model: &mut AppModel) {
+    #[cfg(not(target_os = "android"))]
+    {
+        let launch_cwd = std::env::current_dir()
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let sanitized = match haider_client::launch_origin::sanitize_origin_path(
+            launch_cwd.as_deref(),
+            home.as_deref(),
+        ) {
+            Ok(sanitized) => sanitized,
+            Err(error) => {
+                model.flash = Some(format!("· launch origin was not registered — {error}"));
+                return;
+            }
+        };
+        model.launch_origin_path = Some(haider_protocol::session::LaunchOriginPathV1 {
+            kind: match sanitized.kind {
+                haider_client::launch_origin::OriginPathKind::HomeRelative => {
+                    haider_protocol::session::LaunchOriginPathKindV1::HomeRelative
+                }
+                haider_client::launch_origin::OriginPathKind::Absolute => {
+                    haider_protocol::session::LaunchOriginPathKindV1::Absolute
+                }
+                haider_client::launch_origin::OriginPathKind::Redacted => {
+                    haider_protocol::session::LaunchOriginPathKindV1::Redacted
+                }
+                haider_client::launch_origin::OriginPathKind::Unavailable => {
+                    haider_protocol::session::LaunchOriginPathKindV1::Unavailable
+                }
+            },
+            display: sanitized.display,
+        });
+    }
+}
+
+fn abbreviate_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// Abbreviate the process cwd into the launcher/session dirs.

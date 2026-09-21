@@ -104,6 +104,63 @@ fn live_session_model() -> AppModel {
     model
 }
 
+#[test]
+fn session_transcript_renders_the_sanitized_origin_and_workspace_slot() {
+    let mut model = live_session_model();
+    model.launch_origin = Some((7, Some("/Users/<user>/private-project".into())));
+    model.session_dir = "~/Documents/Haider/1448-04-07/s-abc".into();
+    let (rows, _) = draw(&model, 120, 40);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains("Opened from /Users/<user>/private-project"),
+        "origin prefix missing: {frame}"
+    );
+    assert!(
+        frame.contains("Workspace: ~/Documents/Haider/1448-04-07/s-abc"),
+        "workspace slot missing: {frame}"
+    );
+    assert!(!frame.contains("rizzist"), "raw user identity leaked");
+
+    model.projection.apply(&haider_protocol::EventPayload::Item(
+        haider_protocol::item::ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("narrow-replay"),
+            item: haider_protocol::item::TurnItem::AgentMessage {
+                text: "NARROW-REPLAY-CONTENT".into(),
+            },
+        },
+    ));
+    let session = model.active_session.clone().expect("attached session");
+    model.session_permissions.insert(
+        session.clone(),
+        haider_protocol::session::SessionPermissionOverridesV1 {
+            read_only: false,
+            allow_writes: true,
+            allow_exec: true,
+            allow_mobile: false,
+            auto_allow: true,
+        },
+    );
+    model.session_attention.insert(
+        session,
+        haider_tui::app::SessionAttention {
+            seen_at_ms: Some(1),
+            last_activity_ms: Some(2),
+            waiting_why: None,
+            needs_input: None,
+        },
+    );
+    let (narrow_rows, _) = draw(&model, 90, 10);
+    let narrow = narrow_rows.join("\n");
+    assert!(
+        !narrow.contains("Opened from") && !narrow.contains("Workspace:"),
+        "origin context must shed before transcript content on the short rung: {narrow}"
+    );
+    assert!(
+        narrow.contains("NARROW-REPLAY-CONTENT"),
+        "a one-row transcript must retain content instead of its trailing separator: {narrow}"
+    );
+}
+
 fn chip(agent: &str, name: &str) -> haider_tui::app::ChipModel {
     haider_tui::app::ChipModel::from_seed(ChipSeed {
         agent: agent.to_owned(),

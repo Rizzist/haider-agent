@@ -8,6 +8,32 @@ use std::path::Path;
 
 use haider_protocol::workspace::{WorkspaceUnavailable, WorkspaceUnavailableReason};
 
+/// A valid dated allocation whose exact leaf is still absent. This is a
+/// usable plain-chat state, not `workspace_unavailable`; workspace reads are
+/// refused and the first writing effect materialises it.
+#[must_use]
+pub(crate) fn is_pending(metadata: &haider_protocol::session::SessionMetadataV1) -> bool {
+    let Some(allocation) = metadata.workspace_allocation.as_ref() else {
+        return false;
+    };
+    if allocation.leaf != metadata.cwd {
+        return false;
+    }
+    haider_client::workspace::validate_workspace_allocation(Path::new(&metadata.cwd), allocation)
+        .is_ok()
+}
+
+#[must_use]
+pub(crate) fn unavailable_for_metadata(
+    metadata: &haider_protocol::session::SessionMetadataV1,
+) -> Option<WorkspaceUnavailable> {
+    if is_pending(metadata) {
+        None
+    } else {
+        unavailable(Path::new(&metadata.cwd))
+    }
+}
+
 #[must_use]
 pub(crate) fn unavailable(path: &Path) -> Option<WorkspaceUnavailable> {
     let stored = path.display().to_string();

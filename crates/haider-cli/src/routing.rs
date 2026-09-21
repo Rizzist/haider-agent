@@ -269,7 +269,9 @@ mod tests {
             Some(BareTuiOptions {
                 session: Some("a".into()),
                 no_update_check: true,
-                browse_sessions: false
+                browse_sessions: false,
+                workspace: None,
+                workspace_mode: None,
             })
         );
     }

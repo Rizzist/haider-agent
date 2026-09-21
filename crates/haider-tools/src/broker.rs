@@ -1136,7 +1136,7 @@ impl EffectFinish {
 pub struct EffectBroker {
     journal: BrokerJournal,
     workspace_root: PathBuf,
-    workspace_dir: haider_platform::WorkspaceDirectory,
+    workspace_dir: Option<haider_platform::WorkspaceDirectory>,
     session_id: SessionId,
     worker_generation: u64,
     started_at_ms: u64,
@@ -1221,6 +1221,44 @@ impl EffectBroker {
         )
     }
 
+    /// Creates a broker for a validated dated allocation whose exact leaf is
+    /// intentionally absent. Non-workspace effects can still be journaled;
+    /// callers must install the anchored leaf with
+    /// [`Self::materialize_workspace`] before dispatching a workspace effect.
+    pub fn new_pending(
+        journal: Box<dyn JournalSink>,
+        workspace_root: std::path::PathBuf,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> ToolResult<Self> {
+        if !workspace_root.is_absolute() {
+            return Err(ToolError::invalid_argument(
+                "pending workspace root must be absolute",
+            ));
+        }
+        Ok(Self {
+            journal: BrokerJournal::new(journal),
+            workspace_root,
+            workspace_dir: None,
+            session_id,
+            worker_generation,
+            started_at_ms: unix_time_ms(),
+            next_effect: 0,
+            next_menu: 0,
+            pending_permissions: HashMap::new(),
+            approval_previews: HashMap::new(),
+            file_review_recipes: HashMap::new(),
+            one_shot_rules: Vec::new(),
+            next_finalizer: 0,
+            finalizers: tokio::task::JoinSet::new(),
+            observed_finalizers: Arc::new(Mutex::new(HashSet::new())),
+            computer_cancellations: HashMap::new(),
+            mobile_cancellations: HashMap::new(),
+            workspace_receipts: WorkspaceReceiptTracker::default(),
+            processes: ProcessRegistry::default(),
+        })
+    }
+
     fn new_canonical_at(
         journal: Box<dyn JournalSink>,
         workspace_root: PathBuf,
@@ -1275,7 +1313,7 @@ impl EffectBroker {
         Ok(Self {
             journal: BrokerJournal::new(journal),
             workspace_root,
-            workspace_dir,
+            workspace_dir: Some(workspace_dir),
             session_id,
             worker_generation,
             started_at_ms,
@@ -1299,10 +1337,37 @@ impl EffectBroker {
         &self.workspace_root
     }
 
+    /// Installs the exact no-follow directory handle created for a pending
+    /// allocation. A second installation is refused so authority cannot be
+    /// silently rebound within one broker.
+    pub fn materialize_workspace(
+        &mut self,
+        workspace_dir: haider_platform::WorkspaceDirectory,
+    ) -> ToolResult<()> {
+        if self.workspace_dir.is_some() {
+            return Err(ToolError::invalid_argument(
+                "workspace is already materialized",
+            ));
+        }
+        self.workspace_dir = Some(workspace_dir);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn workspace_is_materialized(&self) -> bool {
+        self.workspace_dir.is_some()
+    }
+
     pub(crate) fn duplicate_workspace_dir(
         &self,
     ) -> ToolResult<haider_platform::WorkspaceDirectory> {
-        haider_platform::duplicate_workspace_directory(&self.workspace_dir)
+        let directory = self.workspace_dir.as_ref().ok_or_else(|| {
+            ToolError::invalid_argument(format!(
+                "workspace root is not materialized: {}",
+                self.workspace_root.display()
+            ))
+        })?;
+        haider_platform::duplicate_workspace_directory(directory)
             .map_err(|error| ToolError::io("duplicate workspace root", &self.workspace_root, error))
     }
 

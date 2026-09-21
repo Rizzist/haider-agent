@@ -3747,7 +3747,8 @@ pub async fn run_live(
     } else {
         config.client_instance_id.clone()
     };
-    let mut driver = LiveDriver::new(instance);
+    let mut driver =
+        LiveDriver::new(instance).with_launch_origin_path(model.launch_origin_path.clone());
     if let Some(token) = binding_token {
         driver = driver
             .with_resident_binding_token(token)

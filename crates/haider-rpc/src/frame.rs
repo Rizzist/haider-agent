@@ -3524,6 +3524,11 @@ pub enum RequestBody {
         max_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_overrides: Option<SessionPermissionOverridesV1>,
+        /// Resolved dated-workspace allocation. The named leaf is allowed to
+        /// be absent; the daemon validates its existing daily-root anchor and
+        /// materialises the exact leaf on the first workspace-writing effect.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_policy: Option<haider_protocol::cache::CachePolicySettingsV1>,
         #[serde(

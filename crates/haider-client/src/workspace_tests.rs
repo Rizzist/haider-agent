@@ -9,7 +9,9 @@ use haider_platform::CivilDateSample;
 use super::{
     CwdReason, MaterializeError, WORKSPACE_BASE_ENV, WorkspaceConfig, WorkspaceEnvironment,
     WorkspaceError, WorkspaceInvocation, WorkspaceMode, WorkspaceRequest, WorkspaceSelection,
-    materialize_daily_root, materialize_leaf, path_is_inside_dated_allocation, resolve_workspace,
+    available_workspace_allocation, materialize_daily_root, materialize_leaf,
+    materialize_workspace_allocation, path_is_inside_dated_allocation, renew_workspace_allocation,
+    resolve_workspace, validate_workspace_allocation, workspace_allocation,
 };
 
 const ENTROPY: [u8; 16] = [
@@ -890,6 +892,134 @@ fn workspace_config_parses_and_rejects() {
         assert!(
             WorkspaceConfig::from_config_value(&invalid).is_err(),
             "accepted invalid config: {invalid}"
+        );
+    }
+}
+
+/// MUTATION CHECK: create the lazy leaf during admission, reopen it by path
+/// after validation, or accept an already-present leaf. Expected failure:
+/// the pre-write snapshot, exact-create refusal, anchored descriptor write,
+/// or private-mode assertion below changes.
+#[test]
+fn persisted_allocation_stays_absent_until_exact_anchored_materialisation() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    let environment = environment_with_base(&base);
+    let config = WorkspaceConfig::default();
+    let WorkspaceSelection::Dated(plan) = resolve_workspace(&request(
+        WorkspaceInvocation::Interactive,
+        Some(temp.path()),
+        &environment,
+        &config,
+        temp.path(),
+    ))
+    .unwrap() else {
+        panic!("expected dated plan");
+    };
+    materialize_daily_root(&plan).unwrap();
+    let allocation = workspace_allocation(&plan).unwrap();
+    let daily_before = snapshot(&plan.daily_root);
+
+    let allocation_leaf = PathBuf::from(&allocation.leaf);
+    let validated = validate_workspace_allocation(&allocation_leaf, &allocation).unwrap();
+    drop(validated);
+    assert_eq!(snapshot(&plan.daily_root), daily_before);
+    assert!(!plan.leaf.exists(), "admission must not create the leaf");
+
+    let directory = materialize_workspace_allocation(&allocation).unwrap();
+    let reopened = haider_platform::open_workspace_directory(&plan.leaf).unwrap();
+    #[cfg(unix)]
+    {
+        let actual = rustix::fs::fstat(&directory).unwrap();
+        let expected = rustix::fs::fstat(&reopened).unwrap();
+        assert_eq!(
+            (actual.st_dev, actual.st_ino),
+            (expected.st_dev, expected.st_ino),
+            "creator must return an anchor for the exact created leaf"
+        );
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        haider_platform::workspace_directory_identity(&directory).unwrap(),
+        haider_platform::workspace_directory_identity(&reopened).unwrap(),
+        "creator must return an anchor for the exact created leaf"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&plan.leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert!(matches!(
+        materialize_workspace_allocation(&allocation),
+        Err(MaterializeError::LeafAlreadyExists(path)) if path == allocation_leaf
+    ));
+}
+
+#[test]
+fn pre_session_collision_rerolls_without_creating_a_leaf() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    let environment = environment_with_base(&base);
+    let config = WorkspaceConfig::default();
+    let WorkspaceSelection::Dated(plan) = resolve_workspace(&request(
+        WorkspaceInvocation::Interactive,
+        Some(temp.path()),
+        &environment,
+        &config,
+        temp.path(),
+    ))
+    .unwrap() else {
+        panic!("expected dated plan");
+    };
+    materialize_daily_root(&plan).unwrap();
+    std::fs::create_dir(&plan.leaf).unwrap();
+    let initial = workspace_allocation(&plan).unwrap();
+    let available = available_workspace_allocation(initial.clone()).unwrap();
+    assert_ne!(available.allocation_id, initial.allocation_id);
+    assert_ne!(available.leaf, initial.leaf);
+    assert!(!Path::new(&available.leaf).exists());
+
+    let next = renew_workspace_allocation(&available).unwrap();
+    assert_ne!(next.allocation_id, available.allocation_id);
+    assert_eq!(next.daily_root, available.daily_root);
+    assert!(!Path::new(&next.leaf).exists());
+}
+
+#[test]
+fn explicit_profile_store_provisions_only_its_private_workspaces_base_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("profile");
+    std::fs::create_dir(&store).unwrap();
+    let environment = WorkspaceEnvironment {
+        explicit_profile_dir: true,
+        ..WorkspaceEnvironment::default()
+    };
+    let config = WorkspaceConfig::default();
+    let WorkspaceSelection::Dated(plan) = resolve_workspace(&request(
+        WorkspaceInvocation::Interactive,
+        Some(temp.path()),
+        &environment,
+        &config,
+        &store,
+    ))
+    .unwrap() else {
+        panic!("expected dated plan");
+    };
+    assert!(!plan.base.exists());
+    materialize_daily_root(&plan).unwrap();
+    assert!(plan.daily_root.is_dir());
+    assert!(!plan.leaf.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&plan.base).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 }

@@ -238,7 +238,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
                  export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \
-                 tui [--theme system|light|dark|desert|oasis] [--session <id>] [--no-update-check], tui --demo [--plain], \
+                 tui [--theme system|light|dark|desert|oasis] [--session <id>] [--workspace <path>|--workspace-mode auto|cwd|dated] [--no-update-check], tui --demo [--plain], \
                  import [codex|claude-code], [--session <id>] [--no-update-check], --ready)"
             );
             ExitCode::from(2)
@@ -253,6 +253,10 @@ pub struct BareTuiOptions {
     /// `haider resume` / `--resume` with no id: boot straight into the
     /// all-sessions browser so the user PICKS a session (owner 2026-08-21).
     pub browse_sessions: bool,
+    /// Existing workspace selected for a new interactive session.
+    pub workspace: Option<String>,
+    /// `auto`, `cwd`, or `dated`; interpreted by the workspace resolver.
+    pub workspace_mode: Option<String>,
 }
 
 /// Parse only the bare-TUI argument vocabulary. `Ok(None)` leaves ordinary
@@ -263,7 +267,7 @@ pub fn parse_bare_tui_options(args: &[String]) -> Result<Option<BareTuiOptions>,
     }
     if !matches!(
         args[0].as_str(),
-        "--session" | "--no-update-check" | "--resume"
+        "--session" | "--no-update-check" | "--resume" | "--workspace" | "--workspace-mode"
     ) {
         return Ok(None);
     }
@@ -281,6 +285,24 @@ pub fn parse_bare_tui_options(args: &[String]) -> Result<Option<BareTuiOptions>,
                 options.session = Some(id.clone());
             }
             "--session" => return Err("--session was supplied twice".into()),
+            "--workspace" if options.workspace.is_none() => {
+                let path = iter
+                    .next()
+                    .filter(|path| !path.is_empty() && !path.starts_with('-'))
+                    .ok_or_else(|| "--workspace requires a path".to_owned())?;
+                options.workspace = Some(path.clone());
+            }
+            "--workspace" => return Err("--workspace was supplied twice".into()),
+            "--workspace-mode" if options.workspace_mode.is_none() => {
+                let mode = iter
+                    .next()
+                    .filter(|mode| !mode.is_empty() && !mode.starts_with('-'))
+                    .ok_or_else(|| "--workspace-mode requires auto|cwd|dated".to_owned())?;
+                options.workspace_mode = Some(mode.clone());
+            }
+            "--workspace-mode" => {
+                return Err("--workspace-mode was supplied twice".into());
+            }
             // `--resume` alone opens the picker; `--resume <id>` is the
             // same door as `--session <id>` (attach that one directly).
             "--resume" if !options.browse_sessions && options.session.is_none() => {
@@ -295,6 +317,14 @@ pub fn parse_bare_tui_options(args: &[String]) -> Result<Option<BareTuiOptions>,
             "--resume" => return Err("--resume was supplied twice".into()),
             other => return Err(format!("unknown bare-TUI flag `{other}`")),
         }
+    }
+    if options.workspace.is_some() && options.workspace_mode.is_some() {
+        return Err("--workspace and --workspace-mode are mutually exclusive".into());
+    }
+    if (options.session.is_some() || options.browse_sessions)
+        && (options.workspace.is_some() || options.workspace_mode.is_some())
+    {
+        return Err("workspace selectors apply only when creating a new session".into());
     }
     Ok(Some(options))
 }

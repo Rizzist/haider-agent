@@ -57,6 +57,20 @@ pub enum OriginSanitizeError {
     DisplayTooLong(usize),
 }
 
+/// Mints the process-open namespace from the OS CSPRNG (O2). The returned
+/// lowercase-hex value contains no path/user material.
+pub fn random_open_namespace() -> std::io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| std::io::Error::other(format!("origin entropy unavailable: {error}")))?;
+    let mut namespace = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(namespace, "{byte:02x}");
+    }
+    Ok(namespace)
+}
+
 impl std::fmt::Display for OriginSanitizeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

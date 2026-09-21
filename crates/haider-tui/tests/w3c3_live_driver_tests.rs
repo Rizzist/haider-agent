@@ -67,6 +67,29 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
     }
 }
 
+fn summary_with_origin(n: usize, revision: u64) -> SessionSummary {
+    let mut summary = summary(n, 0);
+    summary.metadata = Some(
+        serde_json::from_value(serde_json::json!({
+            "cwd": format!("/tmp/workspace-{n}"),
+            "provider": "fake",
+            "model": "fake-v1",
+            "max_tokens": 4096,
+            "created_at_ms": 1,
+            "launch_origin": {
+                "subject_session_id": format!("s-{n}"),
+                "open_id": "prior-open",
+                "revision": revision,
+                "path": {"kind": "redacted", "display": "/Users/<user>/secret"},
+                "recorded_at_ms": 1,
+                "selected_seq": 1
+            }
+        }))
+        .expect("summary metadata"),
+    );
+    summary
+}
+
 fn envelope(session: &SessionId, seq: u64, payload: &EventPayload) -> RawEnvelope {
     EventEnvelope {
         schema_version: 1,
@@ -695,13 +718,17 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
             command_id,
             session: sid(1),
             worker_generation: 7,
-            cwd: "~/dev".to_owned(),
+            cwd: "/tmp/created-workspace".to_owned(),
             model: "fable-5".to_owned(),
         },
     );
     assert_eq!(model.sessions.len(), 1, "the daemon's session became a row");
     assert_eq!(model.sessions[0].id, sid(1), "…under the DAEMON's id");
     assert_eq!(model.active_session.as_ref(), Some(&sid(1)));
+    assert_eq!(
+        model.session_dir, "/tmp/created-workspace",
+        "the session chrome follows the daemon-created workspace, not the launch cwd"
+    );
     assert_eq!(
         after,
         vec![LiveCommand::Attach {
@@ -1048,6 +1075,216 @@ fn a_failed_attach_releases_its_latch_so_the_session_is_not_wedged() {
         driver.sync_selection(&model).len(),
         1,
         "a fresh selection attaches cleanly — the latch was released"
+    );
+}
+
+/// MUTATION CHECK: omit origin registration, reuse the stored origin's open
+/// id, or retry a stale CAS with another registration. Expected failure: the
+/// typed first attach or the legacy soft-conflict retry below changes.
+#[test]
+fn tui_origin_registration_round_trips_and_stale_cas_soft_attaches() {
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1.to_owned());
+    let path = haider_protocol::session::LaunchOriginPathV1 {
+        kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+        display: Some("~/launch".into()),
+    };
+    let mut driver = LiveDriver::new("origin-test").with_launch_origin_path(Some(path.clone()));
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary_with_origin(8, 4)],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(
+        model.sessions[0].dir, "/tmp/workspace-8",
+        "cold roster rows retain the daemon workspace display for checkout"
+    );
+    model.open_session(&sid(8));
+    let first = driver.sync_selection(&model);
+    let [
+        LiveCommand::AttachWithOrigin {
+            session,
+            after_seq: 0,
+            launch_origin: Some(registration),
+        },
+    ] = first.as_slice()
+    else {
+        panic!("expected origin attach, got {first:?}");
+    };
+    assert_eq!(session, &sid(8));
+    assert_eq!(registration.expected_revision, 4);
+    assert_eq!(registration.worker_generation, 7);
+    assert_eq!(registration.path, path);
+    assert_ne!(registration.open_id, "prior-open");
+    let open_id = registration.open_id.clone();
+
+    let retry = driver.apply(
+        &mut model,
+        LiveReply::AttachFailed {
+            session: sid(8),
+            code: haider_rpc::ERROR_CODE_REVISION_CONFLICT.into(),
+            message: "origin changed".into(),
+            retryable: true,
+        },
+    );
+    assert_eq!(
+        retry,
+        vec![LiveCommand::Attach {
+            session: sid(8),
+            after_seq: 0,
+        }],
+        "stale CAS falls back to attach-without-registration"
+    );
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|text| text.contains("without replacing launch origin"))
+    );
+
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(8),
+            attachment: attachment(8),
+            worker_generation: 7,
+            replay_through_seq: 0,
+            launch_origin: Some(haider_protocol::session::LaunchOriginV1 {
+                subject_session_id: sid(8).to_string(),
+                open_id: "winner-open".into(),
+                revision: 5,
+                path: haider_protocol::session::LaunchOriginPathV1 {
+                    kind: haider_protocol::session::LaunchOriginPathKindV1::Redacted,
+                    display: Some("/Users/<user>/winner".into()),
+                },
+                recorded_at_ms: 2,
+                selected_seq: 2,
+            }),
+        },
+    );
+    assert_eq!(model.session_dir, "/tmp/workspace-8");
+    assert_eq!(
+        model.launch_origin,
+        Some((5, Some("/Users/<user>/winner".into())))
+    );
+    assert_ne!(open_id, "winner-open");
+
+    // O4: the replayed config fact updates the replaceable origin slot and
+    // cursor, but it is not session activity and cannot create an unseen dot.
+    model.session_attention.insert(
+        sid(8),
+        haider_tui::app::SessionAttention {
+            seen_at_ms: Some(10),
+            last_activity_ms: Some(10),
+            waiting_why: None,
+            needs_input: None,
+        },
+    );
+    let selected = haider_protocol::session::SessionLaunchOriginSelected {
+        subject_session_id: sid(8).to_string(),
+        open_id: "later-open".into(),
+        revision: 6,
+        path: haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~/later".into()),
+        },
+        recorded_at_ms: 20,
+        workspace_materialized: Some(true),
+    };
+    let raw = EventEnvelope {
+        schema_version: 1,
+        event_id: EventId::new("origin-replay-6"),
+        seq: 1,
+        session_id: sid(8),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("live-device"),
+        authority_epoch: 1,
+        worker_generation: 7,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 20,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: selected.to_payload_value().expect("origin payload").into(),
+    };
+    driver.apply(
+        &mut model,
+        LiveReply::Event {
+            attachment: attachment(8),
+            session: sid(8),
+            envelope: Box::new(raw),
+        },
+    );
+    assert_eq!(model.launch_origin, Some((6, Some("~/later".into()))));
+    assert_eq!(
+        model.session_attention[&sid(8)].last_activity_ms,
+        Some(10),
+        "origin replay must not move local attention activity"
+    );
+}
+
+#[test]
+fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
+    let mut model = live_model();
+    let first = haider_protocol::session::WorkspaceAllocationV1 {
+        daily_root: "/tmp/Haider/1448-04-07".into(),
+        leaf: "/tmp/Haider/1448-04-07/s-0123456789abcdef0123456789abcdef".into(),
+        allocation_id: "0123456789abcdef0123456789abcdef".into(),
+        calendar_id: "islamic-civil".into(),
+        hijri_date: "1448-04-07".into(),
+        gregorian_date: "2026-09-20".into(),
+        allocated_at_ms: 1,
+        offset_seconds: 0,
+    };
+    model.cwd = first.leaf.clone();
+    model.pending_workspace_allocation = Some(first.clone());
+    let mut driver = LiveDriver::new("allocation-test");
+
+    let issued = driver.handle_request(
+        &mut model,
+        AppRequest::CreateSession {
+            text: "first".into(),
+        },
+    );
+    assert!(matches!(
+        issued.as_slice(),
+        [LiveCommand::Create { cwd, workspace_allocation: Some(allocation), .. }]
+            if cwd == &first.leaf && allocation == &first
+    ));
+    let second = model
+        .pending_workspace_allocation
+        .clone()
+        .expect("next allocation");
+    assert_ne!(second.allocation_id, first.allocation_id);
+    assert_eq!(model.cwd, second.leaf);
+
+    let issued = driver.handle_request(
+        &mut model,
+        AppRequest::CreateSession {
+            text: "second".into(),
+        },
+    );
+    assert!(matches!(
+        issued.as_slice(),
+        [LiveCommand::Create { cwd, workspace_allocation: Some(allocation), .. }]
+            if cwd == &second.leaf && allocation == &second
+    ));
+    assert_ne!(
+        model
+            .pending_workspace_allocation
+            .as_ref()
+            .expect("third allocation")
+            .allocation_id,
+        second.allocation_id
     );
 }
 

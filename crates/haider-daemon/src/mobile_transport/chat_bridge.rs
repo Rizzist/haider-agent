@@ -158,6 +158,7 @@ impl DaemonMobileChatBridge {
                     allow_mobile: true,
                     ..SessionPermissionOverridesV1::default()
                 }),
+                workspace_allocation: None,
                 cache_policy: None,
                 interaction_mode: SessionInteractionModeV1::Interactive,
                 ssh_scope: None,

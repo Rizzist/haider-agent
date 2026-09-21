@@ -465,13 +465,19 @@ pub(super) async fn run_session_actor(
                 command,
                 interaction_mode,
                 account_alias,
+                workspace_allocation,
                 completed,
             } => {
                 // Same INV-1 shape as ordinary append: the complete metadata +
                 // Created + receipt transaction returns before publication,
                 // and no await separates that return from `publish`.
                 let result = append_committer
-                    .create_session(command, interaction_mode, account_alias)
+                    .create_session(
+                        command,
+                        interaction_mode,
+                        account_alias,
+                        workspace_allocation,
+                    )
                     .await;
                 if let Ok(SessionCreateOutcome::Committed { envelope, .. }) = &result {
                     head = envelope.seq;

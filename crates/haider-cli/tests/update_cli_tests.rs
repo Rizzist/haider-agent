@@ -181,6 +181,8 @@ fn bare_tui_update_opt_out_flag_preserves_session_arguments() {
         session: Some("session-42".to_owned()),
         no_update_check: true,
         browse_sessions: false,
+        workspace: None,
+        workspace_mode: None,
     };
     for args in [
         vec!["--no-update-check", "--session", "session-42"],
@@ -235,6 +237,42 @@ fn bare_session_flag_refuses_a_flag_shaped_value() {
     );
 }
 
+#[test]
+fn bare_tui_workspace_selectors_are_typed_and_mutually_exclusive() {
+    let parse = |args: &[&str]| {
+        parse_bare_tui_options(&args.iter().copied().map(String::from).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        parse(&["--workspace", "relative/project", "--no-update-check"])
+            .expect("explicit workspace should parse"),
+        Some(BareTuiOptions {
+            session: None,
+            no_update_check: true,
+            browse_sessions: false,
+            workspace: Some("relative/project".into()),
+            workspace_mode: None,
+        })
+    );
+    assert_eq!(
+        parse(&["--workspace-mode", "dated"]).expect("dated workspace mode should parse"),
+        Some(BareTuiOptions {
+            session: None,
+            no_update_check: false,
+            browse_sessions: false,
+            workspace: None,
+            workspace_mode: Some("dated".into()),
+        })
+    );
+    assert_eq!(
+        parse(&["--workspace", "/tmp/project", "--workspace-mode", "cwd"]),
+        Err("--workspace and --workspace-mode are mutually exclusive".into())
+    );
+    assert_eq!(
+        parse(&["--session", "s-1", "--workspace-mode", "dated"]),
+        Err("workspace selectors apply only when creating a new session".into())
+    );
+}
+
 /// v0.0.937 `--resume`: bare opens the all-sessions PICKER, with an id it is
 /// the `--session` door (attach that one), and it never doubles.
 ///
@@ -252,6 +290,8 @@ fn resume_opens_the_picker_or_attaches_the_named_session() {
             session: None,
             no_update_check: false,
             browse_sessions: true,
+            workspace: None,
+            workspace_mode: None,
         }),
         "no id → the picker"
     );
@@ -261,6 +301,8 @@ fn resume_opens_the_picker_or_attaches_the_named_session() {
             session: Some("session-9".to_owned()),
             no_update_check: false,
             browse_sessions: false,
+            workspace: None,
+            workspace_mode: None,
         }),
         "an id → attach it directly, never the picker"
     );
@@ -270,6 +312,8 @@ fn resume_opens_the_picker_or_attaches_the_named_session() {
             session: None,
             no_update_check: true,
             browse_sessions: true,
+            workspace: None,
+            workspace_mode: None,
         }),
         "a FLAG after --resume is not an id"
     );

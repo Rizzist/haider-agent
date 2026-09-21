@@ -236,6 +236,7 @@ impl Client {
                     model: MODEL.into(),
                     max_tokens: 4096,
                     permission_overrides: None,
+                    workspace_allocation: None,
                     cache_policy: None,
                     interaction_mode: SessionInteractionModeV1::Autonomous,
                     ssh_scope: None,

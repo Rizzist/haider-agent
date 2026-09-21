@@ -548,6 +548,7 @@ async fn spawn(
                 model: spec.model.clone().unwrap_or_default(),
                 max_tokens: haider_client::DEFAULT_MAX_TOKENS,
                 permission_overrides: None,
+                workspace_allocation: None,
                 cache_policy: None,
                 interaction_mode: SessionInteractionModeV1::Autonomous,
                 ssh_scope: None,

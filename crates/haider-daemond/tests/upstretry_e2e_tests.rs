@@ -337,6 +337,7 @@ async fn create_and_attach(
             model: "upstretry-model".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            workspace_allocation: None,
             cache_policy: None,
             interaction_mode: SessionInteractionModeV1::Autonomous,
             ssh_scope: None,

@@ -525,6 +525,7 @@ async fn create_and_attach_with_mode(
             model: model.into(),
             max_tokens: 4096,
             permission_overrides,
+            workspace_allocation: None,
             cache_policy: None,
             interaction_mode,
             ssh_scope,

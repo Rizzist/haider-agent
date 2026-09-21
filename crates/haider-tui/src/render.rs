@@ -6360,6 +6360,26 @@ fn render_session(
         runs: transcript_runs.as_ref(),
     };
     transcript_cache.reconcile(&model.projection, layout_ctx);
+    // The origin is context chrome, not conversation content. On the short
+    // session rung it must shed before replayed assistant text: otherwise a
+    // 90x10 cold attach can be perfectly caught up while the only historical
+    // reply is pushed out of every paint (the live PTY gate's narrow law).
+    let origin_prefix: Vec<Line<'static>> = if area.height >= 16 {
+        model
+            .launch_origin
+            .as_ref()
+            .and_then(|(_, origin)| origin.as_ref())
+            .map(|origin| {
+                vec![Line::styled(
+                    format!("· Opened from {origin} · Workspace: {}", model.session_dir),
+                    theme.dim_style(),
+                )]
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let origin_rows = u64::from(wrapped_lines_height(&origin_prefix, transcript_area.width));
     let mut tail: Vec<Line<'static>> = Vec::new();
     // Sim `.thinking` (tui.js:4458-4462): a gold tail for the WHOLE running
     // turn, pulsing (1.4s). The port also breathes the dot ● ↔ ◌ on the
@@ -6388,15 +6408,16 @@ fn render_session(
     // output and the composer band. The breathing row rides the STREAM
     // (the pad row died with S2 item 4), so at the bottom-anchored tail
     // it separates output from the band and it scrolls with history.
-    if !transcript_cache.entries.is_empty() || !tail.is_empty() {
+    // A one-row transcript cannot afford a separator that hides the only
+    // content row. This happens on the 90x10 live rung once the attention
+    // and permission bands are both present: keep the output visible and
+    // let the composer border provide the separation instead.
+    if transcript_area.height > 1 && (!transcript_cache.entries.is_empty() || !tail.is_empty()) {
         tail.push(Line::default());
     }
-    let total = transcript_cache
-        .total_rows
-        .saturating_add(u64::from(wrapped_lines_height(
-            &tail,
-            transcript_area.width,
-        )));
+    let total = origin_rows.saturating_add(transcript_cache.total_rows.saturating_add(u64::from(
+        wrapped_lines_height(&tail, transcript_area.width),
+    )));
     let max_scroll_rows = total.saturating_sub(u64::from(transcript_area.height));
     let max_scroll = max_scroll_rows;
     // RENDER is the single scroll authority (review r3 P2-2): the frame
@@ -6419,7 +6440,7 @@ fn render_session(
         model,
         &transcript_cache,
         &model.projection,
-        0,
+        origin_rows,
         max_scroll_rows,
         transcript_area.height,
     );
@@ -6428,7 +6449,8 @@ fn render_session(
     {
         match model.projection.entry_of_node(&jump.node) {
             Some(entry) => {
-                let row = transcript_cache.row_start(&model.projection, entry)
+                let row = origin_rows
+                    + transcript_cache.row_start(&model.projection, entry)
                     + u64::from(matches!(
                         model.projection.entries().get(entry),
                         Some(TranscriptEntry::User { .. })
@@ -6455,7 +6477,7 @@ fn render_session(
     if let Some(index) = model.search_jump.borrow_mut().take()
         && index < model.projection.entries().len()
     {
-        let row = transcript_cache.row_start(&model.projection, index);
+        let row = origin_rows + transcript_cache.row_start(&model.projection, index);
         model
             .scroll_back
             .set(max_scroll_rows.saturating_sub(row.min(max_scroll_rows)));
@@ -6466,7 +6488,7 @@ fn render_session(
         &model.projection,
         layout_ctx,
         TranscriptViewport {
-            prefix: &[],
+            prefix: &origin_prefix,
             suffix: &tail,
             scroll_back,
             height: transcript_area.height,

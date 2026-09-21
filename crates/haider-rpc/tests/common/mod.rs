@@ -18,7 +18,9 @@ use haider_protocol::peer::{
     PeerDelivery, PeerDescriptor, PeerKind, PeerMessage, PeerReceipt, PeerSender, PeerState,
     PeerTrust,
 };
-use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session::{
+    SessionMetadataV1, SessionPermissionOverridesV1, WorkspaceAllocationV1,
+};
 use haider_protocol::session_fork::{
     SessionForkDraft, SessionForkPromptSelector, SessionForkProvenance, SessionMetaforkProposal,
     SessionMetaforkRemoval, SessionMetaforkReviewManifest,
@@ -400,6 +402,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: None,
+                workspace_allocation: None,
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
@@ -1053,6 +1056,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     allow_mobile: false,
                     auto_allow: false,
                 }),
+                workspace_allocation: None,
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
@@ -2103,6 +2107,7 @@ pub fn transcript() -> Vec<WireFrame> {
     append_fleet_identity_contract_tail(&mut frames);
     append_agent_cancel_contract_tail(&mut frames);
     append_acp_agent_family_tail(&mut frames);
+    append_workspace_allocation_tail(&mut frames);
     frames
 }
 
@@ -2590,6 +2595,41 @@ fn append_acp_agent_family_tail(frames: &mut Vec<WireFrame>) {
             }],
             revision: 13,
             availability: None,
+        },
+    });
+}
+
+/// Stage-2 dated-workspace request shape. It is deliberately a final duplicate
+/// of the existing `session.create` method so every historical create byte
+/// remains fixed while the additive allocation object gets its own golden.
+fn append_workspace_allocation_tail(frames: &mut Vec<WireFrame>) {
+    frames.push(WireFrame::Request {
+        request_id: RequestId::new("request-create-dated-workspace"),
+        body: RequestBody::SessionCreateWithPermissionOverrides {
+            command_id: CommandId::new("command-create-dated-workspace"),
+            cwd: "/tmp/Haider/1448-04-07/s-0123456789abcdef0123456789abcdef".into(),
+            provider: "anthropic".into(),
+            model: "claude-test".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            workspace_allocation: Some(WorkspaceAllocationV1 {
+                daily_root: "/tmp/Haider/1448-04-07".into(),
+                leaf: "/tmp/Haider/1448-04-07/s-0123456789abcdef0123456789abcdef".into(),
+                allocation_id: "0123456789abcdef0123456789abcdef".into(),
+                calendar_id: "islamic-civil".into(),
+                hijri_date: "1448-04-07".into(),
+                gregorian_date: "2026-09-20".into(),
+                allocated_at_ms: 1_789_882_200_000,
+                offset_seconds: 12_600,
+            }),
+            cache_policy: None,
+            interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
+            ssh_scope: None,
+            account_alias: None,
+            resolve_provider: false,
+            resolve_model: false,
+            effort: None,
+            fast: None,
         },
     });
 }

@@ -3118,6 +3118,7 @@ async fn run_headless_inner(
             max_tokens: request.max_tokens,
             permission_overrides: (!request.permission_overrides.is_empty())
                 .then_some(request.permission_overrides),
+            workspace_allocation: None,
             cache_policy: None,
             interaction_mode: SessionInteractionModeV1::Autonomous,
             ssh_scope: session_config.ssh_scope.clone(),

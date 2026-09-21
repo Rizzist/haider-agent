@@ -41,7 +41,10 @@ use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FinishReason, RequestUsage, Usage, UsageSource,
 };
-use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session::{
+    SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
+    WorkspaceAllocationV1,
+};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{AttachmentBlock, ToolPermissionDefault};
 use haider_protocol::workspace::WorkspaceEventPayload;
@@ -517,6 +520,84 @@ async fn create_and_attach_for_provider(
         }
     }
     (session_id, generation)
+}
+
+fn dated_allocation(root: &std::path::Path, allocation_id: &str) -> WorkspaceAllocationV1 {
+    let base = root.join("workspace-base");
+    fs::create_dir_all(&base).expect("dated base");
+    let base = fs::canonicalize(base).expect("canonical dated base");
+    let daily_root = base.join("Haider").join("1448-04-07");
+    fs::create_dir_all(&daily_root).expect("daily organizing root");
+    let leaf = daily_root.join(format!("s-{allocation_id}"));
+    WorkspaceAllocationV1 {
+        daily_root: daily_root.to_string_lossy().into_owned(),
+        leaf: leaf.to_string_lossy().into_owned(),
+        allocation_id: allocation_id.into(),
+        calendar_id: "islamic-civil".into(),
+        hijri_date: "1448-04-07".into(),
+        gregorian_date: "2026-09-20".into(),
+        allocated_at_ms: 1_789_882_200_000,
+        offset_seconds: 12_600,
+    }
+}
+
+async fn create_dated_and_attach(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    request_stem: &str,
+    allocation: &WorkspaceAllocationV1,
+) -> (SessionId, u64, SessionMetadataV1) {
+    send_request(
+        client,
+        config,
+        &format!("{request_stem}-create"),
+        RequestBody::SessionCreateWithPermissionOverrides {
+            command_id: CommandId::new(format!("{request_stem}-command")),
+            cwd: allocation.leaf.clone(),
+            provider: "fake".into(),
+            model: "fake-v1".into(),
+            max_tokens: 4096,
+            permission_overrides: Some(SessionPermissionOverridesV1 {
+                read_only: false,
+                allow_writes: true,
+                allow_exec: true,
+                allow_mobile: false,
+                auto_allow: true,
+            }),
+            workspace_allocation: Some(allocation.clone()),
+            cache_policy: None,
+            interaction_mode: SessionInteractionModeV1::Interactive,
+            ssh_scope: None,
+            account_alias: None,
+            resolve_provider: false,
+            resolve_model: false,
+            effort: None,
+            fast: None,
+        },
+    )
+    .await;
+    let (session, metadata, generation) = match next_response(client).await {
+        WireFrame::Response {
+            body:
+                ResponseBody::SessionCreate {
+                    session_id,
+                    worker_generation,
+                    metadata,
+                    ..
+                },
+            ..
+        } => (session_id, metadata, worker_generation),
+        other => panic!("expected dated session.create response, got {other:?}"),
+    };
+    attach_existing(
+        client,
+        config,
+        session.clone(),
+        0,
+        &format!("{request_stem}-attach"),
+    )
+    .await;
+    (session, generation, metadata)
 }
 
 fn submit_body(
@@ -7235,6 +7316,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         model: "fake-v1".into(),
         max_tokens: 4096,
         permission_overrides: overrides,
+        workspace_allocation: None,
         cache_policy: None,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
         ssh_scope: None,
@@ -7298,6 +7380,154 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
                 })
         })
     ));
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// MUTATION CHECK: eagerly create the dated leaf at session admission, omit
+/// the allocation from metadata, or let `fs_write` open the absent path by
+/// pathname. Expected failure: the no-write snapshot, metadata assertion,
+/// anchored first-write result, or private mode below changes.
+#[tokio::test]
+async fn dated_workspace_is_zero_residue_until_the_first_real_write() {
+    let root = test_root("dated-workspace-live-");
+    let no_write = dated_allocation(root.path(), "0123456789abcdef0123456789abcdef");
+    let rejected_write = dated_allocation(root.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let first_write = dated_allocation(root.path(), "fedcba9876543210fedcba9876543210");
+    let daily_before = fs::read_dir(&no_write.daily_root)
+        .expect("daily root")
+        .map(|entry| entry.expect("daily entry").file_name())
+        .collect::<Vec<_>>();
+    let config = DaemonConfig::new(
+        "dated-workspace-live",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, _fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "invalid-dated-write".into(),
+            name: "fs_write".into(),
+            args: serde_json::json!({"path": 7, "content": "must not materialize"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "invalid-dated-write".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "dated-write".into(),
+            name: "fs_write".into(),
+            args: serde_json::json!({"path": "proof.txt", "content": "first write"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "dated-write".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "dated-workspace-test",
+        "dated-workspace-client",
+        ClientKind::Tui,
+    )
+    .await;
+
+    let (_no_write_session, _, no_write_metadata) =
+        create_dated_and_attach(&mut client, &config, "no-write", &no_write).await;
+    assert_eq!(
+        no_write_metadata.workspace_allocation.as_ref(),
+        Some(&no_write),
+        "allocation must be durable in the create transaction"
+    );
+    assert!(!std::path::Path::new(&no_write.leaf).exists());
+    assert_eq!(
+        fs::read_dir(&no_write.daily_root)
+            .expect("daily root after no-write create")
+            .map(|entry| entry.expect("daily entry").file_name())
+            .collect::<Vec<_>>(),
+        daily_before,
+        "a no-write interactive session leaves no leaf residue"
+    );
+
+    let (rejected_session, rejected_generation, _) =
+        create_dated_and_attach(&mut client, &config, "rejected-write", &rejected_write).await;
+    send_request(
+        &mut client,
+        &config,
+        "rejected-submit",
+        submit_body(
+            "rejected-submit-command",
+            rejected_session,
+            rejected_generation,
+            "attempt an invalid write",
+        ),
+    )
+    .await;
+    let (rejected_run, _) = next_submit_response(&mut client).await;
+    let rejected_events = events_until_terminal(&mut client, &rejected_run).await;
+    assert!(matches!(
+        rejected_events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    assert!(
+        !std::path::Path::new(&rejected_write.leaf).exists(),
+        "argument rejection is not a writing effect"
+    );
+
+    let (write_session, write_generation, write_metadata) =
+        create_dated_and_attach(&mut client, &config, "first-write", &first_write).await;
+    assert_eq!(
+        write_metadata.workspace_allocation.as_ref(),
+        Some(&first_write)
+    );
+    assert!(!std::path::Path::new(&first_write.leaf).exists());
+    send_request(
+        &mut client,
+        &config,
+        "dated-submit",
+        submit_body(
+            "dated-submit-command",
+            write_session,
+            write_generation,
+            "write the proof file",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let events = events_until_terminal(&mut client, &run_id).await;
+    assert!(matches!(
+        events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    let leaf = std::path::Path::new(&first_write.leaf);
+    assert_eq!(
+        fs::read_to_string(leaf.join("proof.txt")).expect("first-write output"),
+        "first write"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(leaf)
+                .expect("leaf metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");

@@ -172,6 +172,11 @@ pub enum LiveCommand {
         session: SessionId,
         after_seq: u64,
     },
+    AttachWithOrigin {
+        session: SessionId,
+        after_seq: u64,
+        launch_origin: Option<haider_protocol::session::LaunchOriginRegistrationV1>,
+    },
     Detach {
         attachment: AttachmentId,
     },
@@ -185,6 +190,7 @@ pub enum LiveCommand {
     Create {
         command_id: CommandId,
         cwd: String,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
         provider: String,
         model: String,
         max_tokens: u64,
@@ -1168,6 +1174,7 @@ impl LiveCommand {
             | Self::List { .. }
             | Self::CheckpointList { .. }
             | Self::Attach { .. }
+            | Self::AttachWithOrigin { .. }
             | Self::Detach { .. }
             | Self::AccountList
             | Self::DeviceCandidates
@@ -2157,6 +2164,12 @@ pub struct LiveDriver {
     ///   answered, so a replay that starts at `after_seq + 2` stops and
     ///   reattaches instead of painting (review W3c3 P1-1).
     attaching: HashMap<SessionId, u64>,
+    launch_origin_path: Option<haider_protocol::session::LaunchOriginPathV1>,
+    open_namespace: Option<String>,
+    next_open: u64,
+    origin_opens: HashMap<SessionId, OriginOpen>,
+    origin_revisions: HashMap<SessionId, u64>,
+    workspace_paths: HashMap<SessionId, String>,
     /// The ONE durable command of the open login card, so a failure can be
     /// correlated to it instead of merely coinciding with it (P2-2) and a
     /// retry re-stages UNDER IT rather than minting a second (P1-4).
@@ -2319,6 +2332,14 @@ pub struct LiveDriver {
     graph_inspect_inflight: bool,
 }
 
+#[derive(Debug, Clone)]
+struct OriginOpen {
+    command_id: String,
+    open_id: String,
+    completed: bool,
+    conflicted: bool,
+}
+
 /// How long the login card may sit in `Submitting` before it says so —
 /// the deadline covers BOTH transactions (`vault.stage` then
 /// `account.login_api`).
@@ -2418,6 +2439,12 @@ impl LiveDriver {
             lru: Vec::new(),
             cold: HashMap::new(),
             attaching: HashMap::new(),
+            launch_origin_path: None,
+            open_namespace: haider_client::launch_origin::random_open_namespace().ok(),
+            next_open: 0,
+            origin_opens: HashMap::new(),
+            origin_revisions: HashMap::new(),
+            workspace_paths: HashMap::new(),
             login_command: None,
             login_attempt: None,
             retired_logins: std::collections::HashSet::new(),
@@ -2468,6 +2495,15 @@ impl LiveDriver {
             workflow_graph_chase: false,
             graph_inspect_inflight: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_launch_origin_path(
+        mut self,
+        path: Option<haider_protocol::session::LaunchOriginPathV1>,
+    ) -> Self {
+        self.launch_origin_path = path;
+        self
     }
 
     /// Installs the client-minted resident-binding correlator. The value is
@@ -2765,15 +2801,65 @@ impl LiveDriver {
             commands.push(LiveCommand::Detach { attachment });
         }
         let after_seq = cursor_of(model, session).unwrap_or(0);
+        let launch_origin = self.launch_origin_registration(model, session);
         // The working set WANTS it from the moment we ask, not from the
         // moment the daemon answers: a disconnect in between must still
         // restore it. Slot and latch move together — see `claim_slot`.
         self.claim_slot(session, after_seq);
-        commands.push(LiveCommand::Attach {
-            session: session.clone(),
-            after_seq,
+        commands.push(match launch_origin {
+            Some(launch_origin) => LiveCommand::AttachWithOrigin {
+                session: session.clone(),
+                after_seq,
+                launch_origin: Some(launch_origin),
+            },
+            None => LiveCommand::Attach {
+                session: session.clone(),
+                after_seq,
+            },
         });
         commands
+    }
+
+    fn launch_origin_registration(
+        &mut self,
+        model: &AppModel,
+        session: &SessionId,
+    ) -> Option<haider_protocol::session::LaunchOriginRegistrationV1> {
+        if !model.daemon_serves(haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1) {
+            return None;
+        }
+        let path = self.launch_origin_path.clone()?;
+        if !self.origin_opens.contains_key(session) {
+            let namespace = self.open_namespace.as_ref()?.clone();
+            self.next_open = self.next_open.saturating_add(1);
+            self.origin_opens.insert(
+                session.clone(),
+                OriginOpen {
+                    command_id: format!("origin-{namespace}-{}", self.next_open),
+                    open_id: format!("{namespace}-{}", self.next_open),
+                    completed: false,
+                    conflicted: false,
+                },
+            );
+        }
+        let open = self.origin_opens.get(session)?;
+        if open.completed || open.conflicted {
+            return None;
+        }
+        let worker_generation = self.generations.get(session).copied()?;
+        let expected_revision = self.origin_revisions.get(session).copied().unwrap_or(0);
+        let workspace_materialized = self
+            .workspace_paths
+            .get(session)
+            .map(|path| std::path::Path::new(path).is_dir());
+        Some(haider_protocol::session::LaunchOriginRegistrationV1 {
+            command_id: open.command_id.clone(),
+            open_id: open.open_id.clone(),
+            worker_generation,
+            expected_revision,
+            path,
+            workspace_materialized,
+        })
     }
 
     /// The coldest session we may detach: never the attached surface, and
@@ -3176,8 +3262,37 @@ impl LiveDriver {
                 next_cursor,
             } => {
                 for summary in sessions {
+                    let workspace_display = summary
+                        .workspace_cwd
+                        .as_deref()
+                        .or_else(|| {
+                            summary
+                                .metadata
+                                .as_ref()
+                                .map(|metadata| metadata.cwd.as_str())
+                        })
+                        .map(workspace_display_path);
+                    if let Some(metadata) = summary.metadata.as_ref() {
+                        self.workspace_paths
+                            .insert(summary.session_id.clone(), metadata.cwd.clone());
+                        if let Some(origin) = metadata.launch_origin.as_ref() {
+                            self.origin_revisions
+                                .insert(summary.session_id.clone(), origin.revision);
+                        }
+                    }
                     self.binding_worker_generation = Some(summary.worker_generation);
                     model.upsert_live_session(&summary.session_id);
+                    if let Some(display) = workspace_display {
+                        if model.active_session.as_ref() == Some(&summary.session_id) {
+                            model.session_dir = display;
+                        } else if let Some(row) = model
+                            .sessions
+                            .iter_mut()
+                            .find(|row| row.id == summary.session_id)
+                        {
+                            row.dir = display;
+                        }
+                    }
                     // Launcher fix 2: the additive turn/footprint fields
                     // hydrate the row's counts at list time — tolerantly
                     // (an older daemon's summary stores nothing).
@@ -3235,18 +3350,29 @@ impl LiveDriver {
             } => {
                 self.binding_worker_generation = Some(worker_generation);
                 self.cold.remove(&session);
+                if let Some(origin) = launch_origin.as_ref() {
+                    self.origin_revisions
+                        .insert(session.clone(), origin.revision);
+                    if self
+                        .origin_opens
+                        .get(&session)
+                        .is_some_and(|open| open.open_id == origin.open_id)
+                        && let Some(open) = self.origin_opens.get_mut(&session)
+                    {
+                        open.completed = true;
+                    }
+                }
                 // Hydrate the one replaceable origin slot from the attach
                 // snapshot at its watermark (addendum O5); replayed origin
                 // facts with lower/equal revisions are ignored in place.
                 if model.active_session.as_ref() == Some(&session)
                     && let Some(origin) = launch_origin
-                    && let Some(display) = origin.path.display
                     && model
                         .launch_origin
                         .as_ref()
                         .is_none_or(|(revision, _)| origin.revision > *revision)
                 {
-                    model.launch_origin = Some((origin.revision, display));
+                    model.launch_origin = Some((origin.revision, origin.path.display));
                     model.dirty = true;
                 }
                 // THE STRICT GAP LAW COVERS THE FIRST ENVELOPE (review
@@ -3329,9 +3455,11 @@ impl LiveDriver {
                 cwd,
                 model: model_name,
             } => {
+                let cwd_display = workspace_display_path(&cwd);
                 self.binding_worker_generation = Some(worker_generation);
                 self.retire(&command_id);
                 self.generations.insert(session.clone(), worker_generation);
+                self.workspace_paths.insert(session.clone(), cwd.clone());
                 // THE LAUNCHER ORDER (R11 cut 4). Only now — with the
                 // daemon's own id in hand — does a row exist. Nothing was
                 // fabricated locally, so nothing has to be reconciled.
@@ -3339,11 +3467,13 @@ impl LiveDriver {
                 if let Some(row) = model.sessions.iter_mut().find(|row| row.id == session) {
                     // The ROW shows the display form; `cwd` is the absolute
                     // path the daemon was given.
+                    row.dir = cwd_display.clone();
                     row.workspace_cwd = Some(cwd.clone());
                     row.model_short = model_name;
                 }
                 let commands = self.ensure_attached(model, &session);
                 model.open_session(&session);
+                model.session_dir = cwd_display;
                 model.session_workspace_cwd = Some(cwd);
                 // THE ORDER (R11 cut 4): create response → attach response
                 // → turn.submit. The turn waits for the ATTACHMENT, not
@@ -3741,6 +3871,7 @@ impl LiveDriver {
                     },
                 );
                 if model.active_session.as_ref() == Some(&session) {
+                    model.session_dir = workspace_display_path(&path);
                     model.session_workspace_cwd = Some(path.clone());
                     model.flash = Some(format!("· workspace re-rooted → {path}"));
                     model.dirty = true;
@@ -4774,6 +4905,18 @@ impl LiveDriver {
                         head_seq: cursor_of(model, &session).unwrap_or(0),
                     },
                 );
+                if code == haider_rpc::ERROR_CODE_REVISION_CONFLICT
+                    && let Some(open) = self.origin_opens.get_mut(&session)
+                    && !open.completed
+                {
+                    open.conflicted = true;
+                    model.flash = Some(
+                        "· opened without replacing launch origin — another TUI updated it"
+                            .to_owned(),
+                    );
+                    model.dirty = true;
+                    return self.ensure_attached(model, &session);
+                }
                 if self.resyncs.contains_key(&session) {
                     return self.resync(
                         model,
@@ -6236,8 +6379,8 @@ impl LiveDriver {
                     .launch_origin
                     .as_ref()
                     .is_none_or(|(revision, _)| selected.revision > *revision);
-                if newer && let Some(display) = selected.path.display {
-                    model.launch_origin = Some((selected.revision, display));
+                if newer {
+                    model.launch_origin = Some((selected.revision, selected.path.display));
                     model.dirty = true;
                 }
             }
@@ -6441,14 +6584,32 @@ impl LiveDriver {
             AppRequest::CreateSession { text } => {
                 let command_id = self.mint();
                 self.creating.insert(command_id.clone(), text.clone());
-                vec![self.enqueue(LiveCommand::Create {
-                    command_id,
-                    cwd: model.cwd.clone(),
-                    provider: model.identity.provider.clone(),
-                    model: model.identity.model_short.clone(),
-                    max_tokens: session_output_cap(model.identity.context_window),
-                    first_text: text,
-                })]
+                let workspace_allocation = model.pending_workspace_allocation.clone();
+                if let Some(current) = workspace_allocation.as_ref() {
+                    match haider_client::workspace::renew_workspace_allocation(current)
+                        .and_then(haider_client::workspace::available_workspace_allocation)
+                    {
+                        Ok(next) => {
+                            model.cwd = next.leaf.clone();
+                            model.pending_workspace_allocation = Some(next);
+                        }
+                        Err(_) => model.pending_workspace_allocation = None,
+                    }
+                }
+                vec![self.enqueue(
+                    LiveCommand::Create {
+                        command_id,
+                        cwd: workspace_allocation.as_ref().map_or_else(
+                            || model.cwd.clone(),
+                            |allocation| allocation.leaf.clone(),
+                        ),
+                        workspace_allocation,
+                        provider: model.identity.provider.clone(),
+                        model: model.identity.model_short.clone(),
+                        max_tokens: session_output_cap(model.identity.context_window),
+                        first_text: text,
+                    },
+                )]
             }
             AppRequest::SubmitText {
                 text,
@@ -7616,6 +7777,21 @@ impl LiveDriver {
                 .map(|text| MenuInput::Text { text }),
         })
     }
+}
+
+/// Convert the canonical daemon workspace into display-only chrome. The
+/// canonical value remains in `workspace_cwd` for every filesystem/RPC use;
+/// this path is only painted, so it follows the same home abbreviation,
+/// other-user masking, and control escaping as launch-origin context.
+fn workspace_display_path(path: &str) -> String {
+    let environment = haider_client::workspace::WorkspaceEnvironment::capture();
+    haider_client::launch_origin::sanitize_origin_path(
+        Some(std::path::Path::new(path)),
+        environment.home.as_deref(),
+    )
+    .ok()
+    .and_then(|sanitized| sanitized.display)
+    .unwrap_or_else(|| "<workspace path unavailable>".to_owned())
 }
 
 /// What to CALL a demo-only request when live mode has to refuse it — the

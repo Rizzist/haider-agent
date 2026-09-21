@@ -7260,7 +7260,8 @@ async fn perform_manual_compaction(
             Ok::<_, HaiderError>(lockdown)
         },
     )?;
-    let workspace_unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd));
+    let workspace_pending = crate::workspace::is_pending(metadata);
+    let workspace_unavailable = crate::workspace::unavailable_for_metadata(metadata);
     if workspace_unavailable.is_some()
         && let Some(hooks) = lease.hub().hooks().map_err(hub_error)?
     {
@@ -7269,7 +7270,8 @@ async fn perform_manual_compaction(
     // Project instruction discovery walks ancestor directories. Lockdown
     // reads are workspace-scoped, so the daemon must not inject that implicit
     // out-of-workspace read into a restricted provider prompt.
-    let instructions = if lockdown.is_some() || workspace_unavailable.is_some() {
+    let instructions = if lockdown.is_some() || workspace_unavailable.is_some() || workspace_pending
+    {
         None
     } else {
         project_instructions::load(&metadata.cwd).await
@@ -7277,7 +7279,7 @@ async fn perform_manual_compaction(
     let instruction_entries = instructions
         .as_ref()
         .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
-    let handoff_dir = if workspace_unavailable.is_none() {
+    let handoff_dir = if workspace_unavailable.is_none() && !workspace_pending {
         delegation
             .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
             .await?
@@ -7661,6 +7663,56 @@ async fn perform_shell_exec(
         )
         .await;
     }
+    let pending_workspace_directory = if crate::workspace::is_pending(metadata) {
+        let allocation = metadata.workspace_allocation.clone().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "pending workspace lost its allocation",
+                false,
+            )
+        })?;
+        match tokio::task::spawn_blocking(move || {
+            haider_client::workspace::materialize_workspace_allocation(&allocation)
+        })
+        .await
+        {
+            Ok(Ok(directory)) => Some(directory),
+            Ok(Err(error)) => {
+                return fail_shell_exec(
+                    lease,
+                    device_id,
+                    &event_ids,
+                    &run_id,
+                    pending.branch_id.as_ref(),
+                    pending.agent_id.as_ref(),
+                    HaiderError::new(
+                        ErrorCode::WorkspaceUnavailable,
+                        format!("workspace materialisation failed: {error}"),
+                        false,
+                    ),
+                )
+                .await;
+            }
+            Err(error) => {
+                return fail_shell_exec(
+                    lease,
+                    device_id,
+                    &event_ids,
+                    &run_id,
+                    pending.branch_id.as_ref(),
+                    pending.agent_id.as_ref(),
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("workspace materialisation task failed: {error}"),
+                        false,
+                    ),
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
     if let Some(unavailable) = crate::workspace::unavailable(Path::new(&metadata.cwd)) {
         return fail_shell_exec(
             lease,
@@ -7744,7 +7796,15 @@ async fn perform_shell_exec(
     // Direct-shell setup also canonicalizes its optional per-command cwd;
     // retain the broker's matching canonical identity here. Ordinary chat
     // turn setup uses `new_canonical` after the shared cheap root probe.
-    let broker = if crate::android_policy::enabled() {
+    let broker = if let Some(directory) = pending_workspace_directory {
+        EffectBroker::new_anchored(
+            Box::new(journal),
+            PathBuf::from(&metadata.cwd),
+            directory,
+            lease.session_id().clone(),
+            lease.worker_generation(),
+        )
+    } else if crate::android_policy::enabled() {
         crate::android_workspace::open(Path::new(&metadata.cwd))
             .map_err(|error| ToolError::Runtime {
                 message: error.to_string(),
@@ -8474,7 +8534,8 @@ async fn start_turn(
     // Creation and explicit re-rooting already establish canonical identity.
     // Turn startup performs only a cheap availability/open check: a vanished
     // root degrades workspace capabilities but must not abort plain chat.
-    let mut workspace_unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd));
+    let workspace_pending = crate::workspace::is_pending(metadata);
+    let mut workspace_unavailable = crate::workspace::unavailable_for_metadata(metadata);
     if workspace_unavailable.is_some()
         && let Some(hooks) = lease.hub().hooks().map_err(hub_error)?
     {
@@ -8807,7 +8868,7 @@ async fn start_turn(
     .await;
     // G1 (L5): a delegation-owned session is a child — its tool pack below
     // excludes the root-only planning surface.
-    let handoff_dir = if workspace_unavailable.is_none() {
+    let handoff_dir = if workspace_unavailable.is_none() && !workspace_pending {
         delegation
             .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
             .await?
@@ -8816,7 +8877,8 @@ async fn start_turn(
     };
     // See the manual-compaction path above: ancestor instruction discovery
     // is an implicit filesystem read and is therefore disabled in lockdown.
-    let instructions = if lockdown.is_some() || workspace_unavailable.is_some() {
+    let instructions = if lockdown.is_some() || workspace_unavailable.is_some() || workspace_pending
+    {
         None
     } else {
         project_instructions::load(&metadata.cwd).await
@@ -9051,7 +9113,7 @@ async fn start_turn(
     // interval must still switch the turn to its rootless dispatcher instead
     // of terminalizing it from the constructor.
     if workspace_unavailable.is_none()
-        && let Some(unavailable) = crate::workspace::unavailable(Path::new(&metadata.cwd))
+        && let Some(unavailable) = crate::workspace::unavailable_for_metadata(metadata)
     {
         if let Some(hooks) = lease.hub().hooks().map_err(hub_error)? {
             hooks.pin_workspace_unavailable(lease.session_id(), &accepted.run_id);
@@ -9151,12 +9213,13 @@ async fn start_turn(
                 // The root can disappear in the tiny interval between the
                 // second cheap probe and the broker's directory open. Convert
                 // that constructor race into the same rootless turn snapshot.
-                let unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd))
-                    .unwrap_or(WorkspaceUnavailable {
+                let unavailable = crate::workspace::unavailable_for_metadata(metadata).unwrap_or(
+                    WorkspaceUnavailable {
                         path: metadata.cwd.clone(),
                         reason: haider_protocol::workspace::WorkspaceUnavailableReason::NotReadable,
                         detail: error.message,
-                    });
+                    },
+                );
                 if let Some(hooks) = lease.hub().hooks().map_err(hub_error)? {
                     hooks.pin_workspace_unavailable(lease.session_id(), &accepted.run_id);
                 }
@@ -16163,7 +16226,19 @@ async fn create_broker_tool_dispatcher(
     .await?;
     let active_tool_name = Arc::new(StdMutex::new(None));
     let journal = HubJournalSink::new(&context, Arc::clone(&active_tool_name), effect_dispatched);
-    let mut broker = if crate::android_policy::enabled() {
+    let pending_workspace = context
+        .metadata
+        .workspace_allocation
+        .clone()
+        .filter(|_| crate::workspace::is_pending(&context.metadata));
+    let mut broker = if let Some(allocation) = pending_workspace.as_ref() {
+        EffectBroker::new_pending(
+            Box::new(journal),
+            PathBuf::from(&allocation.leaf),
+            context.store.session_id().clone(),
+            context.store.worker_generation(),
+        )
+    } else if crate::android_policy::enabled() {
         let directory = crate::android_workspace::open(Path::new(&context.metadata.cwd))?;
         EffectBroker::new_anchored(
             Box::new(journal),
@@ -16243,6 +16318,7 @@ async fn create_broker_tool_dispatcher(
     };
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
+        pending_workspace: Mutex::new(pending_workspace),
         web_search: context.web_search.clone(),
         turn_ordinal: context.turn_ordinal,
         provider_request_ordinals: context.provider_request_ordinals,
@@ -16460,6 +16536,10 @@ pub(crate) fn effective_permission_defaults(
 
 struct BrokerToolDispatcher {
     broker: Mutex<Option<EffectBroker>>,
+    /// Present only while the exact dated leaf is intentionally absent. The
+    /// mutex serializes parallel first effects so exactly one anchored create
+    /// can install the broker root.
+    pending_workspace: Mutex<Option<haider_protocol::session::WorkspaceAllocationV1>>,
     web_search: Option<Arc<dyn WebSearchExecutor>>,
     turn_ordinal: u64,
     provider_request_ordinals: ProviderRequestOrdinal,
@@ -16827,6 +16907,44 @@ fn typed_workflow_coordinates_match(
 mod typed_workflow_boundary_tests;
 
 impl BrokerToolDispatcher {
+    async fn ensure_workspace_materialized(&self) -> Result<(), HaiderError> {
+        let mut pending = self.pending_workspace.lock().await;
+        let Some(allocation) = pending.as_ref().cloned() else {
+            return Ok(());
+        };
+        let directory = tokio::task::spawn_blocking(move || {
+            haider_client::workspace::materialize_workspace_allocation(&allocation)
+        })
+        .await
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("workspace materialisation task failed: {error}"),
+                false,
+            )
+        })?
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::WorkspaceUnavailable,
+                format!("workspace materialisation failed: {error}"),
+                false,
+            )
+        })?;
+        let mut broker = self.broker.lock().await;
+        let broker = broker.as_mut().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "tool dispatcher is already closed",
+                false,
+            )
+        })?;
+        broker
+            .materialize_workspace(directory)
+            .map_err(tool_error)?;
+        pending.take();
+        Ok(())
+    }
+
     async fn record_side_request_attempt(
         &self,
         run_id: &RunId,
@@ -18507,6 +18625,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
         } else {
             None
         };
+        // Argument rejection is not a writing effect and must leave a lazy
+        // allocation invisible. Materialise only after the operation has
+        // parsed into one of the routes capable of mutating the workspace.
+        if matches!(
+            route,
+            RegisteredToolRoute::FsWrite
+                | RegisteredToolRoute::FsEdit
+                | RegisteredToolRoute::FsPath
+                | RegisteredToolRoute::ProcessExec
+                | RegisteredToolRoute::TestRun
+        ) {
+            self.ensure_workspace_materialized().await?;
+        }
         if let Some(lockdown) = self.lockdown.as_ref()
             && matches!(
                 route,

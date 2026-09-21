@@ -707,8 +707,6 @@ pub struct CommandContext {
     /// The OAuth start's attempt id, so the reply is identity-tagged.
     pub oauth_attempt: Option<String>,
     command_id: Option<haider_rpc::CommandId>,
-    cwd: String,
-    model: String,
     /// Carried across `vault.stage` so the login that follows knows which
     /// account it is committing — and, since TUI6.4, WHICH ATTEMPT asked:
     /// the reply is identity-tagged from this context, so stage
@@ -782,18 +780,12 @@ impl CommandContext {
     /// Capture everything the response will not carry back.
     #[must_use]
     pub fn of(command: &LiveCommand) -> Self {
-        let (cwd, model) = match command {
-            LiveCommand::Create { cwd, model, .. } => (cwd.clone(), model.clone()),
-            _ => (String::new(), String::new()),
-        };
         let oauth_attempt = match command {
             LiveCommand::OAuthStart { attempt_id, .. } => Some(attempt_id.clone()),
             _ => None,
         };
         Self {
             command_id: command.command_id().cloned(),
-            cwd,
-            model,
             login: match command {
                 LiveCommand::Stage {
                     provider,
@@ -819,7 +811,8 @@ impl CommandContext {
                 _ => None,
             },
             attach: match command {
-                LiveCommand::Attach { session, .. } => Some(session.clone()),
+                LiveCommand::Attach { session, .. }
+                | LiveCommand::AttachWithOrigin { session, .. } => Some(session.clone()),
                 _ => None,
             },
             surface_watch: match command {
@@ -967,6 +960,28 @@ pub fn request_body_for_features(
             mode: AttachMode::Control,
             sealed_replay: false,
         },
+        LiveCommand::AttachWithOrigin {
+            session,
+            after_seq,
+            launch_origin,
+        } => {
+            if daemon_features.contains(haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1) {
+                RequestBody::SessionAttachWithOrigin {
+                    session_id: session,
+                    after_seq,
+                    mode: AttachMode::Control,
+                    sealed_replay: false,
+                    launch_origin,
+                }
+            } else {
+                RequestBody::SessionAttach {
+                    session_id: session,
+                    after_seq,
+                    mode: AttachMode::Control,
+                    sealed_replay: false,
+                }
+            }
+        }
         LiveCommand::Detach { attachment } => RequestBody::SessionDetach {
             attachment_id: attachment,
             close_session: false,
@@ -985,6 +1000,7 @@ pub fn request_body_for_features(
         LiveCommand::Create {
             command_id,
             cwd,
+            workspace_allocation,
             provider,
             model,
             max_tokens,
@@ -1011,6 +1027,7 @@ pub fn request_body_for_features(
                     auto_allow: true,
                 },
             ),
+            workspace_allocation,
             cache_policy: None,
             interaction_mode:
                 haider_rpc::haider_protocol::session::SessionInteractionModeV1::Interactive,
@@ -1884,14 +1901,15 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionCreate {
             session_id,
             worker_generation,
+            metadata,
             ..
         } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::Created {
                 command_id: id,
                 session: session_id,
                 worker_generation,
-                cwd: context.cwd.clone(),
-                model: context.model.clone(),
+                cwd: metadata.cwd,
+                model: metadata.model,
             }]
         }),
         // The branch-pinned response shape carries the same driver facts as

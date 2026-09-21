@@ -1545,6 +1545,7 @@ impl AppendCommitter {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let byte_weight = command
             .request_json
@@ -1559,6 +1560,7 @@ impl AppendCommitter {
                 command,
                 interaction_mode,
                 account_alias,
+                workspace_allocation,
             },
             byte_weight,
             AppendCommitCompletion::CreateSession(completed),
@@ -1826,6 +1828,7 @@ enum ActorCommand {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
     CreateBranch {
@@ -4241,7 +4244,7 @@ impl SessionHub {
             return Ok(created);
         }
         match self
-            .create_session_with_interaction_mode(command, interaction_mode, None)
+            .create_session_with_interaction_mode(command, interaction_mode, None, None)
             .await
             .map_err(hub_error_as_store)?
         {
@@ -4820,6 +4823,7 @@ impl SessionHub {
             command,
             haider_protocol::session::SessionInteractionModeV1::Interactive,
             None,
+            None,
         )
         .await
     }
@@ -4829,6 +4833,7 @@ impl SessionHub {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
     ) -> Result<SessionCreateOutcome, SessionHubError> {
         if crate::android_policy::enabled() {
             crate::android_workspace::validate(std::path::Path::new(&command.cwd))?;
@@ -4841,6 +4846,7 @@ impl SessionHub {
                 command,
                 interaction_mode,
                 account_alias,
+                workspace_allocation,
                 completed,
             })
             .await

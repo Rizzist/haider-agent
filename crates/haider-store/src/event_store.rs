@@ -2053,6 +2053,7 @@ pub enum JournalCommitBatch {
         command: SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -4623,6 +4624,7 @@ impl Store {
                              SELECT rowid
                                FROM events
                               WHERE session_id = s.id
+                                AND payload_kind IS NOT 'session_launch_origin_selected'
                               ORDER BY seq DESC
                               LIMIT 1
                          )
@@ -4675,6 +4677,7 @@ impl Store {
                                 SELECT committed_at_ms
                                   FROM events
                                  WHERE session_id = s.id
+                                   AND payload_kind IS NOT 'session_launch_origin_selected'
                                  ORDER BY seq DESC
                                  LIMIT 1
                             ), 0)
@@ -8149,11 +8152,13 @@ impl Store {
                 command,
                 interaction_mode,
                 account_alias,
+                workspace_allocation,
             } => self
-                .create_session_with_configuration(
+                .create_session_with_workspace_configuration(
                     command,
                     *interaction_mode,
                     account_alias.clone(),
+                    workspace_allocation.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8191,12 +8196,14 @@ impl Store {
                 command,
                 interaction_mode,
                 account_alias,
+                workspace_allocation,
             } => self
                 .create_session_in_transaction(
                     transaction,
                     command,
                     *interaction_mode,
                     account_alias.clone(),
+                    workspace_allocation.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8450,6 +8457,24 @@ impl Store {
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
     ) -> StoreResult<SessionCreateOutcome> {
+        self.create_session_with_workspace_configuration(
+            command,
+            interaction_mode,
+            account_alias,
+            None,
+        )
+    }
+
+    /// Atomic session creation with an optional resolved dated allocation.
+    /// The allocation is metadata only: this transaction performs no
+    /// filesystem materialisation.
+    pub fn create_session_with_workspace_configuration(
+        &self,
+        command: &SessionCreateCommand,
+        interaction_mode: SessionInteractionModeV1,
+        account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+    ) -> StoreResult<SessionCreateOutcome> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -8459,6 +8484,7 @@ impl Store {
             command,
             interaction_mode,
             account_alias,
+            workspace_allocation,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(outcome)
@@ -8470,6 +8496,7 @@ impl Store {
         command: &SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
     ) -> StoreResult<SessionCreateOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -8532,10 +8559,10 @@ impl Store {
             agent_type: None,
             context_economy: ContextEconomy::default(),
             // Dated-workspace v1: origin arrives with the first foreground
-            // attach; allocation facts ride the create command in a later
-            // additive step. Both stay off the wire while absent.
+            // attach; allocation facts ride the additive create request.
+            // Both stay off the wire while absent.
             launch_origin: None,
-            workspace_allocation: None,
+            workspace_allocation,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {

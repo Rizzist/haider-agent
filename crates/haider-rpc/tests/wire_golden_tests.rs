@@ -1365,12 +1365,13 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     // appends 3 manifest-identity frames, for the frozen 180-frame v0.0.966
     // prefix. K1 appends exactly one agent.cancel request/response pair:
     // 180 + 2 = 182. v0.0.970 appends exactly one provider.list response
-    // carrying the new `acp_agent` execution family: 182 + 1 = 183. The 17
+    // carrying the new `acp_agent` execution family: 182 + 1 = 183. Stage 2
+    // appends the additive dated-workspace create request: 183 + 1 = 184. The 17
     // moved method pairs remain absent from the supplemental fixture, so the
     // two sources stay disjoint. K1 adds one request method: 123 + 1 = 124;
     // the later status.snapshot and session.workspace.set methods make the
     // exhaustive count 126.
-    assert_eq!(expected_frames.len(), 183);
+    assert_eq!(expected_frames.len(), 184);
     let expected_bytes: Vec<GoldenWireBytes> = expected_frames
         .iter()
         .map(|frame| {
@@ -1431,7 +1432,7 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
 #[test]
 fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
     let frames = transcript();
-    assert_eq!(frames.len(), 183);
+    assert_eq!(frames.len(), 184);
     let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
         panic!("monitor delivery must be the first appended stream frame");
     };
@@ -1464,7 +1465,7 @@ fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
 #[test]
 fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
     let frames = transcript();
-    assert_eq!(frames.len(), 183);
+    assert_eq!(frames.len(), 184);
     let WireFrame::LoomRegistryDelta { watch_id, delta } = &frames[131] else {
         panic!("Loom registry delta must follow every prior golden frame");
     };
@@ -1497,7 +1498,7 @@ fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
 #[test]
 fn peer_messaging_methods_and_events_are_tail_appended() {
     let frames = transcript();
-    assert_eq!(frames.len(), 183);
+    assert_eq!(frames.len(), 184);
     assert!(matches!(
         &frames[133],
         WireFrame::Request {
@@ -1598,8 +1599,8 @@ fn prompt_fork_frames_remain_the_exact_four_frame_block() {
     let frames = transcript();
     assert_eq!(
         frames.len(),
-        183,
-        "173 frozen + 4 prompt-fork + 3 fleet-identity + 2 agent-cancel + 1 acp_agent frames"
+        184,
+        "173 frozen + 4 prompt-fork + 3 fleet-identity + 2 agent-cancel + 1 acp_agent + 1 dated-workspace frame"
     );
     assert!(matches!(
         &frames[173],
@@ -1700,8 +1701,8 @@ fn fleet_identity_is_the_exact_three_frame_tail_on_both_paths() {
     let frames = transcript();
     assert_eq!(
         frames.len(),
-        183,
-        "177 pre-X1 + 3 X1 + 2 K1 frames + 1 acp_agent family frame"
+        184,
+        "177 pre-X1 + 3 X1 + 2 K1 frames + 1 acp_agent family + 1 dated-workspace frame"
     );
     assert!(matches!(
         &frames[177],
@@ -1748,8 +1749,8 @@ fn agent_cancel_is_the_exact_two_frame_tail() {
     let frames = transcript();
     assert_eq!(
         frames.len(),
-        183,
-        "180 v0.0.966 + 2 agent.cancel + 1 acp_agent family frame"
+        184,
+        "180 v0.0.966 + 2 agent.cancel + 1 acp_agent family + 1 dated-workspace frame"
     );
     assert!(matches!(
         &frames[180],
@@ -2186,6 +2187,7 @@ fn legacy_session_create_defaults_permission_overrides_to_none() {
                 model: "fake-model".into(),
                 max_tokens: 4096,
                 permission_overrides: None,
+                workspace_allocation: None,
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
@@ -3952,14 +3954,15 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // ends at the NEXT appended welcome and nothing before `d1_start` moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
+        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1 + 1,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
          G3's four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's \
          two monitor-delivery frames, L4's two loom-registry stream frames, \
          then 965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames, \
-         then four prompt-fork frames, three fleet-identity frames, and two agent-cancel frames \
+         then four prompt-fork frames, three fleet-identity frames, two agent-cancel frames, \
+         one acp_agent frame, and one dated-workspace frame \
          — the accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
@@ -4251,12 +4254,13 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
+        3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1 + 1,
         "G2's three frames, then G3's four tuning frames, F1's three fleet frames, \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
          monitor-delivery frames, L4's two loom-registry stream frames, then \
          965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames, \
-         then four prompt-fork frames, three fleet-identity frames, and two agent-cancel frames"
+         then four prompt-fork frames, three fleet-identity frames, two agent-cancel frames, \
+         one acp_agent frame, and one dated-workspace frame"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -4407,13 +4411,14 @@ fn transcription_secret_frames_are_additive_and_redacted() {
         .expect("T1 first set request in the golden transcript");
     assert_eq!(
         frames.len() - t1_start,
-        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
+        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1 + 1,
         "T1's seven frames, U1's three usage frames, G2's three rename frames, \
          G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read \
          frames, Slice 2's folded response, #6's two monitor-delivery frames, \
          L4's two loom-registry stream frames, then 965's six peer frames and \
          34 peer-name/SSH/shell/lockdown union frames, four prompt-fork frames, \
-         then three fleet-identity frames and two agent-cancel frames"
+         then three fleet-identity frames, two agent-cancel frames, one acp_agent frame, \
+         and one dated-workspace frame"
     );
     let tail = &frames[t1_start..t1_start + 7];
     let methods: Vec<String> = tail
@@ -4543,13 +4548,14 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
+        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1 + 1,
         "three U1 frames, then G2's three session-rename frames, then G3's \
          four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
          monitor-delivery frames, L4's two loom-registry stream frames, then \
          965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames, \
-         then four prompt-fork frames, three fleet-identity frames, and two agent-cancel frames \
+         then four prompt-fork frames, three fleet-identity frames, two agent-cancel frames, \
+         one acp_agent frame, and one dated-workspace frame \
          (each later wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
@@ -4973,12 +4979,13 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         .expect("fleet feature welcome");
     assert_eq!(
         frames.len() - fleet_start,
-        3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
+        3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1 + 1,
         "three fleet frames, then WIRE-GAPS' four read frames, Slice 2's \
          folded response, #6's two monitor-delivery frames, and L4's two \
          loom-registry stream frames, then 965's six peer frames and 34 \
          peer-name/SSH/shell/lockdown union frames, four prompt-fork frames, \
-         then three fleet-identity frames and two agent-cancel frames"
+         then three fleet-identity frames, two agent-cancel frames, one acp_agent frame, \
+         and one dated-workspace frame"
     );
     assert!(matches!(
         &frames[fleet_start],

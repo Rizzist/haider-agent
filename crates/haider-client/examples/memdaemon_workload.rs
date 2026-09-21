@@ -154,6 +154,7 @@ async fn drive_turns(
                 allow_exec: true,
                 ..SessionPermissionOverridesV1::default()
             }),
+            workspace_allocation: None,
             cache_policy: None,
             interaction_mode: SessionInteractionModeV1::Autonomous,
             ssh_scope: None,

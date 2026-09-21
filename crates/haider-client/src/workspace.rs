@@ -16,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::hijri::{HIJRI_CALENDAR_ID, HijriError, hijri_from_gregorian};
 use haider_platform::{CivilDateSample, DocumentsLookup, documents_directory};
+use haider_protocol::session::WorkspaceAllocationV1;
 
 /// Exact existing absolute workspace path (environment selector).
 pub const WORKSPACE_ENV: &str = "HAIDER_WORKSPACE";
@@ -300,6 +301,8 @@ pub enum WorkspaceError {
     Calendar(HijriError),
     /// `HAIDER_WORKSPACE_BASE`/config base must be nonempty and absolute.
     InvalidBase(String),
+    /// A resolved platform path cannot be represented on the JSON wire.
+    NonUtf8Path(PathBuf),
 }
 
 impl std::fmt::Display for WorkspaceError {
@@ -331,6 +334,9 @@ impl std::fmt::Display for WorkspaceError {
             ),
             Self::Calendar(error) => write!(f, "calendar error: {error}"),
             Self::InvalidBase(reason) => write!(f, "invalid workspace base: {reason}"),
+            Self::NonUtf8Path(path) => {
+                write!(f, "workspace path is not valid UTF-8: {}", path.display())
+            }
         }
     }
 }
@@ -689,6 +695,90 @@ pub fn allocation_entropy() -> Result<[u8; 16], WorkspaceError> {
     Ok(bytes)
 }
 
+/// Converts a resolved dated plan into the additive create-request metadata.
+/// This is a representation step only and performs no filesystem mutation.
+pub fn workspace_allocation(
+    plan: &DatedWorkspacePlan,
+) -> Result<WorkspaceAllocationV1, WorkspaceError> {
+    let daily_root_path = std::fs::canonicalize(&plan.daily_root).map_err(|error| {
+        WorkspaceError::InvalidBase(format!(
+            "cannot canonicalize daily workspace root {}: {error}",
+            plan.daily_root.display()
+        ))
+    })?;
+    let leaf_name = plan
+        .leaf
+        .file_name()
+        .ok_or_else(|| WorkspaceError::InvalidBase("workspace leaf has no filename".into()))?;
+    let leaf_path = daily_root_path.join(leaf_name);
+    let daily_root = daily_root_path
+        .to_str()
+        .ok_or_else(|| WorkspaceError::NonUtf8Path(daily_root_path.clone()))?;
+    let leaf = leaf_path
+        .to_str()
+        .ok_or_else(|| WorkspaceError::NonUtf8Path(leaf_path.clone()))?;
+    Ok(WorkspaceAllocationV1 {
+        daily_root: daily_root.to_owned(),
+        leaf: leaf.to_owned(),
+        allocation_id: plan.allocation_id.clone(),
+        calendar_id: plan.calendar_id.to_owned(),
+        hijri_date: plan.hijri_label.clone(),
+        gregorian_date: plan.gregorian_label.clone(),
+        allocated_at_ms: plan.sampled_utc_ms,
+        offset_seconds: plan.offset_seconds,
+    })
+}
+
+/// Mints a sibling allocation for the next session created by the same TUI
+/// process. The launch-time date/root remain stable, while allocation identity
+/// and timestamp are fresh. This is pure: the new leaf is not created here.
+pub fn renew_workspace_allocation(
+    previous: &WorkspaceAllocationV1,
+) -> Result<WorkspaceAllocationV1, MaterializeError> {
+    let previous_plan = plan_from_workspace_allocation(previous)?;
+    let allocation_id = hex_lower(
+        &allocation_entropy().map_err(|error| MaterializeError::InvalidPlan(error.to_string()))?,
+    );
+    let leaf = previous_plan.daily_root.join(format!("s-{allocation_id}"));
+    let leaf = leaf
+        .to_str()
+        .ok_or_else(|| MaterializeError::InvalidPlan("workspace leaf is not valid UTF-8".into()))?;
+    let allocated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| MaterializeError::InvalidPlan(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| MaterializeError::InvalidPlan("allocation timestamp overflow".into()))?;
+    Ok(WorkspaceAllocationV1 {
+        daily_root: previous.daily_root.clone(),
+        leaf: leaf.to_owned(),
+        allocation_id,
+        calendar_id: previous.calendar_id.clone(),
+        hijri_date: previous.hijri_date.clone(),
+        gregorian_date: previous.gregorian_date.clone(),
+        allocated_at_ms,
+        offset_seconds: previous.offset_seconds,
+    })
+}
+
+/// Returns the supplied unmaterialised allocation when its leaf is absent,
+/// otherwise mints bounded fresh siblings. This is the pre-session collision
+/// pass; it never creates the leaf and the daemon still revalidates the exact
+/// result at admission to close the race window safely.
+pub fn available_workspace_allocation(
+    initial: WorkspaceAllocationV1,
+) -> Result<WorkspaceAllocationV1, MaterializeError> {
+    let mut candidate = initial;
+    for _ in 0..8 {
+        match std::fs::symlink_metadata(&candidate.leaf) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => candidate = renew_workspace_allocation(&candidate)?,
+            Err(error) => return Err(MaterializeError::Io(candidate.leaf.into(), error)),
+        }
+    }
+    Err(MaterializeError::CollisionRetriesExhausted)
+}
+
 /// Materialisation failures (L4/L5).
 #[derive(Debug)]
 pub enum MaterializeError {
@@ -706,6 +796,9 @@ pub enum MaterializeError {
     CollisionRetriesExhausted,
     /// The created leaf failed post-create validation and was removed.
     LeafValidationFailed(PathBuf),
+    /// The exact persisted allocation leaf already exists before its first
+    /// materialisation attempt.
+    LeafAlreadyExists(PathBuf),
 }
 
 impl std::fmt::Display for MaterializeError {
@@ -730,6 +823,13 @@ impl std::fmt::Display for MaterializeError {
             }
             Self::LeafValidationFailed(path) => {
                 write!(f, "created leaf failed validation: {}", path.display())
+            }
+            Self::LeafAlreadyExists(path) => {
+                write!(
+                    f,
+                    "workspace allocation leaf already exists: {}",
+                    path.display()
+                )
             }
         }
     }
@@ -769,7 +869,8 @@ pub fn materialize_leaf(plan: &DatedWorkspacePlan) -> Result<MaterializedLeaf, M
             .file_name()
             .ok_or_else(|| MaterializeError::InvalidPlan("leaf has no filename".into()))?;
         match create_private_leaf(&daily_root, name, &leaf) {
-            Ok(()) => {
+            Ok(directory) => {
+                drop(directory);
                 return Ok(MaterializedLeaf {
                     leaf,
                     allocation_id,
@@ -785,6 +886,113 @@ pub fn materialize_leaf(plan: &DatedWorkspacePlan) -> Result<MaterializedLeaf, M
         }
     }
     Err(MaterializeError::CollisionRetriesExhausted)
+}
+
+/// An existing daily-root anchor validated for a pending allocation. Keeping
+/// the descriptor alive closes the validation/commit rename race at callers.
+#[derive(Debug)]
+pub struct ValidatedWorkspaceAllocation {
+    pub plan: DatedWorkspacePlan,
+    pub daily_root: haider_platform::WorkspaceDirectory,
+}
+
+/// Validates an additive create allocation without creating its leaf.
+/// The exact leaf must be absent and the daily root must be reachable through
+/// a no-follow component walk.
+pub fn validate_workspace_allocation(
+    cwd: &Path,
+    allocation: &WorkspaceAllocationV1,
+) -> Result<ValidatedWorkspaceAllocation, MaterializeError> {
+    let plan = plan_from_workspace_allocation(allocation)?;
+    if cwd != plan.leaf {
+        return Err(MaterializeError::InvalidPlan(
+            "session cwd is not the allocation leaf".into(),
+        ));
+    }
+    let daily_root =
+        haider_platform::open_absolute_directory(&plan.daily_root).map_err(|error| {
+            MaterializeError::Io(
+                plan.daily_root.clone(),
+                workspace_directory_error_to_io(error),
+            )
+        })?;
+    match std::fs::symlink_metadata(&plan.leaf) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(MaterializeError::LeafAlreadyExists(plan.leaf.clone())),
+        Err(error) => return Err(MaterializeError::Io(plan.leaf.clone(), error)),
+    }
+    Ok(ValidatedWorkspaceAllocation { plan, daily_root })
+}
+
+/// Exact first-write materialisation for a persisted allocation. Unlike the
+/// pre-session allocator, this never retries to a different id: the stored
+/// leaf is session authority.
+pub fn materialize_workspace_allocation(
+    allocation: &WorkspaceAllocationV1,
+) -> Result<haider_platform::WorkspaceDirectory, MaterializeError> {
+    let plan = plan_from_workspace_allocation(allocation)?;
+    let daily_root =
+        haider_platform::open_absolute_directory(&plan.daily_root).map_err(|error| {
+            MaterializeError::Io(
+                plan.daily_root.clone(),
+                workspace_directory_error_to_io(error),
+            )
+        })?;
+    let name = plan
+        .leaf
+        .file_name()
+        .ok_or_else(|| MaterializeError::InvalidPlan("leaf has no filename".into()))?;
+    create_private_leaf(&daily_root, name, &plan.leaf).map_err(|error| match error {
+        PrivateLeafError::AlreadyExists => MaterializeError::LeafAlreadyExists(plan.leaf),
+        PrivateLeafError::Materialize(error) => error,
+    })
+}
+
+fn plan_from_workspace_allocation(
+    allocation: &WorkspaceAllocationV1,
+) -> Result<DatedWorkspacePlan, MaterializeError> {
+    if allocation.calendar_id != HIJRI_CALENDAR_ID {
+        return Err(MaterializeError::InvalidPlan(
+            "unsupported workspace calendar id".into(),
+        ));
+    }
+    let daily_root = PathBuf::from(&allocation.daily_root);
+    let leaf = PathBuf::from(&allocation.leaf);
+    let base = daily_root
+        .parent()
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new("Haider")))
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            MaterializeError::InvalidPlan(
+                "daily root is not below a literal Haider directory".into(),
+            )
+        })?
+        .to_path_buf();
+    let plan = DatedWorkspacePlan {
+        base,
+        base_source: WorkspaceBaseSource::HomeFallback,
+        daily_root,
+        leaf,
+        allocation_id: allocation.allocation_id.clone(),
+        calendar_id: HIJRI_CALENDAR_ID,
+        hijri_label: allocation.hijri_date.clone(),
+        gregorian_label: allocation.gregorian_date.clone(),
+        sampled_utc_ms: allocation.allocated_at_ms,
+        offset_seconds: allocation.offset_seconds,
+    };
+    validate_materialization_plan(&plan)?;
+    if plan
+        .daily_root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        != Some(plan.hijri_label.as_str())
+        || !is_date_label_like(&plan.gregorian_label)
+    {
+        return Err(MaterializeError::InvalidPlan(
+            "allocation date labels are inconsistent".into(),
+        ));
+    }
+    Ok(plan)
 }
 
 fn validate_materialization_plan(plan: &DatedWorkspacePlan) -> Result<(), MaterializeError> {
@@ -833,9 +1041,37 @@ fn materialize_daily_root_directory(
     plan: &DatedWorkspacePlan,
 ) -> Result<haider_platform::WorkspaceDirectory, MaterializeError> {
     validate_materialization_plan(plan)?;
-    let mut directory = haider_platform::open_workspace_directory(&plan.base).map_err(|error| {
-        MaterializeError::BaseUnavailable(plan.base.clone(), workspace_directory_error_to_io(error))
-    })?;
+    let mut directory = match haider_platform::open_workspace_directory(&plan.base) {
+        Ok(directory) => directory,
+        Err(base_error) if plan.base_source == WorkspaceBaseSource::ProfileStoreWorkspaces => {
+            let parent = plan.base.parent().ok_or_else(|| {
+                MaterializeError::InvalidPlan("profile workspace base has no parent".into())
+            })?;
+            if plan.base.file_name() != Some(std::ffi::OsStr::new("workspaces")) {
+                return Err(MaterializeError::InvalidPlan(
+                    "profile workspace base is not the workspaces child".into(),
+                ));
+            }
+            let parent_directory =
+                haider_platform::open_workspace_directory(parent).map_err(|_| {
+                    MaterializeError::BaseUnavailable(
+                        plan.base.clone(),
+                        workspace_directory_error_to_io(base_error),
+                    )
+                })?;
+            create_or_open_private_directory(
+                parent_directory,
+                std::ffi::OsStr::new("workspaces"),
+                &plan.base,
+            )?
+        }
+        Err(error) => {
+            return Err(MaterializeError::BaseUnavailable(
+                plan.base.clone(),
+                workspace_directory_error_to_io(error),
+            ));
+        }
+    };
     let haider = plan.base.join("Haider");
     directory =
         create_or_open_private_directory(directory, std::ffi::OsStr::new("Haider"), &haider)?;
@@ -918,7 +1154,7 @@ fn create_private_leaf(
     daily_root: &haider_platform::WorkspaceDirectory,
     name: &std::ffi::OsStr,
     path: &Path,
-) -> Result<(), PrivateLeafError> {
+) -> Result<haider_platform::WorkspaceDirectory, PrivateLeafError> {
     use rustix::fs::{AtFlags, Mode, OFlags};
 
     match rustix::fs::mkdirat(daily_root, name, Mode::from_raw_mode(0o700)) {
@@ -937,10 +1173,7 @@ fn create_private_leaf(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
-        Ok(directory) => {
-            drop(directory);
-            Ok(())
-        }
+        Ok(directory) => Ok(directory),
         Err(_) => {
             let _ = rustix::fs::unlinkat(daily_root, name, AtFlags::REMOVEDIR);
             Err(PrivateLeafError::Materialize(
@@ -955,7 +1188,7 @@ fn create_private_leaf(
     daily_root: &haider_platform::WorkspaceDirectory,
     name: &std::ffi::OsStr,
     path: &Path,
-) -> Result<(), PrivateLeafError> {
+) -> Result<haider_platform::WorkspaceDirectory, PrivateLeafError> {
     let leaf = daily_root.path().join(name);
     match std::fs::create_dir(&leaf) {
         Ok(()) => {}
@@ -973,10 +1206,7 @@ fn create_private_leaf(
         PrivateLeafError::Materialize(MaterializeError::Io(path.to_path_buf(), error))
     })?;
     match haider_platform::open_workspace_subdirectory(parent, Path::new(name), false) {
-        Ok(directory) => {
-            drop(directory);
-            Ok(())
-        }
+        Ok(directory) => Ok(directory),
         Err(_) => {
             let _ = std::fs::remove_dir(&leaf);
             Err(PrivateLeafError::Materialize(

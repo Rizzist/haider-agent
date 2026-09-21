@@ -3881,6 +3881,7 @@ impl HubConnection {
                 model,
                 max_tokens,
                 permission_overrides,
+                workspace_allocation,
                 cache_policy,
                 interaction_mode,
                 ssh_scope,
@@ -3907,6 +3908,7 @@ impl HubConnection {
                     model,
                     max_tokens,
                     permission_overrides,
+                    workspace_allocation,
                     cache_policy.unwrap_or_default(),
                     interaction_mode,
                     ssh_scope,
@@ -3941,6 +3943,7 @@ impl HubConnection {
                     provider,
                     model,
                     max_tokens,
+                    None,
                     None,
                     Default::default(),
                     haider_protocol::session::SessionInteractionModeV1::Interactive,
@@ -16340,6 +16343,7 @@ impl HubConnection {
         mut model: String,
         max_tokens: u64,
         permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         ssh_scope: Option<haider_rpc::SshScopeWire>,
@@ -16407,6 +16411,14 @@ impl HubConnection {
                 serde_json::to_value(overrides).map_err(|error| {
                     SessionHubError::Task(format!(
                         "cannot encode session permission overrides: {error}"
+                    ))
+                })?;
+        }
+        if let Some(allocation) = workspace_allocation.as_ref() {
+            request_coordinates["workspace_allocation"] = serde_json::to_value(allocation)
+                .map_err(|error| {
+                    SessionHubError::Task(format!(
+                        "cannot encode session workspace allocation: {error}"
                     ))
                 })?;
         }
@@ -16677,7 +16689,7 @@ impl HubConnection {
                 "admitting a custom provider model absent from its advisory inventory"
             );
         }
-        let workspace = match validate_workspace(cwd).await {
+        let workspace = match validate_create_workspace(cwd, workspace_allocation.as_ref()).await {
             Ok(workspace) => workspace,
             Err(message) => {
                 return self.respond_error(
@@ -16695,7 +16707,7 @@ impl HubConnection {
             request_digest,
             request_json,
             session_id: session_id.clone(),
-            cwd: workspace.canonical,
+            cwd: workspace.canonical().to_owned(),
             provider,
             model,
             max_tokens,
@@ -16709,7 +16721,7 @@ impl HubConnection {
         };
         // Keep the opened directory descriptor alive until the transaction
         // returns. M3 transfers the same canonical identity into its broker.
-        let _descriptor = workspace.descriptor;
+        let _workspace_anchor = workspace;
         // Absence is the durable representation of the default `All` scope.
         // A non-default scope must still commit before the session can become
         // visible. Concurrent creators each stage their own candidate; the
@@ -16723,6 +16735,7 @@ impl HubConnection {
                 command,
                 interaction_mode,
                 account_alias.map(|alias| alias.as_str().to_owned()),
+                workspace_allocation,
             )
             .await
         {
@@ -18237,9 +18250,9 @@ impl HubConnection {
                     .await?
             }
         };
-        let workspace_unavailable = metadata.and_then(|metadata| {
-            crate::workspace::unavailable(std::path::Path::new(&metadata.cwd))
-        });
+        let workspace_unavailable = metadata
+            .as_ref()
+            .and_then(crate::workspace::unavailable_for_metadata);
         if let Some(unavailable) = workspace_unavailable {
             tracing::info!(
                 target: "haider.workspace",
@@ -20437,6 +20450,23 @@ struct ValidatedWorkspace {
     descriptor: std::fs::File,
 }
 
+enum ValidatedCreateWorkspace {
+    Existing(ValidatedWorkspace),
+    Pending {
+        canonical: String,
+        _daily_root: haider_platform::WorkspaceDirectory,
+    },
+}
+
+impl ValidatedCreateWorkspace {
+    fn canonical(&self) -> &str {
+        match self {
+            Self::Existing(workspace) => &workspace.canonical,
+            Self::Pending { canonical, .. } => canonical,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn open_workspace_descriptor(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
@@ -20482,6 +20512,39 @@ async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
     })
     .await
     .map_err(|error| format!("session cwd validation task failed: {error}"))?
+}
+
+async fn validate_create_workspace(
+    cwd: String,
+    allocation: Option<&haider_protocol::session::WorkspaceAllocationV1>,
+) -> Result<ValidatedCreateWorkspace, String> {
+    let Some(allocation) = allocation.cloned() else {
+        return validate_workspace(cwd)
+            .await
+            .map(ValidatedCreateWorkspace::Existing);
+    };
+    if crate::android_policy::enabled() {
+        return Err("dated workspace allocation is unavailable on Android".into());
+    }
+    tokio::task::spawn_blocking(move || {
+        let validated = haider_client::workspace::validate_workspace_allocation(
+            std::path::Path::new(&cwd),
+            &allocation,
+        )
+        .map_err(|error| format!("invalid pending workspace allocation: {error}"))?;
+        let canonical = validated
+            .plan
+            .leaf
+            .to_str()
+            .ok_or_else(|| "workspace allocation leaf is not valid UTF-8".to_owned())?
+            .to_owned();
+        Ok(ValidatedCreateWorkspace::Pending {
+            canonical,
+            _daily_root: validated.daily_root,
+        })
+    })
+    .await
+    .map_err(|error| format!("workspace allocation validation task failed: {error}"))?
 }
 
 #[cfg(test)]

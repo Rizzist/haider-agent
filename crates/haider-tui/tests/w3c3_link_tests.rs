@@ -659,6 +659,52 @@ fn request_body_round_trips_the_attachment_commands() {
             close_session: false
         }
     );
+    let origin = haider_protocol::session::LaunchOriginRegistrationV1 {
+        command_id: "origin-command".into(),
+        open_id: "origin-open".into(),
+        worker_generation: 9,
+        expected_revision: 4,
+        path: haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~/launch".into()),
+        },
+        workspace_materialized: Some(false),
+    };
+    let origin_features = BTreeSet::from([haider_rpc::FEATURE_SESSION_LAUNCH_ORIGIN_V1.to_owned()]);
+    assert_eq!(
+        request_body_for_features(
+            LiveCommand::AttachWithOrigin {
+                session: session(4),
+                after_seq: 3,
+                launch_origin: Some(origin.clone()),
+            },
+            &origin_features,
+        ),
+        RequestBody::SessionAttachWithOrigin {
+            session_id: session(4),
+            after_seq: 3,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+            launch_origin: Some(origin),
+        }
+    );
+    assert_eq!(
+        request_body_for_features(
+            LiveCommand::AttachWithOrigin {
+                session: session(4),
+                after_seq: 3,
+                launch_origin: None,
+            },
+            &BTreeSet::new(),
+        ),
+        RequestBody::SessionAttach {
+            session_id: session(4),
+            after_seq: 3,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+        "older daemons receive the legacy attach shape"
+    );
     assert_eq!(
         request_body(LiveCommand::List { cursor: None }),
         RequestBody::SessionList {
@@ -995,9 +1041,20 @@ fn models_refresh_error_maps_to_the_row_scoped_reply() {
 /// menus).
 #[test]
 fn tui_session_create_carries_automode_overrides() {
+    let allocation = haider_protocol::session::WorkspaceAllocationV1 {
+        daily_root: "/tmp/Haider/1448-04-07".into(),
+        leaf: "/tmp/Haider/1448-04-07/s-0123456789abcdef0123456789abcdef".into(),
+        allocation_id: "0123456789abcdef0123456789abcdef".into(),
+        calendar_id: "islamic-civil".into(),
+        hijri_date: "1448-04-07".into(),
+        gregorian_date: "2026-09-20".into(),
+        allocated_at_ms: 1,
+        offset_seconds: 0,
+    };
     let body = request_body(LiveCommand::Create {
         command_id: haider_rpc::CommandId::new("automode-create"),
-        cwd: "/tmp".into(),
+        cwd: allocation.leaf.clone(),
+        workspace_allocation: Some(allocation.clone()),
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
@@ -1006,10 +1063,12 @@ fn tui_session_create_carries_automode_overrides() {
     match body {
         haider_rpc::RequestBody::SessionCreateWithPermissionOverrides {
             permission_overrides: Some(overrides),
+            workspace_allocation: Some(actual),
             interaction_mode,
             ..
         } => {
             assert!(overrides.allow_writes && overrides.allow_exec);
+            assert_eq!(actual, allocation);
             assert_eq!(
                 interaction_mode,
                 haider_protocol::session::SessionInteractionModeV1::Interactive

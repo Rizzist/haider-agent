@@ -87,6 +87,8 @@ pub struct SessionState {
     /// Canonical daemon workspace used for RPC scoping. Distinct from the
     /// display-form `dir`; absent for demo/older daemon rows.
     pub workspace_cwd: Option<String>,
+    /// Latest replaceable launch-origin revision and optional sanitised display.
+    pub launch_origin: Option<(u64, Option<String>)>,
     pub projection: SessionProjection,
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
@@ -200,6 +202,7 @@ impl SessionState {
             head_ros: None,
             dir: String::new(),
             workspace_cwd: None,
+            launch_origin: None,
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),

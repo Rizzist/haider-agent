@@ -5194,11 +5194,12 @@ pub struct AppModel {
     pub pending_cache_change: Option<PendingCacheChange>,
     pub identity: IdentityLine,
     /// One replaceable launch-origin context slot (dated-workspace
-    /// addendum O5/O7): `(revision, sanitised display)` of the LATEST
-    /// committed registration for the active session. Replay folds by
+    /// addendum O5/O7): `(revision, optional sanitised display)` of the
+    /// LATEST committed registration for the active session. `None` display
+    /// represents an unavailable captured path. Replay folds by
     /// revision — the latest wins in place; origin facts never append
     /// per-event transcript rows and never touch unread/turn counters.
-    pub launch_origin: Option<(u64, String)>,
+    pub launch_origin: Option<(u64, Option<String>)>,
     /// The user EXPLICITLY chose a provider/model/account this run
     /// (`/model`, `/provider`, or clicking an account). Once pinned, the
     /// daemon-truth bootstrap below never overwrites their choice; until
@@ -5307,6 +5308,12 @@ pub struct AppModel {
     /// non-absolute cwd, and `~` is a display convention the wire has never
     /// heard of.
     pub cwd: String,
+    /// Creation-only dated allocation. The leaf named by `cwd` remains
+    /// absent until the daemon brokers the first workspace-writing effect.
+    pub pending_workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+    /// Sanitised process launch directory used for TUI-origin registration.
+    /// Android and non-local surfaces leave this absent.
+    pub launch_origin_path: Option<haider_protocol::session::LaunchOriginPathV1>,
     /// The session's working dir — shown in the header; `cd` retargets it.
     pub session_dir: String,
     /// Canonical workspace of the attached session, learned from
@@ -5928,6 +5935,8 @@ impl Default for AppModel {
             talk_config_error: None,
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             cwd: "/".to_owned(),
+            pending_workspace_allocation: None,
+            launch_origin_path: None,
             session_dir: "~/dev/enterprise-suite".to_owned(),
             session_workspace_cwd: None,
             card_seq: 0,
@@ -17471,7 +17480,18 @@ impl AppModel {
                 // the first paint after a spawn reads a clock already
                 // inside the journal's own time base, tick or no tick.
                 self.clock_ms = self.clock_ms.max(envelope.committed_at_ms);
-                self.note_session_activity_at(&envelope.session_id, envelope.committed_at_ms);
+                // Launch origin is session context, not conversation
+                // activity (dated-workspace O4). It advances the journal
+                // cursor but must not create an unseen dot locally; roster
+                // recency applies the same exclusion in the store.
+                let moves_attention = envelope
+                    .payload
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    != Some("session_launch_origin_selected");
+                if moves_attention {
+                    self.note_session_activity_at(&envelope.session_id, envelope.committed_at_ms);
+                }
                 // M10: a BACKGROUND session's terminal/park transition also
                 // warrants a desktop notification. The attached reducer
                 // (`handle_envelope`) only ever evaluated the ACTIVE session, so
@@ -18286,6 +18306,7 @@ impl AppModel {
         self.session_title = None;
         self.session_name = None;
         self.session_workspace_cwd = None;
+        self.launch_origin = None;
         self.lockdown_provider = None;
         self.lockdown_boundary_known = false;
         self.lockdown_status = None;
@@ -18503,6 +18524,7 @@ impl AppModel {
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
         self.session_workspace_cwd = slot.workspace_cwd.take();
+        self.launch_origin = slot.launch_origin.take();
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
         self.menu_selection = 0;
@@ -18635,6 +18657,7 @@ impl AppModel {
             );
             slot.dir = std::mem::replace(&mut self.session_dir, self.launcher_dir.clone());
             slot.workspace_cwd = self.session_workspace_cwd.take();
+            slot.launch_origin = self.launch_origin.take();
         }
         self.last_detached = Some(active);
         self.toolfold.seed_verbosity(self.default_tool_verbosity);

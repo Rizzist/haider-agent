@@ -86,6 +86,7 @@ pub enum CommitGroupBatch {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -717,10 +718,31 @@ impl SqliteStoreHandle {
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         account_alias: Option<String>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
+        self.create_session_with_workspace_configuration(
+            command,
+            interaction_mode,
+            account_alias,
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_session_with_workspace_configuration(
+        &self,
+        command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
+        workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+    ) -> Result<SessionCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
             owner.with_store(|store| {
-                store.create_session_with_configuration(&command, interaction_mode, account_alias)
+                store.create_session_with_workspace_configuration(
+                    &command,
+                    interaction_mode,
+                    account_alias,
+                    workspace_allocation,
+                )
             })
         })
         .await
@@ -2165,10 +2187,12 @@ impl SqliteStoreHandle {
                             command,
                             interaction_mode,
                             account_alias,
+                            workspace_allocation,
                         } => JournalCommitBatch::CreateSession {
                             command,
                             interaction_mode,
                             account_alias,
+                            workspace_allocation,
                         },
                         CommitGroupBatch::AcceptTurn {
                             command,
