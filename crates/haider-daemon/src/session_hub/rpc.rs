@@ -20758,6 +20758,8 @@ mod run_identity_tests {
                 completed: 1,
                 ..Default::default()
             },
+            screenshot_count: 0,
+            screenshot_bytes: 0,
             receipt_refs: Vec::new(),
             started_at_ms: 10,
             finished_at_ms: 20,

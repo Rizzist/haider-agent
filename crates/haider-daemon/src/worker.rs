@@ -19344,7 +19344,8 @@ impl BrokerToolDispatcher {
         settled: Option<ToolDispatchResult>,
         mut outcome_unknown: bool,
     ) -> Result<OrchestrationTerminalReason, HaiderError> {
-        if let Some(ToolDispatchResult::Completed(result)) = settled {
+        if let Some(ToolDispatchResult::Completed(mut result)) = settled {
+            bound_orchestration_screenshot_retention(state, pending, &mut result);
             outcome_unknown |= result.status == ToolResultStatus::Unknown;
             match result.status {
                 ToolResultStatus::Completed => {
@@ -19553,7 +19554,8 @@ impl BrokerToolDispatcher {
                             reason: "deferred tools are not script-bindable",
                         });
                     }
-                    ToolDispatchResult::Completed(result) => {
+                    ToolDispatchResult::Completed(mut result) => {
+                        bound_orchestration_screenshot_retention(state, &call, &mut result);
                         let node = &state.admitted.nodes[call.slot as usize];
                         let retry = matches!(
                             result.status,
@@ -19818,7 +19820,8 @@ impl BrokerToolDispatcher {
                 )
                 .await?
                 {
-                    RecoveredOrchestrationChild::Completed(result) => {
+                    RecoveredOrchestrationChild::Completed(mut result) => {
+                        bound_orchestration_screenshot_retention(&mut state, &pending, &mut result);
                         match result.status {
                             ToolResultStatus::Completed => {
                                 state.completed_calls = state.completed_calls.saturating_add(1);
@@ -20061,7 +20064,8 @@ impl BrokerToolDispatcher {
                             .finish_orchestration(run_id, Some(&mut state), terminal)
                             .await;
                     }
-                    ToolDispatchResult::Completed(result) => {
+                    ToolDispatchResult::Completed(mut result) => {
+                        bound_orchestration_screenshot_retention(&mut state, &pending, &mut result);
                         let retry_limit = orchestration_retry_limit(&state, &node);
                         if matches!(
                             result.status,
@@ -20414,10 +20418,38 @@ fn orchestration_terminal(
         reason_code: Some(reason_code.into()),
         reason: (!reason.is_empty()).then_some(reason),
         counts: orchestration_counts(state),
+        screenshot_count: state.retained_screenshot_count,
+        screenshot_bytes: state.retained_screenshot_bytes,
         receipt_refs: Vec::new(),
         started_at_ms: state.admitted.admitted_at_ms,
         finished_at_ms: unix_time_ms(),
     }
+}
+
+fn bound_orchestration_screenshot_retention(
+    state: &mut crate::orchestration::RuntimeStateV1,
+    pending: &crate::orchestration::PendingCallV1,
+    result: &mut BoundedResult,
+) {
+    if !matches!(pending.tool.as_str(), "computer" | "mobile") || result.images.is_empty() {
+        return;
+    }
+    let added = result
+        .images
+        .iter()
+        .fold(0_u64, |bytes, image| bytes.saturating_add(image.byte_len));
+    let retained = state.retained_screenshot_bytes.saturating_add(added);
+    if retained > haider_protocol::orchestration::ORCHESTRATION_SCREENSHOT_BYTES_MAX {
+        result.images.clear();
+        result.status = ToolResultStatus::Failed;
+        result.reason = Some("orchestration screenshot retention exceeds 32 MiB".into());
+        result.preview = "orchestration screenshot retention limit exceeded".into();
+        return;
+    }
+    state.retained_screenshot_count = state
+        .retained_screenshot_count
+        .saturating_add(u32::try_from(result.images.len()).unwrap_or(u32::MAX));
+    state.retained_screenshot_bytes = retained;
 }
 
 fn orchestration_rejection(
@@ -20441,6 +20473,8 @@ fn orchestration_rejection(
         reason_code: Some(reason_code.into()),
         reason: Some(reason),
         counts: ScriptCountsV1::default(),
+        screenshot_count: 0,
+        screenshot_bytes: 0,
         receipt_refs: Vec::new(),
         started_at_ms: now,
         finished_at_ms: now,

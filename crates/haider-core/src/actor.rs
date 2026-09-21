@@ -8747,6 +8747,8 @@ impl HarnessActor {
             reason_code: Some(code.into()),
             reason: Some(reason.into()),
             counts: ScriptCountsV1::default(),
+            screenshot_count: 0,
+            screenshot_bytes: 0,
             receipt_refs: Vec::new(),
             started_at_ms: now,
             finished_at_ms: now,

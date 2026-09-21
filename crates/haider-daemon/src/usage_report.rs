@@ -1599,6 +1599,16 @@ impl SessionFolder {
                                 .finished_at_ms
                                 .saturating_sub(terminal.started_at_ms),
                         );
+                    self.stats.orchestration.screenshot_count = self
+                        .stats
+                        .orchestration
+                        .screenshot_count
+                        .saturating_add(u64::from(terminal.screenshot_count));
+                    self.stats.orchestration.screenshot_bytes = self
+                        .stats
+                        .orchestration
+                        .screenshot_bytes
+                        .saturating_add(terminal.screenshot_bytes);
                     for evidence in terminal
                         .final_checkpoint
                         .iter()
@@ -2047,6 +2057,12 @@ fn merge_orchestration_usage(target: &mut OrchestrationUsageV1, source: &Orchest
     target.admission_us = target.admission_us.saturating_add(source.admission_us);
     target.scheduling_us = target.scheduling_us.saturating_add(source.scheduling_us);
     target.wall_ms = target.wall_ms.saturating_add(source.wall_ms);
+    target.screenshot_count = target
+        .screenshot_count
+        .saturating_add(source.screenshot_count);
+    target.screenshot_bytes = target
+        .screenshot_bytes
+        .saturating_add(source.screenshot_bytes);
 }
 
 fn merge_optional_cost(target: &mut Option<f64>, source: Option<f64>, target_had_input: bool) {

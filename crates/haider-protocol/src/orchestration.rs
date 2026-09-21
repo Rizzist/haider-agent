@@ -31,6 +31,13 @@ pub const ORCHESTRATION_CHILD_MAX: u32 = 256;
 pub const ORCHESTRATION_CONCURRENCY_MAX: u8 = 4;
 pub const ORCHESTRATION_RETURN_DEFAULT_BYTES: u32 = 32 * 1024;
 pub const ORCHESTRATION_RETURN_MAX_BYTES: u32 = 64 * 1024;
+pub const ORCHESTRATION_DECISION_DEFAULT: u32 = 4;
+pub const ORCHESTRATION_DECISION_MAX: u32 = 8;
+pub const ORCHESTRATION_CONTROL_DEFAULT: u32 = 4;
+pub const ORCHESTRATION_CONTROL_MAX: u32 = 8;
+pub const ORCHESTRATION_SCREENSHOT_DEFAULT: u32 = 5;
+pub const ORCHESTRATION_SCREENSHOT_MAX: u32 = 9;
+pub const ORCHESTRATION_SCREENSHOT_BYTES_MAX: u64 = 32 * 1024 * 1024;
 
 pub const ORCHESTRATION_SCRIPT_EXTENSION: &str = "orchestration_script_v1";
 pub const ORCHESTRATION_CALL_EXTENSION: &str = "orchestration_call_v1";
@@ -199,6 +206,12 @@ pub struct OrchestrationLimitsV1 {
     pub no_progress_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returned_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_points: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_actions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshots: Option<u32>,
 }
 
 impl Default for OrchestrationLimitsV1 {
@@ -211,6 +224,9 @@ impl Default for OrchestrationLimitsV1 {
             child_wall_ms: Some(30_000),
             no_progress_ms: Some(30_000),
             returned_bytes: Some(ORCHESTRATION_RETURN_DEFAULT_BYTES),
+            decision_points: Some(ORCHESTRATION_DECISION_DEFAULT),
+            control_actions: Some(ORCHESTRATION_CONTROL_DEFAULT),
+            screenshots: Some(ORCHESTRATION_SCREENSHOT_DEFAULT),
         }
     }
 }
@@ -419,10 +435,22 @@ pub struct ScriptTerminalV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub counts: ScriptCountsV1,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub screenshot_count: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub screenshot_bytes: u64,
     #[serde(default)]
     pub receipt_refs: Vec<InstructEvidenceRef>,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
+}
+
+const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,6 +466,8 @@ pub struct OrchestrationUsageV1 {
     pub admission_us: u64,
     pub scheduling_us: u64,
     pub wall_ms: u64,
+    pub screenshot_count: u64,
+    pub screenshot_bytes: u64,
 }
 
 impl OrchestrationUsageV1 {
@@ -453,6 +483,8 @@ impl OrchestrationUsageV1 {
             && self.admission_us == 0
             && self.scheduling_us == 0
             && self.wall_ms == 0
+            && self.screenshot_count == 0
+            && self.screenshot_bytes == 0
     }
 }
 
@@ -609,6 +641,21 @@ fn validate_limits(limits: Option<&OrchestrationLimitsV1>) -> Result<(), Orchest
         limits.returned_bytes.map(u64::from),
         ORCHESTRATION_RETURN_MAX_BYTES as u64,
         "returned_bytes",
+    )?;
+    positive(
+        limits.decision_points.map(u64::from),
+        ORCHESTRATION_DECISION_MAX as u64,
+        "decision_points",
+    )?;
+    positive(
+        limits.control_actions.map(u64::from),
+        ORCHESTRATION_CONTROL_MAX as u64,
+        "control_actions",
+    )?;
+    positive(
+        limits.screenshots.map(u64::from),
+        ORCHESTRATION_SCREENSHOT_MAX as u64,
+        "screenshots",
     )
 }
 
@@ -2783,6 +2830,37 @@ mod tests {
                 .code,
             "non_dense_slot"
         );
+    }
+
+    #[test]
+    fn interaction_limits_pin_defaults_and_hard_caps() {
+        let defaults = OrchestrationLimitsV1::default();
+        assert_eq!(defaults.decision_points, Some(4));
+        assert_eq!(defaults.control_actions, Some(4));
+        assert_eq!(defaults.screenshots, Some(5));
+        assert!(validate_limits(Some(&defaults)).is_ok());
+
+        for limits in [
+            OrchestrationLimitsV1 {
+                decision_points: Some(9),
+                ..defaults.clone()
+            },
+            OrchestrationLimitsV1 {
+                control_actions: Some(9),
+                ..defaults.clone()
+            },
+            OrchestrationLimitsV1 {
+                screenshots: Some(10),
+                ..defaults.clone()
+            },
+        ] {
+            assert_eq!(
+                validate_limits(Some(&limits))
+                    .expect_err("interaction limit above the frozen cap must reject")
+                    .code,
+                "limit"
+            );
+        }
     }
 
     #[test]

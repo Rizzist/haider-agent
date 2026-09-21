@@ -119,6 +119,10 @@ pub(crate) struct RuntimeStateV1 {
     pub(crate) failed_calls: u32,
     pub(crate) rejected_calls: u32,
     pub(crate) unknown_calls: u32,
+    #[serde(default)]
+    pub(crate) retained_screenshot_count: u32,
+    #[serde(default)]
+    pub(crate) retained_screenshot_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +146,10 @@ struct DurableCheckpointV1 {
     failed_calls: u32,
     rejected_calls: u32,
     unknown_calls: u32,
+    #[serde(default)]
+    retained_screenshot_count: u32,
+    #[serde(default)]
+    retained_screenshot_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -298,7 +306,9 @@ pub(crate) async fn admit(
             message,
         })?;
     }
+    let limits = effective_limits(request.limits.clone());
     validate_preflight_arguments(&nodes, &request.inputs, wrappers, &digest)?;
+    validate_interaction_sequences(&nodes, &request.inputs, &limits, &digest)?;
     let mut input_refs = Vec::with_capacity(request.inputs.len());
     let mut total_bytes = canonical_bytes;
     for (ordinal, (value, value_type)) in request.inputs.iter().zip(&parameters).enumerate() {
@@ -315,7 +325,6 @@ pub(crate) async fn admit(
         total_bytes = total_bytes.saturating_add(bytes);
         input_refs.push(evidence_ref);
     }
-    let limits = effective_limits(request.limits.clone());
     let manifest = ScriptManifestV1 {
         version: ORCHESTRATION_VERSION,
         transport: ORCHESTRATION_TRANSPORT.into(),
@@ -346,6 +355,8 @@ pub(crate) async fn admit(
         failed_calls: 0,
         rejected_calls: 0,
         unknown_calls: 0,
+        retained_screenshot_count: 0,
+        retained_screenshot_bytes: 0,
         admitted: AdmittedScriptV1 {
             version: ORCHESTRATION_VERSION,
             script_id,
@@ -631,6 +642,8 @@ pub(crate) async fn persist_checkpoint(
         failed_calls: state.failed_calls,
         rejected_calls: state.rejected_calls,
         unknown_calls: state.unknown_calls,
+        retained_screenshot_count: state.retained_screenshot_count,
+        retained_screenshot_bytes: state.retained_screenshot_bytes,
     };
     let mut parents = vec![state.admitted.source_ref.artifact.clone()];
     if let Some(previous) = state.checkpoint_ref.as_ref() {
@@ -1057,6 +1070,8 @@ pub(crate) async fn recover_checkpoint(
         failed_calls: durable.failed_calls,
         rejected_calls: durable.rejected_calls,
         unknown_calls: durable.unknown_calls,
+        retained_screenshot_count: durable.retained_screenshot_count,
+        retained_screenshot_bytes: durable.retained_screenshot_bytes,
     }))
 }
 
@@ -1120,6 +1135,9 @@ fn effective_limits(requested: Option<OrchestrationLimitsV1>) -> OrchestrationLi
         child_wall_ms: requested.child_wall_ms.or(defaults.child_wall_ms),
         no_progress_ms: requested.no_progress_ms.or(defaults.no_progress_ms),
         returned_bytes: requested.returned_bytes.or(defaults.returned_bytes),
+        decision_points: requested.decision_points.or(defaults.decision_points),
+        control_actions: requested.control_actions.or(defaults.control_actions),
+        screenshots: requested.screenshots.or(defaults.screenshots),
     }
 }
 
@@ -1197,27 +1215,14 @@ fn validate_preflight_arguments(
     wrappers: &WrapperSnapshot,
     request_digest: &str,
 ) -> Result<(), AdmissionFailure> {
-    let mut values = vec![None; nodes.len()];
+    let values = preflight_values(nodes, inputs);
     for node in nodes {
-        if matches!(
-            node.evidence_type.as_str(),
-            "OrchCallV1" | "OrchAwaitV1" | "OrchAskPauseV1"
-        ) || node.ports.iter().any(|port| {
-            matches!(port.role, OrchPortRoleV1::Data | OrchPortRoleV1::Guard)
-                && values
-                    .get(port.source_slot as usize)
-                    .and_then(Option::as_ref)
-                    .is_none()
-        }) {
+        if node.evidence_type != "OrchArgumentV1" {
             continue;
         }
-        let Ok(value) = evaluate_pure(node, nodes, &values, inputs) else {
-            // Pure evaluation failures remain runtime failures unless the
-            // value is needed to prove a concrete wrapper argument.
-            continue;
-        };
-        if node.evidence_type == "OrchArgumentV1"
-            && let Some(argument) = value.value()
+        if let Some(argument) = values[node.slot as usize]
+            .as_ref()
+            .and_then(RuntimeValueV1::value)
         {
             let tool = node.config.0["tool"].as_str().unwrap_or_default();
             let Some(wrapper) = wrappers.wrappers.get(tool) else {
@@ -1233,7 +1238,188 @@ fn validate_preflight_arguments(
                 message: format!("slot {} argument for `{tool}`: {message}", node.slot),
             })?;
         }
-        values[node.slot as usize] = Some(value);
+    }
+    Ok(())
+}
+
+fn preflight_values(nodes: &[InlineNodeV1], inputs: &[StrictJson]) -> Vec<Option<RuntimeValueV1>> {
+    let mut values = vec![None; nodes.len()];
+    for node in nodes {
+        if matches!(
+            node.evidence_type.as_str(),
+            "OrchCallV1" | "OrchAwaitV1" | "OrchAskPauseV1"
+        ) || node.ports.iter().any(|port| {
+            matches!(port.role, OrchPortRoleV1::Data | OrchPortRoleV1::Guard)
+                && values
+                    .get(port.source_slot as usize)
+                    .and_then(Option::as_ref)
+                    .is_none()
+        }) {
+            continue;
+        }
+        // Pure evaluation failures remain runtime failures unless a later
+        // admission rule needs the concrete value to prove safety.
+        if let Ok(value) = evaluate_pure(node, nodes, &values, inputs) {
+            values[node.slot as usize] = Some(value);
+        }
+    }
+    values
+}
+
+#[derive(Debug)]
+struct InteractionCall<'a> {
+    slot: u32,
+    tool: &'a str,
+    action: &'a str,
+    region: &'a [Value],
+}
+
+fn validate_interaction_sequences(
+    nodes: &[InlineNodeV1],
+    inputs: &[StrictJson],
+    limits: &OrchestrationLimitsV1,
+    request_digest: &str,
+) -> Result<(), AdmissionFailure> {
+    let values = preflight_values(nodes, inputs);
+    let mut calls = Vec::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.evidence_type == "OrchCallV1")
+    {
+        let tool = node.config.0["tool"].as_str().unwrap_or_default();
+        if !matches!(tool, "computer" | "mobile") {
+            continue;
+        }
+        let argument_slot = node
+            .ports
+            .iter()
+            .find(|port| port.role == OrchPortRoleV1::Data && port.port == "args")
+            .map(|port| port.source_slot as usize);
+        let argument = argument_slot
+            .and_then(|slot| values.get(slot))
+            .and_then(Option::as_ref)
+            .and_then(RuntimeValueV1::value);
+        let action = argument
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| AdmissionFailure {
+                request_digest: request_digest.into(),
+                code: "interaction_argument".into(),
+                message: format!(
+                    "slot {} `{tool}` action must be statically provable at admission",
+                    node.slot
+                ),
+            })?;
+        let region = node
+            .config
+            .0
+            .get("region")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        calls.push(InteractionCall {
+            slot: node.slot,
+            tool,
+            action,
+            region,
+        });
+    }
+    if calls.is_empty() {
+        return Ok(());
+    }
+
+    let candidate_paths = nodes
+        .iter()
+        .filter_map(|node| node.config.0.get("region").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for path in candidate_paths.into_iter().chain(std::iter::once(&[][..])) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    let paths = paths
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !paths
+                .iter()
+                .any(|other| other.len() > candidate.len() && other.starts_with(candidate))
+        })
+        .collect::<Vec<_>>();
+
+    for path in paths {
+        let mut path_screenshots = 0_u32;
+        let mut path_controls = 0_u32;
+        for tool in ["computer", "mobile"] {
+            let path_calls = calls
+                .iter()
+                .filter(|call| call.tool == tool && path.starts_with(call.region))
+                .collect::<Vec<_>>();
+            if path_calls.is_empty() {
+                continue;
+            }
+            let mut screenshot_ready = false;
+            let mut screenshots = 0_u32;
+            let mut controls = 0_u32;
+            for call in path_calls {
+                if call.action == "screenshot" || (tool == "computer" && call.action == "inspect") {
+                    screenshots = screenshots.saturating_add(1);
+                    screenshot_ready = true;
+                    continue;
+                }
+                let observation = match tool {
+                    "computer" => call.action == "cursor_position",
+                    "mobile" => matches!(
+                        call.action,
+                        "a11y_tree" | "inspect" | "list_apps" | "sms_read"
+                    ),
+                    _ => false,
+                };
+                if observation {
+                    continue;
+                }
+                controls = controls.saturating_add(1);
+                if !screenshot_ready {
+                    return Err(AdmissionFailure {
+                        request_digest: request_digest.into(),
+                        code: "interaction_observation".into(),
+                        message: format!(
+                            "slot {} `{tool}` control action requires a fresh preceding screenshot",
+                            call.slot
+                        ),
+                    });
+                }
+                screenshot_ready = false;
+            }
+            if controls > 0 && !screenshot_ready {
+                return Err(AdmissionFailure {
+                    request_digest: request_digest.into(),
+                    code: "interaction_final_observation".into(),
+                    message: format!(
+                        "`{tool}` control sequence must end with a fresh screenshot observation"
+                    ),
+                });
+            }
+            path_controls = path_controls.saturating_add(controls);
+            path_screenshots = path_screenshots.saturating_add(screenshots);
+        }
+        let decision_limit = limits.decision_points.unwrap_or(4);
+        let control_limit = limits.control_actions.unwrap_or(4);
+        let screenshot_limit = limits.screenshots.unwrap_or(5);
+        if path_controls > decision_limit
+            || path_controls > control_limit
+            || path_screenshots > screenshot_limit
+        {
+            return Err(AdmissionFailure {
+                request_digest: request_digest.into(),
+                code: "interaction_limit".into(),
+                message: format!(
+                    "interaction path uses decisions={path_controls}, controls={path_controls}, screenshots={path_screenshots}; limits are {decision_limit}/{control_limit}/{screenshot_limit}"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -2318,5 +2504,118 @@ mod tests {
             Some(RuntimeValueV1::Inactive),
         ];
         assert!(evaluate_join(&all_join(false), &[], &values).is_err());
+    }
+
+    fn interaction_nodes(tool: &str, actions: &[&str]) -> Vec<InlineNodeV1> {
+        let mut nodes = Vec::new();
+        for action in actions {
+            let value_slot = nodes.len() as u32;
+            nodes.push(InlineNodeV1 {
+                slot: value_slot,
+                evidence_type: "OrchValueV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "operator":"literal",
+                    "type":{"kind":"record","fields":{"action":{"kind":"string","max_bytes":32}}},
+                    "operand_config":{"value":{"action":action}},
+                    "region":[]
+                })),
+                ports: vec![],
+            });
+            let argument_slot = nodes.len() as u32;
+            nodes.push(InlineNodeV1 {
+                slot: argument_slot,
+                evidence_type: "OrchArgumentV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":tool,
+                    "wrapper_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "region":[]
+                })),
+                ports: vec![InlinePortV1 {
+                    role: OrchPortRoleV1::Data,
+                    port: "args".into(),
+                    source_slot: value_slot,
+                    output: "value".into(),
+                    selector: None,
+                }],
+            });
+            let call_slot = nodes.len() as u32;
+            nodes.push(InlineNodeV1 {
+                slot: call_slot,
+                evidence_type: "OrchCallV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":tool,
+                    "wrapper_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "region":[]
+                })),
+                ports: vec![InlinePortV1 {
+                    role: OrchPortRoleV1::Data,
+                    port: "args".into(),
+                    source_slot: argument_slot,
+                    output: "value".into(),
+                    selector: None,
+                }],
+            });
+        }
+        nodes
+    }
+
+    #[test]
+    fn interaction_sequence_requires_observe_action_observe() {
+        let valid = interaction_nodes("mobile", &["screenshot", "tap", "screenshot"]);
+        assert!(
+            validate_interaction_sequences(
+                &valid,
+                &[],
+                &OrchestrationLimitsV1::default(),
+                "request",
+            )
+            .is_ok()
+        );
+
+        for actions in [
+            &["tap", "screenshot"][..],
+            &["screenshot", "tap"][..],
+            &["screenshot", "tap", "tap", "screenshot"][..],
+        ] {
+            let invalid = interaction_nodes("mobile", actions);
+            assert!(
+                validate_interaction_sequences(
+                    &invalid,
+                    &[],
+                    &OrchestrationLimitsV1::default(),
+                    "request",
+                )
+                .is_err(),
+                "accepted invalid interaction sequence {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_sequence_enforces_default_decision_bound() {
+        let nodes = interaction_nodes(
+            "computer",
+            &[
+                "screenshot",
+                "left_click",
+                "screenshot",
+                "left_click",
+                "screenshot",
+                "left_click",
+                "screenshot",
+                "left_click",
+                "screenshot",
+                "left_click",
+                "screenshot",
+            ],
+        );
+        let error = validate_interaction_sequences(
+            &nodes,
+            &[],
+            &OrchestrationLimitsV1::default(),
+            "request",
+        )
+        .expect_err("five decisions exceed the default bound");
+        assert_eq!(error.code, "interaction_limit");
     }
 }
