@@ -3516,7 +3516,10 @@ fn start_oauth_import_test_actor(
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: Some(management.clone()),
-        device_discovery: DeviceDiscoverySnapshot::new(false),
+        // Isolated import tests drive discovery through their explicit
+        // commands. Automatic catalog work would add an actor-scheduled
+        // flight after a credential commit and race their revision checks.
+        device_discovery: DeviceDiscoverySnapshot::new(true),
         profile_id: "oauth-import-test".into(),
         default_model: "unused".into(),
         providers,
@@ -9788,6 +9791,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     assert_eq!(candidate.wire.source_label, "Linked to Claude Code");
 
     let (sink, mut frames) = channel_sink();
+    let mut catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(false);
     let native_service: Arc<dyn ClaudeNativeCredentialStore> = native;
     handle_device_import(
         &store,
@@ -9796,7 +9800,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         &snapshot,
         Some(&management),
         &providers,
-        &mut AutomaticCatalogDiscoveryQueue::new(true),
+        &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         Arc::new(UnreachableGcloud),
@@ -9812,6 +9816,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         },
     )
     .await;
+    assert!(catalog_discoveries.is_empty());
     let descriptor = match frames.try_recv().expect("re-adopt response") {
         WireFrame::Response {
             body: ResponseBody::AccountImportDevice { descriptor, .. },
@@ -12391,6 +12396,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     gcloud.push_token(b"GCLOUD_IMPORT_TOKEN_31ab");
     gcloud.push_token(b"GCLOUD_REIMPORT_TOKEN_42cd");
     let (sink, mut frames) = channel_sink();
+    let mut catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(false);
     let job = |command_id: &str, request_id: &str| DeviceImportJob {
         command_id: command_id.to_owned(),
         candidate: candidate.wire.candidate.clone(),
@@ -12407,7 +12413,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
-        &mut AutomaticCatalogDiscoveryQueue::new(true),
+        &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -12415,6 +12421,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         job("gcloud-import-1", "req-1"),
     )
     .await;
+    assert!(catalog_discoveries.is_empty());
     let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
     match frames.try_recv().expect("import response") {
         WireFrame::Response {
@@ -12457,7 +12464,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &snapshot,
         Some(&management),
         &providers,
-        &mut AutomaticCatalogDiscoveryQueue::new(true),
+        &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
@@ -12465,6 +12472,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         job("gcloud-import-2", "req-2"),
     )
     .await;
+    assert!(catalog_discoveries.is_empty());
     match frames.try_recv().expect("re-import response") {
         WireFrame::Response {
             body: ResponseBody::AccountImportDevice { descriptor, .. },
