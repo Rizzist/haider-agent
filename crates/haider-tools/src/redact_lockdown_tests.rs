@@ -26,3 +26,18 @@ fn lockdown_retains_legacy_identifier_and_carrier_redaction() {
         assert_ne!(redact_lockdown_text(value), value);
     }
 }
+
+#[test]
+fn lockdown_passphrase_bytes_remain_frozen() {
+    let secret = "quartz-jumping-vexed-fibers";
+    assert_eq!(
+        redact_lockdown_text(&format!("passphrase={secret}")),
+        "[REDACTED:high_entropy]"
+    );
+    for input in [
+        format!("passphrase=\"{secret}\""),
+        format!(r#"{{"passphrase":"{secret}"}}"#),
+    ] {
+        assert_eq!(redact_lockdown_text(&input), input);
+    }
+}

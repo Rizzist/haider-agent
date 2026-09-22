@@ -158,6 +158,46 @@ fn secret_context_covers_bearer_digest_and_quoted_phrase() {
     }
 }
 
+/// A passphrase is ambiguous when it appears alone, but an explicit
+/// passphrase assignment is credential context. Classify that context before
+/// the code-identifier exemption so labels cannot make an entropy-bearing
+/// value look public.
+#[test]
+fn passphrase_assignment_family_precedes_identifier_exemptions() {
+    let secret = "quartz-jumping-vexed-fibers";
+    let paths = super::ExplicitReadPaths::new(Path::new("handoff.md"));
+    for input in [
+        format!("passphrase={secret}"),
+        format!("pass_phrase='{secret}'"),
+        format!("PASSPHRASE=\"{secret}\""),
+        format!("ssh_passphrase={secret}"),
+        format!(r#"{{"passphrase":"{secret}"}}"#),
+        format!(r#"{{"pass_phrase":"{secret}"}}"#),
+        format!(r#"{{"SSH_PASSPHRASE":"{secret}"}}"#),
+    ] {
+        for output in [
+            redact_text(&input),
+            paths.redact(Path::new("handoff.md"), &input),
+        ] {
+            assert!(!output.text.contains(secret), "{input}: {}", output.text);
+            assert!(
+                output.text.contains("[REDACTED:secret_value]"),
+                "{input}: {}",
+                output.text
+            );
+        }
+    }
+
+    let quoted = format!("\"{secret}\"");
+    for input in [secret, quoted.as_str()] {
+        assert_eq!(
+            redact_text(input).text,
+            input,
+            "the owner-ratified bare-passphrase tradeoff remains unchanged"
+        );
+    }
+}
+
 #[test]
 fn credential_context_overrides_digest_and_identifier_exemptions() {
     let digest = "859c9fd11efbc93ee3d6b5458111b031d4a6477f405146d65d543732901bdfc4";

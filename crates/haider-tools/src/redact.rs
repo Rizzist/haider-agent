@@ -540,7 +540,7 @@ fn extended_secret_regex() -> Option<&'static Regex> {
 fn secret_assignment_regex() -> Option<&'static Regex> {
     static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(
-        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)(["']|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
+        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|pass[_-]?phrase|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)(["']|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
     ).ok()).as_ref()
 }
 
