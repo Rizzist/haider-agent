@@ -476,7 +476,15 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `daemon.shutdown` | `DaemonShutdown` | Control-gated graceful daemon lifecycle request |
 
 The operator surface is `haider daemon stop [--json] [--timeout <duration>]`.
-It never auto-spawns and never escalates to a signal or forced kill. Its
+It never auto-spawns. Its ordinary authenticated path never escalates to a
+signal or forced kill. On Unix only, an endpoint-unavailable daemon may be
+recovered with `SIGTERM` after `F_GETLK` identifies the current profile-lock
+owner, the exact sibling daemon binary and profile arguments are verified,
+and a final lock-owner query closes the numeric-PID race. The runtime PID file
+is corroboration on that path, never authority for choosing the signal target.
+Windows `LockFileEx` contention does not expose the lock owner's PID, so the
+same endpoint-unavailable state is not signalled from the PID file: it returns
+`did_not_stop` with phase `owner_verification_unavailable`. Its
 `haider.daemon-stop.v1` result distinguishes `stopped_cleanly`, `not_running`,
 and `did_not_stop`; `elapsed_ms` measures the caller-observed lifecycle. A clean
 result requires an authenticated connection, a matching `ServerDraining`,

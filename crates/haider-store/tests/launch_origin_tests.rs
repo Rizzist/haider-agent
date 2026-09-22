@@ -13,6 +13,7 @@ use haider_store::{
 };
 use serde_json::json;
 use std::fmt::Debug;
+use std::path::Path;
 
 fn must<T, E: Debug>(result: Result<T, E>) -> T {
     match result {
@@ -82,14 +83,20 @@ fn seed_legacy_session(store: &Store, session: &SessionId) {
     must(store.append(&mut batch));
 }
 
-fn typed_session(store: &Store, session_id: &str) -> SessionId {
+fn typed_session(store: &Store, session_id: &str, cwd: &Path) -> SessionId {
+    let cwd = cwd.to_string_lossy().into_owned();
     let command = SessionCreateCommand {
         command_id: format!("create-{session_id}"),
         request_digest: "digest-create".into(),
-        request_json:
-            r#"{"cwd":"/tmp/work","max_tokens":4096,"model":"fake-v1","provider":"fake"}"#.into(),
+        request_json: json!({
+            "cwd": &cwd,
+            "max_tokens": 4096,
+            "model": "fake-v1",
+            "provider": "fake"
+        })
+        .to_string(),
         session_id: SessionId::new(session_id),
-        cwd: "/tmp/work".into(),
+        cwd,
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4096,
@@ -271,7 +278,8 @@ fn legacy_rows_stay_untyped_and_reconstruct_from_events() {
 fn typed_projection_updates_and_survives_workspace_set() {
     let root = test_root();
     let store = must(Store::open(root.path()));
-    let session = typed_session(&store, "session-origin-typed");
+    let initial_workspace = root.path().join("initial-workspace");
+    let session = typed_session(&store, "session-origin-typed", &initial_workspace);
 
     let command = origin_command(&store, "origin-t", &session, "open-t", 0, home_path("~/x"));
     must(store.register_session_launch_origin(&command));
@@ -281,19 +289,20 @@ fn typed_projection_updates_and_survives_workspace_set() {
     assert_eq!(origin.subject_session_id, session.as_str());
 
     // A workspace change (a different session-config mutation) preserves it.
+    let replacement_workspace = root.path().join("replacement-workspace");
     let workspace = haider_store::SessionWorkspaceSetCommand {
         command_id: "workspace-1".into(),
         request_digest: "workspace-digest".into(),
         request_json: "{}".into(),
         session_id: session.clone(),
         worker_generation: store.worker_generation(),
-        path: "/tmp".into(),
+        path: replacement_workspace.to_string_lossy().into_owned(),
         event_id: EventId::new("workspace-evt"),
         device_id: DeviceId::new("device-test"),
     };
     must(store.set_session_workspace(&workspace));
     let metadata = must(store.session_metadata(&session)).expect("typed metadata");
-    assert_eq!(metadata.cwd, "/tmp");
+    assert_eq!(metadata.cwd, replacement_workspace.to_string_lossy());
     assert_eq!(
         metadata.launch_origin.expect("origin survives").revision,
         1,
@@ -321,18 +330,21 @@ fn unsanitised_ingress_is_refused_without_claiming_the_receipt() {
     let session = SessionId::new("session-origin-dirty");
     seed_legacy_session(&store, &session);
 
+    let bidi_path = root.path().join("a\u{202e}b");
+    let newline_path = root.path().join("a\nb");
+    let over_limit_path = root.path().join("x".repeat(4096));
     for path in [
         LaunchOriginPathV1 {
             kind: LaunchOriginPathKindV1::Absolute,
-            display: Some("/opt/a\u{202e}b".into()),
+            display: Some(bidi_path.to_string_lossy().into_owned()),
         },
         LaunchOriginPathV1 {
             kind: LaunchOriginPathKindV1::Absolute,
-            display: Some("/opt/a\nb".into()),
+            display: Some(newline_path.to_string_lossy().into_owned()),
         },
         LaunchOriginPathV1 {
             kind: LaunchOriginPathKindV1::Absolute,
-            display: Some(format!("/opt/{}", "x".repeat(4096))),
+            display: Some(over_limit_path.to_string_lossy().into_owned()),
         },
         LaunchOriginPathV1 {
             kind: LaunchOriginPathKindV1::HomeRelative,

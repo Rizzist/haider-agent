@@ -310,14 +310,21 @@ async fn stop_daemon(
                     return Ok(report);
                 }
                 if !wait_to_retry(deadline).await {
+                    #[cfg(windows)]
+                    let (phase, reason) = (
+                        "owner_verification_unavailable",
+                        "Windows profile locks do not expose their owning PID; refusing to signal from PID-file diagnostics alone",
+                    );
+                    #[cfg(not(windows))]
+                    let (phase, reason) = (
+                        "connect",
+                        "profile lock remained held while the daemon endpoint was unavailable",
+                    );
                     return Ok(terminal_report(
                         StopOutcome::DidNotStop,
                         started,
-                        Some("connect"),
-                        Some(
-                            "profile lock remained held while the daemon endpoint was unavailable"
-                                .into(),
-                        ),
+                        Some(phase),
+                        Some(reason.into()),
                     ));
                 }
             }

@@ -430,7 +430,10 @@ fn built_status_json_honors_private_xdg_with_enabled_discovery() {
     let wedged: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("wedged stop stdout is JSON");
     assert_eq!(wedged["outcome"], "did_not_stop");
+    #[cfg(unix)]
     assert_eq!(wedged["phase"], "owner_verification");
+    #[cfg(windows)]
+    assert_eq!(wedged["phase"], "owner_verification_unavailable");
     assert!(
         daemon_pid(&wedged_profile).is_some(),
         "daemon stop must not signal a non-daemon profile lock owner"

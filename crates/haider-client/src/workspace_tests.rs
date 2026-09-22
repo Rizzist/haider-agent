@@ -866,13 +866,19 @@ fn relative_explicit_workspace_resolves_against_launch_cwd() {
 
 #[test]
 fn workspace_config_parses_and_rejects() {
+    let root = tempfile::tempdir().unwrap();
+    let absolute_base = root.path().join("abs").join("base");
     let valid: serde_json::Value = serde_json::json!({
         "default_model": "some-model",
-        "workspace": {"mode": "dated", "base": "/abs/base", "timezone": "UTC"}
+        "workspace": {
+            "mode": "dated",
+            "base": absolute_base.to_string_lossy(),
+            "timezone": "UTC"
+        }
     });
     let config = WorkspaceConfig::from_config_value(&valid).unwrap();
     assert_eq!(config.mode, Some(WorkspaceMode::Dated));
-    assert_eq!(config.base, Some(PathBuf::from("/abs/base")));
+    assert_eq!(config.base, Some(absolute_base));
     assert_eq!(config.timezone, Some(super::WorkspaceTimezone::Utc));
 
     // Absent object means no opinion.
@@ -882,10 +888,13 @@ fn workspace_config_parses_and_rejects() {
         WorkspaceConfig::default()
     );
 
+    let parent_escape = root.path().join("safe").join("..").join("escape");
     for invalid in [
         serde_json::json!({"workspace": {"mode": "sometimes"}}),
         serde_json::json!({"workspace": {"base": "relative"}}),
-        serde_json::json!({"workspace": {"base": "/safe/../escape"}}),
+        serde_json::json!({
+            "workspace": {"base": parent_escape.to_string_lossy()}
+        }),
         serde_json::json!({"workspace": {"timezone": "utc"}}),
         serde_json::json!({"workspace": "auto"}),
     ] {
