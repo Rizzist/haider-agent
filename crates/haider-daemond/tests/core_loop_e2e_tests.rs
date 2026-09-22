@@ -1606,19 +1606,25 @@ fn outliving_pipe_child_command() -> String {
     // Start a direct child so it inherits the daemon-owned Job Object. Shell
     // `start /b` is asynchronous and may create a breakaway child, which does
     // not exercise normal-completion Job detachment. The readiness handshake
-    // proves the descendant exists before its PowerShell leader exits.
+    // proves the descendant exists before its PowerShell leader exits. The
+    // product gives PowerShell an identity-checked DOS/UNC cwd rather than its
+    // canonical `\\?\` spelling. cmd.exe `/S` removes the outside quote pair;
+    // doubling it leaves the absolute batch path quoted after that removal.
     concat!(
         "$PSModuleAutoLoadingPreference='None';",
-        "$workspace=(Get-Location).Path;[Environment]::CurrentDirectory=$workspace;",
-        "$ready=Join-Path $workspace 'outliving-child-started.log';",
-        "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
+        "$workspace=$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.Path;",
+        "[Environment]::CurrentDirectory=$workspace;",
+        "$ready=[IO.Path]::Combine($workspace,'outliving-child-started.log');",
+        "$cmd=[IO.Path]::Combine([Environment]::SystemDirectory,'cmd.exe');",
+        "$script=[IO.Path]::Combine($workspace,'outliving-descendant.cmd');",
         "$start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$cmd;",
-        "$start.Arguments='/D /S /C outliving-descendant.cmd';",
+        "$start.Arguments='/D /S /C \"\"' + $script + '\"\"';",
         "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
         "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
         "if($null -eq $child){throw 'descendant process did not start'};",
-        "[IO.File]::WriteAllText((Join-Path $workspace 'outliving-child.pid'),",
-        "$child.Id.ToString([Globalization.CultureInfo]::InvariantCulture));",
+        "[IO.File]::WriteAllText([IO.Path]::Combine($workspace,'outliving-child.pid'),",
+        "$child.Id.ToString([Globalization.CultureInfo]::InvariantCulture),",
+        "[Text.Encoding]::ASCII);",
         "$readyWait=[Diagnostics.Stopwatch]::StartNew();",
         "while(-not [IO.File]::Exists($ready)){",
         "if($child.HasExited){$child.Dispose();",
@@ -1626,7 +1632,7 @@ fn outliving_pipe_child_command() -> String {
         "if($readyWait.ElapsedMilliseconds -ge 45000){",
         "try{$child.Kill()}catch{};$child.Dispose();",
         "throw 'descendant did not create its ready marker within 45 seconds'};",
-        "Start-Sleep -Milliseconds 10};$readyWait.Stop();",
+        "[Threading.Thread]::Sleep(10)};$readyWait.Stop();",
         "if($child.HasExited){$child.Dispose();",
         "throw 'descendant exited immediately after its ready marker'};",
         "$child.Dispose();[Console]::Out.Write('leader');[Console]::Out.Flush()"
@@ -1654,14 +1660,15 @@ fn install_outliving_pipe_fixture(workspace: &Path) {
         workspace.join("outliving-descendant.cmd"),
         concat!(
             "@echo off\r\n",
-            ">outliving-child-started.log <nul set /p \"=started\"\r\n",
+            "echo started>outliving-child-started.log\r\n",
             ":wait\r\n",
             "if exist descendant-probe goto released\r\n",
             "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
             "goto wait\r\n",
             ":released\r\n",
-            ">outliving-child-ran.log <nul set /p \"=ran\"\r\n",
-            "<nul set /p \"=child\"\r\n"
+            "echo ran>outliving-child-ran.log\r\n",
+            "echo child\r\n",
+            "exit /b 0\r\n"
         ),
     )
     .expect("write outliving descendant fixture");
