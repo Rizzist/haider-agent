@@ -36,7 +36,7 @@ class InstallerPackagingTests(unittest.TestCase):
     def archive(self, members=None, windows=False):
         members = members or {'bundle/haider': b'control', 'bundle/haiderd': b'daemon',
                               'bundle/haider-interactive': b'future payload'}
-        archive = self.root / ('haider-v0.0.971-x86_64-pc-windows-msvc.zip' if windows else 'haider-v0.0.971-x86_64-unknown-linux-gnu.tar.xz')
+        archive = self.root / ('haider-v0.0.972-x86_64-pc-windows-msvc.zip' if windows else 'haider-v0.0.972-x86_64-unknown-linux-gnu.tar.xz')
         if windows:
             with zipfile.ZipFile(archive, 'w') as out:
                 for name, data in members.items():
@@ -52,7 +52,7 @@ class InstallerPackagingTests(unittest.TestCase):
         return archive
 
     def prepare(self, archive=None, **kwargs):
-        return payload.prepare(archive or self.archive(), self.root / 'payload', '0.0.971',
+        return payload.prepare(archive or self.archive(), self.root / 'payload', '0.0.972',
                                kwargs.pop('target', 'x86_64-unknown-linux-gnu'), **kwargs)
 
     def test_dynamic_members_preserve_exact_bytes_and_future_payload(self):
@@ -68,7 +68,7 @@ class InstallerPackagingTests(unittest.TestCase):
         split = canonical.with_name(canonical.name.replace('.tar.xz', '-split.tar.xz'))
         split.write_bytes(canonical.read_bytes())
         self.assertEqual(payload.select_archive(self.root, 'x86_64-unknown-linux-gnu'), split)
-        split.with_name(split.name.replace('0.0.971', '0.0.969')).write_bytes(b'old')
+        split.with_name(split.name.replace('0.0.972', '0.0.969')).write_bytes(b'old')
         with self.assertRaisesRegex(ValueError, 'ambiguous'):
             payload.select_archive(self.root, 'x86_64-unknown-linux-gnu')
 
@@ -119,7 +119,7 @@ class InstallerPackagingTests(unittest.TestCase):
 
     def test_version_and_target_inputs_fail_closed(self):
         archive = self.archive()
-        for version, target in [('0.0.971;whoami', 'x86_64-unknown-linux-gnu'), ('0.0.971', '../bad')]:
+        for version, target in [('0.0.972;whoami', 'x86_64-unknown-linux-gnu'), ('0.0.972', '../bad')]:
             with self.assertRaises(ValueError):
                 payload.prepare(archive, self.root/'payload', version, target)
 
@@ -168,7 +168,7 @@ class InstallerPackagingTests(unittest.TestCase):
 
     def render_windows_fixture(self, work, **overrides):
         values = dict(payload=work / 'payload', manifest=work / 'payload/manifest.json',
-                      version='0.0.971', target='x86_64-pc-windows-msvc',
+                      version='0.0.972', target='x86_64-pc-windows-msvc',
                       output=work / 'output', work=work / 'rerendered')
         values.update(overrides)
         args = [arg for name, value in values.items() for arg in (f'--{name}', value)]
@@ -188,7 +188,7 @@ class InstallerPackagingTests(unittest.TestCase):
                         'DestName: "installer-manifest.json"; Flags: ignoreversion')
         self.assertEqual((work / 'members.iss').read_text(encoding='utf-8-sig').splitlines(), expected)
         self.assertEqual((work / 'generated.iss').read_text(encoding='utf-8-sig').splitlines(), [
-            '#define ReleaseVersion "0.0.971"',
+            '#define ReleaseVersion "0.0.972"',
             '#define ReleaseTarget "x86_64-pc-windows-msvc"',
             f'#define OutputPath "{(work / "output").resolve()}"'])
         self.assertEqual((work / 'windows.iss').read_bytes(),
@@ -222,7 +222,7 @@ class InstallerPackagingTests(unittest.TestCase):
     def test_windows_compile_renderer_refuses_invalid_coordinates_and_members(self):
         work = self.windows_fixture()
         for values, error in [({'version': '0.0.969'}, 'Manifest release mismatch'),
-                              ({'version': '0.0.971;bad'}, 'Invalid Windows release coordinates'),
+                              ({'version': '0.0.972;bad'}, 'Invalid Windows release coordinates'),
                               ({'target': 'aarch64-apple-darwin'}, 'Invalid Windows release coordinates')]:
             with self.subTest(values=values):
                 result = self.render_windows_fixture(work, **values)
@@ -250,7 +250,7 @@ class InstallerPackagingTests(unittest.TestCase):
         self.prepare()
         downloads = self.root / 'Downloads ü'
         downloads.mkdir()
-        script = downloads / 'haider-v0.0.971-x86_64-unknown-linux-gnu-uninstall-haider.sh'
+        script = downloads / 'haider-v0.0.972-x86_64-unknown-linux-gnu-uninstall-haider.sh'
         script.write_bytes((self.root / 'payload/uninstall-haider.sh').read_bytes())
         env = dict(os.environ, HOME=str(self.root))
         env.pop('SUDO_USER', None)

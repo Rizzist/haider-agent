@@ -22,7 +22,7 @@ fn live_session() -> AppModel {
     model.daemon_features = [haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned()]
         .into_iter()
         .collect();
-    model.daemon_version = Some("0.0.971".to_owned());
+    model.daemon_version = Some("0.0.972".to_owned());
     let session = SessionId::new("winclip-native-test");
     model.upsert_live_session(&session);
     model.open_session(&session);

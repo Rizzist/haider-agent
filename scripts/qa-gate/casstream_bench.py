@@ -83,7 +83,7 @@ def connect(endpoint: Path) -> tuple[socket.socket, dict]:
     peer.connect(str(endpoint))
     send_json(peer, {
         "v": 1, "kind": "hello", "protocol_min": 1, "protocol_max": 1,
-        "client_name": "casstream-bench", "client_version": "0.0.971",
+        "client_name": "casstream-bench", "client_version": "0.0.972",
         "client_instance_id": f"bench-{os.getpid()}", "client_kind": "cli",
         "capabilities_requested": ["view", "control"],
         "max_receive_frame": FRAME_LIMIT,
