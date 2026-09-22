@@ -207,14 +207,14 @@ pub struct WaitScope {
 /// no-ops, so callers can retain their ordinary uncounted read loop.
 #[must_use]
 pub struct CasHashScope {
-    scope: Scope,
+    _scope: Scope,
 }
 
 impl CasHashScope {
     pub fn enabled(&self) -> bool {
         #[cfg(unix)]
         {
-            self.scope._native.enabled()
+            self._scope._native.enabled()
         }
         #[cfg(not(unix))]
         {
@@ -224,19 +224,19 @@ impl CasHashScope {
 
     pub fn note_bytes_read(&mut self, bytes: usize) {
         #[cfg(unix)]
-        self.scope._native.note_bytes_read(bytes);
+        self._scope._native.note_bytes_read(bytes);
         #[cfg(not(unix))]
         let _ = bytes;
     }
 
     pub fn note_block_hashed(&mut self) {
         #[cfg(unix)]
-        self.scope._native.note_block_hashed();
+        self._scope._native.note_block_hashed();
     }
 
     pub fn note_reverify_call(&mut self) {
         #[cfg(unix)]
-        self.scope._native.note_reverify_call();
+        self._scope._native.note_reverify_call();
     }
 }
 
@@ -246,14 +246,14 @@ impl CasHashScope {
 /// disabled path to the same no-op branch as every other phase probe.
 #[must_use]
 pub struct StoreScope {
-    scope: Scope,
+    _scope: Scope,
 }
 
 impl StoreScope {
     pub fn enabled(&self) -> bool {
         #[cfg(unix)]
         {
-            self.scope._native.enabled()
+            self._scope._native.enabled()
         }
         #[cfg(not(unix))]
         {
@@ -263,21 +263,21 @@ impl StoreScope {
 
     pub fn note_rows_read(&mut self, rows: usize) {
         #[cfg(unix)]
-        self.scope._native.note_rows_read(rows);
+        self._scope._native.note_rows_read(rows);
         #[cfg(not(unix))]
         let _ = rows;
     }
 
     pub fn note_payload_bytes(&mut self, bytes: usize) {
         #[cfg(unix)]
-        self.scope._native.note_payload_bytes(bytes);
+        self._scope._native.note_payload_bytes(bytes);
         #[cfg(not(unix))]
         let _ = bytes;
     }
 
     pub fn note_event_decoded(&mut self) {
         #[cfg(unix)]
-        self.scope._native.note_event_decoded();
+        self._scope._native.note_event_decoded();
     }
 }
 
@@ -304,7 +304,7 @@ pub fn store_scope_for(phase: Phase, caller: StoreReadCaller) -> StoreScope {
     #[cfg(not(unix))]
     let _ = (phase, caller);
     StoreScope {
-        scope: Scope {
+        _scope: Scope {
             #[cfg(unix)]
             _native: native::Scope::new_with_store_caller(phase, caller),
         },
@@ -329,7 +329,7 @@ pub fn store_wait_scope(phase: Phase) -> WaitScope {
 /// and write-side re-verification are accepted so their costs stay separable.
 pub fn cas_hash_scope(reverify: bool) -> CasHashScope {
     CasHashScope {
-        scope: scope(if reverify {
+        _scope: scope(if reverify {
             Phase::CasReverify
         } else {
             Phase::CasReadHash

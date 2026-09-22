@@ -99,6 +99,9 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: platform-tools
       - name: install pinned NDK
         run: sdkmanager "ndk;28.2.13676358"
       - name: native verification script tests
@@ -158,6 +161,9 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: platform-tools
       - name: install pinned SDK and NDK for verification
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;28.2.13676358"
       - uses: gradle/actions/setup-gradle@v4

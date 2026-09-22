@@ -1638,6 +1638,7 @@ fn process_start_observer_surfaces_second_permission_and_terminal_exec_text() {
                         status: haider_protocol::tool::ToolResultStatus::Failed,
                         reason: Some("fixture failed".into()),
                         presentation: None,
+                        orchestration: None,
                         data: None,
                     },
                 },

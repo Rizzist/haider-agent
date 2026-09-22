@@ -151,6 +151,9 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: platform-tools
 
       - name: install SDK packages
         run: |

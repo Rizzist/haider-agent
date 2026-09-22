@@ -909,13 +909,12 @@ pub fn validate_workspace_allocation(
             "session cwd is not the allocation leaf".into(),
         ));
     }
-    let daily_root =
-        haider_platform::open_absolute_directory(&plan.daily_root).map_err(|error| {
-            MaterializeError::Io(
-                plan.daily_root.clone(),
-                workspace_directory_error_to_io(error),
-            )
-        })?;
+    let daily_root = open_anchored_absolute_directory(&plan.daily_root).map_err(|error| {
+        MaterializeError::Io(
+            plan.daily_root.clone(),
+            workspace_directory_error_to_io(error),
+        )
+    })?;
     match std::fs::symlink_metadata(&plan.leaf) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => return Err(MaterializeError::LeafAlreadyExists(plan.leaf.clone())),
@@ -931,13 +930,12 @@ pub fn materialize_workspace_allocation(
     allocation: &WorkspaceAllocationV1,
 ) -> Result<haider_platform::WorkspaceDirectory, MaterializeError> {
     let plan = plan_from_workspace_allocation(allocation)?;
-    let daily_root =
-        haider_platform::open_absolute_directory(&plan.daily_root).map_err(|error| {
-            MaterializeError::Io(
-                plan.daily_root.clone(),
-                workspace_directory_error_to_io(error),
-            )
-        })?;
+    let daily_root = open_anchored_absolute_directory(&plan.daily_root).map_err(|error| {
+        MaterializeError::Io(
+            plan.daily_root.clone(),
+            workspace_directory_error_to_io(error),
+        )
+    })?;
     let name = plan
         .leaf
         .file_name()
@@ -1080,6 +1078,24 @@ fn materialize_daily_root_directory(
         std::ffi::OsStr::new(&plan.hijri_label),
         &plan.daily_root,
     )
+}
+
+/// Reopens an absolute directory while retaining authority over every path
+/// component. Unix can walk from `/` with `openat`; Windows uses the stage-1
+/// root-to-leaf handle chain so an ancestor cannot be replaced underneath a
+/// later path-based operation.
+#[cfg(unix)]
+fn open_anchored_absolute_directory(
+    path: &Path,
+) -> Result<haider_platform::WorkspaceDirectory, haider_platform::WorkspaceDirectoryError> {
+    haider_platform::open_absolute_directory(path)
+}
+
+#[cfg(windows)]
+fn open_anchored_absolute_directory(
+    path: &Path,
+) -> Result<haider_platform::WorkspaceDirectory, haider_platform::WorkspaceDirectoryError> {
+    haider_platform::open_workspace_directory(path)
 }
 
 #[cfg(unix)]

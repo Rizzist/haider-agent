@@ -60,6 +60,7 @@ tui-rapid-submit	linux	haider-tui	test:tui31_lifecycle_tests	two_rapid_aura_subm
 tui-effect-interleaving	linux	haider-tui	test:f2_error_visibility_tests	interleaved_results_attribute_each_effect_to_its_own_row	crates/haider-tui/tests/f2_error_visibility_tests.rs
 # Timing-window tests whose names do not contain an explicit race token.
 cli-one-shot-daemon-reap	macos	haider-cli	test:cli_tests	one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure	crates/haider-cli/tests/cli_tests.rs
+daemon-coordinator-restart-wait	macos	haider-daemon	lib	coordinator_restart_mid_wait_rearms_supervision_from_durable_progress	crates/haider-daemon/src/subagent_core_tests.rs
 daemon-hook-decision-window	linux	haider-daemon	lib	decision_deny_is_reject_once_and_malformed_output_falls_through	crates/haider-daemon/src/hooks_tests.rs
 daemon-hook-replay-window	linux	haider-daemon	lib	zero_hooks_retain_without_decode_then_post_install_replay_fires_old_event	crates/haider-daemon/src/hook_dispatch_peak_rss_tests.rs
 daemon-oauth-slow-down-timing	linux	haider-daemon	lib	device_flow_runner_continues_and_honors_slow_down_interval	crates/haider-daemon/src/oauth_tests.rs
