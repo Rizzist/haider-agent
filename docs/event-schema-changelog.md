@@ -25,11 +25,16 @@ them and because the changelog pin needs a complete current kind set.
 
 New additive extension kind `tool_arguments_finalized_v1` uses the existing
 `item:extension` carrier. Its typed payload binds `tool_item_id`, `call_id`,
-and tool `name` to the complete, consumer-redacted JSON `arguments` object.
-The actor commits its hidden durable Started/Completed pair after the provider
-argument stream closes as a valid object and before any actor-owned behavior,
-dispatcher preflight, grant-ceiling refusal, approval card, daemon dispatch, or
-effect receipt.
+and tool `name` to the complete, consumer-redacted JSON `arguments` value.
+Ordinary provider tools carry their parsed arguments object. `tool_script`
+instead carries its exact raw UTF-8 source encoded as a JSON string, preserving
+duplicate keys for audit and for its stricter parser. An over-ceiling
+`tool_script` stream has no finalized carrier: only a bounded, incomplete
+prefix exists locally, so publishing that prefix as complete would be false.
+For every complete value, the actor commits its hidden durable
+Started/Completed pair after the provider argument stream closes and before
+any actor-owned behavior, dispatcher preflight, grant-ceiling refusal,
+approval card, daemon dispatch, or effect receipt.
 
 For immediately allowed effects the order is therefore finalized carrier →
 `RunningTool` → the atomic Effect Intent/Authorized(Allow)/Dispatched batch.
@@ -44,6 +49,14 @@ carrier's redacted `arguments`. Execution and broker approval retain the raw
 object because approval binds effect identity, not display bytes. Existing item
 bytes are unchanged when the supplemental event is absent. The RPC method pin
 remains 136 and `schema_version` remains 1.
+
+This carrier describes the provider-originated tool call finalized by the
+session actor, including an outer `tool_script` call. Calls made by that
+script's orchestration runtime are distinct child records: their durable
+source/admission, `OrchActivationV1` evidence, `orchestration_call_v1`
+start/result extensions, and `orchestration_checkpoint_v1` records remain the
+child execution and recovery authority. Those child records are not replaced
+or summarized by the actor's outer finalized-arguments carrier.
 
 ### v0.0.972 — permission-bound Edit/Write review
 
