@@ -1235,9 +1235,18 @@ fn tui_origin_registration_round_trips_and_stale_cas_soft_attaches() {
 #[test]
 fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     let mut model = live_model();
+    let workspace_base = tempfile::tempdir().expect("temporary workspace base");
+    let daily_root = workspace_base.path().join("Haider").join("1448-04-07");
+    let first_leaf = daily_root.join("s-0123456789abcdef0123456789abcdef");
     let first = haider_protocol::session::WorkspaceAllocationV1 {
-        daily_root: "/tmp/Haider/1448-04-07".into(),
-        leaf: "/tmp/Haider/1448-04-07/s-0123456789abcdef0123456789abcdef".into(),
+        daily_root: daily_root
+            .to_str()
+            .expect("UTF-8 temporary workspace root")
+            .into(),
+        leaf: first_leaf
+            .to_str()
+            .expect("UTF-8 temporary workspace leaf")
+            .into(),
         allocation_id: "0123456789abcdef0123456789abcdef".into(),
         calendar_id: "islamic-civil".into(),
         hijri_date: "1448-04-07".into(),
@@ -1248,6 +1257,8 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     model.cwd = first.leaf.clone();
     model.pending_workspace_allocation = Some(first.clone());
     let mut driver = LiveDriver::new("allocation-test");
+    assert!(!daily_root.exists());
+    assert!(!first_leaf.exists());
 
     let issued = driver.handle_request(
         &mut model,
@@ -1265,7 +1276,12 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
         .clone()
         .expect("next allocation");
     assert_ne!(second.allocation_id, first.allocation_id);
+    assert_ne!(second.leaf, first.leaf);
+    assert_eq!(second.daily_root, first.daily_root);
     assert_eq!(model.cwd, second.leaf);
+    assert!(!daily_root.exists());
+    assert!(!std::path::Path::new(&first.leaf).exists());
+    assert!(!std::path::Path::new(&second.leaf).exists());
 
     let issued = driver.handle_request(
         &mut model,
@@ -1278,14 +1294,20 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
         [LiveCommand::Create { cwd, workspace_allocation: Some(allocation), .. }]
             if cwd == &second.leaf && allocation == &second
     ));
-    assert_ne!(
-        model
-            .pending_workspace_allocation
-            .as_ref()
-            .expect("third allocation")
-            .allocation_id,
-        second.allocation_id
-    );
+    let third = model
+        .pending_workspace_allocation
+        .as_ref()
+        .expect("third allocation");
+    assert_ne!(third.allocation_id, first.allocation_id);
+    assert_ne!(third.allocation_id, second.allocation_id);
+    assert_ne!(third.leaf, first.leaf);
+    assert_ne!(third.leaf, second.leaf);
+    assert_eq!(third.daily_root, first.daily_root);
+    assert_eq!(model.cwd, third.leaf);
+    assert!(!daily_root.exists());
+    assert!(!std::path::Path::new(&first.leaf).exists());
+    assert!(!std::path::Path::new(&second.leaf).exists());
+    assert!(!std::path::Path::new(&third.leaf).exists());
 }
 
 // ---- menu coordinates -------------------------------------------------

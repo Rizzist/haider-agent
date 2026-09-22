@@ -43,6 +43,7 @@ daemon-budget-stop-race	linux	haider-daemon	lib	a_durable_budget_cause_wins_when
 daemon-recovery-interleaving	linux	haider-daemon	lib	restart_recovery_keeps_interleaved_runs_on_their_accepted_branches	crates/haider-daemon/src/runtime_tests.rs
 daemon-duplicate-fork	linux	haider-daemon	lib	concurrent_duplicate_fork_discards_the_losing_candidate_actor	crates/haider-daemon/src/session_hub_private_tests.rs
 daemon-import-healing	linux	haider-daemon	lib	concurrent_import_healing_reads_source_and_refreshes_once	crates/haider-daemon/src/accounts_tests.rs
+daemon-marked-expired-import-healing	all	haider-daemon	lib	marked_expired_import_commits_a_fresher_source_and_resolves_it	crates/haider-daemon/src/accounts_tests.rs
 client-authenticated-candidate	linux	haider-client	test:client_tests	authenticated_daemon_candidate_is_not_treated_as_a_race_loser	crates/haider-client/tests/client_tests.rs
 client-racing-launcher	macos	haider-client	test:client_tests	racing_launcher_never_owns_the_other_launchers_winner	crates/haider-client/tests/client_tests.rs
 client-deadline-terminal-race	linux	haider-client	lib	durable_request_deadline_reason_wins_terminal_race_as_timeout	crates/haider-client/src/headless_tests.rs

@@ -3168,11 +3168,18 @@ fn run_oauth_import_env_child(test_name: &str, overrides: &[(&str, &std::path::P
     }
     let output = command.output().expect("spawn isolated import test");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success() && stdout.contains("running 1 test"),
-        "isolated import test failed or did not run\nstdout:\n{}\nstderr:\n{}",
+        output.status.success(),
+        "isolated import test failed\nstderr:\n{}\nstdout:\n{}",
+        stderr,
+        stdout
+    );
+    assert!(
+        stdout.contains("running 1 test"),
+        "isolated import test did not run\nstdout:\n{}\nstderr:\n{}",
         stdout,
-        String::from_utf8_lossy(&output.stderr)
+        stderr
     );
     true
 }
@@ -3569,7 +3576,10 @@ fn start_oauth_import_heal_test_actor_with_native(
             validator: Arc::new(ProviderCredentialValidator),
             snapshot: Arc::clone(&snapshot),
             management: Some(management),
-            device_discovery: DeviceDiscoverySnapshot::new(false),
+            // Import-healing tests drive every broker resolution explicitly.
+            // Automatic catalog discovery would start an unrelated resolution
+            // flight after import and make the result depend on actor timing.
+            device_discovery: DeviceDiscoverySnapshot::new(true),
             profile_id: "oauth-import-heal-test".into(),
             default_model: "unused".into(),
             providers,
