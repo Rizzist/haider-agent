@@ -1454,7 +1454,7 @@ async fn submit_turn_allow_always(
     (run_id, events)
 }
 
-async fn assert_isolated_test_passes(test_name: &str, marker: &str) {
+async fn assert_isolated_test_passes(test_name: &str, marker: &str, deadline: std::time::Duration) {
     let executable = std::env::current_exe().expect("current integration-test executable");
     let mut command = tokio::process::Command::new(executable);
     command
@@ -1463,9 +1463,14 @@ async fn assert_isolated_test_passes(test_name: &str, marker: &str) {
         .arg("--nocapture")
         .env(marker, "1")
         .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(8), command.output())
+    let output = tokio::time::timeout(deadline, command.output())
         .await
-        .unwrap_or_else(|_| panic!("isolated regression `{test_name}` hung past 8 seconds"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "isolated regression `{test_name}` hung past {} seconds",
+                deadline.as_secs()
+            )
+        })
         .expect("launch isolated regression process");
     assert!(
         output.status.success(),
@@ -1473,6 +1478,29 @@ async fn assert_isolated_test_passes(test_name: &str, marker: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+const NO_IDLE_PARENT_RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+
+fn no_idle_parent_release_deadline() -> std::time::Duration {
+    #[cfg(windows)]
+    {
+        // The scenario necessarily spends 800 ms in the child provider and
+        // one second in the production terminal tail. On loaded Windows
+        // runners, allow one established IPC scheduling/keepalive interval on
+        // top of the Unix regression bound; this changes no product timeout.
+        NO_IDLE_PARENT_RELEASE_DEADLINE.saturating_add(support::KEEPALIVE_INTERVAL)
+    }
+    #[cfg(not(windows))]
+    {
+        NO_IDLE_PARENT_RELEASE_DEADLINE
+    }
+}
+
+fn no_idle_isolated_process_deadline() -> std::time::Duration {
+    // Preserve the original four seconds of subprocess startup and bounded
+    // daemon-shutdown headroom beyond the inner behavioral assertion.
+    no_idle_parent_release_deadline().saturating_add(std::time::Duration::from_secs(4))
 }
 
 fn continuation_seen(events: &[EventPayload], marker: &str) -> bool {
@@ -1575,7 +1603,33 @@ fn outliving_pipe_child_command() -> String {
 
 #[cfg(windows)]
 fn outliving_pipe_child_command() -> String {
-    "cmd.exe /D /S /C outliving-leader.cmd".into()
+    // Start a direct child so it inherits the daemon-owned Job Object. Shell
+    // `start /b` is asynchronous and may create a breakaway child, which does
+    // not exercise normal-completion Job detachment. The readiness handshake
+    // proves the descendant exists before its PowerShell leader exits.
+    concat!(
+        "$PSModuleAutoLoadingPreference='None';",
+        "$workspace=(Get-Location).Path;[Environment]::CurrentDirectory=$workspace;",
+        "$ready=Join-Path $workspace 'outliving-child-started.log';",
+        "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
+        "$start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$cmd;",
+        "$start.Arguments='/D /S /C outliving-descendant.cmd';",
+        "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
+        "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
+        "if($null -eq $child){throw 'descendant process did not start'};",
+        "$readyWait=[Diagnostics.Stopwatch]::StartNew();",
+        "while(-not [IO.File]::Exists($ready)){",
+        "if($child.HasExited){$child.Dispose();",
+        "throw 'descendant exited before its ready marker'};",
+        "if($readyWait.ElapsedMilliseconds -ge 45000){",
+        "try{$child.Kill()}catch{};$child.Dispose();",
+        "throw 'descendant did not create its ready marker within 45 seconds'};",
+        "Start-Sleep -Milliseconds 10};$readyWait.Stop();",
+        "if($child.HasExited){$child.Dispose();",
+        "throw 'descendant exited immediately after its ready marker'};",
+        "$child.Dispose();[Console]::Out.Write('leader');[Console]::Out.Flush()"
+    )
+    .into()
 }
 
 #[cfg(unix)]
@@ -1595,16 +1649,16 @@ fn install_outliving_pipe_fixture(workspace: &Path) {
 #[cfg(windows)]
 fn install_outliving_pipe_fixture(workspace: &Path) {
     fs::write(
-        workspace.join("outliving-leader.cmd"),
+        workspace.join("outliving-descendant.cmd"),
         concat!(
             "@echo off\r\n",
-            "start \"\" /b cmd.exe /D /S /C \"ping -n 2 127.0.0.1 >nul & ",
-            "echo ran>outliving-child-ran.log & ^<nul set /p =child\"\r\n",
-            "<nul set /p =leader\r\n",
-            "exit /b 0\r\n"
+            ">outliving-child-started.log <nul set /p \"=started\"\r\n",
+            "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            ">outliving-child-ran.log <nul set /p \"=ran\"\r\n",
+            "<nul set /p \"=child\"\r\n"
         ),
     )
-    .expect("write outliving-child leader script");
+    .expect("write outliving descendant fixture");
 }
 
 #[cfg(unix)]
@@ -2680,11 +2734,14 @@ async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
     )
     .await;
     let events = events_until_terminal(&mut client, &run).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    assert!(
-        workspace.join("outliving-child-ran.log").exists(),
-        "foreground process_exec swept a descendant after its leader exited"
-    );
+    let descendant_ran = workspace.join("outliving-child-ran.log");
+    tokio::time::timeout(process_fixture::STOP_OBSERVATION, async {
+        while !descendant_ran.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("foreground process_exec swept a descendant after its leader exited");
     assert_eq!(stdout_bytes(&events), b"leader");
     assert!(continuation_seen(&events, "continued-outliving-pipe"));
     assert_eq!(fake.requests().len(), 2);
@@ -3993,6 +4050,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
         assert_isolated_test_passes(
             "terminal_child_run_without_session_idle_still_releases_parent",
             ISOLATION_MARKER,
+            no_idle_isolated_process_deadline(),
         )
         .await;
         return;
@@ -4132,7 +4190,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
                 .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Queued)))
     }));
     let (parent_events, child_journal) =
-        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        tokio::time::timeout(no_idle_parent_release_deadline(), async {
             let mut attempt = 0_u32;
             loop {
                 let parent_label = format!("no-idle-parent-read-{attempt}");
