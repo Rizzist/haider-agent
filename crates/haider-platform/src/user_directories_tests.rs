@@ -103,8 +103,11 @@ fn relative_xdg_config_home_is_ignored_per_spec() {
 
 #[test]
 fn absolute_xdg_config_home_is_used() {
-    let lookup = linux_documents_directory(&home(), Some(Path::new("/etc/xdg-home")), |path| {
-        assert_eq!(path, Path::new("/etc/xdg-home/user-dirs.dirs"));
+    let config_home = std::env::temp_dir().join("xdg-home");
+    let expected = config_home.join("user-dirs.dirs");
+    assert!(config_home.is_absolute());
+    let lookup = linux_documents_directory(&home(), Some(&config_home), |path| {
+        assert_eq!(path, expected);
         Some("XDG_DOCUMENTS_DIR=\"$HOME/Docs\"\n".to_string())
     });
     assert_eq!(lookup, DocumentsLookup::Documents(home().join("Docs")));

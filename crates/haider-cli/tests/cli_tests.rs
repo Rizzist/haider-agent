@@ -3309,6 +3309,14 @@ fn haider_with_stdin_boot_retry(args: &[&str], input: &[u8]) -> std::process::Ou
 const CLI_PROCESS_DEADLINE: Duration = Duration::from_secs(60);
 
 fn bounded_output(command: &mut Command, input: Option<&[u8]>) -> std::process::Output {
+    bounded_output_with_deadline(command, input, CLI_PROCESS_DEADLINE)
+}
+
+fn bounded_output_with_deadline(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    process_deadline: Duration,
+) -> std::process::Output {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -3342,7 +3350,7 @@ fn bounded_output(command: &mut Command, input: Option<&[u8]>) -> std::process::
             .write_all(input)
             .expect("write prompt stdin");
     }
-    let deadline = Instant::now() + CLI_PROCESS_DEADLINE;
+    let deadline = Instant::now() + process_deadline;
     loop {
         match child.try_wait().expect("inspect bounded binary") {
             Some(status) => {
@@ -3362,7 +3370,7 @@ fn bounded_output(command: &mut Command, input: Option<&[u8]>) -> std::process::
                     stderr: stderr_reader.join().expect("join timed-out stderr reader"),
                 };
                 panic!(
-                    "binary exceeded {CLI_PROCESS_DEADLINE:?}; stderr: {}",
+                    "binary exceeded {process_deadline:?}; stderr: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
@@ -5552,7 +5560,8 @@ fn ordinary_session_submission_is_separate_from_budget_resume() {
 
 #[test]
 fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
-    let limit = haider_protocol::request_budget::RequestBudgetV1::default().hard_cap;
+    let request_budget = haider_protocol::request_budget::RequestBudgetV1::default();
+    let limit = request_budget.hard_cap;
     let mut script = Vec::new();
     for ordinal in 1..=limit {
         if ordinal > 1 {
@@ -5576,7 +5585,11 @@ fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
         let workspace = profile.parent().expect("profile parent").join("workspace");
         std::fs::write(workspace.join("continuity.txt"), "retained fixture history")
             .expect("workspace input");
-        let invoke = |args: &[&str], script: &str, input: Option<&[u8]>, expected: i32| {
+        let invoke = |args: &[&str],
+                      script: &str,
+                      input: Option<&[u8]>,
+                      expected: i32,
+                      process_deadline: Duration| {
             let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
             configure_test_home(&mut command, &profile);
             command
@@ -5589,7 +5602,7 @@ fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
                 .env("HAIDER_TEST_FAKE_PROVIDER", script)
                 .env_remove("HAIDER_MODEL")
                 .args(args);
-            let output = bounded_output(&mut command, input);
+            let output = bounded_output_with_deadline(&mut command, input, process_deadline);
             assert_eq!(
                 output.status.code(),
                 Some(expected),
@@ -5613,9 +5626,28 @@ fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
             DEFAULT_FAKE_SCRIPT,
             None,
             0,
+            CLI_PROCESS_DEADLINE,
         );
         let first: serde_json::Value = serde_json::from_slice(&first.stdout).expect("initial JSON");
         let session_id = first["session_id"].as_str().expect("native session");
+        // Registry #94 BudgetSum: the ordinary ceiling spans two 32-request
+        // tranches, each with the test's existing 30-second CI allowance. Add
+        // the platform startup allowance from the replay timing budget. The
+        // outer harness owns only terminal grace and pipe-drain slack; the
+        // asserted 64-request behavior remains unchanged.
+        let tranche_count = request_budget.hard_cap.div_ceil(request_budget.tranche);
+        let tranche_count = u32::try_from(tranche_count).expect("tranche count fits in u32");
+        let platform_startup_budget = if cfg!(windows) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        let tranche_budget = Duration::from_secs(30);
+        let pipe_drain_budget = Duration::from_secs(2);
+        let ceiling_run_budget = platform_startup_budget + tranche_budget * tranche_count;
+        let ceiling_process_deadline =
+            ceiling_run_budget + haider_client::DEFAULT_TERMINAL_GRACE + pipe_drain_budget;
+        let ceiling_timeout = format!("{}s", ceiling_run_budget.as_secs());
         let capped = invoke(
             &[
                 "run",
@@ -5624,12 +5656,13 @@ fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
                 "--output",
                 output_mode,
                 "--timeout",
-                "30s",
+                ceiling_timeout.as_str(),
                 "reach the ordinary ceiling",
             ],
             &ceiling_script,
             None,
             78,
+            ceiling_process_deadline,
         );
         let stderr = String::from_utf8(capped.stderr).expect("failure stderr");
         let advertised = stderr
@@ -5684,6 +5717,7 @@ fn ordinary_request_ceiling_advertises_an_executable_session_continuation() {
             DEFAULT_FAKE_SCRIPT,
             Some(b"continue with a fresh turn\n"),
             0,
+            CLI_PROCESS_DEADLINE,
         );
         let continued: serde_json::Value =
             serde_json::from_slice(&continued.stdout).expect("continued JSON");

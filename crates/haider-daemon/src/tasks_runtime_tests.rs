@@ -277,7 +277,9 @@ fn monitor_marker_command(marker: &std::path::Path) -> String {
     #[cfg(windows)]
     {
         let marker = marker.replace('\'', "''");
-        format!("[IO.File]::WriteAllText('{marker}','authorized')")
+        format!(
+            "[IO.File]::WriteAllBytes('{marker}',[byte[]](97,117,116,104,111,114,105,122,101,100))"
+        )
     }
 }
 
@@ -426,8 +428,8 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
             .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
     );
     assert_eq!(
-        std::fs::read_to_string(&autonomous_marker).expect("read autonomous marker"),
-        "authorized"
+        std::fs::read(&autonomous_marker).expect("read autonomous marker"),
+        b"authorized"
     );
     autonomous_dispatcher
         .close()
@@ -486,8 +488,8 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         .expect("durable Dispatched phase");
     assert!(authorized < dispatched);
     assert_eq!(
-        std::fs::read_to_string(&allow_marker).expect("read authorized marker"),
-        "authorized"
+        std::fs::read(&allow_marker).expect("read authorized marker"),
+        b"authorized"
     );
 
     allow_dispatcher

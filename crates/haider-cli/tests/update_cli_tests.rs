@@ -263,8 +263,10 @@ fn bare_tui_workspace_selectors_are_typed_and_mutually_exclusive() {
             workspace_mode: Some("dated".into()),
         })
     );
+    let workspace = std::env::temp_dir().join("project");
+    let workspace = workspace.to_string_lossy();
     assert_eq!(
-        parse(&["--workspace", "/tmp/project", "--workspace-mode", "cwd"]),
+        parse(&["--workspace", workspace.as_ref(), "--workspace-mode", "cwd"]),
         Err("--workspace and --workspace-mode are mutually exclusive".into())
     );
     assert_eq!(

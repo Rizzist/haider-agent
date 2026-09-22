@@ -1662,7 +1662,9 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     #[cfg(target_os = "macos")]
     const EXPECTED_FULL_PREFIX_BYTES: usize = 43_354;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_353;
+    // `tool_script` nests the platform-specific `process_exec` schema, so
+    // Windows carries the historical 3-byte command-description delta twice.
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_350;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     const EXPECTED_FULL_PREFIX_BYTES: usize = 43_348;
     config.tools = authorized;

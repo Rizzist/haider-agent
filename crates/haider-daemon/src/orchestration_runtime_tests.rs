@@ -491,6 +491,23 @@ fn two_process_exec_script(first: &str, second: &str) -> String {
     .to_string()
 }
 
+fn marker_write_command(path: &str, contents: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("printf {contents} > {path}")
+    }
+    #[cfg(windows)]
+    {
+        let bytes = contents
+            .as_bytes()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[IO.File]::WriteAllBytes('{path}',[byte[]]({bytes}))")
+    }
+}
+
 fn menu_answer(menu: &Menu, decision: DecisionKind) -> MenuAnswer {
     let (index, option) = menu
         .options
@@ -870,10 +887,9 @@ async fn runtime_permission_denial_fails_child_and_script_after_prior_effect() {
     .await;
     let first_marker = std::path::Path::new(&fixture.cwd).join("first-marker.txt");
     let second_marker = std::path::Path::new(&fixture.cwd).join("second-marker.txt");
-    let script = two_process_exec_script(
-        "printf first > first-marker.txt",
-        "printf second > second-marker.txt",
-    );
+    let first_command = marker_write_command("first-marker.txt", "first");
+    let second_command = marker_write_command("second-marker.txt", "second");
+    let script = two_process_exec_script(&first_command, &second_command);
     let item_id = ItemId::new("outer-permission-script-item");
 
     let first = fixture
@@ -919,8 +935,8 @@ async fn runtime_permission_denial_fails_child_and_script_after_prior_effect() {
     };
     assert_ne!(first_menu.id, second_menu.id);
     assert_eq!(
-        std::fs::read_to_string(&first_marker).expect("first child marker"),
-        "first"
+        std::fs::read(&first_marker).expect("first child marker"),
+        b"first"
     );
     assert!(!second_marker.exists());
     fixture
@@ -968,8 +984,8 @@ async fn runtime_permission_denial_fails_child_and_script_after_prior_effect() {
     assert_eq!(outcomes, 1, "only the approved child may have an outcome");
     assert_eq!(child_results, 2);
     assert_eq!(
-        std::fs::read_to_string(&first_marker).expect("first child still executed once"),
-        "first"
+        std::fs::read(&first_marker).expect("first child still executed once"),
+        b"first"
     );
     assert!(!second_marker.exists(), "denied child must never dispatch");
     close_fixture(fixture).await;
