@@ -9,6 +9,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "race-stress.sh"
 
 
+@unittest.skipIf(
+    os.name == "nt",
+    "race-stress.sh targets the macOS/Linux race catalog, not Windows",
+)
 class RaceStressHarnessTests(unittest.TestCase):
     def test_catalog_mode_lists_real_linux_cases_without_building(self):
         result = subprocess.run(

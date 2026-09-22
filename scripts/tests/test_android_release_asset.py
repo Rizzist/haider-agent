@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 import subprocess
 from pathlib import Path
 import unittest
@@ -76,12 +77,15 @@ class AndroidReleaseAssetTest(unittest.TestCase):
                            publish.index('gh release create'))
 
 
+@unittest.skipIf(
+    os.name == 'nt',
+    'Android artifact collection is POSIX shell executed by the Ubuntu publish job',
+)
 class ReleaseShellTest(unittest.TestCase):
     """Execute the actual workflow shell; only GitHub transport uses fixtures."""
     def run_collection(self, scenario):
         import hashlib
         import json
-        import os
         import tempfile
         workflow = (ROOT / '.github/workflows/release.yml').read_text()
         step = workflow.split('      - name: require verified Android APK artifact before publication\n')[1]
