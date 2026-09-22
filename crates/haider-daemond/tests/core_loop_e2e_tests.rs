@@ -1617,6 +1617,8 @@ fn outliving_pipe_child_command() -> String {
         "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
         "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
         "if($null -eq $child){throw 'descendant process did not start'};",
+        "[IO.File]::WriteAllText((Join-Path $workspace 'outliving-child.pid'),",
+        "$child.Id.ToString([Globalization.CultureInfo]::InvariantCulture));",
         "$readyWait=[Diagnostics.Stopwatch]::StartNew();",
         "while(-not [IO.File]::Exists($ready)){",
         "if($child.HasExited){$child.Dispose();",
@@ -1653,7 +1655,11 @@ fn install_outliving_pipe_fixture(workspace: &Path) {
         concat!(
             "@echo off\r\n",
             ">outliving-child-started.log <nul set /p \"=started\"\r\n",
+            ":wait\r\n",
+            "if exist descendant-probe goto released\r\n",
             "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            "goto wait\r\n",
+            ":released\r\n",
             ">outliving-child-ran.log <nul set /p \"=ran\"\r\n",
             "<nul set /p \"=child\"\r\n"
         ),
@@ -2691,6 +2697,8 @@ async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
     fs::create_dir(&workspace).expect("workspace");
     init_git_workspace(&workspace);
     install_outliving_pipe_fixture(&workspace);
+    #[cfg(windows)]
+    let descendant_probe = process_fixture::DescendantProbe::new(&workspace);
     let (dependencies, fake) = fake_dependencies(tool_round(
         "outliving-pipe",
         "process_exec",
@@ -2734,7 +2742,9 @@ async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
     )
     .await;
     let events = events_until_terminal(&mut client, &run).await;
+    #[cfg(unix)]
     let descendant_ran = workspace.join("outliving-child-ran.log");
+    #[cfg(unix)]
     tokio::time::timeout(process_fixture::STOP_OBSERVATION, async {
         while !descendant_ran.exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2742,6 +2752,42 @@ async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
     })
     .await
     .expect("foreground process_exec swept a descendant after its leader exited");
+    #[cfg(windows)]
+    {
+        let pid_text = fs::read_to_string(workspace.join("outliving-child.pid"))
+            .expect("outliving descendant PID");
+        let pid = pid_text
+            .trim()
+            .parse::<u32>()
+            .expect("numeric outliving descendant PID");
+        let state = haider_platform::windows_process_state(pid)
+            .expect("inspect outliving descendant after normal leader completion")
+            .expect("outliving descendant process remains inspectable");
+        assert!(
+            state.alive,
+            "foreground process_exec swept descendant {pid} after its leader exited: {state:?}"
+        );
+
+        // The previous marker-only probe could not distinguish a swept Job
+        // member from a live descendant starved past STOP_OBSERVATION. Prove
+        // liveness through the retained Win32 process object first, then use
+        // the file handshake only to release and reap the fixture. One shared
+        // IPC keepalive interval is the repository's loaded-Windows scheduling
+        // allowance; it does not weaken the liveness assertion above.
+        descendant_probe.release();
+        let descendant_ran = workspace.join("outliving-child-ran.log");
+        tokio::time::timeout(
+            process_fixture::STOP_OBSERVATION.saturating_add(support::KEEPALIVE_INTERVAL),
+            async {
+                while !descendant_ran.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("live Windows descendant did not observe its release probe");
+        descendant_probe.assert_released();
+    }
     assert_eq!(stdout_bytes(&events), b"leader");
     assert!(continuation_seen(&events, "continued-outliving-pipe"));
     assert_eq!(fake.requests().len(), 2);

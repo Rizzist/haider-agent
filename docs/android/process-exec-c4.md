@@ -106,3 +106,12 @@ kernel cgroup/sandbox or abrupt-app-death descendant guarantee. A parent-death
 signal alone would not solve it: it is not inherited across fork and follows the
 creating thread's death, so this lane does not present it as tree containment.
 [Linux parent-death signal contract](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
+
+Desktop Windows uses a different kernel boundary. The suspended leader enters
+an owned Job Object before it runs, and descendants inherit membership; unlike
+Unix `setsid`, they cannot leave that Job under Haider's no-breakaway policy.
+Cancellation and limit cleanup terminate the Job. Normal desktop completion is
+still the cross-desktop detach contract: Haider clears `KILL_ON_JOB_CLOSE`
+before releasing its final Job handle, so a live descendant is not swept merely
+because its leader exited. If that flag cannot be cleared, Haider retains the
+exact handle instead of closing it and violating the normal-completion contract.

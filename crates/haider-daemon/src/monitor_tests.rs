@@ -10,6 +10,28 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::{oneshot as tokio_oneshot, watch as tokio_watch};
 use tokio::time::timeout;
 
+const MONITOR_REPORT_WAIT: Duration = Duration::from_secs(3);
+
+fn monitor_report_wait() -> Duration {
+    #[cfg(windows)]
+    {
+        // Test timing law: the outer observer covers the source interval,
+        // coalescing, durable queue I/O, and delivery scheduling. Keep the
+        // established three-second Unix budget, then add the monitor
+        // catalog's existing ten-second delivery-attempt budget for loaded
+        // Windows runners. This changes no production interval or timeout.
+        MONITOR_REPORT_WAIT.saturating_add(MONITOR_DELIVERY_ATTEMPT_TIMEOUT)
+    }
+    #[cfg(not(windows))]
+    {
+        MONITOR_REPORT_WAIT
+    }
+}
+
+fn monitor_retry_report_wait() -> Duration {
+    monitor_report_wait().saturating_add(MONITOR_DELIVERY_RETRY_MIN)
+}
+
 #[test]
 fn monitor_event_payload_rejects_unknown_variant_fields() {
     let error = serde_json::from_value::<MonitorEventPayload>(serde_json::json!({
@@ -1048,7 +1070,7 @@ async fn client_mutation_controls_update_pause_resume_and_trigger() {
             monitor_id: monitor_id.clone(),
         }
     );
-    let report = timeout(Duration::from_secs(3), received.recv())
+    let report = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("manual trigger report timeout")
         .expect("manual trigger report");
@@ -1258,7 +1280,7 @@ async fn daemon_restart_rearms_durable_timer_runner() {
         .write()
         .unwrap_or_else(PoisonError::into_inner) = Arc::new(CapturingSink { reports });
     reopened_hub.wait_for_monitor_ready().await;
-    let report = timeout(Duration::from_secs(3), received.recv())
+    let report = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("rearmed timer report timeout")
         .expect("rearmed timer report");
@@ -1367,7 +1389,7 @@ async fn failed_durable_delete_rollback_restores_registry_timeout_and_pending_de
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(&(world.session.clone(), monitor_id.clone()))
     );
-    let restored = timeout(Duration::from_secs(3), restored_report.recv())
+    let restored = timeout(monitor_report_wait(), restored_report.recv())
         .await
         .expect("restored pending delivery timeout")
         .expect("restored pending delivery");
@@ -1570,7 +1592,7 @@ async fn matching_bursts_coalesce_and_a_firehose_auto_stops() {
         publish_sms_incoming(&sources, "+1", &format!("burst-{index}"), index)
             .expect("publish coalesced SMS");
     }
-    let first = timeout(Duration::from_secs(3), received.recv())
+    let first = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("coalesced report timeout")
         .expect("coalesced report");
@@ -1581,7 +1603,7 @@ async fn matching_bursts_coalesce_and_a_firehose_auto_stops() {
         publish_sms_incoming(&sources, "+1", &format!("firehose-{index}"), 100 + index)
             .expect("publish firehose SMS");
     }
-    let stopped = timeout(Duration::from_secs(3), received.recv())
+    let stopped = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("rate-limit report timeout")
         .expect("rate-limit report");
@@ -1605,7 +1627,7 @@ async fn failed_delivery_retries_the_same_durable_report() {
     }));
     publish_sms_incoming(&world.hub.monitor_source_hub(), "+1", "retry me", 1)
         .expect("publish retry event");
-    let report = timeout(Duration::from_secs(4), received.recv())
+    let report = timeout(monitor_retry_report_wait(), received.recv())
         .await
         .expect("retried report timeout")
         .expect("retried report");
@@ -1679,11 +1701,11 @@ async fn stalled_delivery_retains_a_bounded_follow_up_occurrence() {
     .expect("follow-up occurrence did not enter the durable outbox");
 
     release.send_replace(true);
-    let first = timeout(Duration::from_secs(3), received.recv())
+    let first = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("first report timeout")
         .expect("first report");
-    let second = timeout(Duration::from_secs(3), received.recv())
+    let second = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("follow-up report timeout")
         .expect("follow-up report");
@@ -1763,7 +1785,7 @@ async fn terminal_pending_report_rejects_a_second_manual_trigger_and_cleans_up()
     );
 
     release.send_replace(true);
-    let delivered = timeout(Duration::from_secs(3), received.recv())
+    let delivered = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("terminal report timeout")
         .expect("terminal report");
@@ -1817,11 +1839,11 @@ async fn pre_expiry_event_is_classified_before_timeout_via_source_watermark() {
     // Source classification intentionally waits 250ms, past the 100ms
     // deadline. The timeout worker's explicit source watermark must keep
     // the earlier event in front of the terminal report.
-    let matched = timeout(Duration::from_secs(3), received.recv())
+    let matched = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("matched report timeout")
         .expect("matched report");
-    let timed_out = timeout(Duration::from_secs(3), received.recv())
+    let timed_out = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("timeout report timeout")
         .expect("timeout report");
@@ -1843,11 +1865,11 @@ async fn once_stops_after_delivery_while_every_remains_active() {
     world.install_canonical_test_sink(Arc::new(CapturingSink { reports }));
     publish_sms_incoming(&world.hub.monitor_source_hub(), "+1", "event", 1)
         .expect("publish occurrence event");
-    let first = timeout(Duration::from_secs(3), received.recv())
+    let first = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("first occurrence report timeout")
         .expect("first occurrence report");
-    let second = timeout(Duration::from_secs(3), received.recv())
+    let second = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("second occurrence report timeout")
         .expect("second occurrence report");
@@ -1874,7 +1896,7 @@ async fn timeout_reports_and_stops_while_session_lifetime_persists() {
             MonitorLifetime::Timeout { timeout_ms: 100 },
         )
         .await;
-    let report = timeout(Duration::from_secs(3), received.recv())
+    let report = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("timeout report wait")
         .expect("timeout report");
@@ -1929,7 +1951,7 @@ async fn model_pause_resume_replaces_the_timeout_revision() {
         .await;
     assert_eq!(resumed.status, ToolResultStatus::Completed);
 
-    let report = timeout(Duration::from_secs(3), received.recv())
+    let report = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("resumed monitor timeout task was not armed")
         .expect("resumed monitor timeout report");
@@ -1957,7 +1979,7 @@ async fn bounded_registry_and_filter_matching() {
     tokio::time::sleep(MONITOR_COALESCE_WINDOW + Duration::from_millis(50)).await;
     assert!(received.try_recv().is_err());
     publish_sms_incoming(&sources, "+1", "SHIP it", 2).expect("publish match");
-    let matched = timeout(Duration::from_secs(3), received.recv())
+    let matched = timeout(monitor_report_wait(), received.recv())
         .await
         .expect("filter match timeout")
         .expect("filter match report");
