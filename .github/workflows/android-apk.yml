@@ -137,14 +137,32 @@ jobs:
           set -euo pipefail
           LOG="$RUNNER_TEMP/native-resource-$ABI.log"
           SWAP_FILE=/mnt/haider-android.swap
+          ACTIVE_SWAP=
           while IFS= read -r active_swap; do
             if [[ "$active_swap" == /mnt/* ]] && sudo test -f "$active_swap"; then
               SWAP_FILE="$active_swap"
-              sudo swapoff "$SWAP_FILE"
+              ACTIVE_SWAP="$active_swap"
               break
             fi
           done < <(swapon --show --noheadings --raw --output NAME || true)
-          sudo fallocate -l 12G "$SWAP_FILE"
+          SWAP_DIR=$(dirname -- "$SWAP_FILE")
+          read -r swap_filesystem available_bytes < <(
+            df --output=source,avail -B1 "$SWAP_DIR" | tail -n 1
+          )
+          MINIMUM_FREE_BYTES=$((40 * 1024 * 1024 * 1024))
+          if ! [[ "$available_bytes" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Native swap preflight failed::Could not determine free space on the filesystem holding $SWAP_FILE."
+            exit 1
+          fi
+          if (( available_bytes < MINIMUM_FREE_BYTES )); then
+            echo "::error title=Insufficient native swap space::Cannot provision 32 GiB swap at $SWAP_FILE: filesystem $swap_filesystem has $available_bytes bytes free; at least $MINIMUM_FREE_BYTES bytes (40 GiB) required."
+            df -h "$SWAP_DIR"
+            exit 1
+          fi
+          if [[ -n "$ACTIVE_SWAP" ]]; then
+            sudo swapoff "$ACTIVE_SWAP"
+          fi
+          sudo fallocate -l 32G "$SWAP_FILE"
           sudo chmod 0600 "$SWAP_FILE"
           sudo mkswap --force "$SWAP_FILE"
           sudo swapon "$SWAP_FILE"
