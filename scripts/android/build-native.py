@@ -125,8 +125,9 @@ def main():
     if not run(['rustc', '--version']).startswith('rustc 1.95.0 '):
         raise ValueError('Rust 1.95.0 required')
     env = os.environ.copy()
+    env.setdefault('CARGO_BUILD_JOBS', '2')
     env.update(ANDROID_NDK_HOME=str(ndk), ANDROID_NDK_ROOT=str(ndk), ANDROID_NDK=str(ndk),
-               CARGO_BUILD_JOBS='2', CARGO_INCREMENTAL='0', HAIDER_ANDROID_BUILD_ID=build_id,
+               CARGO_INCREMENTAL='0', HAIDER_ANDROID_BUILD_ID=build_id,
                CARGO_PROFILE_RELEASE_DEBUG='2', CARGO_PROFILE_RELEASE_STRIP='none')
     # cargo-ndk supplies target linkers and API-26 C/C++ tools; no ambient API-21 overrides win.
     for key in list(env):

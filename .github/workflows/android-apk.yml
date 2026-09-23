@@ -112,6 +112,48 @@ jobs:
         with:
           path: android/app/build/generated/haiderNative
           key: android-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.abi }}-${{ needs.prepare.outputs.source }}
+      - name: initialize native resource evidence
+        if: always()
+        shell: bash
+        env:
+          ABI: ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/native-resource-$ABI.log"
+          {
+            echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) initial ==="
+            free --bytes
+            swapon --show --bytes || true
+            df -B1 / /mnt "$GITHUB_WORKSPACE"
+            du -sb "$GITHUB_WORKSPACE/target" 2>/dev/null || true
+            ps -eo pid=,ppid=,rss=,comm= --sort=-rss | head -n 20 || true
+          } > "$LOG"
+      - name: provision native link swap
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          ABI: ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/native-resource-$ABI.log"
+          SWAP_FILE=/mnt/haider-android.swap
+          while IFS= read -r active_swap; do
+            if [[ "$active_swap" == /mnt/* ]] && sudo test -f "$active_swap"; then
+              SWAP_FILE="$active_swap"
+              sudo swapoff "$SWAP_FILE"
+              break
+            fi
+          done < <(swapon --show --noheadings --raw --output NAME || true)
+          sudo fallocate -l 12G "$SWAP_FILE"
+          sudo chmod 0600 "$SWAP_FILE"
+          sudo mkswap --force "$SWAP_FILE"
+          sudo swapon "$SWAP_FILE"
+          {
+            echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) swap-ready ==="
+            free --bytes
+            swapon --show --bytes
+            df -B1 / /mnt "$GITHUB_WORKSPACE"
+          } >> "$LOG"
       - uses: dtolnay/rust-toolchain@stable
         if: steps.native-cache.outputs.cache-hit != 'true'
         with:
@@ -129,7 +171,45 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           ABI: ${{ matrix.abi }}
-        run: python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --abi "$ABI"
+          CARGO_BUILD_JOBS: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/native-resource-$ABI.log"
+          sample_resources() {
+            {
+              echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) sample ==="
+              free --bytes
+              swapon --show --bytes || true
+              df -B1 / /mnt "$GITHUB_WORKSPACE"
+              du -sb "$GITHUB_WORKSPACE/target" 2>/dev/null || true
+              ps -eo pid=,ppid=,rss=,comm= --sort=-rss | head -n 20 || true
+            } >> "$LOG"
+          }
+          sample_loop() {
+            while :; do
+              sample_resources
+              sleep 30
+            done
+          }
+          sample_loop &
+          sampler_pid=$!
+          cleanup() {
+            kill "$sampler_pid" 2>/dev/null || true
+            wait "$sampler_pid" 2>/dev/null || true
+            sample_resources
+          }
+          trap cleanup EXIT
+          python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --abi "$ABI"
+      - name: upload native resource evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: haider-android-native-resources-${{ matrix.abi }}
+          path: ${{ runner.temp }}/native-resource-${{ matrix.abi }}.log
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
       - name: verify built or restored native output and debug companions
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
