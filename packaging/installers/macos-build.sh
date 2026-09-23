@@ -14,11 +14,20 @@ work=$(mktemp -d)
 mounted=0
 keychain_created=0
 original_keychains=()
+mount_is_clear() {
+  local work_device mount_device
+  work_device=$(stat -f %d "$work") || return 1
+  mount_device=$(stat -f %d "$work/mount") || return 1
+  [ "$work_device" = "$mount_device" ]
+}
 cleanup() {
   local keep_work=0
-  if [ "$mounted" = 1 ] && ! hdiutil detach "$work/mount" >/dev/null; then
-    printf 'Could not detach %s; retaining temporary mount for manual cleanup\n' "$work/mount" >&2
-    keep_work=1
+  if [ "$mounted" = 1 ]; then
+    hdiutil detach "$work/mount" >/dev/null 2>&1 || true
+    if ! mount_is_clear; then
+      printf 'Could not detach %s; retaining temporary mount for manual cleanup\n' "$work/mount" >&2
+      keep_work=1
+    fi
   fi
   if [ "$keychain_created" = 1 ]; then
     security list-keychains -d user -s "${original_keychains[@]}" >/dev/null || true
@@ -126,18 +135,20 @@ hdiutil_retry() {
 remove_partial_dmg() { rm -f "$dmg"; }
 no_cleanup() { :; }
 detach_partial_mount() {
-  if hdiutil detach "$work/mount" >/dev/null 2>&1; then
+  hdiutil detach "$work/mount" >/dev/null 2>&1 || true
+  if mount_is_clear; then
     mounted=0
     return 0
   fi
+  mounted=1
   if [ -e "$work/mount/$name.pkg" ]; then
-    mounted=1
-    if hdiutil_retry detach no_cleanup "$work/mount"; then
+    hdiutil_retry detach no_cleanup "$work/mount" || true
+    if mount_is_clear; then
       mounted=0
-    else
-      return $?
+      return 0
     fi
   fi
+  return 1
 }
 hdiutil_retry create remove_partial_dmg -volname "Haider $version" -srcfolder "$work/image" -format UDZO "$dmg"
 if [ "$notarized" = 1 ]; then notarize "$dmg"; fi

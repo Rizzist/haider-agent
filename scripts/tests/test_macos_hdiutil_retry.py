@@ -82,8 +82,13 @@ exec /usr/bin/hdiutil "$@"
         return result, output, calls
 
     def build_with_mounted_attach_failure(self, detach_failures, second_attach_error=False,
-                                          attach_error_code=16):
+                                          attach_error_code=16, empty_image=False):
         """Fail attach after a real mount, then inject detach failures."""
+        blank = self.base / 'empty.dmg'
+        if empty_image:
+            subprocess.run(['/usr/bin/hdiutil', 'create', '-size', '8m', '-fs', 'HFS+',
+                            '-volname', 'Empty973', str(blank)], check=True,
+                           capture_output=True, text=True)
         (self.shim / 'hdiutil').write_text('''#!/bin/bash
 printf '%s\\n' "$1" >> "$HDIUTIL_TEST_DIR/calls"
 if [ "$1" = attach ]; then
@@ -92,11 +97,17 @@ if [ "$1" = attach ]; then
   count=$((count + 1))
   printf '%s\\n' "$count" > "$HDIUTIL_TEST_DIR/attach-count"
   if [ "$count" = 1 ]; then
-    /usr/bin/hdiutil "$@" >/dev/null || exit $?
+    if [ "$EMPTY_IMAGE" = 1 ]; then
+      /usr/bin/hdiutil attach "$BLANK_DMG" -readonly -nobrowse -mountpoint "${@: -1}" >/dev/null || exit $?
+    else
+      /usr/bin/hdiutil "$@" >/dev/null || exit $?
+    fi
     printf 'simulated Resource busy after mount\\n' >&2
     exit "$ATTACH_ERROR_CODE"
   fi
-  if [ -e "${@: -1}/$HDIUTIL_TEST_PKG" ]; then
+  mount_device=$(stat -f %d "${@: -1}")
+  parent_device=$(stat -f %d "$(dirname "${@: -1}")")
+  if [ "$mount_device" != "$parent_device" ]; then
     printf 'attach retried before previous mount was detached\\n' >&2
     exit 99
   fi
@@ -122,10 +133,11 @@ exec /usr/bin/hdiutil "$@"
             'PATH': f'{self.shim}:{os.environ.get("PATH", "/usr/bin:/bin")}',
             'TMPDIR': str(self.base) + '/',
             'HDIUTIL_TEST_DIR': str(self.base),
-            'HDIUTIL_TEST_PKG': f'haider-v{VERSION}-{TARGET}.pkg',
             'SECOND_ATTACH_ERROR': '1' if second_attach_error else '0',
             'ATTACH_ERROR_CODE': str(attach_error_code),
             'DETACH_FAILURES': str(detach_failures),
+            'EMPTY_IMAGE': '1' if empty_image else '0',
+            'BLANK_DMG': str(blank),
         }
         result = subprocess.run(
             ['bash', str(BUILD), str(self.payload), str(output), VERSION, TARGET],
@@ -203,6 +215,23 @@ exec /usr/bin/hdiutil "$@"
         self.assertEqual(result.returncode, 5, result.stderr)
         self.assertEqual([calls.count(action) for action in ('attach', 'detach')], [1, 6])
         self.assertIn('simulated Resource busy after mount', result.stderr)
+        self.assertTrue(result.stderr.rstrip().endswith('simulated Resource busy after mount'),
+                        result.stderr)
+
+    def test_empty_hfs_partial_mount_does_not_retry_attach(self):
+        result, output, calls = self.build_with_mounted_attach_failure(1, empty_image=True)
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual([calls.count(action) for action in ('create', 'attach', 'detach')],
+                         [1, 1, 2])
+        self.assertIn('simulated Resource busy after mount', result.stderr)
+        self.assertNotIn('attach retried before previous mount was detached', result.stderr)
+        self.assertFalse(list(output.glob('*.sha256')))
+
+    def test_failed_detach_without_package_preserves_original_status(self):
+        result, _, calls = self.build_with_mounted_attach_failure(
+            1, attach_error_code=5, empty_image=True)
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertEqual([calls.count(action) for action in ('attach', 'detach')], [1, 2])
         self.assertTrue(result.stderr.rstrip().endswith('simulated Resource busy after mount'),
                         result.stderr)
 
