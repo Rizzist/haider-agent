@@ -1216,6 +1216,9 @@ fn ellipsize_spans<'s>(spans: Vec<Span<'s>>, cap: usize, theme: &Theme) -> Vec<S
 /// wording, never the fact.
 const PENDING_WORKSPACE_BADGES: [&str; 3] =
     [" · created on first write", " · not created yet", " · new"];
+/// The origin line's cue for a dated leaf that is still unmaterialised. That
+/// line wraps, so it can afford the whole statement at any width.
+const PENDING_WORKSPACE_ORIGIN_CUE: &str = " · not created yet (created on first write)";
 /// The fewest allocation-id hex digits a narrowed leaf keeps (`s-0123abcd…`)
 /// before the badge itself is allowed to shorten further.
 const PENDING_LEAF_MIN_HEX: usize = 8;
@@ -6389,10 +6392,28 @@ fn render_session(
     header_top.push(Span::styled(format!(" v{VERSION}"), theme.dim_style()));
     // The session's working dir — `cd` retargets it (sim: "the agent
     // works elsewhere while the session stays global").
-    header_top.push(Span::styled(
-        format!(" · {}", model.session_dir),
-        theme.bright_style(),
-    ));
+    // A dated leaf that is not on disk yet keeps its cue in the header
+    // too (972 contract), fitted like the launcher row. When even the
+    // shortest fit cannot sit here (80 columns), the origin line below —
+    // which wraps — still speaks the state beside the full path.
+    let header_fit = if model.session_workspace_uncreated {
+        let used = Line::from(header_top.clone()).width();
+        let budget = usize::from(area.width)
+            .saturating_sub(used)
+            .saturating_sub(" · ".len());
+        fit_pending_workspace(&model.session_dir, budget)
+    } else {
+        None
+    };
+    if let Some((shown, badge)) = header_fit {
+        header_top.push(Span::styled(format!(" · {shown}"), theme.bright_style()));
+        header_top.push(Span::styled(badge, theme.dim_style()));
+    } else {
+        header_top.push(Span::styled(
+            format!(" · {}", model.session_dir),
+            theme.bright_style(),
+        ));
+    }
     // W-flow inline identity: a BOUND agent type recolors the session's own
     // accent — the head callsign trades its gold for the type's registry
     // color and a `{glyph} @{id}` chip rides beside it. The fallback law is
@@ -6502,8 +6523,16 @@ fn render_session(
             .as_ref()
             .and_then(|(_, origin)| origin.as_ref())
             .map(|origin| {
+                let state = if model.session_workspace_uncreated {
+                    PENDING_WORKSPACE_ORIGIN_CUE
+                } else {
+                    ""
+                };
                 vec![Line::styled(
-                    format!("· Opened from {origin} · Workspace: {}", model.session_dir),
+                    format!(
+                        "· Opened from {origin} · Workspace: {}{state}",
+                        model.session_dir
+                    ),
                     theme.dim_style(),
                 )]
             })
@@ -16214,7 +16243,9 @@ mod pending_workspace_fit_tests {
     }
 
     fn joined(path: &str, width: usize) -> String {
-        let (shown, badge) = fit_pending_workspace(path, budget(width)).expect("fits");
+        let Some((shown, badge)) = fit_pending_workspace(path, budget(width)) else {
+            panic!("{path:?} must fit {width} columns");
+        };
         let row = format!("{shown}{badge}");
         assert!(
             cells(&row) <= budget(width),
@@ -16280,10 +16311,14 @@ mod pending_workspace_fit_tests {
     #[test]
     fn narrow_frames_shorten_badge_wording_before_losing_the_state() {
         // 30 cells: `…/1448-04-10/s-01234567…` (24) + ` · new` (6).
-        let (shown, badge) = fit_pending_workspace(LEAF, 30).expect("fits");
+        let Some((shown, badge)) = fit_pending_workspace(LEAF, 30) else {
+            panic!("a 30-cell budget must fit");
+        };
         assert_eq!(format!("{shown}{badge}"), "…/1448-04-10/s-01234567… · new");
         // 26 cells: the 4-digit floor keeps a recognisable id and the state.
-        let (shown, badge) = fit_pending_workspace(LEAF, 26).expect("fits");
+        let Some((shown, badge)) = fit_pending_workspace(LEAF, 26) else {
+            panic!("a 26-cell budget must fit");
+        };
         assert_eq!(format!("{shown}{badge}"), "…/1448-04-10/s-0123… · new");
         assert!(fit_pending_workspace(LEAF, 10).is_none());
     }

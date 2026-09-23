@@ -2170,6 +2170,20 @@ pub struct LiveDriver {
     origin_opens: HashMap<SessionId, OriginOpen>,
     origin_revisions: HashMap<SessionId, u64>,
     workspace_paths: HashMap<SessionId, String>,
+    /// Sessions whose workspace is a lazily-materialised dated leaf (created
+    /// here with an allocation, or carrying one in their metadata). Only
+    /// these may wear the "not created yet" cue: an absent legacy cwd is a
+    /// different fact the cue must not claim.
+    dated_sessions: std::collections::HashSet<SessionId>,
+    /// `session.create` commands that carried a dated allocation, keyed
+    /// until their reply names the daemon's session id.
+    creating_dated: std::collections::HashSet<CommandId>,
+    /// Dated leaves already observed on disk; materialisation is one-way,
+    /// so these are never probed again.
+    materialized_sessions: std::collections::HashSet<SessionId>,
+    /// The session the presence probe last judged, so a surface switch
+    /// re-probes even without an inbound reply.
+    workspace_probe_session: Option<SessionId>,
     /// The ONE durable command of the open login card, so a failure can be
     /// correlated to it instead of merely coinciding with it (P2-2) and a
     /// retry re-stages UNDER IT rather than minting a second (P1-4).
@@ -2445,6 +2459,10 @@ impl LiveDriver {
             origin_opens: HashMap::new(),
             origin_revisions: HashMap::new(),
             workspace_paths: HashMap::new(),
+            dated_sessions: std::collections::HashSet::new(),
+            creating_dated: std::collections::HashSet::new(),
+            materialized_sessions: std::collections::HashSet::new(),
+            workspace_probe_session: None,
             login_command: None,
             login_attempt: None,
             retired_logins: std::collections::HashSet::new(),
@@ -2916,6 +2934,40 @@ impl LiveDriver {
         }
     }
 
+    /// Keep the active session's "not created yet" cue truthful (ratified
+    /// 972 contract: the TUI must not imply a dated leaf exists before its
+    /// first write). A dated, not-yet-seen leaf is probed on disk only when
+    /// a reply arrived (the first write lands as one) or the surface changed;
+    /// once the leaf exists it is never probed again. Non-local surfaces
+    /// (no captured launch path) cannot see the daemon's disk and never
+    /// claim either state.
+    pub fn sync_workspace_presence(&mut self, model: &mut AppModel, reply_arrived: bool) {
+        let active = model.active_session.clone();
+        let switched = self.workspace_probe_session != active;
+        if !reply_arrived && !switched {
+            return;
+        }
+        self.workspace_probe_session.clone_from(&active);
+        let uncreated = match (active, model.session_workspace_cwd.as_deref()) {
+            (Some(session), Some(cwd))
+                if self.launch_origin_path.is_some()
+                    && self.dated_sessions.contains(&session)
+                    && !self.materialized_sessions.contains(&session) =>
+            {
+                let exists = std::path::Path::new(cwd).is_dir();
+                if exists {
+                    self.materialized_sessions.insert(session);
+                }
+                !exists
+            }
+            _ => false,
+        };
+        if model.session_workspace_uncreated != uncreated {
+            model.session_workspace_uncreated = uncreated;
+            model.dirty = true;
+        }
+    }
+
     // ------------------------------------------------------------ replies --
 
     /// Reduce one inbound fact, mutating the model, and return the RPCs the
@@ -3275,6 +3327,9 @@ impl LiveDriver {
                     if let Some(metadata) = summary.metadata.as_ref() {
                         self.workspace_paths
                             .insert(summary.session_id.clone(), metadata.cwd.clone());
+                        if metadata.workspace_allocation.is_some() {
+                            self.dated_sessions.insert(summary.session_id.clone());
+                        }
                         if let Some(origin) = metadata.launch_origin.as_ref() {
                             self.origin_revisions
                                 .insert(summary.session_id.clone(), origin.revision);
@@ -3460,6 +3515,9 @@ impl LiveDriver {
                 self.retire(&command_id);
                 self.generations.insert(session.clone(), worker_generation);
                 self.workspace_paths.insert(session.clone(), cwd.clone());
+                if self.creating_dated.remove(&command_id) {
+                    self.dated_sessions.insert(session.clone());
+                }
                 // THE LAUNCHER ORDER (R11 cut 4). Only now — with the
                 // daemon's own id in hand — does a row exist. Nothing was
                 // fabricated locally, so nothing has to be reconciled.
@@ -6585,6 +6643,9 @@ impl LiveDriver {
                 let command_id = self.mint();
                 self.creating.insert(command_id.clone(), text.clone());
                 let workspace_allocation = model.pending_workspace_allocation.clone();
+                if workspace_allocation.is_some() {
+                    self.creating_dated.insert(command_id.clone());
+                }
                 if let Some(current) = workspace_allocation.as_ref() {
                     match haider_client::workspace::renew_workspace_allocation(current)
                         .and_then(haider_client::workspace::available_workspace_allocation)

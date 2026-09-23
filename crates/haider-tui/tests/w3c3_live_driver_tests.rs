@@ -1319,6 +1319,124 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     assert!(!std::path::Path::new(&third.leaf).exists());
 }
 
+#[test]
+fn an_attached_dated_session_speaks_uncreated_until_its_leaf_exists() {
+    let mut model = live_model();
+    let workspace_base = tempfile::tempdir().expect("temporary workspace base");
+    let daily_root = workspace_base.path().join("Haider").join("1448-04-11");
+    let leaf = daily_root.join("s-00112233445566778899aabbccddeeff");
+    let leaf_text = leaf.to_str().expect("UTF-8 leaf").to_owned();
+    let allocation = haider_protocol::session::WorkspaceAllocationV1 {
+        daily_root: daily_root.to_str().expect("UTF-8 root").into(),
+        leaf: leaf_text.clone(),
+        allocation_id: "00112233445566778899aabbccddeeff".into(),
+        calendar_id: "islamic-civil".into(),
+        hijri_date: "1448-04-11".into(),
+        gregorian_date: "2026-09-24".into(),
+        allocated_at_ms: 1,
+        offset_seconds: 0,
+    };
+    model.cwd = leaf_text.clone();
+    model.pending_workspace_allocation = Some(allocation);
+    let mut driver = LiveDriver::new("presence-test").with_launch_origin_path(Some(
+        haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~".into()),
+        },
+    ));
+    let issued = driver.handle_request(
+        &mut model,
+        AppRequest::CreateSession {
+            text: "just chat".into(),
+        },
+    );
+    let command_id = issued
+        .iter()
+        .find_map(LiveCommand::command_id)
+        .cloned()
+        .expect("session.create is durable");
+    driver.apply(
+        &mut model,
+        LiveReply::Created {
+            command_id,
+            session: sid(1),
+            worker_generation: 3,
+            cwd: leaf_text.clone(),
+            model: "fable-5".to_owned(),
+        },
+    );
+    assert_eq!(
+        model.session_workspace_cwd.as_deref(),
+        Some(leaf_text.as_str())
+    );
+
+    // Chat-only: the surface switch alone re-judges, and the leaf is absent.
+    driver.sync_workspace_presence(&mut model, false);
+    assert!(
+        model.session_workspace_uncreated,
+        "absent dated leaf wears the cue"
+    );
+    assert!(
+        !leaf.exists(),
+        "judging presence must never create the leaf"
+    );
+    driver.sync_workspace_presence(&mut model, true);
+    assert!(model.session_workspace_uncreated);
+
+    // The first write materialises the leaf; the next reply drops the cue.
+    std::fs::create_dir_all(&leaf).expect("simulate the daemon's first write");
+    driver.sync_workspace_presence(&mut model, false);
+    assert!(
+        model.session_workspace_uncreated,
+        "no reply, no switch: the probe stays idle"
+    );
+    driver.sync_workspace_presence(&mut model, true);
+    assert!(
+        !model.session_workspace_uncreated,
+        "materialised leaf loses the cue"
+    );
+
+    // Materialisation is one-way: a later disappearance is not "uncreated".
+    std::fs::remove_dir_all(&leaf).expect("remove leaf");
+    driver.sync_workspace_presence(&mut model, true);
+    assert!(!model.session_workspace_uncreated);
+}
+
+#[test]
+fn an_absent_non_dated_workspace_never_claims_the_uncreated_cue() {
+    let mut model = live_model();
+    model.cwd = "/definitely/not/a/real/haider/workspace".into();
+    let mut driver = LiveDriver::new("presence-legacy").with_launch_origin_path(Some(
+        haider_protocol::session::LaunchOriginPathV1 {
+            kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+            display: Some("~".into()),
+        },
+    ));
+    let issued = driver.handle_request(
+        &mut model,
+        AppRequest::CreateSession {
+            text: "legacy".into(),
+        },
+    );
+    let command_id = issued
+        .iter()
+        .find_map(LiveCommand::command_id)
+        .cloned()
+        .expect("session.create is durable");
+    driver.apply(
+        &mut model,
+        LiveReply::Created {
+            command_id,
+            session: sid(2),
+            worker_generation: 1,
+            cwd: "/definitely/not/a/real/haider/workspace".to_owned(),
+            model: "fable-5".to_owned(),
+        },
+    );
+    driver.sync_workspace_presence(&mut model, true);
+    assert!(!model.session_workspace_uncreated);
+}
+
 // ---- menu coordinates -------------------------------------------------
 
 #[test]

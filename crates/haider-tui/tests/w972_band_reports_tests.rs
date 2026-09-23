@@ -179,6 +179,53 @@ fn narrow_launchers_keep_the_dated_leaf_and_its_uncreated_state_visible() {
 }
 
 #[test]
+fn an_uncreated_dated_session_keeps_its_cue_until_the_first_write() {
+    let leaf = "~/Documents/Haider/1448-04-11/s-0123456789abcdef0123456789abcdef";
+    let mut model = live_session_model();
+    model.launch_origin = Some((1, Some("~".into())));
+    model.session_dir = leaf.into();
+    for (cols, rows) in [(80, 24), (118, 36)] {
+        model.session_workspace_uncreated = true;
+        let (frame_rows, _) = draw(&model, cols, rows);
+        // The origin line wraps: judge the joined, space-normalised text.
+        let flat = frame_rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(&format!(
+                "Workspace: {leaf} · not created yet (created on first write)"
+            )),
+            "{cols}x{rows} chat-only session must speak the uncreated leaf: {frame_rows:#?}"
+        );
+        model.session_workspace_uncreated = false;
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let flat = frame_rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(&format!("Workspace: {leaf}")),
+            "{cols}x{rows}"
+        );
+        assert!(
+            !flat.contains("not created yet") && !flat.contains("created on first write"),
+            "{cols}x{rows} a materialised leaf must drop the cue: {frame_rows:#?}"
+        );
+    }
+    // At 118 the header itself also carries the fitted cue.
+    model.session_workspace_uncreated = true;
+    let (frame_rows, _) = draw(&model, 118, 36);
+    assert!(
+        frame_rows[0].contains("· …/1448-04-11/s-0123456789abcdef0123… · created on first write"),
+        "{:?}",
+        frame_rows[0]
+    );
+}
+
+#[test]
 fn session_transcript_renders_the_sanitized_origin_and_workspace_slot() {
     let mut model = live_session_model();
     model.launch_origin = Some((7, Some("/Users/<user>/private-project".into())));
