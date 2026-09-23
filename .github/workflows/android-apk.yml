@@ -127,7 +127,7 @@ jobs:
             df -B1 / /mnt "$GITHUB_WORKSPACE"
             du -sb "$GITHUB_WORKSPACE/target" 2>/dev/null || true
             ps -eo pid=,ppid=,rss=,comm= --sort=-rss | head -n 20 || true
-          } > "$LOG"
+          } > "$LOG" || true
       - name: provision native link swap
         if: steps.native-cache.outputs.cache-hit != 'true'
         shell: bash
@@ -171,7 +171,7 @@ jobs:
             free --bytes
             swapon --show --bytes
             df -B1 / /mnt "$GITHUB_WORKSPACE"
-          } >> "$LOG"
+          } >> "$LOG" || true
       - uses: dtolnay/rust-toolchain@stable
         if: steps.native-cache.outputs.cache-hit != 'true'
         with:
@@ -206,26 +206,34 @@ jobs:
           }
           sample_loop() {
             while :; do
-              sample_resources
+              sample_resources || true
               sleep 30
             done
           }
           sample_loop &
           sampler_pid=$!
+          # Invoked indirectly by the EXIT trap.
+          # shellcheck disable=SC2329
           cleanup() {
+            step_status=$?
+            trap - EXIT
             kill "$sampler_pid" 2>/dev/null || true
             wait "$sampler_pid" 2>/dev/null || true
-            sample_resources
+            sample_resources || true
+            exit "$step_status"
           }
           trap cleanup EXIT
-          python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --abi "$ABI"
+          build_status=0
+          python3 scripts/android/build-native.py --output android/app/build/generated/haiderNative --version "$VERSION" --abi "$ABI" || build_status=$?
+          exit "$build_status"
       - name: upload native resource evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: haider-android-native-resources-${{ matrix.abi }}
           path: ${{ runner.temp }}/native-resource-${{ matrix.abi }}.log
-          if-no-files-found: error
+          if-no-files-found: warn
           overwrite: true
           retention-days: 30
       - name: verify built or restored native output and debug companions
