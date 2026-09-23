@@ -104,13 +104,17 @@ hdiutil_retry() {
     else
       status=$?
     fi
-    cat "$diagnostic" >&2
     retryable=0
     if [ "$status" -eq 16 ] || LC_ALL=C grep -Eiq 'resource busy|device busy|resource temporarily unavailable|(^|[^[:alnum:]_])ebusy([^[:alnum:]_]|$)' "$diagnostic"; then
       retryable=1
     fi
+    if ! "$cleanup_attempt"; then
+      cat "$diagnostic" >&2
+      rm -f "$diagnostic"
+      return "$status"
+    fi
+    cat "$diagnostic" >&2
     rm -f "$diagnostic"
-    "$cleanup_attempt" || true
     if [ "$retryable" -eq 0 ]; then return "$status"; fi
     if [ "$attempt" -eq 4 ]; then
       printf 'hdiutil %s failed after %s attempts (last exit %s)\n' "$action" "$attempt" "$status" >&2
@@ -122,7 +126,10 @@ hdiutil_retry() {
 remove_partial_dmg() { rm -f "$dmg"; }
 no_cleanup() { :; }
 detach_partial_mount() {
-  hdiutil detach "$work/mount" >/dev/null 2>&1 || true
+  if hdiutil detach "$work/mount" >/dev/null 2>&1; then
+    mounted=0
+    return 0
+  fi
   if [ -e "$work/mount/$name.pkg" ]; then
     mounted=1
     if hdiutil_retry detach no_cleanup "$work/mount"; then
