@@ -2,25 +2,25 @@ class Haider < Formula
   desc "Provider-agnostic coding-agent TUI and runtime"
   homepage "https://github.com/Rizzist/haider-agent"
   license "LicenseRef-KOA-P-1.0"
-  version "0.0.971"
+  version "0.0.972"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-aarch64-apple-darwin-split.tar.xz"
-      sha256 "aa2e7d4f497ff19bff7c8669a4af853fcfb2086499290416149962bcd611c598"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.972/haider-v0.0.972-aarch64-apple-darwin-split.tar.xz"
+      sha256 "e8314e78a453269037ab543f0d82d81e4e417d5c2ce1339065a3dbddaf4054c8"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-x86_64-apple-darwin-split.tar.xz"
-      sha256 "6e005e938ced1f5db7ffb87f776ac715feac51a1419da07cb862e169282bd06b"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.972/haider-v0.0.972-x86_64-apple-darwin-split.tar.xz"
+      sha256 "1b835a3c66519a30017045dca154b3fed3b2829f60faf97f9552dd926a2042d0"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-aarch64-unknown-linux-gnu-split.tar.xz"
-      sha256 "7ca151b99295446eb0aa2672d2bf5c079d8c78cc39edff139dfa56368dc24da6"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.972/haider-v0.0.972-aarch64-unknown-linux-gnu-split.tar.xz"
+      sha256 "28ffe822c50d88bd09b5271023ff062a3fb13d103bc2cbec4183bd9932525c7c"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.971/haider-v0.0.971-x86_64-unknown-linux-gnu-split.tar.xz"
-      sha256 "51a1aa61913f92a1c3d1d575e5b0d6e03baa44a6a881d206bfef73c8f9b85ae6"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.972/haider-v0.0.972-x86_64-unknown-linux-gnu-split.tar.xz"
+      sha256 "da7508b8ed16ab66cc800a83dcb12c070358b0a445cd395609ac6a4a1b7c8e88"
     end
   end
 
