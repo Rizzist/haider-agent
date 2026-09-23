@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 #[test]
-fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces() {
+fn budget_status_renders_only_reached_bounds_with_their_continuation_in_both_surfaces() {
     for (phase, used) in [
         (RequestBudgetPhaseV1::Progress, 31),
         (RequestBudgetPhaseV1::SoftBound, 32),
@@ -46,9 +46,13 @@ fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces(
                 },
             }));
         let expected = format!("requests {used} / tranche 32 / hard cap 64");
+        // 973-tui-toolview (owner): the per-request PROGRESS tally is not
+        // rendered in either surface; a reached bound still is, with its
+        // continuation.
+        let shown = phase != RequestBudgetPhaseV1::Progress;
         let plain = render_plain(&model.projection, 0, None);
-        assert!(plain.contains(&expected), "plain: {plain}");
-        if phase != RequestBudgetPhaseV1::Progress {
+        assert_eq!(plain.contains(&expected), shown, "plain: {plain}");
+        if shown {
             assert!(plain.contains("resume budget-run"));
         }
         let mut terminal = Terminal::new(TestBackend::new(180, 40)).expect("terminal");
@@ -66,6 +70,7 @@ fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains(&expected), "styled: {rendered}");
+        assert_eq!(rendered.contains(&expected), shown, "styled: {rendered}");
+        assert!(!rendered.contains("— in progress"), "styled: {rendered}");
     }
 }

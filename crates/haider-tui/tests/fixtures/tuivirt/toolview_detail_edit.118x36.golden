@@ -1,0 +1,73 @@
+# tuivirt golden · toolview_detail_edit · 118x36
+00|  ● Edit(state/970-STATUS.md)                                                                                         |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×89
+01|    ⎿ Added 2 lines, removed 1 line                                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×16; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×5; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×83
+02|      full detail · rows 1–18 of 18 · ↑↓ PgUp PgDn scroll · esc / ⌃O back                                             |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×67; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×45
+03|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+04|      Diff · +2 −1                                                                                                    |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/BOLD×12; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×100
+05|      41   ## Stage                                                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×99
+06|      42 - planning (not started; 972 release chain first)                                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(58, 36, 34)/NONE×112
+07|      42 + RE-SCOPED by owner 2026-09-23                                                                              |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(36, 48, 39)/NONE×112
+08|      43 + implementation under way                                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(36, 48, 39)/NONE×112
+09|      44   ## Owner                                                                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×99
+10|      Output · 1 line                                                                                                 |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/BOLD×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×97
+11|      edited state/970-STATUS.md (1 replacement)                                                                      |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×42; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×70
+12|      Arguments                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/BOLD×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×103
+13|      {                                                                                                               |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+14|        "edits": [                                                                                                    |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+15|          {                                                                                                           |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+16|            "new": "## Stage\nRE-SCOPED by owner 2026-09-23\nimplementation under way\n## Owner",                     |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+17|            "old": "## Stage\nplanning (not started; 972 release chain first)\n## Owner"                              |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+18|          }                                                                                                           |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+19|        ],                                                                                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+20|        "path": "/work/haider/state/970-STATUS.md"                                                                    |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+21|      }                                                                                                               |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×112
+22|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+23|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+24|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+25|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+26|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+27|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+28|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+29|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+30|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+31|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+32|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+33|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+34|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+35| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×76

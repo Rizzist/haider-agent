@@ -9,20 +9,20 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 04| ❯ read the store and run the tests                                             |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×32; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×45
-05|  ✓ fs_read(crates/haider-store/src/event_store.rs)                             |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×29
-06|  ◐ web_fetch · running…                                                        |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×9; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×56
-07|  ✗ fs_edit(src/lib.rs) · failed                                                |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×48
-08|  Ran 2 shell commands · bounded tails                                          |
+05|  ● Read(crates/haider-store/src/event_store.rs)                                |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×32
+06|  ◐ Fetch(https://example.invalid/very/long/path/that/needs/ellipsi…) · running…|
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×5; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×71
+07|  ● Edit(src/lib.rs)                                                            |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×60
+08|    ⎿ Error editing file                                                        |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×56
+09|  Ran 3 shell commands · bounded tails                                          |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×31; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×42
-09|    └ output line 0052 — bounded tail probe                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×37; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×37
-10|  $ git status --short · exit 0                                                 |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×18; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×49
-11|  ✓ fs_edit crates/haider-store/src/event_store.rs +4 −1                        |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×45; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×24
+10|  ● Edit(crates/haider-store/src/event_store.rs)                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×40; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×32
+11|    ⎿ Added 4 lines, removed 1 line                                             |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×16; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×5; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×45
 12|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 13|                                                                                |
