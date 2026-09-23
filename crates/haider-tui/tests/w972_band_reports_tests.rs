@@ -132,6 +132,53 @@ fn launcher_shows_the_resolved_lazy_workspace_instead_of_the_launch_cwd() {
 }
 
 #[test]
+fn narrow_launchers_keep_the_dated_leaf_and_its_uncreated_state_visible() {
+    let mut model = live_model();
+    model.launcher_dir = "~".into();
+    let leaf = "~/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef";
+    model.pending_workspace_display = Some(leaf.into());
+    // Rows carry symbols only (no styles): this is also the no-colour view,
+    // so the lazy state must be spoken, never merely tinted.
+    for (cols, rows, expected) in [
+        (
+            80,
+            24,
+            "dir …/1448-04-10/s-01234567… · created on first write".to_owned(),
+        ),
+        (118, 36, format!("dir {leaf} · not created yet")),
+    ] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let row = frame_rows
+            .iter()
+            .find(|row| row.contains("dir "))
+            .unwrap_or_else(|| panic!("{cols}x{rows}: no dir row: {frame_rows:#?}"));
+        assert_eq!(
+            row.trim_end().split("  ").last().map(str::trim),
+            Some(expected.as_str()),
+            "{cols}x{rows} launcher dir row: {row:?}"
+        );
+        assert!(!row.trim_end().ends_with('…'), "{cols}x{rows}: {row:?}");
+    }
+
+    // A long, unabbreviated isolated home keeps the date/leaf and the state.
+    model.pending_workspace_display = Some(
+        "/private/var/folders/zz/isolated-profile-0123456789/home/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef".into(),
+    );
+    for (cols, rows) in [(80, 24), (118, 36)] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let row = frame_rows
+            .iter()
+            .find(|row| row.contains("dir "))
+            .expect("dir row");
+        assert!(row.contains("1448-04-10/s-01234567"), "{cols}: {row:?}");
+        assert!(
+            row.contains(" · created on first write") || row.contains(" · not created yet"),
+            "{cols}: {row:?}"
+        );
+    }
+}
+
+#[test]
 fn session_transcript_renders_the_sanitized_origin_and_workspace_slot() {
     let mut model = live_session_model();
     model.launch_origin = Some((7, Some("/Users/<user>/private-project".into())));
