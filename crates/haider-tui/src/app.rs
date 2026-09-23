@@ -1521,6 +1521,10 @@ pub struct UsageState {
     pub today_error: Option<String>,
     /// Models range; `r` cycles today → 7d → 30d → all-time.
     pub model_range: UsageModelRange,
+    /// 973: the frame reset instants render in — local time beside UTC.
+    /// Defaults to UTC-only (deterministic); the live TUI binary sets the
+    /// host zone at boot.
+    pub time_zone: crate::usage_time::UsageTimeZone,
 }
 
 impl UsageState {
@@ -1618,6 +1622,67 @@ impl UsageState {
             .copied()
             .unwrap_or(0)
             .min(group.accounts.len().saturating_sub(1))
+    }
+
+    /// 973 — the ONE on-screen account order for the list scopes (calendar
+    /// and global): the filtered groups flattened, group by group, each in
+    /// report order. Every list scope renders in this order and the arrow
+    /// keys step through exactly this order, so navigation can never jump
+    /// between rows the way the report-index order did.
+    #[must_use]
+    pub fn display_order(&self) -> Vec<usize> {
+        self.groups()
+            .into_iter()
+            .flat_map(|group| group.accounts)
+            .collect()
+    }
+
+    /// The selected account's report index: the cursor's group at its
+    /// selected tab. `None` when no account is shown.
+    #[must_use]
+    pub fn selected_slot(&self) -> Option<usize> {
+        let groups = self.groups();
+        let group = groups.get(self.cursor.min(groups.len().saturating_sub(1)))?;
+        group.accounts.get(self.selected_tab(group)).copied()
+    }
+
+    /// Select the account at report index `slot` (cursor + its group's tab),
+    /// so every scope agrees on the selection. Returns false when `slot` is
+    /// not shown.
+    pub fn select_slot(&mut self, slot: usize) -> bool {
+        let groups = self.groups();
+        for (index, group) in groups.iter().enumerate() {
+            if let Some(tab) = group
+                .accounts
+                .iter()
+                .position(|&candidate| candidate == slot)
+            {
+                self.cursor = index;
+                self.tabs.insert(group.provider.clone(), tab);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Step the selection one row through [`Self::display_order`]:
+    /// `forward` moves down the list. Clamps at both ends (no wrap), so the
+    /// selection only ever moves to the visually adjacent row.
+    pub fn step_selection(&mut self, forward: bool) -> bool {
+        let order = self.display_order();
+        let current = self
+            .selected_slot()
+            .and_then(|slot| order.iter().position(|&candidate| candidate == slot))
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1).min(order.len().saturating_sub(1))
+        } else {
+            current.saturating_sub(1)
+        };
+        order
+            .get(next)
+            .copied()
+            .is_some_and(|slot| self.select_slot(slot))
     }
 }
 
@@ -12051,6 +12116,50 @@ impl AppModel {
                     .scroll
                     .set(self.usage.scroll.get().saturating_sub(1));
                 self.dirty = true;
+            }
+            // 973 (owner diagnosis): the list scopes show ONE flat account
+            // list, so every arrow steps exactly one on-screen row —
+            // ↑/←/shift-tab/< up, ↓/→/tab/> down.
+            KeyCode::Up
+            | KeyCode::Char('k')
+            | KeyCode::Down
+            | KeyCode::Char('j')
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('<')
+            | KeyCode::Char('>')
+                if matches!(self.usage.scope, UsageScope::Calendar | UsageScope::Global) =>
+            {
+                let forward = matches!(
+                    code,
+                    KeyCode::Down
+                        | KeyCode::Char('j')
+                        | KeyCode::Right
+                        | KeyCode::Tab
+                        | KeyCode::Char('>')
+                );
+                if self.usage.step_selection(forward) {
+                    self.usage.follow_cursor.set(true);
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Char('b') if self.usage.scope == UsageScope::Calendar => {
+                // The banked-reset affordance: offered only when the provider
+                // reports a usable operation; otherwise say why, do nothing.
+                let note = self.usage.selected_slot().and_then(|slot| {
+                    let account = self.usage.report.as_ref()?.accounts.get(slot)?;
+                    let extras = crate::usage_detail::account_extras(account);
+                    crate::usage_detail::banked_reset_unavailable_note(
+                        account.alias.as_str(),
+                        &extras.action,
+                    )
+                });
+                if let Some(note) = note {
+                    self.flash = Some(note);
+                    self.dirty = true;
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.usage.cursor = self.usage.cursor.saturating_sub(1);

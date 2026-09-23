@@ -65,6 +65,17 @@ pub fn sample_utc_civil_date() -> Result<CivilDateSample, CivilDateError> {
     Ok(sample_with_offset(utc_ms, 0))
 }
 
+/// The OS local offset (seconds east of UTC) in effect AT `unix_seconds`.
+///
+/// On Unix this is the zone rule for that instant (`localtime_r`), so a
+/// daylight-saving transition between now and the instant is honoured. On
+/// Windows the offset is the one in effect now (the documented limit of the
+/// wall-clock difference method below). An unresolvable offset is an error,
+/// never a silent UTC.
+pub fn local_utc_offset_seconds(unix_seconds: u64) -> Result<i32, CivilDateError> {
+    local_offset_seconds(unix_seconds)
+}
+
 fn unix_millis_now() -> Result<u64, CivilDateError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

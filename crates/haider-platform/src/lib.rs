@@ -72,8 +72,8 @@ pub use ipc::{
     validate_unix_socket_path, write_immediate,
 };
 pub use local_date::{
-    CivilDateError, CivilDateSample, civil_from_unix_days, sample_local_civil_date,
-    sample_utc_civil_date, sample_with_offset,
+    CivilDateError, CivilDateSample, civil_from_unix_days, local_utc_offset_seconds,
+    sample_local_civil_date, sample_utc_civil_date, sample_with_offset,
 };
 #[cfg(target_os = "macos")]
 pub use process::process_group_contains_only_leader;

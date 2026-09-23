@@ -161,18 +161,21 @@ fn calendar_uses_exact_fixture_resets_and_names_unknowns_without_guessing() {
         "OpenAI base five-hour day is marked"
     );
     assert!(text.contains("11  cW"), "OpenAI weekly day is marked");
-    assert!(text.contains("5h Fri 04 September 2026 · 16:42 UTC · five_hour"));
-    assert!(text.contains("weekly Thu 10 September 2026 · 08:15 UTC · seven_day"));
-    assert!(text.contains("5h Sat 05 September 2026 · 02:30 UTC · 5h"));
-    assert!(text.contains("weekly Fri 11 September 2026 · 18:05 UTC · weekly"));
+    assert!(text.contains("5h Fri 04 Sep · 16:42 UTC · in 4h 42m · five_hour"));
+    assert!(text.contains("weekly Thu 10 Sep · 08:15 UTC · in 5d 20h · seven_day"));
+    assert!(text.contains("5h Sat 05 Sep · 02:30 UTC · in 14h 30m · 5h"));
+    assert!(text.contains("weekly Fri 11 Sep · 18:05 UTC · in 7d 6h · weekly"));
     assert!(
         text.contains(
             "5h reset unknown · weekly reset unknown · meter unavailable · credential unavailable"
         ),
         "unavailable means unknown, never an inferred cadence"
     );
+    // 973: the selected account's summary line above the grid repeats its
+    // own reset (`5h in 4h 42m (Fri 04 Sep · 16:42 UTC)`); the LIST rows
+    // (`… UTC · in …`) must still carry 16:42 exactly once.
     assert_eq!(
-        text.matches("Fri 04 September 2026 · 16:42 UTC").count(),
+        text.matches("Fri 04 Sep · 16:42 UTC · in").count(),
         1,
         "the named OpenAI model window is not substituted for its base reset"
     );
@@ -209,8 +212,8 @@ fn calendar_projects_the_existing_provider_fixtures_exactly() {
     .join("\n");
     assert!(openai_text.contains("31  a5"));
     assert!(openai_text.contains("07  aW"));
-    assert!(openai_text.contains("5h Fri 31 January 2025 · 05:06 UTC · 5h"));
-    assert!(openai_text.contains("weekly Fri 07 February 2025 · 03:46 UTC · weekly"));
+    assert!(openai_text.contains("5h Fri 31 Jan · 05:06 UTC · in 17h 6m · 5h"));
+    assert!(openai_text.contains("weekly Fri 07 Feb · 03:46 UTC · in 7d 15h · weekly"));
 
     let anthropic = UsageMeterEndpoint::AnthropicOauth
         .parse(
@@ -242,8 +245,8 @@ fn calendar_projects_the_existing_provider_fixtures_exactly() {
     .rows
     .join("\n");
     assert!(anthropic_text.contains("[05] a5,aW"));
-    assert!(anthropic_text.contains("5h Wed 05 August 2026 · 09:50 UTC · five_hour"));
-    assert!(anthropic_text.contains("weekly Wed 05 August 2026 · 21:00 UTC · seven_day"));
+    assert!(anthropic_text.contains("5h Wed 05 Aug · 09:50 UTC · in 9h 50m · five_hour"));
+    assert!(anthropic_text.contains("weekly Wed 05 Aug · 21:00 UTC · in 21h 0m · seven_day"));
 }
 
 #[test]

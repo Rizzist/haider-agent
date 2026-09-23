@@ -609,6 +609,9 @@ fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
     let mut model = AppModel::new();
     model.sessions.clear();
     model.mode = haider_tui::app::RuntimeMode::Live;
+    // 973: `/usage` reset instants read in the owner's own zone (per instant,
+    // DST-aware) with UTC beside them.
+    model.usage.time_zone = haider_tui::usage_time::UsageTimeZone::Host;
     // The RESOLVED PROFILE owns the defaults every new session is created
     // with — never a UI constant. `session.create` validates the provider
     // against the daemon's own whitelist, so a client that hardcoded one

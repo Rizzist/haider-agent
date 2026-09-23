@@ -1,0 +1,49 @@
+# tuivirt golden · w973_usage_calendar_light · 80x24
+00|⋮  06         07         08         09         10         11         12         |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×1; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×79
+01|   13         14         15         16         17         18         19         |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+02|   20         21         22        [23]        24  d5,e5  25  dW     26         |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×35; Rgb(125, 90, 5)/Rgb(241, 238, 231)/BOLD×11; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×8; Rgb(253, 253, 253)/Rgb(47, 110, 63)/NONE×2; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×12; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×12
+03|   27         28  eW     29         30         01         02         03         |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×2; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×26; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×8
+04|   04         05         06         07         08         09         10         |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×8
+05|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+06|  RESET MARKERS — exact meter fields · unknown is never inferred                |
+   ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×15; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×49; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×16
+07|    a  codex-fc1509ff98ec · openai-oauth                                        |
+   ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/NONE×40; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×40
+08|      resets unknown · meter unavailable · credential unavailable — could not … |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×79; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1
+09|    b  openai-oauth · openai-oauth                                              |
+   ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/NONE×34; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×46
+10|      resets unknown · meter unavailable · malformed response — meter reply no… |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×79; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1
+11|    c  anthropic-oauth · anthropic-oauth                                        |
+   ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/NONE×40; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×40
+12|      resets unknown · meter unavailable · http 429 — rate limited · f retries… |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×79; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1
+13|  > d  anthropic-oauth-2 · anthropic-oauth                                      |
+   ~ Rgb(125, 90, 5)/Rgb(232, 232, 232)/BOLD×42; Rgb(54, 54, 54)/Rgb(232, 232, 232)/NONE×38
+14|      5h Thu 24 Sep · 00:39 local (Wed 23 Sep 21:09 UTC) · in 4h 9m             |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+15|      weekly Fri 25 Sep · 20:29 local (16:59 UTC) · in 1d 23h                   |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+16|      │ DETAIL anthropic-oauth-2 — provider-reported extras                     |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×6; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×45; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×21
+17|      │ previous resets  not reported by provider                               |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×31
+18|      │ banked resets    not reported by provider                               |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×31
+19|⋮     │ use banked reset unavailable — provider offers no banked-reset operati… |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×54; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1
+20|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×80
+21|↑↓ account · b banked · f refresh · s scope · esc back                          |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×54; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×26
+22|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1; Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×4; Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×33; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×38
