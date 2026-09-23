@@ -1256,6 +1256,7 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     };
     model.cwd = first.leaf.clone();
     model.pending_workspace_allocation = Some(first.clone());
+    model.pending_workspace_display = Some(first.leaf.clone());
     let mut driver = LiveDriver::new("allocation-test");
     assert!(!daily_root.exists());
     assert!(!first_leaf.exists());
@@ -1279,6 +1280,10 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     assert_ne!(second.leaf, first.leaf);
     assert_eq!(second.daily_root, first.daily_root);
     assert_eq!(model.cwd, second.leaf);
+    assert_eq!(
+        model.pending_workspace_display.as_deref(),
+        Some(second.leaf.as_str())
+    );
     assert!(!daily_root.exists());
     assert!(!std::path::Path::new(&first.leaf).exists());
     assert!(!std::path::Path::new(&second.leaf).exists());
@@ -1304,6 +1309,10 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     assert_ne!(third.leaf, second.leaf);
     assert_eq!(third.daily_root, first.daily_root);
     assert_eq!(model.cwd, third.leaf);
+    assert_eq!(
+        model.pending_workspace_display.as_deref(),
+        Some(third.leaf.as_str())
+    );
     assert!(!daily_root.exists());
     assert!(!std::path::Path::new(&first.leaf).exists());
     assert!(!std::path::Path::new(&second.leaf).exists());

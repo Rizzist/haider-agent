@@ -1715,18 +1715,45 @@ fn render_launcher(
     ));
     header_top.push(Span::styled(" · ", theme.dim_style()));
     header_top.push(Span::styled(identity.device.clone(), theme.bright_style()));
-    header_bottom.extend([
-        Span::styled("provider ", theme.dim_style()),
-        Span::styled(identity.provider.clone(), theme.bright_style()),
-        Span::styled(" · model ", theme.dim_style()),
-        Span::styled(identity.model_short.clone(), theme.bright_style()),
-        Span::styled(" · account ", theme.dim_style()),
-        Span::styled(identity.account.clone(), theme.bright_style()),
-        Span::styled(" · dir ", theme.dim_style()),
-        Span::styled(model.launcher_dir.clone(), theme.bright_style()),
-        Span::styled(" · mesh ", theme.dim_style()),
-        Span::styled("off", theme.bright_style()),
-    ]);
+    if let Some(workspace) = model.pending_workspace_display.as_ref() {
+        // A fresh interactive session has already resolved its dated leaf,
+        // but that leaf deliberately does not exist yet. Put both facts first
+        // so the owner-width frame cannot keep showing the launch cwd or clip
+        // the lazy-materialisation contract behind provider metadata.
+        header_bottom.extend([
+            Span::styled("dir ", theme.dim_style()),
+            Span::styled(workspace.clone(), theme.bright_style()),
+            Span::styled(" · created on first write", theme.dim_style()),
+        ]);
+        let identity_tail = [
+            Span::styled(" · provider ", theme.dim_style()),
+            Span::styled(identity.provider.clone(), theme.bright_style()),
+            Span::styled(" · model ", theme.dim_style()),
+            Span::styled(identity.model_short.clone(), theme.bright_style()),
+            Span::styled(" · account ", theme.dim_style()),
+            Span::styled(identity.account.clone(), theme.bright_style()),
+            Span::styled(" · mesh ", theme.dim_style()),
+            Span::styled("off", theme.bright_style()),
+        ];
+        let used = Line::from(header_bottom.clone()).width();
+        let tail_width = Line::from(identity_tail.to_vec()).width();
+        if used.saturating_add(tail_width) <= usize::from(area.width) {
+            header_bottom.extend(identity_tail);
+        }
+    } else {
+        header_bottom.extend([
+            Span::styled("provider ", theme.dim_style()),
+            Span::styled(identity.provider.clone(), theme.bright_style()),
+            Span::styled(" · model ", theme.dim_style()),
+            Span::styled(identity.model_short.clone(), theme.bright_style()),
+            Span::styled(" · account ", theme.dim_style()),
+            Span::styled(identity.account.clone(), theme.bright_style()),
+            Span::styled(" · dir ", theme.dim_style()),
+            Span::styled(model.launcher_dir.clone(), theme.bright_style()),
+            Span::styled(" · mesh ", theme.dim_style()),
+            Span::styled("off", theme.bright_style()),
+        ]);
+    }
     let band_cap = area.width as usize;
     let header_top = ellipsize_spans(header_top, band_cap, theme);
     let header_bottom = ellipsize_spans(header_bottom, band_cap, theme);

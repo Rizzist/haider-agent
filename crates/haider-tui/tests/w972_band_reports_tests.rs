@@ -105,6 +105,33 @@ fn live_session_model() -> AppModel {
 }
 
 #[test]
+fn launcher_shows_the_resolved_lazy_workspace_instead_of_the_launch_cwd() {
+    let mut model = live_model();
+    model.launcher_dir = "~".into();
+    model.pending_workspace_display =
+        Some("~/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef".into());
+    let (rows, _) = draw(&model, 120, 30);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains(
+            "dir ~/Documents/Haider/1448-04-10/s-0123456789abcdef0123456789abcdef · created on first write"
+        ),
+        "the 120-column launcher must show the exact resolved leaf and its lazy state: {frame}"
+    );
+    assert!(
+        !frame.contains("dir ~ · mesh off"),
+        "the launch cwd must not masquerade as the next session workspace: {frame}"
+    );
+
+    let (wide_rows, _) = draw(&model, 220, 30);
+    let wide_frame = wide_rows.join("\n");
+    assert!(
+        wide_frame.contains("created on first write · provider anthropic · model fable-5"),
+        "wide launchers must retain provider identity after the workspace preview: {wide_frame}"
+    );
+}
+
+#[test]
 fn session_transcript_renders_the_sanitized_origin_and_workspace_slot() {
     let mut model = live_session_model();
     model.launch_origin = Some((7, Some("/Users/<user>/private-project".into())));

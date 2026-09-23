@@ -698,7 +698,12 @@ fn apply_interactive_workspace(
         .to_owned();
     model.cwd = workspace_text;
     model.pending_workspace_allocation = allocation;
-    model.session_dir = abbreviate_path(&workspace, environment.home.as_deref());
+    let display = abbreviate_path(&workspace, environment.home.as_deref());
+    model.pending_workspace_display = model
+        .pending_workspace_allocation
+        .as_ref()
+        .map(|_| display.clone());
+    model.session_dir = display;
 
     Ok(())
 }

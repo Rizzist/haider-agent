@@ -5311,6 +5311,9 @@ pub struct AppModel {
     /// Creation-only dated allocation. The leaf named by `cwd` remains
     /// absent until the daemon brokers the first workspace-writing effect.
     pub pending_workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+    /// Display-only path for the next dated allocation. The launcher uses
+    /// this instead of implying its shell cwd is the new session workspace.
+    pub pending_workspace_display: Option<String>,
     /// Sanitised process launch directory used for TUI-origin registration.
     /// Android and non-local surfaces leave this absent.
     pub launch_origin_path: Option<haider_protocol::session::LaunchOriginPathV1>,
@@ -5936,6 +5939,7 @@ impl Default for AppModel {
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             cwd: "/".to_owned(),
             pending_workspace_allocation: None,
+            pending_workspace_display: None,
             launch_origin_path: None,
             session_dir: "~/dev/enterprise-suite".to_owned(),
             session_workspace_cwd: None,

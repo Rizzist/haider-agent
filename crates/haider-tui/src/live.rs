@@ -6591,9 +6591,14 @@ impl LiveDriver {
                     {
                         Ok(next) => {
                             model.cwd = next.leaf.clone();
+                            model.pending_workspace_display =
+                                Some(workspace_display_path(&next.leaf));
                             model.pending_workspace_allocation = Some(next);
                         }
-                        Err(_) => model.pending_workspace_allocation = None,
+                        Err(_) => {
+                            model.pending_workspace_allocation = None;
+                            model.pending_workspace_display = None;
+                        }
                     }
                 }
                 vec![self.enqueue(
