@@ -194,32 +194,52 @@ jobs:
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/native-resource-$ABI.log"
-          sample_resources() {
-            {
-              echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) sample ==="
-              free --bytes
-              swapon --show --bytes || true
-              df -B1 / /mnt "$GITHUB_WORKSPACE"
-              du -sb "$GITHUB_WORKSPACE/target" 2>/dev/null || true
-              ps -eo pid=,ppid=,rss=,comm= --sort=-rss | head -n 20 || true
-            } >> "$LOG"
-          }
-          sample_loop() {
+          SAMPLER_SCRIPT="$RUNNER_TEMP/native-resource-sampler-$ABI.sh"
+          cat > "$SAMPLER_SCRIPT" <<'SAMPLE_RESOURCES'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          LOG=$1
+          GITHUB_WORKSPACE=$2
+          {
+            echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) sample ==="
+            free --bytes
+            swapon --show --bytes || true
+            df -B1 / /mnt "$GITHUB_WORKSPACE"
+            du -sb "$GITHUB_WORKSPACE/target" 2>/dev/null || true
+            ps -eo pid=,ppid=,rss=,comm= --sort=-rss | head -n 20 || true
+          } >> "$LOG"
+          SAMPLE_RESOURCES
+          # The positional parameters expand in the child Bash process.
+          # shellcheck disable=SC2016
+          setsid bash -c '
+            sampler_script=$1
+            log=$2
+            workspace=$3
             while :; do
-              sample_resources || true
+              # Keep the timed command in this session so cleanup reaches every child.
+              timeout --foreground -k 5 20 bash "$sampler_script" "$log" "$workspace" || true
               sleep 30
             done
-          }
-          sample_loop &
+          ' _ "$SAMPLER_SCRIPT" "$LOG" "$GITHUB_WORKSPACE" &
           sampler_pid=$!
           # Invoked indirectly by the EXIT trap.
           # shellcheck disable=SC2329
           cleanup() {
             step_status=$?
             trap - EXIT
-            kill "$sampler_pid" 2>/dev/null || true
-            wait "$sampler_pid" 2>/dev/null || true
-            sample_resources || true
+            # Signal the leader too: cleanup can race setsid before its group exists.
+            kill -TERM "$sampler_pid" 2>/dev/null || true
+            kill -TERM -- "-$sampler_pid" 2>/dev/null || true
+            for _ in {1..20}; do
+              if ! kill -0 "$sampler_pid" 2>/dev/null &&
+                 ! kill -0 -- "-$sampler_pid" 2>/dev/null; then
+                break
+              fi
+              sleep 0.1
+            done
+            kill -KILL "$sampler_pid" 2>/dev/null || true
+            kill -KILL -- "-$sampler_pid" 2>/dev/null || true
+            timeout -k 5 20 bash "$SAMPLER_SCRIPT" "$LOG" "$GITHUB_WORKSPACE" || true
             exit "$step_status"
           }
           trap cleanup EXIT
