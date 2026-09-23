@@ -84,6 +84,26 @@ pub const TOOL_TIMING_MAX: usize = 1024;
 /// than one turn's worth of items.
 pub const TOOL_TIMING_SCAN: usize = 64;
 
+/// Largest file `AppModel::note_edit_anchors` reads to number an edit.
+pub const EDIT_ANCHOR_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read the file an edit call named — relative paths against the session
+/// workspace — when it exists locally, is a regular file, is valid UTF-8
+/// and is no larger than [`EDIT_ANCHOR_MAX_BYTES`].
+fn read_edited_file(workspace: Option<&str>, path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(workspace?).join(path)
+    };
+    let metadata = std::fs::metadata(&full).ok()?;
+    if !metadata.is_file() || metadata.len() > EDIT_ANCHOR_MAX_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(full).ok()
+}
+
 /// The demo VFS seed (sim tui.js:418-426).
 #[must_use]
 pub fn vfs_seed() -> BTreeMap<String, Vec<String>> {
@@ -4177,6 +4197,22 @@ pub struct InboxCounts {
     pub unseen: usize,
 }
 
+/// The open full-detail view of one tool row (973-tui-toolview).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolDetailView {
+    /// The item id the view was opened for — resolved against the viewed
+    /// transcript every frame, so a row that vanished closes nothing and
+    /// shows an honest "no longer available" line.
+    pub item_id: String,
+    /// First display row shown. The renderer clamps it against the rows it
+    /// actually produced and publishes the clamp in `scroll_max`.
+    pub scroll: usize,
+    /// The largest meaningful `scroll`, as of the last frame.
+    pub scroll_max: std::cell::Cell<usize>,
+    /// Display rows one page moves, as of the last frame.
+    pub page: std::cell::Cell<usize>,
+}
+
 /// Incremental search over the currently attached transcript.  Matching is
 /// entry based so the renderer can jump through its existing wrapped-row
 /// geometry without copying or reflowing the transcript.
@@ -4404,6 +4440,11 @@ pub enum Hit {
     ToolFoldToggle(String),
     /// The bounded expanded region's `⏎ show all` affordance.
     ToolShowAll(String),
+    /// A collapsed row's `… +N lines (⌃O to expand)` affordance — opens the
+    /// row's full-detail view (973-tui-toolview).
+    ToolDetail(String),
+    /// The full-detail view's `esc back` header — closes the view.
+    ToolDetailClose,
     /// The live background-task line under the composer — click expands it
     /// into the per-task list, and folds it again.
     TaskLineToggle,
@@ -5319,6 +5360,16 @@ pub struct AppModel {
     /// Canonical workspace of the attached session, learned from
     /// `SessionSummary` or the create response.
     pub session_workspace_cwd: Option<String>,
+    /// The user's home directory, ABSOLUTE, when the host process knows it
+    /// (the executable seeds it from `HOME`). Tool rows shorten paths under
+    /// it to `~/…`; `None` (every test fixture) shortens nothing.
+    pub home_dir: Option<String>,
+    /// The full-detail view of one tool row (973-tui-toolview): ⌃O on a
+    /// focused row, or a click on its `… +N lines` affordance. It COVERS
+    /// the transcript and owns the keys while open; closing it (Esc, ⌃O,
+    /// q, ⏎) returns to the transcript exactly where it was — the view
+    /// never writes the transcript's scroll state.
+    pub tool_detail: Option<ToolDetailView>,
     /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
     /// each time, exactly as the sim's `nid()` does (review r2 P1-1 — fixed
     /// ids let a stale answer apply its consequences to a later card).
@@ -5432,6 +5483,14 @@ pub struct AppModel {
     /// newest calls, and a row whose start was never observed drops its
     /// duration segment rather than printing a fabricated `0s`.
     pub tool_timings: std::collections::BTreeMap<String, crate::toolfold::ToolTiming>,
+    /// File line of each replacement a settled edit made, per item id
+    /// (973-tui-toolview) — what numbers an edit's diff rows. Resolved ONCE,
+    /// only for calls this client watched run (a replayed row's file may
+    /// have moved on since), and `None` wherever the text could not be
+    /// found: an unresolved edit shows no numbers rather than invented ones.
+    pub edit_anchors: std::collections::BTreeMap<String, Vec<Option<usize>>>,
+    /// Bumped whenever `edit_anchors` changes — a layout-cache coordinate.
+    pub edit_anchor_revision: u64,
     /// Monotone counter of persisted verbosity commits — the settings
     /// store's write trigger (the `theme_commits` idiom: a commit
     /// re-affirming the current value must still reach disk).
@@ -5939,6 +5998,8 @@ impl Default for AppModel {
             launch_origin_path: None,
             session_dir: "~/dev/enterprise-suite".to_owned(),
             session_workspace_cwd: None,
+            home_dir: None,
+            tool_detail: None,
             card_seq: 0,
             vfs: vfs_seed(),
             launcher_shellout: None,
@@ -5974,6 +6035,8 @@ impl Default for AppModel {
             toolfold: crate::toolfold::ToolFold::default(),
             default_tool_verbosity: crate::toolfold::Verbosity::default(),
             tool_timings: std::collections::BTreeMap::new(),
+            edit_anchors: std::collections::BTreeMap::new(),
+            edit_anchor_revision: 0,
             verbosity_commits: 0,
             auto_resuming: false,
             aura: AuraModel::seed(),
@@ -7287,7 +7350,9 @@ impl AppModel {
         let had_overlay = self.transcript_search.is_some()
             || self.search_jump.borrow().is_some()
             || self.mention_completion.is_some()
-            || self.inbox_open;
+            || self.inbox_open
+            || self.tool_detail.is_some();
+        self.tool_detail = None;
         self.transcript_search = None;
         *self.search_jump.borrow_mut() = None;
         self.mention_completion = None;
@@ -8435,6 +8500,9 @@ impl AppModel {
             self.dirty = true;
             return;
         }
+        if self.tool_detail_key(key) {
+            return;
+        }
         if self.screen == Screen::Loom
             && self
                 .loom_authoring
@@ -8556,7 +8624,7 @@ impl AppModel {
                 // deliberately NOT used: it is tmux's own default prefix,
                 // which is exactly the terminal this fallback exists for.
                 KeyCode::Char('o') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
-                    self.toggle_all_tool_rows();
+                    self.ctrl_o_tool_rows();
                 }
                 KeyCode::Char('f') if matches!(self.screen, Screen::Session | Screen::Subagent) => {
                     self.open_transcript_search();
@@ -16485,9 +16553,69 @@ impl AppModel {
         }
     }
 
+    /// Resolve the file line each settled edit's replacement landed on
+    /// (973-tui-toolview). Walks the same bounded transcript tail as
+    /// [`Self::note_tool_timings`], considers only successful edit calls
+    /// whose START this client observed, reads each file at most once
+    /// (bounded to [`EDIT_ANCHOR_MAX_BYTES`]), and records `None` for any
+    /// replacement it cannot place — a remote daemon's path, an empty
+    /// replacement, a file changed again before this beat.
+    pub fn note_edit_anchors(&mut self) {
+        let workspace = self.tool_path_context().workspace;
+        let entries = self.projection.entries();
+        let scan_from = entries.len().saturating_sub(TOOL_TIMING_SCAN);
+        let mut resolved: Vec<(String, Vec<Option<usize>>)> = Vec::new();
+        for entry in &entries[scan_from..] {
+            let crate::projection::TranscriptEntry::Item(block) = entry else {
+                continue;
+            };
+            let haider_protocol::item::TurnItem::ToolCall {
+                name, args, status, ..
+            } = &block.item
+            else {
+                continue;
+            };
+            let id = block.item_id.as_str();
+            if *status != haider_protocol::item::ToolStatus::Completed
+                || crate::toolview::tool_kind(name) != crate::toolview::ToolKind::Edit
+                || self.edit_anchors.contains_key(id)
+                || !self.tool_timings.contains_key(id)
+            {
+                continue;
+            }
+            let pairs = crate::toolview::edit_pairs(args);
+            let content = args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|path| read_edited_file(workspace.as_deref(), path));
+            let anchors = pairs
+                .iter()
+                .map(|pair| {
+                    content
+                        .as_deref()
+                        .and_then(|content| crate::toolview::line_of(content, &pair.new))
+                })
+                .collect();
+            resolved.push((id.to_owned(), anchors));
+        }
+        if resolved.is_empty() {
+            return;
+        }
+        self.edit_anchors.extend(resolved);
+        while self.edit_anchors.len() > TOOL_TIMING_MAX {
+            let Some(oldest) = self.edit_anchors.keys().next().cloned() else {
+                break;
+            };
+            self.edit_anchors.remove(&oldest);
+        }
+        self.edit_anchor_revision = self.edit_anchor_revision.wrapping_add(1);
+        self.dirty = true;
+    }
+
     /// The projection currently on screen. A missing child has no rows;
     /// it must never fall back to navigating the hidden main transcript.
-    fn viewed_tool_projection(&self) -> Option<&SessionProjection> {
+    pub(crate) fn viewed_tool_projection(&self) -> Option<&SessionProjection> {
         match self.screen {
             Screen::Subagent => self.viewed_chip().map(|chip| &chip.transcript),
             Screen::Session => Some(&self.projection),
@@ -16584,6 +16712,99 @@ impl AppModel {
         true
     }
 
+    /// Where tool-row paths shorten from: the attached session's canonical
+    /// workspace (else the process cwd), then the home directory.
+    #[must_use]
+    pub fn tool_path_context(&self) -> crate::toolview::PathContext {
+        let workspace = self
+            .session_workspace_cwd
+            .clone()
+            .or_else(|| (!self.cwd.is_empty()).then(|| self.cwd.clone()));
+        crate::toolview::PathContext {
+            workspace,
+            home: self.home_dir.clone(),
+        }
+    }
+
+    /// Open the full-detail view of one tool row of the VIEWED transcript.
+    /// Answers `false` (and opens nothing) for an id that is not a tool row
+    /// there — a stale click can never open a view onto another surface.
+    pub fn open_tool_detail(&mut self, item_id: &str) -> bool {
+        if !self.tool_row_ids().iter().any(|id| id == item_id) {
+            return false;
+        }
+        self.tool_detail = Some(ToolDetailView {
+            item_id: item_id.to_owned(),
+            ..ToolDetailView::default()
+        });
+        self.dirty = true;
+        true
+    }
+
+    /// Close the full-detail view. The transcript was never touched while
+    /// it was open, so the reader is back exactly where they were.
+    pub fn close_tool_detail(&mut self) {
+        if self.tool_detail.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Scroll the open full-detail view by `delta` display rows, clamped to
+    /// the last frame's measured maximum.
+    pub fn scroll_tool_detail(&mut self, delta: isize) {
+        let Some(view) = self.tool_detail.as_mut() else {
+            return;
+        };
+        let max = view.scroll_max.get();
+        let current = view.scroll.min(max);
+        view.scroll = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta.unsigned_abs()).min(max)
+        };
+        self.dirty = true;
+    }
+
+    /// ⌃O. With a tool row FOCUSED (⌥N/⌥P, `/collapse next`, a click) it
+    /// opens that row's full detail — Claude Code's "ctrl+o to expand". With
+    /// no focus it keeps its 971 meaning, ⌥T's Alt-free twin: every row at
+    /// once (owner ruling 4).
+    pub fn ctrl_o_tool_rows(&mut self) {
+        if let Some(id) = self.focused_tool_row().map(str::to_owned)
+            && self.open_tool_detail(&id)
+        {
+            return;
+        }
+        self.toggle_all_tool_rows();
+    }
+
+    /// Keys while the full-detail view is open. Answers `true` when the key
+    /// was the view's; chords it does not own (⌃C, ⌃T, …) fall through.
+    fn tool_detail_key(&mut self, key: KeyEvent) -> bool {
+        if self.tool_detail.is_none() {
+            return false;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self
+            .tool_detail
+            .as_ref()
+            .map_or(1, |view| view.page.get().max(1));
+        let page = isize::try_from(page).unwrap_or(1);
+        match key.code {
+            KeyCode::Char('o') if control => self.close_tool_detail(),
+            _ if control => return false,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close_tool_detail(),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_tool_detail(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_tool_detail(1),
+            KeyCode::PageUp => self.scroll_tool_detail(-page),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_tool_detail(page),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_tool_detail(isize::MIN),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_tool_detail(isize::MAX),
+            _ => {}
+        }
+        true
+    }
+
     /// ⌥T / ⌃O / `/collapse` — every tool row at once.
     pub fn toggle_all_tool_rows(&mut self) {
         self.toolfold.toggle_all();
@@ -16628,7 +16849,11 @@ impl AppModel {
             crate::projection::TranscriptEntry::Item(block)
                 if block.item_id.as_str() == item_id =>
             {
-                Some(crate::render::retained_output_rows(block, width))
+                Some(crate::render::expanded_display_rows(
+                    block,
+                    width,
+                    &self.edit_anchors,
+                ))
             }
             _ => None,
         }) else {
@@ -18306,6 +18531,7 @@ impl AppModel {
         self.session_title = None;
         self.session_name = None;
         self.session_workspace_cwd = None;
+        self.tool_detail = None;
         self.launch_origin = None;
         self.lockdown_provider = None;
         self.lockdown_boundary_known = false;
@@ -18334,6 +18560,8 @@ impl AppModel {
         // session restores its own mode and disclosure record.
         self.toolfold.clear_session();
         self.tool_timings.clear();
+        self.edit_anchors.clear();
+        self.edit_anchor_revision = self.edit_anchor_revision.wrapping_add(1);
         self.tasks_line_expanded = false;
         self.tasks_line_page = 0;
         *self.pending_tool_reveal.borrow_mut() = None;
@@ -18524,6 +18752,7 @@ impl AppModel {
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
         self.session_workspace_cwd = slot.workspace_cwd.take();
+        self.tool_detail = None;
         self.launch_origin = slot.launch_origin.take();
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
@@ -19270,6 +19499,12 @@ impl AppModel {
         if self.help_open {
             return;
         }
+        if self.tool_detail.is_some() {
+            if hit == Hit::ToolDetailClose {
+                self.close_tool_detail();
+            }
+            return;
+        }
         if self.shells_open && !matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus) {
             return;
         }
@@ -19589,6 +19824,11 @@ impl AppModel {
                 self.toolfold.set_focus(Some(&item_id));
                 self.toolfold.toggle_fold(&item_id);
             }
+            Hit::ToolDetail(item_id) => {
+                self.toolfold.set_focus(Some(&item_id));
+                self.open_tool_detail(&item_id);
+            }
+            Hit::ToolDetailClose => self.close_tool_detail(),
             Hit::ToolShowAll(item_id)
                 if matches!(self.screen, Screen::Session | Screen::Subagent) =>
             {
@@ -19835,6 +20075,11 @@ impl AppModel {
         // The login gate joins the help gate (TUI6.2c finding 7 —
         // consistency: nothing scrolls beneath a modal).
         if self.help_open || self.login.is_some() {
+            return;
+        }
+        // The full-detail view scrolls itself, never the transcript under it.
+        if self.tool_detail.is_some() {
+            self.scroll_tool_detail(if up { -3 } else { 3 });
             return;
         }
         // The all-sessions browser scrolls under the wheel: it is a long

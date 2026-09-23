@@ -8,7 +8,6 @@ use crate::app::{AppModel, Hit, LauncherRow, LoomPane, Screen, update_version_la
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_INTRO_TEXT, PALETTE_MAX_ROWS, help_catalog_lines};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
-use crate::plain::status_glyph;
 use crate::projection::{ItemBlock, SessionProjection, TranscriptEntry};
 use crate::sanctum::SanctumLine;
 use crate::theme::{Theme, ThemeKey};
@@ -54,6 +53,13 @@ pub(crate) struct LayoutCtx<'a> {
     /// Foldable runs over this projection's entries — sorted and disjoint,
     /// computed once per frame by [`foldable_runs`].
     pub runs: &'a [crate::toolfold::FoldRun],
+    /// Where tool-row paths shorten from (workspace, then `~`).
+    pub paths: &'a crate::toolview::PathContext,
+    /// Resolved file lines of settled edits, keyed by item id — what
+    /// numbers an edit's diff rows.
+    pub anchors: &'a BTreeMap<String, Vec<Option<usize>>>,
+    /// `AppModel::edit_anchor_revision` — a layout-cache coordinate.
+    pub anchor_revision: u64,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -72,6 +78,8 @@ struct EntryMarks {
     summary: Option<usize>,
     /// Index, in the produced `lines`, of the `⏎ show all` affordance.
     show_all: Option<usize>,
+    /// Index of a collapsed row's `… +N lines (⌃O to expand)` affordance.
+    detail: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +89,11 @@ pub(crate) struct TranscriptLayoutCache {
     theme: Option<ThemeKey>,
     /// The tool-disclosure revision the cached geometry was measured under.
     fold_revision: u64,
+    /// The path context tool headers were shortened under: a workspace
+    /// learned after a row was measured re-shortens every row.
+    paths_fingerprint: u64,
+    /// The edit-anchor revision diff rows were numbered under.
+    anchor_revision: u64,
     revision: u64,
     entry_mutation_revision: u64,
     source_ptr: usize,
@@ -122,6 +135,9 @@ struct CachedTranscriptEntry {
     /// below the line the reader clicked.
     show_all_row: Option<u64>,
     summary_row: Option<u64>,
+    /// Wrapped-row offset of the `(⌃O to expand)` affordance, measured the
+    /// same way as `show_all_row`.
+    detail_row: Option<u64>,
 }
 
 impl TranscriptLayoutCache {
@@ -157,7 +173,9 @@ impl TranscriptLayoutCache {
         let layout_changed = !self.initialized
             || self.width != width
             || self.theme != Some(theme_key)
-            || self.fold_revision != ctx.fold.revision();
+            || self.fold_revision != ctx.fold.revision()
+            || self.paths_fingerprint != ctx.paths.fingerprint()
+            || self.anchor_revision != ctx.anchor_revision;
         let source = projection.entries();
         let projection_changed = self.revision != projection.render_revision()
             || self.source_ptr != source.as_ptr() as usize
@@ -202,6 +220,8 @@ impl TranscriptLayoutCache {
         self.width = width;
         self.theme = Some(theme_key);
         self.fold_revision = ctx.fold.revision();
+        self.paths_fingerprint = ctx.paths.fingerprint();
+        self.anchor_revision = ctx.anchor_revision;
         self.revision = projection.render_revision();
         self.entry_mutation_revision = projection.entry_mutation_revision();
         self.source_ptr = source.as_ptr() as usize;
@@ -394,10 +414,20 @@ fn cache_transcript_entry_window(
         .summary
         .and_then(|index| lines.get(..index))
         .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
+    let detail_row = marks
+        .detail
+        .and_then(|index| lines.get(..index))
+        .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
+    // Live tool AND model-command rows wear the spinner, so both re-render
+    // on the animation clock.
     let dynamic = matches!(
         entry,
         TranscriptEntry::Item(ItemBlock {
             item: TurnItem::ToolCall {
+                status: haider_protocol::item::ToolStatus::Pending
+                    | haider_protocol::item::ToolStatus::InProgress,
+                ..
+            } | TurnItem::CommandExecution {
                 status: haider_protocol::item::ToolStatus::Pending
                     | haider_protocol::item::ToolStatus::InProgress,
                 ..
@@ -414,6 +444,7 @@ fn cache_transcript_entry_window(
         windowed: false,
         show_all_row,
         summary_row,
+        detail_row,
     }
 }
 
@@ -531,6 +562,7 @@ fn cache_extreme_agent_entry(
             dynamic: false,
             show_all_row: None,
             summary_row: None,
+            detail_row: None,
             windowed: true,
         };
     }
@@ -582,6 +614,7 @@ fn cache_extreme_agent_entry(
             dynamic: false,
             show_all_row: None,
             summary_row: None,
+            detail_row: None,
             windowed: true,
         };
     };
@@ -647,6 +680,7 @@ fn cache_extreme_agent_entry(
         dynamic: false,
         show_all_row: None,
         summary_row: None,
+        detail_row: None,
         windowed: true,
     }
 }
@@ -721,10 +755,13 @@ pub fn foldable_runs(
             return None;
         }
         match &block.item {
+            // 973-tui-toolview: runs fold by FAMILY (`Read 3 files`,
+            // `Searched for 2 patterns`, `Ran 3 shell commands`); writes and
+            // edits never fold — their diff is the point of the row.
             TurnItem::ToolCall { name, status, .. }
                 if *status == haider_protocol::item::ToolStatus::Completed =>
             {
-                Some(name.clone())
+                crate::toolview::fold_key(name)
             }
             // Keep user actions separate from model calls, including when
             // folded; both use the established "shell commands" noun.
@@ -774,9 +811,14 @@ pub fn foldable_runs(
             }
         }
         // The elbow speaks for the LATEST call in the run — "where did that
-        // leave things?", not "how did it start?".
+        // leave things?", not "how did it start?". A run of reads or searches
+        // has no such answer (the first line of a file is not a result), so
+        // its fold row stands alone, as the reference's `Read 1 file` does.
+        if matches!(run.name.as_str(), "read" | "search") {
+            continue;
+        }
         if let Some(TranscriptEntry::Item(last)) = entries.get(run.last()) {
-            let output = last.output_text();
+            let output = last.tool_output();
             // A tail the 8 KiB cap cut at the front opens on a mid-line
             // FRAGMENT; the elbow speaks with the first WHOLE line instead.
             let body = if last.output_truncated {
@@ -1089,7 +1131,9 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Sessions => render_sessions(model, theme, frame, body, &mut hits),
         }
     }
-    if model.inbox_open {
+    if model.tool_detail.is_some() {
+        render_tool_detail(model, theme, frame, body, &mut hits);
+    } else if model.inbox_open {
         render_inbox(model, theme, frame, body);
         hits.clear();
     } else if model.help_open {
@@ -6350,6 +6394,7 @@ fn render_session(
     // in the same global wrapped-row space as before.
     let mut transcript_cache = model.transcript_layout.borrow_mut();
     let transcript_runs = transcript_cache.cached_runs(&model.projection, &model.toolfold);
+    let tool_paths = model.tool_path_context();
     let layout_ctx = LayoutCtx {
         theme,
         width: transcript_area.width,
@@ -6358,6 +6403,9 @@ fn render_session(
         timings: &model.tool_timings,
         now_ms: model.clock_ms,
         runs: transcript_runs.as_ref(),
+        paths: &tool_paths,
+        anchors: &model.edit_anchors,
+        anchor_revision: model.edit_anchor_revision,
     };
     transcript_cache.reconcile(&model.projection, layout_ctx);
     // The origin is context chrome, not conversation content. On the short
@@ -11006,6 +11054,7 @@ fn render_subagent(
     }
     let mut transcript_cache = chip.transcript_layout.borrow_mut();
     let transcript_runs = transcript_cache.cached_runs(&chip.transcript, &model.toolfold);
+    let tool_paths = model.tool_path_context();
     let layout_ctx = LayoutCtx {
         theme,
         width: transcript_area.width,
@@ -11014,6 +11063,9 @@ fn render_subagent(
         timings: &model.tool_timings,
         now_ms: model.clock_ms,
         runs: transcript_runs.as_ref(),
+        paths: &tool_paths,
+        anchors: &model.edit_anchors,
+        anchor_revision: model.edit_anchor_revision,
     };
     transcript_cache.reconcile(&chip.transcript, layout_ctx);
     let mut tail: Vec<Line<'static>> = Vec::new();
@@ -15446,11 +15498,11 @@ fn todo_row<'a>(item: &'a TodoItem, all: &[TodoItem], theme: &Theme, phase: u8) 
     Line::from(spans)
 }
 
-// ---- 971-tui-collapse: the collapsed tool row ----
+// ---- 971-tui-collapse / 973-tui-toolview: the tool row ----
 
 /// One [`crate::toolfold::Segment`] row as a themed ratatui line. This and
 /// [`Theme::tone_style`] are the whole seam between "what the text MEANS"
-/// (`toolfold.rs`, colourless) and "what ink it wears" (the theme).
+/// (`toolfold.rs` / `toolview.rs`, colourless) and "what ink it wears".
 fn toned_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'static> {
     Line::from(
         segments
@@ -15460,20 +15512,66 @@ fn toned_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'sta
     )
 }
 
-/// One DISPLAY row of expanded tool output: the 4-cell indent, then the row
-/// split into meaning-toned runs (owner item 3 — a non-zero exit code, a
-/// verdict, a `file:line`, a thread id each keep their own ink). The body
-/// ink is `dim`, not the old `faint`: this is text a reader reads.
+/// One DISPLAY row of an expanded tool row or the full-detail view, inked.
 ///
-/// The row arrives already wrapped to the content budget by
-/// `toolfold::output_rows`, so nothing is ellipsized away here — verify 1
-/// (F2) found `show all` silently dropping the suffix of every long line.
-fn tool_output_line(text: &str, theme: &Theme) -> Line<'static> {
-    let mut spans = vec![Span::styled("    ", theme.faint_style())];
-    for segment in crate::toolfold::meaning_segments(text) {
-        spans.push(Span::styled(segment.text, theme.tone_style(segment.tone)));
+/// Rows arrive already wrapped to the content width by
+/// `toolview::detail_rows`, so nothing is ellipsized away here. Output rows
+/// are split into meaning-toned runs (owner item 3 — a non-zero exit code,
+/// a verdict, a `file:line`, a thread id each keep their own ink); diff rows
+/// wear the added/removed ground across the whole row, with the `+`/`-`
+/// marker carrying the meaning where a terminal draws no colour.
+fn display_row_line(
+    row: &crate::toolview::DisplayRow,
+    theme: &Theme,
+    width: usize,
+) -> Line<'static> {
+    use crate::toolview::{DETAIL_INDENT, DiffKind, RowRole};
+    let indent = Span::styled(" ".repeat(DETAIL_INDENT), theme.faint_style());
+    match row.role {
+        RowRole::Heading => Line::from(vec![
+            indent,
+            Span::styled(
+                row.text.clone(),
+                theme.dim_style().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        RowRole::Args => Line::from(vec![
+            indent,
+            Span::styled(row.text.clone(), theme.text_style()),
+        ]),
+        RowRole::Note(tone) => Line::from(vec![
+            indent,
+            Span::styled(row.text.clone(), theme.tone_style(tone)),
+        ]),
+        RowRole::Output => {
+            let mut spans = vec![indent];
+            for segment in crate::toolfold::meaning_segments(&row.text) {
+                spans.push(Span::styled(segment.text, theme.tone_style(segment.tone)));
+            }
+            Line::from(spans)
+        }
+        RowRole::Diff { kind, first } => {
+            let style = match kind {
+                DiffKind::Added => theme.diff_added_style(),
+                DiffKind::Removed => theme.diff_removed_style(),
+                DiffKind::Context => theme.dim_style(),
+                DiffKind::Gap => theme.faint_style(),
+            };
+            let marker = if first { kind.marker() } else { ' ' };
+            let gutter = if row.gutter.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", row.gutter)
+            };
+            let mut body = format!("{gutter}{marker} {}", row.text);
+            if matches!(kind, DiffKind::Added | DiffKind::Removed) {
+                // The ground spans the row, as the reference's does.
+                let used = DETAIL_INDENT + unicode_width::UnicodeWidthStr::width(body.as_str());
+                body.push_str(&" ".repeat(width.saturating_sub(used)));
+            }
+            Line::from(vec![indent, Span::styled(body, style)])
+        }
     }
-    Line::from(spans)
 }
 
 /// The glyph's tone per terminal status. A live row no longer PULSES its
@@ -15492,10 +15590,9 @@ const fn status_tone(status: haider_protocol::item::ToolStatus) -> crate::toolfo
     }
 }
 
-/// The terminal-status WORD a summary row shows where no exit code exists.
-/// `Completed` needs none (the ✓ glyph already said it), and a cancellation
-/// wears metadata ink — it is an outcome, never a failure (the frozen
-/// `ToolStatus` law).
+/// The terminal-status WORD a quiet-mode header shows where no exit code
+/// exists. `Completed` needs none, and a cancellation wears metadata ink —
+/// it is an outcome, never a failure (the frozen `ToolStatus` law).
 fn status_outcome(status: haider_protocol::item::ToolStatus) -> Option<crate::toolfold::Segment> {
     use crate::toolfold::{Segment, Tone};
     use haider_protocol::item::ToolStatus;
@@ -15510,14 +15607,27 @@ fn status_outcome(status: haider_protocol::item::ToolStatus) -> Option<crate::to
     Some(Segment::new(word, tone))
 }
 
-/// Retained output lines. This counts what the client actually HOLDS (the
-/// bounded 8 KiB tail), not what the tool produced — a truncated row says so
-/// on its own honesty marker rather than claiming a total it never saw.
-fn retained_output_lines(block: &ItemBlock) -> usize {
-    if block.output_tail.is_empty() {
-        return 0;
+/// How a status settles for the `⎿` result line.
+const fn settle_of(status: haider_protocol::item::ToolStatus) -> crate::toolview::Settle {
+    use crate::toolview::Settle;
+    use haider_protocol::item::ToolStatus;
+    match status {
+        ToolStatus::Completed => Settle::Done,
+        ToolStatus::Pending | ToolStatus::InProgress => Settle::Running,
+        ToolStatus::Failed => Settle::Failed,
+        ToolStatus::Rejected => Settle::Rejected,
+        ToolStatus::Conflict => Settle::Conflict,
+        ToolStatus::Unknown => Settle::Unknown,
+        ToolStatus::Cancelled => Settle::Cancelled,
     }
-    block.output_text().lines().count()
+}
+
+/// Retained output lines. This counts what the client actually HOLDS (the
+/// bounded 8 KiB tail, or the joined result preview), not what the tool
+/// produced — a truncated row says so on its own honesty marker rather than
+/// claiming a total it never saw.
+fn retained_output_lines(block: &ItemBlock) -> usize {
+    block.tool_output().lines().count()
 }
 
 /// The client-observed duration for this call, or `None` when its start was
@@ -15529,9 +15639,90 @@ fn observed_elapsed(block: &ItemBlock, ctx: LayoutCtx<'_>) -> Option<u64> {
         .map(|timing| timing.elapsed_ms(ctx.now_ms))
 }
 
+/// What a tool row derives from its block beyond the header facts: its
+/// family, how it settled, the diff its arguments carry, and the full
+/// command when the one-line header could not carry it.
+#[derive(Default)]
+pub(crate) struct ToolRowExtras {
+    kind: Option<crate::toolview::ToolKind>,
+    settle: crate::toolview::Settle,
+    exit_code: Option<i32>,
+    diff: Option<crate::toolview::ToolDiff>,
+    inline_args: Option<String>,
+}
+
+/// A command worth showing in full in place: one the header had to cut to
+/// its first line (a heredoc, a multi-line script).
+fn multi_line_command(command: &str) -> Option<String> {
+    (command.trim().lines().count() > 1).then(|| command.to_owned())
+}
+
+pub(crate) fn tool_extras(
+    block: &ItemBlock,
+    anchors: &BTreeMap<String, Vec<Option<usize>>>,
+) -> ToolRowExtras {
+    match &block.item {
+        TurnItem::ToolCall {
+            name, args, status, ..
+        } => {
+            let kind = crate::toolview::tool_kind(name);
+            ToolRowExtras {
+                kind: Some(kind),
+                settle: settle_of(*status),
+                exit_code: None,
+                diff: crate::toolview::tool_diff(
+                    name,
+                    args,
+                    anchors
+                        .get(block.item_id.as_str())
+                        .map_or(&[], Vec::as_slice),
+                ),
+                inline_args: if kind == crate::toolview::ToolKind::Shell {
+                    crate::toolview::shell_command(args)
+                        .as_deref()
+                        .and_then(multi_line_command)
+                } else {
+                    None
+                },
+            }
+        }
+        TurnItem::CommandExecution {
+            command,
+            status,
+            exit_code,
+            ..
+        } => ToolRowExtras {
+            kind: Some(crate::toolview::ToolKind::Shell),
+            settle: settle_of(*status),
+            exit_code: *exit_code,
+            diff: None,
+            inline_args: multi_line_command(command),
+        },
+        _ => ToolRowExtras::default(),
+    }
+}
+
+/// Every display row an expanded tool row shows in place, at `width`.
+fn expanded_rows(
+    block: &ItemBlock,
+    extras: &ToolRowExtras,
+    width: usize,
+) -> Vec<crate::toolview::DisplayRow> {
+    let output = block.tool_output();
+    crate::toolview::detail_rows(
+        &crate::toolview::DetailFacts {
+            args: extras.inline_args.as_deref(),
+            diff: extras.diff.as_ref(),
+            output: &output,
+            ..crate::toolview::DetailFacts::default()
+        },
+        width,
+    )
+}
+
 /// Render one tool-ish row in its current disclosure state: a fold head, a
-/// hidden fold member, a collapsed summary (+ `└` sub-line), a bounded
-/// expanded region (+ `show all`), or every retained row.
+/// hidden fold member, a collapsed header (+ `⎿` result + diff preview), a
+/// bounded expanded region (+ `show all`), or every display row.
 fn tool_disclosure_lines<'a>(
     lines: &mut Vec<Line<'a>>,
     block: &'a ItemBlock,
@@ -15541,6 +15732,7 @@ fn tool_disclosure_lines<'a>(
     marks: &mut EntryMarks,
 ) {
     use crate::toolfold::{self as tf, FoldRole, RowState};
+    use crate::toolview as tv;
     let theme = ctx.theme;
     let cells = ctx.width as usize;
     let item_id = block.item_id.as_str();
@@ -15580,13 +15772,44 @@ fn tool_disclosure_lines<'a>(
         ctx.width,
         theme,
     ));
-    let output = block.output_text();
+    let extras = tool_extras(block, ctx.anchors);
+    let output = block.tool_output();
+    let shows_subline = ctx.fold.verbosity().shows_subline();
+    if shows_subline
+        && let Some(segments) = tv::result_segments(
+            &tv::ResultFacts {
+                kind: extras.kind,
+                settle: extras.settle,
+                exit_code: extras.exit_code,
+                reason: block.tool_reason.as_deref(),
+                output: &output,
+                output_cut: block.output_truncated,
+                diff: extras.diff.as_ref(),
+                matches: block.search_matches(),
+                output_shown: !state.is_collapsed(),
+            },
+            cells,
+        )
+    {
+        lines.push(toned_line(&segments, theme));
+    }
     if state.is_collapsed() {
-        if ctx.fold.verbosity().shows_subline()
-            && let Some(segments) =
-                tf::subline_segments_from(&output, block.output_truncated, cells)
+        // The inline diff preview: a SUCCESSFUL write or edit shows a few
+        // rows of what changed, then the door to the rest. A failed one
+        // shows only its reason — what it tried to write is detail.
+        if shows_subline
+            && extras.settle == tv::Settle::Done
+            && let Some(diff) = extras.diff.as_ref().filter(|diff| !diff.lines.is_empty())
         {
-            lines.push(toned_line(&segments, theme));
+            let (start, end) = diff.preview_window(tv::DIFF_PREVIEW_ROWS);
+            for row in tv::diff_rows_clipped(diff, start..end, cells) {
+                lines.push(display_row_line(&row, theme, cells));
+            }
+            let hidden = diff.lines.len().saturating_sub(end - start);
+            if hidden > 0 {
+                marks.detail = Some(lines.len());
+                lines.push(toned_line(&tv::more_segments(hidden), theme));
+            }
         }
         // The honesty markers are NOT verbosity-gated and not disclosure-
         // gated: a bounded tail and an undecodable chunk are facts about
@@ -15607,20 +15830,20 @@ fn tool_disclosure_lines<'a>(
         }
         return;
     }
-    // Every retained row, hard-wrapped to the content budget: `show all`
-    // now really does show all of it (F2).
-    let retained = tf::output_rows(&output, cells.saturating_sub(OUTPUT_INDENT));
+    // Every display row — full command, full diff, retained output — hard-
+    // wrapped to the row: `show all` really does show all of it (F2).
+    let rows = expanded_rows(block, &extras, cells);
     let (start, end, below) = if matches!(state, RowState::ShowAll) {
-        (0, retained.len(), 0)
+        (0, rows.len(), 0)
     } else {
         tf::bounded_window(
-            retained.len(),
+            rows.len(),
             ctx.fold.scroll_of(item_id),
             tf::EXPANDED_MAX_ROWS,
         )
     };
-    for text in &retained[start..end] {
-        lines.push(tool_output_line(text, theme));
+    for row in &rows[start..end] {
+        lines.push(display_row_line(row, theme, cells));
     }
     if start > 0 || below > 0 {
         // Remembered by LINE index; the cache measures it into a wrapped
@@ -15644,20 +15867,256 @@ fn tool_disclosure_lines<'a>(
     }
 }
 
-/// Cells the output indent costs, so the wrap budget and the rendered row
-/// agree exactly.
-pub(crate) const OUTPUT_INDENT: usize = 4;
-
-/// How many DISPLAY rows one tool row's retained output wraps to at `width`
+/// How many DISPLAY rows one tool row's expanded body wraps to at `width`
 /// — the clamp the scroll gestures need, taken from the same function that
 /// renders them so the two can never disagree.
 #[must_use]
-pub fn retained_output_rows(block: &ItemBlock, width: u16) -> usize {
-    crate::toolfold::output_rows(
-        &block.output_text(),
-        (width as usize).saturating_sub(OUTPUT_INDENT),
-    )
-    .len()
+pub fn expanded_display_rows(
+    block: &ItemBlock,
+    width: u16,
+    anchors: &BTreeMap<String, Vec<Option<usize>>>,
+) -> usize {
+    expanded_rows(block, &tool_extras(block, anchors), width as usize).len()
+}
+
+/// The header facts for one tool-ish item (`ToolCall` or
+/// `CommandExecution`) in the Claude Code idiom: `● Verb(argument)`.
+fn tool_row_facts<'b>(block: &'b ItemBlock, ctx: LayoutCtx<'_>) -> crate::toolfold::RowFacts<'b> {
+    use crate::toolfold::{RowFacts, Tone};
+    use crate::toolview as tv;
+    let subline_outcome = ctx.fold.verbosity().shows_subline();
+    match &block.item {
+        TurnItem::ToolCall {
+            name, status, args, ..
+        } => {
+            let remote_profile = if name == "ssh_shell" || name == "process_exec" {
+                args.get("profile").and_then(serde_json::Value::as_str)
+            } else {
+                None
+            };
+            let verb = tv::verb(name);
+            RowFacts {
+                name: remote_profile.map_or_else(
+                    || verb.clone(),
+                    |profile| format!("↗ remote · {profile} · {verb}"),
+                ),
+                name_tone: Tone::Name,
+                args: tv::header_args(name, args, ctx.paths),
+                glyph: tv::BULLET,
+                glyph_tone: status_tone(*status),
+                // The protocol carries NO exit code on a generic tool call;
+                // the row shows the terminal STATUS instead of inventing one.
+                exit_code: None,
+                outcome: status_outcome(*status),
+                output_lines: retained_output_lines(block),
+                elapsed_ms: observed_elapsed(block, ctx),
+                streaming: !settled_tool(*status),
+                spinner: true,
+                reason: block.tool_reason.as_deref(),
+                subline_outcome,
+            }
+        }
+        TurnItem::CommandExecution {
+            command,
+            status,
+            exit_code,
+            ..
+        } => {
+            let outcome = exit_code
+                .is_none()
+                .then(|| status_outcome(*status))
+                .flatten();
+            if block.user_command {
+                // A user `!` command keeps its sigil: it is PROVENANCE, and
+                // a running one must still look like the reader's own.
+                RowFacts {
+                    name: tv::one_line(command),
+                    name_tone: Tone::Body,
+                    args: String::new(),
+                    glyph: "!",
+                    glyph_tone: Tone::Accent,
+                    exit_code: *exit_code,
+                    outcome,
+                    output_lines: retained_output_lines(block),
+                    elapsed_ms: observed_elapsed(block, ctx),
+                    streaming: !settled_tool(*status),
+                    spinner: false,
+                    reason: None,
+                    subline_outcome,
+                }
+            } else {
+                RowFacts {
+                    name: "Bash".to_owned(),
+                    name_tone: Tone::Name,
+                    args: tv::one_line(command),
+                    glyph: tv::BULLET,
+                    glyph_tone: match exit_code {
+                        Some(code) if *code != 0 => Tone::Err,
+                        _ => status_tone(*status),
+                    },
+                    exit_code: *exit_code,
+                    outcome,
+                    output_lines: retained_output_lines(block),
+                    elapsed_ms: observed_elapsed(block, ctx),
+                    streaming: !settled_tool(*status),
+                    spinner: true,
+                    reason: None,
+                    subline_outcome,
+                }
+            }
+        }
+        _ => RowFacts::default(),
+    }
+}
+
+/// The full-detail view of one tool row (973-tui-toolview): ⌃O on a focused
+/// row, or a click on its `(⌃O to expand)` door. It covers the body with the
+/// row's header, its `⎿` result, and then EVERYTHING the client holds for
+/// the call — the full arguments (the whole heredoc), the full diff with its
+/// line numbers, every retained output row, and the unshortened reason —
+/// scrollable, closed by esc / ⌃O / q / ⏎. It reads the transcript and never
+/// writes its scroll, so closing it lands the reader exactly where they were.
+fn render_tool_detail(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    use crate::toolview as tv;
+    let Some(view) = &model.tool_detail else {
+        return;
+    };
+    hits.clear();
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Block::default().style(theme.text_style()), area);
+    let cells = area.width as usize;
+    let block = model.viewed_tool_projection().and_then(|projection| {
+        projection.entries().iter().find_map(|entry| match entry {
+            TranscriptEntry::Item(block) if block.item_id.as_str() == view.item_id => Some(block),
+            _ => None,
+        })
+    });
+    let Some(block) = block else {
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![Line::styled(
+                "  this tool row is no longer in the transcript · esc back",
+                theme.dim_style(),
+            )])),
+            area,
+        );
+        return;
+    };
+    let paths = model.tool_path_context();
+    let ctx = LayoutCtx {
+        theme,
+        width: area.width,
+        phase: model.anim_phase,
+        fold: &model.toolfold,
+        timings: &model.tool_timings,
+        now_ms: model.clock_ms,
+        runs: &[],
+        paths: &paths,
+        anchors: &model.edit_anchors,
+        anchor_revision: model.edit_anchor_revision,
+    };
+    let mut facts = tool_row_facts(block, ctx);
+    // The header carries its outcome in full here; the `⎿` line follows.
+    facts.subline_outcome = true;
+    let extras = tool_extras(block, ctx.anchors);
+    let output = block.tool_output();
+    let mut head: Vec<Line<'static>> = vec![toned_line(
+        &crate::toolfold::summary_segments(&facts, model.anim_phase, cells),
+        theme,
+    )];
+    if let Some(segments) = tv::result_segments(
+        &tv::ResultFacts {
+            kind: extras.kind,
+            settle: extras.settle,
+            exit_code: extras.exit_code,
+            reason: block.tool_reason.as_deref(),
+            output: &output,
+            output_cut: block.output_truncated,
+            diff: extras.diff.as_ref(),
+            matches: block.search_matches(),
+            output_shown: true,
+        },
+        cells,
+    ) {
+        head.push(toned_line(&segments, theme));
+    }
+    let full_args = match &block.item {
+        TurnItem::ToolCall { name, args, .. } => tv::full_args(name, args),
+        TurnItem::CommandExecution { command, .. } => Some(command.clone()),
+        _ => None,
+    };
+    // The unshortened reason: the typed presentation or the raw reason the
+    // result carried, before the transcript's one-line bound.
+    let full_reason = block
+        .tool_result
+        .as_ref()
+        .and_then(|result| {
+            result
+                .presentation
+                .as_ref()
+                .map(crate::projection::format_error_presentation)
+                .or_else(|| result.reason.clone())
+        })
+        .or_else(|| block.tool_reason.clone());
+    let rows = tv::detail_rows(
+        &tv::DetailFacts {
+            args: full_args.as_deref(),
+            diff: extras.diff.as_ref(),
+            output: &output,
+            output_truncated: block.output_truncated,
+            output_decode_error: block.output_decode_error,
+            reason: full_reason.as_deref(),
+            headings: true,
+        },
+        cells,
+    );
+    // Header rows + the hint row + one breathing row sit above the body.
+    let chrome = head.len() + 2;
+    let body_height = (area.height as usize).saturating_sub(chrome).max(1);
+    let max = rows.len().saturating_sub(body_height);
+    let start = view.scroll.min(max);
+    let end = start.saturating_add(body_height).min(rows.len());
+    view.scroll_max.set(max);
+    view.page.set(body_height.saturating_sub(1).max(1));
+    let position = if rows.is_empty() {
+        "nothing retained".to_owned()
+    } else {
+        format!("rows {}–{} of {}", start + 1, end, rows.len())
+    };
+    let hint_row = head.len();
+    let mut lines = head;
+    lines.push(Line::from(vec![
+        Span::styled(tv::ELBOW.replace('⎿', " "), theme.faint_style()),
+        Span::styled(format!("full detail · {position} · "), theme.dim_style()),
+        Span::styled("↑↓ PgUp PgDn scroll · esc / ⌃O back", theme.dim_style()),
+    ]));
+    lines.push(Line::default());
+    for row in &rows[start..end] {
+        lines.push(display_row_line(row, theme, cells));
+    }
+    let hint_y = area
+        .y
+        .saturating_add(u16::try_from(hint_row).unwrap_or(u16::MAX));
+    if hint_y < area.y.saturating_add(area.height) {
+        hits.push((
+            Rect {
+                x: area.x,
+                y: hint_y,
+                width: area.width,
+                height: 1,
+            },
+            Hit::ToolDetailClose,
+        ));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 /// Register the click targets for every visible tool row (971-tui-collapse).
@@ -15719,6 +16178,13 @@ fn tool_row_hits(
             && let Some(rect) = row_rect(start.saturating_add(offset))
         {
             hits.push((rect, Hit::ToolShowAll(item_id.clone())));
+        }
+        // The collapsed preview's `(⌃O to expand)` door opens the row's
+        // full-detail view.
+        if let Some(offset) = entry.detail_row
+            && let Some(rect) = row_rect(start.saturating_add(offset))
+        {
+            hits.push((rect, Hit::ToolDetail(item_id.clone())));
         }
         if let Some(offset) = entry.summary_row
             && let Some(rect) = row_rect(start.saturating_add(offset))
@@ -15874,68 +16340,12 @@ fn item_lines<'a>(
                 ),
             ]));
         }
-        TurnItem::ToolCall {
-            name, status, args, ..
-        } => {
-            // 971-tui-collapse: ONE summary row by default (sim ToolRow's
-            // glyph · maroon name · dim desc, now carrying the exit/lines/
-            // duration figures), an indented `└` first-result line, and the
-            // full output only where the reader asked for it. The old form
-            // printed the whole retained tail in `faint` (1.4:1) on every
-            // row — the owner's "darker text … navigation difficult".
-            let remote_profile = if name == "ssh_shell" || name == "process_exec" {
-                args.get("profile").and_then(serde_json::Value::as_str)
-            } else {
-                None
-            };
-            let facts = crate::toolfold::RowFacts {
-                name: remote_profile.map_or_else(
-                    || name.clone(),
-                    |profile| format!("↗ remote · {profile} · {name}"),
-                ),
-                name_tone: crate::toolfold::Tone::Name,
-                args: crate::toolfold::semantic_summary(name, args),
-                glyph: status_glyph(*status),
-                glyph_tone: status_tone(*status),
-                // The protocol carries NO exit code on a generic tool call;
-                // the row shows the terminal STATUS word instead of
-                // inventing a number.
-                exit_code: None,
-                outcome: status_outcome(*status),
-                output_lines: retained_output_lines(block),
-                elapsed_ms: observed_elapsed(block, ctx),
-                streaming: !settled_tool(*status),
-                spinner: true,
-                reason: block.tool_reason.as_deref(),
-            };
-            tool_disclosure_lines(lines, block, ctx, index, &facts, marks);
-        }
-        TurnItem::CommandExecution {
-            command,
-            status,
-            exit_code,
-            ..
-        } => {
-            // The `$`/`!` sigil is the command row's glyph, and the command
-            // itself is BODY text — it is prose the reader reads, not a
-            // label. Everything else is the shared collapsed row.
-            let facts = crate::toolfold::RowFacts {
-                name: command.clone(),
-                name_tone: crate::toolfold::Tone::Body,
-                args: String::new(),
-                glyph: if block.user_command { "!" } else { "$" },
-                glyph_tone: crate::toolfold::Tone::Accent,
-                exit_code: *exit_code,
-                outcome: exit_code
-                    .is_none()
-                    .then(|| status_outcome(*status))
-                    .flatten(),
-                output_lines: retained_output_lines(block),
-                elapsed_ms: observed_elapsed(block, ctx),
-                streaming: !settled_tool(*status),
-                spinner: false,
-                reason: None,
-            };
+        // 971-tui-collapse + 973-tui-toolview: ONE `● Verb(argument)`
+        // header by default, a `⎿` result line, an inline diff preview for
+        // writes and edits, and the full content only where the reader
+        // asked for it (in place, or the ⌃O full-detail view).
+        TurnItem::ToolCall { .. } | TurnItem::CommandExecution { .. } => {
+            let facts = tool_row_facts(block, ctx);
             tool_disclosure_lines(lines, block, ctx, index, &facts, marks);
         }
         TurnItem::FileChange {
@@ -15943,15 +16353,30 @@ fn item_lines<'a>(
             added,
             removed,
         } => {
-            // Sim shape (seed rows, tui.js:480): a completed fs_edit tool
-            // row — ✓ glyph · maroon name · dim path · dim +a −r meta.
+            // 973-tui-toolview: an applied file change reads like the edit
+            // row it reports — `● Edit(path)` over its `⎿` line counts.
+            let (added, removed) = (*added as usize, *removed as usize);
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("✓ ", theme.ok_style()),
-                Span::styled("fs_edit", theme.maroon_style()),
-                Span::styled(format!(" {path}"), theme.dim_style()),
-                Span::styled(format!(" +{added} −{removed}"), theme.dim_style()),
+                Span::styled(format!("{} ", crate::toolview::BULLET), theme.ok_style()),
+                Span::styled("Edit", theme.maroon_style()),
+                Span::styled(format!("({})", ctx.paths.shorten(path)), theme.dim_style()),
             ]));
+            let diff = crate::toolview::ToolDiff {
+                added,
+                removed,
+                ..crate::toolview::ToolDiff::default()
+            };
+            if let Some(segments) = crate::toolview::result_segments(
+                &crate::toolview::ResultFacts {
+                    kind: Some(crate::toolview::ToolKind::Edit),
+                    diff: Some(&diff),
+                    ..crate::toolview::ResultFacts::default()
+                },
+                width as usize,
+            ) {
+                lines.push(toned_line(&segments, theme));
+            }
         }
         TurnItem::ChildSpawn { agent } => {
             lines.push(Line::styled(
@@ -16036,10 +16461,16 @@ fn item_lines<'a>(
                     &block.item,
                 )
             {
-                lines.push(Line::styled(
-                    format!("  {}", budget.summary()),
-                    theme.gold_style(),
-                ));
+                // 973-tui-toolview (owner): the per-request `requests N /
+                // tranche T / hard cap H — in progress` tally is noise in a
+                // transcript and renders NOTHING. A bound that was actually
+                // reached still says so — it carries the continuation.
+                if budget.phase != haider_protocol::request_budget::RequestBudgetPhaseV1::Progress {
+                    lines.push(Line::styled(
+                        format!("  {}", budget.summary()),
+                        theme.gold_style(),
+                    ));
+                }
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 let suffix = label.strip_prefix("🖼 image").unwrap_or(&label);
                 lines.push(Line::from(vec![

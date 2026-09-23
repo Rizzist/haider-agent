@@ -903,6 +903,9 @@ pub async fn run_demo(
         // clock, so a collapsed row can carry an honest duration (the
         // protocol carries none).
         model.note_tool_timings();
+        // 973-tui-toolview: locate settled edits in their files so the
+        // diff preview can number its rows.
+        model.note_edit_anchors();
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
@@ -4157,8 +4160,9 @@ pub async fn run_live(
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
-        // 971-tui-collapse: see the demo loop.
+        // 971-tui-collapse / 973-tui-toolview: see the demo loop.
         model.note_tool_timings();
+        model.note_edit_anchors();
         emit_notifications(&mut model);
         if model.theme != active_theme {
             active_theme = model.theme;
