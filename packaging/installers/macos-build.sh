@@ -15,12 +15,17 @@ mounted=0
 keychain_created=0
 original_keychains=()
 cleanup() {
-  if [ "$mounted" = 1 ]; then hdiutil detach "$work/mount" >/dev/null || true; fi
+  local keep_work=0
+  if [ "$mounted" = 1 ] && ! hdiutil detach "$work/mount" >/dev/null; then
+    printf 'Could not detach %s; retaining temporary mount for manual cleanup\n' "$work/mount" >&2
+    keep_work=1
+  fi
   if [ "$keychain_created" = 1 ]; then
     security list-keychains -d user -s "${original_keychains[@]}" >/dev/null || true
     security delete-keychain "$work/signing.keychain-db" >/dev/null || true
   fi
-  rm -rf "$work"
+  rm -f "$work/cert.p12" "$work/signing.keychain-db"
+  if [ "$keep_work" = 0 ]; then rm -rf "$work"; fi
 }
 trap cleanup EXIT
 mkdir -p "$work/root/usr/local/bin" "$work/root/usr/local/share/haider" "$work/image"
@@ -87,13 +92,36 @@ fi
 pkgutil --expand-full "$pkg" "$work/expanded"
 python3 "$here/macos-verify.py" "$work/expanded" "$payload" "$version" "$target"
 cp "$pkg" "$work/image/"
-hdiutil create -volname "Haider $version" -srcfolder "$work/image" -format UDZO "$dmg"
+hdiutil_retry() {
+  local action=$1 cleanup_attempt=$2 attempt status
+  shift 2
+  for ((attempt=1; attempt<=4; attempt++)); do
+    if hdiutil "$action" "$@"; then return 0; else status=$?; fi
+    "$cleanup_attempt"
+    if [ "$attempt" -eq 4 ]; then
+      printf 'hdiutil %s failed after %s attempts (last exit %s)\n' "$action" "$attempt" "$status" >&2
+      return "$status"
+    fi
+    sleep "$((1 << (attempt - 1)))"
+  done
+}
+remove_partial_dmg() { rm -f "$dmg"; }
+no_cleanup() { :; }
+detach_partial_mount() {
+  hdiutil detach "$work/mount" >/dev/null 2>&1 || true
+  if [ -e "$work/mount/$name.pkg" ]; then
+    mounted=1
+    hdiutil_retry detach no_cleanup "$work/mount"
+    mounted=0
+  fi
+}
+hdiutil_retry create remove_partial_dmg -volname "Haider $version" -srcfolder "$work/image" -format UDZO "$dmg"
 if [ "$notarized" = 1 ]; then notarize "$dmg"; fi
 mkdir "$work/mount"
-hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
+hdiutil_retry attach detach_partial_mount "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
 mounted=1
 cmp "$pkg" "$work/mount/$name.pkg"
-hdiutil detach "$work/mount"
+hdiutil_retry detach no_cleanup "$work/mount"
 mounted=0
 (cd "$out" && shasum -a 256 "$name.pkg" > "$name.pkg.sha256" && shasum -a 256 "$name.dmg" > "$name.dmg.sha256")
 printf 'macOS installer gate PASS signed=%s notarized=%s\n' "$signed" "$notarized"
