@@ -2834,10 +2834,20 @@ impl ProviderError {
 
     #[must_use]
     pub fn with_http_metadata(mut self, status: u16, request_id: Option<&str>) -> Self {
+        let request_id = request_id.and_then(crate::error_detail::sanitize_provider_error_detail);
         self.presentation = self
             .presentation
             .with_http_status(status)
-            .with_request_id(request_id);
+            .with_request_id(request_id.as_deref());
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_provider_error_type(mut self, error_type: Option<&str>) -> Self {
+        let error_type = error_type.and_then(crate::error_detail::sanitize_provider_error_detail);
+        self.presentation = self
+            .presentation
+            .with_provider_error_type(error_type.as_deref());
         self
     }
 
@@ -2882,6 +2892,9 @@ impl ProviderError {
         presentation
             .provider_request_id
             .clone_from(&self.presentation.provider_request_id);
+        presentation
+            .provider_error_type
+            .clone_from(&self.presentation.provider_error_type);
         presentation.retry_after_ms = self.presentation.retry_after_ms;
         presentation.reset_at_ms = self.presentation.reset_at_ms;
         presentation.opened_within_ms = self.presentation.opened_within_ms;

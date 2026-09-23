@@ -1,7 +1,91 @@
+#![allow(clippy::expect_used)]
+
 use haider_provider::{
     ProviderErrorKind, replay_anthropic_http_error, replay_gemini_http_error,
     replay_openai_http_error,
 };
+
+type ErrorClassifier = fn(u16, Option<&str>, &[u8]) -> haider_provider::ProviderError;
+type DenialCase = (ErrorClassifier, &'static str, &'static str);
+
+#[test]
+fn anthropic_and_openai_account_denials_keep_safe_diagnostics_in_journal_shape() {
+    let cases: [DenialCase; 4] = [
+        (
+            replay_anthropic_http_error,
+            "permission_error",
+            "Anthropic API key access denied",
+        ),
+        (
+            replay_openai_http_error,
+            "insufficient_permissions",
+            "OpenAI API key access denied",
+        ),
+        (
+            replay_openai_http_error,
+            "permission_denied",
+            "OpenAI OAuth grant denied",
+        ),
+        (
+            replay_anthropic_http_error,
+            "permission_error",
+            "Anthropic OAuth subscription denied",
+        ),
+    ];
+    for (classify, error_type, message) in cases {
+        let body = serde_json::json!({"type": "error", "error": {
+            "type": error_type,
+            "message": format!("{message}; Authorization: Bearer fixture-opaque-secret")
+        }})
+        .to_string();
+        let error =
+            classify(403, None, body.as_bytes()).with_http_metadata(403, Some("req_fixture-403"));
+        assert_eq!(error.kind, ProviderErrorKind::PermissionDenied);
+        assert!(error.presentation.detail.starts_with(message));
+        assert!(error.presentation.detail.contains("[REDACTED]"));
+        assert!(!error.presentation.detail.contains("fixture-opaque-secret"));
+        assert_eq!(
+            error.presentation.provider_error_type.as_deref(),
+            Some(error_type)
+        );
+        assert_eq!(
+            error.presentation.provider_request_id.as_deref(),
+            Some("req_fixture-403")
+        );
+        let journal = serde_json::to_vec(&error).expect("journal shape serializes");
+        assert!(
+            !journal
+                .windows(b"fixture-opaque-secret".len())
+                .any(|w| w == b"fixture-opaque-secret")
+        );
+        let replayed: haider_provider::ProviderError =
+            serde_json::from_slice(&journal).expect("journal shape replays");
+        assert_eq!(replayed, error);
+    }
+}
+
+#[test]
+fn provider_error_type_and_request_id_are_redacted_and_bounded() {
+    let body = serde_json::json!({"error": {
+        "type": format!("permission_error Authorization: Bearer fixture-type-secret {}", "x".repeat(256)),
+        "message": "Access denied"
+    }})
+    .to_string();
+    let error = replay_openai_http_error(403, None, body.as_bytes()).with_http_metadata(
+        403,
+        Some("req-safe Authorization: Bearer fixture-id-secret"),
+    );
+    let presentation = error.presentation;
+    let error_type = presentation.provider_error_type.expect("provider type");
+    let request_id = presentation.provider_request_id.expect("request id");
+    assert!(error_type.len() <= 128);
+    assert!(request_id.len() <= 128);
+    for value in [&error_type, &request_id] {
+        assert!(value.contains("[REDACTED]"));
+        assert!(!value.contains("fixture-type-secret"));
+        assert!(!value.contains("fixture-id-secret"));
+    }
+}
 
 #[test]
 fn rejected_requests_keep_bounded_provider_diagnostics() {

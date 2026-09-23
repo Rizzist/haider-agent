@@ -7,6 +7,7 @@ const SUBCODE_LIMIT: usize = 64;
 const TITLE_LIMIT: usize = 96;
 const DETAIL_LIMIT: usize = 512;
 const REQUEST_ID_LIMIT: usize = 128;
+const PROVIDER_ERROR_TYPE_LIMIT: usize = 128;
 
 /// Stable, bounded machine-readable reason carried to every presentation
 /// surface. Values are lowercase ASCII kebab tokens; invalid producer input
@@ -128,6 +129,9 @@ pub struct ErrorPresentation {
     pub budget_ms: Option<u64>,
     pub scope: ErrorScope,
     pub allowed_actions: Vec<ErrorAction>,
+    /// Provider's own error category, when its response supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_error_type: Option<String>,
 }
 
 impl ErrorPresentation {
@@ -179,6 +183,7 @@ impl ErrorPresentation {
             budget_ms: None,
             scope,
             allowed_actions,
+            provider_error_type: None,
         }
     }
 
@@ -193,6 +198,14 @@ impl ErrorPresentation {
         self.provider_request_id = request_id
             .map(|value| bounded_public_text(value, REQUEST_ID_LIMIT))
             .filter(|value| !value.is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn with_provider_error_type(mut self, error_type: Option<&str>) -> Self {
+        self.provider_error_type = error_type
+            .map(|value| bounded_public_text(value, PROVIDER_ERROR_TYPE_LIMIT).replace('\n', " "))
+            .filter(|value| !value.trim().is_empty());
         self
     }
 
@@ -253,6 +266,8 @@ struct RawErrorPresentation {
     scope: Option<ErrorScope>,
     #[serde(default)]
     allowed_actions: Vec<ErrorAction>,
+    #[serde(default)]
+    provider_error_type: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ErrorPresentation {
@@ -273,6 +288,7 @@ impl<'de> Deserialize<'de> for ErrorPresentation {
             .provider_request_id
             .map(|value| bounded_public_text(&value, REQUEST_ID_LIMIT))
             .filter(|value| !value.is_empty());
+        presentation = presentation.with_provider_error_type(raw.provider_error_type.as_deref());
         presentation.retry_after_ms = raw.retry_after_ms;
         presentation.reset_at_ms = raw.reset_at_ms;
         presentation.opened_within_ms = raw.opened_within_ms;

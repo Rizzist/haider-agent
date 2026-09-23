@@ -13519,6 +13519,9 @@ fn copy_provider_metadata(target: &mut ErrorPresentation, source: &ErrorPresenta
     target
         .provider_request_id
         .clone_from(&source.provider_request_id);
+    target
+        .provider_error_type
+        .clone_from(&source.provider_error_type);
     target.retry_after_ms = source.retry_after_ms;
     target.reset_at_ms = source.reset_at_ms;
     target.opened_within_ms = source.opened_within_ms;
@@ -13533,6 +13536,7 @@ fn recovery_card_kind(presentation: &ErrorPresentation) -> Option<ErrorRecoveryC
         "account-deleted" | "account-unavailable" => Some(ErrorRecoveryCardKind::AccountDeleted),
         "rate-limited" => Some(ErrorRecoveryCardKind::RateLimit),
         "quota-exhausted" => Some(ErrorRecoveryCardKind::QuotaExhausted),
+        "permission-denied" => Some(ErrorRecoveryCardKind::Generic),
         "keychain-relink-required" => Some(ErrorRecoveryCardKind::KeychainRelink),
         _ => None,
     }
@@ -13556,6 +13560,9 @@ fn recovery_menu(
     }
     if let Some(request_id) = &presentation.provider_request_id {
         body.push(format!("Request ID: {request_id}"));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        body.push(format!("Provider error type: {error_type}"));
     }
     if let Some(retry_after_ms) = presentation.retry_after_ms {
         let seconds = retry_after_ms.div_ceil(1_000);

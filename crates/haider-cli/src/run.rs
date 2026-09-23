@@ -980,7 +980,17 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             if result.outcome != HeadlessOutcome::Done
                 && let Some(failure) = &result.failure
             {
-                eprintln!("haider: {}", failure.message);
+                if let Some(presentation) = &failure.presentation {
+                    eprintln!("haider: {} — {}", presentation.title, presentation.detail);
+                    if let Some(error_type) = &presentation.provider_error_type {
+                        eprintln!("haider: provider error type: {error_type}");
+                    }
+                    if let Some(request_id) = &presentation.provider_request_id {
+                        eprintln!("haider: request id: {request_id}");
+                    }
+                } else {
+                    eprintln!("haider: {}", failure.message);
+                }
                 if matches!(
                     failure.code,
                     HeadlessFailureCode::Run(ErrorCode::CredentialMissing)

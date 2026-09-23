@@ -1973,13 +1973,11 @@ pub fn replay_anthropic_http_error(
         }
     };
     let detail = crate::error_detail::http_error_detail(body);
-    if kind == ProviderErrorKind::InvalidRequest
-        && !hosted_web_rejected
-        && let Some(detail) = detail
-    {
+    if let Some(detail) = detail {
         error = error.with_provider_detail(&detail);
     }
     error
+        .with_provider_error_type(body_kind)
         .with_retry_after_ms(retry_after_ms)
         .with_http_metadata(status, None)
 }

@@ -4079,6 +4079,7 @@ pub fn replay_openai_http_error(
         None => error,
     };
     error
+        .with_provider_error_type(error_type.or(error_code))
         .with_retry_after_ms(retry_after_ms)
         .with_http_metadata(status, None)
 }
@@ -4164,7 +4165,8 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
             "OpenAI stream returned {}",
             provider_kind_name(provider_kind)
         ),
-    );
+    )
+    .with_provider_error_type(kind);
     match provider_detail.as_deref() {
         Some(detail) => provider_error.with_provider_detail(detail),
         None => provider_error,

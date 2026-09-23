@@ -2423,12 +2423,14 @@ pub const FACT_RANK_RESET: u8 = 1;
 pub const FACT_RANK_ACTIONS: u8 = 2;
 pub const FACT_RANK_HTTP: u8 = 3;
 pub const FACT_RANK_REQUEST: u8 = 4;
+pub const FACT_RANK_ERROR_TYPE: u8 = 5;
 
 /// The compact fact line's segments, display-ordered (`subcode · HTTP 429
 /// · req 8f3a2c1d… · resets in 2m 14s`), each with its shed rank. A
 /// missing datum DROPS its whole segment — never a placeholder. The
 /// request id is shortened to its first 8 chars (the journal keeps the
-/// full id; the transcript string renders it whole). The reset segment is
+/// full id; the transcript string and expanded card render it whole). The
+/// provider error type is a separate, shedable segment. The reset segment is
 /// LIVE when the caller supplies the daemon clock (`reset_at_ms − now`)
 /// and otherwise the static provider delay recorded at failure time.
 #[must_use]
@@ -2458,6 +2460,7 @@ fn build_error_fact_segments(
     let capacity = 1
         + usize::from(presentation.provider_http_status.is_some())
         + usize::from(presentation.provider_request_id.is_some())
+        + usize::from(presentation.provider_error_type.is_some())
         + usize::from(reset.is_some())
         + additional_capacity;
     let mut segments = Vec::with_capacity(capacity);
@@ -2470,6 +2473,9 @@ fn build_error_fact_segments(
             format!("req {}", short_request_id(request_id)),
             FACT_RANK_REQUEST,
         ));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        segments.push((format!("type {error_type}"), FACT_RANK_ERROR_TYPE));
     }
     if let Some(reset) = reset {
         segments.push((reset, FACT_RANK_RESET));
@@ -2586,7 +2592,7 @@ fn short_request_id(request_id: &str) -> String {
 
 /// The canonical flattened formatter for typed failures and the
 /// plain/greppable authority. Shape: `{title} — {detail} [{subcode}] · HTTP {status} · req {id}
-/// · {resets in …} · actions: {…}` — provider facts additive after the
+/// · type {provider type} · {resets in …} · actions: {…}` — provider facts additive after the
 /// subcode (full request id here; the styled fact line shortens it), the
 /// reset human-readable via the h/m/s vocabulary, absent facts dropping
 /// their whole segment.
@@ -2611,6 +2617,9 @@ pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
     }
     if let Some(request_id) = &presentation.provider_request_id {
         let _ = write!(out, " · req {request_id}");
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        let _ = write!(out, " · type {error_type}");
     }
     if let Some(retry_after) = presentation.retry_after_ms {
         out.push_str(" · ");

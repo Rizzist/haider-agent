@@ -142,6 +142,29 @@ fn rate_limit_menu() -> Menu {
     }
 }
 
+#[test]
+fn expanded_provider_card_displays_full_diagnostic_identity() {
+    let mut menu = rate_limit_menu();
+    menu.title = "Provider access denied".into();
+    if let MenuKind::ErrorRecovery {
+        card, presentation, ..
+    } = &mut menu.kind
+    {
+        *card = ErrorRecoveryCardKind::Generic;
+        presentation.title = menu.title.clone();
+        presentation.detail = "The account lacks model access.".into();
+        presentation.provider_http_status = Some(403);
+        presentation.provider_error_type = Some("permission_error".into());
+    }
+    let mut model = live_session();
+    model.route_raw(&raw(1, 1_000_000, &EventPayload::MenuOpened(menu)));
+    let (rows, _) = draw(&model, 110, 32);
+    row_of(&rows, "Provider access denied");
+    row_of(&rows, "The account lacks model access.");
+    row_of(&rows, "Provider error type: permission_error");
+    row_of(&rows, "Request ID: 8f3a2c1d9b7e5a42");
+}
+
 fn draw(model: &AppModel, width: u16, height: u16) -> (Vec<String>, Terminal<TestBackend>) {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");

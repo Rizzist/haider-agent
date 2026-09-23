@@ -139,6 +139,32 @@ fn e2a_typed_run_failure_render_never_uses_legacy_body_marker() {
 }
 
 #[test]
+fn provider_denial_plain_card_shows_message_type_and_full_request_id() {
+    let mut projection = SessionProjection::default();
+    projection.apply(&EventPayload::RunFailed {
+        code: ErrorCode::PermissionDenied,
+        message: "Anthropic HTTP 403 returned a permission error".into(),
+        retryable: false,
+        presentation: Some(
+            ErrorPresentation::new(
+                "permission-denied",
+                "Provider access denied",
+                "The account lacks model access.",
+                ErrorScope::Account,
+                [ErrorAction::SwitchAccount],
+            )
+            .with_http_status(403)
+            .with_request_id(Some("req_011CfLqHxA6nuihem8Gk4Xny"))
+            .with_provider_error_type(Some("permission_error")),
+        ),
+    });
+    let rendered = render_plain(&projection, 0, None);
+    assert!(rendered.contains("The account lacks model access."));
+    assert!(rendered.contains("type permission_error"));
+    assert!(rendered.contains("req req_011CfLqHxA6nuihem8Gk4Xny"));
+}
+
+#[test]
 fn e4_incomplete_assistant_item_has_explicit_plain_label() {
     let mut projection = SessionProjection::default();
     projection.apply(&EventPayload::Item(ItemEvent::Completed {

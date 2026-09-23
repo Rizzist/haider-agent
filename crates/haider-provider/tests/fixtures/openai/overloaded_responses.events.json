@@ -10,7 +10,8 @@
         "title": "Provider is overloaded",
         "detail": "private overload detail",
         "scope": "turn",
-        "allowed_actions": ["retry"]
+        "allowed_actions": ["retry"],
+        "provider_error_type": "overloaded_error"
       }
     }
   }
