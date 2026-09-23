@@ -120,6 +120,12 @@ pub struct ItemBlock {
     pub output_decode_error: bool,
     /// Bounded terminal reason joined from the matching `ToolResult` fact.
     pub tool_reason: Option<String>,
+    /// The matching `ToolResult` fact itself, kept WHOLE (973-tui-toolview):
+    /// its preview is the output a non-streaming tool (`fs_read`,
+    /// `fs_search`, …) produced, its reason is unshortened, and its typed
+    /// data carries counts. The full-detail view reads it; nothing here is
+    /// truncated beyond what the tool itself bounded.
+    pub tool_result: Option<Box<haider_protocol::tool::BoundedResult>>,
     /// The block was produced during a voice turn — the agent header tags
     /// ` · ♪ speaking` (sim tui.js:3895-3897; demo-local voice surface).
     pub spoken: bool,
@@ -143,6 +149,7 @@ impl ItemBlock {
             output_truncated: false,
             output_decode_error: false,
             tool_reason: None,
+            tool_result: None,
             spoken: false,
             agent_line_starts,
         }
@@ -160,6 +167,29 @@ impl ItemBlock {
     #[must_use]
     pub fn output_text(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.output_tail)
+    }
+
+    /// What a tool row shows as its output: the streamed tail when the tool
+    /// streamed one, otherwise the joined result's payload (the preview
+    /// without its truncation marker line). Command rows only ever stream.
+    #[must_use]
+    pub fn tool_output(&self) -> std::borrow::Cow<'_, str> {
+        if !self.output_tail.is_empty() {
+            return self.output_text();
+        }
+        match &self.tool_result {
+            Some(result) => std::borrow::Cow::Borrowed(result.payload_text()),
+            None => std::borrow::Cow::Borrowed(""),
+        }
+    }
+
+    /// The typed search match count, when the joined result carries one.
+    #[must_use]
+    pub fn search_matches(&self) -> Option<usize> {
+        match self.tool_result.as_ref()?.data.as_ref()? {
+            haider_protocol::tool::ToolResultData::FsSearch { matches, .. } => Some(matches.len()),
+            _ => None,
+        }
     }
 }
 
@@ -1333,6 +1363,7 @@ impl SessionProjection {
                 } if known == call_id => {
                     *status = result.status.item_status();
                     block.tool_reason = reason.clone();
+                    block.tool_result = Some(Box::new(result.clone()));
                     Some((block.item_id.clone(), is_screen_control_item(&block.item)))
                 }
                 _ => None,

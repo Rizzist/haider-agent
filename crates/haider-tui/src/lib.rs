@@ -47,6 +47,7 @@ pub mod terms_journal;
 pub mod theme;
 pub mod throughput;
 pub mod toolfold;
+pub mod toolview;
 pub mod wordmark;
 
 /// Crate marker used by the workspace self-test.

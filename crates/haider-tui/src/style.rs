@@ -4,6 +4,11 @@
 use crate::theme::{Rgb, Theme};
 use ratatui::style::{Color, Modifier, Style};
 
+/// Per-mille strength of the success/error tint under a diff row. Light
+/// enough that body ink clears 6:1 on it in every theme, strong enough that
+/// added and removed rows read apart at a glance.
+pub const DIFF_GROUND_ALPHA: u16 = 180;
+
 impl From<Rgb> for Color {
     fn from(rgb: Rgb) -> Self {
         Color::Rgb(rgb.r, rgb.g, rgb.b)
@@ -242,7 +247,7 @@ impl Theme {
     /// Note what `Body` and `Meta` are for: expanded tool output used to
     /// render in `faint` (1.4:1 — the owner's "darker text" complaint), and
     /// now rides `dim`, which this wave pinned at ≥ 4.5:1 on every ground.
-    /// `Structure` is the ONLY faint slot left on these rows: the `└` elbow
+    /// `Structure` is the ONLY faint slot left on these rows: the `⎿` elbow
     /// and the leading indent, glyphs nobody reads.
     #[must_use]
     pub fn tone_style(&self, tone: crate::toolfold::Tone) -> Style {
@@ -258,6 +263,38 @@ impl Theme {
             Tone::Warn => self.warn_style(),
             Tone::Err => self.err_style(),
         }
+    }
+
+    /// The ground an ADDED diff row sits on (973-tui-toolview): the success
+    /// ink tinted into the page ground, so body ink keeps ≥ 4.5:1 on it in
+    /// every theme (`toolview_tests` pins the floor).
+    #[must_use]
+    pub fn diff_added_ground(&self) -> Rgb {
+        self.ok.over(self.bg, DIFF_GROUND_ALPHA)
+    }
+
+    /// The ground a REMOVED diff row sits on — the error ink's tint.
+    #[must_use]
+    pub fn diff_removed_ground(&self) -> Rgb {
+        self.err.over(self.bg, DIFF_GROUND_ALPHA)
+    }
+
+    /// Body ink on the added-row ground (text, gutter and `+` marker alike:
+    /// the ground carries the colour, the `+` carries the meaning when a
+    /// terminal draws no colour at all).
+    #[must_use]
+    pub fn diff_added_style(&self) -> Style {
+        Style::default()
+            .fg(self.text.into())
+            .bg(self.diff_added_ground().into())
+    }
+
+    /// Body ink on the removed-row ground.
+    #[must_use]
+    pub fn diff_removed_style(&self) -> Style {
+        Style::default()
+            .fg(self.text.into())
+            .bg(self.diff_removed_ground().into())
     }
 
     /// Success / warning / error inks.
