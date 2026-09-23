@@ -2210,8 +2210,8 @@ fn assert_repair_carriers_present(text: &str) {
         assert!(text.contains(carrier), "carrier {carrier} lost");
     }
     for authority in [
-        "https://owner:[REDACTED:secret_value]@",
-        "postgres://owner:[REDACTED:secret_value]@",
+        "https://owner:[REDACTED:password]@",
+        "postgres://owner:[REDACTED:password]@",
     ] {
         assert!(
             text.contains(authority),

@@ -516,7 +516,7 @@ async fn search_tail_matches_keep_multiline_quote_state_before_context_selection
             };
             assert_eq!(matches.len(), 1);
             assert_eq!(matches[0].line, 2);
-            assert_eq!(matches[0].text, "[REDACTED:secret_value] after");
+            assert_eq!(matches[0].text, "[REDACTED:password] after");
             assert!(result.artifact.is_none());
             assert!(cas.0.is_empty());
         }

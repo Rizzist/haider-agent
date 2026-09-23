@@ -129,12 +129,12 @@ fn url_passwords_and_escaped_values_are_safe_at_every_stream_boundary() {
         "password='abc\\\\SYNTHETICTAIL987'\n",
     );
     let expected = concat!(
-        "https://owner:[REDACTED:secret_value]@example.test/repo\n",
-        "postgres://owner:[REDACTED:secret_value]@db.test/app\n",
-        "password=[REDACTED:secret_value]\n",
-        "password=[REDACTED:secret_value]\n",
-        "password=[REDACTED:secret_value]\n",
-        "password=[REDACTED:secret_value]\n",
+        "https://owner:[REDACTED:password]@example.test/repo\n",
+        "postgres://owner:[REDACTED:password]@db.test/app\n",
+        "password=[REDACTED:password]\n",
+        "password=[REDACTED:password]\n",
+        "password=[REDACTED:password]\n",
+        "password=[REDACTED:password]\n",
     );
     for boundary in 0..=input.len() {
         let mut redactor = OutputRedactor::default();
@@ -152,8 +152,7 @@ fn multiline_quotes_remain_safe_at_every_byte_boundary_and_finish() {
             let input = format!(
                 "password={quote}abc{newline}é\\{quote}SYNTHETICTAIL987{quote} after\npublic\n"
             );
-            let expected =
-                b"password=[REDACTED:secret_value]\n[REDACTED:secret_value] after\npublic\n";
+            let expected = b"password=[REDACTED:password]\n[REDACTED:password] after\npublic\n";
             for boundary in 0..=input.len() {
                 let mut redactor = OutputRedactor::default();
                 let mut safe = redactor.push_bytes(&input.as_bytes()[..boundary]);
@@ -187,7 +186,7 @@ fn multiline_quote_state_is_per_stream_and_survives_empty_lines() {
     });
     assert_eq!(
         super::redact_process_output(&chunks).expect("chunks"),
-        "password=[REDACTED:secret_value]\nnotice \"\n\n[REDACTED:secret_value] after\n"
+        "password=[REDACTED:password]\nnotice \"\n\n[REDACTED:password] after\n"
     );
 }
 
@@ -196,7 +195,7 @@ fn multiline_quote_overflow_never_reopens_on_a_late_closing_quote() {
     let mut redactor = OutputRedactor::default();
     assert_eq!(
         redactor.push(b"password=\"abc\n"),
-        "password=[REDACTED:secret_value]\n"
+        "password=[REDACTED:password]\n"
     );
     let line = vec![b'x'; 1024];
     for _ in 0..2048 {
@@ -204,7 +203,7 @@ fn multiline_quote_overflow_never_reopens_on_a_late_closing_quote() {
         let _ = redactor.push(b"\n");
     }
     let output = redactor.push(b"SYNTHETICTAIL987\" after\nPUBLIC\n");
-    assert_eq!(output, "[REDACTED:secret_value]\n[REDACTED:secret_value]\n");
+    assert_eq!(output, "[REDACTED:password]\n[REDACTED:password]\n");
     assert!(redactor.pending.len() <= crate::PROCESS_MAX_OUTPUT_BYTES);
 }
 

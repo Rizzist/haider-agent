@@ -106,14 +106,16 @@ impl RedactionState {
 #[derive(Clone, Debug, Default)]
 struct QuotedValue {
     quote: Option<u8>,
+    kind: Option<&'static str>,
     escaped: bool,
     remaining: usize,
     exhausted: bool,
 }
 
 impl QuotedValue {
-    fn start(&mut self, quote: u8) {
+    fn start(&mut self, quote: u8, kind: &'static str) {
         self.quote = Some(quote);
+        self.kind = Some(kind);
         self.escaped = false;
         self.remaining = QUOTED_SECRET_MAX_BYTES - 1;
     }
@@ -357,7 +359,11 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
             spans.push(Span {
                 start: found.start(),
                 end: found.end(),
-                kind: known_kind(found.as_str()),
+                kind: if policy == RedactionPolicy::Lockdown {
+                    lockdown_known_kind(found.as_str())
+                } else {
+                    known_kind(found.as_str())
+                },
             });
         }
     }
@@ -368,10 +374,11 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
     {
         for captures in regex.captures_iter(input) {
             if let Some(found) = captures.get(1) {
-                if spans
-                    .iter()
-                    .any(|span| span.start == found.start() && span.end == found.end())
-                {
+                if spans.iter().any(|span| {
+                    span.kind != "high_entropy"
+                        && span.start == found.start()
+                        && span.end == found.end()
+                }) {
                     continue;
                 }
                 if !spans.iter().any(|span| {
@@ -383,7 +390,7 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
                     spans.push(Span {
                         start: found.start(),
                         end: found.end(),
-                        kind: "secret_value",
+                        kind: "password",
                     });
                 }
             }
@@ -391,10 +398,13 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
     }
     if policy != RedactionPolicy::Lockdown {
         for span in secret_assignment_spans(input, quoted) {
-            // Keep a known key's marker, but a PEM-looking continuation is
-            // still inside the quoted value and must preserve its line ending.
+            // Keep a concrete known format's marker. An invalid JWT-shaped
+            // value is only generic entropy, so explicit context wins.
             if spans.iter().any(|other| {
-                other.kind != "private_key" && other.start == span.start && other.end == span.end
+                other.kind != "private_key"
+                    && other.kind != "high_entropy"
+                    && other.start == span.start
+                    && other.end == span.end
             }) {
                 continue;
             }
@@ -447,15 +457,22 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
             spans.push(Span {
                 start: found.start(),
                 end: found.end(),
-                kind: "private_key_material",
+                kind: if policy == RedactionPolicy::Lockdown {
+                    "private_key_material"
+                } else {
+                    "high_entropy"
+                },
             });
         }
     }
     spans.sort_by_key(|span| (span.start, span.end));
     let mut output = Vec::with_capacity(spans.len());
     for span in spans {
-        if span.kind == "secret_value" {
-            push_secret_lines(&mut output, input, span.start, span.end);
+        if matches!(
+            span.kind,
+            "secret_value" | "password" | "api_key" | "bearer_token" | "basic_auth"
+        ) {
+            push_secret_lines(&mut output, input, span.start, span.end, span.kind);
         } else {
             output.push(span);
         }
@@ -516,18 +533,78 @@ fn private_key_material_regex() -> Option<&'static Regex> {
         .as_ref()
 }
 
-fn known_kind(value: &str) -> &'static str {
+// The restricted provider has an established byte contract. Keep its original
+// classifier independent of the more precise labels used by ordinary previews.
+fn lockdown_known_kind(value: &str) -> &'static str {
+    common_known_kind(value).unwrap_or("jwt")
+}
+
+fn common_known_kind(value: &str) -> Option<&'static str> {
     if value.starts_with("AKIA") || value.starts_with("ASIA") {
-        "aws_access_key"
+        Some("aws_access_key")
     } else if value.starts_with("sk-") {
-        "api_key"
+        Some("api_key")
     } else if value.starts_with("ghp_") || value.starts_with("github_pat_") {
-        "github_token"
+        Some("github_token")
     } else if value.starts_with("xox") {
-        "slack_token"
+        Some("slack_token")
     } else {
-        "jwt"
+        None
     }
+}
+
+fn known_kind(value: &str) -> &'static str {
+    if let Some(kind) = common_known_kind(value) {
+        kind
+    } else if value.starts_with("gl") {
+        "gitlab_token"
+    } else if value.starts_with("npm_") {
+        "npm_token"
+    } else if ["sk_live_", "pk_live_", "sk_test_", "rk_live_"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        "stripe_api_key"
+    } else if value.starts_with("AIza") {
+        "google_api_key"
+    } else if is_jwt(value) {
+        "jwt"
+    } else {
+        "high_entropy"
+    }
+}
+
+fn is_jwt(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    // The marker describes a parsed JWT shape, not a verified signature.
+    // Bound decoding and JSON parsing for attacker-controlled process output.
+    if [header, payload, signature]
+        .iter()
+        .any(|part| part.len() > 16 * 1024)
+    {
+        return false;
+    }
+    let decoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let Some(header) = decoder.decode(header).ok() else {
+        return false;
+    };
+    let Some(payload) = decoder.decode(payload).ok() else {
+        return false;
+    };
+    decoder
+        .decode(signature)
+        .is_ok_and(|bytes| !bytes.is_empty())
+        && serde_json::from_slice::<serde_json::Value>(&header)
+            .ok()
+            .is_some_and(|json| json.get("alg").is_some_and(serde_json::Value::is_string))
+        && serde_json::from_slice::<serde_json::Value>(&payload)
+            .ok()
+            .is_some_and(|json| json.is_object())
 }
 
 fn extended_secret_regex() -> Option<&'static Regex> {
@@ -546,12 +623,13 @@ fn secret_assignment_regex() -> Option<&'static Regex> {
 
 fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
     let mut spans = Vec::new();
+    let continuation_kind = quoted.kind.unwrap_or("secret_value");
     let mut cursor = quoted.consume(input);
     if cursor > 0 {
         spans.push(Span {
             start: 0,
             end: cursor,
-            kind: "secret_value",
+            kind: continuation_kind,
         });
     }
     if quoted.active() {
@@ -562,11 +640,15 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
             let Some(value) = captures.get(1) else {
                 continue;
             };
+            let Some(found) = captures.get(0) else {
+                continue;
+            };
             if value.start() < cursor {
                 continue;
             }
+            let kind = assignment_kind(&input[found.start()..value.start()], value.as_str());
             let end = if matches!(value.as_str(), "\"" | "'") {
-                quoted.start(input.as_bytes()[value.start()]);
+                quoted.start(input.as_bytes()[value.start()], kind);
                 value.end() + quoted.consume(&input[value.end()..])
             } else {
                 value.end()
@@ -574,7 +656,7 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
             spans.push(Span {
                 start: value.start(),
                 end,
-                kind: "secret_value",
+                kind,
             });
             cursor = end;
             if quoted.active() {
@@ -585,7 +667,42 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
     spans
 }
 
-fn push_secret_lines(spans: &mut Vec<Span>, input: &str, start: usize, end: usize) {
+fn assignment_kind(prefix: &str, value: &str) -> &'static str {
+    let prefix = prefix.trim().to_ascii_lowercase();
+    if prefix.ends_with("bearer")
+        || value
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("bearer "))
+    {
+        "bearer_token"
+    } else if prefix.ends_with("basic")
+        || value
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("basic "))
+    {
+        "basic_auth"
+    } else if prefix.contains("api_key") || prefix.contains("api-key") || prefix.contains("apikey")
+    {
+        "api_key"
+    } else if prefix.contains("password")
+        || prefix.contains("passwd")
+        || prefix.contains("passphrase")
+        || prefix.contains("pass_phrase")
+        || prefix.contains("pass-phrase")
+    {
+        "password"
+    } else {
+        "secret_value"
+    }
+}
+
+fn push_secret_lines(
+    spans: &mut Vec<Span>,
+    input: &str,
+    start: usize,
+    end: usize,
+    kind: &'static str,
+) {
     // Preserve physical line numbering for fs_read, including empty lines.
     // Newlines count toward the quote window even though they remain visible.
     let mut cursor = start;
@@ -595,7 +712,7 @@ fn push_secret_lines(spans: &mut Vec<Span>, input: &str, start: usize, end: usiz
             spans.push(Span {
                 start: cursor,
                 end: cursor + content.len(),
-                kind: "secret_value",
+                kind,
             });
         }
         cursor += line.len();

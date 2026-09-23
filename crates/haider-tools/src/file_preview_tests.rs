@@ -176,12 +176,12 @@ async fn password_redaction_precedes_file_line_and_column_paging() {
         "thread-01a0e893-52bc-7def-89ab-0123456789cd\n",
     );
     let expected = concat!(
-        "https://owner:[REDACTED:secret_value]@example.test/repo\n",
-        "postgres://owner:[REDACTED:secret_value]@db.test/app\n",
-        "password=[REDACTED:secret_value]\n",
-        "password=[REDACTED:secret_value]\n",
-        "password=[REDACTED:secret_value]\n",
-        "password=[REDACTED:secret_value]\n",
+        "https://owner:[REDACTED:password]@example.test/repo\n",
+        "postgres://owner:[REDACTED:password]@db.test/app\n",
+        "password=[REDACTED:password]\n",
+        "password=[REDACTED:password]\n",
+        "password=[REDACTED:password]\n",
+        "password=[REDACTED:password]\n",
         "thread-01a0e893-52bc-7def-89ab-0123456789cd\n",
     );
     for (line, expected_line) in expected.split_inclusive('\n').enumerate() {
@@ -217,7 +217,7 @@ async fn multiline_password_redaction_precedes_tail_only_line_and_column_pages()
             let input = format!(
                 "public\npassword={quote}abc{newline}SYNTHETICTAIL987{quote} after\nlast\n"
             );
-            for column in [1, 3, 20, 28] {
+            for column in [1, 3, 20, 24] {
                 let page = bounded_file_read(
                     input.clone(),
                     &FsRead::new("multiline.txt")
@@ -228,7 +228,7 @@ async fn multiline_password_redaction_precedes_tail_only_line_and_column_pages()
                 )
                 .await
                 .expect("tail page");
-                let line = "[REDACTED:secret_value] after\n";
+                let line = "[REDACTED:password] after\n";
                 assert!(
                     page.preview
                         .starts_with(&format!("3: {}", &line[column - 1..]))

@@ -823,7 +823,7 @@ async fn anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction() {
         (
             "multiline.txt",
             "password=\"abc\\\nSYNTHETICTAIL987\" after\n".into(),
-            "REDACTED:secret_value",
+            "REDACTED:password",
             Some("SYNTHETICTAIL987"),
         ),
         (

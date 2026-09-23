@@ -58,7 +58,7 @@ fn known_and_high_entropy_tokens_are_redacted_deterministically() {
 
     let ranged_body = redact_text("QWxhZGRpbjpPcGVuU2Vz\n");
     assert_eq!(
-        ranged_body.text, "[REDACTED:private_key_material]\n",
+        ranged_body.text, "[REDACTED:high_entropy]\n",
         "a range or line-oriented search cannot bypass PEM-body redaction"
     );
 
@@ -69,6 +69,66 @@ fn known_and_high_entropy_tokens_are_redacted_deterministically() {
     ));
     assert_eq!(short_body.replacements, 3);
     assert!(!short_body.text.contains("AA=="));
+}
+
+#[test]
+fn default_redaction_labels_match_detected_classes_golden() {
+    use base64::Engine as _;
+    let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let jwt = format!(
+        "{}.{}.{}",
+        encoder.encode(br#"{"alg":"HS256","typ":"JWT"}"#),
+        encoder.encode(br#"{"sub":"synthetic-user"}"#),
+        encoder.encode("synthetic-signature")
+    );
+    let input = [
+        "AKIAABCDEFGHIJKLMNOP".to_owned(),
+        "sk-abcdefghijklmnopQRSTUV".to_owned(),
+        "ghp_abcdefghijklmnopqrstuvwxyz1234".to_owned(),
+        "xoxb-1234567890-abcdefghij".to_owned(),
+        vendor_fixture(&["glpat", "-"], VENDOR_PAYLOAD_20),
+        vendor_fixture(&["npm", "_"], VENDOR_PAYLOAD_36),
+        vendor_fixture(&["sk", "_live", "_"], VENDOR_PAYLOAD_26),
+        vendor_fixture(&["AI", "za"], VENDOR_PAYLOAD_35),
+        jwt,
+        "eyJabcdefghijk.eyJabcdefghijk.abcdefghijkl".to_owned(),
+        "Authorization: Bearer 859c9fd11efbc93ee3d6b5458111b031d4a6477f405146d65d543732901bdfc4"
+            .to_owned(),
+        "api_key=ordinary-fixture-value".to_owned(),
+        "api_key=eyJabcdefghijk.eyJabcdefghijk.abcdefghijkl".to_owned(),
+        "password=ordinary-fixture-value".to_owned(),
+        "aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY".to_owned(),
+        "QWxhZGRpbjpPcGVuU2Vz".to_owned(),
+    ]
+    .join("\n");
+    let actual = super::redact_output_text(&format!("{input}\n"));
+    assert_eq!(
+        actual,
+        include_str!("../tests/fixtures/redaction_labels_v1.golden")
+    );
+    assert!(!actual.contains("ordinary-fixture-value"));
+    assert!(!actual.contains("synthetic-signature"));
+}
+
+#[test]
+fn explicit_context_overrides_generic_jwt_lookalike_label() {
+    let lookalike = "eyJabcdefghijk.eyJabcdefghijk.abcdefghijkl";
+    for (input, expected) in [
+        (
+            format!("api_key={lookalike}"),
+            "api_key=[REDACTED:api_key]".to_owned(),
+        ),
+        (
+            format!("Bearer {lookalike}"),
+            "Bearer [REDACTED:bearer_token]".to_owned(),
+        ),
+        (
+            format!("https://owner:{lookalike}@example.test"),
+            "https://owner:[REDACTED:password]@example.test".to_owned(),
+        ),
+    ] {
+        assert_eq!(super::redact_output_text(&input), expected);
+    }
 }
 
 #[test]
@@ -147,14 +207,17 @@ fn explicit_pointer_allow_list_is_exact_and_keeps_secret_checks() {
 
 #[test]
 fn secret_context_covers_bearer_digest_and_quoted_phrase() {
-    for value in [
-        "Authorization: Bearer 859c9fd11efbc93ee3d6b5458111b031d4a6477f405146d65d543732901bdfc4",
-        "password=\"ordinary secret phrase\"",
+    for (value, kind) in [
+        (
+            "Authorization: Bearer 859c9fd11efbc93ee3d6b5458111b031d4a6477f405146d65d543732901bdfc4",
+            "bearer_token",
+        ),
+        ("password=\"ordinary secret phrase\"", "password"),
     ] {
         let text = redact_text(value).text;
         assert!(!text.contains("859c9fd"));
         assert!(!text.contains("ordinary secret phrase"));
-        assert!(text.contains("[REDACTED:secret_value]"));
+        assert!(text.contains(&format!("[REDACTED:{kind}]")));
     }
 }
 
@@ -181,7 +244,7 @@ fn passphrase_assignment_family_precedes_identifier_exemptions() {
         ] {
             assert!(!output.text.contains(secret), "{input}: {}", output.text);
             assert!(
-                output.text.contains("[REDACTED:secret_value]"),
+                output.text.contains("[REDACTED:password]"),
                 "{input}: {}",
                 output.text
             );
@@ -210,7 +273,13 @@ fn credential_context_overrides_digest_and_identifier_exemptions() {
     ] {
         let output = redact_text(&format!("{label}{digest}")).text;
         assert!(!output.contains(digest), "{label}");
-        assert!(output.contains("[REDACTED:secret_value]"));
+        let kind = match label {
+            "OPENAI_API_KEY=" => "api_key",
+            "Bearer " => "bearer_token",
+            "Basic " => "basic_auth",
+            _ => "secret_value",
+        };
+        assert!(output.contains(&format!("[REDACTED:{kind}]")));
     }
     for (value, kind) in [
         ("ASIA0123456789ABCDEF", "aws_access_key"),
@@ -304,23 +373,23 @@ fn url_userinfo_redacts_only_passwords_before_carrier_exemptions() {
     for (input, expected) in [
         (
             "https://owner:fixturepass@example.test/repo",
-            "https://owner:[REDACTED:secret_value]@example.test/repo",
+            "https://owner:[REDACTED:password]@example.test/repo",
         ),
         (
             "postgres://owner:p%40ssw0rd@db.test/app",
-            "postgres://owner:[REDACTED:secret_value]@db.test/app",
+            "postgres://owner:[REDACTED:password]@db.test/app",
         ),
         (
             "https://owner:01a0e893-52bc-7def-89ab-0123456789cd@example.test/repo",
-            "https://owner:[REDACTED:secret_value]@example.test/repo",
+            "https://owner:[REDACTED:password]@example.test/repo",
         ),
         (
             "https://own%65r:p%3Ass%2Fword@example.test/repo",
-            "https://own%65r:[REDACTED:secret_value]@example.test/repo",
+            "https://own%65r:[REDACTED:password]@example.test/repo",
         ),
         (
             "https://owner:pa'ss:word@example.test/repo",
-            "https://owner:[REDACTED:secret_value]@example.test/repo",
+            "https://owner:[REDACTED:password]@example.test/repo",
         ),
         (
             "https://owner:sk-abcdefghijklmnopQRSTUV@example.test/repo",
@@ -353,10 +422,7 @@ fn escaped_credential_quotes_consume_through_the_real_closing_quote() {
             redact_text(input),
             paths.redact(Path::new("handoff.md"), input),
         ] {
-            assert_eq!(
-                output.text, "password=[REDACTED:secret_value] after",
-                "{input}"
-            );
+            assert_eq!(output.text, "password=[REDACTED:password] after", "{input}");
         }
     }
 }
@@ -372,10 +438,14 @@ fn named_public_carriers_survive_standard_output_but_secret_context_wins() {
         "run_id=aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY",
     ] {
         assert_eq!(super::redact_output_text(value), value);
-        for label in ["password=", "Bearer ", "secret="] {
+        for (label, kind) in [
+            ("password=", "password"),
+            ("Bearer ", "bearer_token"),
+            ("secret=", "secret_value"),
+        ] {
             assert_eq!(
                 redact_text(&format!("{label}{value}")).text,
-                format!("{label}[REDACTED:secret_value]")
+                format!("{label}[REDACTED:{kind}]")
             );
         }
     }
@@ -470,7 +540,14 @@ fn identifier_false_positive_corpus_survives_standard_redaction() {
     ] {
         let output = redact_text(input).text;
         assert!(!output.contains("test_"), "{input}");
-        assert!(output.contains("[REDACTED:secret_value]"), "{input}");
+        let kind = if input.starts_with("api_key") {
+            "api_key"
+        } else if input.starts_with("Bearer") {
+            "bearer_token"
+        } else {
+            "password"
+        };
+        assert!(output.contains(&format!("[REDACTED:{kind}]")), "{input}");
     }
     assert_ne!(
         super::redact_lockdown_text("test_unreadable_file_exit_code_path"),
@@ -570,8 +647,7 @@ fn multiline_quoted_values_preserve_lines_and_hide_every_secret_fragment() {
                 } else {
                     " after".into()
                 };
-                let expected =
-                    format!("password=[REDACTED:secret_value]\n[REDACTED:secret_value]{suffix}");
+                let expected = format!("password=[REDACTED:password]\n[REDACTED:password]{suffix}");
                 for output in [
                     redact_text(&input),
                     paths.redact(Path::new("handoff.md"), &input),
@@ -603,9 +679,9 @@ fn multiline_quote_window_is_byte_bounded_and_fails_closed_on_overflow() {
                 "a".repeat(length)
             );
             let expected = if length == super::QUOTED_SECRET_MAX_BYTES - 3 {
-                "password=[REDACTED:secret_value]\n[REDACTED:secret_value] after\nPUBLIC"
+                "password=[REDACTED:password]\n[REDACTED:password] after\nPUBLIC"
             } else {
-                "password=[REDACTED:secret_value]\n[REDACTED:secret_value]\n[REDACTED:secret_value]"
+                "password=[REDACTED:password]\n[REDACTED:password]\n[REDACTED:password]"
             };
             for output in [
                 redact_text(&input),
