@@ -1022,6 +1022,7 @@ async fn session_create_accepts_gemini_when_account_active() {
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         }];
         let models_json = serde_json::to_string(&models)

@@ -1107,7 +1107,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     fn discovered_details(&self, provider: &str) -> Vec<DiscoveredModel> {
         self.model_source
             .models(provider)
-            .map(|models| pickable(&models))
+            .map(|models| pickable(provider, &models))
             .unwrap_or_default()
     }
 
@@ -1119,7 +1119,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         let inventory = self.model_source.inventory(&profile.provider_id);
         let discovered = inventory
             .models()
-            .map(|models| pickable(&models))
+            .map(|models| pickable(&profile.provider_id, &models))
             .unwrap_or_default();
         // Offline catalogs are authoritative without a network request.
         // An empty remote result never falls back to configured rows.
@@ -1178,6 +1178,7 @@ fn offline_model(_provider: &str, slug: &str) -> DiscoveredModel {
         supported_efforts: Vec::new(),
         visible: true,
         priority: None,
+        use_responses_lite: None,
         extensions: None,
     }
 }

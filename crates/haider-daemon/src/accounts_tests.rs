@@ -426,6 +426,8 @@ pub(super) fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegis
                         supported_efforts: Vec::new(),
                         visible: true,
                         priority: None,
+                        use_responses_lite: (provider == OPENAI_OAUTH_PROVIDER_NAME)
+                            .then_some(true),
                         extensions: None,
                     })
                     .collect(),
@@ -2910,6 +2912,7 @@ async fn custom_provider_configure_commits_then_enqueues_discovery() {
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: Some("fixture-etag".into()),
@@ -6411,6 +6414,7 @@ fn endpoint_edit_registry(
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
             },
@@ -7347,6 +7351,7 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         }]),
         discovered_etag: Some("recovered-etag".into()),
@@ -7481,6 +7486,7 @@ async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -7621,6 +7627,7 @@ async fn start_gemini_catalog_test_actor(
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -7956,6 +7963,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -7970,6 +7978,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: Some(r#"W/"gemini-catalog""#.to_owned()),
@@ -7984,6 +7993,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,
@@ -8141,6 +8151,34 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
     store.close().await.expect("close");
 }
 
+#[test]
+fn old_codex_cache_forces_full_refresh_before_etag_reuse() {
+    let legacy = haider_core::CachedModels {
+        models_json: r#"[{"slug":"old-row","display_name":"Old Row","context_window":null,"description":null,"default_effort":null,"supported_efforts":[],"visible":true,"priority":null}]"#.into(),
+        etag: Some("fixture-etag".into()),
+        fetched_at_ms: 1,
+    };
+    assert_eq!(
+        catalog_refresh_etag(OPENAI_OAUTH_PROVIDER_NAME, Some(&legacy)),
+        None
+    );
+    assert_eq!(
+        catalog_refresh_etag(ANTHROPIC_OAUTH_PROVIDER_NAME, Some(&legacy)).as_deref(),
+        Some("fixture-etag")
+    );
+    let current = haider_core::CachedModels {
+        models_json: legacy.models_json.replace(
+            "\"priority\":null",
+            "\"priority\":null,\"use_responses_lite\":true",
+        ),
+        ..legacy
+    };
+    assert_eq!(
+        catalog_refresh_etag(OPENAI_OAUTH_PROVIDER_NAME, Some(&current)).as_deref(),
+        Some("fixture-etag")
+    );
+}
+
 /// Refresh HTTP is handed to an owned task, broker resolution exposes only
 /// the OAuth access token, and the actor alone publishes the durable result.
 ///
@@ -8219,6 +8257,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
                     supported_efforts: vec!["low".to_owned(), "medium".to_owned()],
                     visible: true,
                     priority: Some(7),
+                    use_responses_lite: Some(true),
                     extensions: None,
                 }],
                 etag: Some(r#"W/"refresh-etag""#.to_owned()),
@@ -10604,6 +10643,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
         supported_efforts: Vec::new(),
         visible: true,
         priority: None,
+        use_responses_lite: None,
         extensions: None,
     };
     store
@@ -14245,6 +14285,7 @@ fn customprov_model_rows(ids: &[&str]) -> Vec<haider_provider::DiscoveredModel> 
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         })
         .collect()
@@ -14930,6 +14971,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 }],
                 etag: None,

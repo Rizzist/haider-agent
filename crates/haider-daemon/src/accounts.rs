@@ -2972,7 +2972,7 @@ async fn begin_provider_models_refresh(
             return;
         }
     };
-    let etag = cached.as_ref().and_then(|cached| cached.etag.clone());
+    let etag = catalog_refresh_etag(&provider, cached.as_ref());
     refreshing_providers.insert(provider.clone());
     let commands = commands.clone();
     let model_discoverer = Arc::clone(model_discoverer);
@@ -3031,6 +3031,28 @@ async fn begin_provider_models_refresh(
             .await;
     });
     refresh_routes.insert(refresh_task.id(), (provider, completed, true));
+}
+
+fn catalog_refresh_etag(
+    provider: &str,
+    cached: Option<&haider_core::CachedModels>,
+) -> Option<String> {
+    let cached = cached?;
+    // Pre-973 Codex cache rows lack the Lite routing declaration. Refetch
+    // their full body once rather than accepting a 304 that would preserve
+    // the old, now unselectable inventory indefinitely.
+    if provider == OPENAI_OAUTH_PROVIDER_NAME
+        && serde_json::from_str::<Vec<DiscoveredModel>>(&cached.models_json)
+            .map(|models| {
+                models
+                    .iter()
+                    .any(|model| model.use_responses_lite.is_none())
+            })
+            .unwrap_or(true)
+    {
+        return None;
+    }
+    cached.etag.clone()
 }
 
 struct ProviderModelsRefreshContext<'a> {
@@ -5161,6 +5183,7 @@ async fn handle_provider_configure(
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    use_responses_lite: None,
                     extensions: None,
                 })
                 .collect();
@@ -8467,6 +8490,7 @@ struct AccountProviderCatalogModelCacheKey {
     supported_efforts: Vec<String>,
     visible: bool,
     priority: Option<i64>,
+    use_responses_lite: Option<bool>,
     extensions: Option<AccountProviderCatalogExtensionsCacheKey>,
 }
 
@@ -8491,6 +8515,7 @@ impl From<&DiscoveredModel> for AccountProviderCatalogModelCacheKey {
             supported_efforts: model.supported_efforts.clone(),
             visible: model.visible,
             priority: model.priority,
+            use_responses_lite: model.use_responses_lite,
             extensions: model.extensions.as_ref().map(|extensions| {
                 AccountProviderCatalogExtensionsCacheKey {
                     protocol: extensions.protocol.clone(),

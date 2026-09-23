@@ -44,6 +44,7 @@ fn discovered_with_context(
         supported_efforts: Vec::new(),
         visible,
         priority,
+        use_responses_lite: None,
         extensions: None,
     }
 }
@@ -1116,6 +1117,33 @@ fn builtin_without_cached_models_is_unknown_not_available_with_guesses() {
         summary.availability_reason.as_deref(),
         Some("provider model inventory is unavailable")
     );
+}
+
+#[test]
+fn openai_subscription_summary_excludes_incompatible_and_legacy_cached_rows() {
+    let mut ready = discovered("lite-ready", true, Some(3));
+    ready.use_responses_lite = Some(true);
+    let mut standard = discovered("standard-only", true, Some(1));
+    standard.use_responses_lite = Some(false);
+    let source = model_source([(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        vec![standard, discovered("legacy-row", true, Some(2)), ready],
+    )]);
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([OPENAI_OAUTH_PROVIDER_NAME.to_owned()]),
+            "legacy-row",
+        ),
+        source,
+    )
+    .expect("registry");
+    let summary = registry
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("OpenAI summary");
+    assert_eq!(summary.models, vec!["lite-ready"]);
+    assert_eq!(summary.model_details.len(), 1);
+    assert_eq!(summary.default_model, None);
 }
 
 /// MUTATION CHECK: register Kimi as a generic/custom provider, API-key

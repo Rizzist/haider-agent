@@ -70,6 +70,10 @@ pub struct DiscoveredModel {
     pub visible: bool,
     /// Picker ordering hint; lower sorts first.
     pub priority: Option<i64>,
+    /// Codex routing declaration. The subscription adapter always sends
+    /// Responses Lite; old cached rows deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
     /// Provider-declared capability metadata that is richer than the common
     /// catalog contract. Absent for existing sources so their serialized
     /// cache rows stay byte-identical.
@@ -618,6 +622,7 @@ pub fn parse_catalog(
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             });
             continue;
@@ -660,8 +665,9 @@ pub fn parse_catalog(
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
-                visible: true,
+                visible: catalog_entry_visible(&source, entry),
                 priority: None,
+                use_responses_lite: None,
                 extensions: None,
             });
             continue;
@@ -674,6 +680,14 @@ pub fn parse_catalog(
         {
             // Residual documented by B6k: the Anthropic Messages adapter is
             // intentionally not wired for Kimi until a later catalog wave.
+            continue;
+        }
+        if matches!(source, CatalogSource::AnthropicSubscription)
+            && entry
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind != "model")
+        {
             continue;
         }
         // codex names it `slug`; Anthropic names it `id`.
@@ -802,6 +816,13 @@ pub fn parse_catalog(
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|visibility| visibility == "list"),
             priority: entry.get("priority").and_then(serde_json::Value::as_i64),
+            use_responses_lite: if matches!(source, CatalogSource::OpenAiSubscription) {
+                entry
+                    .get("use_responses_lite")
+                    .and_then(serde_json::Value::as_bool)
+            } else {
+                None
+            },
             extensions: kimi_extensions.or(grok_extensions),
         });
     }
@@ -834,6 +855,19 @@ pub fn parse_catalog(
         }
     }
     Ok(models)
+}
+
+/// Fixed API catalogs can explicitly exclude rows from their serving
+/// endpoint. Custom compatible catalogs remain advisory id lists.
+fn catalog_entry_visible(source: &CatalogSource, entry: &serde_json::Value) -> bool {
+    if !matches!(source, CatalogSource::HaiderCodeApi) {
+        return true;
+    }
+    entry
+        .get("visibility")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|visibility| visibility == "list")
+        && entry.get("supported_in_api") != Some(&serde_json::Value::Bool(false))
 }
 
 pub(crate) fn apply_catalog_credential(
@@ -872,13 +906,17 @@ fn sensitive_credential_header(
     Ok(request.header(name, value))
 }
 
-/// Picker order: provider priority first, then display name. Hidden models
-/// are dropped — the provider said not to list them.
+/// Picker order: provider priority first, then display name. OpenAI OAuth
+/// only offers rows declared for the Lite transport that its adapter uses.
 #[must_use]
-pub fn pickable(models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
+pub fn pickable(provider: &str, models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
     let mut visible: Vec<DiscoveredModel> = models
         .iter()
-        .filter(|model| model.visible)
+        .filter(|model| {
+            model.visible
+                && (provider != crate::OPENAI_OAUTH_PROVIDER_NAME
+                    || model.use_responses_lite == Some(true))
+        })
         .cloned()
         .collect();
     visible.sort_by(|left, right| {

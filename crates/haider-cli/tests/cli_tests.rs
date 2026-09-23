@@ -1024,6 +1024,7 @@ fn run_custom_model_wire_case(
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            use_responses_lite: None,
             extensions: None,
         })
         .collect::<Vec<_>>();
