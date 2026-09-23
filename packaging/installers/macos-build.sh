@@ -93,11 +93,25 @@ pkgutil --expand-full "$pkg" "$work/expanded"
 python3 "$here/macos-verify.py" "$work/expanded" "$payload" "$version" "$target"
 cp "$pkg" "$work/image/"
 hdiutil_retry() {
-  local action=$1 cleanup_attempt=$2 attempt status
+  local action=$1 cleanup_attempt=$2 attempt status diagnostic retryable
   shift 2
   for ((attempt=1; attempt<=4; attempt++)); do
-    if hdiutil "$action" "$@"; then return 0; else status=$?; fi
-    "$cleanup_attempt"
+    diagnostic=$(mktemp "$work/hdiutil.XXXXXX")
+    if hdiutil "$action" "$@" 2>"$diagnostic"; then
+      cat "$diagnostic" >&2
+      rm -f "$diagnostic"
+      return 0
+    else
+      status=$?
+    fi
+    cat "$diagnostic" >&2
+    retryable=0
+    if [ "$status" -eq 16 ] || LC_ALL=C grep -Eiq 'resource busy|device busy|resource temporarily unavailable|(^|[^[:alnum:]_])ebusy([^[:alnum:]_]|$)' "$diagnostic"; then
+      retryable=1
+    fi
+    rm -f "$diagnostic"
+    "$cleanup_attempt" || true
+    if [ "$retryable" -eq 0 ]; then return "$status"; fi
     if [ "$attempt" -eq 4 ]; then
       printf 'hdiutil %s failed after %s attempts (last exit %s)\n' "$action" "$attempt" "$status" >&2
       return "$status"
@@ -111,8 +125,11 @@ detach_partial_mount() {
   hdiutil detach "$work/mount" >/dev/null 2>&1 || true
   if [ -e "$work/mount/$name.pkg" ]; then
     mounted=1
-    hdiutil_retry detach no_cleanup "$work/mount"
-    mounted=0
+    if hdiutil_retry detach no_cleanup "$work/mount"; then
+      mounted=0
+    else
+      return $?
+    fi
   fi
 }
 hdiutil_retry create remove_partial_dmg -volname "Haider $version" -srcfolder "$work/image" -format UDZO "$dmg"

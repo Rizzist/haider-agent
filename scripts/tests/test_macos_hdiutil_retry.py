@@ -46,21 +46,23 @@ if [ "$1" = "$HDIUTIL_TEST_OPERATION" ]; then
   if [ "$count" -le "$HDIUTIL_TEST_FAILURES" ]; then
     if [ "$1" = create ]; then touch "${@: -1}"; fi
     if [ "$1" = attach ]; then /usr/bin/hdiutil "$@" >/dev/null || exit $?; fi
-    printf 'simulated Resource busy, attempt %s\\n' "$count" >&2
-    exit 16
+    printf 'simulated %s, attempt %s\\n' "$HDIUTIL_TEST_ERROR" "$count" >&2
+    exit "$HDIUTIL_TEST_EXIT"
   fi
 fi
 exec /usr/bin/hdiutil "$@"
 ''')
         script.chmod(0o755)
 
-    def build(self, operation, failures):
+    def build(self, operation, failures, error='Resource busy', error_exit=16):
         output = self.base / f'output-{operation}'
         env = {
             'PATH': f'{self.shim}:{os.environ.get("PATH", "/usr/bin:/bin")}',
             'HDIUTIL_TEST_DIR': str(self.base),
             'HDIUTIL_TEST_OPERATION': operation,
             'HDIUTIL_TEST_FAILURES': str(failures),
+            'HDIUTIL_TEST_ERROR': error,
+            'HDIUTIL_TEST_EXIT': str(error_exit),
         }
         result = subprocess.run(
             ['bash', str(BUILD), str(self.payload), str(output), VERSION, TARGET],
@@ -92,6 +94,15 @@ exec /usr/bin/hdiutil "$@"
         self.assertEqual(calls.count('create'), 4)
         self.assertIn('simulated Resource busy, attempt 4', result.stderr)
         self.assertIn('hdiutil create failed after 4 attempts (last exit 16)', result.stderr)
+        self.assertFalse(list(output.glob('*.dmg')))
+        self.assertFalse(list(output.glob('*.sha256')))
+
+    def test_permanent_create_failure_returns_original_status_immediately(self):
+        result, output, calls = self.build('create', 4, 'Invalid argument', 5)
+        self.assertEqual(result.returncode, 5)
+        self.assertEqual(calls.count('create'), 1)
+        self.assertIn('simulated Invalid argument, attempt 1', result.stderr)
+        self.assertNotIn('failed after 4 attempts', result.stderr)
         self.assertFalse(list(output.glob('*.dmg')))
         self.assertFalse(list(output.glob('*.sha256')))
 
