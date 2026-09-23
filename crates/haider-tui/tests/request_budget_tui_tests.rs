@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 #[test]
-fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces() {
+fn budget_status_hides_per_request_progress_and_renders_only_actionable_bounds() {
     for (phase, used) in [
         (RequestBudgetPhaseV1::Progress, 31),
         (RequestBudgetPhaseV1::SoftBound, 32),
@@ -47,8 +47,10 @@ fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces(
             }));
         let expected = format!("requests {used} / tranche 32 / hard cap 64");
         let plain = render_plain(&model.projection, 0, None);
-        assert!(plain.contains(&expected), "plain: {plain}");
-        if phase != RequestBudgetPhaseV1::Progress {
+        if phase == RequestBudgetPhaseV1::Progress {
+            assert!(!plain.contains(&expected), "plain: {plain}");
+        } else {
+            assert!(plain.contains(&expected), "plain: {plain}");
             assert!(plain.contains("resume budget-run"));
         }
         let mut terminal = Terminal::new(TestBackend::new(180, 40)).expect("terminal");
@@ -66,6 +68,10 @@ fn budget_status_without_label_renders_counts_and_continuation_in_both_surfaces(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains(&expected), "styled: {rendered}");
+        if phase == RequestBudgetPhaseV1::Progress {
+            assert!(!rendered.contains(&expected), "styled: {rendered}");
+        } else {
+            assert!(rendered.contains(&expected), "styled: {rendered}");
+        }
     }
 }

@@ -40,6 +40,7 @@ use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
 use haider_protocol::loom::LoomAgentType;
 use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
+use haider_protocol::request_budget::RequestBudgetStatusV1;
 use haider_protocol::session::{
     SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
 };
@@ -1877,7 +1878,17 @@ async fn assert_headless_workflow_chain_completes(test_id: &str, node_names: &[&
         "headless-workflow",
     )
     .await;
-    let _events = events_until_terminal(&mut client, &run_id).await;
+    let events = events_until_terminal(&mut client, &run_id).await;
+    assert!(
+        !events.iter().any(|payload| {
+            matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Completed { item, .. })
+                    if RequestBudgetStatusV1::from_extension_item(item).is_some()
+            )
+        }),
+        "a workflow without an explicit request policy stays unbounded"
+    );
     let requests = fake.requests();
     assert_eq!(
         requests.len(),
@@ -1930,6 +1941,105 @@ async fn headless_five_stage_workflow_has_no_two_hop_ceiling() {
         &["PLAN", "IMPLEMENT", "VERIFY", "PACKAGE", "PUBLISH"],
     )
     .await;
+}
+
+#[tokio::test]
+async fn interactive_turn_without_request_policy_completes_beyond_old_hard_cap() {
+    const TOOL_REQUESTS: usize = 65;
+    let test_id = "interactive-unbounded-request-count";
+    let root = test_root("interactive-unbounded-request-count-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(workspace.join("continuity.txt"), "retained fixture history")
+        .expect("workspace input");
+
+    let mut script = Vec::new();
+    for ordinal in 1..=TOOL_REQUESTS {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("unbounded-{}", ordinal - 1),
+            });
+        }
+        script.push(FakeStep::EmitToolCall {
+            call_id: format!("unbounded-{ordinal}"),
+            name: "fs_read".into(),
+            args: serde_json::json!({"path": "continuity.txt"}),
+        });
+        script.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    script.push(FakeStep::ExpectToolResult {
+        call_id: format!("unbounded-{TOOL_REQUESTS}"),
+    });
+    script.push(FakeStep::EmitText {
+        text: "completed after sixty-six provider requests".into(),
+    });
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+
+    let (dependencies, fake) = fake_dependencies(script);
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "unbounded-client",
+        ClientKind::Tui,
+    )
+    .await;
+    let overrides = SessionPermissionOverridesV1 {
+        read_only: true,
+        allow_writes: false,
+        allow_exec: false,
+        allow_mobile: false,
+        auto_allow: false,
+    };
+    let (session_id, generation) = create_and_attach(
+        &mut client,
+        &config,
+        &workspace,
+        "fake",
+        "fake-v1",
+        Some(overrides),
+        None,
+    )
+    .await;
+    let run_id = submit_turn(
+        &mut client,
+        &config,
+        "unbounded-turn",
+        session_id,
+        generation,
+        "complete beyond the retired default request cap",
+    )
+    .await;
+    let events = events_until_terminal(&mut client, &run_id).await;
+
+    assert_eq!(fake.requests().len(), TOOL_REQUESTS + 1);
+    assert!(continuation_seen(
+        &events,
+        "completed after sixty-six provider requests"
+    ));
+    assert!(
+        !events.iter().any(|payload| {
+            matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Completed { item, .. })
+                    if RequestBudgetStatusV1::from_extension_item(item).is_some()
+            )
+        }),
+        "an omitted request policy must not synthesize request-budget items"
+    );
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
 }
 
 #[tokio::test]

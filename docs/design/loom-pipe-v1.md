@@ -106,9 +106,9 @@ only after both are green.
 - **Autonomous continuation**: one external turn may spend as many workflow
   continuations as the declared stages require and its run budget permits.
   Each logical provider-request boundary rebinds the current typed node and
-  its exact CAS inputs. The run deadline, `max-cost`, and
-  `max_provider_requests_per_turn` remain the enclosing bounds; crossing the
-  request ceiling returns the typed loop-limit error. A repeated
+  its exact CAS inputs. The run deadline and `max-cost` remain enclosing bounds;
+  an explicitly configured `request_budget` adds a provider-request bound, and
+  crossing its hard cap returns the typed loop-limit error. A repeated
   `(run_id, workflow-state digest)` after a durable finalization deferral stays
   fail-closed as `workflow_unfinished`, because crash/replay ambiguity or no
   progress cannot safely authorize duplicate work. A changed digest is durable

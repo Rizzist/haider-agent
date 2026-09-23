@@ -1,14 +1,15 @@
 #![allow(clippy::expect_used)]
 
+use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
 use haider_protocol::headless::RunBudgetV1;
-use haider_protocol::ids::{RunId, SessionId};
+use haider_protocol::ids::{AgentId, LeaseId, RunId, SessionId};
 use haider_protocol::request_budget::{
     PROVIDER_REQUEST_BUDGET_EXTENSION_KIND, RequestBudgetContinuationV1, RequestBudgetPhaseV1,
     RequestBudgetStatusV1, RequestBudgetV1,
 };
 
 #[test]
-fn request_budget_defaults_allow_two_tranches_and_validate_order() {
+fn explicit_request_budget_defaults_allow_two_tranches_and_validate_order() {
     let budget = RequestBudgetV1::default();
     assert_eq!((budget.tranche, budget.hard_cap), (32, 64));
     assert!(budget.validate().is_ok());
@@ -29,6 +30,7 @@ fn request_budget_defaults_allow_two_tranches_and_validate_order() {
 fn legacy_run_budget_omits_request_policy_and_new_pin_roundtrips() {
     let legacy: RunBudgetV1 = serde_json::from_str("{}").expect("legacy budget");
     assert!(legacy.is_empty());
+    assert_eq!(legacy.request_budget, None, "omission is unbounded");
     assert_eq!(
         serde_json::to_value(legacy).expect("legacy encodes"),
         serde_json::json!({})
@@ -48,6 +50,34 @@ fn legacy_run_budget_omits_request_policy_and_new_pin_roundtrips() {
             tranche: 40,
             hard_cap: 80
         })
+    );
+}
+
+#[test]
+fn legacy_child_manifest_without_request_policy_is_unbounded() {
+    let manifest = AgentManifest {
+        agent: AgentId::new("unbounded-child"),
+        role: AgentRole::Subagent,
+        task: "long task".into(),
+        callsign: None,
+        model_profile: "fake-model".into(),
+        grant: Grant {
+            tools: Vec::new(),
+            effect_ceiling: Vec::new(),
+        },
+        budget_tokens: None,
+        placement: Placement::Local,
+        lease: LeaseId::new("unbounded-child-lease"),
+        fencing_epoch: 1,
+        attempt: 0,
+        parent: None,
+        coordinates: None,
+        cli_scope: None,
+    };
+    assert_eq!(
+        manifest.request_budget().expect("legacy manifest"),
+        None,
+        "omitted child request policy is unbounded"
     );
 }
 

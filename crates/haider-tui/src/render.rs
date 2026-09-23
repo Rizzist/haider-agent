@@ -16036,10 +16036,12 @@ fn item_lines<'a>(
                     &block.item,
                 )
             {
-                lines.push(Line::styled(
-                    format!("  {}", budget.summary()),
-                    theme.gold_style(),
-                ));
+                if budget.phase != haider_protocol::request_budget::RequestBudgetPhaseV1::Progress {
+                    lines.push(Line::styled(
+                        format!("  {}", budget.summary()),
+                        theme.gold_style(),
+                    ));
+                }
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 let suffix = label.strip_prefix("🖼 image").unwrap_or(&label);
                 lines.push(Line::from(vec![

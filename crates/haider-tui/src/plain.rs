@@ -685,8 +685,10 @@ fn render_item(out: &mut String, block: &ItemBlock) {
                     &block.item,
                 )
             {
-                out.push_str(&budget.summary());
-                out.push('\n');
+                if budget.phase != haider_protocol::request_budget::RequestBudgetPhaseV1::Progress {
+                    out.push_str(&budget.summary());
+                    out.push('\n');
+                }
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 out.push_str(&label);
                 out.push('\n');

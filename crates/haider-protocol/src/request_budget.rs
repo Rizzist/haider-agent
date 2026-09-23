@@ -12,12 +12,15 @@ pub struct RequestBudgetV1 {
     pub hard_cap: usize,
 }
 
+/// Convenience values for callers that explicitly opt into request-count
+/// limits. Runtime omission is represented by `Option<RequestBudgetV1>::None`
+/// and is unbounded.
 impl Default for RequestBudgetV1 {
     fn default() -> Self {
         Self {
             tranche: 32,
-            // Two 32-request tranches leave 11 requests beyond the observed
-            // 53-round solved benchmark while retaining a finite loop guard.
+            // Historical explicit-policy counterpart when a caller supplies
+            // only `--request-tranche` and leaves the cap flag absent.
             hard_cap: 64,
         }
     }

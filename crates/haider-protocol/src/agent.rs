@@ -46,9 +46,9 @@ pub struct AgentManifest {
 }
 
 impl AgentManifest {
-    /// Request policy frozen at child creation. Legacy manifests use the
-    /// normal default; malformed persisted policy is an error, never an
-    /// invitation to silently raise the child's limits.
+    /// Optional request policy frozen at child creation. Legacy manifests
+    /// without the coordinate are unbounded; malformed persisted policy is
+    /// an error, never an invitation to silently raise the child's limits.
     pub fn request_budget(&self) -> Result<Option<crate::request_budget::RequestBudgetV1>, String> {
         let Some(value) = self
             .coordinates

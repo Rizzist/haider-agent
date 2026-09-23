@@ -318,16 +318,23 @@ accepted `haider run --output jsonl` stream.
 
 ## Logical request budgets (v0.0.970)
 
-Every logical provider dispatch carries a durable `provider_request_budget_v1`
-extension status with used requests, soft tranche, and hard cap. The default
-is 32 / 64. The soft-bound note is both model-readable and visible; the hard
-checkpoint commits with `run_failed { code: request_budget_exceeded }` and the
-single `errored` terminal. CLI exit is **78**, the stable dedicated internal
-request-ceiling code (previously shared blocked code 77), with continuation instructions.
-These facts replay unchanged and do not discard prior text or tool results.
+Logical request budgets are opt-in. An omitted policy is unbounded and emits no
+`provider_request_budget_v1` status. With an explicit policy, every logical
+provider dispatch carries that durable extension status with used requests,
+soft tranche, and hard cap. The soft-bound note is both model-readable and
+visible; the hard checkpoint commits with
+`run_failed { code: request_budget_exceeded }` and the single `errored`
+terminal. CLI exit is **78**, the stable dedicated internal request-ceiling
+code (previously shared blocked code 77), with continuation instructions. These
+facts replay unchanged and do not discard prior text or tool results.
+Interactive TUI and plain transcript rendering suppress progress statuses;
+bound checkpoints remain useful, and machine JSON/JSONL retains all facts for
+an explicitly budgeted run.
 
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
-request policy. `haider run --resume RUN_ID --output jsonl` accepts a fresh
+request policy. Supplying only one flag uses the explicit-policy convenience
+counterpart (tranche 32 or hard cap 64); supplying neither leaves the run
+unbounded. `haider run --resume RUN_ID --output jsonl` accepts a fresh
 turn in the original headless root session, restoring tool history and the
 source policy unless explicitly overridden. Its stream correlates the new
 run and retains the ordinary contiguous cursor contract. The source run and

@@ -629,10 +629,6 @@ mod actor_ceiling;
 #[path = "actor_journalview_tests.rs"]
 mod actor_journalview_tests;
 
-// Two soft tranches cover the reported 53-round solved benchmark with 11
-// requests of headroom, while preserving a finite guard against runaway work.
-const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 64;
-
 /// Profile-scoped secret used only for diagnostic prefix fingerprints.
 /// Custom debug output is deliberately redacted so a config dump cannot
 /// disclose the key that protects short prompt components from guessing.
@@ -954,11 +950,9 @@ pub struct HarnessConfig {
     pub interaction_policy: InteractionResolutionPolicy,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
-    /// Hard ceiling on provider requests made by one logical turn.
-    pub max_provider_requests_per_turn: usize,
-    /// Warn the model once after this many logical requests. Transport retries
-    /// do not spend another request. A fresh continuation turn resets the budget.
-    pub provider_request_tranche: usize,
+    /// Optional logical provider-request policy for one turn. Absence is
+    /// unbounded; transport retries never spend another logical request.
+    pub provider_request_budget: Option<RequestBudgetV1>,
     /// Headless workspace for durable pre/post tree receipts at the hard cap.
     /// Embedders without a workspace leave this absent.
     pub ceiling_workspace: Option<std::path::PathBuf>,
@@ -1094,8 +1088,7 @@ impl HarnessConfig {
             interaction_policy: InteractionResolutionPolicy::default(),
             command_capacity: 8,
             broadcast_capacity: 128,
-            max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
-            provider_request_tranche: 32,
+            provider_request_budget: None,
             ceiling_workspace: None,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
@@ -3680,7 +3673,7 @@ impl HarnessActor {
         // Recovery reuses the durable warning, including its exact prompt text.
         // Only recovery pays for a journal scan; fresh turns start with no note.
         let mut soft_bound_emitted = false;
-        if restore_budget {
+        if restore_budget && self.config.provider_request_budget.is_some() {
             match self.restore_request_budget(&run_id).await {
                 Ok((used, note)) => {
                     provider_request_count = provider_request_count.max(used);
@@ -3874,12 +3867,14 @@ impl HarnessActor {
             }
         }
         'requests: loop {
-            if provider_attempt == 0 {
-                let budget = self.request_budget();
+            if provider_attempt == 0
+                && let Some(budget) = self.config.provider_request_budget
+            {
                 if !soft_bound_emitted && provider_request_count >= budget.tranche {
                     let status = self.request_budget_status(
                         &run_id,
                         provider_request_count,
+                        budget,
                         RequestBudgetPhaseV1::SoftBound,
                     );
                     if let Err(error) = self.commit_request_budget_note(&run_id, &status).await {
@@ -3898,6 +3893,7 @@ impl HarnessActor {
                     let status = self.request_budget_status(
                         &run_id,
                         provider_request_count,
+                        budget,
                         RequestBudgetPhaseV1::HardBound,
                     );
                     let mut error = request_budget_error(&status);
@@ -4618,12 +4614,15 @@ impl HarnessActor {
                         cache: request_attempt_data,
                         response_epoch: replay.response_epoch,
                         workspace_receipt: pending_workspace_receipt.take(),
-                        request_budget: (provider_attempt == 1).then(|| {
-                            self.request_budget_status(
-                                &run_id,
-                                provider_request_count,
-                                RequestBudgetPhaseV1::Progress,
-                            )
+                        request_budget: self.config.provider_request_budget.and_then(|budget| {
+                            (provider_attempt == 1).then(|| {
+                                self.request_budget_status(
+                                    &run_id,
+                                    provider_request_count,
+                                    budget,
+                                    RequestBudgetPhaseV1::Progress,
+                                )
+                            })
                         }),
                     },
                     &mut thinking_pending,
@@ -11496,26 +11495,16 @@ impl HarnessActor {
         Ok(())
     }
 
-    fn request_budget(&self) -> RequestBudgetV1 {
-        RequestBudgetV1 {
-            // Preserve embedders that only override the old hard-cap field.
-            tranche: self
-                .config
-                .provider_request_tranche
-                .min(self.config.max_provider_requests_per_turn),
-            hard_cap: self.config.max_provider_requests_per_turn,
-        }
-    }
-
     fn request_budget_status(
         &self,
         run_id: &RunId,
         used: usize,
+        budget: RequestBudgetV1,
         phase: RequestBudgetPhaseV1,
     ) -> RequestBudgetStatusV1 {
         RequestBudgetStatusV1 {
             used,
-            budget: self.request_budget(),
+            budget,
             phase,
             continuation: RequestBudgetContinuationV1 {
                 session_id: self.config.session_id.clone(),

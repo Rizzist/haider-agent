@@ -402,7 +402,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || !budget.is_empty()
             || seed.is_some()
         {
-            return Err("--session inherits the session's configuration and request ceiling; configuration and run-budget overrides are not accepted".into());
+            return Err("--session inherits the session's configuration and any configured request policy; configuration and run-budget overrides are not accepted".into());
         }
     }
     if resume_run_id.is_some() && action != RunAction::Execute {
@@ -2338,7 +2338,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits() {
+    fn request_budget_is_opt_in_and_flags_preserve_explicit_counterpart_defaults() {
+        let unbounded = parse_run_options_with_config(&["-p".into(), "long task".into()])
+            .expect("unbounded default");
+        assert_eq!(unbounded.options.budget.request_budget, None);
+
         let parsed = parse_run_options_with_config(&[
             "-p".into(),
             "long task".into(),
@@ -2351,6 +2355,20 @@ mod tests {
             Some(haider_protocol::request_budget::RequestBudgetV1 {
                 tranche: 32,
                 hard_cap: 96
+            })
+        );
+        let tranche = parse_run_options_with_config(&[
+            "-p".into(),
+            "long task".into(),
+            "--request-tranche".into(),
+            "40".into(),
+        ])
+        .expect("tranche override");
+        assert_eq!(
+            tranche.options.budget.request_budget,
+            Some(haider_protocol::request_budget::RequestBudgetV1 {
+                tranche: 40,
+                hard_cap: 64
             })
         );
         for flags in [

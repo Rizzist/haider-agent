@@ -314,8 +314,9 @@ pub trait ProviderFactory: Send + Sync {
     /// ephemeral cache resources when a session switches wire families.
     async fn reconcile_cache_scope(&self, _session_id: &SessionId, _provider: &str) {}
 
-    /// Integration-test seam for proving the actor's request-loop budget
-    /// through the real daemon. Production factories keep the core default.
+    /// Integration-test seam for proving an explicit actor request-loop cap
+    /// through the real daemon. Production factories return `None`, leaving
+    /// provider-request count unbounded.
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
@@ -9351,16 +9352,14 @@ async fn start_turn(
     config.interaction_policy =
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
-    config.ceiling_workspace = headless
-        .as_ref()
-        .map(|_| std::path::PathBuf::from(&metadata.cwd));
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
     config.turn_ordinal = accepted.turn_ordinal;
     config.provider_request_ordinals = Some(request_ordinals.clone());
     config.provider_request_attempt_recorder = Some(provider_request_attempt_recorder.clone());
     config.recovery_request_local_usage = admission_retry;
-    // A run pin overrides the child's frozen policy; absent both, the core
-    // supplies its ordinary 32-request tranche and 64-request hard ceiling.
+    // A run pin overrides the child's frozen policy. Absent both, provider
+    // requests are unbounded; explicit token, cost, time, cancellation, and
+    // non-request-count loop guards remain independent.
     let child_request_budget = delegation_record
         .as_ref()
         .map(|record| record.manifest.request_budget())
@@ -9375,14 +9374,24 @@ async fn start_turn(
         budget
             .validate()
             .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
-        config.provider_request_tranche = budget.tranche;
-        config.max_provider_requests_per_turn = budget.hard_cap;
+        config.provider_request_budget = Some(budget);
+        config.ceiling_workspace = headless
+            .as_ref()
+            .map(|_| std::path::PathBuf::from(&metadata.cwd));
     }
     if let Some(limit) = dependencies
         .provider_factory
         .max_provider_requests_per_turn_override()
     {
-        config.max_provider_requests_per_turn = limit;
+        config.provider_request_budget = Some(haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: haider_protocol::request_budget::RequestBudgetV1::default()
+                .tranche
+                .min(limit),
+            hard_cap: limit,
+        });
+        config.ceiling_workspace = headless
+            .as_ref()
+            .map(|_| std::path::PathBuf::from(&metadata.cwd));
     }
     config.reserved_output_tokens = metadata.max_tokens;
     if let Some(window) = config.context_window

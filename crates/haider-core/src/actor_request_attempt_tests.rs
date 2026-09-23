@@ -914,8 +914,10 @@ async fn hard_request_checkpoint_and_named_terminal_share_one_atomic_append() {
         1,
         1,
     );
-    config.provider_request_tranche = 1;
-    config.max_provider_requests_per_turn = 2;
+    config.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     config.provider_requests_already_made = 2;
     let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
         reason: FinishReason::EndTurn,
@@ -999,8 +1001,10 @@ async fn rejected_hard_request_checkpoint_exposes_neither_handle_nor_terminal() 
         1,
         1,
     );
-    config.provider_request_tranche = 1;
-    config.max_provider_requests_per_turn = 2;
+    config.provider_request_budget = Some(RequestBudgetV1 {
+        tranche: 1,
+        hard_cap: 2,
+    });
     config.provider_requests_already_made = 2;
     let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
         reason: FinishReason::EndTurn,
