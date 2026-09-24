@@ -882,8 +882,8 @@ fn child_tool_pack_excludes_root_authority_tools() {
     );
     assert_eq!(
         root.len(),
-        child.len() + 5,
-        "exactly five tools removed (todo_write, graph_evidence, computer, plan, loom_register)"
+        child.len() + 6,
+        "six root-only tools include usage_reset_apply alongside the five existing exclusions"
     );
     for definition in &child {
         assert!(

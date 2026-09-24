@@ -2839,6 +2839,20 @@ impl Store {
         )
     }
 
+    pub fn usage_meter_samples_range(
+        &self,
+        through_date: &str,
+        days: u16,
+    ) -> StoreResult<Vec<haider_protocol::usage::UsageHistoryMeterSampleV1>> {
+        let expected_device_id = self.profile_installation_id()?;
+        crate::usage_ledger::read_usage_meter_samples_for_device(
+            &self.root,
+            through_date,
+            days,
+            &expected_device_id,
+        )
+    }
+
     pub fn append_usage_meter_sample(
         &self,
         sample: &haider_protocol::usage::UsageHistoryMeterSampleV1,

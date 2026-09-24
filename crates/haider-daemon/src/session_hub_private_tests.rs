@@ -3446,6 +3446,216 @@ async fn missing_snapshot_subsystems_publish_reasoned_unavailability() {
     store.close().await.expect("store closes");
 }
 
+/// The sensitive reset RPC commits a non-blocking human decision point and
+/// returns immediately. Merely requesting it must never reach the provider.
+#[tokio::test]
+async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("usage-reset-rpc");
+    hub.create_internal_session(create_command(&session, "usage-reset-rpc"))
+        .await
+        .expect("session created");
+    let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+    let snapshot = Arc::new(std::sync::Mutex::new(vec![
+        haider_protocol::credential::CredentialDescriptor {
+            alias: account.clone(),
+            provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: haider_protocol::credential::AuthMethod::OAuth,
+            identity: "redacted@example.invalid".into(),
+            status: haider_protocol::credential::CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        },
+    ]));
+    hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+        snapshot,
+        None,
+        Arc::new(crate::usage_report::ReqwestUsageMeterHttp::new()),
+    )))
+    .expect("usage service installs");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("session head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("usage-reset-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attachment opens");
+    sink.0.lock().expect("frames").clear();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        connection.request(
+            haider_rpc::RequestId::new("usage-reset-request"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("usage-reset-command"),
+                session_id: session.clone(),
+                account: account.clone(),
+            },
+        ),
+    )
+    .await
+    .expect("request returns without awaiting a decision")
+    .expect("request routes");
+
+    let frames = sink.0.lock().expect("frames").clone();
+    let (approval_id, menu_id, request_seq, worker_generation) = frames
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    haider_rpc::ResponseBody::UsageResetApply {
+                        result,
+                        menu_id,
+                        request_seq,
+                        worker_generation,
+                    },
+            } if request_id.as_str() == "usage-reset-request"
+                && result.status
+                    == haider_protocol::usage::UsageResetApplyStatusV1::ApprovalPending =>
+            {
+                Some((
+                    result.approval_id.clone(),
+                    menu_id.clone(),
+                    *request_seq,
+                    *worker_generation,
+                ))
+            }
+            _ => None,
+        })
+        .expect("typed pending response");
+    let opened = store
+        .read(&session, request_seq.saturating_sub(1), 1)
+        .await
+        .expect("read parked menu")
+        .pop()
+        .expect("menu event");
+    let EventPayload::MenuOpened(menu) = opened.payload.decode_event().expect("decode menu") else {
+        panic!("request coordinate must identify MenuOpened");
+    };
+    assert_eq!(menu.id, menu_id);
+    assert!(!menu.blocking, "deferred approval cannot stop the run");
+    assert!(matches!(
+        menu.kind,
+        MenuKind::DeferredApproval {
+            approval_id: seen,
+            effect: EffectClass::UsageResetApply,
+            account: Some(seen_account),
+        } if seen == approval_id && seen_account == account
+    ));
+    assert!(
+        store
+            .read(&session, 0, 32)
+            .await
+            .expect("read approval journal")
+            .iter()
+            .all(|event| !matches!(
+                event.payload.decode_event(),
+                Ok(EventPayload::Effect(
+                    EffectPhase::Dispatched { .. } | EffectPhase::Outcome { .. }
+                ))
+            )),
+        "request alone cannot dispatch or spend a credit"
+    );
+
+    connection
+        .menu_answer(
+            Some(haider_rpc::RequestId::new("usage-reset-deny")),
+            haider_rpc::CommandId::new("usage-reset-deny-command"),
+            session.clone(),
+            menu_id,
+            request_seq,
+            worker_generation,
+            "deny".into(),
+            1,
+            None,
+        )
+        .await
+        .expect("deny commits");
+    let events = store
+        .read(&session, 0, 64)
+        .await
+        .expect("read denied approval");
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::Deny { .. },
+            ..
+        }))
+    )));
+    assert!(
+        events.iter().any(|event| matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { ref kind, ref data },
+                ..
+            })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+                && data["status"] == "denied"
+        )),
+        "denial publishes the typed notification"
+    );
+    assert!(
+        events.iter().all(|event| !matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+        )),
+        "denial cannot dispatch or spend a credit"
+    );
+
+    let head_after_denial = store.latest_seq(&session).await.expect("denied head");
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            haider_rpc::RequestId::new("usage-reset-replay"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("usage-reset-command"),
+                session_id: session.clone(),
+                account: account.clone(),
+            },
+        )
+        .await
+        .expect("same command replays the original approval");
+    assert_eq!(
+        store.latest_seq(&session).await.expect("replay head"),
+        head_after_denial,
+        "an idempotent request cannot open a second menu"
+    );
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::UsageResetApply { result, .. },
+        } if request_id.as_str() == "usage-reset-replay"
+            && result.approval_id == approval_id
+    )));
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// An available empty history read is successful absence, not subsystem
 /// unavailability. Store errors take the correlated error path in the router
 /// and therefore cannot be flattened into this response shape.

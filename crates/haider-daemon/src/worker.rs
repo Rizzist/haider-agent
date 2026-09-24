@@ -129,8 +129,8 @@ use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
 use haider_protocol::ids::{
-    AgentId, BranchId, DeviceId, EffectId, EventId, GraphId, ItemId, MenuId, NodeId, RunId,
-    SessionId,
+    AgentId, BranchId, CredentialAlias, DeviceId, EffectId, EventId, GraphId, ItemId, MenuId,
+    NodeId, RunId, SessionId,
 };
 use haider_protocol::image::{IMAGE_CREATED_EXTENSION_KIND, ImageCreatedV1};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem, UserCommandOriginV1};
@@ -162,6 +162,9 @@ use haider_protocol::tool::{
     BoundedResult, DispatchMode, ImageBlockRef, RememberedGrantScope, RememberedSessionGrant,
     ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
     ToolResultStatus,
+};
+use haider_protocol::usage::{
+    USAGE_RESET_APPLY_RESULT_EXTENSION, UsageResetApplyResultV1, UsageResetApplyStatusV1,
 };
 use haider_protocol::workspace::{WorkspaceEventPayload, WorkspaceUnavailable};
 use haider_protocol::{DeliveryMode, EventPayload};
@@ -14031,6 +14034,7 @@ pub(crate) enum RegisteredToolRoute {
     Monitor,
     ListModels,
     SessionTranscript,
+    UsageResetApply,
     PeerList,
     PeerSend,
     SshList,
@@ -14511,6 +14515,13 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             RegisteredToolRoute::SessionTranscript,
         ),
         registered_manifest(
+            haider_tools::usage_reset_apply_manifest(),
+            // This remains Ask even in autonomous/auto-allow mode; the
+            // effective-default projection has an explicit exception too.
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::UsageResetApply,
+        ),
+        registered_manifest(
             peer_list_manifest(),
             ToolPermissionDefault::Allow,
             RegisteredToolRoute::PeerList,
@@ -14574,6 +14585,7 @@ fn orchestration_route_name(route: RegisteredToolRoute) -> &'static str {
         RegisteredToolRoute::Monitor => "monitor",
         RegisteredToolRoute::ListModels => "list_models",
         RegisteredToolRoute::SessionTranscript => "session_transcript",
+        RegisteredToolRoute::UsageResetApply => "usage_reset_apply",
         RegisteredToolRoute::PeerList => "peer_list",
         RegisteredToolRoute::PeerSend => "peer_send",
         RegisteredToolRoute::SshList => "ssh_list",
@@ -14592,6 +14604,7 @@ fn orchestration_repeat_safe(route: RegisteredToolRoute) -> bool {
             | RegisteredToolRoute::WebSearch
             | RegisteredToolRoute::ListModels
             | RegisteredToolRoute::SessionTranscript
+            | RegisteredToolRoute::UsageResetApply
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::SshList
     )
@@ -14983,6 +14996,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
                         | RegisteredToolRoute::Mobile
+                        | RegisteredToolRoute::UsageResetApply
                 )
             })
             .map(|entry| entry.manifest.name.clone())
@@ -14999,6 +15013,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
                         | RegisteredToolRoute::Mobile
+                        | RegisteredToolRoute::UsageResetApply
                 )
             })
             .flat_map(|entry| entry.manifest.effects.iter().cloned())
@@ -16852,6 +16867,7 @@ const LOCKDOWN_HARD_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::MobileControl,
     EffectClass::ReadSms,
     EffectClass::PeerMessage,
+    EffectClass::UsageResetApply,
 ];
 
 pub(crate) const READ_ONLY_WRITE_DENIAL: &str = "write denied: run is --read-only";
@@ -16862,6 +16878,7 @@ pub(crate) const READ_ONLY_COMPUTER_CONTROL_DENIAL: &str =
     "computer control denied: run is --read-only";
 pub(crate) const READ_ONLY_PEER_MESSAGE_DENIAL: &str = "peer message denied: run is --read-only";
 pub(crate) const READ_ONLY_REGISTRY_DENIAL: &str = "registry mutation denied: run is --read-only";
+pub(crate) const READ_ONLY_USAGE_RESET_DENIAL: &str = "usage reset denied: run is --read-only";
 const READ_ONLY_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::FsWrite,
     EffectClass::ProcessExec,
@@ -16870,6 +16887,7 @@ const READ_ONLY_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::GuiAct,
     EffectClass::ScreenControl,
     EffectClass::PeerMessage,
+    EffectClass::UsageResetApply,
 ];
 
 fn read_only_denial_reason(class: &EffectClass) -> Option<&'static str> {
@@ -16880,6 +16898,7 @@ fn read_only_denial_reason(class: &EffectClass) -> Option<&'static str> {
         EffectClass::GitOp => Some(READ_ONLY_GIT_DENIAL),
         EffectClass::GuiAct | EffectClass::ScreenControl => Some(READ_ONLY_COMPUTER_CONTROL_DENIAL),
         EffectClass::PeerMessage => Some(READ_ONLY_PEER_MESSAGE_DENIAL),
+        EffectClass::UsageResetApply => Some(READ_ONLY_USAGE_RESET_DENIAL),
         _ => None,
     }
 }
@@ -16893,6 +16912,7 @@ fn is_read_only_denial(reason: &str) -> bool {
         READ_ONLY_COMPUTER_CONTROL_DENIAL,
         READ_ONLY_PEER_MESSAGE_DENIAL,
         READ_ONLY_REGISTRY_DENIAL,
+        READ_ONLY_USAGE_RESET_DENIAL,
     ]
     .contains(&reason)
 }
@@ -16988,7 +17008,8 @@ pub(crate) fn effective_permission_defaults(
                 // TCC gate for computer actions remains independent, and every
                 // effect is still journaled. Autonomous sessions fail that OS
                 // gate closed instead of opening a blocking grant card.
-                let default = if (autonomous_permissions || overrides.auto_allow)
+                let default = if class != EffectClass::UsageResetApply
+                    && (autonomous_permissions || overrides.auto_allow)
                     && base == ToolPermissionDefault::Ask
                 {
                     ToolPermissionDefault::Allow
@@ -17416,6 +17437,255 @@ fn typed_workflow_coordinates_match(
 mod typed_workflow_boundary_tests;
 
 impl BrokerToolDispatcher {
+    fn usage_reset_tool_result(
+        result: &UsageResetApplyResultV1,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        let preview = serde_json::to_string(result).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot encode usage reset result: {error}"),
+                false,
+            )
+        })?;
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview,
+            truncated: false,
+            truncation: None,
+            effects: Vec::new(),
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: if result.status == UsageResetApplyStatusV1::Failed {
+                ToolResultStatus::Failed
+            } else {
+                ToolResultStatus::Completed
+            },
+            reason: result.reason.clone(),
+            presentation: None,
+            orchestration: None,
+        }))
+    }
+
+    async fn usage_reset_status(
+        &self,
+        account: &CredentialAlias,
+        approval_id: &str,
+    ) -> Result<Option<UsageResetApplyResultV1>, HaiderError> {
+        let mut cursor = 0;
+        let mut opened = false;
+        let mut menu_id = None;
+        let mut answer = None;
+        let mut answer_generation = None;
+        let mut dispatched_generation = None;
+        let effect = crate::usage_report::usage_reset_effect_id(approval_id);
+        loop {
+            let page = self
+                .output
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::WorkerPermission,
+                    &self.session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |event| event.seq);
+            for event in page {
+                let Ok(payload) = event.payload.decode_event() else {
+                    continue;
+                };
+                match payload {
+                    EventPayload::MenuOpened(Menu {
+                        kind:
+                            MenuKind::DeferredApproval {
+                                approval_id: stored_id,
+                                effect: EffectClass::UsageResetApply,
+                                account: Some(stored_account),
+                            },
+                        id,
+                        ..
+                    }) if stored_id == approval_id && stored_account == *account => {
+                        opened = true;
+                        menu_id = Some(id);
+                    }
+                    EventPayload::MenuAnswered(menu_answer)
+                        if menu_id.as_ref() == Some(&menu_answer.menu)
+                            && menu_answer.via == AnswerVia::Rpc =>
+                    {
+                        answer = Some(menu_answer.option_key.unwrap_or_else(|| {
+                            if menu_answer.option_index == 0 {
+                                "approve".into()
+                            } else {
+                                "deny".into()
+                            }
+                        }));
+                        answer_generation = Some(event.worker_generation);
+                    }
+                    EventPayload::Effect(EffectPhase::Dispatched {
+                        effect: dispatched_effect,
+                    }) if dispatched_effect == effect => {
+                        dispatched_generation = Some(event.worker_generation);
+                    }
+                    EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { kind, data },
+                        ..
+                    }) if kind == USAGE_RESET_APPLY_RESULT_EXTENSION => {
+                        let Ok(result) = serde_json::from_value::<UsageResetApplyResultV1>(data)
+                        else {
+                            continue;
+                        };
+                        if result.approval_id == approval_id && result.account == *account {
+                            return Ok(Some(result));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !opened {
+            return Ok(None);
+        }
+        // Only the human-facing RPC menu-answer path can consume a credit.
+        // It commits Dispatched before the HTTP call. A poll never retries an
+        // ambiguous post-restart outcome, even with the provider idempotency
+        // key, so the daemon cannot fire the consume request twice.
+        let interrupted_before_dispatch = answer.as_deref() == Some("approve")
+            && answer_generation != Some(self.output.store.worker_generation())
+            && dispatched_generation.is_none();
+        let status = if answer.as_deref() == Some("deny") {
+            UsageResetApplyStatusV1::Denied
+        } else if interrupted_before_dispatch {
+            UsageResetApplyStatusV1::Failed
+        } else {
+            UsageResetApplyStatusV1::ApprovalPending
+        };
+        Ok(Some(UsageResetApplyResultV1 {
+            approval_id: approval_id.to_owned(),
+            account: account.clone(),
+            status,
+            windows_reset: None,
+            reason: if interrupted_before_dispatch {
+                Some("approval_interrupted_before_dispatch".into())
+            } else {
+                dispatched_generation
+                    .filter(|generation| *generation != self.output.store.worker_generation())
+                    .map(|_| "provider_outcome_unconfirmed".into())
+            },
+        }))
+    }
+
+    async fn execute_usage_reset_apply(
+        &self,
+        run_id: &RunId,
+        call_id: &str,
+        args: &serde_json::Value,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        let request: haider_tools::UsageResetApply =
+            serde_json::from_value(args.clone()).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid usage_reset_apply arguments: {error}"),
+                    false,
+                )
+            })?;
+        if self
+            .metadata
+            .permission_overrides
+            .is_some_and(|overrides| overrides.read_only)
+        {
+            return Ok(self
+                .permission_denial_result(READ_ONLY_USAGE_RESET_DENIAL.into())
+                .await);
+        }
+        let service = self
+            .output
+            .store
+            .hub()
+            .usage_report_service()
+            .map_err(hub_error)?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    "usage subsystem is not configured",
+                    false,
+                )
+            })?;
+        if !service.reset_apply_supported(&request.account) {
+            return Self::usage_reset_tool_result(&UsageResetApplyResultV1 {
+                approval_id: request.approval_id.unwrap_or_default(),
+                account: request.account,
+                status: UsageResetApplyStatusV1::Failed,
+                windows_reset: None,
+                reason: Some("provider_reset_not_supported".into()),
+            });
+        }
+        if let Some(approval_id) = request.approval_id.as_deref() {
+            let Some(result) = self
+                .usage_reset_status(&request.account, approval_id)
+                .await?
+            else {
+                return Self::usage_reset_tool_result(&UsageResetApplyResultV1 {
+                    approval_id: approval_id.to_owned(),
+                    account: request.account,
+                    status: UsageResetApplyStatusV1::Failed,
+                    windows_reset: None,
+                    reason: Some("approval_not_found".into()),
+                });
+            };
+            return Self::usage_reset_tool_result(&result);
+        }
+
+        let mut identity = blake3::Hasher::new();
+        for part in [
+            self.session_id.as_str(),
+            run_id.as_str(),
+            call_id,
+            request.account.as_str(),
+        ] {
+            identity.update(&(part.len() as u64).to_be_bytes());
+            identity.update(part.as_bytes());
+        }
+        let approval_id = format!("usage-reset-{}", identity.finalize().to_hex());
+        if let Some(existing) = self
+            .usage_reset_status(&request.account, &approval_id)
+            .await?
+        {
+            return Self::usage_reset_tool_result(&existing);
+        }
+        let menu = crate::usage_report::usage_reset_approval_menu(&approval_id, &request.account);
+        let intent = crate::usage_report::usage_reset_intent(&approval_id, &request.account);
+        let effect = intent.effect.clone();
+        append_payloads(
+            &self.output.store,
+            &self.output.device_id,
+            run_id,
+            self.branch_id.as_ref(),
+            &self.output.event_ids,
+            vec![
+                EventPayload::Effect(EffectPhase::Intent(intent)),
+                EventPayload::Effect(EffectPhase::Authorized {
+                    effect,
+                    verdict: AuthorizationVerdict::Ask {
+                        menu: menu.id.clone(),
+                    },
+                }),
+                EventPayload::MenuOpened(menu),
+            ],
+        )
+        .await?;
+        Self::usage_reset_tool_result(&UsageResetApplyResultV1 {
+            approval_id,
+            account: request.account,
+            status: UsageResetApplyStatusV1::ApprovalPending,
+            windows_reset: None,
+            reason: None,
+        })
+    }
+
     async fn ensure_workspace_materialized(&self) -> Result<(), HaiderError> {
         let mut pending = self.pending_workspace.lock().await;
         let Some(allocation) = pending.as_ref().cloned() else {
@@ -20927,6 +21197,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .execute_tool_script(run_id, item_id, call_id, args.as_ref(), cancel)
                 .await;
         }
+        if route == RegisteredToolRoute::UsageResetApply {
+            return self
+                .execute_usage_reset_apply(run_id, call_id, args.as_ref())
+                .await;
+        }
         if self
             .metadata
             .permission_overrides
@@ -23655,6 +23930,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::Monitor
             | RegisteredToolRoute::ListModels
             | RegisteredToolRoute::SessionTranscript
+            | RegisteredToolRoute::UsageResetApply
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::PeerSend
             | RegisteredToolRoute::SshList

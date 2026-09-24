@@ -4432,7 +4432,7 @@ fn render_usage_calendar(
                     )
             };
             let suffix = match &account.meter {
-                AccountMeterStateV1::Unavailable { reason } => format!(
+                AccountMeterStateV1::Unavailable { reason, .. } => format!(
                     " · meter unavailable ({})",
                     crate::format::fmt_meter_reason(reason)
                 ),
@@ -4501,7 +4501,7 @@ fn render_usage_calendar(
             },
         ));
         match &account.meter {
-            AccountMeterStateV1::Unavailable { reason } => lines.push(Line::styled(
+            AccountMeterStateV1::Unavailable { reason, .. } => lines.push(Line::styled(
                 format!(
                     "      5h reset unknown · weekly reset unknown · meter unavailable · {}",
                     crate::format::fmt_meter_reason(reason)
@@ -5029,7 +5029,9 @@ fn render_usage(
                                 ));
                             }
                         }
-                        haider_protocol::usage::AccountMeterStateV1::Unavailable { reason } => {
+                        haider_protocol::usage::AccountMeterStateV1::Unavailable {
+                            reason, ..
+                        } => {
                             spans.push(Span::styled(
                                 format!(
                                     "meter unavailable · {}",
@@ -5191,7 +5193,7 @@ fn render_usage(
                         lines.push(Line::from(spans));
                     }
                 }
-                AccountMeterStateV1::Unavailable { reason } => {
+                AccountMeterStateV1::Unavailable { reason, .. } => {
                     // The typed reason, honestly — NEVER a fabricated bar.
                     lines.push(Line::from(vec![
                         Span::styled("    meter unavailable · ", theme.warn_style()),

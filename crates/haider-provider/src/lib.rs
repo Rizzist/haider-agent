@@ -1270,10 +1270,11 @@ pub use pricing::{
 };
 pub use usage::{
     ANTHROPIC_OAUTH_USAGE_URL, ANTHROPIC_OAUTH_USAGE_USER_AGENT, KIMI_OAUTH_USAGE_URL,
-    MeterReading, MeterUnavailable, OPENAI_OAUTH_ACCOUNT_ID_HEADER, OPENAI_OAUTH_USAGE_ORIGINATOR,
-    OPENAI_OAUTH_USAGE_URL, OPENAI_OAUTH_USAGE_USER_AGENT, UsageMeterEndpoint,
-    normalize_utilization, parse_anthropic_oauth_usage, parse_grok_billing,
-    parse_haider_code_account, parse_kimi_usages, parse_openai_wham_usage,
+    MeterReading, MeterUnavailable, OPENAI_OAUTH_ACCOUNT_ID_HEADER, OPENAI_OAUTH_RESET_CONSUME_URL,
+    OPENAI_OAUTH_RESET_CREDITS_URL, OPENAI_OAUTH_USAGE_ORIGINATOR, OPENAI_OAUTH_USAGE_URL,
+    OPENAI_OAUTH_USAGE_USER_AGENT, UsageMeterEndpoint, normalize_utilization,
+    parse_anthropic_oauth_usage, parse_grok_billing, parse_haider_code_account, parse_kimi_usages,
+    parse_openai_reset_credits, parse_openai_wham_usage, parse_retry_after_at_ms,
     parse_rfc3339_to_unix_ms,
 };
 pub use webfetch::{

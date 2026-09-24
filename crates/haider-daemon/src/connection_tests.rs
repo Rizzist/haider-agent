@@ -362,9 +362,8 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        121,
-        "session launch-origin registration adds one feature to the \
-         existing 120-feature set"
+        122,
+        "usage reset apply adds one feature to the reviewed 121-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -482,6 +481,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_TURN_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_TURN_RETRACT_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
+            haider_rpc::FEATURE_USAGE_RESET_APPLY_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned(),
             haider_rpc::FEATURE_QUEUE_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_PEER_MESSAGING_V1.to_owned(),

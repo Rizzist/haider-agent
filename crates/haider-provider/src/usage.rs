@@ -1,6 +1,6 @@
 //! Per-provider usage meter collectors (U1).
 //!
-//! Three OAuth providers expose a server-side meter; each parser here is a
+//! OAuth providers with verified server-side meters are parsed here as pure
 //! pure function over recorded response bytes so fixtures replay without a
 //! network. Response shapes were research-verified against real payloads:
 //!
@@ -46,8 +46,12 @@
 //! [`MeterUnavailable`] with a bounded reason — never a panic, never a
 //! fabricated reading, and never token material in the reason.
 
-use haider_protocol::usage::UsageWindowV1;
+use haider_protocol::usage::{
+    UsageResetCreditV1, UsageResetCreditsV1, UsageResetHistoryEntryV1, UsageResetHistorySourceV1,
+    UsageWindowV1,
+};
 use serde::Deserialize;
+use std::time::UNIX_EPOCH;
 
 /// One successfully parsed meter reading.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +64,12 @@ pub struct MeterReading {
     pub basis_points: Vec<u32>,
     /// Subscription plan when the meter reports one (codex `plan_type`).
     pub plan: Option<String>,
+    /// Provider-stated reset-credit inventory, when this endpoint publishes
+    /// one. Absence is never converted to zero.
+    pub reset_credits: Option<UsageResetCreditsV1>,
+    /// Provider-stated prior reset events. Device-journal fallback is added
+    /// by the daemon, not inferred here.
+    pub previous_resets: Vec<UsageResetHistoryEntryV1>,
 }
 
 /// Typed unavailability: the honest terminal state of a failed reading.
@@ -68,14 +78,37 @@ pub struct MeterUnavailable {
     /// Bounded machine-readable `snake_case` reason (e.g. `http_status_429`,
     /// `malformed_response`). Never carries response or token bytes.
     pub reason: String,
+    /// Exact provider retry instant when a transport supplied `Retry-After`.
+    pub retry_at_ms: Option<u64>,
 }
 
 impl MeterUnavailable {
     pub fn new(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
+            retry_at_ms: None,
         }
     }
+
+    #[must_use]
+    pub fn with_retry_at_ms(mut self, retry_at_ms: Option<u64>) -> Self {
+        self.retry_at_ms = retry_at_ms;
+        self
+    }
+}
+
+/// Converts an exact HTTP `Retry-After` value into an absolute Unix-ms
+/// instant. Relative seconds are anchored only to the supplied fetch time;
+/// an invalid value remains absent.
+pub fn parse_retry_after_at_ms(value: Option<&str>, fetched_at_ms: u64) -> Option<u64> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(fetched_at_ms.saturating_add(seconds.saturating_mul(1_000)));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    at.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 /// Parses a Haider Code account snapshot without deriving plan state from
@@ -106,6 +139,10 @@ pub enum UsageMeterEndpoint {
 pub const ANTHROPIC_OAUTH_USAGE_USER_AGENT: &str = "claude-code/2.0.19";
 /// codex/openai-oauth usage meter URL.
 pub const OPENAI_OAUTH_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const OPENAI_OAUTH_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+pub const OPENAI_OAUTH_RESET_CONSUME_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 pub const OPENAI_OAUTH_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 /// Secret-free identity headers sent with the OpenAI subscription meter.
 /// `chatgpt-account-id` is account-specific and therefore supplied by the
@@ -257,8 +294,17 @@ pub fn normalize_utilization(raw: f64) -> f64 {
 struct WhamUsage {
     plan_type: Option<String>,
     rate_limit: Option<WhamRateLimit>,
-    #[serde(default)]
-    additional_rate_limits: Vec<WhamAdditionalRateLimit>,
+    additional_rate_limits: Option<Vec<WhamAdditionalRateLimit>>,
+    rate_limit_reset_credits: Option<WhamResetCreditsSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhamResetCreditsSummary {
+    available_count: u64,
+    applicable_available_count: Option<u64>,
+    total_earned_count: Option<u64>,
+    used_count: Option<u64>,
+    remaining_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,7 +411,7 @@ pub fn parse_openai_wham_usage_at(
             windows.push(window);
         }
     }
-    for additional in &usage.additional_rate_limits {
+    for additional in usage.additional_rate_limits.iter().flatten() {
         let Some(rate_limit) = &additional.rate_limit else {
             continue;
         };
@@ -395,7 +441,97 @@ pub fn parse_openai_wham_usage_at(
             .collect(),
         windows,
         plan: usage.plan_type,
+        reset_credits: usage
+            .rate_limit_reset_credits
+            .map(|credits| UsageResetCreditsV1 {
+                available_count: credits.available_count,
+                applicable_available_count: credits.applicable_available_count,
+                total_earned_count: credits.total_earned_count,
+                used_count: credits.used_count,
+                remaining_count: credits.remaining_count,
+                credits: Vec::new(),
+                apply_supported: true,
+            }),
+        previous_resets: Vec::new(),
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct WhamResetCreditsDetails {
+    #[serde(default)]
+    credits: Vec<WhamResetCredit>,
+    available_count: u64,
+    applicable_available_count: Option<u64>,
+    total_earned_count: Option<u64>,
+    used_count: Option<u64>,
+    remaining_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhamResetCredit {
+    reset_type: String,
+    status: String,
+    granted_at: Option<String>,
+    expires_at: Option<String>,
+    redeemed_at: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+}
+
+/// Parses the separate OpenAI reset-credit inventory endpoint. Every count
+/// and timestamp is copied only when present in provider JSON.
+pub fn parse_openai_reset_credits(
+    body: &[u8],
+) -> Result<(UsageResetCreditsV1, Vec<UsageResetHistoryEntryV1>), MeterUnavailable> {
+    let details: WhamResetCreditsDetails =
+        serde_json::from_slice(body).map_err(|_| MeterUnavailable::new("malformed_response"))?;
+    let mut previous_resets = Vec::new();
+    let credits = details
+        .credits
+        .into_iter()
+        .map(|credit| {
+            let redeemed_at_ms = credit
+                .redeemed_at
+                .as_deref()
+                .and_then(parse_rfc3339_to_unix_ms);
+            if let Some(reset_at_ms) = redeemed_at_ms {
+                previous_resets.push(UsageResetHistoryEntryV1 {
+                    reset_at_ms,
+                    source: UsageResetHistorySourceV1::Provider,
+                    window: None,
+                    observed_at_ms: None,
+                    kind: Some("banked_reset".into()),
+                });
+            }
+            UsageResetCreditV1 {
+                reset_type: credit.reset_type,
+                status: credit.status,
+                granted_at_ms: credit
+                    .granted_at
+                    .as_deref()
+                    .and_then(parse_rfc3339_to_unix_ms),
+                expires_at_ms: credit
+                    .expires_at
+                    .as_deref()
+                    .and_then(parse_rfc3339_to_unix_ms),
+                redeemed_at_ms,
+                title: credit.title,
+                description: credit.description,
+            }
+        })
+        .collect();
+    Ok((
+        UsageResetCreditsV1 {
+            available_count: details.available_count,
+            applicable_available_count: details.applicable_available_count,
+            total_earned_count: details.total_earned_count,
+            used_count: details.used_count,
+            remaining_count: details.remaining_count,
+            credits,
+            apply_supported: true,
+        },
+        previous_resets,
+    ))
 }
 
 // --- anthropic-oauth ------------------------------------------------------
@@ -477,6 +613,8 @@ pub fn parse_anthropic_oauth_usage(body: &[u8]) -> Result<MeterReading, MeterUna
             .collect(),
         windows,
         plan: None,
+        reset_credits: None,
+        previous_resets: Vec::new(),
     })
 }
 
@@ -589,6 +727,8 @@ pub fn parse_kimi_usages(body: &[u8]) -> Result<MeterReading, MeterUnavailable> 
             .collect(),
         windows,
         plan: None,
+        reset_credits: None,
+        previous_resets: Vec::new(),
     })
 }
 
@@ -699,6 +839,8 @@ pub fn parse_grok_billing(body: &[u8]) -> Result<MeterReading, MeterUnavailable>
             .collect(),
         windows,
         plan: billing.subscription_tier,
+        reset_credits: None,
+        previous_resets: Vec::new(),
     })
 }
 

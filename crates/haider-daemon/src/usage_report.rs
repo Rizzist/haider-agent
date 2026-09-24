@@ -1,7 +1,7 @@
 //! Cross-provider `usage.report` assembly (U1).
 //!
 //! One service, two truths, honestly separated:
-//! - **OAuth meters** — the three researched endpoints
+//! - **OAuth meters** — the researched provider endpoints
 //!   ([`haider_provider::UsageMeterEndpoint`]) fetched with broker-resolved
 //!   access tokens through an injected [`UsageMeterHttp`], cached per
 //!   account, and never polled more often than each endpoint's floor
@@ -10,7 +10,7 @@
 //!   failures cannot turn into hammering, and never replaced by stale
 //!   "good" numbers.
 //! - **Haider Code plan meter** — no independent probe exists. The
-//!   active-session `/v1/account` plan-status push deposits the held snapshot
+//!   active-account `/v1/account` plan-status poll deposits the held snapshot
 //!   here and appends its exact-integer weekly allowance opportunistically.
 //!   With no held status, the API-key account remains honest `local_only`.
 //! - **Local accounting** — a journal fold per session: cumulative
@@ -39,10 +39,12 @@ use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageBreakdown, AgentUsa
 use haider_protocol::credential::{
     AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
 };
+use haider_protocol::effect::{EffectClass, EffectIntent};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{AgentId, CredentialAlias, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::orchestration::{
     ORCHESTRATION_TERMINAL_EXTENSION, OrchestrationUsageV1, ScriptTerminalV1,
 };
@@ -54,7 +56,8 @@ use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageRequestScopeV1,
     CacheUsageRequestV1, CacheUsageStatsV1, HaiderCodePlanSnapshotV1, LocalUsageStatsV1,
-    UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1, UsageReportV1, UsageWindowV1,
+    UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1, UsageReportV1, UsageResetCreditsV1,
+    UsageResetHistoryEntryV1, UsageResetHistorySourceV1, UsageWindowV1,
 };
 use haider_provider::{MeterReading, MeterUnavailable, UsageMeterEndpoint};
 use serde::Deserialize;
@@ -129,7 +132,26 @@ pub(crate) trait UsageMeterHttp: Send + Sync {
         bearer: &SecretHandle,
         extra_headers: &[(&'static str, &'static str)],
         chatgpt_account_id: Option<&str>,
-    ) -> Result<(u16, Vec<u8>), MeterUnavailable>;
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable>;
+
+    async fn post_json(
+        &self,
+        url: &str,
+        bearer: &SecretHandle,
+        extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+        let _ = (url, bearer, extra_headers, chatgpt_account_id, body);
+        Err(MeterUnavailable::new("transport_unavailable"))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageMeterHttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub retry_after: Option<String>,
 }
 
 /// Production transport: pinned-policy reqwest client (no proxy, no
@@ -155,7 +177,7 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         bearer: &SecretHandle,
         extra_headers: &[(&'static str, &'static str)],
         chatgpt_account_id: Option<&str>,
-    ) -> Result<(u16, Vec<u8>), MeterUnavailable> {
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
         let Some(client) = self.transport.client() else {
             return Err(MeterUnavailable::new("transport_unavailable"));
         };
@@ -167,6 +189,7 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         let mut request = client
             .get(url)
             .timeout(Duration::from_secs(15))
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .header(reqwest::header::AUTHORIZATION, authorization);
         for (name, value) in extra_headers {
             request = request.header(*name, *value);
@@ -185,12 +208,100 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
             }
         })?;
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body = response
             .bytes()
             .await
             .map_err(|_| MeterUnavailable::new("transport_error"))?;
-        Ok((status, body.to_vec()))
+        Ok(UsageMeterHttpResponse {
+            status,
+            body: body.to_vec(),
+            retry_after,
+        })
     }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        bearer: &SecretHandle,
+        extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+        let Some(client) = self.transport.client() else {
+            return Err(MeterUnavailable::new("transport_unavailable"));
+        };
+        let token = std::str::from_utf8(bearer.expose_secret())
+            .map_err(|_| MeterUnavailable::new("credential_not_utf8"))?;
+        let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| MeterUnavailable::new("credential_not_header_safe"))?;
+        authorization.set_sensitive(true);
+        let mut request = client
+            .post(url)
+            .timeout(Duration::from_secs(15))
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(reqwest::header::AUTHORIZATION, authorization)
+            .json(body);
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(account_id) = chatgpt_account_id {
+            let mut account_id = reqwest::header::HeaderValue::from_str(account_id)
+                .map_err(|_| MeterUnavailable::new("credential_account_id_not_header_safe"))?;
+            account_id.set_sensitive(true);
+            request = request.header(haider_provider::OPENAI_OAUTH_ACCOUNT_ID_HEADER, account_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                MeterUnavailable::new("transport_timeout")
+            } else {
+                MeterUnavailable::new("transport_error")
+            }
+        })?;
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| MeterUnavailable::new("transport_error"))?;
+        Ok(UsageMeterHttpResponse {
+            status,
+            body: body.to_vec(),
+            retry_after,
+        })
+    }
+}
+
+fn classify_meter_response(
+    endpoint: UsageMeterEndpoint,
+    response: UsageMeterHttpResponse,
+    fetched_at_ms: u64,
+) -> Result<MeterReading, MeterUnavailable> {
+    if response.status == 401 {
+        return Err(MeterUnavailable::new("credential_expired"));
+    }
+    if response.status == 403 {
+        return Err(MeterUnavailable::new("http_403_forbidden_relogin"));
+    }
+    if response.status == 429 {
+        return Err(
+            MeterUnavailable::new("http_429_rate_limited").with_retry_at_ms(
+                haider_provider::parse_retry_after_at_ms(
+                    response.retry_after.as_deref(),
+                    fetched_at_ms,
+                ),
+            ),
+        );
+    }
+    endpoint.parse_at(response.status, &response.body, fetched_at_ms)
 }
 
 /// Stable meter reason for a supervised-agent provider whose protocol exposes
@@ -230,6 +341,7 @@ pub(crate) fn agent_owned_meter_state(status: &CredentialStatus) -> AccountMeter
     if let Some(reason) = credential_meter_unavailable_reason(status) {
         return AccountMeterStateV1::Unavailable {
             reason: reason.to_owned(),
+            retry_at_ms: None,
         };
     }
     match status {
@@ -248,6 +360,7 @@ pub(crate) fn agent_owned_meter_state(status: &CredentialStatus) -> AccountMeter
         | CredentialStatus::Revoked
         | CredentialStatus::NeedsAttention { .. } => AccountMeterStateV1::Unavailable {
             reason: ACP_AGENT_NO_QUOTA_REASON.to_owned(),
+            retry_at_ms: None,
         },
     }
 }
@@ -365,6 +478,58 @@ fn system_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn usage_reset_effect_id(approval_id: &str) -> haider_protocol::ids::EffectId {
+    haider_protocol::ids::EffectId::new(format!("effect-{approval_id}"))
+}
+
+pub(crate) fn usage_reset_intent(approval_id: &str, account: &CredentialAlias) -> EffectIntent {
+    EffectIntent {
+        effect: usage_reset_effect_id(approval_id),
+        class: EffectClass::UsageResetApply,
+        summary: format!("apply one usage reset credit for {account}"),
+        args_digest: format!(
+            "blake3:{}",
+            blake3::hash(account.as_str().as_bytes()).to_hex()
+        ),
+        workspace_revision: None,
+    }
+}
+
+pub(crate) fn usage_reset_approval_menu(approval_id: &str, account: &CredentialAlias) -> Menu {
+    Menu {
+        id: haider_protocol::ids::MenuId::new(format!("deferred-{approval_id}")),
+        kind: MenuKind::DeferredApproval {
+            approval_id: approval_id.to_owned(),
+            effect: EffectClass::UsageResetApply,
+            account: Some(account.clone()),
+        },
+        title: "Apply a usage reset credit?".into(),
+        body: vec![
+            format!("Account: {account}"),
+            "This spends one limited provider-issued reset credit. Work continues while this decision is pending.".into(),
+        ],
+        options: vec![
+            MenuOption {
+                key: "approve".into(),
+                label: "Apply one reset".into(),
+                detail: Some("Spend one applicable reset credit now.".into()),
+                decision: Some(DecisionKind::AllowOnce),
+            },
+            MenuOption {
+                key: "deny".into(),
+                label: "Deny".into(),
+                detail: Some("Do not spend a reset credit.".into()),
+                decision: Some(DecisionKind::RejectOnce),
+            },
+        ],
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "deferred_approval_v1".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
+
 impl UsageReportService {
     pub(crate) fn new(
         snapshot: AccountsSnapshot,
@@ -449,11 +614,102 @@ impl UsageReportService {
         self.haider_code_plans.lock().await.remove(account_alias);
     }
 
+    /// Applies one provider-issued reset credit. The caller must already hold
+    /// a committed human approval; this service deliberately has no policy
+    /// bypass or auto-approval path of its own.
+    pub(crate) async fn apply_reset(
+        &self,
+        account_alias: &CredentialAlias,
+        approval_id: &str,
+    ) -> Result<u64, MeterUnavailable> {
+        let descriptor = self
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| &descriptor.alias == account_alias)
+            .ok_or_else(|| MeterUnavailable::new("account_not_found"))?;
+        if descriptor.provider != haider_provider::OPENAI_OAUTH_PROVIDER_NAME
+            || descriptor.auth_method != AuthMethod::OAuth
+        {
+            return Err(MeterUnavailable::new("provider_reset_not_supported"));
+        }
+        let Some(tokens) = &self.tokens else {
+            return Err(MeterUnavailable::new("credential_broker_unavailable"));
+        };
+        let token = tokens.bearer(&descriptor).await?;
+        let account_id = descriptor
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref())
+            .filter(|account_id| !account_id.is_empty())
+            .ok_or_else(|| MeterUnavailable::new("credential_identity_incomplete"))?;
+        let response = self
+            .http
+            .post_json(
+                haider_provider::OPENAI_OAUTH_RESET_CONSUME_URL,
+                &token,
+                UsageMeterEndpoint::OpenAiOauth.extra_headers(),
+                Some(account_id),
+                &serde_json::json!({ "redeem_request_id": approval_id }),
+            )
+            .await?;
+        if response.status == 401 {
+            return Err(MeterUnavailable::new("credential_expired"));
+        }
+        if response.status == 403 {
+            return Err(MeterUnavailable::new("http_403_forbidden_relogin"));
+        }
+        if response.status == 429 {
+            return Err(
+                MeterUnavailable::new("http_429_rate_limited").with_retry_at_ms(
+                    haider_provider::parse_retry_after_at_ms(
+                        response.retry_after.as_deref(),
+                        (self.clock)(),
+                    ),
+                ),
+            );
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(MeterUnavailable::new(format!(
+                "http_status_{}",
+                response.status
+            )));
+        }
+        #[derive(Deserialize)]
+        struct ResetApplied {
+            code: String,
+            #[serde(default)]
+            windows_reset: u64,
+        }
+        let applied: ResetApplied = serde_json::from_slice(&response.body)
+            .map_err(|_| MeterUnavailable::new("malformed_response"))?;
+        let windows_reset = match applied.code.as_str() {
+            "reset" | "already_redeemed" => applied.windows_reset,
+            "nothing_to_reset" => {
+                return Err(MeterUnavailable::new("no_eligible_window"));
+            }
+            "no_credit" => return Err(MeterUnavailable::new("no_reset_credit")),
+            _ => return Err(MeterUnavailable::new("unexpected_response")),
+        };
+        self.cache
+            .lock()
+            .await
+            .remove(&(descriptor.provider, descriptor.alias));
+        Ok(windows_reset)
+    }
+
     fn descriptors(&self) -> Vec<CredentialDescriptor> {
         self.snapshot
             .lock()
             .map(|descriptors| descriptors.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn reset_apply_supported(&self, account_alias: &CredentialAlias) -> bool {
+        self.descriptors().into_iter().any(|descriptor| {
+            &descriptor.alias == account_alias
+                && descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME
+                && descriptor.auth_method == AuthMethod::OAuth
+        })
     }
 
     /// Assembles the full report. Store failures propagate (the caller owns
@@ -464,10 +720,14 @@ impl UsageReportService {
         store: &haider_core::SqliteStoreHandle,
     ) -> Result<UsageReportV1, haider_protocol::error::HaiderError> {
         let local = collect_local_stats(store).await?;
+        let generated_at_ms = (self.clock)();
+        let mut journal_resets = collect_device_reset_history(store, generated_at_ms).await?;
         let haider_code_plans = self.haider_code_plans.lock().await.clone();
         let mut accounts = Vec::new();
         for descriptor in self.descriptors() {
             let mut plan = None;
+            let mut reset_credits: Option<UsageResetCreditsV1> = None;
+            let mut previous_resets = journal_resets.remove(&descriptor.alias).unwrap_or_default();
             let mut identity = Some(descriptor.identity.clone()).filter(|id| !id.is_empty());
             let meter = if descriptor.provider == haider_provider::HAIDER_CODE_PROVIDER_NAME {
                 match haider_code_plans.get(&descriptor.alias) {
@@ -495,6 +755,11 @@ impl UsageReportService {
                         plan = entry.token_identity.plan;
                         match entry.outcome {
                             Ok(reading) => {
+                                reset_credits = reading.reset_credits.clone();
+                                merge_reset_history(
+                                    &mut previous_resets,
+                                    reading.previous_resets.clone(),
+                                );
                                 if reading.plan.is_some() {
                                     plan.clone_from(&reading.plan);
                                 }
@@ -526,6 +791,7 @@ impl UsageReportService {
                             }
                             Err(unavailable) => AccountMeterStateV1::Unavailable {
                                 reason: unavailable.reason,
+                                retry_at_ms: unavailable.retry_at_ms,
                             },
                         }
                     }
@@ -538,6 +804,8 @@ impl UsageReportService {
                 plan,
                 auth_method: descriptor.auth_method,
                 meter,
+                reset_credits,
+                previous_resets,
                 local: local.get(&descriptor.alias).cloned().unwrap_or_default(),
             });
         }
@@ -546,7 +814,7 @@ impl UsageReportService {
             merge_orchestration_usage(&mut orchestration, &account.local.orchestration);
         }
         Ok(UsageReportV1 {
-            generated_at_ms: (self.clock)(),
+            generated_at_ms,
             accounts,
             orchestration,
         })
@@ -642,7 +910,7 @@ impl UsageReportService {
         } else {
             None
         };
-        let outcome = match self
+        let mut outcome = match self
             .http
             .get(
                 endpoint.url(),
@@ -652,11 +920,128 @@ impl UsageReportService {
             )
             .await
         {
-            Ok((status, body)) => endpoint.parse_at(status, &body, (self.clock)()),
+            Ok(response) => classify_meter_response(endpoint, response, (self.clock)()),
             Err(unavailable) => Err(unavailable),
         };
+        if endpoint == UsageMeterEndpoint::OpenAiOauth
+            && let Ok(reading) = &mut outcome
+            && reading.reset_credits.is_some()
+            && let Ok(response) = self
+                .http
+                .get(
+                    haider_provider::OPENAI_OAUTH_RESET_CREDITS_URL,
+                    &token,
+                    endpoint.extra_headers(),
+                    chatgpt_account_id,
+                )
+                .await
+            && (200..300).contains(&response.status)
+            && let Ok((credits, previous_resets)) =
+                haider_provider::parse_openai_reset_credits(&response.body)
+        {
+            reading.reset_credits = Some(credits);
+            reading.previous_resets = previous_resets;
+        }
         (outcome, token_identity)
     }
+}
+
+fn utc_date_from_ms(timestamp_ms: u64) -> String {
+    let days = i64::try_from(timestamp_ms / 86_400_000).unwrap_or(i64::MAX);
+    let z = days.saturating_add(719_468);
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+async fn collect_device_reset_history(
+    store: &haider_core::SqliteStoreHandle,
+    now_ms: u64,
+) -> Result<
+    HashMap<CredentialAlias, Vec<UsageResetHistoryEntryV1>>,
+    haider_protocol::error::HaiderError,
+> {
+    // The ledger rejects dates before 1970. Synthetic clocks near the epoch
+    // still have a valid report; limit the lookback to elapsed calendar days.
+    let elapsed_days = (now_ms / 86_400_000).saturating_add(1);
+    let days = u16::try_from(elapsed_days.min(366)).unwrap_or(366);
+    let samples = store
+        .usage_meter_samples_range(utc_date_from_ms(now_ms), days)
+        .await?;
+    let mut by_window = HashMap::<(String, String), Vec<UsageHistoryMeterSampleV1>>::new();
+    for sample in samples {
+        by_window
+            .entry((sample.account.clone(), sample.window.clone()))
+            .or_default()
+            .push(sample);
+    }
+    let mut seen = HashSet::<(String, String, u64)>::new();
+    let mut histories = HashMap::<CredentialAlias, Vec<UsageResetHistoryEntryV1>>::new();
+    for ((account, window), mut window_samples) in by_window {
+        window_samples.sort_by_key(|sample| sample.sampled_at_ms);
+        for (index, sample) in window_samples.iter().enumerate() {
+            let Some(reset_at_ms) = sample.resets_at_ms.filter(|reset| *reset <= now_ms) else {
+                continue;
+            };
+            // A scheduled instant merely passing is not proof that the reset
+            // happened. Require a later device sample, taken at or after the
+            // instant, that observes this exact window on a different reset
+            // cycle. That is still explicitly device-journal provenance.
+            let Some(confirmed_at_ms) = window_samples[index + 1..]
+                .iter()
+                .find(|later| {
+                    later.sampled_at_ms >= reset_at_ms
+                        && later.resets_at_ms.is_some()
+                        && later.resets_at_ms != Some(reset_at_ms)
+                })
+                .map(|later| later.sampled_at_ms)
+            else {
+                continue;
+            };
+            let key = (account.clone(), window.clone(), reset_at_ms);
+            if !seen.insert(key) {
+                continue;
+            }
+            histories
+                .entry(CredentialAlias::new(account.clone()))
+                .or_default()
+                .push(UsageResetHistoryEntryV1 {
+                    reset_at_ms,
+                    source: UsageResetHistorySourceV1::DeviceJournal,
+                    window: Some(window.clone()),
+                    observed_at_ms: Some(confirmed_at_ms),
+                    kind: Some("window_reset".into()),
+                });
+        }
+    }
+    for entries in histories.values_mut() {
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.reset_at_ms));
+        entries.truncate(128);
+    }
+    Ok(histories)
+}
+
+fn merge_reset_history(
+    existing: &mut Vec<UsageResetHistoryEntryV1>,
+    mut provider: Vec<UsageResetHistoryEntryV1>,
+) {
+    if provider.is_empty() {
+        return;
+    }
+    let mut seen = HashSet::<(u64, Option<String>, Option<String>)>::new();
+    provider
+        .retain(|entry| seen.insert((entry.reset_at_ms, entry.window.clone(), entry.kind.clone())));
+    provider.sort_by_key(|entry| std::cmp::Reverse(entry.reset_at_ms));
+    provider.truncate(128);
+    *existing = provider;
 }
 
 fn haider_code_windows(snapshot: &HaiderCodePlanSnapshotV1) -> Vec<UsageWindowV1> {

@@ -703,3 +703,19 @@ new error codes retain the established forward-compatibility behavior.
   terminal discriminator remains `cancellation`; no new terminal kind is added.
   All these fields are durable and replay byte-for-byte; `schema_version`
   remains 1. Unknown supplemental payloads retain the raw-envelope law.
+
+### v0.0.973 — usage reset inventory and deferred approval
+
+- `usage.report` account rows add optional `reset_credits` and
+  `previous_resets`; unavailable meters add optional `retry_at_ms`. Provider
+  reset history and exact device-journal observations have explicit source
+  labels. Missing fields remain absent.
+- New effect class `usage_reset_apply` and menu kind `deferred_approval` park a
+  finite-resource action without changing the run to a blocked state. The
+  menu answer remains the human authorization fact; terminal provider status
+  rides the existing `item:extension` carrier as
+  `usage_reset_apply_result_v1`.
+- Additive feature `usage_reset_apply_v1` gates RPC `usage.reset_apply`.
+  Initial RPC and agent-tool results are typed `approval_pending` receipts.
+  `schema_version` remains 1; unknown menu/effect values retain existing
+  tolerance rules.

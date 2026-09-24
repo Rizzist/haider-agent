@@ -107,6 +107,8 @@ fn account_report(provider: &str, alias: &str, meter: AccountMeterStateV1) -> Ac
         plan: None,
         auth_method: AuthMethod::OAuth,
         meter,
+        reset_credits: None,
+        previous_resets: Vec::new(),
         local: LocalUsageStatsV1::default(),
     }
 }
@@ -610,6 +612,7 @@ fn the_google_meter_renders_unavailable_with_its_reason_never_a_zero() {
     let model = usage_model(
         AccountMeterStateV1::Unavailable {
             reason: NO_QUOTA_REASON.into(),
+            retry_at_ms: None,
         },
         UsageScope::Accounts,
     );
@@ -648,6 +651,7 @@ fn the_calendar_says_reset_unknown_for_a_google_account() {
     let model = usage_model(
         AccountMeterStateV1::Unavailable {
             reason: NO_QUOTA_REASON.into(),
+            retry_at_ms: None,
         },
         UsageScope::Calendar,
     );
@@ -751,6 +755,7 @@ fn antigravity_meter_dark_goldens_at_owner_widths() {
     let mut model = usage_model(
         AccountMeterStateV1::Unavailable {
             reason: NO_QUOTA_REASON.into(),
+            retry_at_ms: None,
         },
         UsageScope::Calendar,
     );
@@ -765,6 +770,7 @@ fn antigravity_meter_light_goldens_at_owner_widths() {
     let mut model = usage_model(
         AccountMeterStateV1::Unavailable {
             reason: NO_QUOTA_REASON.into(),
+            retry_at_ms: None,
         },
         UsageScope::Calendar,
     );

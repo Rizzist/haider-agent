@@ -40,6 +40,8 @@ fn account(
         plan: plan.map(str::to_owned),
         auth_method: AuthMethod::OAuth,
         meter,
+        reset_credits: None,
+        previous_resets: Vec::new(),
         local: LocalUsageStatsV1::default(),
     }
 }
@@ -77,6 +79,7 @@ fn calendar_report() -> UsageReportV1 {
                 None,
                 AccountMeterStateV1::Unavailable {
                     reason: "credential_unavailable".into(),
+                    retry_at_ms: None,
                 },
             ),
             account(

@@ -65,3 +65,18 @@ fn peer_send_hard_ceiling_wins_over_user_allow() {
         crate::ToolError::RefusedByLockdown { ref tool, .. } if tool == "peer_send"
     ));
 }
+
+#[test]
+fn usage_reset_always_asks_even_under_allowlists_and_auto_allow() {
+    let intent = EffectIntent {
+        effect: EffectId::new("effect-sensitive-reset"),
+        class: EffectClass::UsageResetApply,
+        summary: "spend one usage reset credit".to_owned(),
+        args_digest: "digest-sensitive-reset".to_owned(),
+        workspace_revision: None,
+    };
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::UsageResetApply);
+    policy.auto_allow_asks();
+    assert_eq!(policy.decision(&intent), PolicyDecision::Ask);
+}

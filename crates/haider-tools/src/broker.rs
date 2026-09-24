@@ -501,6 +501,14 @@ impl PermissionPolicy {
                 reason: rule.reason.clone(),
             };
         }
+        // A reset credit is a finite account resource. Session grants,
+        // class-wide allow rules, and autonomous/auto-allow mode must never
+        // spend one without a fresh human decision. An exact committed
+        // one-shot answer can still authorize the bound intent through
+        // `authorization_decision`.
+        if intent.class == EffectClass::UsageResetApply {
+            return PolicyDecision::Ask;
+        }
         if self
             .always_allow
             .iter()
@@ -549,6 +557,7 @@ fn denied_effect_error(
                 EffectClass::MobileControl => "mobile_control",
                 EffectClass::ReadSms => "read_sms",
                 EffectClass::PeerMessage => "peer_send",
+                EffectClass::UsageResetApply => "usage_reset_apply",
             }
             .to_owned(),
             reason,

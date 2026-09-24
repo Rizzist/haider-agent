@@ -8,6 +8,10 @@
 //!   `Sources/.../CodexOAuth/CodexOAuthUsageFetcher.swift` (field-for-field
 //!   `CodingKeys`) and the sample payload in luisleineweber/usagebar
 //!   `docs/providers/codex.md`.
+//! - `usage/openai_wham_usage_live_redacted.json` — captured through Haider's
+//!   authenticated meter flow on 2026-09-24. Every string value (including
+//!   identities) was replaced before the fixture was written; numeric/null
+//!   response structure is exact.
 //! - `usage/anthropic_oauth_usage_live.json` — captured LIVE from
 //!   `GET https://api.anthropic.com/api/oauth/usage` with a real Claude Max
 //!   account on 2026-08-05 (HTTP 200; token redacted at capture time; the
@@ -121,6 +125,53 @@ fn openai_optional_window_matrix_keeps_every_window_that_exists() {
     assert_eq!(
         UsageMeterEndpoint::OpenAiOauth.parse(200, &fixture("openai_wham_malformed.json")),
         Err(MeterUnavailable::new("malformed_response"))
+    );
+}
+
+#[test]
+fn openai_live_redacted_shape_keeps_exact_weekly_window_and_reset_counts() {
+    let reading = UsageMeterEndpoint::OpenAiOauth
+        .parse(200, &fixture("openai_wham_usage_live_redacted.json"))
+        .expect("current live WHAM shape parses");
+    assert_eq!(reading.windows.len(), 1, "no absent 5h window is invented");
+    assert_eq!(reading.windows[0].window, "weekly");
+    assert!((reading.windows[0].utilization - 0.41).abs() < 1e-9);
+    assert_eq!(reading.windows[0].resets_at_ms, Some(1_790_662_309_000));
+    let credits = reading.reset_credits.expect("provider reset summary");
+    assert_eq!(credits.available_count, 1);
+    assert_eq!(credits.applicable_available_count, Some(0));
+    assert!(credits.apply_supported);
+}
+
+#[test]
+fn openai_reset_credit_details_publish_only_provider_fields() {
+    let body = br#"{
+        "available_count": 2,
+        "applicable_available_count": 1,
+        "total_earned_count": 4,
+        "used_count": 2,
+        "remaining_count": 2,
+        "credits": [{
+            "reset_type": "weekly",
+            "status": "redeemed",
+            "granted_at": "2026-09-01T00:00:00Z",
+            "expires_at": null,
+            "redeem_started_at": null,
+            "redeemed_at": null,
+            "title": "Reset",
+            "description": "One reset"
+        }]
+    }"#;
+    let (credits, history) = haider_provider::parse_openai_reset_credits(body)
+        .expect("official reset-credit detail shape parses");
+    assert_eq!(credits.available_count, 2);
+    assert_eq!(credits.total_earned_count, Some(4));
+    assert_eq!(credits.used_count, Some(2));
+    assert_eq!(credits.remaining_count, Some(2));
+    assert_eq!(credits.credits.len(), 1);
+    assert!(
+        history.is_empty(),
+        "the confirmed contract has no reset history"
     );
 }
 

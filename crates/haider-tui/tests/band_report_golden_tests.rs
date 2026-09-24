@@ -101,6 +101,8 @@ fn usage_report_frames() {
                         },
                     ],
                 },
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: LocalUsageStatsV1::default(),
             },
             AccountUsageReportV1 {
@@ -110,6 +112,8 @@ fn usage_report_frames() {
                 plan: None,
                 auth_method: haider_protocol::credential::AuthMethod::ApiKey,
                 meter: AccountMeterStateV1::LocalOnly,
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: LocalUsageStatsV1::default(),
             },
         ],

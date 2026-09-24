@@ -43,6 +43,7 @@ pub(crate) const HARD_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::ScreenObserve,
     EffectClass::ScreenControl,
     EffectClass::PeerMessage,
+    EffectClass::UsageResetApply,
 ];
 
 pub(crate) fn effect_allowed(class: &EffectClass) -> bool {
@@ -106,6 +107,7 @@ pub(crate) fn request_denied(body: &RequestBody) -> bool {
                 | RequestBody::AccountSourceRemove { .. }
                 | RequestBody::AccountSourceScan
                 | RequestBody::AccountImportDevice { .. }
+                | RequestBody::UsageResetApply { .. }
                 | RequestBody::HooksTrust { .. }
                 | RequestBody::TurnSubmitWithHookTrust { .. }
                 | RequestBody::LoomInstallRetry { .. }

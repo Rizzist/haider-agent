@@ -777,6 +777,7 @@ enum BudgetCaseAction<'a> {
 struct BudgetCaseOptions<'a> {
     action: Option<BudgetCaseAction<'a>>,
     native_pdf: Option<Vec<u8>>,
+    usage_reset_auto_allow: Option<bool>,
 }
 
 // Registry #94: action cases first spend at most 1 s waiting for request one.
@@ -847,6 +848,7 @@ async fn run_provider_budget_case_with_action(
         BudgetCaseOptions {
             action,
             native_pdf: None,
+            usage_reset_auto_allow: None,
         },
     )
     .await
@@ -869,6 +871,7 @@ async fn run_provider_budget_case_with_native_pdf(
         BudgetCaseOptions {
             action: None,
             native_pdf: Some(pdf_bytes),
+            usage_reset_auto_allow: None,
         },
     )
     .await
@@ -883,22 +886,55 @@ async fn run_provider_budget_case_inner(
     script: Vec<FakeStep>,
     options: BudgetCaseOptions<'_>,
 ) -> (usize, Vec<RawEnvelope>) {
-    let BudgetCaseOptions { action, native_pdf } = options;
+    let BudgetCaseOptions {
+        action,
+        native_pdf,
+        usage_reset_auto_allow,
+    } = options;
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    if usage_reset_auto_allow.is_some() {
+        let account = haider_protocol::credential::CredentialDescriptor {
+            alias: haider_protocol::ids::CredentialAlias::new("synthetic-openai"),
+            provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: haider_protocol::credential::AuthMethod::OAuth,
+            identity: "synthetic account".into(),
+            status: haider_protocol::credential::CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        };
+        hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+            Arc::new(std::sync::Mutex::new(vec![account])),
+            None,
+            Arc::new(crate::usage_report::ReqwestUsageMeterHttp::new()),
+        )))
+        .expect("install fake usage account");
+    }
+    let permission_overrides =
+        usage_reset_auto_allow.map(|auto_allow| SessionPermissionOverridesV1 {
+            auto_allow,
+            ..SessionPermissionOverridesV1::default()
+        });
     // A scripted delegation budget case explicitly requests that feature;
     // ordinary budget cases keep the production default coding surface.
-    let tool_factory: Arc<dyn crate::worker::TurnToolFactory> = if script
-        .iter()
-        .any(|step| matches!(step, FakeStep::EmitToolCall { name, .. } if name == "spawn_subagent"))
-    {
-        crate::worker::DaemonDependencies::default()
-            .with_tool_exposure(Some(vec!["spawn_subagent".into()]))
-            .tool_factory
-    } else {
-        Arc::new(BrokerToolFactory)
-    };
+    let tool_factory: Arc<dyn crate::worker::TurnToolFactory> =
+        if usage_reset_auto_allow.is_some() {
+            crate::worker::DaemonDependencies::default()
+                .with_tool_exposure(Some(vec!["usage_reset_apply".into()]))
+                .tool_factory
+        } else if script.iter().any(
+            |step| matches!(step, FakeStep::EmitToolCall { name, .. } if name == "spawn_subagent"),
+        ) {
+            crate::worker::DaemonDependencies::default()
+                .with_tool_exposure(Some(vec!["spawn_subagent".into()]))
+                .tool_factory
+        } else {
+            Arc::new(BrokerToolFactory)
+        };
     let provider = Arc::new(if native_pdf.is_some() {
         FakeProvider::new(script).with_pdf_documents_native()
     } else {
@@ -936,7 +972,7 @@ async fn run_provider_budget_case_inner(
         provider: provider_name.to_owned(),
         model: model.to_owned(),
         max_tokens: max_output_tokens,
-        permission_overrides: None,
+        permission_overrides,
         effort: None,
         fast: false,
         cache_policy: Default::default(),
@@ -956,7 +992,7 @@ async fn run_provider_budget_case_inner(
         effort: None,
         fast: false,
         seed: None,
-        permission_overrides: SessionPermissionOverridesV1::default(),
+        permission_overrides: permission_overrides.unwrap_or_default(),
         trust_hooks: false,
         budget,
         request_deadline_unix_ms: None,
@@ -1068,6 +1104,79 @@ async fn run_provider_budget_case_inner(
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
     (request_count, events)
+}
+
+#[tokio::test]
+async fn agent_usage_reset_call_parks_human_approval_even_with_auto_allow() {
+    for auto_allow in [false, true] {
+        let label = if auto_allow {
+            "usage-reset-auto-allow"
+        } else {
+            "usage-reset-default"
+        };
+        let (_, events) = run_provider_budget_case_inner(
+            label,
+            "fake",
+            "fake-model",
+            4_096,
+            RunBudgetV1::default(),
+            vec![
+                FakeStep::EmitToolCall {
+                    call_id: "reset-call".into(),
+                    name: "usage_reset_apply".into(),
+                    args: serde_json::json!({"account":"synthetic-openai"}),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::ToolUse,
+                },
+                FakeStep::ExpectToolResult {
+                    call_id: "reset-call".into(),
+                },
+                FakeStep::EmitText {
+                    text: "continued without consuming a credit".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+            BudgetCaseOptions {
+                action: None,
+                native_pdf: None,
+                usage_reset_auto_allow: Some(auto_allow),
+            },
+        )
+        .await;
+        let result = events
+            .iter()
+            .find_map(|event| match event.payload.decode_event() {
+                Ok(EventPayload::ToolResult { call_id, result }) if call_id == "reset-call" => {
+                    Some(
+                        serde_json::from_str::<serde_json::Value>(&result.preview)
+                            .expect("typed reset tool result"),
+                    )
+                }
+                _ => None,
+            })
+            .expect("agent tool result");
+        assert_eq!(result["status"], "approval_pending");
+        assert!(events.iter().any(|event| matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::MenuOpened(haider_protocol::menu::Menu {
+                kind: haider_protocol::menu::MenuKind::DeferredApproval { .. },
+                blocking: false,
+                ..
+            }))
+        )));
+        assert!(
+            events.iter().all(|event| !matches!(
+                event.payload.decode_event(),
+                Ok(EventPayload::Effect(
+                    haider_protocol::effect::EffectPhase::Dispatched { .. }
+                ))
+            )),
+            "an agent request cannot dispatch the consume operation"
+        );
+    }
 }
 
 fn budget_fact(events: &[RawEnvelope]) -> RunBudgetExhaustedV1 {

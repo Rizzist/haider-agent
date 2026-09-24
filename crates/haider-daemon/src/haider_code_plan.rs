@@ -1,4 +1,4 @@
-//! Interest-gated Haider Code account-plan polling.
+//! Haider Code account-plan polling.
 //!
 //! The endpoint is provider authority: cadence and allowance state are
 //! published, never inferred. The loop resolves the active account afresh on
@@ -431,19 +431,6 @@ pub(crate) async fn run_plan_poller(
         }
 
         let recipients = interest_source.recipients().await;
-        if recipients.is_empty() {
-            if !wait_until_due_or_changed(
-                None,
-                &mut stop,
-                &mut account_changes,
-                &mut interest_changes,
-            )
-            .await
-            {
-                break;
-            }
-            continue;
-        }
         let Some(account) = account_source.active_account() else {
             if let Some(descriptor) = observed_account.as_ref() {
                 interest_source.clear(&descriptor.alias).await;

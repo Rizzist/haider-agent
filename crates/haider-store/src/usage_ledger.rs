@@ -437,6 +437,39 @@ pub(crate) fn read_usage_range_for_device(
     read_usage_range_inner(profile_root, through_date, days, Some(expected_device_id))
 }
 
+pub(crate) fn read_usage_meter_samples_for_device(
+    profile_root: &Path,
+    through_date: &str,
+    days: u16,
+    expected_device_id: &str,
+) -> StoreResult<Vec<UsageHistoryMeterSampleV1>> {
+    if days == 0 || days > USAGE_HISTORY_MAX_RANGE_DAYS {
+        return Err(invalid(format!(
+            "usage-history range days must be in 1..={USAGE_HISTORY_MAX_RANGE_DAYS}"
+        )));
+    }
+    let through = days_from_date(through_date)?;
+    let first = through
+        .checked_sub(i64::from(days) - 1)
+        .ok_or_else(|| invalid("usage-history range is before the supported calendar"))?;
+    let mut samples = Vec::new();
+    for offset in 0..days {
+        let date = date_from_days(first + i64::from(offset));
+        let Some(day) = read_usage_day(profile_root, &date)? else {
+            continue;
+        };
+        if day.device_id != expected_device_id {
+            return Err(corrupt(format!(
+                "usage-history day {date} belongs to device {}, expected {expected_device_id}",
+                day.device_id
+            )));
+        }
+        samples.extend(day.meter_samples);
+    }
+    samples.sort_by_key(|sample| sample.sampled_at_ms);
+    Ok(samples)
+}
+
 fn read_usage_range_inner(
     profile_root: &Path,
     through_date: &str,

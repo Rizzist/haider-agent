@@ -461,7 +461,10 @@ fn usage_report() -> UsageReportV1 {
                 auth_method: haider_protocol::credential::AuthMethod::OAuth,
                 meter: AccountMeterStateV1::Unavailable {
                     reason: "http_status_401".to_owned(),
+                    retry_at_ms: None,
                 },
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: LocalUsageStatsV1::default(),
             },
             AccountUsageReportV1 {
@@ -471,6 +474,8 @@ fn usage_report() -> UsageReportV1 {
                 plan: None,
                 auth_method: haider_protocol::credential::AuthMethod::ApiKey,
                 meter: AccountMeterStateV1::LocalOnly,
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: LocalUsageStatsV1::default(),
             },
         ],

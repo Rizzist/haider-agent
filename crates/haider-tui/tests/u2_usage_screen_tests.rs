@@ -141,6 +141,8 @@ fn report() -> UsageReportV1 {
                         },
                     ],
                 },
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: oauth_stats(),
             },
             AccountUsageReportV1 {
@@ -151,7 +153,10 @@ fn report() -> UsageReportV1 {
                 auth_method: AuthMethod::OAuth,
                 meter: AccountMeterStateV1::Unavailable {
                     reason: "http_status_401".to_owned(),
+                    retry_at_ms: None,
                 },
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: idle_oauth_stats(),
             },
             AccountUsageReportV1 {
@@ -161,6 +166,8 @@ fn report() -> UsageReportV1 {
                 plan: None,
                 auth_method: AuthMethod::ApiKey,
                 meter: AccountMeterStateV1::LocalOnly,
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: stats(3, Some(0.57)),
             },
         ],
