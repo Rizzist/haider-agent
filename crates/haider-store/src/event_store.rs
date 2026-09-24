@@ -12996,6 +12996,8 @@ impl Store {
     /// The first row is always returned when `limit > 0`, even when that one
     /// envelope exceeds `byte_budget`. This preserves forward progress while
     /// bounding ordinary pages by `byte_budget` plus at most one decoded row.
+    /// Pending rows are read in the outbox primary-key order, preserving each
+    /// session's event sequence without an extra ordering index.
     pub fn pending_hook_dispatches_bounded(
         &self,
         limit: usize,
@@ -13016,7 +13018,7 @@ impl Store {
                  FROM hook_dispatch_outbox AS o
                  JOIN events AS e
                    ON e.session_id = o.session_id AND e.seq = o.seq
-                 ORDER BY o.rowid ASC
+                 ORDER BY o.session_id ASC, o.seq ASC
                  LIMIT ?1",
             )
             .map_err(map_sqlite_error)?;
