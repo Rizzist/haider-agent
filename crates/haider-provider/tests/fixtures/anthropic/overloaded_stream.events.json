@@ -8,7 +8,7 @@
       "presentation": {
         "subcode": "provider-overloaded",
         "title": "Provider is overloaded",
-        "detail": "message withheld: may contain account data",
+        "detail": "Overloaded",
         "scope": "turn",
         "allowed_actions": ["retry"],
         "provider_error_type": "overloaded_error"

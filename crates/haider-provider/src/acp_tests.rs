@@ -1109,6 +1109,47 @@ fn the_stderr_tail_never_retains_an_oauth_url() {
 }
 
 #[test]
+fn acp_stderr_tail_keeps_safe_diagnostics_and_scrubs_account_data() {
+    use crate::acp::client::AcpError;
+
+    let safe = AcpError::Closed.into_provider_error("agent failed to start: model unavailable");
+    assert!(
+        safe.presentation
+            .detail
+            .contains("Agent stderr tail: agent failed to start: model unavailable")
+    );
+
+    let private = AcpError::Closed.into_provider_error("agent failed for alice973@example.test");
+    assert!(
+        private
+            .presentation
+            .detail
+            .contains("Agent stderr tail: agent failed for")
+    );
+    assert!(
+        !private
+            .presentation
+            .detail
+            .contains("alice973@example.test")
+    );
+    let multiline = AcpError::Closed.into_provider_error(
+        "agent connection failed\nmodel unavailable for alice973@example.test",
+    );
+    assert!(
+        multiline
+            .presentation
+            .detail
+            .contains("agent connection failed")
+    );
+    assert!(
+        !multiline
+            .presentation
+            .detail
+            .contains("alice973@example.test")
+    );
+}
+
+#[test]
 fn the_stderr_ring_bounds_a_child_that_never_emits_a_newline() {
     let ring = StderrRing::new(ACP_STDERR_TAIL_BYTES);
     for _ in 0..64 {

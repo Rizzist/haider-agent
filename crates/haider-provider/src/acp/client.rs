@@ -293,7 +293,16 @@ impl AcpError {
         if stderr_tail.is_empty() {
             error
         } else {
-            error.with_provider_detail(&format!("{message} Agent stderr tail: {stderr_tail}"))
+            // Line breaks are framing in the stderr ring. Join its lines
+            // before the single provider-detail boundary so ordinary agent
+            // diagnostics can survive while control bytes still fail closed.
+            let tail = stderr_tail
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            error.with_provider_detail(&format!("{message} Agent stderr tail: {tail}"))
         }
     }
 }

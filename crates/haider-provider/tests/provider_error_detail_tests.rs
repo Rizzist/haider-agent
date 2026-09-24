@@ -2,11 +2,11 @@
 
 use haider_provider::{
     ProviderErrorKind, replay_anthropic_http_error, replay_gemini_http_error,
-    replay_openai_http_error,
+    replay_openai_http_error, replay_openai_responses_sse,
 };
 
 type Classifier = fn(u16, Option<&str>, &[u8]) -> haider_provider::ProviderError;
-const WITHHELD: &str = "message withheld: may contain account data";
+const WITHHELD: &str = "details withheld";
 
 fn classifiers() -> [Classifier; 3] {
     [
@@ -144,43 +144,87 @@ fn request_ids_require_the_exact_bounded_header_shape() {
 fn oversized_and_invalid_utf8_provider_bodies_never_publish_fragments() {
     for classify in [replay_anthropic_http_error, replay_openai_http_error] {
         let html = format!("<html><body>{}</body></html>", "x".repeat(16_000));
-        assert_eq!(
-            classify(403, None, html.as_bytes()).presentation.detail,
-            WITHHELD
+        assert!(
+            classify(403, None, html.as_bytes())
+                .presentation
+                .detail
+                .ends_with(WITHHELD)
         );
         let invalid = classify(403, None, b"\xff\xfeprivate");
         assert!(!invalid.presentation.detail.contains("private"));
+        assert!(invalid.presentation.detail.ends_with(WITHHELD));
+        let markup = serde_json::json!({"error": {"message": "Invalid request <body>fixture973private</body>"}}).to_string();
+        let detail = classify(403, None, markup.as_bytes()).presentation.detail;
+        assert!(detail.ends_with(WITHHELD));
+        assert!(!detail.contains("fixture973private"));
     }
 }
 
 #[test]
-fn suspicious_message_shapes_are_withheld_across_adapters() {
+fn suspicious_message_shapes_are_scrubbed_across_adapters() {
     let messages = [
-        "Access denied: alice973@example.test",
-        "Access denied: Cookie: session=fixture_973_cookie_secret",
-        "Access denied: Set-Cookie: session=fixture_973_cookie_secret",
-        "Access denied: acct_973_private_account",
-        "Access denied: org_973_private_org",
-        "Access denied: user_973_private_user",
-        "Access denied: credit_973_private_credit",
-        "Access denied: prompt=fixture_973_private_request_payload",
-        "Access denied: request_body={\"prompt\":\"private\"}",
-        "Access denied: https://example.test/path?token=private",
-        "Access denied: Authorization: Bearer fixture-opaque-secret",
-        "Access denied: sk-fixture-973-key",
-        "Access denied: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.fixture973signature",
-        "Invalid shape.\u{1b}[31m",
-        "messages.2: tool_use ids were found without tool_result blocks",
+        (
+            "Access denied: alice973@example.test",
+            "alice973@example.test",
+        ),
+        (
+            "Access denied: Cookie: session=fixture_973_cookie_secret",
+            "fixture_973_cookie_secret",
+        ),
+        (
+            "Access denied: Set-Cookie: session=fixture_973_cookie_secret",
+            "fixture_973_cookie_secret",
+        ),
+        (
+            "Access denied: acct_973_private_account",
+            "acct_973_private_account",
+        ),
+        ("Access denied: org_973_private_org", "org_973_private_org"),
+        (
+            "Access denied: user_973_private_user",
+            "user_973_private_user",
+        ),
+        (
+            "Access denied: credit_973_private_credit",
+            "credit_973_private_credit",
+        ),
+        (
+            "Access denied: prompt=fixture_973_private_request_payload",
+            "fixture_973_private_request_payload",
+        ),
+        (
+            "Access denied: request_body={\"prompt\":\"private\"}",
+            "private",
+        ),
+        (
+            "Access denied: https://example.test/path?token=private",
+            "token=private",
+        ),
+        (
+            "Access denied: Authorization: Bearer fixture-opaque-secret",
+            "fixture-opaque-secret",
+        ),
+        (
+            "Invalid request; \"fixturehead Authorization: Bearer fixturetail\"; retry.",
+            "fixturehead",
+        ),
+        (
+            "Invalid request; \"fixturehead Authorization: Bearer fixturetail\"; retry.",
+            "fixturetail",
+        ),
+        ("Access denied: sk-fixture-973-key", "sk-fixture-973-key"),
+        (
+            "Access denied: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.fixture973signature",
+            "eyJhbGciOiJIUzI1NiJ9",
+        ),
+        ("Invalid shape.\u{1b}[31m", "\u{1b}"),
     ];
     for classify in classifiers() {
-        for message in messages {
+        for (message, secret) in messages {
             let body = serde_json::json!({"error": {"message": message}}).to_string();
             for input in [body.as_bytes(), message.as_bytes()] {
-                assert_eq!(
-                    classify(400, None, input).presentation.detail,
-                    WITHHELD,
-                    "{message}"
-                );
+                let detail = classify(400, None, input).presentation.detail;
+                assert!(!detail.contains(secret), "{message}: {detail}");
             }
         }
     }
@@ -210,7 +254,12 @@ fn credential_boundary_matrix_remains_fail_closed() {
                     );
                     let body = serde_json::json!({"error": {"message": message}}).to_string();
                     for input in [body.as_bytes(), message.as_bytes()] {
-                        assert_eq!(classify(400, None, input).presentation.detail, WITHHELD);
+                        assert!(
+                            classify(400, None, input)
+                                .presentation
+                                .detail
+                                .ends_with(WITHHELD)
+                        );
                     }
                 }
             }
@@ -225,7 +274,6 @@ fn previous_credential_corpus_remains_private() -> Result<(), serde_json::Error>
         name: String,
         detail: String,
         secrets: Vec<String>,
-        expected: Option<String>,
     }
     let fixtures: Vec<Fixture> =
         serde_json::from_str(include_str!("fixtures/provider_error_details.json"))?;
@@ -238,12 +286,256 @@ fn previous_credential_corpus_remains_private() -> Result<(), serde_json::Error>
                 for secret in &fixture.secrets {
                     assert!(!detail.contains(secret), "{} leaked {secret}", fixture.name);
                 }
-                if fixture.expected.is_some() {
-                    assert_eq!(detail, WITHHELD, "{}", fixture.name);
-                }
+                assert!(!detail.is_empty(), "{}", fixture.name);
                 assert!(detail.len() <= 512);
             }
         }
     }
     Ok(())
+}
+
+#[test]
+fn useful_provider_messages_survive_scrubbing() {
+    for (classify, message, expected) in [
+        (
+            replay_anthropic_http_error as Classifier,
+            "Overloaded",
+            "Overloaded",
+        ),
+        (
+            replay_anthropic_http_error,
+            "Your organization does not have access to this model.",
+            "Your organization does not have access to this model.",
+        ),
+        (
+            replay_anthropic_http_error,
+            "prompt is too long: 120001 tokens > 100000 maximum",
+            "prompt is too long: 120001 tokens > 100000 maximum",
+        ),
+        (
+            replay_anthropic_http_error,
+            "Your credit balance is too low to access the Anthropic API…",
+            "Your credit balance is too low to access the Anthropic API…",
+        ),
+        (
+            replay_openai_http_error,
+            "Unsupported parameter: service_tier",
+            "Unsupported parameter: service_tier",
+        ),
+        (
+            replay_openai_http_error,
+            "Unknown field: metadata",
+            "Unknown field: metadata",
+        ),
+        (
+            replay_openai_http_error,
+            "The model `x` does not exist or you do not have access to it.",
+            "The model `x` does not exist or you do not have access to it.",
+        ),
+        (
+            replay_openai_http_error,
+            "You exceeded your current quota. Read the docs: https://platform.openai.com/docs/guides/error-codes?token=fixture",
+            "You exceeded your current quota. Read the docs: https://platform.openai.com",
+        ),
+        (
+            replay_openai_http_error,
+            "Your authentication token has been invalidated. Please sign in again.",
+            "Your authentication token has been invalidated. Please sign in again.",
+        ),
+        (
+            replay_gemini_http_error,
+            "Invalid JSON payload received. Unknown name \"toolConfig\"",
+            "Invalid JSON payload received. Unknown name \"toolConfig\"",
+        ),
+        (
+            replay_gemini_http_error,
+            "INVALID_ARGUMENT: Request contains an invalid argument.",
+            "INVALID_ARGUMENT: Request contains an invalid argument.",
+        ),
+    ] {
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        let detail = classify(400, None, body.as_bytes()).presentation.detail;
+        assert_eq!(detail, expected, "{message}");
+    }
+    for word in [
+        "forgot", "users", "nobody", "promptly", "tokens", "sessions",
+    ] {
+        let message = format!("The {word} field is valid.");
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        assert_eq!(
+            replay_openai_http_error(400, None, body.as_bytes())
+                .presentation
+                .detail,
+            message
+        );
+    }
+    let gemini = replay_gemini_http_error(
+        400,
+        None,
+        br#"{"error":{"status":"INVALID_ARGUMENT","message":"Invalid JSON payload received. Unknown name \"toolConfig\""}}"#,
+    );
+    assert_eq!(
+        gemini.presentation.detail,
+        "Invalid JSON payload received. Unknown name \"toolConfig\""
+    );
+    assert!(gemini.presentation.provider_error_type.is_none());
+}
+
+#[test]
+fn redaction_pairs_never_expose_synthetic_account_values() {
+    let cases = [
+        (
+            "Access denied for alice973@example.test; retry later.",
+            "alice973@example.test",
+        ),
+        (
+            "Your organization named Willow Fixture Labs lacks access.",
+            "Willow Fixture Labs",
+        ),
+        ("Your organization Acme, Inc lacks access.", "Acme, Inc"),
+        (
+            "The account (acct_973_private_account) has expired.",
+            "acct_973_private_account",
+        ),
+        (
+            "See https://example.test/private?token=fixture973query for quota details.",
+            "fixture973query",
+        ),
+        (
+            "See https://fixtureuser:fixturepass@example.test/private?token=fixture973query for quota details.",
+            "fixturepass",
+        ),
+        (
+            "See https://org_973_private_org.example.test/private for quota details.",
+            "org_973_private_org",
+        ),
+        (
+            "Invalid payload {\"prompt\":\"fixture973body\"}; retry.",
+            "fixture973body",
+        ),
+        (
+            "Invalid token QWxhZGRpbjpvcGVuIHNlc2FtZV9maXh0dXJlOTcz; retry.",
+            "QWxhZGRpbjpvcGVuIHNlc2FtZV9maXh0dXJlOTcz",
+        ),
+        (
+            "Invalid digest 0123456789abcdef0123456789abcdef; retry.",
+            "0123456789abcdef0123456789abcdef",
+        ),
+        (
+            "The org (оrg_973_private) is unavailable.",
+            "оrg_973_private",
+        ),
+        (
+            "Access denied for alice973@exam\u{200b}ple.test.",
+            "alice973@exam\u{200b}ple.test",
+        ),
+    ];
+    for classify in classifiers() {
+        for (message, secret) in cases {
+            let body = serde_json::json!({"error": {"message": message}}).to_string();
+            let detail = classify(400, None, body.as_bytes()).presentation.detail;
+            assert!(!detail.contains(secret), "{message}: {detail}");
+            assert!(detail.len() <= 512);
+        }
+        let email = serde_json::json!({"error": {"message": "Access denied for alice973@example.test; retry later."}}).to_string();
+        assert_eq!(
+            classify(400, None, email.as_bytes()).presentation.detail,
+            "Access denied for [REDACTED]; retry later."
+        );
+        let json = serde_json::json!({"error": {"message": "Invalid payload {\"prompt\":\"fixture973body\"}; retry."}}).to_string();
+        assert_eq!(
+            classify(400, None, json.as_bytes()).presentation.detail,
+            "Invalid payload [REDACTED]; retry."
+        );
+        let two = serde_json::json!({"error": {"message": "Invalid {\"prompt\":\"fixtureA\"} and {\"token\":\"fixtureB\"}; retry."}}).to_string();
+        assert_eq!(
+            classify(400, None, two.as_bytes()).presentation.detail,
+            "Invalid [REDACTED] and [REDACTED]; retry."
+        );
+        let url = serde_json::json!({"error": {"message": "See https://example.test/private?token=fixture973query for quota details."}}).to_string();
+        assert_eq!(
+            classify(400, None, url.as_bytes()).presentation.detail,
+            "See https://example.test for quota details."
+        );
+    }
+    let near_cut = format!("{} alice973@example.test", "safe ".repeat(101));
+    let body = serde_json::json!({"error": {"message": near_cut}}).to_string();
+    let detail = replay_openai_http_error(400, None, body.as_bytes())
+        .presentation
+        .detail;
+    assert!(detail.ends_with(WITHHELD));
+    assert!(!detail.contains("alice973@example.test"));
+
+    let malformed =
+        serde_json::json!({"error": {"message": "Invalid payload {\"prompt\":\"fixture973body\""}})
+            .to_string();
+    let detail = replay_openai_http_error(400, None, malformed.as_bytes())
+        .presentation
+        .detail;
+    assert!(detail.starts_with("The provider could not accept this request shape."));
+    assert!(detail.ends_with(WITHHELD));
+    assert!(!detail.contains("fixture973body"));
+}
+
+#[test]
+fn openai_safe_code_then_safe_type_classification_precedence() {
+    let unknown_code =
+        br#"{"error":{"code":"private_code","type":"rate_limit_error","message":"Please wait."}}"#;
+    let error = replay_openai_http_error(400, None, unknown_code);
+    assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    assert_eq!(
+        error.presentation.provider_error_type.as_deref(),
+        Some("rate_limit_error")
+    );
+
+    let conflicting = br#"{"error":{"code":"insufficient_quota","type":"invalid_request_error","message":"Quota exhausted."}}"#;
+    let error = replay_openai_http_error(400, None, conflicting);
+    assert_eq!(error.kind, ProviderErrorKind::QuotaExhausted);
+    assert_eq!(
+        error.presentation.provider_error_type.as_deref(),
+        Some("invalid_request_error")
+    );
+
+    let stream = replay_openai_responses_sse(
+        b"event: error\ndata: {\"error\":{\"code\":\"private_code\",\"type\":\"rate_limit_error\",\"message\":\"Please wait.\"}}\n\n",
+    );
+    let error = stream
+        .into_iter()
+        .next()
+        .expect("stream item")
+        .expect_err("error frame");
+    assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    assert_eq!(
+        error.presentation.provider_error_type.as_deref(),
+        Some("rate_limit_error")
+    );
+}
+
+#[test]
+fn post_scrub_byte_limit_never_cuts_a_unicode_scalar_or_secret() {
+    let exact = format!("{}go", "ok ".repeat(170));
+    assert_eq!(exact.len(), 512);
+    let body = serde_json::json!({"error": {"message": exact}}).to_string();
+    assert_eq!(
+        replay_openai_http_error(400, None, body.as_bytes())
+            .presentation
+            .detail,
+        exact
+    );
+    let one_byte_over = format!("{}goo", "ok ".repeat(170));
+    assert_eq!(one_byte_over.len(), 513);
+    let body = serde_json::json!({"error": {"message": one_byte_over}}).to_string();
+    assert!(
+        replay_openai_http_error(400, None, body.as_bytes())
+            .presentation
+            .detail
+            .ends_with(WITHHELD)
+    );
+    let over = format!("{}🦀", "ok ".repeat(170));
+    let body = serde_json::json!({"error": {"message": over}}).to_string();
+    let detail = replay_openai_http_error(400, None, body.as_bytes())
+        .presentation
+        .detail;
+    assert!(detail.ends_with(WITHHELD));
+    assert!(!detail.contains('🦀'));
 }

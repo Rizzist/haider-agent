@@ -5643,9 +5643,11 @@ impl HarnessActor {
                         }
                         if message.as_ref().is_some_and(|partial| !partial.is_empty()) {
                             let mut presentation = stream_interruption_presentation(&error);
-                            if self.config.provider_lockdown {
-                                presentation.withhold_provider_detail();
-                            }
+                            apply_provider_detail_lockdown(
+                                self.config.provider_lockdown,
+                                &ErrorCode::ProviderError,
+                                &mut presentation,
+                            );
                             let (source_item, partial) = match self
                                 .complete_incomplete_message(
                                     &run_id,
@@ -11088,9 +11090,11 @@ impl HarnessActor {
             }
         }
         specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
-        if self.config.provider_lockdown {
-            provider_error.presentation.withhold_provider_detail();
-        }
+        apply_provider_detail_lockdown(
+            self.config.provider_lockdown,
+            &ErrorCode::ProviderError,
+            &mut provider_error.presentation,
+        );
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(
                 self.next_menu_id(),
@@ -11188,14 +11192,12 @@ impl HarnessActor {
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
         let mut error = self.latched_terminal_failure().await.unwrap_or(error);
-        if self.config.provider_lockdown
-            && let Some(presentation) = error.presentation.as_mut()
-            && matches!(
-                error.code,
-                ErrorCode::ProviderError | ErrorCode::ProviderTimeout | ErrorCode::IdleTimeout
-            )
-        {
-            presentation.withhold_provider_detail();
+        if let Some(presentation) = error.presentation.as_mut() {
+            apply_provider_detail_lockdown(
+                self.config.provider_lockdown,
+                &error.code,
+                presentation,
+            );
         }
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
@@ -13393,6 +13395,56 @@ fn run_state_is_provider_retry(run_state: Option<&RunState>) -> bool {
     )
 }
 
+/// Every core path that publishes a provider presentation uses this gate.
+fn apply_provider_detail_lockdown(
+    lockdown: bool,
+    code: &ErrorCode,
+    presentation: &mut ErrorPresentation,
+) {
+    if lockdown
+        && matches!(
+            code,
+            ErrorCode::ProviderError | ErrorCode::ProviderTimeout | ErrorCode::IdleTimeout
+        )
+    {
+        presentation.withhold_provider_detail();
+    }
+}
+
+#[cfg(test)]
+mod provider_detail_lockdown_tests {
+    use super::*;
+
+    #[test]
+    fn one_gate_withholds_all_provider_terminal_paths() {
+        for code in [
+            ErrorCode::ProviderError,
+            ErrorCode::ProviderTimeout,
+            ErrorCode::IdleTimeout,
+        ] {
+            let mut presentation = ErrorPresentation::new(
+                "provider-error",
+                "Provider failed",
+                "private provider detail",
+                ErrorScope::Turn,
+                [ErrorAction::Retry],
+            );
+            apply_provider_detail_lockdown(true, &code, &mut presentation);
+            assert!(!presentation.detail.contains("private provider detail"));
+            assert!(presentation.detail.contains("details withheld"));
+        }
+        let mut presentation = ErrorPresentation::new(
+            "provider-error",
+            "Provider failed",
+            "ordinary detail",
+            ErrorScope::Turn,
+            [ErrorAction::Retry],
+        );
+        apply_provider_detail_lockdown(false, &ErrorCode::ProviderError, &mut presentation);
+        assert_eq!(presentation.detail, "ordinary detail");
+    }
+}
+
 fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError) {
     if error.kind != ProviderErrorKind::Authentication {
         return;
@@ -13577,7 +13629,7 @@ fn recovery_menu(
         body.push(format!("Provider HTTP status: {status}"));
     }
     if let Some(request_id) = &presentation.provider_request_id {
-        body.push(format!("Request ID: {request_id}"));
+        body.push(format!("Request id: {request_id}"));
     }
     if let Some(error_type) = &presentation.provider_error_type {
         body.push(format!("Provider error type: {error_type}"));

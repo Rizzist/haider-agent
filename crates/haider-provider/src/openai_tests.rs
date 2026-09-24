@@ -243,7 +243,7 @@ async fn hostile_probe_and_http_error_body_sources_are_bounded() {
     assert!(reset_after_status.retryable);
 }
 
-/// Safe prose survives; structured fragments and credentials are withheld.
+/// Safe prose survives; credential values are scrubbed.
 #[test]
 fn openai_http_errors_preserve_safe_provider_explanations() {
     let parsed = replay_openai_http_error(
@@ -254,7 +254,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
     assert_eq!(parsed.kind, ProviderErrorKind::InvalidRequest);
     assert_eq!(
         parsed.presentation.detail,
-        "message withheld: may contain account data"
+        "Unsupported parameter: service_tier"
     );
 
     let plain = replay_openai_http_error(
@@ -274,10 +274,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
         None,
         br#"{"error":{"message":"Credential Bearer sk-provider-secret-value was rejected"}}"#,
     );
-    assert_eq!(
-        redacted.presentation.detail,
-        "message withheld: may contain account data"
-    );
+    assert!(redacted.presentation.detail.contains("Credential"));
     assert!(
         !redacted
             .presentation
@@ -291,10 +288,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
         None,
         br#"{"error":{"message":"Credential Authorization: Bearer opaque-provider-token-value was rejected"}}"#,
     );
-    assert_eq!(
-        redacted.presentation.detail,
-        "message withheld: may contain account data"
-    );
+    assert!(redacted.presentation.detail.contains("Credential"));
     assert!(
         !redacted
             .presentation
@@ -313,7 +307,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
     assert!(!invalidated.retryable);
     assert_eq!(
         invalidated.presentation.detail,
-        "message withheld: may contain account data"
+        "Your authentication token has been invalidated. Please sign in again."
     );
 }
 
@@ -329,10 +323,7 @@ fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
         .expect("one stream item")
         .expect_err("response.failed is an error");
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-    assert_eq!(
-        error.presentation.detail,
-        "message withheld: may contain account data"
-    );
+    assert_eq!(error.presentation.detail, "Unknown field: metadata");
 
     let raw = replay_openai_responses_sse(
         b"event: error\ndata: The service is overloaded. Please try again later.\n\n",
@@ -374,7 +365,7 @@ fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
     assert!(!error.retryable);
     assert_eq!(
         error.presentation.detail,
-        "message withheld: may contain account data"
+        "Your authentication token has been invalidated. Please sign in again."
     );
 }
 

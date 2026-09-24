@@ -160,8 +160,8 @@ fn provider_denial_plain_card_shows_message_type_and_full_request_id() {
     });
     let rendered = render_plain(&projection, 0, None);
     assert!(rendered.contains("The account lacks model access."));
-    assert!(rendered.contains("type permission_error"));
-    assert!(rendered.contains("req req_011CfLqHxA6nuihem8Gk4Xny"));
+    assert!(rendered.contains("Provider error type: permission_error"));
+    assert!(rendered.contains("Request id: req_011CfLqHxA6nuihem8Gk4Xny"));
 }
 
 #[test]

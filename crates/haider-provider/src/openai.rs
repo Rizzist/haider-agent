@@ -4007,6 +4007,9 @@ pub fn replay_openai_http_error(
         .and_then(|envelope| envelope.error.code.as_deref());
     let safe_type = error_type.and_then(crate::error_detail::safe_error_type);
     let safe_code = error_code.and_then(crate::error_detail::safe_error_type);
+    // An allowlisted code is the most specific classifier. Unknown codes are
+    // ignored, then an allowlisted type can classify the response. The public
+    // identity below instead prefers type, matching the provider's type field.
     let error_tag = safe_code.or(safe_type);
     let context_exceeded = matches!(
         error_tag,
@@ -4128,6 +4131,8 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
     let error_type = error.get("type").and_then(serde_json::Value::as_str);
     let safe_code = code.and_then(crate::error_detail::safe_error_type);
     let safe_type = error_type.and_then(crate::error_detail::safe_error_type);
+    // Match HTTP precedence: safe code, then safe type. Raw values never
+    // classify or enter the public presentation.
     let kind = safe_code.or(safe_type);
     let raw_detail = crate::error_detail::provider_error_message(error);
     let provider_kind = match kind {

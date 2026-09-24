@@ -12,53 +12,57 @@
 //! Adapters use [`http_error_prose`] / [`provider_error_message`] only to
 //! locate raw prose (and to classify it); they never publish it themselves.
 
+// Static, test-exercised redaction patterns must fail loudly if edited into
+// invalid regexes; silently skipping one would expose untrusted provider text.
+#![allow(clippy::expect_used)]
+
 use haider_protocol::error::PROVIDER_DETAIL_WITHHELD;
+use regex::{Captures, Regex};
+use std::sync::LazyLock;
 
-/// Raw prose longer than this is withheld outright. Mirrors the protocol's
-/// durable `ErrorPresentation.detail` bound (512 UTF-8 bytes).
-const MAX_RAW_DETAIL_BYTES: usize = 512;
-/// A publishable sentence, after trimming, is at most this long.
-const MAX_SENTENCE_BYTES: usize = 256;
-/// A single word (edge punctuation trimmed) is at most this long; longer
-/// alphabetic runs are treated as opaque identifiers.
-const MAX_WORD_BYTES: usize = 32;
-/// Single-token prose ("Overloaded", "req_x") carries no explanation and is
-/// indistinguishable from an echoed identifier.
-const MIN_SENTENCE_WORDS: usize = 2;
-/// Punctuation allowed at the edges of an otherwise ASCII-alphabetic word.
-const WORD_EDGE_PUNCTUATION: [char; 6] = ['.', ',', '!', '?', '-', '\''];
+/// Durable protocol detail bound, measured after scrubbing.
+const MAX_DETAIL_BYTES: usize = 512;
+const REDACTED: &str = "[REDACTED]";
 
-/// Case-insensitive substrings that withhold the whole sentence: account,
-/// identity, request-echo, URL and credential vocabulary. Substring match is
-/// deliberate ("org" also covers "organization"/"org_id"; "body" covers
-/// "request body"), so it errs towards withholding.
-const ACCOUNT_DATA_MARKERS: &[&str] = &[
-    "cookie",
-    "account",
-    "acct_",
-    "org",
-    "user",
-    "customer",
-    "tenant",
-    "credit",
-    "email",
-    "session",
-    "identifier",
-    "prompt",
-    "body",
-    "http",
-    "www.",
-    "api_key",
-    "authorization",
-    "bearer",
-    "token",
-    "secret",
-];
+// These patterns identify values, not ordinary uses of words such as
+// "tokens", "users", or "organization".
+static URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)[A-Z][A-Z0-9+.-]*://[^\s<>"']+"#).expect("static URL regex")
+});
+static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}").expect("static email regex")
+});
+static ACCOUNT_ID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(^|[^A-Z0-9])(?:org|acct|account|user|proj|project|workspace|credit|session)[_-][A-Z0-9_-]+")
+    .expect("static account id regex")
+});
+static LABELED_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(?:organization|org|account|user|project|workspace|customer|tenant|email|cookie|session|prompt|request[_ -]?(?:body|id)|response[_ -]?body|token|secret|api[_ -]?key|authorization|access[_ -]?token|refresh[_ -]?token)\b(?:[_ -]?(?:id|name|named))?\s*[:=]\s*[^,;.]+|\b(?:organization|org|account|user|project|workspace|customer|tenant)\s+(?:id|name|named)\s+[^,;.]+"#).expect("static labeled value regex")
+});
+static NAMED_ACCOUNT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:organization|org|account|user|project|workspace|customer|tenant)\s+[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*)*").expect("static named account regex")
+});
+static NAMED_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:organization|org|account|user|project|workspace|customer|tenant)\s+(?:id|name|named)\b").expect("static named label regex")
+});
+static OPAQUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:[A-F0-9]{16,}|[A-Z0-9+/=_-]{20,})\b").expect("static opaque value regex")
+});
+static CREDENTIAL_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:authorization|proxy-authorization|bearer|x-api-key|x_api_key|api-key|api_key|apikey|access_token|access-token|refresh_token|refresh-token|cookie|set-cookie|echoed)\b\s*[:=]?").expect("static credential label regex")
+});
+static PRIVATE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:prompt|request[_ -]?(?:body|id)|response[_ -]?body|token|secret|session|account|org|organization|user|project|workspace|credit|email)(?:[_ -]?(?:id|name))?\s*[:=]").expect("static private label regex")
+});
+static CREDENTIAL_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:sk-|sess-|AKIA|ghp_|xoxb-|eyJ)[A-Za-z0-9_-]{8,}")
+        .expect("static credential prefix regex")
+});
 
 /// Provider error `type`/`code` values that may be published verbatim. Any
 /// other value is dropped (not shown, and not used for classification).
 /// Sources: Anthropic API error types; OpenAI error types/codes (including
-/// the Codex backend and compatible servers); Google `INVALID_ARGUMENT`.
+/// the Codex backend and compatible servers). Gemini uses only prose here.
 const PUBLIC_PROVIDER_ERROR_TYPES: &[&str] = &[
     // Permission / authentication.
     "permission_error",
@@ -95,7 +99,6 @@ const PUBLIC_PROVIDER_ERROR_TYPES: &[&str] = &[
     "model_context_window_exceeded",
     "prompt_too_long",
     "input_too_large",
-    "INVALID_ARGUMENT",
 ];
 
 /// Request ids must start with one of these (Anthropic `request-id` and
@@ -116,8 +119,16 @@ const REQUEST_ID_ACCOUNT_MARKERS: &[&str] = &[
 /// it but must publish it only through `ProviderError::with_provider_detail`.
 pub(crate) fn http_error_prose(body: &[u8]) -> Option<String> {
     match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(value) => provider_error_message(&value).map(str::to_owned),
-        Err(_) => std::str::from_utf8(body).ok().map(str::to_owned),
+        Ok(value) => provider_error_message(&value)
+            .map(str::to_owned)
+            .or_else(|| Some(PROVIDER_DETAIL_WITHHELD.to_owned())),
+        Err(_) => match std::str::from_utf8(body) {
+            Ok(prose) if prose.trim_start().starts_with(['{', '[', '<']) => {
+                Some(PROVIDER_DETAIL_WITHHELD.to_owned())
+            }
+            Ok(prose) => Some(prose.to_owned()),
+            Err(_) => Some(PROVIDER_DETAIL_WITHHELD.to_owned()),
+        },
     }
 }
 
@@ -143,48 +154,220 @@ pub(crate) fn provider_error_message(value: &serde_json::Value) -> Option<&str> 
         .or_else(|| value.as_str())
 }
 
-/// The public-detail decision for untrusted provider prose. `None` means
-/// there is no prose at all (blank); otherwise the result is either the
-/// trimmed prose, when it passes every rule below, or the fixed
-/// [`PROVIDER_DETAIL_WITHHELD`] text. Idempotent.
+/// Redact provider prose before publication. Structural/credential tails are
+/// removed, then the full output redactor, credential scanner and targeted
+/// account-value scrubber process the remaining prose.
+/// Unparseable fragments and residual unsafe shapes fail closed.
 pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
-    // Apply the same complete consumer used for tool output, plus the
-    // credential consumer below; any change either makes means the prose
-    // carried something secret-shaped, so none of it is published.
-    let redacted = haider_tools::redact_output_text(detail);
-    let credential_redacted = redact_credentials(&redacted)?;
-    if detail.len() > MAX_RAW_DETAIL_BYTES
-        || redacted != detail
-        || credential_redacted != detail
-        || !plain_sentence(detail)
+    if detail.chars().any(unsafe_unicode) {
+        return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
+    }
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    if detail == PROVIDER_DETAIL_WITHHELD {
+        return Some(detail.to_owned());
+    }
+    // An HTML/XML fragment can contain arbitrary reflected request content.
+    if detail.contains('<') {
+        return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
+    }
+    let detail = match scrub_body_fragment(detail) {
+        Some(detail) => detail,
+        None => return Some(PROVIDER_DETAIL_WITHHELD.to_owned()),
+    };
+    // Hide URLs while the general redactor scans prose: it treats even a
+    // public hostname as opaque entropy. Only the parsed scheme and host are
+    // restored after that pass; userinfo, path, query and fragment are gone.
+    let (detail, urls, url_marker) = protect_url_hosts(&detail);
+    let tail_label = [
+        CREDENTIAL_LABEL.find(&detail),
+        PRIVATE_LABEL.find(&detail),
+        NAMED_LABEL.find(&detail),
+        NAMED_ACCOUNT.find(&detail),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(regex::Match::start);
+    let detail = if let Some(label) = tail_label {
+        if CREDENTIAL_PREFIX
+            .find(&detail)
+            .is_some_and(|prefix| prefix.start() < label.start())
+        {
+            return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
+        }
+        let start = open_quote_before(&detail, label.start()).unwrap_or(label.start());
+        format!("{}{}", &detail[..start], REDACTED)
+    } else if CREDENTIAL_PREFIX.is_match(&detail) {
+        return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
+    } else {
+        detail
+    };
+    let redacted = haider_tools::redact_output_text(&detail);
+    let mut prose = match redact_credentials(&redacted) {
+        Some(prose) => prose,
+        None => return Some(PROVIDER_DETAIL_WITHHELD.to_owned()),
+    };
+    for (index, host) in urls.iter().enumerate() {
+        prose = prose.replace(&format!("{url_marker}{index}~"), host);
+    }
+    prose = EMAIL.replace_all(&prose, REDACTED).into_owned();
+    prose = ACCOUNT_ID
+        .replace_all(&prose, |captures: &Captures<'_>| {
+            format!(
+                "{}{}",
+                captures.get(1).map_or("", |part| part.as_str()),
+                REDACTED
+            )
+        })
+        .into_owned();
+    prose = LABELED_VALUE.replace_all(&prose, REDACTED).into_owned();
+    prose = NAMED_ACCOUNT.replace_all(&prose, REDACTED).into_owned();
+    prose = OPAQUE.replace_all(&prose, REDACTED).into_owned();
+    let prose = prose.trim();
+    if prose.is_empty()
+        || prose.len() > MAX_DETAIL_BYTES
+        || prose.chars().any(unsafe_unicode)
+        || EMAIL.is_match(prose)
+        || ACCOUNT_ID.is_match(prose)
+        || OPAQUE.is_match(prose)
     {
         return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
     }
-    Some(detail.trim().to_owned())
+    Some(prose.to_owned())
 }
 
-/// Only short, ordinary sentences can be published. Any identifier, header,
-/// URL, JSON fragment, email, or ambiguous punctuation withholds the whole
-/// message so that partially scrubbed request bodies cannot leak a suffix.
-fn plain_sentence(detail: &str) -> bool {
-    let detail = detail.trim();
-    if detail.is_empty() || detail.len() > MAX_SENTENCE_BYTES || detail.contains(char::is_control) {
-        return false;
+fn unsafe_unicode(ch: char) -> bool {
+    ch.is_control()
+        || (ch.is_alphanumeric() && !ch.is_ascii())
+        || matches!(
+            ch,
+            '\u{00ad}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
+
+/// If a sensitive label occurs inside an echoed quoted value, the text
+/// before the label belongs to that same value and must be removed too.
+fn open_quote_before(detail: &str, end: usize) -> Option<usize> {
+    let mut open = None;
+    let mut escaped = false;
+    for (index, ch) in detail[..end].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && open.is_some() {
+            escaped = true;
+            continue;
+        }
+        if !matches!(ch, '\'' | '"') {
+            continue;
+        }
+        if ch == '\''
+            && detail[..index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+            && detail[index + 1..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        match open {
+            Some((_, quote)) if quote == ch => open = None,
+            None => open = Some((index, ch)),
+            _ => {}
+        }
     }
-    if contains_marker(detail, ACCOUNT_DATA_MARKERS) {
-        return false;
+    open.map(|(index, _)| index)
+}
+
+fn url_host(captures: &Captures<'_>) -> String {
+    let original = captures.get(0).map_or("", |capture| capture.as_str());
+    let value = original.trim_end_matches(['.', ',', ';', ')', '!']);
+    let punctuation = &original[value.len()..];
+    url::Url::parse(value)
+        .ok()
+        .and_then(|parsed| {
+            parsed.host_str().and_then(|host| {
+                (!ACCOUNT_ID.is_match(host) && !OPAQUE.is_match(host))
+                    .then(|| format!("{}://{host}{punctuation}", parsed.scheme()))
+            })
+        })
+        .unwrap_or_else(|| REDACTED.to_owned())
+}
+
+fn protect_url_hosts(detail: &str) -> (String, Vec<String>, String) {
+    // Pick a marker absent from the input so provider prose cannot impersonate
+    // one and cause a different host to be restored into arbitrary text.
+    let mut marker = "~u".to_owned();
+    while detail.contains(&marker) {
+        marker.push('u');
     }
-    if detail.split_whitespace().count() < MIN_SENTENCE_WORDS
-        || !detail.chars().any(char::is_alphabetic)
-    {
-        return false;
+    let mut hosts = Vec::new();
+    let protected = URL
+        .replace_all(detail, |captures: &Captures<'_>| {
+            let index = hosts.len();
+            hosts.push(url_host(captures));
+            format!("{marker}{index}~")
+        })
+        .into_owned();
+    (protected, hosts, marker)
+}
+
+/// A JSON/body echo is removed as one unit. A missing close delimiter is
+/// ambiguous: publishing even its suffix could expose request content.
+fn scrub_body_fragment(detail: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut cursor = 0;
+    while let Some(relative) = detail[cursor..].find(['{', '[']) {
+        let start = cursor + relative;
+        if detail[cursor..start].contains(['}', ']']) {
+            return None;
+        }
+        output.push_str(&detail[cursor..start]);
+        let mut stack = Vec::new();
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, ch) in detail[start..].char_indices() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => quoted = true,
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' if stack.pop() != Some(ch) => return None,
+                '}' | ']' if stack.is_empty() => {
+                    end = Some(start + offset + ch.len_utf8());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        cursor = end?;
+        output.push_str(REDACTED);
     }
-    detail.split_whitespace().all(|word| {
-        let plain = word.trim_matches(WORD_EDGE_PUNCTUATION);
-        !plain.is_empty()
-            && plain.len() <= MAX_WORD_BYTES
-            && plain.chars().all(|c| c.is_ascii_alphabetic())
-    })
+    if detail[cursor..].contains(['}', ']']) {
+        return None;
+    }
+    output.push_str(&detail[cursor..]);
+    Some(output)
 }
 
 /// Publishes a provider error `type`/`code` only when it is an exact member
@@ -556,6 +739,8 @@ mod tests {
             "Credential Bearer sk-provider-secret-value was rejected",
             "missing apikey.",
             "contact owner@example.test",
+            "See https://example.test/path?token=private for details.",
+            "The account (acct_973_private_account) expired.",
             PROVIDER_DETAIL_WITHHELD,
         ] {
             let once = sanitize_provider_error_detail(prose);

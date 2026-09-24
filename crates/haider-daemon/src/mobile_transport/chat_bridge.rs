@@ -994,13 +994,13 @@ impl TurnProjection {
                 let mut parts = vec![code.as_str().to_owned()];
                 if let Some(presentation) = presentation {
                     if let Some(error_type) = presentation.provider_error_type {
-                        parts.push(error_type);
+                        parts.push(format!("Provider error type: {error_type}"));
                     }
                     if let Some(status) = presentation.provider_http_status {
                         parts.push(format!("HTTP {status}"));
                     }
                     if let Some(request_id) = presentation.provider_request_id {
-                        parts.push(format!("Request ID: {request_id}"));
+                        parts.push(format!("Request id: {request_id}"));
                     }
                     parts.push(presentation.detail);
                 }

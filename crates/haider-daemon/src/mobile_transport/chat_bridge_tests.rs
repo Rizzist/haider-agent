@@ -214,7 +214,7 @@ async fn run_failure_bridge_uses_safe_presentation_instead_of_raw_message() {
     let presentation = ErrorPresentation::new(
         "permission-denied",
         "Provider denied the request",
-        "message withheld: may contain account data",
+        "The active account is not allowed to make this request. · details withheld",
         ErrorScope::Turn,
         [ErrorAction::SwitchAccount],
     )

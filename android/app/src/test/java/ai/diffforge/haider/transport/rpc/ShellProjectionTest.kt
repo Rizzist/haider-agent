@@ -78,7 +78,7 @@ class ShellProjectionTest {
                 "presentation" to obj("provider_error_type" to "permission_error",
                     "provider_http_status" to 403,
                     "provider_request_id" to "req_fixture-403"))).single()
-        assertEquals("provider_error · permission_error · HTTP 403 · Request ID: req_fixture-403", command.error)
+        assertEquals("provider_error · Provider error type: permission_error · HTTP 403 · Request id: req_fixture-403", command.error)
         assertFalse(command.error.orEmpty().contains("raw private body"))
     }
 

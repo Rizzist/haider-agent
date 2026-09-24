@@ -15200,7 +15200,7 @@ fn peer_entry_lines<'a>(
 ///  ✗ Provider rate limit reached            ← err ink, BOLD (title)
 ///  ▏ Wait for the provider limit to reset,  ← err rail · dim detail,
 ///  ▏ then retry.                              wrapped by display cells
-///  ▏ rate-limited · HTTP 429 · req 8f3a2c1… ← dim fact line, whole-
+///  ▏ rate-limited · HTTP 429 · Request id: …  ← dim fact line, whole-
 ///                                             segment shed to width
 /// ```
 ///

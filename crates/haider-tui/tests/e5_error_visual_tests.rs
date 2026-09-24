@@ -4,7 +4,7 @@
 //! Laws under test:
 //!
 //! * FACT-LINE LAW: the compact fact line composes display-ordered
-//!   (`subcode · HTTP 429 · req 8f3a2c1d… · resets in 2m 14s`), the reset
+//!   (`subcode · HTTP 429 · Request id: 8f3a2c1d… · resets in 2m 14s`), the reset
 //!   human-readable in the ONE h/m/s vocabulary; under width pressure it
 //!   sheds WHOLE segments by pinned rank (req → HTTP → actions → resets;
 //!   the subcode never sheds) — never a mid-word truncation;
@@ -117,7 +117,7 @@ fn rate_limit_menu() -> Menu {
         body: vec![
             presentation.detail.clone(),
             "Provider HTTP status: 429".into(),
-            "Request ID: 8f3a2c1d9b7e5a42".into(),
+            "Request id: 8f3a2c1d9b7e5a42".into(),
             "Retry countdown: 134s (reset at Unix time 1134000 ms).".into(),
         ],
         options: vec![
@@ -162,7 +162,7 @@ fn expanded_provider_card_displays_full_diagnostic_identity() {
     row_of(&rows, "Provider access denied");
     row_of(&rows, "The account lacks model access.");
     row_of(&rows, "Provider error type: permission_error");
-    row_of(&rows, "Request ID: 8f3a2c1d9b7e5a42");
+    row_of(&rows, "Request id: 8f3a2c1d9b7e5a42");
 }
 
 fn draw(model: &AppModel, width: u16, height: u16) -> (Vec<String>, Terminal<TestBackend>) {
@@ -216,14 +216,15 @@ fn e5a_fact_line_composes_and_sheds_whole_segments() {
     let segments = error_fact_segments_with_actions(&presentation, None);
     let full = shed_fact_line(&segments, 500);
     assert_eq!(
-        full, "rate-limited · HTTP 429 · req 8f3a2c1d… · resets in 2m 14s · actions: wait, retry",
+        full,
+        "rate-limited · HTTP 429 · Request id: 8f3a2c1d… · resets in 2m 14s · actions: wait, retry",
         "display order + short req + h/m/s reset"
     );
     // The LIVE form counts against the supplied daemon clock.
     let live = error_fact_segments(&presentation, Some(1_060_000));
     assert_eq!(
         shed_fact_line(&live, 500),
-        "rate-limited · HTTP 429 · req 8f3a2c1d… · resets in 1m 14s"
+        "rate-limited · HTTP 429 · Request id: 8f3a2c1d… · resets in 1m 14s"
     );
     // Shedding: every narrower budget drops WHOLE segments, rank order.
     let originals: Vec<&str> = segments.iter().map(|(s, _)| s.as_str()).collect();
@@ -243,7 +244,7 @@ fn e5a_fact_line_composes_and_sheds_whole_segments() {
     assert_eq!(
         seen,
         vec![
-            "rate-limited · HTTP 429 · req 8f3a2c1d… · resets in 2m 14s · actions: wait, retry"
+            "rate-limited · HTTP 429 · Request id: 8f3a2c1d… · resets in 2m 14s · actions: wait, retry"
                 .to_owned(),
             // req (rank 4) sheds first…
             "rate-limited · HTTP 429 · resets in 2m 14s · actions: wait, retry".to_owned(),
@@ -347,7 +348,7 @@ fn e5c_recovery_card_accent_facts_countdown_and_primary_affordance() {
         "TITLE prominent"
     );
     // The typed fact line, LIVE against committed_at_ms 1 000 000.
-    let fact = "rate-limited · HTTP 429 · req 8f3a2c1d… · resets in 2m 14s";
+    let fact = "rate-limited · HTTP 429 · Request id: 8f3a2c1d… · resets in 2m 14s";
     let fact_y = row_of(&rows, fact);
     let fact_x = col_of(&rows[fact_y as usize], "rate-limited");
     assert_eq!(
@@ -405,7 +406,7 @@ fn e5d_plain_recovery_card_carries_detail_and_facts() {
     assert!(rendered.contains("? Provider rate limit reached"));
     assert!(rendered.contains("  Wait for the provider limit to reset, then retry."));
     assert!(
-        rendered.contains("  rate-limited · HTTP 429 · req 8f3a2c1d… · resets in 2m 14s"),
+        rendered.contains("  rate-limited · HTTP 429 · Request id: 8f3a2c1d… · resets in 2m 14s"),
         "the fact line in plain: {rendered}"
     );
     assert!(rendered.contains("  1. Wait"));
@@ -449,7 +450,7 @@ fn e5e_typed_run_failure_renders_the_card_shaped_block() {
     );
     let fact_y = row_of(
         &rows,
-        "rate-limited · HTTP 429 · req 8f3a2c1d… · resets in 2m 14s · actions: wait, retry",
+        "rate-limited · HTTP 429 · Request id: 8f3a2c1d… · resets in 2m 14s · actions: wait, retry",
     );
     assert_eq!(
         buffer[(col_of(&rows[fact_y as usize], "rate-limited"), fact_y)].fg,
@@ -460,7 +461,7 @@ fn e5e_typed_run_failure_renders_the_card_shaped_block() {
     assert!(
         rendered.contains(
             "✗ Provider rate limit reached — Wait for the provider limit to reset, then retry. \
-             [rate-limited] · HTTP 429 · req 8f3a2c1d9b7e5a42 · resets in 2m 14s · actions: wait, retry"
+             [rate-limited] · HTTP 429 · Request id: 8f3a2c1d9b7e5a42 · resets in 2m 14s · actions: wait, retry"
         ),
         "{rendered}"
     );

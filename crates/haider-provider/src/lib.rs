@@ -2876,13 +2876,19 @@ impl ProviderError {
     /// Replaces only the operator-facing explanation while retaining the
     /// typed recovery contract and provider metadata. This is the single
     /// provider-prose boundary: adapters (including ACP stderr tails) pass
-    /// raw, untrusted prose here and the `error_detail` shape policy decides
-    /// between the trimmed prose and the fixed withheld text. Blank prose
+    /// raw, untrusted prose here and the `error_detail` policy scrubs it.
+    /// If safety cannot be established, retain the provider-class default
+    /// explanation and append the fixed withheld notice. Blank prose
     /// leaves the existing presentation untouched.
     #[must_use]
     pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
         let Some(detail) = crate::error_detail::sanitize_provider_error_detail(detail) else {
             return self;
+        };
+        let detail = if detail == haider_protocol::error::PROVIDER_DETAIL_WITHHELD {
+            format!("{} · {detail}", self.presentation.detail)
+        } else {
+            detail
         };
         let mut presentation = ErrorPresentation::new(
             self.presentation.subcode.as_str(),
@@ -4646,8 +4652,7 @@ mod e2_contract_tests {
                 .contains(&ErrorAction::Retry)
         );
         let rendered = serde_json::to_string(&error.presentation).expect("presentation JSON");
-        assert!(rendered.contains("message withheld: may contain account data"));
-        assert!(!rendered.contains(DETAIL));
+        assert!(rendered.contains(DETAIL));
         assert!(!rendered.contains(SECRET));
     }
 }

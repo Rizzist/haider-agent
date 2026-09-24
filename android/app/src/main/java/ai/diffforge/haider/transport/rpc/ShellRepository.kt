@@ -155,9 +155,9 @@ internal object ShellProjection {
                 "shell_run_state" -> value.optionalString("state")?.let { states[run] = it }
                 "run_failed" -> errors[run] = listOfNotNull(
                     value.optionalString("code"),
-                    value.optionalString("provider_error_type"),
+                    value.optionalString("provider_error_type")?.let { "Provider error type: $it" },
                     value.optionalNumber("provider_http_status")?.let { "HTTP $it" },
-                    value.optionalString("provider_request_id")?.let { "Request ID: $it" },
+                    value.optionalString("provider_request_id")?.let { "Request id: $it" },
                 ).joinToString(" · ").ifEmpty { "run_failed" }
                 "shell_item" -> {
                     val id = value.string("item_id")

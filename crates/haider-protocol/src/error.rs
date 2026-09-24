@@ -12,7 +12,7 @@ const PROVIDER_ERROR_TYPE_LIMIT: usize = 128;
 /// Fixed public detail that replaces provider prose whenever it cannot be
 /// shown safely: the provider adapter's shape policy rejected it, or the turn
 /// ran under lockdown. Provider prose is untrusted and may echo account data.
-pub const PROVIDER_DETAIL_WITHHELD: &str = "message withheld: may contain account data";
+pub const PROVIDER_DETAIL_WITHHELD: &str = "details withheld";
 
 /// Stable, bounded machine-readable reason carried to every presentation
 /// surface. Values are lowercase ASCII kebab tokens; invalid producer input
@@ -214,10 +214,10 @@ impl ErrorPresentation {
         self
     }
 
-    /// Replaces the operator detail with [`PROVIDER_DETAIL_WITHHELD`] while
-    /// keeping the allowlisted structured provider fields.
+    /// Replaces provider prose under lockdown while retaining a safe title
+    /// and the allowlisted structured provider fields.
     pub fn withhold_provider_detail(&mut self) {
-        PROVIDER_DETAIL_WITHHELD.clone_into(&mut self.detail);
+        self.detail = format!("{} · {PROVIDER_DETAIL_WITHHELD}", self.title);
     }
 
     #[must_use]
