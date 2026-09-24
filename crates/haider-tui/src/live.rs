@@ -2190,6 +2190,8 @@ pub struct LiveDriver {
     workspace_probe_due: bool,
     /// When the pending leaf was last probed (throttle anchor).
     workspace_probe_last: Option<std::time::Instant>,
+    /// Filesystem probes performed so far.
+    workspace_probe_count: u64,
     /// The ONE durable command of the open login card, so a failure can be
     /// correlated to it instead of merely coinciding with it (P2-2) and a
     /// retry re-stages UNDER IT rather than minting a second (P1-4).
@@ -2471,6 +2473,7 @@ impl LiveDriver {
             workspace_probe_session: None,
             workspace_probe_due: false,
             workspace_probe_last: None,
+            workspace_probe_count: 0,
             login_command: None,
             login_attempt: None,
             retired_logins: std::collections::HashSet::new(),
@@ -2945,10 +2948,12 @@ impl LiveDriver {
     /// Keep the active session's "not created yet" cue truthful (ratified
     /// 972 contract: the TUI must not imply a dated leaf exists before its
     /// first write). Bounded filesystem work: only an attached DATED session
-    /// whose leaf has not been seen is ever probed; a surface switch probes
-    /// at once, while inbound replies merely mark a probe due, and due
-    /// probes run at most once per [`WORKSPACE_PROBE_INTERVAL`] however fast
-    /// a stream arrives (the wake-up is folded into [`Self::next_deadline`]).
+    /// whose leaf has not been seen is ever probed. Surface switches and
+    /// inbound replies both merely mark a probe due; a due probe runs at once
+    /// when the window allows, otherwise at its boundary (folded into
+    /// [`Self::next_deadline`]), so probes never exceed one per
+    /// [`WORKSPACE_PROBE_INTERVAL`] however fast replies or switches arrive.
+    /// Until a probe has seen the leaf, the cue stays on.
     /// Once the leaf exists it is never probed again. The stat runs in the
     /// live pass, never the render path. Non-local surfaces (no captured
     /// launch path) cannot see the daemon's disk and never claim either
@@ -2967,9 +2972,10 @@ impl LiveDriver {
         };
         let switched = self.workspace_probe_session != active;
         if switched {
+            // A switch marks the new surface due; it does NOT reset the
+            // throttle anchor, so rapid switching cannot exceed the bound.
             self.workspace_probe_session.clone_from(&active);
             self.workspace_probe_due = candidate.is_some();
-            self.workspace_probe_last = None;
         } else if reply_arrived && candidate.is_some() {
             self.workspace_probe_due = true;
         }
@@ -2980,14 +2986,17 @@ impl LiveDriver {
             Some((session, cwd)) if self.workspace_probe_due && !throttled => {
                 self.workspace_probe_due = false;
                 self.workspace_probe_last = Some(self.now);
+                self.workspace_probe_count = self.workspace_probe_count.saturating_add(1);
                 let exists = std::path::Path::new(&cwd).is_dir();
                 if exists {
                     self.materialized_sessions.insert(session);
                 }
                 !exists
             }
-            // Not due (or throttled): keep the last judgement.
-            Some(_) => model.session_workspace_uncreated,
+            // Not probed this pass (throttled or not due): a candidate has
+            // never been SEEN on disk, so it keeps the cue — the safe side
+            // of the contract — until a probe observes the leaf.
+            Some(_) => true,
             None => {
                 self.workspace_probe_due = false;
                 false
@@ -3003,6 +3012,13 @@ impl LiveDriver {
     #[must_use]
     pub fn workspace_probe_due(&self) -> bool {
         self.workspace_probe_due
+    }
+
+    /// How many presence probes have stat-ed the filesystem (the bound's
+    /// observable, for tests and diagnostics).
+    #[must_use]
+    pub fn workspace_probe_count(&self) -> u64 {
+        self.workspace_probe_count
     }
 
     // ------------------------------------------------------------ replies --
@@ -7895,7 +7911,11 @@ impl LiveDriver {
 /// canonical value remains in `workspace_cwd` for every filesystem/RPC use;
 /// this path is only painted, so it follows the same home abbreviation,
 /// other-user masking, and control escaping as launch-origin context.
-fn workspace_display_path(path: &str) -> String {
+/// The ONE display producer for workspace paths (sanitised, home-relative,
+/// `/`-normalised); the exe uses it for the first dated preview too, so the
+/// initial and renewed previews — and their fallback — are identical.
+#[must_use]
+pub fn workspace_display_path(path: &str) -> String {
     let environment = haider_client::workspace::WorkspaceEnvironment::capture();
     haider_client::launch_origin::sanitize_origin_path(
         Some(std::path::Path::new(path)),

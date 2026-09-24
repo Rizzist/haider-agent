@@ -698,16 +698,10 @@ fn apply_interactive_workspace(
         .to_owned();
     model.cwd = workspace_text;
     model.pending_workspace_allocation = allocation;
-    // The SAME sanitised producer the live driver uses for renewed
-    // allocations (`/`-normalised, home-relative), so the first and every
-    // later preview spell a path identically on every platform.
-    let display = haider_client::launch_origin::sanitize_origin_path(
-        Some(&workspace),
-        environment.home.as_deref(),
-    )
-    .ok()
-    .and_then(|sanitized| sanitized.display)
-    .unwrap_or_else(|| abbreviate_path(&workspace, environment.home.as_deref()));
+    // The SAME producer the live driver uses for renewed allocations
+    // (sanitised, home-relative, `/`-normalised, identical fallback), so the
+    // first and every later preview spell a path identically everywhere.
+    let display = haider_tui::live::workspace_display_path(&model.cwd);
     model.pending_workspace_display = model
         .pending_workspace_allocation
         .as_ref()
@@ -753,16 +747,6 @@ fn apply_launch_origin(model: &mut AppModel) {
             },
             display: sanitized.display,
         });
-    }
-}
-
-fn abbreviate_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
-    match home.and_then(|home| path.strip_prefix(home).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        // Native separator after `~`: `~/` before a Windows `rest` would
-        // produce a mixed `~/Documents\Haider\…` spelling.
-        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
-        None => path.display().to_string(),
     }
 }
 
