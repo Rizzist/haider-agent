@@ -2056,6 +2056,8 @@ struct PendingCustom {
 
 /// `account.oauth_status` poll cadence while the browser owns the flow.
 const OAUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Minimum spacing between filesystem probes of a pending dated leaf.
+const WORKSPACE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const SESSION_SEEN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// The committed coordinates of one open menu (report R11 cut 4): a live
@@ -2184,6 +2186,10 @@ pub struct LiveDriver {
     /// The session the presence probe last judged, so a surface switch
     /// re-probes even without an inbound reply.
     workspace_probe_session: Option<SessionId>,
+    /// A reply arrived since the last probe of a pending leaf.
+    workspace_probe_due: bool,
+    /// When the pending leaf was last probed (throttle anchor).
+    workspace_probe_last: Option<std::time::Instant>,
     /// The ONE durable command of the open login card, so a failure can be
     /// correlated to it instead of merely coinciding with it (P2-2) and a
     /// retry re-stages UNDER IT rather than minting a second (P1-4).
@@ -2463,6 +2469,8 @@ impl LiveDriver {
             creating_dated: std::collections::HashSet::new(),
             materialized_sessions: std::collections::HashSet::new(),
             workspace_probe_session: None,
+            workspace_probe_due: false,
+            workspace_probe_last: None,
             login_command: None,
             login_attempt: None,
             retired_logins: std::collections::HashSet::new(),
@@ -2936,36 +2944,65 @@ impl LiveDriver {
 
     /// Keep the active session's "not created yet" cue truthful (ratified
     /// 972 contract: the TUI must not imply a dated leaf exists before its
-    /// first write). A dated, not-yet-seen leaf is probed on disk only when
-    /// a reply arrived (the first write lands as one) or the surface changed;
-    /// once the leaf exists it is never probed again. Non-local surfaces
-    /// (no captured launch path) cannot see the daemon's disk and never
-    /// claim either state.
+    /// first write). Bounded filesystem work: only an attached DATED session
+    /// whose leaf has not been seen is ever probed; a surface switch probes
+    /// at once, while inbound replies merely mark a probe due, and due
+    /// probes run at most once per [`WORKSPACE_PROBE_INTERVAL`] however fast
+    /// a stream arrives (the wake-up is folded into [`Self::next_deadline`]).
+    /// Once the leaf exists it is never probed again. The stat runs in the
+    /// live pass, never the render path. Non-local surfaces (no captured
+    /// launch path) cannot see the daemon's disk and never claim either
+    /// state.
     pub fn sync_workspace_presence(&mut self, model: &mut AppModel, reply_arrived: bool) {
         let active = model.active_session.clone();
-        let switched = self.workspace_probe_session != active;
-        if !reply_arrived && !switched {
-            return;
-        }
-        self.workspace_probe_session.clone_from(&active);
-        let uncreated = match (active, model.session_workspace_cwd.as_deref()) {
+        let candidate = match (active.as_ref(), model.session_workspace_cwd.as_deref()) {
             (Some(session), Some(cwd))
                 if self.launch_origin_path.is_some()
-                    && self.dated_sessions.contains(&session)
-                    && !self.materialized_sessions.contains(&session) =>
+                    && self.dated_sessions.contains(session)
+                    && !self.materialized_sessions.contains(session) =>
             {
-                let exists = std::path::Path::new(cwd).is_dir();
+                Some((session.clone(), cwd.to_owned()))
+            }
+            _ => None,
+        };
+        let switched = self.workspace_probe_session != active;
+        if switched {
+            self.workspace_probe_session.clone_from(&active);
+            self.workspace_probe_due = candidate.is_some();
+            self.workspace_probe_last = None;
+        } else if reply_arrived && candidate.is_some() {
+            self.workspace_probe_due = true;
+        }
+        let throttled = self
+            .workspace_probe_last
+            .is_some_and(|last| self.now < last + WORKSPACE_PROBE_INTERVAL);
+        let uncreated = match candidate {
+            Some((session, cwd)) if self.workspace_probe_due && !throttled => {
+                self.workspace_probe_due = false;
+                self.workspace_probe_last = Some(self.now);
+                let exists = std::path::Path::new(&cwd).is_dir();
                 if exists {
                     self.materialized_sessions.insert(session);
                 }
                 !exists
             }
-            _ => false,
+            // Not due (or throttled): keep the last judgement.
+            Some(_) => model.session_workspace_uncreated,
+            None => {
+                self.workspace_probe_due = false;
+                false
+            }
         };
         if model.session_workspace_uncreated != uncreated {
             model.session_workspace_uncreated = uncreated;
             model.dirty = true;
         }
+    }
+
+    /// Whether a throttled presence probe is still waiting to run.
+    #[must_use]
+    pub fn workspace_probe_due(&self) -> bool {
+        self.workspace_probe_due
     }
 
     // ------------------------------------------------------------ replies --
@@ -5956,7 +5993,16 @@ impl LiveDriver {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        match (existing, busy) {
+        let existing = match (existing, busy) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // A throttled presence probe wakes the loop when it may run.
+        let probe = self
+            .workspace_probe_last
+            .filter(|_| self.workspace_probe_due)
+            .map(|last| last + WORKSPACE_PROBE_INTERVAL);
+        match (existing, probe) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }

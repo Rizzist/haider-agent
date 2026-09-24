@@ -1371,6 +1371,8 @@ fn an_attached_dated_session_speaks_uncreated_until_its_leaf_exists() {
     );
 
     // Chat-only: the surface switch alone re-judges, and the leaf is absent.
+    let base = std::time::Instant::now();
+    driver.set_now(base);
     driver.sync_workspace_presence(&mut model, false);
     assert!(
         model.session_workspace_uncreated,
@@ -1380,21 +1382,38 @@ fn an_attached_dated_session_speaks_uncreated_until_its_leaf_exists() {
         !leaf.exists(),
         "judging presence must never create the leaf"
     );
+    assert!(!driver.workspace_probe_due());
+
+    // A streaming reply only marks a probe due; inside the throttle window
+    // it does not touch the disk, and the loop is woken when it may.
     driver.sync_workspace_presence(&mut model, true);
     assert!(model.session_workspace_uncreated);
+    assert!(driver.workspace_probe_due(), "reply marks the probe due");
+    assert_eq!(
+        driver.next_deadline(),
+        Some(base + std::time::Duration::from_millis(500)),
+        "the throttled probe folds its wake-up into the loop deadline"
+    );
 
-    // The first write materialises the leaf; the next reply drops the cue.
+    // The first write materialises the leaf, but a burst of replies inside
+    // the window still does not probe.
     std::fs::create_dir_all(&leaf).expect("simulate the daemon's first write");
-    driver.sync_workspace_presence(&mut model, false);
+    for _ in 0..50 {
+        driver.sync_workspace_presence(&mut model, true);
+    }
     assert!(
         model.session_workspace_uncreated,
-        "no reply, no switch: the probe stays idle"
+        "throttled: no probe inside the window"
     );
-    driver.sync_workspace_presence(&mut model, true);
+    // Once the window elapses the due probe runs without a new reply.
+    driver.set_now(base + std::time::Duration::from_millis(600));
+    driver.sync_workspace_presence(&mut model, false);
     assert!(
         !model.session_workspace_uncreated,
         "materialised leaf loses the cue"
     );
+    assert!(!driver.workspace_probe_due());
+    assert_eq!(driver.next_deadline(), None);
 
     // Materialisation is one-way: a later disappearance is not "uncreated".
     std::fs::remove_dir_all(&leaf).expect("remove leaf");

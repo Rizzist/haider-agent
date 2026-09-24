@@ -219,10 +219,73 @@ fn an_uncreated_dated_session_keeps_its_cue_until_the_first_write() {
     model.session_workspace_uncreated = true;
     let (frame_rows, _) = draw(&model, 118, 36);
     assert!(
-        frame_rows[0].contains("· …/1448-04-11/s-0123456789abcdef0123… · created on first write"),
+        frame_rows[0].contains("· …/1448-04-11/s-0123456789abcdef01234… · created on first write"),
         "{:?}",
         frame_rows[0]
     );
+}
+
+#[test]
+fn the_uncreated_cue_lives_in_fixed_chrome_through_a_long_chat() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::ids::ItemId;
+    use haider_protocol::item::{ItemEvent, TurnItem};
+    let leaf = "~/Documents/Haider/1448-04-11/s-0123456789abcdef0123456789abcdef";
+    let mut model = live_session_model();
+    model.launch_origin = Some((1, Some("~".into())));
+    model.session_dir = leaf.into();
+    model.session_workspace_uncreated = true;
+    // One ordinary long text-only answer: far more rows than 80x24 holds,
+    // so the origin line scrolls out of the transcript viewport.
+    let answer = (1..=60)
+        .map(|n| format!("line {n} of a long text-only answer"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("long-answer"),
+            item: TurnItem::AgentMessage {
+                text: answer.into(),
+            },
+        }));
+    for (cols, rows, expected) in [
+        (80, 24, "· 1448-04-11/s-0123… · new"),
+        (
+            118,
+            36,
+            "· …/1448-04-11/s-0123456789abcdef01234… · created on first write",
+        ),
+    ] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let flat = frame_rows.join("\n");
+        assert!(
+            flat.contains("line 60 of a long text-only answer") && !flat.contains("Opened from"),
+            "{cols}x{rows}: the transcript must have scrolled the origin line away: {flat}"
+        );
+        assert!(
+            frame_rows[0].contains(expected),
+            "{cols}x{rows}: the fixed header must keep the uncreated cue: {:?}",
+            frame_rows[0]
+        );
+    }
+    // After the first write the fixed header returns to the plain path.
+    model.session_workspace_uncreated = false;
+    for (cols, rows) in [(80, 24), (118, 36)] {
+        let (frame_rows, _) = draw(&model, cols, rows);
+        let flat = frame_rows.join("\n");
+        assert!(
+            !flat.contains(" · new")
+                && !flat.contains("created on first write")
+                && !flat.contains("not created yet"),
+            "{cols}x{rows}: {flat}"
+        );
+        assert!(
+            frame_rows[0].contains("· ~/Documents/Haider/1448-"),
+            "{:?}",
+            frame_rows[0]
+        );
+    }
 }
 
 #[test]

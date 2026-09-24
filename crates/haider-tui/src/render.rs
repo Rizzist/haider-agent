@@ -1243,9 +1243,16 @@ fn cells(text: &str) -> usize {
 /// badge wording (never its presence) yielding first. `None` means the
 /// frame is too narrow for even `…/<date>/s-xxxx…` plus ` · new`.
 pub(crate) fn fit_pending_workspace(path: &str, budget: usize) -> Option<(String, &'static str)> {
-    let separator = if path.contains('/') { '/' } else { '\\' };
-    let parts: Vec<&str> = path.split(separator).collect();
-    let sep = separator.to_string();
+    // Split on EITHER separator (a Windows home-relative spelling can mix
+    // them: `~/Documents\Haider\…`); elided shapes rejoin with the one
+    // nearest the leaf, i.e. the native spelling of the dated components.
+    let separators = ['/', '\\'];
+    let parts: Vec<&str> = path.split(separators).collect();
+    let sep = path
+        .rfind(separators)
+        .and_then(|index| path[index..].chars().next())
+        .unwrap_or('/')
+        .to_string();
     let mut shapes = vec![path.to_owned()];
     if parts.len() > 3 {
         // `~/…/Haider/<date>/<leaf>` style: keep the root component and a
@@ -1271,22 +1278,34 @@ pub(crate) fn fit_pending_workspace(path: &str, budget: usize) -> Option<(String
             return Some((shape.clone(), badge));
         }
     }
-    // The tail itself must shorten: keep `…/<date>/` and the leaf's head.
+    // The tail itself must shorten: keep `…/<date>/` and the leaf's head;
+    // the last rung drops the `…/` lead too (`<date>/s-xxxx… · new`), which
+    // is what an 80-column session header can hold.
     let leaf = parts.last().copied().unwrap_or(path);
-    let head = if parts.len() > 1 {
-        format!("…{sep}{}{sep}", parts[parts.len() - 2])
+    let (head, bare_head) = if parts.len() > 1 {
+        let date = parts[parts.len() - 2];
+        (format!("…{sep}{date}{sep}"), format!("{date}{sep}"))
     } else {
-        String::new()
+        (String::new(), String::new())
     };
     let id_prefix = if leaf.starts_with("s-") { 2 } else { 0 };
     let leaf_chars: Vec<char> = leaf.chars().collect();
-    let narrowed = |keep: usize| -> String {
+    let narrowed = |lead: &str, keep: usize| -> String {
         let kept: String = leaf_chars.iter().take(keep).collect();
-        format!("{head}{kept}…")
+        format!("{lead}{kept}…")
     };
-    for (floor, badges) in [
-        (PENDING_LEAF_MIN_HEX, &PENDING_WORKSPACE_BADGES[..]),
-        (PENDING_LEAF_FLOOR_HEX, &PENDING_WORKSPACE_BADGES[2..]),
+    for (lead, floor, badges) in [
+        (&head, PENDING_LEAF_MIN_HEX, &PENDING_WORKSPACE_BADGES[..]),
+        (
+            &head,
+            PENDING_LEAF_FLOOR_HEX,
+            &PENDING_WORKSPACE_BADGES[2..],
+        ),
+        (
+            &bare_head,
+            PENDING_LEAF_FLOOR_HEX,
+            &PENDING_WORKSPACE_BADGES[2..],
+        ),
     ] {
         let min_keep = (id_prefix + floor).min(leaf_chars.len());
         for badge in badges {
@@ -1294,7 +1313,7 @@ pub(crate) fn fit_pending_workspace(path: &str, budget: usize) -> Option<(String
             // Grow the kept leaf head as far as the room allows.
             let mut best = None;
             for keep in min_keep..leaf_chars.len() {
-                let candidate = narrowed(keep);
+                let candidate = narrowed(lead, keep);
                 if cells(&candidate) <= room {
                     best = Some(candidate);
                 } else {
@@ -1825,7 +1844,7 @@ fn render_launcher(
         let used = Line::from(header_bottom.clone()).width();
         let budget = usize::from(area.width)
             .saturating_sub(used)
-            .saturating_sub("dir ".len());
+            .saturating_sub(cells("dir "));
         let (shown, badge) = fit_pending_workspace(workspace, budget)
             .unwrap_or_else(|| (workspace.clone(), PENDING_WORKSPACE_BADGES[0]));
         header_bottom.extend([
@@ -6392,15 +6411,15 @@ fn render_session(
     header_top.push(Span::styled(format!(" v{VERSION}"), theme.dim_style()));
     // The session's working dir — `cd` retargets it (sim: "the agent
     // works elsewhere while the session stays global").
-    // A dated leaf that is not on disk yet keeps its cue in the header
-    // too (972 contract), fitted like the launcher row. When even the
-    // shortest fit cannot sit here (80 columns), the origin line below —
-    // which wraps — still speaks the state beside the full path.
+    // A dated leaf that is not on disk yet keeps its cue in this FIXED
+    // header (972 contract) — the origin line scrolls away with the
+    // transcript, so it can never be the only carrier. Fitted like the
+    // launcher row; at 80 columns that is `<date>/s-xxxx… · new`.
     let header_fit = if model.session_workspace_uncreated {
         let used = Line::from(header_top.clone()).width();
         let budget = usize::from(area.width)
             .saturating_sub(used)
-            .saturating_sub(" · ".len());
+            .saturating_sub(cells(" · "));
         fit_pending_workspace(&model.session_dir, budget)
     } else {
         None
@@ -6408,6 +6427,10 @@ fn render_session(
     if let Some((shown, badge)) = header_fit {
         header_top.push(Span::styled(format!(" · {shown}"), theme.bright_style()));
         header_top.push(Span::styled(badge, theme.dim_style()));
+    } else if model.session_workspace_uncreated {
+        // Narrower than even `<date>/s-xxxx… · new`: the fixed header keeps
+        // the STATE (the path is secondary and still on the origin line).
+        header_top.push(Span::styled(PENDING_WORKSPACE_BADGES[2], theme.dim_style()));
     } else {
         header_top.push(Span::styled(
             format!(" · {}", model.session_dir),
@@ -16306,6 +16329,44 @@ mod pending_workspace_fit_tests {
         let row = joined(windows, 80);
         assert!(row.starts_with(r"…\1448-04-10\s-01234567"), "{row}");
         assert!(row.ends_with(" · created on first write"), "{row}");
+    }
+
+    #[test]
+    fn mixed_windows_separators_keep_date_and_leaf() {
+        // `~/` + a native Windows remainder (the old abbreviate spelling).
+        let mixed = r"~/Documents\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            joined(mixed, 80),
+            r"…\1448-04-11\s-01234567… · created on first write"
+        );
+        assert_eq!(joined(mixed, 118), format!("{mixed} · not created yet"));
+        assert_eq!(
+            joined(mixed, 112),
+            r"~\…\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef · created on first write"
+        );
+        // Pure backslash home-relative and drive-absolute spellings.
+        let native = r"~\Documents\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            joined(native, 80),
+            r"…\1448-04-11\s-01234567… · created on first write"
+        );
+        let drive =
+            r"C:\Users\owner\Documents\Haider\1448-04-11\s-0123456789abcdef0123456789abcdef";
+        let row = joined(drive, 118);
+        assert!(row.contains(r"1448-04-11\s-0123456789abcdef"), "{row}");
+        assert!(
+            row.ends_with(" · not created yet") || row.ends_with(" · created on first write"),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn the_80_column_session_header_budget_keeps_date_id_and_state() {
+        // 80 - (chip 10 + 2 + mark 24 + 2 + `haider v0.0.972` 15) - ` · ` = 24.
+        let Some((shown, badge)) = fit_pending_workspace(LEAF, 24) else {
+            panic!("the 80-column session header budget must fit");
+        };
+        assert_eq!(format!("{shown}{badge}"), "1448-04-10/s-0123… · new");
     }
 
     #[test]
