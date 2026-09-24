@@ -2861,7 +2861,18 @@ async fn wait_for_state(
     session_id: &SessionId,
     expected: impl Fn(&RunState) -> bool,
 ) {
-    let observed = timeout(Duration::from_secs(5), async {
+    wait_for_state_within(store, session_id, Duration::from_secs(5), expected).await;
+}
+
+/// Multi-level delegation chains settle one provider round per level; under
+/// a loaded full-suite run they need more than the single-turn 5 s window.
+async fn wait_for_state_within(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    within: Duration,
+    expected: impl Fn(&RunState) -> bool,
+) {
+    let observed = timeout(within, async {
         loop {
             let events = store.read(session_id, 0, 1024).await.expect("read run");
             if events.iter().any(|event| {
@@ -5332,7 +5343,10 @@ async fn opt_in_depth_cap_three_rejects_depth_four_as_a_typed_continuable_error(
     let parent_run = RunId::new("w6c-recursion-root-run");
     let accepted = accept_parent(&hub, &parent_session, &parent_run, "w6c-recursion").await;
     manager_handle.submit(accepted).await.expect("submit root");
-    wait_for_state(&store, &parent_session, |state| *state == RunState::Done).await;
+    wait_for_state_within(&store, &parent_session, Duration::from_secs(60), |state| {
+        *state == RunState::Done
+    })
+    .await;
 
     let depth_one = hub
         .delegations_for_parent_run(parent_session.clone(), parent_run)
@@ -5463,7 +5477,10 @@ async fn default_subagent_depth_is_unbounded_five_deep_chain_completes() {
     let parent_run = RunId::new("depth-unbounded-root-run");
     let accepted = accept_parent(&hub, &parent_session, &parent_run, "depth-unbounded").await;
     manager_handle.submit(accepted).await.expect("submit root");
-    wait_for_state(&store, &parent_session, |state| *state == RunState::Done).await;
+    wait_for_state_within(&store, &parent_session, Duration::from_secs(60), |state| {
+        *state == RunState::Done
+    })
+    .await;
 
     let (mut session, mut run) = (parent_session.clone(), parent_run.clone());
     let mut parent_agent = None;
