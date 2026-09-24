@@ -686,14 +686,23 @@ impl AccountsState {
         {
             return false;
         }
-        self.rows = rows
+        let selected_alias = self
+            .rows
+            .get(self.cursor)
+            .map(|row| row.alias.as_str().to_owned());
+        let visible_rows = rows
             .into_iter()
             .filter(|row| !is_probe_account_alias(&row.alias))
             .collect();
+        self.rows = group_account_rows(visible_rows);
         if revision.is_some() {
             self.revision = revision;
         }
-        if self.cursor >= self.rows.len() {
+        if let Some(selected_alias) = selected_alias
+            && let Some(index) = self.rows.iter().position(|row| row.alias == selected_alias)
+        {
+            self.cursor = index;
+        } else if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
         }
         true
@@ -705,6 +714,23 @@ impl AccountsState {
     pub fn apply_sources(&mut self, sources: Vec<AccountSourceRow>) {
         self.sources = sources;
     }
+}
+
+fn group_account_rows(rows: Vec<AccountRow>) -> Vec<AccountRow> {
+    let mut providers = Vec::new();
+    for row in &rows {
+        if !providers.contains(&row.provider) {
+            providers.push(row.provider.clone());
+        }
+    }
+    providers
+        .into_iter()
+        .flat_map(|provider| {
+            rows.iter()
+                .filter(move |row| row.provider == provider)
+                .cloned()
+        })
+        .collect()
 }
 
 /// The `/accounts` OAuth add card (sim authFlow, tui.js:3629-3682): a
@@ -11576,8 +11602,26 @@ impl AppModel {
             self.dirty = true;
             return;
         };
+        // W5 extension (additive status vocabulary): an unusable row is
+        // refused locally with an honest reason instead of a doomed RPC.
+        // Status wins even for the selected row: calling an expired default
+        // "active" without a recovery action is exactly the poisoned-default
+        // trap this screen exists to resolve.
+        match row.status {
+            haider_protocol::credential::CredentialStatus::Expired
+            | haider_protocol::credential::CredentialStatus::Revoked
+            | haider_protocol::credential::CredentialStatus::NeedsAttention { .. } => {
+                self.accounts.message = Some(format!(
+                    "· `{alias}` unusable — ↑/↓ choose live; /login re-authenticates"
+                ));
+                self.dirty = true;
+                return;
+            }
+            haider_protocol::credential::CredentialStatus::Ok
+            | haider_protocol::credential::CredentialStatus::Limited { .. } => {}
+        }
         if row.selected {
-            // Sim parity: re-clicking the active row re-emits the message
+            // Sim parity: re-clicking a usable active row re-emits the message
             // without a daemon round-trip (useAccount has no early return).
             self.accounts.message = Some(format!(
                 "✓ {} → {} · {} · active",
@@ -11587,21 +11631,6 @@ impl AppModel {
             ));
             self.dirty = true;
             return;
-        }
-        // W5 extension (additive status vocabulary): an unusable row is
-        // refused locally with an honest reason instead of a doomed RPC.
-        match row.status {
-            haider_protocol::credential::CredentialStatus::Expired
-            | haider_protocol::credential::CredentialStatus::Revoked
-            | haider_protocol::credential::CredentialStatus::NeedsAttention { .. } => {
-                self.accounts.message = Some(format!(
-                    "· {alias} is not usable — /login to re-authenticate"
-                ));
-                self.dirty = true;
-                return;
-            }
-            haider_protocol::credential::CredentialStatus::Ok
-            | haider_protocol::credential::CredentialStatus::Limited { .. } => {}
         }
         let change = PendingCacheChange::Account {
             alias: alias.to_owned(),
@@ -12585,12 +12614,40 @@ impl AppModel {
             // loop of its own, so the identity rides it MASKED-ALWAYS
             // (one authority — `mask_identity`); the durable, revealable
             // surface is the account row itself.
-            self.accounts.message = Some(format!(
+            let mut message = format!(
                 "✓ {} → {} · oauth · {}",
                 descriptor.provider,
                 descriptor.alias,
                 crate::format::mask_identity(&descriptor.identity)
-            ));
+            );
+            if let Some(identity) = descriptor.account_identity.as_ref() {
+                let duplicates = self
+                    .accounts
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.provider == descriptor.provider
+                            && row.alias != descriptor.alias.as_str()
+                            && row
+                                .account_identity
+                                .as_ref()
+                                .is_some_and(|prior| prior.same_stable_principal(identity))
+                    })
+                    .map(|row| row.alias.as_str())
+                    .collect::<Vec<_>>();
+                if !duplicates.is_empty() {
+                    message.push_str(&format!(
+                        " · matching aliases retained: {} · remove explicitly with `haider account remove {} --confirm`",
+                        duplicates.join(", "),
+                        duplicates[0]
+                    ));
+                }
+            } else {
+                message.push_str(
+                    " · provider exposes no stable identity; re-login through this alias to update it",
+                );
+            }
+            self.accounts.message = Some(message);
             self.requests.push(AppRequest::AccountsRefresh);
             self.dirty = true;
         }

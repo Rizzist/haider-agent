@@ -520,7 +520,7 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
             .msh_headers
             .lock()
             .expect("MSH header lock")
-            .push(headers);
+            .push(headers.clone());
     }
     if target == "/device_authorization" {
         assert_eq!(method, "POST");
@@ -595,6 +595,35 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
     if target == "/token-redirect-target" {
         state.redirect_target_calls.fetch_add(1, Ordering::SeqCst);
         write_http(&mut stream, 500, &[], b"must not follow").await;
+        return;
+    }
+    if target == "/profile" {
+        assert_eq!(method, "GET");
+        assert_eq!(
+            authorization.as_deref(),
+            Some("Bearer ACCESS_TOKEN_SENTINEL_834a")
+        );
+        assert_eq!(
+            headers
+                .get(haider_provider::ANTHROPIC_OAUTH_BETA_HEADER)
+                .map(String::as_str),
+            Some(haider_provider::ANTHROPIC_OAUTH_BETA_VALUE)
+        );
+        let response = serde_json::json!({
+            "account": {
+                "uuid": "account-uuid-973",
+                "email": "owner@example.test",
+                "display_name": "Account Owner",
+                "full_name": "Owner Example"
+            },
+            "organization": {
+                "uuid": "organization-uuid-973",
+                "name": "Personal",
+                "organization_type": "claude_max"
+            }
+        })
+        .to_string();
+        write_http(&mut stream, 200, &[], response.as_bytes()).await;
         return;
     }
     if target == "/resource" {
@@ -1374,6 +1403,12 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
     assert_eq!(
         anthropic.token_endpoint,
         "https://console.anthropic.com/v1/oauth/token"
+    );
+    assert_eq!(
+        haider_provider::oauth_identity_source(anthropic.provider_id)
+            .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
+            .map(|endpoint| endpoint.url),
+        Some("https://api.anthropic.com/api/oauth/profile")
     );
     assert_eq!(anthropic.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     // Claude Code 2.1.220 parity (W5g-7): the consent page derives its
@@ -2275,9 +2310,12 @@ fn denied_or_locked_native_store_never_suppresses_readable_claude_file() {
 }
 
 #[tokio::test]
-async fn anthropic_native_login_gets_a_stable_synthetic_account_identity() {
+async fn anthropic_native_login_gets_verified_profile_identity() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
-    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    let mut registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_identity_endpoint(format!("http://{}/profile", server.address))
+        .expect("test identity endpoint");
     registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
     registration.identity_mode = RuntimeIdentityMode::TokenEndpointGrant {
         display_identity: "Anthropic login".into(),
@@ -2292,17 +2330,27 @@ async fn anthropic_native_login_gets_a_stable_synthetic_account_identity() {
     })
     .to_string();
 
-    let first = token_bundle_from_response(&registration, body.as_bytes(), b"nonce", 1, None)
-        .await
-        .expect("Anthropic grant");
-    let identity = first.account_identity.as_ref().expect("synthetic identity");
-    assert!(
-        identity
-            .account_id
-            .as_deref()
-            .is_some_and(|account_id| account_id.starts_with("anthropic:"))
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let first =
+        token_bundle_from_response(&client, &registration, body.as_bytes(), b"nonce", 1, None)
+            .await
+            .expect("Anthropic grant");
+    let identity = first.account_identity.as_ref().expect("profile identity");
+    assert_eq!(
+        identity.account_id.as_deref(),
+        Some("account=account-uuid-973;organization=organization-uuid-973")
     );
-    assert_eq!(identity.display_name.as_deref(), Some("Anthropic login"));
+    assert_eq!(identity.email.as_deref(), Some("owner@example.test"));
+    assert_eq!(identity.display_name.as_deref(), Some("Account Owner"));
+    assert_eq!(identity.plan.as_deref(), Some("claude_max"));
+    assert!(identity.verified);
+    assert_eq!(
+        first.identity.display_identity,
+        "owner@example.test · claude_max"
+    );
 
     let refreshed = refresh_bundle_from_response(&registration, body.as_bytes(), &first)
         .expect("refresh bundle");
@@ -4142,7 +4190,7 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
         panic!("third device poll must produce tokens");
     };
     let before = now_ms().expect("clock");
-    let bundle = token_bundle_from_response(&registration, &bytes, &[], 1, None)
+    let bundle = token_bundle_from_response(&client, &registration, &bytes, &[], 1, None)
         .await
         .expect("Kimi token bundle");
     assert_eq!(bundle.access_token(), ACCESS_SENTINEL.as_bytes());
@@ -6013,11 +6061,12 @@ fn token_response_source_chunks_are_exclusively_owned_and_scrubbed() {
             && source
                 .matches("reqwest::header::CONNECTION, \"close\"")
                 .count()
-                // Five key-bearing transports must each close: authorization-code
-                // exchange, refresh, the W5b.2a JWKS fetch, and the B6k Kimi
-                // device-authorization and device-token-poll requests (both feed
-                // bounded_response, so their source chunks join the same scrub).
-                == 5
+                // Six key-bearing transports must each close: authorization-code
+                // exchange, refresh, authenticated identity lookup, the W5b.2a
+                // JWKS fetch, and the B6k Kimi device-authorization and
+                // device-token-poll requests (all bounded responses join the
+                // same source-chunk scrub discipline).
+                == 6
             && source.contains("chunk.as_mut().zeroize();"),
         "token and JWKS transports must close before every source chunk is mutable-owned and scrubbed"
     );

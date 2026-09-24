@@ -1128,6 +1128,7 @@ impl AccountsFacade {
     pub(crate) async fn refresh_provider_models(
         &self,
         provider: String,
+        account_alias: Option<CredentialAlias>,
     ) -> Result<ProviderSummaryWire, ProviderModelsRefreshFailure> {
         let commands = self
             .login
@@ -1142,6 +1143,7 @@ impl AccountsFacade {
         commands
             .send(AccountCommand::RefreshProviderModels {
                 provider,
+                account_alias,
                 completed: ProviderModelsRefreshCompletion::internal(sender),
             })
             .await
@@ -1431,10 +1433,13 @@ pub(crate) enum AccountCommand {
     SetProviderTrust(Box<ProviderSetTrustJob>),
     RefreshProviderModels {
         provider: String,
+        account_alias: Option<CredentialAlias>,
         completed: ProviderModelsRefreshCompletion,
     },
     ProviderModelsRefreshCompleted {
         provider: String,
+        account_alias: Option<CredentialAlias>,
+        explicit_account: bool,
         cached: Option<haider_core::CachedModels>,
         result: ProviderModelsRefreshResult,
         completed: ProviderModelsRefreshCompletion,
@@ -1794,6 +1799,7 @@ async fn run_account_actor(
                     &mut model_refresh_followers,
                     &mut refreshing_providers,
                     provider,
+                    None,
                     ProviderModelsRefreshCompletion::Automatic,
                 )
                 .await;
@@ -1899,6 +1905,8 @@ async fn run_account_actor(
                     management.as_ref(),
                     &providers,
                     &mut pending_catalog_discoveries,
+                    &source_registry,
+                    &source_snapshot,
                     &profile_id,
                     &reserved_aliases,
                     *job,
@@ -2342,6 +2350,7 @@ async fn run_account_actor(
             }
             AccountCommand::RefreshProviderModels {
                 provider,
+                account_alias,
                 completed,
             } => {
                 if draining {
@@ -2366,6 +2375,7 @@ async fn run_account_actor(
                     &mut model_refresh_followers,
                     &mut refreshing_providers,
                     provider,
+                    account_alias,
                     completed,
                 )
                 .await;
@@ -2373,6 +2383,8 @@ async fn run_account_actor(
             }
             AccountCommand::ProviderModelsRefreshCompleted {
                 provider,
+                account_alias,
+                explicit_account,
                 cached,
                 result,
                 completed,
@@ -2396,6 +2408,8 @@ async fn run_account_actor(
                         completed: &completed,
                     },
                     provider,
+                    account_alias.as_ref(),
+                    explicit_account,
                     cached,
                     result,
                 )
@@ -2849,6 +2863,127 @@ fn redact_probe_error(error: CatalogError, secret: Option<&str>) -> CatalogError
     }
 }
 
+fn model_refresh_descriptor<'a>(
+    accounts: &'a AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+    expected_auth: AuthMethod,
+    account_alias: Option<&CredentialAlias>,
+) -> Result<&'a CredentialDescriptor, HaiderError> {
+    let descriptor = if let Some(alias) = account_alias {
+        accounts.get(alias).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!("account `{alias}` does not exist"),
+                false,
+            )
+        })?
+    } else {
+        accounts
+            .active_for_provider(provider)
+            .filter(|descriptor| {
+                descriptor.auth_method == expected_auth && descriptor.status == CredentialStatus::Ok
+            })
+            .or_else(|| {
+                accounts.list().iter().find(|descriptor| {
+                    descriptor.provider == provider
+                        && descriptor.auth_method == expected_auth
+                        && descriptor.status == CredentialStatus::Ok
+                })
+            })
+            .or_else(|| accounts.active_for_provider(provider))
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    "provider has no active credential",
+                    false,
+                )
+            })?
+    };
+    if descriptor.provider != provider {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "account `{}` belongs to provider `{}`, not `{provider}`",
+                descriptor.alias, descriptor.provider
+            ),
+            false,
+        ));
+    }
+    if descriptor.auth_method != expected_auth {
+        let requirement = if expected_auth == AuthMethod::OAuth {
+            "OAuth"
+        } else {
+            "API-key"
+        };
+        let message = account_alias.map_or_else(
+            || {
+                format!(
+                    "provider model discovery requires an active {requirement} credential"
+                )
+            },
+            |_| {
+                format!(
+                    "account `{}` cannot serve the model catalog; {requirement} authentication is required",
+                    descriptor.alias
+                )
+            },
+        );
+        return Err(HaiderError::new(
+            ErrorCode::CredentialMissing,
+            message,
+            false,
+        ));
+    }
+    Ok(descriptor)
+}
+
+async fn discover_models_with_account(
+    broker: &CredentialBroker,
+    descriptor: &CredentialDescriptor,
+    model_discoverer: &dyn ProviderModelDiscoverer,
+    source: CatalogSource,
+    etag: Option<&str>,
+) -> ProviderModelsRefreshResult {
+    match broker.resolve(descriptor).await {
+        Ok(access_token) => {
+            let access_token = std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
+                let message = if descriptor.auth_method == AuthMethod::OAuth {
+                    "OAuth access token is not valid UTF-8"
+                } else {
+                    "API key is not valid UTF-8"
+                };
+                HaiderError::new(ErrorCode::CredentialMissing, message, false)
+            });
+            match access_token {
+                Ok(access_token) => ProviderModelsRefreshResult::Discovery(
+                    discover_provider_models_bounded(
+                        model_discoverer,
+                        source,
+                        Some(access_token),
+                        etag,
+                    )
+                    .await,
+                ),
+                Err(error) => ProviderModelsRefreshResult::Credential(error),
+            }
+        }
+        Err(error) => ProviderModelsRefreshResult::Credential(error),
+    }
+}
+
+fn catalog_error_is_account_specific(error: &CatalogError) -> bool {
+    match error {
+        CatalogError::Unauthorized => true,
+        CatalogError::Unavailable { reason } => {
+            reason.contains("provider does not serve a model list to this credential")
+        }
+        CatalogError::NotModified
+        | CatalogError::Transport { .. }
+        | CatalogError::InvalidBody { .. }
+        | CatalogError::Empty => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn begin_provider_models_refresh(
     store: &SqliteStoreHandle,
@@ -2862,8 +2997,10 @@ async fn begin_provider_models_refresh(
     refresh_followers: &mut HashMap<String, Vec<ProviderModelsRefreshCompletion>>,
     refreshing_providers: &mut HashSet<String>,
     provider: String,
+    account_alias: Option<CredentialAlias>,
     completed: ProviderModelsRefreshCompletion,
 ) {
+    let explicit_account = account_alias.is_some();
     let Some((source, auth_requirement)) = catalog_source(&provider, providers) else {
         respond_provider_models_unavailable(
             &completed,
@@ -2884,7 +3021,10 @@ async fn begin_provider_models_refresh(
                             ProviderModelsRefreshCompletion::Automatic
                         )
                 });
-        if active_is_automatic && !matches!(completed, ProviderModelsRefreshCompletion::Automatic) {
+        if account_alias.is_none()
+            && active_is_automatic
+            && !matches!(completed, ProviderModelsRefreshCompletion::Automatic)
+        {
             refresh_followers
                 .entry(provider)
                 .or_default()
@@ -2912,32 +3052,51 @@ async fn begin_provider_models_refresh(
         }
     };
     let descriptor = if let Some(expected_auth) = expected_auth {
-        let Some(descriptor) = accounts.active_for_provider(&provider).cloned() else {
-            providers.models_unavailable(&provider, "provider has no active credential".to_owned());
-            respond_model_refresh_error(
-                &completed,
-                ERROR_CODE_CREDENTIAL_MISSING,
-                "provider has no active credential",
-                false,
-                None,
-            );
-            return;
-        };
-        if descriptor.auth_method != expected_auth {
-            let reason = if expected_auth == AuthMethod::OAuth {
-                "provider model discovery requires an active OAuth credential"
-            } else {
-                "provider model discovery requires an active API-key credential"
-            };
-            providers.models_unavailable(&provider, reason.to_owned());
-            respond_provider_models_unavailable(&completed, &provider, reason);
-            return;
+        match model_refresh_descriptor(accounts, &provider, expected_auth, account_alias.as_ref()) {
+            Ok(descriptor) => Some(descriptor.clone()),
+            Err(error) => {
+                if account_alias.is_none() {
+                    providers.models_unavailable(&provider, error.message.clone());
+                }
+                let code = if error.code == ErrorCode::InvalidArgument {
+                    ERROR_CODE_INVALID_ARGUMENT
+                } else {
+                    ERROR_CODE_CREDENTIAL_MISSING
+                };
+                respond_model_refresh_error(
+                    &completed,
+                    code,
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+                return;
+            }
         }
-        Some(descriptor)
     } else {
         None
     };
-    let broker = if descriptor.is_some() {
+    let mut descriptors = descriptor.into_iter().collect::<Vec<_>>();
+    if account_alias.is_none()
+        && let Some(expected_auth) = expected_auth
+    {
+        let selected_alias = descriptors
+            .first()
+            .map(|descriptor| descriptor.alias.clone());
+        descriptors.extend(
+            accounts
+                .list()
+                .iter()
+                .filter(|candidate| {
+                    candidate.provider == provider
+                        && candidate.auth_method == expected_auth
+                        && candidate.status == CredentialStatus::Ok
+                        && selected_alias.as_ref() != Some(&candidate.alias)
+                })
+                .cloned(),
+        );
+    }
+    let broker = if !descriptors.is_empty() {
         let Some(broker) = broker.cloned() else {
             let message = if expected_auth == Some(AuthMethod::OAuth) {
                 "OAuth credential broker is unavailable"
@@ -2979,51 +3138,64 @@ async fn begin_provider_models_refresh(
     let task_provider = provider.clone();
     let task_completed = completed.clone();
     let refresh_task = refresh_tasks.spawn(async move {
-        let result = match (broker, descriptor) {
-            (Some(broker), Some(descriptor)) => match broker.resolve(&descriptor).await {
-                Ok(access_token) => {
-                    let access_token =
-                        std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
-                            let message = if descriptor.auth_method == AuthMethod::OAuth {
-                                "OAuth access token is not valid UTF-8"
-                            } else {
-                                "API key is not valid UTF-8"
-                            };
-                            HaiderError::new(ErrorCode::CredentialMissing, message, false)
-                        });
-                    match access_token {
-                        Ok(access_token) => ProviderModelsRefreshResult::Discovery(
-                            discover_provider_models_bounded(
-                                model_discoverer.as_ref(),
-                                source,
-                                Some(access_token),
-                                etag.as_deref(),
-                            )
-                            .await,
-                        ),
-                        Err(error) => ProviderModelsRefreshResult::Credential(error),
-                    }
-                }
-                Err(error) => ProviderModelsRefreshResult::Credential(error),
-            },
-            (None, None) => ProviderModelsRefreshResult::Discovery(
-                discover_provider_models_bounded(
-                    model_discoverer.as_ref(),
-                    source,
-                    None,
-                    etag.as_deref(),
-                )
-                .await,
-            ),
-            _ => ProviderModelsRefreshResult::Credential(HaiderError::new(
+        let (task_account_alias, result) = if let Some(broker) = broker {
+            let mut attempts = descriptors.into_iter().peekable();
+            let mut final_alias = None;
+            let mut final_result = ProviderModelsRefreshResult::Credential(HaiderError::new(
                 ErrorCode::Internal,
                 "model discovery credential state is inconsistent",
                 false,
-            )),
+            ));
+            while let Some(descriptor) = attempts.next() {
+                final_alias = Some(descriptor.alias.clone());
+                final_result = discover_models_with_account(
+                    &broker,
+                    &descriptor,
+                    model_discoverer.as_ref(),
+                    source.clone(),
+                    etag.as_deref(),
+                )
+                .await;
+                let account_failed = match &final_result {
+                    ProviderModelsRefreshResult::Discovery(Err(error)) => {
+                        catalog_error_is_account_specific(error)
+                    }
+                    ProviderModelsRefreshResult::Credential(_) => true,
+                    ProviderModelsRefreshResult::Discovery(Ok(_)) => false,
+                };
+                if !account_failed || attempts.peek().is_none() {
+                    break;
+                }
+            }
+            (final_alias, final_result)
+        } else if descriptors.is_empty() {
+            (
+                None,
+                ProviderModelsRefreshResult::Discovery(
+                    discover_provider_models_bounded(
+                        model_discoverer.as_ref(),
+                        source,
+                        None,
+                        etag.as_deref(),
+                    )
+                    .await,
+                ),
+            )
+        } else {
+            (
+                None,
+                ProviderModelsRefreshResult::Credential(HaiderError::new(
+                    ErrorCode::Internal,
+                    "model discovery credential state is inconsistent",
+                    false,
+                )),
+            )
         };
         let _ = commands
             .send(AccountCommand::ProviderModelsRefreshCompleted {
                 provider: task_provider,
+                account_alias: task_account_alias,
+                explicit_account,
                 cached,
                 result,
                 completed: task_completed,
@@ -3041,9 +3213,50 @@ struct ProviderModelsRefreshContext<'a> {
     completed: &'a ProviderModelsRefreshCompletion,
 }
 
+fn catalog_auth_failure_message(account_alias: Option<&CredentialAlias>) -> String {
+    account_alias.map_or_else(
+        || "model catalog authentication failed".to_owned(),
+        |alias| {
+            format!(
+                "account `{alias}` cannot authenticate the model catalog; switch to a live account or re-authenticate it"
+            )
+        },
+    )
+}
+
+fn catalog_credential_failure_message(
+    account_alias: Option<&CredentialAlias>,
+    message: &str,
+) -> String {
+    account_alias.map_or_else(
+        || message.to_owned(),
+        |alias| format!("account `{alias}` cannot supply a model-catalog credential: {message}"),
+    )
+}
+
+fn catalog_discovery_failure_message(
+    account_alias: Option<&CredentialAlias>,
+    error: &CatalogError,
+) -> String {
+    if catalog_error_is_account_specific(error) {
+        account_alias.map_or_else(
+            || error.to_string(),
+            |alias| {
+                format!(
+                    "account `{alias}` cannot authenticate the model catalog: {error}; switch to a live account or re-authenticate it"
+                )
+            },
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 async fn finish_provider_models_refresh(
     context: ProviderModelsRefreshContext<'_>,
     provider: String,
+    account_alias: Option<&CredentialAlias>,
+    explicit_account: bool,
     cached: Option<haider_core::CachedModels>,
     result: ProviderModelsRefreshResult,
 ) {
@@ -3057,10 +3270,31 @@ async fn finish_provider_models_refresh(
     let failure_reason = match &result {
         ProviderModelsRefreshResult::Discovery(Ok(_))
         | ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => None,
-        ProviderModelsRefreshResult::Discovery(Err(error)) => Some(error.to_string()),
-        ProviderModelsRefreshResult::Credential(error) => Some(error.message.clone()),
+        ProviderModelsRefreshResult::Discovery(Err(error)) => {
+            Some(catalog_discovery_failure_message(account_alias, error))
+        }
+        ProviderModelsRefreshResult::Credential(error) => Some(catalog_credential_failure_message(
+            account_alias,
+            &error.message,
+        )),
     };
-    if let Some(reason) = failure_reason {
+    let has_usable_alternate = account_alias.is_some_and(|selected| {
+        accounts.list().iter().any(|descriptor| {
+            descriptor.provider == provider
+                && descriptor.alias != *selected
+                && descriptor.status == CredentialStatus::Ok
+        })
+    });
+    let credential_specific_failure = match &result {
+        ProviderModelsRefreshResult::Discovery(Err(error)) => {
+            catalog_error_is_account_specific(error)
+        }
+        ProviderModelsRefreshResult::Credential(_) => true,
+        ProviderModelsRefreshResult::Discovery(Ok(_)) => false,
+    };
+    let preserve_global_inventory =
+        explicit_account && credential_specific_failure && has_usable_alternate;
+    if let Some(reason) = failure_reason.filter(|_| !preserve_global_inventory) {
         providers.models_unavailable(&provider, reason);
         publish_inventory_states(store, management, accounts, providers).await;
     }
@@ -3189,18 +3423,24 @@ async fn finish_provider_models_refresh(
             });
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unavailable { reason })) => {
+            let message = catalog_discovery_failure_message(
+                account_alias,
+                &CatalogError::Unavailable {
+                    reason: reason.clone(),
+                },
+            );
             if let Some(data) =
                 custom_probe_error_data(providers, &provider, ProviderProbeFailureWire::Unavailable)
             {
                 respond_model_refresh_error(
                     completed,
                     ERROR_CODE_PROVIDER_ERROR,
-                    &reason,
+                    &message,
                     false,
                     Some(data),
                 );
             } else {
-                respond_provider_models_unavailable(completed, &provider, &reason);
+                respond_provider_models_unavailable(completed, &provider, &message);
             }
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Transport { reason })) => {
@@ -3217,10 +3457,11 @@ async fn finish_provider_models_refresh(
             );
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized)) => {
+            let message = catalog_auth_failure_message(account_alias);
             respond_model_refresh_error(
                 completed,
                 ERROR_CODE_UNAUTHORIZED,
-                "model catalog authentication failed",
+                &message,
                 false,
                 custom_probe_error_data(
                     providers,
@@ -3263,10 +3504,11 @@ async fn finish_provider_models_refresh(
             }
         }
         ProviderModelsRefreshResult::Credential(error) => {
+            let message = catalog_credential_failure_message(account_alias, &error.message);
             respond_model_refresh_error(
                 completed,
                 ERROR_CODE_PROVIDER_ERROR,
-                &error.message,
+                &message,
                 error.retryable,
                 None,
             );
@@ -6525,6 +6767,8 @@ async fn handle_oauth_add(
     management: Option<&ManagementSnapshot>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
+    source_registry: &Arc<StdMutex<CredentialSourceRegistry>>,
+    source_snapshot: &AccountSourcesSnapshot,
     _profile_id: &str,
     reserved_aliases: &HashSet<String>,
     job: OAuthAddJob,
@@ -6549,6 +6793,8 @@ async fn handle_oauth_add(
         display_alias,
         auth_method: "oauth".into(),
     };
+    let requested_alias = CredentialAlias::new(identity.physical_alias.clone());
+    let staging_alias = oauth_staging_alias(&command_id);
     let request_json = match identity.canonical_json() {
         Ok(json) => json,
         Err(error) => {
@@ -6562,6 +6808,17 @@ async fn handle_oauth_add(
         .await;
     let resume = match receipt {
         Ok(AccountAddClaim::Committed(response)) => {
+            if response.descriptor.alias != requested_alias
+                && let Err(error) = delete_oauth_staging(Arc::clone(&vault), &staging_alias).await
+            {
+                respond_error(
+                    &route,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                );
+                return;
+            }
             enqueue_catalog_discovery(
                 &response.descriptor.provider,
                 providers,
@@ -6587,8 +6844,7 @@ async fn handle_oauth_add(
             return;
         }
     };
-    let alias = CredentialAlias::new(identity.physical_alias.clone());
-    if reserved_aliases.contains(alias.as_str()) {
+    if reserved_aliases.contains(requested_alias.as_str()) {
         respond_error(
             &route,
             ERROR_CODE_BUSY,
@@ -6597,7 +6853,21 @@ async fn handle_oauth_add(
         );
         return;
     }
-    if resume && accounts.get(&alias).is_some() {
+    if resume && accounts.get(&requested_alias).is_some() {
+        if let Err(error) = promote_linked_alias_to_haider_oauth(
+            source_registry,
+            source_snapshot,
+            accounts,
+            &requested_alias,
+        ) {
+            respond_error(
+                &route,
+                ERROR_CODE_PROVIDER_ERROR,
+                &error.message,
+                error.retryable,
+            );
+            return;
+        }
         finalize_oauth_commit(
             store,
             accounts,
@@ -6606,75 +6876,76 @@ async fn handle_oauth_add(
             providers,
             pending_catalog_discoveries,
             &command_id,
-            &alias,
+            &requested_alias,
             &route,
             OAuthCommitResponse::Add,
+            None,
         )
         .await;
         return;
     }
-    if resume {
-        let vault_for_read = Arc::clone(&vault);
-        let alias_for_read = alias.clone();
-        let stored = tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
-            .await
-            .ok()
-            .and_then(Result::ok);
-        if let Some(stored) = stored {
-            match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
-                Ok(bundle) => {
-                    let descriptor = oauth_descriptor_for(
-                        &identity.provider,
-                        &alias,
-                        &bundle,
-                        accounts.active_for_provider(&identity.provider).is_none(),
-                    );
-                    if let Err(error) = accounts.add(descriptor) {
+    let (bundle, resumed_from_staging) = if resume {
+        let stored = match resolve_optional_vault_secret(Arc::clone(&vault), &staging_alias).await {
+            Ok(Some(stored)) => Some((stored, true)),
+            Ok(None) => {
+                match resolve_optional_vault_secret(Arc::clone(&vault), &requested_alias).await {
+                    Ok(stored) => stored.map(|stored| (stored, false)),
+                    Err(error) => {
                         respond_error(
                             &route,
                             ERROR_CODE_PROVIDER_ERROR,
-                            &format!("resumed OAuth descriptor commit failed: {}", error.message),
-                            true,
+                            &error.message,
+                            error.retryable,
                         );
                         return;
                     }
-                    finalize_oauth_commit(
-                        store,
-                        accounts,
-                        snapshot,
-                        management,
-                        providers,
-                        pending_catalog_discoveries,
-                        &command_id,
-                        &alias,
-                        &route,
-                        OAuthCommitResponse::Add,
-                    )
-                    .await;
-                    return;
-                }
-                Err(_) => {
-                    respond_error(
-                        &route,
-                        ERROR_CODE_UNAUTHORIZED,
-                        "stored OAuth token bundle is invalid; restart sign-in",
-                        false,
-                    );
-                    return;
                 }
             }
-        }
-    }
-    let Some(claim) = claim else {
-        respond_error(
-            &route,
-            haider_rpc::ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
-            "OAuth ready reference is unavailable; start a fresh browser flow",
-            true,
-        );
-        return;
+            Err(error) => {
+                respond_error(
+                    &route,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                );
+                return;
+            }
+        };
+        let Some((stored, from_staging)) = stored else {
+            respond_error(
+                &route,
+                haider_rpc::ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+                "OAuth ready reference is unavailable; start a fresh browser flow",
+                true,
+            );
+            return;
+        };
+        let bundle = match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+            Ok(bundle) => bundle,
+            Err(_) => {
+                respond_error(
+                    &route,
+                    ERROR_CODE_UNAUTHORIZED,
+                    "stored OAuth token bundle is invalid; restart sign-in",
+                    false,
+                );
+                return;
+            }
+        };
+        (bundle, from_staging)
+    } else {
+        let Some(claim) = claim else {
+            respond_error(
+                &route,
+                haider_rpc::ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+                "OAuth ready reference is unavailable; start a fresh browser flow",
+                true,
+            );
+            return;
+        };
+        (claim.bundle, false)
     };
-    if claim.bundle.provider_id != identity.provider {
+    if bundle.provider_id != identity.provider {
         respond_error(
             &route,
             ERROR_CODE_INVALID_ARGUMENT,
@@ -6683,15 +6954,62 @@ async fn handle_oauth_add(
         );
         return;
     }
+    let alias = oauth_alias_for_identity(accounts, &identity.provider, &requested_alias, &bundle);
+    if reserved_aliases.contains(alias.as_str()) {
+        respond_error(
+            &route,
+            ERROR_CODE_BUSY,
+            "matching account alias is reserved by pending removal cleanup",
+            true,
+        );
+        return;
+    }
+    let needs_staging = alias != requested_alias;
+    if needs_staging
+        && !resumed_from_staging
+        && let Err(error) = put_oauth_staging(Arc::clone(&vault), &staging_alias, &bundle).await
+    {
+        respond_error(
+            &route,
+            ERROR_CODE_PROVIDER_ERROR,
+            &error.message,
+            error.retryable,
+        );
+        return;
+    }
+    let prior_secret = match resolve_optional_vault_secret(Arc::clone(&vault), &alias).await {
+        Ok(secret) => secret,
+        Err(error) => {
+            respond_error(
+                &route,
+                ERROR_CODE_PROVIDER_ERROR,
+                &error.message,
+                error.retryable,
+            );
+            return;
+        }
+    };
     if let Err(error) = persist_oauth_bundle(
         accounts,
         Arc::clone(&vault),
         &identity.provider,
         &alias,
-        claim.bundle,
-        None,
+        &bundle,
+        prior_secret,
+        true,
     )
     .await
+    {
+        respond_error(
+            &route,
+            ERROR_CODE_PROVIDER_ERROR,
+            &error.message,
+            error.retryable,
+        );
+        return;
+    }
+    if let Err(error) =
+        promote_linked_alias_to_haider_oauth(source_registry, source_snapshot, accounts, &alias)
     {
         respond_error(
             &route,
@@ -6712,6 +7030,7 @@ async fn handle_oauth_add(
         &alias,
         &route,
         OAuthCommitResponse::Add,
+        needs_staging.then(|| (Arc::clone(&vault), staging_alias)),
     )
     .await;
 }
@@ -7720,6 +8039,7 @@ async fn handle_oauth_import(
             &alias,
             &job.route,
             response_kind,
+            None,
         )
         .await;
         return;
@@ -7751,6 +8071,7 @@ async fn handle_oauth_import(
         &alias,
         &job.route,
         response_kind,
+        None,
     )
     .await;
 }
@@ -7913,13 +8234,117 @@ fn same_oauth_import(
         }
 }
 
+fn oauth_alias_for_identity(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+    requested_alias: &CredentialAlias,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+) -> CredentialAlias {
+    let Some(identity) = bundle.account_identity.as_ref() else {
+        return requested_alias.clone();
+    };
+    accounts
+        .list()
+        .iter()
+        .filter(|descriptor| {
+            descriptor.provider == provider && descriptor.auth_method == AuthMethod::OAuth
+        })
+        .filter(|descriptor| {
+            descriptor
+                .account_identity
+                .as_ref()
+                .is_some_and(|prior| prior.same_stable_principal(identity))
+        })
+        .min_by_key(|descriptor| descriptor.alias != *requested_alias)
+        .map_or_else(
+            || requested_alias.clone(),
+            |descriptor| descriptor.alias.clone(),
+        )
+}
+
+fn oauth_staging_alias(command_id: &str) -> CredentialAlias {
+    let digest = blake3::hash(command_id.as_bytes()).to_hex().to_string();
+    CredentialAlias::new(format!("__oauth_stage_{}", &digest[..24]))
+}
+
+fn promote_linked_alias_to_haider_oauth(
+    source_registry: &Arc<StdMutex<CredentialSourceRegistry>>,
+    source_snapshot: &AccountSourcesSnapshot,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    alias: &CredentialAlias,
+) -> Result<(), HaiderError> {
+    let mut registry = source_registry.lock().map_err(|_| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "credential source registry is unavailable",
+            true,
+        )
+    })?;
+    let Some(mut source) = registry.find_by_alias(alias.as_str()).cloned() else {
+        return Ok(());
+    };
+    // The interactive grant now owns this stable account alias. Retain the
+    // external source as a disabled enrollment (and never touch its file),
+    // but unlink it so startup reconciliation cannot overwrite the newly
+    // authenticated Haider-owned credential.
+    source.enabled = false;
+    source.account_alias = None;
+    source.health = CredentialSourceHealth::Pending;
+    registry.update(source)?;
+    publish_source_snapshot(source_snapshot, &registry, accounts);
+    Ok(())
+}
+
+async fn resolve_optional_vault_secret(
+    vault: Arc<dyn Vault>,
+    alias: &CredentialAlias,
+) -> Result<Option<SecretHandle>, HaiderError> {
+    let alias = alias.clone();
+    tokio::task::spawn_blocking(move || vault.resolve(&alias))
+        .await
+        .map_err(|_| HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true))?
+        .map(Some)
+        .or_else(|error| {
+            (error.code == ErrorCode::CredentialMissing)
+                .then_some(None)
+                .ok_or(error)
+        })
+}
+
+async fn put_oauth_staging(
+    vault: Arc<dyn Vault>,
+    alias: &CredentialAlias,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+) -> Result<(), HaiderError> {
+    let encoded = bundle.encode()?;
+    let alias = alias.clone();
+    tokio::task::spawn_blocking(move || vault.put(&alias, &encoded))
+        .await
+        .map_err(|_| {
+            HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
+        })?
+}
+
+async fn delete_oauth_staging(
+    vault: Arc<dyn Vault>,
+    alias: &CredentialAlias,
+) -> Result<(), HaiderError> {
+    let alias = alias.clone();
+    tokio::task::spawn_blocking(move || vault.delete(&alias))
+        .await
+        .map_err(|_| {
+            HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
+        })?
+}
+
 async fn persist_oauth_bundle(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     provider: &str,
     alias: &CredentialAlias,
-    bundle: haider_accounts::OAuthTokenBundleV1,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
     prior_secret: Option<SecretHandle>,
+    activate: bool,
 ) -> Result<(), HaiderError> {
     // The STORE is the authority on whether the descriptor row exists —
     // not `prior_secret`. A vanished prior secret (a Keychain→file-vault
@@ -7928,11 +8353,12 @@ async fn persist_oauth_bundle(
     // below still keys off `prior_secret`: with none, a failed save deletes
     // what we just wrote rather than restoring bytes that were already gone.
     let replacing = accounts.get(alias).is_some();
-    let active = accounts.get(alias).map_or_else(
-        || accounts.active_for_provider(provider).is_none(),
-        |descriptor| descriptor.active,
-    );
-    let descriptor = oauth_descriptor_for(provider, alias, &bundle, active);
+    let active = activate
+        || accounts.get(alias).map_or_else(
+            || accounts.active_for_provider(provider).is_none(),
+            |descriptor| descriptor.active,
+        );
+    let descriptor = oauth_descriptor_for(provider, alias, bundle, active);
     let encoded = bundle.encode()?;
     let vault_for_put = Arc::clone(&vault);
     let alias_for_put = alias.clone();
@@ -7941,7 +8367,9 @@ async fn persist_oauth_bundle(
         .map_err(|_| {
             HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
         })??;
-    let descriptor_result = if replacing {
+    let descriptor_result = if replacing && activate {
+        accounts.replace_and_select(descriptor)
+    } else if replacing {
         accounts.replace(descriptor)
     } else {
         accounts.add(descriptor)
@@ -7984,8 +8412,9 @@ async fn persist_oauth_import_material(
             vault,
             provider,
             alias,
-            material.bundle,
+            &material.bundle,
             prior_secret,
+            false,
         )
         .await;
     };
@@ -8014,8 +8443,9 @@ async fn persist_oauth_import_material(
         Arc::clone(&vault),
         provider,
         alias,
-        material.bundle,
+        &material.bundle,
         prior_secret,
+        false,
     )
     .await
     {
@@ -8106,6 +8536,7 @@ async fn finalize_oauth_commit(
     alias: &CredentialAlias,
     route: &LoginRoute,
     response: OAuthCommitResponse,
+    staging_cleanup: Option<(Arc<dyn Vault>, CredentialAlias)>,
 ) {
     let Some(descriptor) = accounts.get(alias).cloned() else {
         let error = HaiderError::new(
@@ -8145,6 +8576,19 @@ async fn finalize_oauth_commit(
             return;
         }
     };
+    if let Some((vault, staging_alias)) = staging_cleanup
+        && let Err(error) = delete_oauth_staging(vault, &staging_alias).await
+    {
+        match response {
+            OAuthCommitResponse::Add => {
+                respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+            }
+            OAuthCommitResponse::ImportLegacy | OAuthCommitResponse::ImportDevice => {
+                respond_management_error(route, &error);
+            }
+        }
+        return;
+    }
     publish_management_snapshot(snapshot, management, accounts, revision);
     enqueue_catalog_discovery(&descriptor.provider, providers, pending_catalog_discoveries);
     match response {
@@ -11700,6 +12144,27 @@ fn source_alias(record: &CredentialSourceRecord) -> CredentialAlias {
     CredentialAlias::new(format!("{prefix}-{suffix}"))
 }
 
+fn available_source_alias(
+    record: &CredentialSourceRecord,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) -> Result<CredentialAlias, HaiderError> {
+    let base = source_alias(record);
+    if accounts.get(&base).is_none() {
+        return Ok(base);
+    }
+    for suffix in 2..=999_u16 {
+        let candidate = CredentialAlias::new(format!("{base}-{suffix}"));
+        if accounts.get(&candidate).is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(HaiderError::new(
+        ErrorCode::InvalidArgument,
+        "credential source has no available account alias",
+        false,
+    ))
+}
+
 /// Operator-facing source-kind vocabulary for `haider account source add`.
 /// Each kind accepts its durable `as_str()` name plus one short alias.
 fn parse_source_kind(kind: &str) -> Option<CredentialSourceKind> {
@@ -11794,7 +12259,7 @@ fn reconcile_credential_sources(
                     .account_alias
                     .as_deref()
                     .map(CredentialAlias::new)
-                    .unwrap_or_else(|| source_alias(&record));
+                    .map_or_else(|| available_source_alias(&record, accounts), Ok)?;
                 record.account_alias = Some(alias.as_str().to_owned());
                 let status = match material.health {
                     CredentialSourceHealth::Ready => CredentialStatus::Ok,
@@ -11888,7 +12353,11 @@ fn account_source_wires(
                 path: Some(record.root.to_string_lossy().into_owned()),
                 credential_store: record.store_mode.as_str().to_owned(),
                 refresh_owner: record.refresh_owner.as_str().to_owned(),
-                health: record.health.as_str().to_owned(),
+                health: if record.enabled {
+                    record.health.as_str().to_owned()
+                } else {
+                    "disabled".to_owned()
+                },
                 last_seen_at_ms: record
                     .health
                     .eq(&CredentialSourceHealth::Ready)

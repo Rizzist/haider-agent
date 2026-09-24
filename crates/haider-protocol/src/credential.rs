@@ -26,6 +26,24 @@ pub struct AccountIdentity {
 }
 
 impl AccountIdentity {
+    /// Returns whether two records identify the same stable provider account.
+    ///
+    /// A provider account ID is authoritative when both records carry one.
+    /// Otherwise a case-insensitive email match supports migration from older
+    /// rows that predate a provider's stable-ID capture. Display labels,
+    /// subscription plans, and credential bytes are never identity keys.
+    #[must_use]
+    pub fn same_stable_principal(&self, other: &Self) -> bool {
+        match (self.account_id.as_deref(), other.account_id.as_deref()) {
+            (Some(left), Some(right)) => left == right,
+            _ => self
+                .email
+                .as_deref()
+                .zip(other.email.as_deref())
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right)),
+        }
+    }
+
     /// Normalizes one untrusted informational claim before it can reach a
     /// descriptor or operator surface.
     #[must_use]

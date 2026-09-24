@@ -805,6 +805,21 @@ async fn execute_use(
             );
             Ok(ExitCode::SUCCESS)
         }
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } if code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED => {
+            Err(AccountError::Rpc {
+                code,
+                message: format!(
+                    "{message}; run `haider account use {alias} --confirm` to confirm this selection"
+                ),
+                retryable,
+                data,
+            })
+        }
         response => Err(response_error(
             response,
             "account.set_active response method mismatch",
@@ -1443,7 +1458,7 @@ fn write_json(document: &impl Serialize) -> ExitCode {
 
 fn write_human(document: &AccountsDocument) -> ExitCode {
     let mut text = String::new();
-    for account in &document.accounts {
+    for (index, account) in document.accounts.iter().enumerate() {
         text.push_str(&format!(
             "{}  provider={}  identity={}  created={}\n",
             account.alias,
@@ -1457,6 +1472,20 @@ fn write_human(document: &AccountsDocument) -> ExitCode {
                 |created| created.to_string(),
             )
         ));
+        if let Some(identity) = account.identity.as_ref()
+            && let Some(canonical) = document.accounts[..index].iter().find(|prior| {
+                prior.provider == account.provider
+                    && prior
+                        .identity
+                        .as_ref()
+                        .is_some_and(|prior| prior.same_stable_principal(identity))
+            })
+        {
+            text.push_str(&format!(
+                "  matching identity already kept as `{}`; remove this duplicate explicitly with `haider account remove {} --confirm`\n",
+                canonical.alias, account.alias
+            ));
+        }
     }
     let stdout = io::stdout();
     let mut output = stdout.lock();

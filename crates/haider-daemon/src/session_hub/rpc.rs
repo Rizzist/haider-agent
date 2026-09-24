@@ -37,7 +37,7 @@ use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawPayload, RenderTargets, SCHEMA_VERSION, write_payload_json,
 };
-use haider_protocol::ids::{AgentId, ItemId, RunId};
+use haider_protocol::ids::{AgentId, CredentialAlias, ItemId, RunId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
@@ -1203,6 +1203,10 @@ fn fleet_now_ms() -> u64 {
 
 pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, model: &str) -> bool {
     summary.inventory.needs_refresh()
+        || matches!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::Unavailable { .. }
+        )
         || matches!(
             summary.inventory,
             haider_rpc::ModelInventoryWire::Fetched { .. }
@@ -10419,6 +10423,7 @@ impl HubConnection {
             request_id.clone(),
             crate::accounts::AccountCommand::RefreshProviderModels {
                 provider,
+                account_alias: None,
                 completed: crate::accounts::ProviderModelsRefreshCompletion::Wire(
                     crate::accounts::LoginRoute {
                         request_id,
@@ -10434,6 +10439,7 @@ impl HubConnection {
         summaries: &mut Vec<ProviderSummaryWire>,
         provider: &str,
         model: &str,
+        account_alias: Option<&str>,
     ) -> Result<(), InventoryRefreshError> {
         let cached_serves_model = summaries
             .iter()
@@ -10467,7 +10473,13 @@ impl HubConnection {
                     data: None,
                 })
             })?;
-        let refreshed = match facade.refresh_provider_models(provider.to_owned()).await {
+        let refreshed = match facade
+            .refresh_provider_models(
+                provider.to_owned(),
+                account_alias.map(|alias| CredentialAlias::new(alias.to_owned())),
+            )
+            .await
+        {
             Ok(refreshed) => refreshed,
             // A custom compatible catalog is advisory. Refresh-on-miss still
             // probes exactly once, but discovery failure cannot veto a
@@ -12055,7 +12067,14 @@ impl HubConnection {
             .filter(|provider| !provider.is_empty())
             .unwrap_or(&current.provider);
         match self
-            .refresh_inventory_if_needed(&mut summaries, selected_provider, model.trim())
+            .refresh_inventory_if_needed(
+                &mut summaries,
+                selected_provider,
+                model.trim(),
+                (selected_provider == current.provider)
+                    .then_some(current.account_alias.as_deref())
+                    .flatten(),
+            )
             .await
         {
             Ok(()) => {}
@@ -16679,7 +16698,12 @@ impl HubConnection {
             .and_then(|facade| facade.management.read())
             .map_or_else(Vec::new, |view| view.providers);
         match self
-            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim())
+            .refresh_inventory_if_needed(
+                &mut summaries,
+                &provider,
+                model.trim(),
+                account_alias.as_ref().map(CredentialAlias::as_str),
+            )
             .await
         {
             Ok(()) => {}

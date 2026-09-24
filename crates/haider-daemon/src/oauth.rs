@@ -685,6 +685,7 @@ pub struct OAuthProviderRegistration {
     issuer: String,
     authorization_endpoint: Url,
     token_endpoint: Url,
+    identity_endpoint: Option<Url>,
     client_id: String,
     scopes: Vec<String>,
     audience: String,
@@ -721,6 +722,10 @@ impl fmt::Debug for OAuthProviderRegistration {
                 &safe_url(&self.authorization_endpoint),
             )
             .field("token_endpoint", &safe_url(&self.token_endpoint))
+            .field(
+                "identity_endpoint",
+                &self.identity_endpoint.as_ref().map(safe_url),
+            )
             .field("client_id", &self.client_id)
             .field("scopes", &self.scopes)
             .field("audience", &self.audience)
@@ -813,6 +818,18 @@ impl OAuthProviderRegistration {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_identity_endpoint(
+        mut self,
+        endpoint: impl AsRef<str>,
+    ) -> Result<Self, OAuthPublicError> {
+        let endpoint = Url::parse(endpoint.as_ref())
+            .map_err(|_| OAuthPublicError::new("invalid_test_identity_endpoint", false))?;
+        validate_metadata_url(&endpoint)?;
+        self.identity_endpoint = Some(endpoint);
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_with_identity(
         provider_id: impl Into<String>,
@@ -853,6 +870,7 @@ impl OAuthProviderRegistration {
             issuer,
             authorization_endpoint,
             token_endpoint,
+            identity_endpoint: None,
             client_id,
             scopes,
             audience,
@@ -934,6 +952,16 @@ impl Default for OAuthProviderCatalog {
                 )
                 .ok()?;
                 registration.redirect_policy = metadata.redirect_policy;
+                registration.identity_endpoint =
+                    haider_provider::oauth_identity_source(metadata.provider_id)
+                        .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
+                        .map(|endpoint| endpoint.url)
+                        .map(Url::parse)
+                        .transpose()
+                        .ok()?;
+                if let Some(endpoint) = registration.identity_endpoint.as_ref() {
+                    validate_metadata_url(endpoint).ok()?;
+                }
                 registration.authorize_parameters = metadata
                     .authorize_parameters
                     .iter()
@@ -3594,7 +3622,8 @@ async fn run_device_token_flow(
             }
             Ok(DeviceTokenPoll::Tokens(bytes)) => {
                 set_terminal(&inner, &flow_id, InternalFlowStatus::Exchanging);
-                match token_bundle_from_response(&registration, &bytes, &[], 1, None).await {
+                match token_bundle_from_response(client, &registration, &bytes, &[], 1, None).await
+                {
                     Ok(bundle) => {
                         if registration.provider_id == haider_provider::KIMI_OAUTH_PROVIDER_NAME
                             && let Err(error) = validate_kimi_oauth_bundle(&bundle).await
@@ -4464,7 +4493,7 @@ async fn exchange_authorization_code(
     if !status.is_success() {
         return Err(classify_token_error(status.as_u16(), &bytes));
     }
-    token_bundle_from_response(registration, &bytes, nonce, 1, None).await
+    token_bundle_from_response(client, registration, &bytes, nonce, 1, None).await
 }
 
 async fn bounded_response(
@@ -4678,7 +4707,117 @@ struct TokenResponse {
     id_token: Option<SecretJson>,
 }
 
+#[derive(Deserialize)]
+struct OAuthProfileResponse {
+    account: OAuthProfileAccount,
+    organization: OAuthProfileOrganization,
+}
+
+#[derive(Deserialize)]
+struct OAuthProfileAccount {
+    uuid: String,
+    email: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    full_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OAuthProfileOrganization {
+    uuid: String,
+    #[serde(default)]
+    organization_type: Option<String>,
+}
+
+async fn account_identity_from_endpoint(
+    client: &reqwest::Client,
+    registration: &OAuthProviderRegistration,
+    access_token: &[u8],
+    captured_at: u64,
+) -> Result<Option<(OAuthIdentityV1, AccountIdentity)>, OAuthPublicError> {
+    let Some(endpoint) = registration.identity_endpoint.clone() else {
+        return Ok(None);
+    };
+    let mut authorization = Zeroizing::new(b"Bearer ".to_vec());
+    authorization.extend_from_slice(access_token);
+    let mut authorization = reqwest::header::HeaderValue::from_bytes(&authorization)
+        .map_err(|_| OAuthPublicError::new("invalid_token_response", false))?;
+    authorization.set_sensitive(true);
+    let mut request = client
+        .get(endpoint)
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "close");
+    if registration.provider_id == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
+        request = request.header(
+            haider_provider::ANTHROPIC_OAUTH_BETA_HEADER,
+            haider_provider::ANTHROPIC_OAUTH_BETA_VALUE,
+        );
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| OAuthPublicError::new("identity_endpoint_unavailable", true))?;
+    if response.status().is_redirection() {
+        return Err(OAuthPublicError::new("identity_redirect_rejected", false));
+    }
+    if !response.status().is_success() {
+        return Err(OAuthPublicError::new("identity_endpoint_rejected", false));
+    }
+    let bytes = bounded_response(response).await?;
+    let profile = serde_json::from_slice::<OAuthProfileResponse>(&bytes)
+        .map_err(|_| OAuthPublicError::new("identity_response_invalid", false))?;
+    let account_id = AccountIdentity::sanitized_field(&profile.account.uuid)
+        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
+    let email = AccountIdentity::sanitized_field(&profile.account.email)
+        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
+    // A subscription credential is scoped by both the user account and the
+    // selected organization. Keep that pair as one public stable coordinate
+    // in today's AccountIdentity schema so separate organizations cannot be
+    // collapsed merely because they share an owner.
+    let organization_id = AccountIdentity::sanitized_field(&profile.organization.uuid)
+        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
+    let stable_account_coordinate = format!("account={account_id};organization={organization_id}");
+    let display_name = profile
+        .account
+        .display_name
+        .as_deref()
+        .and_then(AccountIdentity::sanitized_field)
+        .or_else(|| {
+            profile
+                .account
+                .full_name
+                .as_deref()
+                .and_then(AccountIdentity::sanitized_field)
+        });
+    let account_identity = AccountIdentity {
+        email: Some(email),
+        display_name,
+        account_id: Some(stable_account_coordinate.clone()),
+        plan: profile
+            .organization
+            .organization_type
+            .as_deref()
+            .and_then(AccountIdentity::sanitized_field),
+        issuer: Some(registration.issuer.clone()),
+        captured_at,
+        verified: true,
+    };
+    Ok(Some((
+        OAuthIdentityV1 {
+            subject_hash: blake3::hash(stable_account_coordinate.as_bytes())
+                .to_hex()
+                .to_string(),
+            display_identity: account_identity.summary(),
+        },
+        account_identity,
+    )))
+}
+
 async fn token_bundle_from_response(
+    client: &reqwest::Client,
     registration: &OAuthProviderRegistration,
     bytes: &[u8],
     nonce: &[u8],
@@ -4709,7 +4848,7 @@ async fn token_bundle_from_response(
     {
         return Err(OAuthPublicError::new("scope_mismatch", false));
     }
-    let identity = match &registration.identity_mode {
+    let mut identity = match &registration.identity_mode {
         RuntimeIdentityMode::VerifiedIdToken(verifier) => {
             let id_token = response
                 .id_token
@@ -4760,22 +4899,16 @@ async fn token_bundle_from_response(
         account_identity.verified = true;
     }
     if account_identity.is_none()
-        && registration.provider_id == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
+        && let Some((endpoint_identity, endpoint_account)) = account_identity_from_endpoint(
+            client,
+            registration,
+            response.access_token.0.as_slice(),
+            now,
+        )
+        .await?
     {
-        // Anthropic's token response has no ID token/account coordinate. Pin
-        // one synthetic identity to the login's initial grant identity; the
-        // refresh path preserves this AccountIdentity byte-for-byte, so token
-        // rotation cannot rename the account or break its meter association.
-        let stable_suffix = identity.subject_hash.chars().take(16).collect::<String>();
-        account_identity = Some(AccountIdentity {
-            email: None,
-            display_name: Some(identity.display_identity.clone()),
-            account_id: Some(format!("anthropic:{stable_suffix}")),
-            plan: None,
-            issuer: Some(registration.issuer.clone()),
-            captured_at: now,
-            verified: false,
-        });
+        identity = endpoint_identity;
+        account_identity = Some(endpoint_account);
     }
     let expires_at = now
         .checked_add(response.expires_in.saturating_mul(1000))

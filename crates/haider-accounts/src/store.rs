@@ -313,7 +313,27 @@ impl<S: StoreLike> AccountStore<S> {
     /// alias, provider, auth method, and base URL are immutable coordinates;
     /// replacement may update only public identity/status metadata.
     pub fn replace(&mut self, mut descriptor: CredentialDescriptor) -> AccountsResult<()> {
-        validate_descriptor(&descriptor)?;
+        self.replace_with_activity(&mut descriptor, false)
+    }
+
+    /// Atomically replaces one descriptor and makes it active for its provider.
+    ///
+    /// Interactive re-authentication uses this door because completing a
+    /// sign-in is an explicit request to use that identity. Background token
+    /// refresh keeps using [`Self::replace`] so it cannot move the default.
+    pub fn replace_and_select(
+        &mut self,
+        mut descriptor: CredentialDescriptor,
+    ) -> AccountsResult<()> {
+        self.replace_with_activity(&mut descriptor, true)
+    }
+
+    fn replace_with_activity(
+        &mut self,
+        descriptor: &mut CredentialDescriptor,
+        select: bool,
+    ) -> AccountsResult<()> {
+        validate_descriptor(descriptor)?;
         let index = self
             .descriptors
             .iter()
@@ -342,7 +362,7 @@ impl<S: StoreLike> AccountStore<S> {
                 false,
             ));
         }
-        descriptor.active = previous.active;
+        descriptor.active = select || previous.active;
         // The operator's display label survives replacement (v0.0.938): OAuth
         // rotation and re-login rebuild a descriptor from provider truth and
         // carry no label, and silently discarding the chosen name on every
@@ -356,7 +376,14 @@ impl<S: StoreLike> AccountStore<S> {
         // re-login. Pre-964 rows deliberately keep their unknown timestamp.
         descriptor.created_at_ms = previous.created_at_ms;
         let mut next = self.descriptors.clone();
-        next[index] = descriptor;
+        if select {
+            for existing in &mut next {
+                if existing.provider == descriptor.provider {
+                    existing.active = false;
+                }
+            }
+        }
+        next[index] = descriptor.clone();
         self.commit(next)
     }
 

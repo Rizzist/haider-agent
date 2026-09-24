@@ -167,8 +167,10 @@ impl OAuthIdentitySource for AnthropicOAuthIdentitySource {
         Ok(None)
     }
 
-    fn unavailable_reason(&self) -> Option<&'static str> {
-        Some("Claude OAuth currently returns no ID token or stable account identifier")
+    fn identity_endpoint(&self) -> Option<IdentityEndpoint> {
+        Some(IdentityEndpoint {
+            url: "https://api.anthropic.com/api/oauth/profile",
+        })
     }
 }
 
@@ -273,11 +275,15 @@ mod tests {
                 "missing identity source for {provider}"
             );
         }
-        assert!(
-            oauth_identity_source(ANTHROPIC_OAUTH_PROVIDER_NAME)
-                .and_then(|source| source.unavailable_reason())
-                .is_some()
+        let anthropic = oauth_identity_source(ANTHROPIC_OAUTH_PROVIDER_NAME)
+            .expect("Anthropic identity source");
+        assert_eq!(
+            anthropic.identity_endpoint(),
+            Some(IdentityEndpoint {
+                url: "https://api.anthropic.com/api/oauth/profile"
+            })
         );
+        assert_eq!(anthropic.unavailable_reason(), None);
         assert!(
             oauth_identity_source(KIMI_OAUTH_PROVIDER_NAME)
                 .and_then(|source| source.unavailable_reason())

@@ -269,6 +269,28 @@ async fn account_use_resolves_alias_then_sets_the_profile_default() {
 }
 
 #[tokio::test]
+async fn account_use_cache_warning_names_the_exact_confirmation_command() {
+    let client = FakeAccountClient::new([
+        list_response("work", Some(3)),
+        ResponseBody::Error {
+            code: haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED.to_owned(),
+            message: "cache epoch change: account".to_owned(),
+            retryable: false,
+            data: None,
+        },
+    ]);
+    let error = execute_use(&client, "work".to_owned(), false)
+        .await
+        .expect_err("selection must require confirmation");
+
+    assert!(
+        error
+            .to_string()
+            .contains("run `haider account use work --confirm`")
+    );
+}
+
+#[tokio::test]
 async fn source_add_sends_coordinates_without_credential_material() {
     let source = AccountSourceWire {
         source_id: format!("src1_{}", "1".repeat(64)),

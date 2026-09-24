@@ -490,6 +490,102 @@ fn oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
     .expect("OAuth bundle")
 }
 
+fn stable_test_identity(email: &str, account_id: Option<&str>) -> AccountIdentity {
+    AccountIdentity {
+        email: Some(email.to_owned()),
+        display_name: Some("Account Owner".to_owned()),
+        account_id: account_id.map(str::to_owned),
+        plan: Some("pro".to_owned()),
+        issuer: Some("https://issuer.example.test".to_owned()),
+        captured_at: 1,
+        verified: true,
+    }
+}
+
+#[tokio::test]
+async fn oauth_relogin_reuses_stable_identity_alias_and_makes_it_active() {
+    let mut accounts = memory_accounts();
+    let old_alias = CredentialAlias::new("old-default");
+    let canonical_alias = CredentialAlias::new("codex-existing");
+    for (alias, active, identity) in [
+        (
+            old_alias.clone(),
+            true,
+            stable_test_identity("other@example.test", Some("other-account")),
+        ),
+        (
+            canonical_alias.clone(),
+            false,
+            stable_test_identity("support@splutter.ai", Some("acct-973")),
+        ),
+    ] {
+        accounts
+            .add(CredentialDescriptor {
+                alias,
+                provider: "fake-oauth".to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::OAuth,
+                identity: identity.summary(),
+                status: CredentialStatus::Ok,
+                active,
+                label: None,
+                account_identity: Some(identity),
+                created_at_ms: None,
+            })
+            .expect("seed OAuth account");
+    }
+    let bundle = oauth_bundle().with_account_identity(stable_test_identity(
+        "SUPPORT@splutter.ai",
+        Some("acct-973"),
+    ));
+    let requested_alias = CredentialAlias::new("fake-oauth-3");
+    let selected = oauth_alias_for_identity(&accounts, "fake-oauth", &requested_alias, &bundle);
+    assert_eq!(selected, canonical_alias);
+
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    persist_oauth_bundle(
+        &mut accounts,
+        vault,
+        "fake-oauth",
+        &selected,
+        &bundle,
+        None,
+        true,
+    )
+    .await
+    .expect("interactive OAuth commit");
+
+    assert_eq!(accounts.list().len(), 2, "re-login must not add a row");
+    assert_eq!(
+        accounts
+            .active_for_provider("fake-oauth")
+            .map(|descriptor| &descriptor.alias),
+        Some(&canonical_alias)
+    );
+}
+
+#[test]
+fn oauth_provider_without_stable_identity_keeps_requested_alias() {
+    let accounts = memory_accounts();
+    let requested_alias = CredentialAlias::new("kimi-oauth-2");
+    assert_eq!(
+        oauth_alias_for_identity(&accounts, "fake-oauth", &requested_alias, &oauth_bundle()),
+        requested_alias
+    );
+
+    let current = stable_test_identity("owner@example.test", Some("account-a"));
+    let different_account = stable_test_identity("OWNER@example.test", Some("account-b"));
+    assert!(
+        !current.same_stable_principal(&different_account),
+        "different provider account IDs are authoritative over a reused email"
+    );
+    let legacy = stable_test_identity("OWNER@example.test", None);
+    assert!(
+        current.same_stable_principal(&legacy),
+        "email bridges a legacy row that predates stable account-ID capture"
+    );
+}
+
 // MUTATION CHECK (W5a/B6a provider dispatch): remove either native API-key
 // arm from `build_account_provider`. Expected failure: OpenAI or Gemini
 // resolution returns InvalidArgument before capabilities identify the native
@@ -7713,6 +7809,7 @@ async fn automatic_catalog_flight_coalesces_foreground_and_honors_discovery_disa
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: GEMINI_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("gemini-foreground-refresh"),
                 sink,
@@ -7757,6 +7854,7 @@ async fn automatic_catalog_flight_coalesces_foreground_and_honors_discovery_disa
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: GEMINI_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("gemini-explicit-refresh"),
                 sink,
@@ -7802,13 +7900,17 @@ fn refresh_oauth_catalog() -> OAuthProviderCatalog {
 }
 
 fn refresh_oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
+    refresh_oauth_bundle_with_access(b"MODEL_REFRESH_ACCESS_SENTINEL_73c1")
+}
+
+fn refresh_oauth_bundle_with_access(access_token: &[u8]) -> haider_accounts::OAuthTokenBundleV1 {
     haider_accounts::OAuthTokenBundleV1::new(
         OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         "http://127.0.0.1:32111".to_owned(),
         "model-refresh-audience".to_owned(),
         Some("model-refresh-resource".to_owned()),
         "Bearer".to_owned(),
-        Zeroizing::new(b"MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_vec()),
+        Zeroizing::new(access_token.to_vec()),
         Some(Zeroizing::new(
             b"MODEL_REFRESH_UNUSED_REFRESH_SENTINEL_442a".to_vec(),
         )),
@@ -7822,6 +7924,61 @@ fn refresh_oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
         1,
     )
     .expect("model refresh bundle")
+}
+
+#[test]
+fn model_refresh_skips_dead_default_and_honours_explicit_alias() {
+    let mut accounts = memory_accounts();
+    for (alias, status, active) in [
+        ("dead-default", CredentialStatus::Expired, true),
+        ("live-fallback", CredentialStatus::Ok, false),
+        ("live-explicit", CredentialStatus::Ok, false),
+    ] {
+        accounts
+            .add(CredentialDescriptor {
+                alias: CredentialAlias::new(alias),
+                provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::OAuth,
+                identity: format!("{alias}@example.invalid"),
+                status,
+                active,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            })
+            .expect("seed account");
+    }
+
+    assert_eq!(
+        model_refresh_descriptor(
+            &accounts,
+            OPENAI_OAUTH_PROVIDER_NAME,
+            AuthMethod::OAuth,
+            None
+        )
+        .expect("healthy fallback")
+        .alias
+        .as_str(),
+        "live-fallback"
+    );
+    let explicit = CredentialAlias::new("live-explicit");
+    assert_eq!(
+        model_refresh_descriptor(
+            &accounts,
+            OPENAI_OAUTH_PROVIDER_NAME,
+            AuthMethod::OAuth,
+            Some(&explicit),
+        )
+        .expect("explicit account")
+        .alias
+        .as_str(),
+        "live-explicit"
+    );
+    assert_eq!(
+        catalog_auth_failure_message(Some(&CredentialAlias::new("dead-default"))),
+        "account `dead-default` cannot authenticate the model catalog; switch to a live account or re-authenticate it"
+    );
 }
 
 /// MUTATION CHECK (W5g-5b): drop the custom-profile arm from
@@ -8030,6 +8187,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: key_provider.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("custom-key-refresh"),
                 sink: key_sink,
@@ -8058,6 +8216,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: GEMINI_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("gemini-key-refresh"),
                 sink: gemini_sink,
@@ -8089,6 +8248,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: no_auth_provider.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("custom-none-refresh"),
                 sink: none_sink,
@@ -8191,8 +8351,18 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         account_identity: None,
         created_at_ms: None,
     };
+    let fallback_alias = CredentialAlias::new("model-refresh-fallback");
+    let fallback_descriptor = CredentialDescriptor {
+        alias: fallback_alias.clone(),
+        active: false,
+        identity: "model refresh fallback".to_owned(),
+        ..descriptor.clone()
+    };
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
+    accounts
+        .add(fallback_descriptor)
+        .expect("fallback descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = Arc::new(MemoryVault::new());
     vault
@@ -8201,6 +8371,14 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             &refresh_oauth_bundle().encode().expect("encode bundle"),
         )
         .expect("seed OAuth bundle");
+    vault
+        .put(
+            &fallback_alias,
+            &refresh_oauth_bundle_with_access(b"MODEL_REFRESH_LIVE_SENTINEL_973")
+                .encode()
+                .expect("encode fallback bundle"),
+        )
+        .expect("seed fallback OAuth bundle");
     let providers = test_provider_registry();
     let management =
         ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries(&|_| false));
@@ -8209,6 +8387,9 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         release: tokio::sync::Notify::new(),
         seen: StdMutex::new(Vec::new()),
         results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Err(CatalogError::Unavailable {
+                reason: "provider does not serve a model list to this credential (403)".to_owned(),
+            })),
             ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
                 models: vec![haider_provider::DiscoveredModel {
                     slug: "frontier-refresh".to_owned(),
@@ -8272,6 +8453,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models"),
                 sink,
@@ -8301,6 +8483,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert_eq!(resolved.descriptor.alias, alias);
 
     discoverer.release.notify_one();
+    discoverer.release.notify_one();
     let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
         .await
         .expect("refresh response deadline")
@@ -8320,13 +8503,20 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
 
     let seen = discoverer.seen.lock().expect("seen lock").clone();
     assert_eq!(
-        seen.first(),
-        Some(&(
-            CatalogSource::OpenAiSubscription,
-            Some("MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_owned()),
-            None,
-        )),
-        "discovery receives the broker-extracted access token, never the encoded bundle"
+        &seen[..2],
+        [
+            (
+                CatalogSource::OpenAiSubscription,
+                Some("MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_owned()),
+                None,
+            ),
+            (
+                CatalogSource::OpenAiSubscription,
+                Some("MODEL_REFRESH_LIVE_SENTINEL_973".to_owned()),
+                None,
+            ),
+        ],
+        "a catalog 403 retries another healthy account without exposing bundle bytes"
     );
     let cached = store
         .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
@@ -8356,6 +8546,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-not-modified"),
                 sink,
@@ -8403,7 +8594,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert_eq!(store.management_revision().await.expect("revision"), 1);
     let seen = discoverer.seen.lock().expect("seen lock").clone();
     assert_eq!(
-        seen.get(1).and_then(|(_, _, etag)| etag.as_deref()),
+        seen.get(2).and_then(|(_, _, etag)| etag.as_deref()),
         Some(r#"W/"refresh-etag""#)
     );
 
@@ -8414,6 +8605,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-unavailable"),
                 sink,
@@ -8472,6 +8664,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-panic"),
                 sink,
@@ -8505,6 +8698,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-after-panic"),
                 sink,
@@ -8532,6 +8726,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            account_alias: None,
             completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-during-drain"),
                 sink,
@@ -12897,6 +13092,91 @@ fn write_linked_codex_source(root: &std::path::Path, account_id: &str, email: &s
 }
 
 #[test]
+fn interactive_oauth_promotion_retains_but_disables_external_source() {
+    let profile = test_store_dir();
+    let root = profile.path().join("codex-owned-before-relogin");
+    write_linked_codex_source(&root, "acct-promotion-973", "owner@example.test");
+    let source_path = root.join("auth.json");
+    let source_before = std::fs::read(&source_path).expect("read source before promotion");
+
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::CodexHome, &root, Some("Codex source"))
+        .expect("enroll source");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("reconcile source");
+    let alias = CredentialAlias::new(
+        registry.records()[0]
+            .account_alias
+            .as_deref()
+            .expect("linked alias"),
+    );
+    let registry = Arc::new(StdMutex::new(registry));
+    let snapshot = empty_source_snapshot();
+
+    promote_linked_alias_to_haider_oauth(&registry, &snapshot, &accounts, &alias)
+        .expect("promote interactive OAuth account");
+
+    let registry_guard = registry.lock().expect("registry lock");
+    let retained = &registry_guard.records()[0];
+    assert!(
+        !retained.enabled,
+        "the enrollment remains but cannot reconcile"
+    );
+    assert_eq!(
+        retained.account_alias, None,
+        "source is no longer its owner"
+    );
+    assert_eq!(
+        std::fs::read(&source_path).expect("read retained source"),
+        source_before,
+        "promotion never rewrites or removes the external credential file"
+    );
+    drop(registry_guard);
+    let wires = snapshot.lock().expect("snapshot lock");
+    assert!(wires.iter().any(|source| {
+        source.kind == "codex_home" && source.account_alias.is_none() && source.health == "disabled"
+    }));
+    assert!(wires.iter().any(|source| {
+        source.kind == "haider_oauth" && source.account_alias.as_ref() == Some(&alias)
+    }));
+    drop(wires);
+
+    {
+        let mut registry = registry.lock().expect("registry lock");
+        registry
+            .enroll(
+                CredentialSourceKind::CodexHome,
+                &root,
+                Some("Codex source re-enrolled"),
+            )
+            .expect("explicitly re-enroll source");
+        reconcile_credential_sources(&mut registry, &mut accounts)
+            .expect("reconcile re-enrolled source");
+        let source_alias = CredentialAlias::new(
+            registry.records()[0]
+                .account_alias
+                .as_deref()
+                .expect("new linked alias"),
+        );
+        assert_ne!(
+            source_alias, alias,
+            "re-enrollment cannot take the OAuth alias"
+        );
+        assert!(accounts.get(&source_alias).is_some());
+    }
+    assert!(
+        accounts.get(&alias).is_some(),
+        "the promoted credential is retained"
+    );
+    assert_eq!(
+        accounts.list().len(),
+        2,
+        "re-enrollment is an explicit split"
+    );
+}
+
+#[test]
 fn source_reconciliation_links_every_codex_root_without_owning_refresh_rotation() {
     let profile = test_store_dir();
     let first_root = profile.path().join("codex-one");
@@ -14955,6 +15235,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         &mut followers,
         &mut refreshing,
         OPENAI_OAUTH_PROVIDER_NAME.into(),
+        None,
         ProviderModelsRefreshCompletion::Wire(LoginRoute {
             request_id: RequestId::new("missing-oauth"),
             sink: failed_sink,
@@ -14995,6 +15276,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         &mut followers,
         &mut refreshing,
         HAIDER_CODE_PROVIDER_NAME.into(),
+        None,
         ProviderModelsRefreshCompletion::Wire(LoginRoute {
             request_id: RequestId::new("public"),
             sink,
@@ -15011,6 +15293,8 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         .expect("completion");
     let AccountCommand::ProviderModelsRefreshCompleted {
         provider,
+        account_alias,
+        explicit_account,
         cached,
         result,
         completed,
@@ -15027,6 +15311,8 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             completed: &completed,
         },
         provider,
+        account_alias.as_ref(),
+        explicit_account,
         cached,
         result,
     )
@@ -15089,6 +15375,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             &mut followers,
             &mut refreshing,
             OPENAI_OAUTH_PROVIDER_NAME.into(),
+            None,
             ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("credential-preflight"),
                 sink,

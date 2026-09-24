@@ -677,3 +677,31 @@ fn labels_are_set_cleared_and_survive_rotation() {
             .is_err()
     );
 }
+
+#[test]
+fn interactive_replacement_selects_the_account_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    store
+        .add(descriptor("old", "acme", CredentialStatus::Ok, true))
+        .unwrap();
+    store
+        .add(descriptor("fresh", "acme", CredentialStatus::Ok, false))
+        .unwrap();
+
+    let mut replacement = descriptor("fresh", "acme", CredentialStatus::Ok, false);
+    replacement.identity = "signed-in-again@example.test".to_owned();
+    store.replace_and_select(replacement).unwrap();
+
+    assert_eq!(
+        store
+            .active_for_provider("acme")
+            .map(|descriptor| descriptor.alias.as_str()),
+        Some("fresh")
+    );
+    assert!(!store.get(&CredentialAlias::new("old")).unwrap().active);
+    assert_eq!(
+        store.get(&CredentialAlias::new("fresh")).unwrap().identity,
+        "signed-in-again@example.test"
+    );
+}

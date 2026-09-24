@@ -2253,6 +2253,133 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     store.close().await.expect("store close");
 }
 
+/// A provider-wide failed inventory must be retried through the account named
+/// by session creation. This pins the `haider run --account <live-alias>`
+/// path: admission may not silently substitute the provider default.
+#[tokio::test]
+async fn session_create_refreshes_unavailable_inventory_with_explicit_account() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let live_alias = haider_protocol::ids::CredentialAlias::new("live-openai");
+    let descriptor = haider_protocol::credential::CredentialDescriptor {
+        alias: live_alias.clone(),
+        provider: "openai-oauth".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::OAuth,
+        identity: "live@example.invalid".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: false,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let mut unavailable = provider_summary("openai-oauth");
+    unavailable.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "dead default returned 403".into(),
+    };
+    unavailable.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+    unavailable.availability_reason = Some("dead default returned 403".into());
+    let (commands, mut actor_mailbox) = mpsc::channel(2);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(commands),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(vec![descriptor.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            vec![descriptor],
+            vec![unavailable],
+        ),
+        vault_supported: true,
+        discovery_disabled: false,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+        vault: Some(Arc::new(haider_accounts::MemoryVault::default())),
+    })
+    .expect("accounts install");
+    hub.install_creatable_providers(std::collections::BTreeSet::from(
+        ["openai-oauth".to_owned()],
+    ))
+    .expect("creatable providers");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let request = connection.request(
+        RequestId::new("explicit-account-create"),
+        RequestBody::SessionCreateWithPermissionOverrides {
+            command_id: haider_rpc::CommandId::new("explicit-account-create-command"),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "openai-oauth".into(),
+            model: "gpt-live".into(),
+            max_tokens: 4_096,
+            permission_overrides: None,
+            workspace_allocation: None,
+            cache_policy: None,
+            interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+            ssh_scope: None,
+            account_alias: Some(live_alias.clone()),
+            resolve_provider: false,
+            resolve_model: false,
+            effort: None,
+            fast: None,
+        },
+    );
+    tokio::pin!(request);
+    let command = tokio::select! {
+        command = actor_mailbox.recv() => command.expect("model refresh command"),
+        result = &mut request => panic!("session admission completed before refresh: {result:?}"),
+    };
+    let crate::accounts::AccountCommand::RefreshProviderModels {
+        provider,
+        account_alias,
+        completed,
+    } = command
+    else {
+        panic!("unexpected account command");
+    };
+    assert_eq!(provider, "openai-oauth");
+    assert_eq!(account_alias.as_ref(), Some(&live_alias));
+    let crate::accounts::ProviderModelsRefreshCompletion::Internal(sender) = completed else {
+        panic!("session admission must use an internal completion");
+    };
+    let mut refreshed = provider_summary("openai-oauth");
+    refreshed.models = vec!["gpt-live".into()];
+    refreshed.default_model = Some("gpt-live".into());
+    refreshed.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    refreshed.availability = haider_rpc::ProviderAvailabilityWire::Available;
+    sender
+        .lock()
+        .expect("completion lock")
+        .take()
+        .expect("completion sender")
+        .send(Ok(refreshed))
+        .expect("refresh completion");
+    request.await.expect("session create completes");
+
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionCreate { metadata, .. },
+        } if request_id.as_str() == "explicit-account-create"
+            && metadata.account_alias.as_deref() == Some("live-openai")
+    )));
+    connection.close().await.expect("connection close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// R2-03: absent storage is the canonical default `All` scope. A later
 /// narrowing must survive exact create-receipt replay, while an explicitly
 /// non-default create still persists its scope before returning.
@@ -5225,12 +5352,14 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
     let command = actor_mailbox.recv().await.expect("owned actor job");
     let crate::accounts::AccountCommand::RefreshProviderModels {
         provider,
+        account_alias,
         completed,
     } = command
     else {
         panic!("unexpected actor command");
     };
     assert_eq!(provider, "openai-oauth");
+    assert_eq!(account_alias, None);
     let crate::accounts::ProviderModelsRefreshCompletion::Wire(completed) = completed else {
         panic!("RPC refresh must carry a wire completion");
     };
