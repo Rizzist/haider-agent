@@ -16,7 +16,7 @@
 //!
 //! [`UsageState::display_order`]: crate::app::UsageState::display_order
 
-use haider_protocol::usage::{AccountMeterStateV1, AccountUsageReportV1, UsageWindowV1};
+use haider_protocol::usage::{AccountMeterStateV1, AccountUsageReportV1};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -24,82 +24,12 @@ use super::{ellipsize, hover_band};
 use crate::app::AppModel;
 use crate::theme::Theme;
 use crate::usage_detail::{
-    DetailTone, account_extras, detail_rows, fmt_meter_reason_friendly, is_haider_code,
+    DetailTone, ResetKind, account_extras, account_marker, detail_rows, fmt_meter_reason_friendly,
+    reset_at, reset_window,
 };
 use crate::usage_time::{
     UsageTimeZone, fmt_relative, fmt_reset_instant, fmt_reset_short, fmt_zone_caption, zoned_day,
 };
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResetKind {
-    FiveHour,
-    Weekly,
-}
-
-impl ResetKind {
-    const BOTH: [Self; 2] = [Self::FiveHour, Self::Weekly];
-
-    const fn marker(self) -> char {
-        match self {
-            Self::FiveHour => '5',
-            Self::Weekly => 'W',
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::FiveHour => "5h",
-            Self::Weekly => "weekly",
-        }
-    }
-}
-
-/// Pick only provider-published windows whose names have a defined meaning.
-/// In particular, this never derives a reset by adding five hours or seven
-/// days: a missing canonical window/reset stays `reset unknown`. Haider Code
-/// publishes one account-wide weekly allowance and no five-hour window.
-fn reset_window(account: &AccountUsageReportV1, kind: ResetKind) -> Option<&UsageWindowV1> {
-    let AccountMeterStateV1::Metered { windows } = &account.meter else {
-        return None;
-    };
-    let provider = account.provider.to_ascii_lowercase();
-    let names: &[&str] = match (provider.as_str(), kind) {
-        (provider, ResetKind::FiveHour) if provider.starts_with("anthropic") => &["five_hour"],
-        (provider, ResetKind::Weekly) if provider.starts_with("anthropic") => &["seven_day"],
-        (provider, ResetKind::FiveHour)
-            if provider.starts_with("openai") || provider.contains("codex") =>
-        {
-            &["5h", "five_hour"]
-        }
-        (provider, ResetKind::Weekly)
-            if provider.starts_with("openai") || provider.contains("codex") =>
-        {
-            &["weekly", "seven_day"]
-        }
-        (provider, ResetKind::Weekly) if is_haider_code(provider) => &["weekly", "seven_day"],
-        _ => return None,
-    };
-    // OpenAI can publish identically sized named per-model windows. Only an
-    // unlabeled provider window is account-wide; even a lone labeled window
-    // is not a safe account reset and must stay unknown.
-    windows
-        .iter()
-        .find(|window| window.label.is_none() && names.contains(&window.window.as_str()))
-}
-
-fn reset_at(account: &AccountUsageReportV1, kind: ResetKind) -> Option<u64> {
-    reset_window(account, kind).and_then(|window| window.resets_at_ms)
-}
-
-fn account_marker(index: usize) -> String {
-    u8::try_from(index)
-        .ok()
-        .filter(|index| *index < 26)
-        .map_or_else(
-            || (index + 1).to_string(),
-            |index| char::from(b'a' + index).to_string(),
-        )
-}
 
 fn month_name(month: u32) -> &'static str {
     const MONTHS: [&str; 12] = [

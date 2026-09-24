@@ -5046,7 +5046,7 @@ fn render_usage(
             "↑↓ ←→ account (list order) · b banked reset · PgUp/PgDn scroll · f refresh · s next scope · esc back"
         }
         crate::app::UsageScope::Calendar => {
-            "↑↓ account · b banked · f refresh · s scope · esc back"
+            "↑↓ account · ⇞⇟ scroll · b banked · f refresh · s scope · esc back"
         }
         crate::app::UsageScope::Global if wide => {
             "↑↓ ←→ account (list order) · r reveal · f refresh · s next scope · esc back"

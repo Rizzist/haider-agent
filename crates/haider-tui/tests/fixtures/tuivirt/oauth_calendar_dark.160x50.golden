@@ -43,8 +43,8 @@
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×111
 21|      │ banked resets    not reported by provider                                                                                                               |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×111
-22|      │ use banked reset unavailable — provider offers no banked-reset operation                                                                                |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×17; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×55; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+22|      │ use banked reset no operation reported for this account                                                                                                 |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×17; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×38; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×97
 23|    b  anthropic2 · anthropic-oauth · w***@c***.dev · plan unknown                                                                                              |
    ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×66; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×94
 24|      5h reset unknown · weekly reset unknown · meter unavailable · credential unavailable — could not load the login · try /login                              |

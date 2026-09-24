@@ -37,12 +37,12 @@
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×31
 18|      │ banked resets    not reported by provider                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×31
-19|⋮     │ use banked reset unavailable — provider offers no banked-reset operati… |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×54; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1
+19|⋮     │ use banked reset no operation reported for this account                 |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×17
 20|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×80
-21|↑↓ account · b banked · f refresh · s scope · esc back                          |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×54; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×26
+21|↑↓ account · ⇞⇟ scroll · b banked · f refresh · s scope · esc back              |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×66; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×14
 22|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×80
 23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |

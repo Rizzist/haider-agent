@@ -780,11 +780,23 @@ pub fn providers_plain(model: &crate::app::AppModel) -> String {
     out
 }
 
-/// `/usage` plain grammar — the scope headline, the honesty lines (demo /
-/// fetching / read error), and one line per account: worst-window meter
-/// state spelled in words plus this device's journal totals.
+/// `/usage` plain grammar — the styled screen's information in words
+/// (973): the scope headline and honesty lines (demo / fetching / read
+/// error), the time frame, then every account in the ONE on-screen order
+/// the arrow keys step (`>` marks the selection) with its meter state, each
+/// 5h/weekly reset as `local (UTC) · relative · window` or the reason it is
+/// unknown, the selected account's detail fields (absent data says "not
+/// reported"), and the reset days in calendar order naming the account
+/// alias beside every reset. No colour, no glyph carries meaning alone.
 #[must_use]
 pub fn usage_plain(model: &crate::app::AppModel) -> String {
+    use crate::usage_detail::{
+        ResetKind, account_extras, account_marker, detail_rows, fmt_meter_reason_friendly,
+        reset_at, reset_unknown_reason, reset_window,
+    };
+    use crate::usage_time::{
+        fmt_relative, fmt_reset_instant, fmt_reset_short, fmt_zone_caption, zoned_day,
+    };
     use haider_protocol::usage::AccountMeterStateV1;
     let usage = &model.usage;
     let mut out = format!(
@@ -795,8 +807,12 @@ pub fn usage_plain(model: &crate::app::AppModel) -> String {
         out.push_str(&format!("filter: {filter}*\n"));
     }
     if model.mode.fabricates_locally() {
+        // The demo never fabricates a report; one injected by a fixture
+        // (dev example / tests) is rendered below, under this honesty line.
         out.push_str("demo — usage is live daemon truth, never fabricated\n");
-        return out;
+        if usage.report.is_none() {
+            return out;
+        }
     }
     if usage.fetching {
         out.push_str("fetching…\n");
@@ -812,8 +828,50 @@ pub fn usage_plain(model: &crate::app::AppModel) -> String {
     };
     if report.accounts.is_empty() {
         out.push_str("no accounts known — /login adds one\n");
+        return out;
     }
-    for account in &report.accounts {
+    let order = usage
+        .display_order()
+        .into_iter()
+        .filter(|&slot| slot < report.accounts.len())
+        .collect::<Vec<_>>();
+    if order.is_empty() {
+        out.push_str(&format!(
+            "no accounts match \"{}\" — bare /usage clears the filter\n",
+            usage.filter.as_deref().unwrap_or_default()
+        ));
+        return out;
+    }
+    let zone = usage.time_zone;
+    let snapshot = report.generated_at_ms;
+    let year = crate::format::civil_from_days(zoned_day(snapshot, zone)).0;
+    out.push_str(&format!(
+        "times: {}; relative to the snapshot {}\n",
+        if zone.offset_at_ms(snapshot).is_some() {
+            format!("{}, UTC beside each", fmt_zone_caption(snapshot, zone))
+        } else {
+            fmt_zone_caption(snapshot, zone)
+        },
+        fmt_reset_instant(snapshot, zone, year)
+    ));
+    out.push_str(
+        "keys: up/down/left/right step accounts in the order listed; b banked reset; s next scope\n",
+    );
+    let selected = usage.selected_slot();
+    if let Some(slot) = selected
+        && let Some(index) = order.iter().position(|&candidate| candidate == slot)
+    {
+        let account = &report.accounts[slot];
+        out.push_str(&format!(
+            "selected: {} {} ({})\n",
+            account_marker(index),
+            account.alias,
+            account.provider
+        ));
+    }
+    out.push_str("accounts, in on-screen order:\n");
+    for (index, &slot) in order.iter().enumerate() {
+        let account = &report.accounts[slot];
         let meter = match &account.meter {
             AccountMeterStateV1::Metered { windows } => windows
                 .iter()
@@ -825,28 +883,115 @@ pub fn usage_plain(model: &crate::app::AppModel) -> String {
                 .map_or_else(
                     || "metered; no windows published".to_owned(),
                     |worst| {
+                        // `fmt_remaining` already says "N% left" (the 972
+                        // grammar printed "left left").
                         format!(
-                            "{} left in {}",
+                            "{} in {}",
                             crate::format::fmt_remaining(worst.utilization),
                             worst.window
                         )
                     },
                 ),
-            AccountMeterStateV1::Unavailable { reason } => format!(
-                "meter unavailable — {}",
-                crate::format::fmt_meter_reason(reason)
-            ),
+            AccountMeterStateV1::Unavailable { reason } => {
+                format!("meter unavailable — {}", fmt_meter_reason_friendly(reason))
+            }
             AccountMeterStateV1::LocalOnly => "local only".to_owned(),
         };
         let local = &account.local;
+        let is_selected = selected == Some(slot);
         out.push_str(&format!(
-            "{} — {} — {meter}; in {}; out {}; cached {}\n",
+            "{} {} {} — {} — {meter}; in {}; out {}; cached {}{}\n",
+            if is_selected { ">" } else { " " },
+            account_marker(index),
             account.alias,
             account.provider,
             fmt_tok(local.input_tokens),
             fmt_tok(local.output_tokens),
             fmt_tok(local.cached_tokens),
+            if is_selected { " (selected)" } else { "" },
         ));
+        for kind in ResetKind::BOTH {
+            let line = match (reset_at(account, kind), reset_window(account, kind)) {
+                (Some(at), Some(window)) => format!(
+                    "{} · {} · {}",
+                    fmt_reset_instant(at, zone, year),
+                    fmt_relative(snapshot, at),
+                    window.window
+                ),
+                _ => format!(
+                    "unknown — {}",
+                    reset_unknown_reason(account, kind).unwrap_or_default()
+                ),
+            };
+            out.push_str(&format!("    {} reset: {line}\n", kind.label()));
+        }
+        if is_selected {
+            out.push_str(&format!("    detail for {}:\n", account.alias));
+            let extras = account_extras(account);
+            let mut label = "";
+            for row in detail_rows(account, &extras, zone, snapshot, year) {
+                if !row.label.is_empty() {
+                    label = row.label;
+                }
+                out.push_str(&format!("      {label}: {}\n", row.text));
+            }
+        }
+    }
+    // The calendar grid in words: every day that carries a published
+    // reset, in date order, naming the account alias beside each reset.
+    let mut days: Vec<(i64, u64, String)> = Vec::new();
+    for (index, &slot) in order.iter().enumerate() {
+        let account = &report.accounts[slot];
+        for kind in ResetKind::BOTH {
+            if let Some(at) = reset_at(account, kind) {
+                days.push((
+                    zoned_day(at, zone),
+                    at,
+                    format!(
+                        "{} {} {} at {}{}",
+                        account_marker(index),
+                        account.alias,
+                        kind.label(),
+                        fmt_reset_short(at, zone, year),
+                        if selected == Some(slot) {
+                            " (selected)"
+                        } else {
+                            ""
+                        }
+                    ),
+                ));
+            }
+        }
+    }
+    days.sort_by_key(|(day, at, _)| (*day, *at));
+    if days.is_empty() {
+        out.push_str("reset days: none published\n");
+    } else {
+        out.push_str("reset days:\n");
+        let mut current = None;
+        let mut line = String::new();
+        for (day, at, text) in days {
+            if current != Some(day) {
+                if !line.is_empty() {
+                    out.push_str(&format!("{line}\n"));
+                }
+                let offset = zone.offset_at_ms(at).unwrap_or(0);
+                let civil = crate::usage_time::civil_instant(at, offset);
+                line = format!(
+                    "  {}{}: {text}",
+                    crate::usage_time::fmt_civil_date(&civil, year),
+                    if day == zoned_day(snapshot, zone) {
+                        " (today)"
+                    } else {
+                        ""
+                    }
+                );
+                current = Some(day);
+            } else {
+                line.push_str(&format!("; {text}"));
+            }
+        }
+        out.push_str(&format!("{line}\n"));
     }
     out
 }

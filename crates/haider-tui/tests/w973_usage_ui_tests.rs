@@ -620,9 +620,7 @@ fn detail_panel_says_not_reported_and_disables_the_action() {
     assert!(text.contains("│ DETAIL anthropic-oauth-2 — provider-reported extras"));
     assert!(text.contains("│ previous resets  not reported by provider"));
     assert!(text.contains("│ banked resets    not reported by provider"));
-    assert!(
-        text.contains("│ use banked reset unavailable — provider offers no banked-reset operation")
-    );
+    assert!(text.contains("│ use banked reset no operation reported for this account"));
     assert_eq!(
         text.matches("│ DETAIL").count(),
         1,
@@ -802,9 +800,7 @@ fn b_explains_the_unavailable_banked_reset_and_requests_nothing() {
     model.handle(key(KeyCode::Char('b')));
     assert_eq!(
         model.flash.as_deref(),
-        Some(
-            "use banked reset: unavailable for openai-oauth — provider offers no banked-reset operation"
-        )
+        Some("no banked-reset operation reported for openai-oauth")
     );
     assert!(
         !model
@@ -817,6 +813,20 @@ fn b_explains_the_unavailable_banked_reset_and_requests_nothing() {
         banked_reset_unavailable_note("x", &BankedResetAction::Available),
         None
     );
+    // Only an EXPLICIT wire state may say the provider offers none; the
+    // current wire's silence is "not reported".
+    assert_eq!(
+        banked_reset_unavailable_note("x", &BankedResetAction::NotOffered).as_deref(),
+        Some("use banked reset: unavailable for x — provider offers no banked-reset operation")
+    );
+    let report = owner_report();
+    for account in &report.accounts {
+        assert_eq!(
+            account_extras(account).action,
+            BankedResetAction::NotReported,
+            "absence on the wire is never 'not offered'"
+        );
+    }
 }
 
 // ---- 6. friendlier meter failures ---------------------------------------
@@ -920,4 +930,112 @@ fn dump_frames_for_review() {
     for row in draw(&global, 118, 36).rows {
         println!("{}", row.trim_end());
     }
+}
+
+// ---- 8. plain mode -------------------------------------------------------
+
+/// Plain mode carries the calendar's information in words: on-screen
+/// order with the selection, every reset as local (UTC) · relative ·
+/// window with the alias beside it, unknowns with their reason, the
+/// selected account's detail fields, and the reset days in date order.
+/// The demo's honesty line stays, and a (fixture) report is still read.
+#[test]
+fn plain_mode_carries_the_calendar_information_in_words() {
+    let mut model = calendar(UsageTimeZone::Fixed(OWNER_OFFSET));
+    for _ in 0..3 {
+        model.handle(key(KeyCode::Down));
+    }
+    let plain = haider_tui::plain::usage_plain(&model);
+    for needle in [
+        "USAGE — scope calendar;",
+        "demo — usage is live daemon truth, never fabricated",
+        "times: local UTC+03:30, UTC beside each; relative to the snapshot Wed 23 Sep · 20:30 local (17:00 UTC)",
+        "selected: d anthropic-oauth-2 (anthropic-oauth)",
+        "accounts, in on-screen order:",
+        "  c anthropic-oauth — anthropic-oauth — meter unavailable — http 429 — rate limited · f retries later;",
+        "    5h reset: unknown — meter unavailable · http 429 — rate limited · f retries later",
+        "> d anthropic-oauth-2 — anthropic-oauth — 60% left in five_hour; in 0; out 0; cached 0 (selected)",
+        "    5h reset: Thu 24 Sep · 00:39 local (Wed 23 Sep 21:09 UTC) · in 4h 9m · five_hour",
+        "    weekly reset: Fri 25 Sep · 20:29 local (16:59 UTC) · in 1d 23h · seven_day",
+        "    detail for anthropic-oauth-2:",
+        "      previous resets: not reported by provider",
+        "      banked resets: not reported by provider",
+        "      use banked reset: no operation reported for this account",
+        "    5h reset: unknown — local only; no provider meter",
+        "reset days:",
+        "  Thu 24 Sep: d anthropic-oauth-2 5h at Thu 24 Sep 00:39 local (selected); e anthropic-oauth-3 5h at Thu 24 Sep 05:45 local",
+        "  Fri 25 Sep: d anthropic-oauth-2 weekly at Fri 25 Sep 20:29 local (selected)",
+        "  Mon 28 Sep: e anthropic-oauth-3 weekly at Mon 28 Sep 12:30 local",
+    ] {
+        assert!(plain.contains(needle), "missing {needle:?} in:\n{plain}");
+    }
+    // The listed order is the arrow order.
+    let listed = plain
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("> ")
+                .or_else(|| line.strip_prefix("  "))?;
+            let (marker, rest) = rest.split_once(' ')?;
+            (marker.len() == 1 && marker.chars().all(|c| c.is_ascii_lowercase()))
+                .then(|| rest.split(" — ").next().unwrap_or_default().to_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(listed, DISPLAY_ORDER);
+    assert!(
+        !plain.contains("offers no"),
+        "absence is never 'not offered'"
+    );
+}
+
+#[test]
+fn plain_mode_without_a_local_zone_says_utc_and_marks_today() {
+    let mut model = calendar(UsageTimeZone::UtcOnly);
+    for _ in 0..3 {
+        model.handle(key(KeyCode::Down));
+    }
+    let plain = haider_tui::plain::usage_plain(&model);
+    assert!(
+        plain.contains("times: UTC; relative to the snapshot Wed 23 Sep · 17:00 UTC"),
+        "{plain}"
+    );
+    assert!(plain.contains("    5h reset: Wed 23 Sep · 21:09 UTC · in 4h 9m · five_hour"));
+    assert!(
+        plain.contains(
+            "  Wed 23 Sep (today): d anthropic-oauth-2 5h at Wed 23 Sep 21:09 UTC (selected)"
+        ),
+        "{plain}"
+    );
+    // The demo plain oracle appends the grammar only when left on /usage.
+    let oracle = haider_tui::runtime::run_demo_plain(model);
+    assert!(oracle.contains("selected: d anthropic-oauth-2 (anthropic-oauth)"));
+    let launcher = haider_tui::runtime::run_demo_plain(launcher_model());
+    assert!(
+        !launcher.contains("USAGE —"),
+        "other screens keep their oracle"
+    );
+}
+
+#[test]
+fn plain_mode_haider_code_allowance_and_no_report_states() {
+    let mut report = owner_report();
+    report.accounts[2].meter = AccountMeterStateV1::Metered {
+        windows: vec![window("weekly", 0.38, Some(HC_WEEKLY_MS))],
+    };
+    let mut model = usage_model(
+        report,
+        UsageScope::Calendar,
+        UsageTimeZone::Fixed(OWNER_OFFSET),
+    );
+    for _ in 0..5 {
+        model.handle(key(KeyCode::Down));
+    }
+    let plain = haider_tui::plain::usage_plain(&model);
+    assert!(plain.contains(
+        "      weekly allowance: 62% left · resets Wed 30 Sep · 03:30 local (00:00 UTC) · in 6d 7h · weekly"
+    ), "{plain}");
+    assert!(plain.contains("    5h reset: unknown — exact window not published"));
+    let mut empty = launcher_model();
+    run_slash(&mut empty, "/usage");
+    assert!(haider_tui::plain::usage_plain(&empty).ends_with("never fabricated\n"));
 }

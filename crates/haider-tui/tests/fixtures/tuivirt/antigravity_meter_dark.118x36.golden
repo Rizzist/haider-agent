@@ -41,8 +41,8 @@
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×69
 20|      │ banked resets    not reported by provider                                                                     |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×69
-21|      │ use banked reset unavailable — provider offers no banked-reset operation                                      |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×17; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×55; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38
+21|      │ use banked reset no operation reported for this account                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×17; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×38; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×55
 22|                                                                                                                      |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
 23|                                                                                                                      |

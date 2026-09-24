@@ -57,8 +57,8 @@
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×69
 28|      │ banked resets    not reported by provider                                                                     |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×69
-29|      │ use banked reset unavailable — provider offers no banked-reset operation                                      |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×55; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×38
+29|      │ use banked reset no operation reported for this account                                                       |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×55
 30|    e  anthropic-oauth-3 · anthropic-oauth · c******@e******.com · plan unknown                                       |
    ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/NONE×79; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×39
 31|⋮     5h Thu 24 Sep · 05:45 local (02:15 UTC) · in 9h 15m · five_hour                                                 |

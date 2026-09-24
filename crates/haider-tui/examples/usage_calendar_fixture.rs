@@ -6,6 +6,7 @@
 //! ```sh
 //! TZ=Asia/Tehran cargo run -p haider-tui --example usage_calendar_fixture
 //! # then type `/usage calendar` ⏎ and use ↑↓ ←→ / b / s
+//! TZ=Asia/Tehran cargo run -p haider-tui --example usage_calendar_fixture -- --plain --down 3
 //! ```
 //!
 //! The report is synthetic (identities are `example.*` addresses) and is
@@ -18,9 +19,10 @@ use haider_protocol::ids::CredentialAlias;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1, UsageWindowV1,
 };
-use haider_tui::app::AppModel;
+use haider_tui::app::{AppEvent, AppModel};
 use haider_tui::theme::{ThemeChoice, ThemeKey};
 use haider_tui::usage_time::UsageTimeZone;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn account(
     provider: &str,
@@ -117,12 +119,54 @@ fn fixture_report() -> UsageReportV1 {
     }
 }
 
+fn key(model: &mut AppModel, code: KeyCode) {
+    model.handle(AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+}
+
+/// `--plain [--down N]`: open `/usage calendar`, step the selection N rows
+/// with the real key handler, press `b`, and print the repo's plain oracle
+/// (`run_demo_plain`, which appends the `/usage` plain grammar) instead of
+/// starting the interactive loop.
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let plain = args.iter().any(|arg| arg == "--plain");
+    let downs = args
+        .iter()
+        .position(|arg| arg == "--down")
+        .and_then(|at| args.get(at + 1))
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(0);
     let mut model = AppModel::new();
     model.identity.device = "fixture-box".to_owned();
     model.apply_theme_choice(ThemeChoice::Fixed(ThemeKey::Dark));
     model.usage.apply_report(fixture_report());
     model.usage.time_zone = UsageTimeZone::Host;
-    haider_tui::runtime::run_demo(model, None).await
+    if !plain {
+        return haider_tui::runtime::run_demo(model, None).await;
+    }
+    // Leave the boot screen the way the runtime does, so the composer takes
+    // the slash command.
+    model.handle(AppEvent::Envelope(Box::new(
+        haider_protocol::EventPayload::HarnessStatus(haider_protocol::state::HarnessStatus::Ready),
+    )));
+    for c in "/usage calendar".chars() {
+        key(&mut model, KeyCode::Char(c));
+    }
+    key(&mut model, KeyCode::Esc);
+    key(&mut model, KeyCode::Enter);
+    for _ in 0..downs {
+        key(&mut model, KeyCode::Down);
+    }
+    if model.screen != haider_tui::app::Screen::Usage {
+        eprintln!("usage_calendar_fixture: /usage did not open");
+        std::process::exit(1);
+    }
+    key(&mut model, KeyCode::Char('b'));
+    let banked_note = model.flash.clone();
+    print!("{}", haider_tui::runtime::run_demo_plain(model));
+    if let Some(note) = banked_note {
+        println!("b pressed: {note}");
+    }
+    Ok(())
 }

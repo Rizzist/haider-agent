@@ -37,12 +37,12 @@
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×31
 18|      │ banked resets    not reported by provider                               |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×31
-19|⋮     │ use banked reset unavailable — provider offers no banked-reset operati… |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×17; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×54; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+19|⋮     │ use banked reset no operation reported for this account                 |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×17; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×38; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×17
 20|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
-21|↑↓ account · b banked · f refresh · s scope · esc back                          |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×54; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×26
+21|↑↓ account · ⇞⇟ scroll · b banked · f refresh · s scope · esc back              |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×66; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×14
 22|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
 23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |

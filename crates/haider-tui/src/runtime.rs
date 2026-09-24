@@ -3258,6 +3258,9 @@ fn copy_selection_effects(model: &mut AppModel, text: &str) {
 /// return the final plain rendering (the `--plain` path and the CI oracle).
 #[must_use]
 pub fn run_demo_plain(mut model: AppModel) -> String {
+    // 973: a model handed over ON `/usage` carries that screen's plain
+    // grammar too (the demo script never opens it; fixture harnesses do).
+    let on_usage = model.screen == crate::app::Screen::Usage;
     for payload in demo_script() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
@@ -3271,6 +3274,9 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
         &model.status_line(),
     );
     output.push_str(&crate::plain::agent_metrics_plain(&model));
+    if on_usage {
+        output.push_str(&crate::plain::usage_plain(&model));
+    }
     output
 }
 

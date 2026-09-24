@@ -58,8 +58,13 @@ pub struct BankedResets {
 /// Whether "use banked reset" can be offered for this account.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BankedResetAction {
-    /// No provider operation exists (or none is reported): disabled.
+    /// Nothing on the wire says whether an operation exists (the 973 usage
+    /// report carries no such field). Unknown is never inferred: this is
+    /// "not reported", NOT "not offered". Disabled.
     #[default]
+    NotReported,
+    /// The provider/daemon explicitly reported that no operation exists
+    /// (a future wire state). Disabled.
     NotOffered,
     /// The provider operation exists but cannot be used now (typed reason,
     /// e.g. `no banked resets remaining`): disabled with that reason.
@@ -108,6 +113,105 @@ pub fn haider_code_weekly_window(account: &AccountUsageReportV1) -> Option<&Usag
     windows.iter().find(|window| {
         window.label.is_none() && matches!(window.window.as_str(), "weekly" | "seven_day")
     })
+}
+
+/// The two account-wide reset windows the calendar plots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetKind {
+    FiveHour,
+    Weekly,
+}
+
+impl ResetKind {
+    pub const BOTH: [Self; 2] = [Self::FiveHour, Self::Weekly];
+
+    /// The grid marker suffix (`a5`, `aW`).
+    #[must_use]
+    pub const fn marker(self) -> char {
+        match self {
+            Self::FiveHour => '5',
+            Self::Weekly => 'W',
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FiveHour => "5h",
+            Self::Weekly => "weekly",
+        }
+    }
+}
+
+/// Pick only provider-published windows whose names have a defined meaning.
+/// This never derives a reset by adding five hours or seven days: a missing
+/// canonical window/reset stays `reset unknown`. Haider Code publishes one
+/// account-wide weekly allowance and no five-hour window.
+#[must_use]
+pub fn reset_window(account: &AccountUsageReportV1, kind: ResetKind) -> Option<&UsageWindowV1> {
+    let AccountMeterStateV1::Metered { windows } = &account.meter else {
+        return None;
+    };
+    let provider = account.provider.to_ascii_lowercase();
+    let names: &[&str] = match (provider.as_str(), kind) {
+        (provider, ResetKind::FiveHour) if provider.starts_with("anthropic") => &["five_hour"],
+        (provider, ResetKind::Weekly) if provider.starts_with("anthropic") => &["seven_day"],
+        (provider, ResetKind::FiveHour)
+            if provider.starts_with("openai") || provider.contains("codex") =>
+        {
+            &["5h", "five_hour"]
+        }
+        (provider, ResetKind::Weekly)
+            if provider.starts_with("openai") || provider.contains("codex") =>
+        {
+            &["weekly", "seven_day"]
+        }
+        (provider, ResetKind::Weekly) if is_haider_code(provider) => &["weekly", "seven_day"],
+        _ => return None,
+    };
+    // OpenAI can publish identically sized named per-model windows. Only an
+    // unlabeled provider window is account-wide; even a lone labeled window
+    // is not a safe account reset and must stay unknown.
+    windows
+        .iter()
+        .find(|window| window.label.is_none() && names.contains(&window.window.as_str()))
+}
+
+/// The grid letter for display index `index` (`a`…`z`, then `27`, `28`…).
+#[must_use]
+pub fn account_marker(index: usize) -> String {
+    u8::try_from(index)
+        .ok()
+        .filter(|index| *index < 26)
+        .map_or_else(
+            || (index + 1).to_string(),
+            |index| char::from(b'a' + index).to_string(),
+        )
+}
+
+/// The published reset instant of `kind`, when there is one.
+#[must_use]
+pub fn reset_at(account: &AccountUsageReportV1, kind: ResetKind) -> Option<u64> {
+    reset_window(account, kind).and_then(|window| window.resets_at_ms)
+}
+
+/// Why a reset of `kind` is unknown, in words (`None` when it is known).
+#[must_use]
+pub fn reset_unknown_reason(account: &AccountUsageReportV1, kind: ResetKind) -> Option<String> {
+    match &account.meter {
+        AccountMeterStateV1::Unavailable { reason } => Some(format!(
+            "meter unavailable · {}",
+            fmt_meter_reason_friendly(reason)
+        )),
+        AccountMeterStateV1::LocalOnly => Some("local only; no provider meter".to_owned()),
+        AccountMeterStateV1::Metered { .. } => match reset_window(account, kind) {
+            None => Some("exact window not published".to_owned()),
+            Some(window) if window.resets_at_ms.is_none() => {
+                Some(format!("{} published no reset", window.window))
+            }
+            Some(_) => None,
+        },
+    }
 }
 
 #[must_use]
@@ -249,6 +353,11 @@ pub fn detail_rows(
         }
     });
     rows.push(match &extras.action {
+        BankedResetAction::NotReported => DetailRow::new(
+            "use banked reset",
+            "no operation reported for this account",
+            DetailTone::Disabled,
+        ),
         BankedResetAction::NotOffered => DetailRow::new(
             "use banked reset",
             "unavailable — provider offers no banked-reset operation",
@@ -273,6 +382,9 @@ pub fn detail_rows(
 pub fn banked_reset_unavailable_note(alias: &str, action: &BankedResetAction) -> Option<String> {
     match action {
         BankedResetAction::Available => None,
+        BankedResetAction::NotReported => {
+            Some(format!("no banked-reset operation reported for {alias}"))
+        }
         BankedResetAction::NotOffered => Some(format!(
             "use banked reset: unavailable for {alias} — provider offers no banked-reset operation"
         )),
