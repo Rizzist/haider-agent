@@ -175,6 +175,40 @@ fn every_context_class_keeps_its_label_on_each_quoted_line() {
 }
 
 #[test]
+fn authorization_scheme_labels_accept_whitespace_variants() {
+    let token = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for (scheme, kind) in [
+        ("Bearer", "bearer_token"),
+        ("bEaReR", "bearer_token"),
+        ("Basic", "basic_auth"),
+        ("bAsIc", "basic_auth"),
+    ] {
+        for gap in [
+            " ", "  ", "\t", "\t ", "\r", "\u{000b}", "\u{000c}", "\u{00a0}", "\u{2003}",
+            "\u{2009}",
+        ] {
+            let input = format!("Authorization: {scheme}{gap}{token}");
+            assert_eq!(
+                super::redact_output_text(&input),
+                format!("Authorization: [REDACTED:{kind}]"),
+                "{scheme:?} {gap:?}"
+            );
+            let standalone = format!("{scheme}{gap}{token}");
+            assert_eq!(
+                super::redact_output_text(&standalone),
+                format!("{scheme}{gap}[REDACTED:{kind}]"),
+                "standalone {scheme:?} {gap:?}"
+            );
+        }
+    }
+
+    assert_eq!(
+        super::redact_output_text(&format!("Authorization: Bearer{token}")),
+        "Authorization: [REDACTED:secret_value]"
+    );
+}
+
+#[test]
 fn bounded_redaction_is_the_exact_full_redaction_prefix() {
     let input = format!(
         "éprefix {} middle sk-abcdefghijklmnopQRSTUV suffix {}",

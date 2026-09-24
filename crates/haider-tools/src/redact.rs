@@ -757,9 +757,9 @@ const PASSWORD_NAMES: &[&str] = &[
 fn assignment_kind(prefix: &str, value: &str) -> SecretKind {
     let prefix = prefix.trim().to_ascii_lowercase();
     let names = |names: &[&str]| names.iter().any(|name| prefix.contains(name));
-    if prefix.ends_with("bearer") || starts_with_ignore_ascii_case(value, "bearer ") {
+    if prefix.ends_with("bearer") || starts_with_auth_scheme(value, "bearer") {
         SecretKind::BearerToken
-    } else if prefix.ends_with("basic") || starts_with_ignore_ascii_case(value, "basic ") {
+    } else if prefix.ends_with("basic") || starts_with_auth_scheme(value, "basic") {
         SecretKind::BasicAuth
     } else if names(API_KEY_NAMES) {
         SecretKind::ApiKey
@@ -770,10 +770,15 @@ fn assignment_kind(prefix: &str, value: &str) -> SecretKind {
     }
 }
 
-fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+fn starts_with_auth_scheme(value: &str, scheme: &str) -> bool {
+    let Some(head) = value.get(..scheme.len()) else {
+        return false;
+    };
+    head.eq_ignore_ascii_case(scheme)
+        && value[scheme.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
 }
 
 fn push_secret_lines(
