@@ -153,6 +153,15 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
 /// pattern is indexed and serialized, so a 512 KiB ceiling retains the hot
 /// B-tree path without pinning SQLite's 2 MiB default page cache at idle.
 const SQLITE_PAGE_CACHE_KIB: i64 = -512;
+/// Keep statement journals and temporary B-trees in memory (`2` = MEMORY).
+/// Group commits nest a savepoint per request, so a turn's batch can modify
+/// more than SQLite's 64 KiB in-memory statement-journal budget. With the
+/// desktop default (file), that spill is an unlinked `etilqs_*` file whose
+/// pages still reach the disk: 72–320 KiB on otherwise 4–8 KiB turns. These
+/// journals only support statement/savepoint rollback, never crash recovery,
+/// so WAL durability is unchanged. Android's bundled SQLite already compiles
+/// with `SQLITE_TEMP_STORE=3` (always memory).
+const SQLITE_TEMP_STORE_MEMORY: i64 = 2;
 const CACHE_DIAGNOSTIC_KEY_FILE: &str = "cache-diagnostic.key";
 /// A v25 upgrade may need old graph facts, but profile open must never retain
 /// an unbounded copy of the journal. `envelope_weight_bytes` conservatively
@@ -25550,6 +25559,9 @@ fn open_connection_with(path: &Path, synchronous: StoreSynchronous) -> StoreResu
         .pragma_update(None, "cache_size", SQLITE_PAGE_CACHE_KIB)
         .map_err(map_sqlite_error)?;
     connection
+        .pragma_update(None, "temp_store", SQLITE_TEMP_STORE_MEMORY)
+        .map_err(map_sqlite_error)?;
+    connection
         .pragma_update(None, "synchronous", synchronous.pragma_value())
         .map_err(map_sqlite_error)?;
     Ok(connection)
@@ -29288,6 +29300,57 @@ mod store_synchronous_tests {
             SQLITE_PAGE_CACHE_KIB,
             "every store connection must install the measured page-cache ceiling"
         );
+    }
+
+    /// MUTATION CHECK: removing the `temp_store` pragma (desktop default
+    /// FILE) must fail the MEMORY pin, and the savepoint below would again
+    /// spill its statement journal to an unlinked temporary file.
+    #[test]
+    fn statement_journals_stay_in_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut connection = open_connection_with(
+            &dir.path().join("temp-store.sqlite"),
+            StoreSynchronous::Normal,
+        )
+        .expect("open store");
+        assert_eq!(
+            queried_i64_pragma(&connection, "temp_store"),
+            SQLITE_TEMP_STORE_MEMORY,
+            "every store connection must keep statement journals in memory"
+        );
+        connection
+            .execute_batch(
+                "CREATE TABLE savepoint_pressure (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+            )
+            .expect("create pressure table");
+        let payload = vec![0x5A_u8; 2 * 1_024];
+        for id in 0..256_i64 {
+            connection
+                .execute(
+                    "INSERT INTO savepoint_pressure(id, payload) VALUES (?1, ?2)",
+                    params![id, payload.as_slice()],
+                )
+                .expect("seed pressure row");
+        }
+        // A savepoint rewriting ~128 existing pages exceeds SQLite's 64 KiB
+        // in-memory statement-journal budget; rollback must still restore it.
+        let mut transaction = connection.transaction().expect("begin");
+        {
+            let savepoint = transaction.savepoint().expect("savepoint");
+            savepoint
+                .execute("UPDATE savepoint_pressure SET payload = zeroblob(2048)", [])
+                .expect("rewrite rows");
+            savepoint.finish().expect("roll back savepoint");
+        }
+        let preserved: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM savepoint_pressure WHERE payload = ?1",
+                params![payload.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count preserved rows");
+        transaction.commit().expect("commit");
+        assert_eq!(preserved, 256, "savepoint rollback must restore every page");
     }
 
     /// MUTATION CHECK: deleting the `synchronous` `pragma_update` in

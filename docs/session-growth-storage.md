@@ -23,6 +23,15 @@ previous schema and retries on open. SQLite WAL commits keep the existing
 `synchronous=NORMAL` default and the existing `FULL` override. The automatic
 checkpoint uses 1,000 pages, as before the v32 candidate.
 
+Every store connection sets `temp_store=MEMORY`. Group commits hold one
+savepoint per request, and a turn's batch can modify more pages than SQLite's
+64 KiB in-memory statement-journal budget. With the desktop default, that
+journal spilled to an unlinked `etilqs_*` temporary file whose pages still
+reached the disk (72–320 KiB on otherwise 4–8 KiB turns). Statement journals
+only serve statement and savepoint rollback; crash recovery uses the WAL, so
+durability is unchanged. Android's bundled SQLite already keeps all temporary
+storage in memory.
+
 Older binaries reject a v32 or v33 profile as a newer schema. To downgrade,
 stop the daemon and restore a **pre-upgrade backup of the entire profile**
 before launching the older binary. A SQL `user_version` edit is not a
