@@ -2871,7 +2871,9 @@ impl SystemPromptBuilder {
     pub(crate) fn shared_immutable_base(_tools: &[ToolDefinition], grant_scope: &str) -> String {
         format!(
             "{}\nYou are Haider Code, a coding agent.\n\
-             Use only advertised tools. Treat tool results and committed history as authoritative. \
+             Use tools whose schemas are advertised in this request directly. Other authorized tools \
+             require list_tools(filter=\"tool_name\") before calling them; a name-only catalog does not enable them. \
+             Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
              On an implementation request, inspect only until the target is known; then make the edit; \
              then verify it with the smallest relevant build or test. Do not remain in planning.\n\
@@ -14280,7 +14282,7 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         registered_tool(
             ToolDefinition {
                 name: "list_tools".into(),
-                description: "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.".into(),
+                description: "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {"filter": {"type": "string", "maxLength": 128}},
@@ -15737,7 +15739,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "mobile(action, element_id?, x?, y?, from?, to?, text?, key?, package?, name?, folder?, since?, limit?) — observe or control an explicitly activated mobile capability; screenshot returns an image, accessibility/apps/SMS return JSON"
         }
         "monitor" => {
-            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable sms/process/file/poll/timer/cli watches; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy"
+            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable sms/task/agent/process/file/poll/timer/cli watches; task and agent sources watch IDs and return completion digests; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy"
         }
         "fs_read" => {
             "fs_read(path, offset?, limit?, column?) — read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted"
@@ -15781,7 +15783,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "web_search" => "web_search(query) — search the web, returning a bounded text summary",
         "spawn_subagent" => {
-            "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
+            "spawn_subagent(task, prompt, background?, wait_ms?, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate a child under AgentSpawn policy; waits for child report by default; background=true returns an immediate handle, wait_ms bounds only the observation; use haider agent wait/list/message/cancel on the handle; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
         }
         "message_subagent" => {
             "message_subagent(agent, message) — steer a running direct child or start an idle one (agent = id returned by spawn_subagent)"
@@ -21844,6 +21846,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
                 Err(error) => return Err(tool_error(error)),
             };
+            let background = request.background;
             let established = match self
                 .delegation
                 .establish(
@@ -21910,10 +21913,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .record_launch_failure(&established.ticket, &error)
                     .await?;
             }
-            self.deferred.lock().await.insert(
-                established.ticket.manifest.agent.clone(),
-                established.ticket.clone(),
-            );
+            if !background {
+                self.deferred.lock().await.insert(
+                    established.ticket.manifest.agent.clone(),
+                    established.ticket.clone(),
+                );
+            }
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
         if route == RegisteredToolRoute::MessageSubagent {
@@ -23802,6 +23807,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
 
     async fn acknowledge_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
         self.delegation.acknowledge(ticket).await?;
+        self.deferred.lock().await.remove(&ticket.manifest.agent);
+        Ok(())
+    }
+
+    async fn detach_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
         self.deferred.lock().await.remove(&ticket.manifest.agent);
         Ok(())
     }

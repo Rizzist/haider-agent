@@ -22,7 +22,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{AgentId, BranchId, EventId, RunId, SessionId};
+use haider_protocol::ids::{AgentId, BranchId, EventId, RunId, SessionId, TaskId};
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_tools::{
     MonitorAction, MonitorApproval, MonitorCliPreset, MonitorFilter, MonitorFilterField,
@@ -91,6 +91,12 @@ pub struct SmsIncomingEvent {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MonitorEventPayload {
     Sms(SmsIncomingEvent),
+    Task {
+        payload: String,
+    },
+    Agent {
+        payload: String,
+    },
     Process {
         line: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +131,8 @@ pub enum MonitorEventPayload {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum MonitorEventPayloadWire {
     Sms(SmsIncomingEvent),
+    Task(MonitorFileEvent),
+    Agent(MonitorFileEvent),
     Process(MonitorProcessEvent),
     File(MonitorFileEvent),
     Poll(MonitorPollEvent),
@@ -171,6 +179,12 @@ impl<'de> Deserialize<'de> for MonitorEventPayload {
     {
         Ok(match MonitorEventPayloadWire::deserialize(deserializer)? {
             MonitorEventPayloadWire::Sms(event) => Self::Sms(event),
+            MonitorEventPayloadWire::Task(event) => Self::Task {
+                payload: event.payload,
+            },
+            MonitorEventPayloadWire::Agent(event) => Self::Agent {
+                payload: event.payload,
+            },
             MonitorEventPayloadWire::Process(event) => Self::Process {
                 line: event.line,
                 structured: event.structured,
@@ -201,6 +215,8 @@ impl MonitorEventPayload {
     fn source_kind(&self) -> MonitorSourceKind {
         match self {
             Self::Sms(_) => MonitorSourceKind::Sms,
+            Self::Task { .. } => MonitorSourceKind::Task,
+            Self::Agent { .. } => MonitorSourceKind::Agent,
             Self::Process { .. } => MonitorSourceKind::Process,
             Self::File { .. } => MonitorSourceKind::File,
             Self::Poll { .. } => MonitorSourceKind::Poll,
@@ -216,7 +232,9 @@ impl MonitorEventPayload {
             (Self::Process { line, .. } | Self::Cli { line, .. }, MonitorFilterField::Payload) => {
                 Some(line)
             }
-            (Self::File { payload }, MonitorFilterField::Payload)
+            (Self::Task { payload }, MonitorFilterField::Payload)
+            | (Self::Agent { payload }, MonitorFilterField::Payload)
+            | (Self::File { payload }, MonitorFilterField::Payload)
             | (Self::Poll { payload }, MonitorFilterField::Payload) => Some(payload),
             _ => None,
         }
@@ -495,6 +513,8 @@ fn validate_event_payload(payload: &MonitorEventPayload) -> Result<(), MonitorEr
         }
         MonitorEventPayload::Process { line, .. }
         | MonitorEventPayload::Cli { line, .. }
+        | MonitorEventPayload::Task { payload: line }
+        | MonitorEventPayload::Agent { payload: line }
         | MonitorEventPayload::File { payload: line }
         | MonitorEventPayload::Poll { payload: line } => {
             if line.len() > MAX_SMS_BODY_BYTES {
@@ -571,6 +591,8 @@ impl MonitorReport {
                     "exit_code": exit_code,
                 }),
                 MonitorEventPayload::File { payload: line }
+                | MonitorEventPayload::Task { payload: line }
+                | MonitorEventPayload::Agent { payload: line }
                 | MonitorEventPayload::Poll { payload: line } => json!({
                     "payload": bounded_chars(line, MAX_REPORT_BODY_CHARS),
                 }),
@@ -1167,6 +1189,7 @@ enum ReportQueueOutcome {
 
 struct MonitorServiceInner {
     sources: MonitorSourceHub,
+    hub: StdRwLock<Option<WeakSessionHub>>,
     registry: MonitorRegistry,
     mutations: Mutex<()>,
     completion_mutations: Mutex<()>,
@@ -1212,6 +1235,7 @@ impl Default for MonitorService {
         Self {
             inner: Arc::new(MonitorServiceInner {
                 sources: MonitorSourceHub::new(),
+                hub: StdRwLock::new(None),
                 registry: MonitorRegistry::default(),
                 mutations: Mutex::new(()),
                 completion_mutations: Mutex::new(()),
@@ -1282,6 +1306,11 @@ impl MonitorService {
         }
         *self
             .inner
+            .hub
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hub.clone());
+        *self
+            .inner
             .sink
             .write()
             .unwrap_or_else(PoisonError::into_inner) =
@@ -1292,6 +1321,8 @@ impl MonitorService {
         )];
         for source in [
             MonitorSourceKind::Sms,
+            MonitorSourceKind::Task,
+            MonitorSourceKind::Agent,
             MonitorSourceKind::Process,
             MonitorSourceKind::File,
             MonitorSourceKind::Poll,
@@ -4096,6 +4127,36 @@ impl MonitorService {
                     .await?;
                     return Ok(result);
                 }
+                let owned = match &source {
+                    MonitorSource::Task { task_id } => hub
+                        .task_registry()
+                        .get(store.session_id(), &TaskId::new(task_id))
+                        .is_some(),
+                    MonitorSource::Agent { agent_id } => hub
+                        .delegation(AgentId::new(agent_id))
+                        .await
+                        .map_err(|error| ToolError::Runtime {
+                            message: error.to_string(),
+                        })?
+                        .is_some_and(|record| record.parent_session_id == *store.session_id()),
+                    _ => true,
+                };
+                if !owned {
+                    let result = tool_result(
+                        json!({"status":"rejected", "kind":"source_not_owned", "source":source.kind()}),
+                        ToolResultStatus::Rejected,
+                        Some("monitor source id is not owned by this session".into()),
+                    );
+                    self.persist_tool_receipt_locked(
+                        store,
+                        &coordinates,
+                        &operation_id,
+                        &request_digest,
+                        &result,
+                    )
+                    .await?;
+                    return Ok(result);
+                }
                 let current = self.inner.registry.snapshot(store.session_id());
                 if current.len() >= MAX_MONITORS_PER_SESSION {
                     let result = tool_result(
@@ -5870,6 +5931,86 @@ async fn run_monitor_source(
     }
     match &registration.source {
         MonitorSource::Sms => {}
+        MonitorSource::Task { task_id } => {
+            let task = TaskId::new(task_id);
+            loop {
+                let hub = service
+                    .inner
+                    .hub
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let Some(hub) = hub.and_then(|weak| weak.upgrade()) else {
+                    return;
+                };
+                if let Some(completed) = hub
+                    .task_registry()
+                    .monitor_completion(&registration.owner_session_id, &task)
+                {
+                    let payload = serde_json::to_string(&completed)
+                        .unwrap_or_else(|_| "task completed without an encodable digest".into());
+                    let _ = service
+                        .publish_runner_event(&registration, MonitorEventPayload::Task { payload });
+                    return;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(MONITOR_FILE_POLL_INTERVAL) => {}
+                    _ = &mut cancelled => return,
+                }
+            }
+        }
+        MonitorSource::Agent { agent_id } => {
+            let agent = AgentId::new(agent_id);
+            loop {
+                let hub = service
+                    .inner
+                    .hub
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let Some(hub) = hub.and_then(|weak| weak.upgrade()) else {
+                    return;
+                };
+                match hub.delegation(agent.clone()).await {
+                    Ok(Some(record))
+                        if record.parent_session_id == registration.owner_session_id =>
+                    {
+                        match crate::delegation::DelegationHandle::new(hub.clone())
+                            .derive_terminal_report(&record)
+                            .await
+                        {
+                            Ok(Some(completion)) => {
+                                let payload = json!({
+                                    "agent": agent,
+                                    "child_session_id": record.child_session_id,
+                                    "child_run_id": record.child_run_id,
+                                    "report": completion.report,
+                                    "chip": completion.chip,
+                                })
+                                .to_string();
+                                let _ = service.publish_runner_event(
+                                    &registration,
+                                    MonitorEventPayload::Agent { payload },
+                                );
+                                return;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child report")
+                            }
+                        }
+                    }
+                    Ok(_) => return,
+                    Err(error) => {
+                        tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child")
+                    }
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(MONITOR_FILE_POLL_INTERVAL) => {}
+                    _ = &mut cancelled => return,
+                }
+            }
+        }
         MonitorSource::Timer { interval_ms } => {
             let interval = Duration::from_millis(*interval_ms);
             let mut tick = 0_u64;
@@ -6952,6 +7093,14 @@ pub(crate) fn monitor_source_availability() -> Vec<haider_rpc::MonitorSourceAvai
             availability: Availability::Available,
         },
         Row {
+            source: Source::Task,
+            availability: Availability::Available,
+        },
+        Row {
+            source: Source::Agent,
+            availability: Availability::Available,
+        },
+        Row {
             source: Source::Process,
             availability: Availability::Available,
         },
@@ -7206,6 +7355,12 @@ fn monitor_registration_wire(
 fn monitor_source_wire(source: &MonitorSource) -> haider_rpc::MonitorSourceWire {
     match source {
         MonitorSource::Sms => haider_rpc::MonitorSourceWire::Sms,
+        MonitorSource::Task { task_id } => haider_rpc::MonitorSourceWire::Task {
+            task_id: task_id.clone(),
+        },
+        MonitorSource::Agent { agent_id } => haider_rpc::MonitorSourceWire::Agent {
+            agent_id: agent_id.clone(),
+        },
         MonitorSource::Process {
             command,
             cwd,
@@ -7285,6 +7440,8 @@ fn monitor_cli_preset_wire(preset: MonitorCliPreset) -> haider_rpc::MonitorCliPr
 fn monitor_source_kind_wire(source: MonitorSourceKind) -> haider_rpc::MonitorSourceKindWire {
     match source {
         MonitorSourceKind::Sms => haider_rpc::MonitorSourceKindWire::Sms,
+        MonitorSourceKind::Task => haider_rpc::MonitorSourceKindWire::Task,
+        MonitorSourceKind::Agent => haider_rpc::MonitorSourceKindWire::Agent,
         MonitorSourceKind::Process => haider_rpc::MonitorSourceKindWire::Process,
         MonitorSourceKind::File => haider_rpc::MonitorSourceKindWire::File,
         MonitorSourceKind::Poll => haider_rpc::MonitorSourceKindWire::Poll,
@@ -7377,6 +7534,12 @@ pub(crate) fn monitor_delivery_report(
                         body: sms.body,
                         received_at_ms: sms.received_at_ms,
                     },
+                    MonitorEventPayload::Task { payload } => {
+                        haider_rpc::MonitorEventPayloadWire::Task { payload }
+                    }
+                    MonitorEventPayload::Agent { payload } => {
+                        haider_rpc::MonitorEventPayloadWire::Agent { payload }
+                    }
                     MonitorEventPayload::Process {
                         line,
                         structured,
@@ -7646,6 +7809,8 @@ fn escape_monitor_attribute(value: &str) -> String {
 fn monitor_source_name(source: MonitorSourceKind) -> &'static str {
     match source {
         MonitorSourceKind::Sms => "sms",
+        MonitorSourceKind::Task => "task",
+        MonitorSourceKind::Agent => "agent",
         MonitorSourceKind::Process => "process",
         MonitorSourceKind::File => "file",
         MonitorSourceKind::Poll => "poll",
@@ -7673,6 +7838,8 @@ fn monitor_runtime_state_name(state: MonitorRuntimeState) -> &'static str {
 fn monitor_source_summary(source: &MonitorSource) -> String {
     match source {
         MonitorSource::Sms => "incoming SMS".into(),
+        MonitorSource::Task { task_id } => format!("task {task_id} completion"),
+        MonitorSource::Agent { agent_id } => format!("agent {agent_id} completion"),
         MonitorSource::Process { restart, .. } => {
             format!(
                 "process · restart {}",
@@ -7716,6 +7883,7 @@ fn next_fire_at_ms(registration: &MonitorRegistration) -> Option<u64> {
             ..
         } => Some(interval_ms.unwrap_or(5_000)),
         MonitorSource::Sms | MonitorSource::Process { .. } | MonitorSource::Cli { .. } => None,
+        MonitorSource::Task { .. } | MonitorSource::Agent { .. } => Some(1_000),
     }?;
     Some(now_ms().saturating_add(delay))
 }
@@ -7723,6 +7891,9 @@ fn next_fire_at_ms(registration: &MonitorRegistration) -> Option<u64> {
 fn event_summary(payload: &MonitorEventPayload) -> String {
     let summary = match payload {
         MonitorEventPayload::Sms(sms) => format!("SMS from {}", sms.address),
+        MonitorEventPayload::Task { payload } | MonitorEventPayload::Agent { payload } => {
+            payload.clone()
+        }
         MonitorEventPayload::Process {
             line,
             terminal,
@@ -7767,6 +7938,8 @@ fn trigger_payload(registration: &MonitorRegistration) -> MonitorEventPayload {
             body: payload,
             received_at_ms: i64::try_from(now_ms()).unwrap_or(i64::MAX),
         }),
+        MonitorSourceKind::Task => MonitorEventPayload::Task { payload },
+        MonitorSourceKind::Agent => MonitorEventPayload::Agent { payload },
         MonitorSourceKind::Process => MonitorEventPayload::Process {
             line: payload,
             structured: None,

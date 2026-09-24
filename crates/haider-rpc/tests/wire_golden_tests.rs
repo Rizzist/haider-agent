@@ -42,6 +42,52 @@ fn fixture_path() -> PathBuf {
         .join("wire_transcript.json")
 }
 
+#[test]
+fn monitor_handle_sources_are_additive_wire_variants() {
+    let pinned: Value =
+        serde_json::from_str(include_str!("fixtures/monitor_handle_sources_v1.json"))
+            .expect("monitor handle wire fixture");
+    let sources = [
+        haider_rpc::MonitorSourceWire::Task {
+            task_id: "task-fixture".into(),
+        },
+        haider_rpc::MonitorSourceWire::Agent {
+            agent_id: "agent-fixture".into(),
+        },
+    ];
+    let events = [
+        haider_rpc::MonitorEventPayloadWire::Task {
+            payload: "{\"output_digest\":\"ok\"}".into(),
+        },
+        haider_rpc::MonitorEventPayloadWire::Agent {
+            payload: "{\"report\":\"done\"}".into(),
+        },
+    ];
+    assert_eq!(
+        serde_json::to_value(&sources).expect("encode sources"),
+        pinned["sources"]
+    );
+    assert_eq!(
+        serde_json::to_value(&events).expect("encode events"),
+        pinned["events"]
+    );
+    for source in sources {
+        let value = serde_json::to_value(&source).expect("encode source");
+        assert_eq!(
+            serde_json::from_value::<haider_rpc::MonitorSourceWire>(value).expect("decode source"),
+            source
+        );
+    }
+    for event in events {
+        let value = serde_json::to_value(&event).expect("encode event");
+        assert_eq!(
+            serde_json::from_value::<haider_rpc::MonitorEventPayloadWire>(value)
+                .expect("decode event"),
+            event
+        );
+    }
+}
+
 fn contract_methods_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

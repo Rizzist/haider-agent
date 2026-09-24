@@ -4,15 +4,13 @@
 //! It exposes typed spawn/collect operations, never a raw store or child
 //! session address.
 //!
-//! # Sequential spawn contract
+//! # Spawn contract
 //!
 //! The codex responses-lite history contract admits one tool call per provider
 //! round and requires that call's result to remain paired with the call in the
-//! next request. A spawn round therefore parks in `Waiting(LocalChild)` until
-//! the coordinator has the child's report; only then does core journal the
-//! tool result and acknowledge collection. Do not "parallelize" this by
-//! acknowledging spawn before the report: that would advance provider history
-//! without the result paired to the call that created the child.
+//! next request. Blocking spawn parks in `Waiting(LocalChild)` until the child
+//! report is collected. Background spawn returns a durable handle immediately;
+//! either result is journalled before the next provider round.
 
 use crate::session_hub::SessionHub;
 use crate::usage_report::SessionFolder;
@@ -33,7 +31,7 @@ use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RawPayload, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildWorkflowDecision,
     ChildWorkflowTrigger, EvidenceAuthority, EvidenceVerdict, GraphGateKind, GraphPhase,
@@ -66,12 +64,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
 const CHILD_SETTLEMENT_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
-// Registry #94 production arithmetic: 120s pre-nudge stall attribution +
-// 120s post-nudge grace + 1s cancellation/reap tail = 241s run wait bound.
-// Unlike the two blame clocks, this absolute run clock never pauses.
+// Recovery/cancellation tail compatibility for explicitly supervised test
+// waits. Ordinary production collection has no default child deadline.
 const CHILD_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(241);
 pub(crate) const DELEGATED_MENU_ORIGIN: &str = "delegated-child";
-const DELEGATED_WAIT_TIMEOUT_KIND: &str = "delegated_child_wait_timeout";
 pub(crate) const DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND: &str =
     "delegation_terminal_mirror_handoff_v1";
 pub(crate) const RECURSION_DEPTH_LIMIT: u32 = 3;
@@ -90,6 +86,7 @@ pub(crate) struct DelegationHandle {
     hub: SessionHub,
     stall_deadline: Duration,
     run_wait_timeout: Duration,
+    stall_supervision: bool,
     settlement_tail_timeout: Duration,
     #[cfg(all(test, unix))]
     stall_deadline_clock: Option<Arc<StallDeadlineTestClock>>,
@@ -309,6 +306,7 @@ impl DelegationHandle {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            stall_supervision: false,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
@@ -323,6 +321,7 @@ impl DelegationHandle {
             hub,
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            stall_supervision: true,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
             stall_deadline_clock: None,
         }
@@ -340,6 +339,7 @@ impl DelegationHandle {
             hub,
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            stall_supervision: true,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
             stall_deadline_clock: Some(stall_deadline_clock),
         }
@@ -356,6 +356,7 @@ impl DelegationHandle {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            stall_supervision: false,
             settlement_tail_timeout,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
@@ -375,6 +376,7 @@ impl DelegationHandle {
             hub,
             stall_deadline,
             run_wait_timeout,
+            stall_supervision: true,
             settlement_tail_timeout,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
@@ -700,6 +702,13 @@ impl DelegationHandle {
                 .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
             manifest_coordinates["request_budget"] =
                 serde_json::to_value(budget).map_err(internal_serialization)?;
+        }
+        if let Some(wait_ms) = request.wait_ms {
+            manifest_coordinates["wait_ms"] = serde_json::json!(wait_ms);
+            manifest_coordinates["wait_started_at_ms"] = serde_json::json!(unix_time_ms());
+        }
+        if request.background {
+            manifest_coordinates["background"] = serde_json::Value::Bool(true);
         }
         let manifest = AgentManifest {
             agent: agent_id.clone(),
@@ -1207,7 +1216,33 @@ impl DelegationHandle {
                     false,
                 )
             })?;
-        let budget = self.child_wait_budget(&initial, run_deadline).await?;
+        let wait_deadline = ticket
+            .manifest
+            .coordinates
+            .as_ref()
+            .and_then(|coordinates| {
+                Some((
+                    coordinates.get("wait_started_at_ms")?.as_u64()?,
+                    coordinates.get("wait_ms")?.as_u64()?,
+                ))
+            })
+            .map(|(started, duration)| {
+                instant_from_unix_deadline(started.saturating_add(duration))
+            });
+        let observation_deadline = match (run_deadline, wait_deadline) {
+            (Some(run), Some(wait)) => Some(run.min(wait)),
+            (Some(run), None) => Some(run),
+            (None, Some(wait)) => Some(wait),
+            (None, None) => None,
+        };
+        let budget = if observation_deadline.is_some() || self.stall_supervision {
+            Some(
+                self.child_wait_budget(&initial, observation_deadline)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let wait = async {
             loop {
                 let record = self
@@ -1280,19 +1315,22 @@ impl DelegationHandle {
                         });
                     }
                 }
-                let progress = self.delegation_progress(&record).await?;
-                if !progress.human_required {
-                    match progress.nudge {
-                        None if self.stall_deadline_elapsed(progress.latest_at_ms) => {
-                            self.nudge(&record).await?;
+                if self.stall_supervision {
+                    let progress = self.delegation_progress(&record).await?;
+                    if !progress.human_required {
+                        match progress.nudge {
+                            None if self.stall_deadline_elapsed(progress.latest_at_ms) => {
+                                self.nudge(&record).await?;
+                            }
+                            Some((_, nudge_at_ms))
+                                if self.stall_deadline_elapsed(
+                                    progress.latest_at_ms.max(nudge_at_ms),
+                                ) =>
+                            {
+                                self.cancel_subtree(&record, CancelCause::Stall).await?;
+                            }
+                            _ => {}
                         }
-                        Some((_, nudge_at_ms))
-                            if self
-                                .stall_deadline_elapsed(progress.latest_at_ms.max(nudge_at_ms)) =>
-                        {
-                            self.cancel_subtree(&record, CancelCause::Stall).await?;
-                        }
-                        _ => {}
                     }
                 }
                 tokio::select! {
@@ -1304,17 +1342,25 @@ impl DelegationHandle {
                 }
             }
         };
-        let active_limit = budget
-            .active_deadline
-            .saturating_duration_since(tokio::time::Instant::now());
-        match haider_platform::bounded_wait("delegated child active wait", active_limit, wait).await
-        {
+        let outcome = if let Some(budget) = budget {
+            let active_limit = budget
+                .active_deadline
+                .saturating_duration_since(tokio::time::Instant::now());
+            haider_platform::bounded_wait("delegated child active wait", active_limit, wait).await
+        } else {
+            haider_platform::BoundedWait::Completed(wait.await)
+        };
+        match outcome {
             haider_platform::BoundedWait::Completed(Ok(ChildWaitWake::Ready {
                 record,
                 completion,
             })) => {
+                let deadline = budget.map_or_else(
+                    || tokio::time::Instant::now() + self.settlement_tail_timeout,
+                    |budget| budget.deadline,
+                );
                 let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror, budget.deadline)
+                    .mirror_until_child_terminal(&record, &mut chip_mirror, deadline)
                     .await?;
                 report_child_settlement_outcome(settlement);
                 self.collapse_child_contract(&record, &completion.report)
@@ -1322,6 +1368,10 @@ impl DelegationHandle {
                 Ok(completion)
             }
             haider_platform::BoundedWait::Completed(Ok(ChildWaitWake::ParentCancelled(record))) => {
+                let budget = match budget {
+                    Some(budget) => budget,
+                    None => self.child_wait_budget(&record, None).await?,
+                };
                 let handoff = self
                     .begin_terminal_mirror_handoff(
                         &record,
@@ -1361,31 +1411,29 @@ impl DelegationHandle {
                             false,
                         )
                     })?;
-                // Registry #94: the pending journal fact is committed before
-                // cancellation, and every following phase consumes the one
-                // original absolute deadline. No awaited receipt/store work
-                // restarts or extends the reserved terminal/reap tail.
-                let handoff = self
-                    .begin_terminal_mirror_handoff(
-                        &record,
-                        &budget,
-                        CancelCause::Deadline,
-                        "collector",
-                    )
-                    .await?;
-                let terminal_deadline = instant_from_unix_deadline(handoff.deadline_at_ms);
-                let _cancel_issued = self
-                    .cancel_subtree_before(&record, CancelCause::Deadline, terminal_deadline)
-                    .await?;
-                let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror, terminal_deadline)
-                    .await?;
-                report_child_settlement_outcome(settlement);
-                if chip_mirror.child_run_terminal {
-                    self.complete_terminal_mirror_handoff(&record, handoff)
-                        .await?;
-                }
-                Err(delegated_wait_timeout(timeout, &record))
+                let progress = self.session_progress(&record).await?;
+                Ok(DeferredToolResult {
+                    report: ChildReport {
+                        agent: record.agent_id.clone(),
+                        summary: serde_json::json!({
+                            "kind": "child_still_running",
+                            "status": "child_still_running",
+                            "agent": record.agent_id,
+                            "parent_session_id": record.parent_session_id,
+                            "child_session_id": record.child_session_id,
+                            "child_run_id": record.child_run_id,
+                            "progress": progress.state,
+                            "latest_progress_at_ms": progress.latest_at_ms,
+                            "wait_limit_ms": duration_millis(timeout.limit()),
+                            "collect": format!("haider agent wait {} {} --json", record.parent_session_id, record.agent_id),
+                        }).to_string(),
+                        verified: ReportVerification::Unverified,
+                        workspace_revision: None,
+                    },
+                    chip: ChipState::Waiting,
+                    truncated: false,
+                    truncation: None,
+                })
             }
         }
     }
@@ -1395,15 +1443,10 @@ impl DelegationHandle {
         record: &DelegationRecord,
         run_deadline: Option<tokio::time::Instant>,
     ) -> Result<ChildWaitBudget, HaiderError> {
-        // This is the delegation clock, not the workflow continuation clock:
-        // logical provider-request boundaries own the continuation count,
-        // while every child wait in every hop consumes this one parent-run
-        // deadline and never increments that count. Interactive runs have no
-        // explicit client deadline, so their durable delegation budget starts
-        // at the parent run's first committed fact:
-        // one stall interval before the nudge + one grace interval after it +
-        // the terminal/reap tail. Recovery re-derives the same absolute bound
-        // from the journal instead of restarting a relative timer.
+        // Only an explicit observation deadline reaches ordinary collection.
+        // The legacy fallback remains for cancellation settlement and
+        // explicitly supervised test fixtures; it never limits a production
+        // child's active work by default.
         let now = tokio::time::Instant::now();
         let started_at_ms = self.parent_run_started_at_ms(record).await?;
         let deadline = anchored_child_wait_deadline(
@@ -2313,7 +2356,7 @@ impl DelegationHandle {
         Ok(path)
     }
 
-    async fn derive_terminal_report(
+    pub(crate) async fn derive_terminal_report(
         &self,
         record: &DelegationRecord,
     ) -> Result<Option<DeferredToolResult>, HaiderError> {
@@ -3334,12 +3377,8 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-/// Returns the earlier of the explicit parent-run deadline and the fallback
-/// delegation deadline anchored to the parent's first durable fact.
-///
-/// Both inputs are absolute run clocks. In particular, `fallback_total` is
-/// never applied to the current hop's `now`: a later autonomous workflow hop
-/// can only consume the original child-wait budget, never refresh it.
+/// Returns an explicit observation deadline when given, otherwise the legacy
+/// fallback used only by cancellation settlement and test supervision.
 pub(crate) fn anchored_child_wait_deadline(
     now: tokio::time::Instant,
     now_unix_ms: u64,
@@ -3350,9 +3389,7 @@ pub(crate) fn anchored_child_wait_deadline(
     let fallback_deadline_ms = parent_started_at_ms.saturating_add(duration_millis(fallback_total));
     let fallback_deadline =
         now + Duration::from_millis(fallback_deadline_ms.saturating_sub(now_unix_ms));
-    run_deadline.map_or(fallback_deadline, |deadline| {
-        deadline.min(fallback_deadline)
-    })
+    run_deadline.unwrap_or(fallback_deadline)
 }
 
 fn instant_from_unix_deadline(deadline_at_ms: u64) -> tokio::time::Instant {
@@ -3915,40 +3952,6 @@ fn not_owned_child(agent: &AgentId) -> HaiderError {
 fn workflow_rejection(kind: &'static str, message: impl Into<String>) -> HaiderError {
     let mut error = HaiderError::new(ErrorCode::InvalidArgument, message, false);
     error.details = Some(serde_json::json!({ "kind": kind }));
-    error
-}
-
-fn delegated_wait_timeout(
-    timeout: haider_platform::WaitTimeout,
-    record: &DelegationRecord,
-) -> HaiderError {
-    let limit_ms = duration_millis(timeout.limit());
-    let mut error = HaiderError::new(
-        ErrorCode::ProviderTimeout,
-        format!(
-            "delegated child {} did not settle before the run deadline",
-            record.agent_id
-        ),
-        true,
-    )
-    .with_presentation(
-        ErrorPresentation::new(
-            "delegated-child-wait-timeout",
-            "Delegated child timed out",
-            "The child did not finish before this run's wait deadline. It was cancelled and reaped.",
-            ErrorScope::Turn,
-            [ErrorAction::Retry],
-        )
-        .with_timeout_budget(limit_ms, limit_ms),
-    );
-    error.details = Some(serde_json::json!({
-        "kind": DELEGATED_WAIT_TIMEOUT_KIND,
-        "operation": timeout.operation(),
-        "limit_ms": limit_ms,
-        "agent": record.agent_id,
-        "child_session_id": record.child_session_id,
-        "child_run_id": record.child_run_id,
-    }));
     error
 }
 

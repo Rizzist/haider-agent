@@ -21,6 +21,12 @@ pub const MAX_SELECTOR_BYTES: usize = 128;
 pub struct SpawnSubagent {
     pub task: String,
     pub prompt: String,
+    /// Return the durable child handle immediately instead of waiting for its report.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+    /// Optional bound on this parent's observation, never on the child's life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
     /// Per-turn request tranche and hard ceiling pinned for this child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_budget: Option<crate::request_budget::RequestBudgetV1>,
@@ -92,9 +98,20 @@ impl SpawnSubagent {
         if let Some(budget) = request.request_budget {
             budget.validate()?;
         }
+        if request
+            .wait_ms
+            .is_some_and(|wait_ms| wait_ms == 0 || wait_ms > 86_400_000)
+        {
+            return Err("spawn_subagent wait_ms must be in 1..=86400000".into());
+        }
+        if request.background && request.wait_ms.is_some() {
+            return Err("spawn_subagent wait_ms is only valid for a blocking spawn".into());
+        }
         Ok(Self {
             task: task.to_owned(),
             prompt: prompt.to_owned(),
+            background: request.background,
+            wait_ms: request.wait_ms,
             request_budget: request.request_budget,
             model,
             provider,

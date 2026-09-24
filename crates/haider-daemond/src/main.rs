@@ -12,6 +12,7 @@ use haider_daemon::{
 use haider_protocol::error::HaiderError;
 use haider_protocol::session::SessionMetadataV1;
 use haider_provider::FakeProvider;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[cfg(feature = "mimalloc")]
@@ -27,9 +28,11 @@ mod telemetry;
 /// TEST-ONLY seam, OFF by default (W3c3 M3).
 ///
 /// When set to a `FakeProvider` step script (the same JSON the CLI's
-/// `HAIDER_FAKE_SCRIPT_JSON` takes), the daemon resolves EVERY turn to that
-/// deterministic provider instead of the account store. This exists for one
-/// reason: `scripts/tui-probes/pty-probe-live.py` drives the REAL `haider`
+/// `HAIDER_FAKE_SCRIPT_JSON` takes), or to `{ "by_model": { model: steps } }`,
+/// the daemon resolves each turn to the specified deterministic provider
+/// instead of the account store. The model map lets one private replay give
+/// independent parent and child scripts without relying on scheduling.
+/// The seam exists because `scripts/tui-probes/pty-probe-live.py` drives the REAL `haider`
 /// binary against the REAL daemon over a real socket, and §6.4 requires
 /// that path to pass "deterministically with `FakeProvider` and no network".
 ///
@@ -275,9 +278,36 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
     let script = script
         .into_string()
         .map_err(|_| format!("{FAKE_PROVIDER_ENV} is not valid UTF-8"))?;
-    let fake = FakeProvider::from_json(&script)
-        .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}"))?
-        .without_request_recording();
+    let parsed: serde_json::Value = serde_json::from_str(&script)
+        .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not JSON: {error}"))?;
+    let (fake, by_model) = if let Some(models) = parsed.get("by_model") {
+        let models = models
+            .as_object()
+            .ok_or_else(|| format!("{FAKE_PROVIDER_ENV}.by_model must be an object"))?;
+        if models.is_empty() {
+            return Err(format!("{FAKE_PROVIDER_ENV}.by_model must not be empty"));
+        }
+        let mut routed = HashMap::new();
+        for (model, steps) in models {
+            if model.trim().is_empty() {
+                return Err(format!(
+                    "{FAKE_PROVIDER_ENV}.by_model has an empty model name"
+                ));
+            }
+            let provider = FakeProvider::from_json(&steps.to_string())
+                .map_err(|error| {
+                    format!("{FAKE_PROVIDER_ENV}.by_model.{model} is invalid: {error}")
+                })?
+                .without_request_recording();
+            routed.insert(model.clone(), Arc::new(provider));
+        }
+        (None, Some(routed))
+    } else {
+        let provider = FakeProvider::from_json(&script)
+            .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}"))?
+            .without_request_recording();
+        (Some(Arc::new(provider)), None)
+    };
     eprintln!("haiderd: TEST MODE — every turn resolves to the injected fake provider");
     // Every turn resolves to the fake regardless of what the session was
     // created with, so the creatable set includes the release default too:
@@ -290,9 +320,7 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
     providers.insert("fake".to_owned());
     Ok(DaemonDependencies {
         provider_factory: ProviderFactoryConfig::Injected {
-            factory: Arc::new(FakeFactory {
-                fake: Arc::new(fake),
-            }),
+            factory: Arc::new(FakeFactory { fake, by_model }),
             providers,
         },
         ..DaemonDependencies::default()
@@ -301,7 +329,8 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
 
 /// The injected factory: one deterministic provider for every turn.
 struct FakeFactory {
-    fake: Arc<FakeProvider>,
+    fake: Option<Arc<FakeProvider>>,
+    by_model: Option<HashMap<String, Arc<FakeProvider>>>,
 }
 
 #[async_trait::async_trait]
@@ -310,8 +339,24 @@ impl ProviderFactory for FakeFactory {
         &self,
         metadata: &SessionMetadataV1,
     ) -> Result<ResolvedTurnProvider, HaiderError> {
+        let fake = match &self.by_model {
+            Some(models) => models.get(&metadata.model).cloned().ok_or_else(|| {
+                HaiderError::new(
+                    haider_protocol::error::ErrorCode::InvalidArgument,
+                    format!("test fake script has no route for model {}", metadata.model),
+                    false,
+                )
+            })?,
+            None => self.fake.as_ref().cloned().ok_or_else(|| {
+                HaiderError::new(
+                    haider_protocol::error::ErrorCode::Internal,
+                    "test fake provider has no script",
+                    false,
+                )
+            })?,
+        };
         Ok(ResolvedTurnProvider {
-            provider: self.fake.clone(),
+            provider: fake,
             // Echo the SESSION's own provider: the worker rejects a
             // factory that returns a different provider than the session
             // was created with, and the point of this seam is to substitute

@@ -212,6 +212,17 @@ impl TaskRegistry {
             .cloned()
     }
 
+    /// The monitor sees only a task owned by this session and its durable
+    /// terminal digest. It never reads a process or an output side-effect file.
+    pub(crate) fn monitor_completion(
+        &self,
+        session_id: &SessionId,
+        task: &TaskId,
+    ) -> Option<TaskCompleted> {
+        self.get(session_id, task)
+            .and_then(|entry| entry.terminal_fact)
+    }
+
     fn known(&self, session_id: &SessionId, task: &TaskId) -> bool {
         self.lock()
             .get(session_id)

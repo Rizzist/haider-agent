@@ -3,7 +3,7 @@
 
 use crate::effect::EffectClass;
 use crate::error::ErrorPresentation;
-use crate::ids::ArtifactRef;
+use crate::ids::{AgentId, ArtifactRef, RunId, SessionId};
 use crate::item::ToolStatus;
 use serde::{Deserialize, Serialize};
 
@@ -279,6 +279,18 @@ pub enum ToolResultData {
     /// Actor-authored discovery receipt. Only a successful, correlated
     /// `list_tools` result promotes these names into a session's tool view.
     ToolsDiscovered { promoted: Vec<String> },
+    /// A delegated child outlived an explicit observation window. The child
+    /// stays live and its durable handle remains collectable.
+    ChildStillRunning {
+        agent: AgentId,
+        parent_session_id: SessionId,
+        child_session_id: SessionId,
+        child_run_id: RunId,
+        progress: Option<serde_json::Value>,
+        latest_progress_at_ms: u64,
+        wait_limit_ms: u64,
+        collect: String,
+    },
     InvalidToolCall {
         tool: String,
         message: String,

@@ -899,7 +899,7 @@ fn list_models_surface_is_manifest_route_and_text_pinned() {
     // request-budget argument, spawn authorization, and deferred report wait.
     assert_eq!(
         spawn,
-        "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
+        "spawn_subagent(task, prompt, background?, wait_ms?, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate a child under AgentSpawn policy; waits for child report by default; background=true returns an immediate handle, wait_ms bounds only the observation; use haider agent wait/list/message/cancel on the handle; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
     );
 }
 

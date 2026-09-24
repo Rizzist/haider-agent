@@ -2100,6 +2100,11 @@ pub trait ToolDispatcher: Send + Sync {
         Ok(())
     }
 
+    /// Release a live child handle after a bounded observation ends.
+    async fn detach_deferred(&self, _ticket: &DeferredTicket) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
     /// Cancels every child still owned by this turn. The actor invokes this
     /// only on a real turn cancellation, never when a durable child-wait
     /// checkpoint is quietly parked for restart.
@@ -8991,6 +8996,13 @@ impl HarnessActor {
             let result = match outcome {
                 GeneralToolOutcome::Completed(result) => result,
                 GeneralToolOutcome::Deferred(ticket) => {
+                    let background = ticket
+                        .manifest
+                        .coordinates
+                        .as_ref()
+                        .and_then(|coordinates| coordinates.get("background"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     self.commit_payload(
                         run_id,
                         EventPayload::AgentSpawned(ticket.manifest.clone()),
@@ -9015,18 +9027,47 @@ impl HarnessActor {
                         },
                     )
                     .await?;
-                    deferred.push(DeferredAccumulator {
-                        call_id: tools[index].call_id.clone(),
-                        ticket: *ticket,
-                        report_emitted: false,
-                        child_result_emitted: false,
-                        tool_result_emitted: false,
-                        item_completed: false,
-                    });
-                    self.commit_state(run_id, RunState::Streaming)
-                        .await
-                        .map_err(DriveError::Store)?;
-                    return Ok(CompletedTool::Continue(None));
+                    if background {
+                        let agent = &ticket.manifest.agent;
+                        let coordinates = ticket.manifest.coordinates.as_ref();
+                        BoundedResult {
+                            preview: serde_json::json!({
+                                "status": "child_spawned",
+                                "agent": agent,
+                                "parent_session_id": self.config.session_id,
+                                "child_session_id": coordinates.and_then(|value| value.get("child_session_id")),
+                                "child_run_id": coordinates.and_then(|value| value.get("child_run_id")),
+                                "collect": format!("haider agent wait {} {} --json", self.config.session_id, agent),
+                                "list": format!("haider agent list {} --json", self.config.session_id),
+                                "cancel": format!("haider agent cancel {} {} --json", self.config.session_id, agent),
+                            })
+                            .to_string(),
+                            truncated: false,
+                            truncation: None,
+                            effects: Vec::new(),
+                            data: None,
+                            artifact: None,
+                            images: Vec::new(),
+                            cursor: None,
+                            status: ToolResultStatus::Completed,
+                            reason: None,
+                            presentation: None,
+                            orchestration: None,
+                        }
+                    } else {
+                        deferred.push(DeferredAccumulator {
+                            call_id: tools[index].call_id.clone(),
+                            ticket: *ticket,
+                            report_emitted: false,
+                            child_result_emitted: false,
+                            tool_result_emitted: false,
+                            item_completed: false,
+                        });
+                        self.commit_state(run_id, RunState::Streaming)
+                            .await
+                            .map_err(DriveError::Store)?;
+                        return Ok(CompletedTool::Continue(None));
+                    }
                 }
             };
             let result = tools[index].correct_result(result);
@@ -10453,13 +10494,6 @@ impl HarnessActor {
                 if let Some(result) = wake {
                     break match result {
                         Ok(completion) => completion,
-                        // Delegation owns a typed, run-deadline-derived wait
-                        // bound. Do not turn that terminal condition into an
-                        // ordinary red tool result and issue another provider
-                        // request; preserve it as RunFailed + Errored.
-                        Err(error) if delegated_child_wait_timed_out(&error) => {
-                            return Err(DriveError::Store(error));
-                        }
                         Err(error) => DeferredToolResult {
                             report: ChildReport {
                                 agent: pending.ticket.manifest.agent.clone(),
@@ -10474,18 +10508,25 @@ impl HarnessActor {
                     };
                 }
             };
+            let child_still_running = completion.chip == ChipState::Waiting;
             let mut result = BoundedResult {
                 // The opaque id is operational routing, not display identity:
                 // a later `message_subagent` call must be able to name the
                 // direct child without guessing from task/callsign text.
-                preview: format!(
-                    "agent: {}\n\n{}",
-                    completion.report.agent, completion.report.summary
-                ),
+                preview: if child_still_running {
+                    completion.report.summary.clone()
+                } else {
+                    format!(
+                        "agent: {}\n\n{}",
+                        completion.report.agent, completion.report.summary
+                    )
+                },
                 truncated: completion.truncated,
                 truncation: None,
                 effects: Vec::new(),
-                data: None,
+                data: child_still_running
+                    .then(|| serde_json::from_str(&completion.report.summary).ok())
+                    .flatten(),
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -10508,7 +10549,7 @@ impl HarnessActor {
             if let Some(truncation) = completion.truncation {
                 result.declare_truncation(truncation);
             }
-            if !pending.report_emitted {
+            if !pending.report_emitted && !child_still_running {
                 self.commit_payload(
                     run_id,
                     EventPayload::AgentReport(completion.report.clone()),
@@ -10528,7 +10569,7 @@ impl HarnessActor {
             )
             .await
             .map_err(DriveError::Store)?;
-            if !pending.child_result_emitted {
+            if !pending.child_result_emitted && !child_still_running {
                 self.commit_closed_item(
                     run_id,
                     TurnItem::ChildResult {
@@ -10574,10 +10615,17 @@ impl HarnessActor {
             }
             let projection = model_tool_result_projection(&tools[tool_index].name, &result);
             tools.remove(tool_index);
-            dispatcher
-                .acknowledge_deferred(&pending.ticket)
-                .await
-                .map_err(DriveError::Store)?;
+            if child_still_running {
+                dispatcher
+                    .detach_deferred(&pending.ticket)
+                    .await
+                    .map_err(DriveError::Store)?;
+            } else {
+                dispatcher
+                    .acknowledge_deferred(&pending.ticket)
+                    .await
+                    .map_err(DriveError::Store)?;
+            }
             results.push(Message::tool_result(
                 pending.call_id,
                 projection.preview,
@@ -13294,16 +13342,6 @@ fn submit_busy_error(capacity: usize) -> HaiderError {
         "deferred_command_capacity": capacity,
     }));
     error
-}
-
-fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
-    error.code == ErrorCode::ProviderTimeout
-        && error
-            .details
-            .as_ref()
-            .and_then(|details| details.get("kind"))
-            .and_then(serde_json::Value::as_str)
-            == Some("delegated_child_wait_timeout")
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {

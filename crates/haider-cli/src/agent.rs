@@ -815,11 +815,7 @@ async fn wait(
         }
         target_frozen = true;
         let original = child_run_id == original_run_id;
-        let selected_report = if original {
-            report
-                .as_ref()
-                .map(|(report, seq)| (report.clone(), Some(*seq)))
-        } else {
+        let journal_report = || {
             terminal.as_ref().map(|_| {
                 (
                     ChildReport {
@@ -832,6 +828,14 @@ async fn wait(
                 )
             })
         };
+        let selected_report = if original {
+            report
+                .as_ref()
+                .map(|(report, seq)| (report.clone(), Some(*seq)))
+                .or_else(journal_report)
+        } else {
+            journal_report()
+        };
         if let (Some((state, terminal_seq)), Some((report, child_result_seq))) =
             (&terminal, selected_report)
         {
@@ -842,7 +846,7 @@ async fn wait(
             };
             let result = json!({"session_id":session_id,"agent_id":agent_id,"child_session_id":child_session,
                 "child_run_id":child_run_id,"state":name,"terminal_seq":terminal_seq,"child_result_seq":child_result_seq,
-                "report_source":if original {"child_result"} else {"child_journal"},"report":report});
+                "report_source":if child_result_seq.is_some() {"child_result"} else {"child_journal"},"report":report});
             if exit != 0 {
                 let mut failure = Failure::new(
                     if exit == 130 {

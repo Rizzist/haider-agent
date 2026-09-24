@@ -358,6 +358,14 @@ fn client_availability_is_exhaustive_and_does_not_invent_adapters() {
                 availability: Availability::Available,
             },
             haider_rpc::MonitorSourceAvailabilityWire {
+                source: Source::Task,
+                availability: Availability::Available,
+            },
+            haider_rpc::MonitorSourceAvailabilityWire {
+                source: Source::Agent,
+                availability: Availability::Available,
+            },
+            haider_rpc::MonitorSourceAvailabilityWire {
                 source: Source::Process,
                 availability: Availability::Available,
             },

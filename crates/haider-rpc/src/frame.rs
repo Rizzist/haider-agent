@@ -2768,6 +2768,8 @@ pub enum HookTrustStateWire {
 #[non_exhaustive]
 pub enum MonitorSourceKindWire {
     Sms,
+    Task,
+    Agent,
     Process,
     File,
     Poll,
@@ -2783,6 +2785,12 @@ pub enum MonitorSourceKindWire {
 #[non_exhaustive]
 pub enum MonitorSourceWire {
     Sms,
+    Task {
+        task_id: String,
+    },
+    Agent {
+        agent_id: String,
+    },
     Process {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3403,6 +3411,12 @@ pub enum MonitorEventPayloadWire {
         address: String,
         body: String,
         received_at_ms: i64,
+    },
+    Task {
+        payload: String,
+    },
+    Agent {
+        payload: String,
     },
     Process {
         line: String,

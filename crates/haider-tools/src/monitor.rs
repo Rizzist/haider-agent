@@ -140,6 +140,18 @@ struct MonitorUpdateRequest {
 #[serde(deny_unknown_fields)]
 struct MonitorNoFields {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorTaskSource {
+    task_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorAgentSource {
+    agent_id: String,
+}
+
 impl<'de> Deserialize<'de> for MonitorRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -287,6 +299,12 @@ fn validate_monitor_id(monitor_id: &str) -> ToolResult<()> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MonitorSource {
     Sms,
+    Task {
+        task_id: String,
+    },
+    Agent {
+        agent_id: String,
+    },
     Process {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +347,8 @@ pub enum MonitorSource {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum MonitorSourceWire {
     Sms(MonitorNoFields),
+    Task(MonitorTaskSource),
+    Agent(MonitorAgentSource),
     Process(MonitorCommandSource),
     File(MonitorFileSource),
     Poll(MonitorPollSource),
@@ -394,6 +414,12 @@ impl<'de> Deserialize<'de> for MonitorSource {
     {
         Ok(match MonitorSourceWire::deserialize(deserializer)? {
             MonitorSourceWire::Sms(MonitorNoFields {}) => Self::Sms,
+            MonitorSourceWire::Task(source) => Self::Task {
+                task_id: source.task_id,
+            },
+            MonitorSourceWire::Agent(source) => Self::Agent {
+                agent_id: source.agent_id,
+            },
             MonitorSourceWire::Process(source) => Self::Process {
                 command: source.command,
                 cwd: source.cwd,
@@ -501,6 +527,8 @@ impl MonitorSource {
     pub fn kind(&self) -> MonitorSourceKind {
         match self {
             Self::Sms => MonitorSourceKind::Sms,
+            Self::Task { .. } => MonitorSourceKind::Task,
+            Self::Agent { .. } => MonitorSourceKind::Agent,
             Self::Process { .. } => MonitorSourceKind::Process,
             Self::File { .. } => MonitorSourceKind::File,
             Self::Poll { .. } => MonitorSourceKind::Poll,
@@ -512,6 +540,8 @@ impl MonitorSource {
     fn validate(&self) -> ToolResult<()> {
         match self {
             Self::Sms => Ok(()),
+            Self::Task { task_id } => bounded_nonempty(task_id, 128, "monitor task_id"),
+            Self::Agent { agent_id } => bounded_nonempty(agent_id, 128, "monitor agent_id"),
             Self::Process {
                 command,
                 cwd,
@@ -574,7 +604,11 @@ impl MonitorSource {
                 Some(crate::process::monitor_shell_argv(command))
             }
             Self::Cli { preset, argv, .. } => Some(cli_preset_argv(*preset, argv)),
-            Self::Sms | Self::File { .. } | Self::Timer { .. } => None,
+            Self::Sms
+            | Self::Task { .. }
+            | Self::Agent { .. }
+            | Self::File { .. }
+            | Self::Timer { .. } => None,
         }
     }
 
@@ -584,7 +618,11 @@ impl MonitorSource {
             Self::Process { cwd, .. } | Self::Poll { cwd, .. } | Self::Cli { cwd, .. } => {
                 cwd.as_deref()
             }
-            Self::Sms | Self::File { .. } | Self::Timer { .. } => None,
+            Self::Sms
+            | Self::Task { .. }
+            | Self::Agent { .. }
+            | Self::File { .. }
+            | Self::Timer { .. } => None,
         }
     }
 
@@ -600,7 +638,11 @@ impl MonitorSource {
             | Self::Cli {
                 env_passthrough, ..
             } => env_passthrough,
-            Self::Sms | Self::File { .. } | Self::Timer { .. } => &[],
+            Self::Sms
+            | Self::Task { .. }
+            | Self::Agent { .. }
+            | Self::File { .. }
+            | Self::Timer { .. } => &[],
         }
     }
 }
@@ -609,6 +651,8 @@ impl MonitorSource {
 #[serde(rename_all = "snake_case")]
 pub enum MonitorSourceKind {
     Sms,
+    Task,
+    Agent,
     Process,
     File,
     Poll,
@@ -640,7 +684,9 @@ impl MonitorFilter {
                     MonitorFilterField::Address | MonitorFilterField::Body
                 )
             }
-            MonitorSourceKind::Process
+            MonitorSourceKind::Task
+            | MonitorSourceKind::Agent
+            | MonitorSourceKind::Process
             | MonitorSourceKind::File
             | MonitorSourceKind::Poll
             | MonitorSourceKind::Cli => self.field == MonitorFilterField::Payload,
@@ -1167,7 +1213,7 @@ fn bounded_nonempty(value: &str, maximum: usize, name: &str) -> ToolResult<()> {
 pub fn monitor_manifest() -> ToolManifest {
     let mut manifest = ToolManifest {
         name: "monitor".into(),
-        description: "List also returns pending follow-ups. Use follow_up with obligation_id, attempt, completion_action=claim/handled/dismiss/resume and evidence_event_ids. Claim task/menu work explicitly; handled requires committed action-result evidence for the consuming run (available in list); report-only monitors may cite a completed owner message. Reconcile side effects before repeating them. Register, list, update, pause, resume, trigger, or remove durable sms/process/file/poll/timer/cli watches. Matches coalesce per monitor: idle wakes as a subturn; busy queues to the next turn boundary. Command registration/update requires ProcessExec authorization for exact argv/cwd/env names; external files require FsRead authorization.".into(),
+        description: "List also returns pending follow-ups. Use follow_up with obligation_id, attempt, completion_action=claim/handled/dismiss/resume and evidence_event_ids. Claim task/menu work explicitly; handled requires committed action-result evidence for the consuming run (available in list); report-only monitors may cite a completed owner message. Reconcile side effects before repeating them. Register, list, update, pause, resume, trigger, or remove durable sms/task/agent/process/file/poll/timer/cli watches. Task and agent sources watch their IDs directly and wake with a completion digest. Matches coalesce per monitor: idle wakes as a subturn; busy queues to the next turn boundary. Command registration/update requires ProcessExec authorization for exact argv/cwd/env names; external files require FsRead authorization.".into(),
         effects: vec![],
         dispatch: DispatchMode::Await,
         input_schema: serde_json::json!({
@@ -1182,7 +1228,9 @@ pub fn monitor_manifest() -> ToolManifest {
                 "source": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "enum": ["sms", "process", "file", "poll", "timer", "cli"] },
+                        "kind": { "type": "string", "enum": ["sms", "task", "agent", "process", "file", "poll", "timer", "cli"] },
+                        "task_id": { "type": "string" },
+                        "agent_id": { "type": "string" },
                         "command": { "type": "string" },
                         "path": { "type": "string" },
                         "interval_ms": { "type": "integer" },
@@ -1235,10 +1283,11 @@ pub fn monitor_manifest() -> ToolManifest {
         }),
     };
     if cfg!(feature = "android-standalone") {
-        manifest.description = "Register, list, update, pause, resume, trigger, or remove durable SMS, workspace-file, and native timer watches. Reports use the canonical session hub.".into();
+        manifest.description = "Register, list, update, pause, resume, trigger, or remove durable SMS, task, agent, workspace-file, and native timer watches. Task and agent IDs report terminal digests through the session hub.".into();
         manifest.input_schema["properties"]["source"] = serde_json::json!({
             "type":"object", "properties": {
-                "kind":{"type":"string","enum":["sms","file","timer"]},
+                "kind":{"type":"string","enum":["sms","task","agent","file","timer"]},
+                "task_id":{"type":"string"}, "agent_id":{"type":"string"},
                 "path":{"type":"string"}, "interval_ms":{"type":"integer"}
             }, "required":["kind"], "additionalProperties":false
         });
@@ -1313,6 +1362,8 @@ mod tests {
     fn every_tagged_monitor_variant_still_parses() {
         for source in [
             serde_json::json!({"kind": "sms"}),
+            serde_json::json!({"kind": "task", "task_id": "task-123"}),
+            serde_json::json!({"kind": "agent", "agent_id": "agent-123"}),
             serde_json::json!({"kind": "process", "command": "printf ok"}),
             serde_json::json!({"kind": "file", "path": "status.txt"}),
             serde_json::json!({"kind": "poll", "command": "printf ok", "interval_ms": 5_000}),

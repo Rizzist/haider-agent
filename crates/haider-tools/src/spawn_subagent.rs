@@ -22,6 +22,10 @@ use haider_protocol::spawn_subagent::{
 pub struct SpawnSubagent {
     pub task: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
     /// Per-turn request tranche and hard ceiling pinned for this child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
@@ -55,6 +59,8 @@ impl SpawnSubagent {
         let SpawnSubagentArguments {
             task,
             prompt,
+            background,
+            wait_ms,
             request_budget,
             model,
             provider,
@@ -67,6 +73,8 @@ impl SpawnSubagent {
         Ok(Self {
             task,
             prompt,
+            background,
+            wait_ms,
             request_budget,
             model,
             provider,
@@ -99,7 +107,7 @@ impl EffectOperation for SpawnSubagent {
 pub fn spawn_subagent_manifest() -> ToolManifest {
     ToolManifest {
         name: "spawn_subagent".into(),
-        description: "Delegate one bounded task to a depth-capped local child under AgentSpawn policy; waits for the child report before returning its tool result. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.".into(),
+        description: "Delegate a local child under AgentSpawn policy. By default wait for its report; background=true returns a durable handle immediately and wait_ms bounds only the observation. Use haider agent wait/list/message/cancel on the returned parent session and child id. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.".into(),
         effects: vec![EffectClass::AgentSpawn],
         dispatch: DispatchMode::Deferred,
         input_schema: serde_json::json!({
@@ -126,6 +134,14 @@ pub fn spawn_subagent_manifest() -> ToolManifest {
                     "minLength": 1,
                     "maxLength": MAX_PROMPT_BYTES,
                     "description": "Complete task prompt for the child"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Return a durable child handle immediately. Use haider agent wait/list/message/cancel with the returned parent session and child id."
+                },
+                "wait_ms": {
+                    "type": "integer", "minimum": 1, "maximum": 86400000,
+                    "description": "Optional time to observe a blocking child. On expiry return child_still_running; the child continues."
                 },
                 "model": {
                     "type": "string",

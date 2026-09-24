@@ -9,8 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // Registry #94: one command may cold-start (30s), issue its RPC (60s),
-// observe --timeout 10s, and publish/drain its terminal (2s): 30+60+10+2=102s.
-const COMMAND_BOUND: Duration = Duration::from_secs(30 + 60 + 10 + 2);
+// observe --timeout 30s, and publish/drain its terminal (2s): 30+60+30+2=122s.
+const COMMAND_BOUND: Duration = Duration::from_secs(30 + 60 + 30 + 2);
 // Product daemon stop is 20s, followed by 2s process-exit observation.
 const STOP_BOUND: Duration = Duration::from_secs(20 + 2);
 
@@ -308,6 +308,430 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a str {
 
 fn report_script(text: &str) -> Value {
     json!([{"step":"emit_text","text":text},{"step":"finish","reason":"end_turn"}])
+}
+
+#[cfg(unix)]
+fn ax2_child_script(command: &str, label: &str, slow_ms: u64) -> Value {
+    json!([
+        {"step":"delay","ms":slow_ms},
+        {"step":"emit_tool_call","call_id":format!("write-{label}"),"name":"process_exec","args":{"command":command}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":format!("write-{label}")},
+        {"step":"emit_text","text":format!("{label} implementation and tests written")},
+        {"step":"finish","reason":"end_turn"}
+    ])
+}
+
+#[cfg(unix)]
+fn ax2_log(workspace: &std::path::Path, moment: Value) {
+    use std::io::Write as _;
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(workspace.join("experience-log.jsonl"))
+        .expect("AX-2 experience log");
+    writeln!(log, "{moment}").expect("AX-2 orchestration moment");
+}
+
+/// AX-2 T3 replay: three real delegated tool writers and a delayed integration
+/// process run through the real CLI/daemon with a private model-routed fake.
+/// `HAIDER_AX2_SLOW_SECONDS=90` reproduces the original deliberate build wait;
+/// the ordinary suite uses ten seconds so registration wins under CI load.
+#[cfg(unix)]
+#[test]
+fn ax2_t3_fake_parent_finishes_while_three_children_and_build_run() {
+    let slow_seconds = std::env::var("HAIDER_AX2_SLOW_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10);
+    let csv = r#"mkdir -p csvstat; touch csvstat/__init__.py; cat > csvstat/csvstat.py <<'PY'
+import csv, json, statistics, sys
+def stats(path, column):
+    with open(path, newline='', encoding='utf-8') as stream:
+        values = [float(row[column]) for row in csv.DictReader(stream) if row[column].strip()]
+    if not values:
+        raise ValueError('no numeric values')
+    return {'count': len(values), 'mean': statistics.mean(values), 'median': statistics.median(values), 'min': min(values), 'max': max(values)}
+if __name__ == '__main__':
+    print(json.dumps(stats(sys.argv[1], sys.argv[2]), sort_keys=True))
+PY
+cat > csvstat/test_csvstat.py <<'PY'
+import tempfile, unittest
+from pathlib import Path
+from csvstat.csvstat import stats
+class CsvStatTests(unittest.TestCase):
+    def test_column_stats(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'numbers.csv'
+            path.write_text('n\n1\n2\n5\n', encoding='utf-8')
+            self.assertEqual(stats(path, 'n'), {'count': 3, 'mean': 8/3, 'median': 2, 'min': 1, 'max': 5})
+    def test_empty_column(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'numbers.csv'
+            path.write_text('n\n\n', encoding='utf-8')
+            with self.assertRaises(ValueError): stats(path, 'n')
+PY"#;
+    let slug = r#"mkdir -p slugify; touch slugify/__init__.py; cat > slugify/slugify.py <<'PY'
+import re, sys, unicodedata
+def slugify(value):
+    value = value.casefold().translate(str.maketrans({'ß':'ss', 'ø':'o', 'ł':'l', 'æ':'ae'}))
+    value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+    return re.sub(r'[^a-z0-9]+', '-', value).strip('-')
+if __name__ == '__main__': print(slugify(' '.join(sys.argv[1:])))
+PY
+cat > slugify/test_slugify.py <<'PY'
+import unittest
+from slugify.slugify import slugify
+class SlugTests(unittest.TestCase):
+    def test_unicode(self): self.assertEqual(slugify('Straße Øresund Łódź'), 'strasse-oresund-lodz')
+    def test_punctuation(self): self.assertEqual(slugify('  Hello,   world!! '), 'hello-world')
+PY"#;
+    let path = r#"mkdir -p jsonpath-lite; touch jsonpath-lite/__init__.py; cat > jsonpath-lite/jsonpath_lite.py <<'PY'
+import json, re, sys
+def extract(data, path):
+    tokens = re.findall(r'[^.\[\]]+|\[\d+\]', path)
+    if not tokens: raise ValueError('empty path')
+    for token in tokens:
+        data = data[int(token[1:-1])] if token.startswith('[') else data[token]
+    return data
+if __name__ == '__main__':
+    with open(sys.argv[1], encoding='utf-8') as stream: print(json.dumps(extract(json.load(stream), sys.argv[2])))
+PY
+cat > jsonpath-lite/test_jsonpath_lite.py <<'PY'
+import importlib.util, unittest
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('jsonpath_lite', Path(__file__).with_name('jsonpath_lite.py'))
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+class PathTests(unittest.TestCase):
+    def test_dotted_index(self): self.assertEqual(module.extract({'a': {'b': [{'c': 7}]}}, 'a.b[0].c'), 7)
+    def test_missing(self):
+        with self.assertRaises(KeyError): module.extract({}, 'missing')
+PY"#;
+    let setup = r#"cat > run_all_tests.sh <<'SH'
+#!/bin/sh
+set -eu
+python3 -m unittest discover -s csvstat -t . -p 'test_*.py'
+python3 -m unittest discover -s slugify -t . -p 'test_*.py'
+python3 -m unittest discover -s jsonpath-lite -p 'test_*.py'
+SH
+chmod +x run_all_tests.sh"#;
+    let parent = json!([
+        {"step":"emit_tool_call","call_id":"setup","name":"process_exec","args":{"command":setup}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"setup"},
+        {"step":"emit_tool_call","call_id":"csv-child","name":"spawn_subagent","args":{"task":"csvstat","prompt":"Implement CSV statistics and tests","model":"fake-csv","provider":"fake","background":true}},
+        {"step":"emit_tool_call","call_id":"slug-child","name":"spawn_subagent","args":{"task":"slugify","prompt":"Implement Unicode slugifier and tests","model":"fake-slug","provider":"fake","background":true}},
+        {"step":"emit_tool_call","call_id":"path-child","name":"spawn_subagent","args":{"task":"jsonpath-lite","prompt":"Implement dotted JSON extractor and tests","model":"fake-path","provider":"fake","background":true}},
+        {"step":"emit_tool_call","call_id":"integration-build","name":"process_exec","args":{"command":format!("sleep {slow_seconds} && ./run_all_tests.sh > build.log 2>&1"),"background":true,"name":"AX-2 integration"}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"csv-child"},
+        {"step":"expect_tool_result","call_id":"slug-child"},
+        {"step":"expect_tool_result","call_id":"path-child"},
+        {"step":"expect_tool_result","call_id":"integration-build"},
+        {"step":"emit_text","text":"All three children and the integration build are running; collect their handles."},
+        {"step":"finish","reason":"end_turn"},
+        {"step":"emit_text","text":"The child completion monitor fired; the integration task is still running."},
+        {"step":"finish","reason":"end_turn"},
+        {"step":"emit_tool_call","call_id":"integration-verify","name":"process_exec","args":{"command":"./run_all_tests.sh"}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"integration-verify"},
+        {"step":"emit_text","text":"Monitor woke the parent; all three tool suites pass."},
+        {"step":"finish","reason":"end_turn"}
+    ]);
+    let script = json!({"by_model": {
+        "fake-model": parent,
+        "fake-csv": ax2_child_script(csv, "csv", 1200),
+        "fake-slug": ax2_child_script(slug, "slug", 0),
+        "fake-path": ax2_child_script(path, "path", 0),
+    }});
+    let mut profile = Profile::new(script);
+    profile.tool_exposure = None;
+    let models = ["fake-model", "fake-csv", "fake-slug", "fake-path"]
+        .into_iter()
+        .map(|slug| json!({"slug":slug,"display_name":slug,"supported_efforts":[],"visible":true}))
+        .collect::<Vec<_>>();
+    let fetched_at = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("time fits");
+    haider_store::Store::open(&profile.profile)
+        .expect("catalog store")
+        .put_provider_models("fake", &Value::Array(models).to_string(), None, fetched_at)
+        .expect("publish fake model routes");
+    let output = profile.run(&[
+        "run",
+        "--provider",
+        "fake",
+        "--model",
+        "fake-model",
+        "--jsonl",
+        "-p",
+        "AX-2 T3 orchestration replay",
+    ]);
+    assert!(
+        output.status.success(),
+        "parent exit {:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("JSONL event"))
+        .collect::<Vec<_>>();
+    let result = |call_id: &str| -> Value {
+        let event = events
+            .iter()
+            .find(|event| {
+                event["payload"]["type"] == "tool_result" && event["payload"]["call_id"] == call_id
+            })
+            .expect("tool result");
+        serde_json::from_str(field(&event["payload"]["result"], "preview")).expect("typed preview")
+    };
+    let handles = ["csv-child", "slug-child", "path-child"].map(&result);
+    let build = result("integration-build");
+    let task_id = field(&build, "task_id").to_owned();
+    let parent_session = field(&handles[0], "parent_session_id").to_owned();
+    eprintln!("AX2-T3 parent_session={parent_session} integration_task={task_id}");
+    for (tool, handle) in ["csvstat", "slugify", "jsonpath-lite"]
+        .into_iter()
+        .zip(&handles)
+    {
+        ax2_log(
+            &profile.workspace,
+            json!({"event":"spawn","tool":tool,"agent":handle["agent"],"status":handle["status"]}),
+        );
+    }
+    ax2_log(
+        &profile.workspace,
+        json!({"event":"background_build_started","task_id":task_id,"slow_seconds":slow_seconds}),
+    );
+    assert!(
+        handles
+            .iter()
+            .all(|handle| handle["parent_session_id"].as_str() == Some(parent_session.as_str()))
+    );
+    let listed = profile.json(
+        &["agent", "list", &parent_session, "--json", "--no-spawn"],
+        "haider.agent.list.v1",
+        0,
+    );
+    for handle in &handles {
+        assert!(
+            listed.to_string().contains(field(handle, "agent")),
+            "{listed}"
+        );
+    }
+    let status = profile.run(&["status", "--json", "--no-spawn"]);
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).expect("daemon status");
+    let endpoint = PathBuf::from(field(&status["daemon"], "socket_path"));
+    let generation = profile
+        .journal(&parent_session)
+        .first()
+        .and_then(|event| event["worker_generation"].as_u64())
+        .expect("parent worker generation");
+    let agent_monitor_id = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("monitor runtime")
+        .block_on(async {
+            let connection = haider_client::connect(&endpoint, haider_client::ClientConfig::default())
+                .await.expect("real monitor connection");
+            let session_id = haider_protocol::ids::SessionId::new(parent_session.clone());
+            let attached = connection.client.request(haider_rpc::RequestBody::SessionAttach {
+                session_id: session_id.clone(), after_seq: 0, mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            }).await.expect("control attachment");
+            assert!(matches!(&attached, haider_rpc::ResponseBody::SessionAttach { .. }), "{attached:?}");
+            let registered = connection.client.request(haider_rpc::RequestBody::MonitorRegister {
+                command_id: haider_rpc::CommandId::new("ax2-task-monitor"),
+                session_id: session_id.clone(),
+                worker_generation: generation,
+                source: haider_rpc::MonitorSourceWire::Task { task_id: task_id.clone() },
+                filter: None,
+                action: haider_rpc::MonitorActionWire { report: true, follow_up: Some("The integration build completed. Run all three suites and report the result.".into()) },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Once,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            }).await.expect("register task monitor");
+            assert!(matches!(&registered, haider_rpc::ResponseBody::MonitorRegister { receipt } if matches!(&receipt.outcome, haider_rpc::MonitorRegisterOutcomeWire::Registered { .. })), "{registered:?}");
+            let agent_watch = connection.client.request(haider_rpc::RequestBody::MonitorRegister {
+                command_id: haider_rpc::CommandId::new("ax2-agent-monitor"),
+                session_id,
+                worker_generation: generation,
+                source: haider_rpc::MonitorSourceWire::Agent { agent_id: field(&handles[0], "agent").into() },
+                filter: None,
+                action: haider_rpc::MonitorActionWire { report: true, follow_up: None },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            }).await.expect("register agent monitor");
+            let agent_monitor_id = match &agent_watch {
+                haider_rpc::ResponseBody::MonitorRegister { receipt } => match &receipt.outcome {
+                    haider_rpc::MonitorRegisterOutcomeWire::Registered { monitor } => monitor.monitor_id.clone(),
+                    other => panic!("agent watch refused: {other:?}"),
+                },
+                other => panic!("agent watch response: {other:?}"),
+            };
+            let _ = connection.client.close();
+            agent_monitor_id
+        });
+    ax2_log(
+        &profile.workspace,
+        json!({"event":"monitor_registered","source":"task","id":task_id}),
+    );
+    ax2_log(
+        &profile.workspace,
+        json!({"event":"monitor_registered","source":"agent","id":handles[0]["agent"]}),
+    );
+    for handle in &handles {
+        assert_eq!(handle["status"], "child_spawned", "{handle}");
+        ax2_log(
+            &profile.workspace,
+            json!({"event":"wait","agent":handle["agent"]}),
+        );
+        let wait_args = [
+            "agent",
+            "wait",
+            field(handle, "parent_session_id"),
+            field(handle, "agent"),
+            "--json",
+            "--timeout",
+            "30s",
+            "--no-spawn",
+        ];
+        let waited_output = profile.run(&wait_args);
+        if !waited_output.status.success() {
+            let child_events = profile.journal(field(handle, "child_session_id"));
+            let recent = child_events
+                .iter()
+                .rev()
+                .take(20)
+                .map(|event| {
+                    json!({
+                        "seq": event["seq"],
+                        "type": event["payload"]["type"],
+                        "state": event["payload"]["state"],
+                    })
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "child wait failed: {}\nrecent child events: {recent:#?}",
+                String::from_utf8_lossy(&waited_output.stdout)
+            );
+        }
+        let waited: Value = serde_json::from_slice(&waited_output.stdout).expect("agent wait JSON");
+        assert_eq!(waited["result"]["state"], "done", "{waited}");
+        assert_eq!(
+            waited["result"]["report_source"], "child_journal",
+            "{waited}"
+        );
+        eprintln!("AX2-T3 child={} state=done", field(handle, "agent"));
+        ax2_log(
+            &profile.workspace,
+            json!({"event":"result_retrieved","agent":handle["agent"],"state":"done"}),
+        );
+    }
+    assert!(profile.workspace.join("csvstat/csvstat.py").exists());
+    assert!(profile.workspace.join("slugify/slugify.py").exists());
+    assert!(
+        profile
+            .workspace
+            .join("jsonpath-lite/jsonpath_lite.py")
+            .exists()
+    );
+    let agent_watch_deadline = Instant::now() + Duration::from_secs(5);
+    let mut agent_watch_fired = false;
+    while Instant::now() < agent_watch_deadline {
+        let endpoint = endpoint.clone();
+        let session = parent_session.clone();
+        let monitor = agent_monitor_id.clone();
+        agent_watch_fired = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("list runtime")
+            .block_on(async {
+                let connection = haider_client::connect(&endpoint, haider_client::ClientConfig::default()).await.expect("monitor list connection");
+                let response = connection.client.request(haider_rpc::RequestBody::MonitorList { session_id: haider_protocol::ids::SessionId::new(session) }).await.expect("list monitors");
+                let _ = connection.client.close();
+                matches!(response, haider_rpc::ResponseBody::MonitorList { receipt } if matches!(&receipt.outcome, haider_rpc::MonitorListOutcomeWire::Listed { monitors } if monitors.iter().any(|entry| entry.monitor_id == monitor && entry.fire_count > 0)))
+            });
+        if agent_watch_fired {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(agent_watch_fired, "agent-handle monitor did not fire");
+    ax2_log(
+        &profile.workspace,
+        json!({"event":"agent_monitor_fired","monitor_id":agent_monitor_id}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(slow_seconds + 15);
+    let mut saw_monitor_wake = false;
+    while Instant::now() < deadline {
+        let journal = profile.journal(&parent_session);
+        let verifying_run = journal
+            .iter()
+            .find(|event| {
+                event["payload"]["type"] == "tool_result"
+                    && event["payload"]["call_id"] == "integration-verify"
+                    && event["payload"]["result"]["preview"]
+                        .as_str()
+                        .is_some_and(|preview| preview.contains("\"exit_code\":0"))
+            })
+            .and_then(|event| event["run_id"].as_str());
+        saw_monitor_wake = verifying_run.is_some_and(|run_id| {
+            journal.iter().any(|event| {
+                event["run_id"].as_str() == Some(run_id)
+                    && event["payload"]["type"] == "run_state"
+                    && event["payload"]["state"] == "done"
+            })
+        });
+        if saw_monitor_wake {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !saw_monitor_wake {
+        let journal = profile.journal(&parent_session);
+        let recent = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["payload"]["type"].as_str(),
+                    Some("tool_result" | "user_message")
+                )
+            })
+            .map(|event| {
+                json!({
+                    "seq": event["seq"],
+                    "run": event["run_id"],
+                    "type": event["payload"]["type"],
+                    "call_id": event["payload"]["call_id"],
+                    "text": event["payload"]["text"],
+                    "preview": event["payload"]["result"]["preview"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let build_log = std::fs::read_to_string(profile.workspace.join("build.log"));
+        panic!(
+            "task monitor did not wake parent for integration: {recent:#?}\nbuild log: {build_log:?}"
+        );
+    }
+    ax2_log(
+        &profile.workspace,
+        json!({"event":"task_monitor_wake","task_id":task_id}),
+    );
+    let build_log =
+        std::fs::read_to_string(profile.workspace.join("build.log")).expect("build log");
+    assert!(build_log.contains("OK"), "{build_log}");
+    ax2_log(
+        &profile.workspace,
+        json!({"event":"integration_verified","status":"pass"}),
+    );
+    let experience_log = std::fs::read_to_string(profile.workspace.join("experience-log.jsonl"))
+        .expect("recorded orchestration moments");
+    assert!(experience_log.lines().count() >= 13, "{experience_log}");
+    eprintln!("AX2-T3 task_monitor_wake=done integration_tests=pass slow_seconds={slow_seconds}");
+    profile.stop();
 }
 
 fn provider_requests(events: &[Value]) -> usize {

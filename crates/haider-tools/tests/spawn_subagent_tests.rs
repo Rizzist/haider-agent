@@ -107,6 +107,37 @@ fn m2e_legacy_spawn_arguments_remain_byte_for_byte_plain() {
     assert!(request.workflow_trigger.is_none());
     assert!(request.parent_slot.is_none());
     assert!(!request.workflow_author);
+    assert!(!request.background);
+    assert_eq!(request.wait_ms, None);
+}
+
+#[test]
+fn background_and_wait_observation_are_explicit_and_child_safe() {
+    let background = SpawnSubagent::from_tool_args(serde_json::json!({
+        "task": "slow work", "prompt": "finish later", "background": true,
+    }))
+    .expect("background child");
+    assert!(background.background);
+    assert_eq!(background.arguments().expect("wire")["background"], true);
+    let bounded = SpawnSubagent::from_tool_args(serde_json::json!({
+        "task": "slow work", "prompt": "finish later", "wait_ms": 125,
+    }))
+    .expect("bounded parent observation");
+    assert_eq!(bounded.wait_ms, Some(125));
+    for invalid in [0, 86_400_001] {
+        assert!(
+            SpawnSubagent::from_tool_args(serde_json::json!({
+                "task": "slow work", "prompt": "finish later", "wait_ms": invalid,
+            }))
+            .is_err()
+        );
+    }
+    assert!(
+        SpawnSubagent::from_tool_args(serde_json::json!({
+            "task": "slow work", "prompt": "finish later", "background": true, "wait_ms": 125,
+        }))
+        .is_err()
+    );
 }
 
 /// MUTATION CHECK: keep the AgentSpawn effect dispatched until simulated

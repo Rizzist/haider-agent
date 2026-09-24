@@ -407,11 +407,9 @@ use tokio::sync::watch;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, timeout};
 
-/// The delegation fallback is one absolute parent-run clock, even when a
-/// headless deadline lies farther away. MUTATION: cap `run_deadline - now` by
-/// 241s at each invocation and the second hop moves the deadline forward 60s.
+/// An explicit parent deadline is the only bound for a delegated wait.
 #[test]
-fn workflow_hops_do_not_refresh_the_delegation_wait_deadline() {
+fn explicit_parent_deadline_is_not_shortened_by_child_fallback() {
     let parent_started_at_ms = 1_000;
     let first_now_unix_ms = parent_started_at_ms;
     let first_now = tokio::time::Instant::now();
@@ -433,7 +431,7 @@ fn workflow_hops_do_not_refresh_the_delegation_wait_deadline() {
         Some(explicit_parent_deadline),
     );
 
-    assert_eq!(first_hop_deadline, first_now + fallback);
+    assert_eq!(first_hop_deadline, explicit_parent_deadline);
     assert_eq!(second_hop_deadline, first_hop_deadline);
 }
 
@@ -1160,6 +1158,8 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         auto_hermetic: false,
     };
     let request = SpawnSubagent {
+        background: false,
+        wait_ms: None,
         request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
             tranche: 40,
             hard_cap: 96,
@@ -1577,6 +1577,8 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: None,
                 task: "parser audit".into(),
                 prompt: "inspect the parser state machine".into(),
@@ -1832,6 +1834,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: None,
                 task: "first pass".into(),
                 prompt: "finish once".into(),
@@ -2100,6 +2104,8 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
                     tranche: 1,
                     hard_cap: 1,
@@ -2283,6 +2289,8 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: None,
                 task: "owned child".into(),
                 prompt: "do not cross parents".into(),
@@ -3121,9 +3129,11 @@ fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<Even
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
 enum ParkedChildMode {
     Complete,
     StallAfterApproval,
+    ParentWaitTimeout,
 }
 
 #[cfg(unix)]
@@ -3151,6 +3161,7 @@ async fn start_parked_child(
         stall_deadline,
         Duration::from_secs(241),
         Duration::from_secs(1),
+        None,
     )
     .await
 }
@@ -3162,14 +3173,19 @@ async fn start_parked_child_with_wait_budgets(
     stall_deadline: Duration,
     run_wait_timeout: Duration,
     settlement_tail_timeout: Duration,
+    observation_wait_ms: Option<u64>,
 ) -> ParkedChildHarness {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut spawn_args = serde_json::json!({"task":"permission","prompt":"run one command"});
+    if let Some(wait_ms) = observation_wait_ms {
+        spawn_args["wait_ms"] = serde_json::json!(wait_ms);
+    }
     let mut script = vec![
         FakeStep::EmitToolCall {
             call_id: format!("{label}-spawn"),
             name: "spawn_subagent".into(),
-            args: serde_json::json!({"task":"permission","prompt":"run one command"}),
+            args: spawn_args,
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -3187,12 +3203,12 @@ async fn start_parked_child_with_wait_budgets(
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        FakeStep::ExpectToolResult {
-            call_id: format!("{label}-ask"),
-        },
     ];
     match mode {
         ParkedChildMode::Complete => script.extend([
+            FakeStep::ExpectToolResult {
+                call_id: format!("{label}-ask"),
+            },
             FakeStep::EmitText {
                 text: "child continued after permission".into(),
             },
@@ -3200,19 +3216,41 @@ async fn start_parked_child_with_wait_budgets(
                 reason: FinishReason::EndTurn,
             },
         ]),
-        ParkedChildMode::StallAfterApproval => script.push(FakeStep::Hang),
+        ParkedChildMode::StallAfterApproval => script.extend([
+            FakeStep::ExpectToolResult {
+                call_id: format!("{label}-ask"),
+            },
+            FakeStep::Hang,
+        ]),
+        ParkedChildMode::ParentWaitTimeout => {
+            // The child is still parked. The next provider request belongs to
+            // the parent and must consume the bounded spawn observation.
+            script.extend([
+                FakeStep::ExpectToolResult {
+                    call_id: format!("{label}-spawn"),
+                },
+                FakeStep::EmitText {
+                    text: "parent received a live child handle".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ]);
+        }
     }
-    script.extend([
-        FakeStep::ExpectToolResult {
-            call_id: format!("{label}-spawn"),
-        },
-        FakeStep::EmitText {
-            text: "parent collected permission child".into(),
-        },
-        FakeStep::Finish {
-            reason: FinishReason::EndTurn,
-        },
-    ]);
+    if !matches!(mode, ParkedChildMode::ParentWaitTimeout) {
+        script.extend([
+            FakeStep::ExpectToolResult {
+                call_id: format!("{label}-spawn"),
+            },
+            FakeStep::EmitText {
+                text: "parent collected permission child".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]);
+    }
     let provider = Arc::new(FakeProvider::new(script));
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let manager = WorkerManager::start(
@@ -3223,12 +3261,16 @@ async fn start_parked_child_with_wait_budgets(
                 provider: provider.clone(),
             }),
             tool_factory: delegation_tool_factory(),
-            delegation: Some(DelegationHandle::with_wait_budgets(
-                hub.clone(),
-                stall_deadline,
-                run_wait_timeout,
-                settlement_tail_timeout,
-            )),
+            delegation: Some(if observation_wait_ms.is_some() {
+                DelegationHandle::new(hub.clone())
+            } else {
+                DelegationHandle::with_wait_budgets(
+                    hub.clone(),
+                    stall_deadline,
+                    run_wait_timeout,
+                    settlement_tail_timeout,
+                )
+            }),
             web_search: None,
         },
         false,
@@ -4173,19 +4215,17 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
     final_store.close().await.expect("final store close");
 }
 
-/// MUTATION CHECK: remove `bounded_wait` around the delegated active wait.
-/// Expected RUNTIME failure: the outer five-second state observer times out
-/// because the parent remains Waiting(LocalChild). Returning token/tool
-/// counters as completion also fails because the typed timeout disappears.
+/// A bounded observation returns a handle while the child remains answerable.
 #[tokio::test]
 #[cfg(unix)]
-async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
+async fn unanswered_delegated_question_returns_child_still_running() {
     let harness = start_parked_child_with_wait_budgets(
         "unanswered-bound",
-        ParkedChildMode::Complete,
+        ParkedChildMode::ParentWaitTimeout,
         Duration::from_secs(1),
         Duration::from_millis(2_250),
         Duration::from_millis(250),
+        Some(2_250),
     )
     .await;
     let _ = wait_for_parent_delegated_menu(
@@ -4196,47 +4236,13 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     .await;
 
     wait_for_state(&harness.store, &harness.parent_session, |state| {
-        *state == RunState::Errored
+        *state == RunState::Done
     })
     .await;
     wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
-        *state == RunState::Cancelled
+        matches!(state, RunState::InputRequired { .. })
     })
     .await;
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let events = harness
-                .store
-                .read(&harness.child.child_session_id, 0, 1024)
-                .await
-                .expect("timed-out child journal");
-            let cancelled = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(payload, EventPayload::RunState(RunState::Cancelled))
-                })
-            });
-            let idle = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(
-                        payload,
-                        EventPayload::SessionState(
-                            haider_protocol::state::SessionState::Idle { .. }
-                        )
-                    )
-                })
-            });
-            if cancelled
-                .zip(idle)
-                .is_some_and(|(cancelled, idle)| idle > cancelled)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("timed-out child is cancelled and reaped to Idle");
-
     let parent_payloads = typed_payloads(
         &harness
             .store
@@ -4244,11 +4250,19 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
             .await
             .expect("timed-out parent journal"),
     );
-    assert!(parent_payloads.iter().any(|payload| matches!(
-        payload,
-        EventPayload::RunFailed { code: ErrorCode::ProviderTimeout, presentation: Some(presentation), .. }
-            if presentation.subcode.as_str() == "delegated-child-wait-timeout"
+    assert!(parent_payloads.iter().any(|payload| matches!(payload,
+        EventPayload::ToolResult { result, .. }
+            if result.preview.contains("child_still_running")
+                && result.preview.contains(harness.child.agent_id.as_str())
+                && matches!(&result.data,
+                    Some(haider_protocol::tool::ToolResultData::ChildStillRunning { agent, collect, .. })
+                        if agent == &harness.child.agent_id && collect.contains("haider agent wait"))
     )));
+    assert!(
+        !parent_payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunFailed { .. }))
+    );
 
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
@@ -5882,6 +5896,8 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
         auto_hermetic: false,
     };
     let request = SpawnSubagent {
+        background: false,
+        wait_ms: None,
         request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
             tranche: 40,
             hard_cap: 96,

@@ -830,6 +830,38 @@ fn invalid_tool_call_data_has_a_typed_round_trip_without_changing_legacy_results
 }
 
 #[test]
+fn child_still_running_data_is_additive_and_keeps_legacy_results() {
+    let data = ToolResultData::ChildStillRunning {
+        agent: AgentId::new("agent-1"),
+        parent_session_id: SessionId::new("parent-1"),
+        child_session_id: SessionId::new("child-1"),
+        child_run_id: RunId::new("run-1"),
+        progress: Some(serde_json::json!({"state":"waiting"})),
+        latest_progress_at_ms: 42,
+        wait_limit_ms: 1_000,
+        collect: "haider agent wait parent-1 agent-1 --json".into(),
+    };
+    let wire = serde_json::json!({
+        "kind":"child_still_running", "agent":"agent-1",
+        "parent_session_id":"parent-1", "child_session_id":"child-1",
+        "child_run_id":"run-1", "progress":{"state":"waiting"},
+        "latest_progress_at_ms":42, "wait_limit_ms":1000,
+        "collect":"haider agent wait parent-1 agent-1 --json"
+    });
+    assert_eq!(
+        serde_json::to_value(&data).expect("encode child handle"),
+        wire
+    );
+    assert_eq!(
+        serde_json::from_value::<ToolResultData>(wire).expect("decode child handle"),
+        data
+    );
+    let legacy = serde_json::json!({"preview":"old", "truncated":false});
+    let decoded: BoundedResult = serde_json::from_value(legacy.clone()).expect("legacy result");
+    assert_eq!(serde_json::to_value(decoded).expect("legacy bytes"), legacy);
+}
+
+#[test]
 fn invalid_tool_call_repair_metadata_is_additive_and_round_trips() {
     for repaired in [false, true] {
         let data = ToolResultData::InvalidToolCall {
