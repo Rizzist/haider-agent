@@ -3,9 +3,10 @@
 comes back to exactly the same screen.
 
 Drives the real `haider tui --demo` binary under a PTY (hermetic env from
-probelib): start the scripted demo turn from the launcher, wait for its
-Claude-Code-style rows (`● Read(…)`, `● Edit(…)` over `⎿ Added 4 lines,
-removed 1 line`), focus the newest tool row with the typed fallback
+probelib): start the interactive demo's scripted turn from the launcher, wait for its
+Claude-Code-style rows (`● Search(…)`, `● Read(…)`, `● Edit(…)`,
+`● Bash(cargo check)` over `⎿ (No output)`), focus the newest tool row
+(the Bash call) with the typed fallback
 (`/collapse next` — Alt-free), press ⌃O, and GATE on:
 
   - the full-detail view paints (`full detail`, the row's header, the
@@ -70,11 +71,13 @@ def wait_screen(needle, seconds):
 
 pump(4.5)  # boot -> launcher
 write(b"probe the tool rows\r")
-session = wait_screen("⎿ Added 4 lines, removed 1 line", 20)
+session = wait_screen("● Bash(cargo check)", 25)
 text = screen_text(session)
 checks.append(("the demo turn reached the session", "● Read(" in text))
+checks.append(("a search reads as ● Search(pattern)", "● Search(" in text))
 checks.append(("an edit reads as ● Edit(path)", "● Edit(" in text))
-checks.append(("its ⎿ line counts the change", "⎿ Added 4 lines, removed 1 line" in text))
+checks.append(("a shell call reads as ● Bash(cmd)", "● Bash(cargo check)" in text))
+checks.append(("its ⎿ line reports the result", "⎿ (No output)" in text))
 checks.append(("no request-budget tally", "tranche" not in text))
 
 # Focus the newest tool row without an Alt chord, then settle.
@@ -88,7 +91,7 @@ view = repaint()
 view_text = screen_text(view)
 checks.append(("⌃O opened the full-detail view", "full detail" in view_text))
 checks.append(("the view names its way back", "esc / ⌃O back" in view_text))
-checks.append(("the view shows the row's header", "● Read(" in view_text))
+checks.append(("the view shows the focused row's header", "● Bash(cargo check)" in view_text))
 
 write(b"\x1b")  # Esc
 pump(1.5)  # crossterm's lone-Esc disambiguation window
@@ -110,15 +113,20 @@ closed = repaint()
 checks.append(("⌃O reopens the view", "full detail" in again))
 checks.append(("…and the same key closes it", closed == before))
 
-write(b"\x03")
-probelib.drain_quiet(fd, sink)
-child_clean = probelib.reap(pid)
-out = sink[0]
 if os.environ.get("TOOLVIEW_PROBE_DUMP"):
     print("---- session ----")
     print(text)
     print("---- detail view ----")
     print(view_text)
     print("---- after esc ----")
-    print(after_text)
+    print(after_text, flush=True)
+
+# The session surface's ⌃C is two-step (first arms, second quits) — the
+# convention the other session probes follow.
+write(b"\x03")
+pump(0.5)
+write(b"\x03")
+probelib.drain_quiet(fd, sink)
+child_clean = probelib.reap(pid)
+out = sink[0]
 probelib.verdict("TOOLVIEW_PROBE", out, child_clean, checks)

@@ -682,8 +682,79 @@ fn a_watched_edit_is_numbered_from_its_file_and_a_replayed_one_is_not() {
     model.note_tool_timings();
     model.note_edit_anchors();
     assert!(!model.edit_anchors.contains_key("e2"));
+    // A file the client cannot read yet (a workspace still being learned,
+    // a remote daemon) records nothing, so a later beat can still place it.
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("e3"),
+            item: tool(
+                "e3",
+                "fs_edit",
+                serde_json::json!({"path": "later.md", "edits": [{"old": "a", "new": "b"}]}),
+                ToolStatus::InProgress,
+            ),
+        }),
+    );
+    model.note_tool_timings();
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("e3"),
+            item: tool(
+                "e3",
+                "fs_edit",
+                serde_json::json!({"path": "later.md", "edits": [{"old": "a", "new": "b"}]}),
+                ToolStatus::Completed,
+            ),
+        }),
+    );
+    model.note_tool_timings();
+    model.note_edit_anchors();
+    assert!(!model.edit_anchors.contains_key("e3"), "not readable yet");
+    std::fs::write(
+        dir.path().join("later.md"),
+        "x
+b
+",
+    )
+    .unwrap();
+    model.note_edit_anchors();
+    assert_eq!(model.edit_anchors.get("e3"), Some(&vec![Some(2)]));
     // Resolving is once per row: a later beat does not re-read.
     let revision = model.edit_anchor_revision;
     model.note_edit_anchors();
     assert_eq!(model.edit_anchor_revision, revision);
+}
+
+// ---- 5. click geometry under the "Opened from" origin line -------------
+
+/// A live session opened from another directory draws a (wrapping) origin
+/// line ahead of entry 0. Every tool click target must sit on the row its
+/// glyphs were drawn on — the rows below the origin line, not above them.
+#[test]
+fn tool_click_targets_sit_on_their_rows_below_the_origin_line() {
+    let mut model = toolview_model();
+    model.launch_origin = Some((
+        1,
+        Some("/private/tmp/a-rather-long-origin-directory/that/wraps/at/eighty/columns/ws".into()),
+    ));
+    for (width, height) in [(118u16, 40u16), (80, 40)] {
+        let frame = draw(&model, width, height);
+        assert!(frame.contains("Opened from"), "{}", frame.rows.join("\n"));
+        let door = frame
+            .row_containing("(⌃O to expand)")
+            .expect("the write's door is drawn");
+        let (rect, _) = frame
+            .find_hit(|hit| matches!(hit, Hit::ToolDetail(id) if id == "write-lanes"))
+            .expect("…and is a click target");
+        assert_eq!(usize::from(rect.y), door, "door hit at {width} cols");
+        let header = frame
+            .row_containing("● Edit(state/970-STATUS.md)")
+            .expect("edit header drawn");
+        let (rect, _) = frame
+            .find_hit(|hit| matches!(hit, Hit::ToolRowToggle(id) if id == "edit-status"))
+            .expect("edit header is a click target");
+        assert_eq!(usize::from(rect.y), header, "header hit at {width} cols");
+    }
 }

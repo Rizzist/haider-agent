@@ -6616,10 +6616,15 @@ fn render_session(
             )),
             transcript_area,
         );
+        // `scroll` counts the origin prefix's wrapped rows (the viewport
+        // puts them ahead of entry 0), so every entry hit starts after them
+        // too. Passing 0 here put each click `origin_rows` above the row it
+        // was drawn on whenever a session showed its "Opened from" line
+        // (973-tui-toolview: the `(⌃O to expand)` door found it).
         image_reveal_hits(
             &transcript_cache,
             &model.projection,
-            0,
+            origin_rows,
             scroll,
             transcript_area,
             hits,
@@ -6632,7 +6637,7 @@ fn render_session(
             &transcript_cache,
             &model.projection,
             layout_ctx,
-            0,
+            origin_rows,
             scroll,
             transcript_area,
             hits,

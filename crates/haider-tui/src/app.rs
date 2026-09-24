@@ -16556,10 +16556,12 @@ impl AppModel {
     /// Resolve the file line each settled edit's replacement landed on
     /// (973-tui-toolview). Walks the same bounded transcript tail as
     /// [`Self::note_tool_timings`], considers only successful edit calls
-    /// whose START this client observed, reads each file at most once
-    /// (bounded to [`EDIT_ANCHOR_MAX_BYTES`]), and records `None` for any
-    /// replacement it cannot place — a remote daemon's path, an empty
-    /// replacement, a file changed again before this beat.
+    /// whose START this client observed, records each row once its file
+    /// is readable (bounded to [`EDIT_ANCHOR_MAX_BYTES`]), and records
+    /// `None` for any replacement it cannot place in that file — an empty
+    /// replacement, a file changed again before this beat. A file it cannot
+    /// read (a remote daemon's path) is retried while the row is in the
+    /// scanned tail and otherwise never numbered.
     pub fn note_edit_anchors(&mut self) {
         let workspace = self.tool_path_context().workspace;
         let entries = self.projection.entries();
@@ -16589,13 +16591,17 @@ impl AppModel {
                 .or_else(|| args.get("file_path"))
                 .and_then(serde_json::Value::as_str)
                 .and_then(|path| read_edited_file(workspace.as_deref(), path));
+            // An unreadable file records NOTHING, so a later beat retries:
+            // a live session learns its canonical (dated) workspace after
+            // the create response, and the first beats may still be looking
+            // under the process cwd. The bounded tail scan ends the retries
+            // once the row scrolls out of it.
+            let Some(content) = content else {
+                continue;
+            };
             let anchors = pairs
                 .iter()
-                .map(|pair| {
-                    content
-                        .as_deref()
-                        .and_then(|content| crate::toolview::line_of(content, &pair.new))
-                })
+                .map(|pair| crate::toolview::line_of(&content, &pair.new))
                 .collect();
             resolved.push((id.to_owned(), anchors));
         }
