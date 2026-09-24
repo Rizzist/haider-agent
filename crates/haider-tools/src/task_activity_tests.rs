@@ -3,6 +3,23 @@
 use super::TaskOutputBuffer;
 
 #[test]
+fn observed_task_bytes_follow_redacted_rendering() {
+    let mut buffer = TaskOutputBuffer::new(4096, 4096);
+    buffer.append_stream(
+        haider_protocol::item::OutputStream::Stdout,
+        b"password=violet-sunrise\n",
+    );
+    assert_eq!(
+        buffer.captured_bytes(),
+        "password=[REDACTED:password]\n".len() as u64
+    );
+    assert_ne!(
+        buffer.captured_bytes(),
+        b"password=violet-sunrise\n".len() as u64
+    );
+}
+
+#[test]
 fn activity_redacts_complete_lines_across_every_chunk_boundary_and_tail_eviction() {
     let output = b"first\nsk-abcdefghijklmnopQRSTUV\n";
     for split in 0..output.len() {

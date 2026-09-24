@@ -11,7 +11,8 @@
 //!   lexicographically first 500 paths and reports overflow honestly.
 //! - File freshness is session-scoped and advances only with a durably
 //!   journaled terminal outcome. File `fs_read`, `fs_write`, and `fs_edit`
-//!   attach the exact BLAKE3 digest to that outcome. Existing-file writes and
+//!   attach a BLAKE3 digest to that outcome (a process-secret keyed digest
+//!   for a redacted read). Existing-file writes and
 //!   edits compare it against the locked current snapshot, returning typed
 //!   unread or stale refusals before any replacement is prepared.
 //! - Mutations record their post-mutation digest in the
@@ -1326,6 +1327,22 @@ impl EffectBroker {
                 let sensitive_path = crate::redact::is_sensitive_path(&operation.path)
                     || (crate::redact::is_token_config_path(&operation.path)
                         && crate::redact::token_config_contains_secret(read.contents.as_bytes()));
+                let redacted_file = read.digest.is_some()
+                    && (sensitive_path
+                        || crate::redact::ExplicitReadPaths::new(&operation.path)
+                            .redact(&operation.path, &read.contents)
+                            .replacements
+                            > 0);
+                let freshness_digest = read.digest.as_ref().and_then(|digest| {
+                    if redacted_file {
+                        private_freshness_digest(
+                            read.contents.as_bytes(),
+                            self.freshness_profile_scope(),
+                        )
+                    } else {
+                        Some(digest.clone())
+                    }
+                });
                 let result = bounded_read(
                     read.contents,
                     &operation,
@@ -1336,7 +1353,7 @@ impl EffectBroker {
                 )
                 .await;
                 let freshness = result.as_ref().ok().and_then(|_| {
-                    read.digest.map(|digest| FileFreshness {
+                    freshness_digest.map(|digest| FileFreshness {
                         path: freshness_path,
                         digest,
                     })
@@ -2776,7 +2793,7 @@ struct SearchOutput {
     match_count: usize,
     max_matches: usize,
     total_bytes: usize,
-    original_sha256: String,
+    presented_sha256: String,
     complete: tempfile::NamedTempFile,
     footprint: Option<ReadFootprint>,
     structured: Vec<FsSearchMatch>,
@@ -2785,13 +2802,15 @@ struct SearchOutput {
     skipped_sensitive: usize,
     files_scanned: usize,
     bytes_scanned: usize,
+    safe_bytes_scanned: usize,
+    redaction_applied: bool,
 }
 
 struct SearchCollector {
     preview: String,
     match_count: usize,
     total_bytes: usize,
-    original_hasher: Sha256,
+    presented_hasher: Sha256,
     max_preview_bytes: usize,
     max_matches: usize,
     preview_saturated: bool,
@@ -2803,6 +2822,8 @@ struct SearchCollector {
     skipped_sensitive: usize,
     files_scanned: usize,
     bytes_scanned: usize,
+    safe_bytes_scanned: usize,
+    redaction_applied: bool,
 }
 
 fn ensure_search_collector(
@@ -2840,7 +2861,7 @@ impl SearchCollector {
             preview: String::new(),
             match_count: 0,
             total_bytes: 0,
-            original_hasher: Sha256::new(),
+            presented_hasher: Sha256::new(),
             max_preview_bytes,
             max_matches,
             preview_saturated: false,
@@ -2852,18 +2873,20 @@ impl SearchCollector {
             skipped_sensitive: 0,
             files_scanned: 0,
             bytes_scanned: 0,
+            safe_bytes_scanned: 0,
+            redaction_applied: false,
         })
     }
 
     fn push_line(
         &mut self,
-        raw_line: &str,
+        spool_line: &str,
         preview_line: &str,
         mut structured: Vec<FsSearchMatch>,
     ) -> ToolResult<Vec<usize>> {
         let projected_bytes = self
             .total_bytes
-            .saturating_add(raw_line.len())
+            .saturating_add(spool_line.len())
             .saturating_add(1);
         if projected_bytes
             .saturating_add(self.structured_bytes)
@@ -2874,11 +2897,11 @@ impl SearchCollector {
             return Ok(Vec::new());
         }
         self.complete
-            .write_all(raw_line.as_bytes())
+            .write_all(spool_line.as_bytes())
             .and_then(|()| self.complete.write_all(b"\n"))
             .map_err(|error| ToolError::io("write search result spool", "<search>", error))?;
-        self.original_hasher.update(raw_line.as_bytes());
-        self.original_hasher.update(b"\n");
+        self.presented_hasher.update(spool_line.as_bytes());
+        self.presented_hasher.update(b"\n");
         self.total_bytes = projected_bytes;
         let first_match_index = self.match_count;
         self.match_count = self.match_count.saturating_add(structured.len());
@@ -2947,6 +2970,11 @@ impl SearchCollector {
         self.bytes_scanned = self.bytes_scanned.saturating_add(bytes);
     }
 
+    fn observe_safe_line(&mut self, bytes: usize, redacted: bool) {
+        self.safe_bytes_scanned = self.safe_bytes_scanned.saturating_add(bytes);
+        self.redaction_applied |= redacted;
+    }
+
     fn file_scanned(&mut self) {
         self.files_scanned = self.files_scanned.saturating_add(1);
     }
@@ -2986,7 +3014,7 @@ impl SearchCollector {
             match_count: self.match_count,
             max_matches: self.max_matches,
             total_bytes: self.total_bytes,
-            original_sha256: format!("{:x}", self.original_hasher.finalize()),
+            presented_sha256: format!("{:x}", self.presented_hasher.finalize()),
             complete: self.complete,
             footprint,
             structured: self.structured,
@@ -2995,6 +3023,8 @@ impl SearchCollector {
             skipped_sensitive: self.skipped_sensitive,
             files_scanned: self.files_scanned,
             bytes_scanned: self.bytes_scanned,
+            safe_bytes_scanned: self.safe_bytes_scanned,
+            redaction_applied: self.redaction_applied,
         }
     }
 }
@@ -3520,6 +3550,7 @@ fn collect_streamed_file_matches(
         // Feed physical line endings to the quote consumer before removing
         // them from search's single-line presentation and match coordinates.
         let redacted = crate::redact::redact_line_with_state(full_line, &mut redaction);
+        matches.observe_safe_line(redacted.text.len(), redacted.replacements > 0);
         let line = full_line.strip_suffix('\n').unwrap_or(full_line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let safe_line = redacted.text.strip_suffix('\n').unwrap_or(&redacted.text);
@@ -3555,6 +3586,11 @@ fn collect_streamed_file_matches(
             let display = portable_relative_path(display_path)?;
             let raw_legacy = format!("{display}:{line_number}:{line}");
             let preview_legacy = format!("{display}:{line_number}:{safe_line}");
+            let spool_line = if redacted.replacements > 0 {
+                &preview_legacy
+            } else {
+                &raw_legacy
+            };
             let structured = columns
                 .into_iter()
                 .map(|column| FsSearchMatch {
@@ -3566,7 +3602,7 @@ fn collect_streamed_file_matches(
                     context_after: Vec::new(),
                 })
                 .collect();
-            let indices = matches.push_line(&raw_legacy, &preview_legacy, structured)?;
+            let indices = matches.push_line(spool_line, &preview_legacy, structured)?;
             if operation.context.after > 0 {
                 pending.extend(indices.into_iter().map(|match_index| PendingContext {
                     match_index,
@@ -4562,7 +4598,7 @@ fn install_checkpoint_state_in(
             let (current_bytes, _) = file_snapshot(&parent, &mut file, &display_path)
                 .map_err(checkpoint_install_error)?
                 .parts();
-            let current_digest = mutation_digest(&current_bytes);
+            let current_digest = freshness_digest_for_expected(&current_bytes, expected_digest);
             match expected_digest {
                 Some(expected) if current_digest == expected => {}
                 _ => {
@@ -4732,7 +4768,7 @@ pub(crate) fn install_checkpoint_state(
                 .map_err(checkpoint_install_error)?;
             let snapshot = windows_stable_snapshot(&mut file, &display_path)
                 .map_err(checkpoint_install_error)?;
-            let current_digest = mutation_digest(&snapshot.bytes);
+            let current_digest = freshness_digest_for_expected(&snapshot.bytes, expected_digest);
             match expected_digest {
                 Some(expected) if expected == current_digest => {}
                 _ => {
@@ -4966,7 +5002,7 @@ fn apply_windows_write(
         Ok(_) => {
             let mut file = open_windows_locked_file(&target, &operation.path)?;
             let source = windows_stable_snapshot(&mut file, &operation.path)?;
-            let current_digest = mutation_digest(&source.bytes);
+            let current_digest = freshness_digest_for_expected(&source.bytes, expected_digest);
             let Some(expected_digest) = expected_digest else {
                 return Err(ToolError::UnreadFile {
                     path: operation.path.clone(),
@@ -5095,7 +5131,7 @@ fn apply_windows_edit(
         windows_mutation_target(workspace_root, relative, &operation.path, false)?;
     let mut source_file = open_windows_locked_file(&target, &operation.path)?;
     let source = windows_stable_snapshot(&mut source_file, &operation.path)?;
-    let current_digest = mutation_digest(&source.bytes);
+    let current_digest = freshness_digest_for_expected(&source.bytes, expected_digest);
     let Some(expected_digest) = expected_digest else {
         return Err(ToolError::UnreadFile {
             path: operation.path.clone(),
@@ -6572,7 +6608,7 @@ fn apply_write_at(
             let (mut source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
             let (source_bytes, _source_basis) =
                 file_snapshot(&parent, &mut source, &operation.path)?.parts();
-            let current_digest = mutation_digest(&source_bytes);
+            let current_digest = freshness_digest_for_expected(&source_bytes, expected_digest);
             let Some(expected_digest) = expected_digest else {
                 return Err(ToolError::UnreadFile {
                     path: operation.path.clone(),
@@ -6796,7 +6832,7 @@ fn apply_edit_at_with_commit_hooks(
     let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
     let (source_bytes, _source_basis) =
         file_snapshot(&parent, &mut source, &operation.path)?.parts();
-    let current_digest = mutation_digest(&source_bytes);
+    let current_digest = freshness_digest_for_expected(&source_bytes, expected_digest);
     let Some(expected_digest) = expected_digest else {
         return Err(ToolError::UnreadFile {
             path: operation.path.clone(),
@@ -8384,6 +8420,11 @@ where
     };
     let redacted = crate::redact::redact_text_bounded(&presented, bounds.max_preview_bytes);
     let presentation_reduced = presented.as_ref() != contents || redacted.replacements > 0;
+    let safe_source = if sensitive_path || redacted.replacements > 0 {
+        crate::redact::redact_text(&presented).text.into_bytes()
+    } else {
+        contents.as_bytes().to_vec()
+    };
     let contents_len = contents.len();
     let truncated = semantic_truncated
         || presentation_reduced
@@ -8393,10 +8434,10 @@ where
         || contents_len > bounds.max_preview_bytes
         || redacted.full_len > bounds.max_preview_bytes;
     let truncation =
-        truncated.then(|| ToolTruncation::from_bytes(contents.as_bytes(), redacted.text.len()));
+        truncated.then(|| ToolTruncation::from_bytes(&safe_source, redacted.text.len()));
     drop(presented);
     let artifact = if artifact_required {
-        Some(cas.put_owned(contents.into_bytes()).await?)
+        Some(cas.put_owned(safe_source).await?)
     } else {
         None
     };
@@ -8446,7 +8487,7 @@ where
         truncated: true,
         original_bytes: output.total_bytes as u64,
         payload_bytes: output.preview.len() as u64,
-        sha256: output.original_sha256,
+        sha256: output.presented_sha256,
     };
     let artifact = if truncated {
         Some(cas.put_file(output.complete.path()).await?)
@@ -8464,7 +8505,11 @@ where
             binary_files_skipped: output.binary_files_skipped,
             skipped_sensitive: output.skipped_sensitive,
             files_scanned: output.files_scanned,
-            bytes_scanned: output.bytes_scanned,
+            bytes_scanned: if output.redaction_applied {
+                output.safe_bytes_scanned
+            } else {
+                output.bytes_scanned
+            },
         }),
         artifact,
         images: Vec::new(),
@@ -8600,6 +8645,41 @@ fn relative_path_argument(path: &Path) -> ToolResult<&str> {
 /// duplicating digest logic across mutation tools.
 fn mutation_digest(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+/// Redacted reads need byte-exact stale checks without publishing a guessable
+/// hash of their original content. The process-local master is never written
+/// to a journal or wire result. Production scopes derivation to the profile
+/// installation ID. A daemon restart changes the master and therefore refuses
+/// an old redacted freshness claim until the file is read again.
+fn private_freshness_digest(bytes: &[u8], profile_scope: &str) -> Option<String> {
+    static MASTER: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    let master = MASTER.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).ok().map(|()| key)
+    });
+    let master = master.as_ref()?;
+    let mut material = Vec::with_capacity(master.len() + profile_scope.len());
+    material.extend_from_slice(master);
+    material.extend_from_slice(profile_scope.as_bytes());
+    let key = blake3::derive_key("haider redacted file freshness v1", &material);
+    Some(format!(
+        "blake3k:{profile_scope}:{}",
+        blake3::keyed_hash(&key, bytes).to_hex()
+    ))
+}
+
+fn freshness_digest_for_expected(bytes: &[u8], expected: Option<&str>) -> String {
+    if let Some(profile_scope) = expected
+        .and_then(|digest| digest.strip_prefix("blake3k:"))
+        .and_then(|digest| digest.rsplit_once(':'))
+        .map(|(scope, _)| scope)
+    {
+        private_freshness_digest(bytes, profile_scope)
+            .unwrap_or_else(|| "blake3k:unavailable".to_owned())
+    } else {
+        mutation_digest(bytes)
+    }
 }
 
 #[cfg(unix)]
@@ -9024,9 +9104,15 @@ mod w4a13_tests;
 
 #[cfg(all(test, unix))]
 #[allow(clippy::expect_used)]
+#[path = "filesystem/tests/redaction_provenance.rs"]
+mod redaction_provenance_tests;
+
+#[cfg(all(test, unix))]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
     use std::os::unix::fs::{MetadataExt, symlink};
 
     #[test]

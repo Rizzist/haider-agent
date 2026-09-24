@@ -2,6 +2,7 @@
 use super::*;
 use async_trait::async_trait;
 use haider_protocol::ids::ArtifactRef;
+use sha2::{Digest as _, Sha256};
 
 #[derive(Default)]
 struct Capture(Vec<Vec<u8>>);
@@ -161,6 +162,52 @@ async fn redaction_outside_the_requested_range_does_not_mark_it_incomplete() {
     assert!(!result.truncated);
     assert!(result.truncation.is_none());
     assert!(result.artifact.is_none());
+}
+
+#[tokio::test]
+async fn redacted_preview_provenance_cannot_test_equal_length_password_guesses() {
+    let original = "password=violet-sunrise\n";
+    let safe = "password=[REDACTED:password]\n";
+    let mut cas = Capture::default();
+    let result = bounded_file_read(
+        original.into(),
+        &FsRead::new("oracle.txt"),
+        ResultBounds::file_read(),
+        &mut cas,
+    )
+    .await
+    .expect("redacted preview");
+    let marker = result.truncation.expect("provenance");
+    assert_eq!(marker.original_bytes, safe.len() as u64);
+    assert_eq!(marker.sha256, format!("{:x}", Sha256::digest(safe)));
+    for guess in [
+        "violet-sunrise",
+        "violet-morning",
+        "cobalt-sunrise",
+        "silver-evening",
+    ] {
+        assert_ne!(
+            marker.sha256,
+            format!("{:x}", Sha256::digest(format!("password={guess}\n")))
+        );
+    }
+    assert!(!result.preview.contains("violet-sunrise"));
+
+    let paged = bounded_file_read(
+        format!("{original}next line\n"),
+        &FsRead::new("oracle.txt"),
+        ResultBounds {
+            max_preview_bytes: 12,
+        },
+        &mut cas,
+    )
+    .await
+    .expect("paged redacted preview");
+    assert!(paged.artifact.is_some());
+    assert_eq!(
+        cas.0.last().expect("safe artifact"),
+        b"password=[REDACTED:password]\nnext line\n"
+    );
 }
 
 #[tokio::test]

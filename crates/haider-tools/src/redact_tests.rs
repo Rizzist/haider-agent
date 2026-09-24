@@ -132,6 +132,87 @@ fn explicit_context_overrides_generic_jwt_lookalike_label() {
 }
 
 #[test]
+fn failed_jwt_shape_uses_entropy_only_when_detector_accepts_it() {
+    let low = "eyJaaaaaaaa.aaaaaaaa.aaaaaaaa";
+    assert!(!super::looks_high_entropy(low));
+    assert_eq!(redact_text(low).text, "[REDACTED:secret_value]");
+    assert_eq!(
+        redact_private_key_lines(low).text,
+        "[REDACTED:secret_value]"
+    );
+    assert_eq!(
+        redact_text(&format!("api_key={low}")).text,
+        "api_key=[REDACTED:api_key]"
+    );
+    assert_eq!(
+        redact_text(&format!("https://owner:{low}@example.test")).text,
+        "https://owner:[REDACTED:password]@example.test"
+    );
+}
+
+#[test]
+fn assignment_label_comes_from_terminal_matched_field() {
+    let input = concat!(
+        "PASSWORD_RESET_TOKEN=synthetic-phrase\n",
+        "API_KEY_PASSWORD=synthetic-phrase\n",
+        "notapassword_token=synthetic-phrase\n",
+        "Authorization: Bearer synthetic-phrase\n",
+    );
+    let expected = concat!(
+        "PASSWORD_RESET_TOKEN=[REDACTED:secret_value]\n",
+        "API_KEY_PASSWORD=[REDACTED:password]\n",
+        "notapassword_token=[REDACTED:secret_value]\n",
+        "Authorization: [REDACTED:bearer_token]\n",
+    );
+    assert_eq!(redact_private_key_lines(input).text, expected);
+    assert_eq!(redact_text(input).text, expected);
+}
+
+#[test]
+fn pem_body_is_masked_in_bounded_linewise_and_process_rendering() {
+    for input in [
+        "password=-----BEGIN\x20PRIVATE KEY-----\nVGVzdA==\n-----END PRIVATE KEY-----\n",
+        "password=foo-----BEGIN\x20PRIVATE KEY-----\nVGVzdA==\n-----END PRIVATE KEY-----\n",
+        "password=\"-----BEGIN\x20PRIVATE KEY-----\nVGVzdA==\n-----END PRIVATE KEY----- trailing-secret\"\n",
+    ] {
+        for rendered in [
+            redact_text_bounded(input, usize::MAX).text,
+            redact_private_key_lines(input).text,
+            super::redact_output_text(input),
+        ] {
+            assert!(!rendered.contains("VGVzdA=="), "{rendered}");
+            assert!(!rendered.contains("trailing-secret"), "{rendered}");
+            assert!(
+                !rendered.contains("-----END PRIVATE KEY-----"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("[REDACTED:"), "{rendered}");
+        }
+        assert_eq!(
+            redact_text_bounded(input, usize::MAX).text,
+            redact_private_key_lines(input).text,
+            "PEM assignment overlap must agree across bounded and linewise paths"
+        );
+    }
+}
+
+#[test]
+fn paged_capture_does_not_reclassify_an_existing_marker() {
+    for marker in [
+        "[REDACTED:api_key]",
+        "[REDACTED:password]",
+        "[REDACTED:private_key]",
+    ] {
+        let safe = format!("token={marker}\n");
+        assert_eq!(super::redact_output_text(&safe), safe);
+    }
+    assert_eq!(
+        super::redact_output_text("token=[REDACTED:unknown]suffix\n"),
+        "token=[REDACTED:secret_value]\n"
+    );
+}
+
+#[test]
 fn marker_table_bytes_are_pinned() {
     use super::SecretKind::*;
     for (kind, marker) in [

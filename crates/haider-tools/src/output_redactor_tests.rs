@@ -2,6 +2,24 @@
 use super::OutputRedactor;
 
 #[test]
+fn provenance_flag_tracks_masking_and_stripped_terminal_controls() {
+    use base64::Engine as _;
+    let chunk = |text: &str| crate::ProcessOutputChunk {
+        stream: haider_protocol::item::OutputStream::Stdout,
+        chunk_b64: base64::engine::general_purpose::STANDARD.encode(text),
+    };
+    let (plain, masked) = super::redact_process_output_with_redaction(&[chunk("plain\x1b[0m\n")])
+        .expect("plain output");
+    assert_eq!(plain, "plain\n");
+    assert!(masked);
+    let (secret, masked) =
+        super::redact_process_output_with_redaction(&[chunk("password=synthetic-phrase\n")])
+            .expect("secret output");
+    assert_eq!(secret, "password=[REDACTED:password]\n");
+    assert!(masked);
+}
+
+#[test]
 fn every_chunk_boundary_preserves_secret_redaction_and_plain_output() {
     let input = "begin\néclair\napi=sk-abcdefghijklmnopQRSTUV\n-----BEGIN\x20PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\nend";
     for boundary in 0..=input.len() {
@@ -236,5 +254,24 @@ fn quoted_passwords_and_pem_delimiters_cannot_reset_each_others_protection() {
             output.extend(redactor.finish_bytes());
             assert_eq!(output, expected.as_bytes(), "boundary {boundary}");
         }
+    }
+}
+
+#[test]
+fn assignment_starting_at_pem_header_masks_body_through_process_stream() {
+    let input = "password=-----BEGIN\x20PRIVATE KEY-----\nVGVzdA==\n-----END PRIVATE KEY-----\n";
+    for boundary in 0..=input.len() {
+        let mut redactor = OutputRedactor::default();
+        let mut output = redactor.push_bytes(&input.as_bytes()[..boundary]);
+        output.extend(redactor.push_bytes(&input.as_bytes()[boundary..]));
+        output.extend(redactor.finish_bytes());
+        let rendered = String::from_utf8(output).expect("UTF-8 synthetic fixture");
+        assert!(!rendered.contains("VGVzdA=="), "boundary {boundary}");
+        assert!(
+            !rendered.contains("-----END PRIVATE KEY-----"),
+            "boundary {boundary}"
+        );
+        assert!(rendered.contains("[REDACTED:"), "boundary {boundary}");
+        assert!(redactor.redactions_applied());
     }
 }

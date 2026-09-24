@@ -6,8 +6,9 @@
 use crate::ids::{EffectId, MenuId, WorkspaceRevision};
 use serde::{Deserialize, Serialize};
 
-/// Durable per-session knowledge of the exact bytes last observed or written
-/// for one workspace-relative file.
+/// Durable per-session identity of the bytes last observed or written for one
+/// workspace-relative file. A redacted read uses a keyed digest so the
+/// journal cannot serve as an offline guessing oracle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFreshness {
     pub path: String,

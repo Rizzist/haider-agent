@@ -7899,6 +7899,7 @@ async fn perform_shell_exec(
             .await;
         }
     };
+    broker.set_freshness_profile_scope(lease.hub().peer_device_id());
     let output_context = HubCommandOutputContext {
         store: lease.clone(),
         branch_id: pending.branch_id.clone(),
@@ -8124,7 +8125,14 @@ async fn perform_shell_exec(
         }
     };
     if let Err(error) = broker.close().await {
-        let _ = shell.add_output(result.output_bytes);
+        // Even a broker-close failure can publish a shell byte count. Derive
+        // it through the same complete-capture redaction boundary; if that
+        // boundary fails too, publish no raw count.
+        let safe_count = crate::tasks::TaskFacade::new(lease.hub().clone())
+            .retain_foreground_capture(lease.session_id(), &mut result)
+            .await
+            .map_or(0, |_| result.output_bytes);
+        let _ = shell.add_output(safe_count);
         let _ = shell.exited(result.exit_code);
         return fail_shell_exec(
             lease,
@@ -16740,6 +16748,7 @@ async fn create_broker_tool_dispatcher(
             });
         crate::workspace::error(&unavailable)
     })?;
+    broker.set_freshness_profile_scope(context.store.hub().peer_device_id());
     broker
         .restore_freshness(durable_freshness.into_values())
         .map_err(tool_error)?;
@@ -22955,6 +22964,29 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 };
                                 if let Some(truncation) = outcome.truncation {
                                     result.declare_truncation(truncation);
+                                }
+                                let payload_chunk = haider_tools::ProcessOutputChunk {
+                                    stream: haider_protocol::item::OutputStream::Stdout,
+                                    chunk_b64: base64::engine::general_purpose::STANDARD
+                                        .encode(result.payload_text()),
+                                };
+                                let (safe_payload, masked) =
+                                    haider_tools::redact_process_output_with_redaction(&[
+                                        payload_chunk,
+                                    ])
+                                    .map_err(tool_error)?;
+                                if masked {
+                                    let was_truncated = result.truncated;
+                                    result.preview = safe_payload;
+                                    if was_truncated {
+                                        let safe_provenance =
+                                            haider_protocol::tool::ToolTruncation::from_bytes(
+                                                result.preview.as_bytes(),
+                                                result.preview.len(),
+                                            );
+                                        result.truncation = None;
+                                        result.declare_truncation(safe_provenance);
+                                    }
                                 }
                                 if result.preview.len()
                                     > haider_tools::WEB_FETCH_MODEL_PREVIEW_MAX_BYTES

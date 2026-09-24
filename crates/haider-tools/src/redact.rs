@@ -80,6 +80,16 @@ pub fn redact_output_text(input: &str) -> String {
     redact_private_key_lines(input).text
 }
 
+/// A durable workspace receipt must not publish a raw path or a digest of a
+/// file that an explicit read would hide. The caller can report an incomplete
+/// receipt instead of exporting a guessable identity for that entry.
+pub fn workspace_receipt_path_sensitive(path: &Path) -> bool {
+    is_sensitive_path(path)
+        || path
+            .to_str()
+            .is_some_and(|text| redact_output_text(text) != text)
+}
+
 /// The quote window shares the process-output ceiling. Once exhausted without
 /// a closing quote, fail closed for the rest of this input/stream; do not scan
 /// for a later delimiter or retain the discarded bytes.
@@ -212,7 +222,8 @@ enum SecretKind {
     Password,
     /// Any other explicit credential assignment.
     SecretValue,
-    /// Unrecognized random-looking text, including invalid JWT lookalikes.
+    /// Text accepted by the entropy detector, including qualifying invalid
+    /// JWT lookalikes.
     HighEntropy,
 }
 
@@ -309,13 +320,34 @@ pub(crate) fn token_config_contains_secret(bytes: &[u8]) -> bool {
     })
 }
 
-#[cfg(test)]
 pub(crate) fn redact_text(input: &str) -> RedactedText {
-    redact_with_state(
-        input,
-        RedactionPolicy::Standard,
-        &mut QuotedValue::default(),
-    )
+    if has_pem_assignment_overlap(input) {
+        // A quoted assignment may begin on an earlier physical line than the
+        // PEM header. Use the stateful line path for that exceptional overlap
+        // so the header, body, and line breaks agree with process output.
+        redact_lines(input, RedactionPolicy::Standard)
+    } else {
+        redact_with_state(
+            input,
+            RedactionPolicy::Standard,
+            &mut QuotedValue::default(),
+        )
+    }
+}
+
+fn has_pem_assignment_overlap(input: &str) -> bool {
+    if !input.contains("PRIVATE KEY-----") {
+        return false;
+    }
+    let Some(pem) = private_key_regex() else {
+        return false;
+    };
+    let assignments = secret_assignment_spans(input, &mut QuotedValue::default());
+    pem.find_iter(input).any(|key| {
+        assignments
+            .iter()
+            .any(|value| value.start < key.end() && key.start() < value.end)
+    })
 }
 
 fn redact_with_state(
@@ -349,10 +381,19 @@ fn redact_with_state(
     }
 }
 
-/// Produces the exact UTF-8 byte prefix of standard redaction without allocating
-/// the complete redacted value. `full_len` is the byte length that complete
-/// value would have had, so callers retain the existing truncation decision.
+/// Produces the exact UTF-8 byte prefix of standard redaction. The usual path
+/// avoids allocating the complete rendering; a PEM/assignment overlap uses the
+/// stateful line rendering so it cannot expose the body or drop line breaks.
+/// `full_len` is the complete rendered byte length.
 pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedactedText {
+    if has_pem_assignment_overlap(input) {
+        let redacted = redact_lines(input, RedactionPolicy::Standard);
+        return BoundedRedactedText {
+            text: utf8_prefix(&redacted.text, max_bytes).to_owned(),
+            replacements: redacted.replacements,
+            full_len: redacted.text.len(),
+        };
+    }
     let spans = redaction_spans(
         input,
         RedactionPolicy::Standard,
@@ -442,6 +483,7 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
             if let Some(found) = captures.get(1) {
                 if spans.iter().any(|span| {
                     span.kind != SecretKind::HighEntropy
+                        && span.kind != SecretKind::SecretValue
                         && span.start == found.start()
                         && span.end == found.end()
                 }) {
@@ -465,22 +507,45 @@ fn redaction_spans(input: &str, policy: RedactionPolicy, quoted: &mut QuotedValu
     if policy != RedactionPolicy::Lockdown {
         for span in secret_assignment_spans(input, quoted) {
             // Keep a concrete known format's marker. An invalid JWT-shaped
-            // value is only generic entropy, so explicit context wins.
+            // value is only generic entropy or secret context, so a more
+            // specific assignment field still wins.
             if spans.iter().any(|other| {
                 other.kind != SecretKind::PrivateKey
                     && other.kind != SecretKind::HighEntropy
+                    && other.kind != SecretKind::SecretValue
                     && other.start == span.start
                     && other.end == span.end
             }) {
                 continue;
             }
-            // An enclosing PEM block retains priority over assignments in its
-            // body. A PEM-looking delimiter inside a quote is secret text.
-            if spans.iter().any(|other| {
-                other.kind == SecretKind::PrivateKey
-                    && other.start < span.start
-                    && span.start < other.end
-            }) {
+            // Mask the union when a credential assignment and a PEM block
+            // overlap. In particular, a value beginning at the PEM header
+            // must never replace the block with a shorter assignment span;
+            // a quote extending beyond the PEM end must stay hidden too.
+            let pem_union = spans
+                .iter()
+                .filter(|other| {
+                    other.kind == SecretKind::PrivateKey
+                        && span.start < other.end
+                        && other.start < span.end
+                })
+                .fold(None, |union: Option<Span>, other| {
+                    let current = union.unwrap_or(span);
+                    Some(Span {
+                        start: current.start.min(other.start),
+                        end: current.end.max(other.end),
+                        kind: SecretKind::PrivateKey,
+                    })
+                });
+            if let Some(pem_union) = pem_union {
+                spans.retain(|other| pem_union.start >= other.end || other.start >= pem_union.end);
+                push_secret_lines(
+                    &mut spans,
+                    input,
+                    pem_union.start,
+                    pem_union.end,
+                    SecretKind::PrivateKey,
+                );
                 continue;
             }
             spans.retain(|other| span.start >= other.end || other.start >= span.end);
@@ -642,7 +707,11 @@ fn default_known_kind(value: &str) -> SecretKind {
             if is_jwt(value) {
                 SecretKind::Jwt
             } else {
-                SecretKind::HighEntropy
+                if looks_high_entropy(value) {
+                    SecretKind::HighEntropy
+                } else {
+                    SecretKind::SecretValue
+                }
             }
         })
 }
@@ -690,7 +759,7 @@ fn extended_secret_regex() -> Option<&'static Regex> {
 fn secret_assignment_regex() -> Option<&'static Regex> {
     static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(
-        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|pass[_-]?phrase|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?:Bearer|Basic)\s+)(["']|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
+        r#"(?i)(?:\b(?:[A-Za-z][A-Za-z0-9]*[_-])*(?P<field>password|passwd|pass[_-]?phrase|secret|client[_-]?secret|private[_-]?key|credentials|_?auth(?:[_-]?token)?|api[_-]?key|access[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization)\b["']?\s*[:=]\s*|\b(?P<scheme>Bearer|Basic)\s+)(?P<value>["']|(?:Bearer|Basic)\s+[^\s"',;]+|[^\s"',;]+)"#
     ).ok()).as_ref()
 }
 
@@ -710,16 +779,21 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
     }
     if let Some(regex) = secret_assignment_regex() {
         for captures in regex.captures_iter(input) {
-            let Some(value) = captures.get(1) else {
-                continue;
-            };
-            let Some(found) = captures.get(0) else {
+            let Some(value) = captures.name("value") else {
                 continue;
             };
             if value.start() < cursor {
                 continue;
             }
-            let kind = assignment_kind(&input[found.start()..value.start()], value.as_str());
+            if is_existing_redaction_marker(value.as_str()) {
+                cursor = value.end();
+                continue;
+            }
+            let kind = assignment_kind(
+                captures.name("field").map(|field| field.as_str()),
+                captures.name("scheme").map(|scheme| scheme.as_str()),
+                value.as_str(),
+            );
             let end = if matches!(value.as_str(), "\"" | "'") {
                 quoted.start(input.as_bytes()[value.start()], kind);
                 value.end() + quoted.consume(&input[value.end()..])
@@ -740,33 +814,49 @@ fn secret_assignment_spans(input: &str, quoted: &mut QuotedValue) -> Vec<Span> {
     spans
 }
 
-/// Key-name fragments that make an assignment an API key or a password.
-/// Any other name the assignment regex accepts is a generic `SecretValue`.
-const API_KEY_NAMES: &[&str] = &["api_key", "api-key", "apikey"];
-const PASSWORD_NAMES: &[&str] = &[
-    "password",
-    "passwd",
-    "passphrase",
-    "pass_phrase",
-    "pass-phrase",
-];
+fn is_existing_redaction_marker(value: &str) -> bool {
+    use SecretKind::*;
+    [
+        PrivateKey,
+        PrivateKeyMaterial,
+        AwsAccessKey,
+        ApiKey,
+        GithubToken,
+        SlackToken,
+        GitlabToken,
+        NpmToken,
+        StripeApiKey,
+        GoogleApiKey,
+        Jwt,
+        BearerToken,
+        BasicAuth,
+        Password,
+        SecretValue,
+        HighEntropy,
+    ]
+    .into_iter()
+    .any(|kind| value == kind.marker())
+}
 
-/// Labels a context match. `prefix` is the matched key/scheme text before the
-/// value; an auth scheme (in the key position or leading the value) wins over
-/// the key name.
-fn assignment_kind(prefix: &str, value: &str) -> SecretKind {
-    let prefix = prefix.trim().to_ascii_lowercase();
-    let names = |names: &[&str]| names.iter().any(|name| prefix.contains(name));
-    if prefix.ends_with("bearer") || starts_with_auth_scheme(value, "bearer") {
+/// Classify the terminal field captured by the winning assignment rule. A
+/// namespace prefix such as PASSWORD_RESET_ has no authority over TOKEN.
+fn assignment_kind(field: Option<&str>, scheme: Option<&str>, value: &str) -> SecretKind {
+    if scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+        || starts_with_auth_scheme(value, "bearer")
+    {
         SecretKind::BearerToken
-    } else if prefix.ends_with("basic") || starts_with_auth_scheme(value, "basic") {
+    } else if scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+        || starts_with_auth_scheme(value, "basic")
+    {
         SecretKind::BasicAuth
-    } else if names(API_KEY_NAMES) {
-        SecretKind::ApiKey
-    } else if names(PASSWORD_NAMES) {
-        SecretKind::Password
     } else {
-        SecretKind::SecretValue
+        match field.map(str::to_ascii_lowercase).as_deref() {
+            Some("api_key" | "api-key" | "apikey") => SecretKind::ApiKey,
+            Some("password" | "passwd" | "passphrase" | "pass_phrase" | "pass-phrase") => {
+                SecretKind::Password
+            }
+            _ => SecretKind::SecretValue,
+        }
     }
 }
 

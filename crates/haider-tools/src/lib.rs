@@ -26,7 +26,9 @@ mod monitor;
 mod output_redactor;
 mod plan;
 mod process;
-pub use output_redactor::{OutputRedactor, redact_process_output};
+pub use output_redactor::{
+    OutputRedactor, redact_process_output, redact_process_output_with_redaction,
+};
 mod redact;
 mod repo;
 mod request_input;
@@ -132,7 +134,7 @@ pub use process::{
     ProcessSignal, android_shell_available, capture_paging_hint, monitor_process_command,
     task_paging_hint,
 };
-pub use redact::{redact_lockdown_text, redact_output_text};
+pub use redact::{redact_lockdown_text, redact_output_text, workspace_receipt_path_sensitive};
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{
     BuiltinResult, ComposerSubmission, EnvViewEntry, OutputAdapter, PROCESS_INLINE_RETENTION_BYTES,

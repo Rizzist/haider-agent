@@ -158,7 +158,7 @@ prefix/suffix or tool-specific projection and ends with exactly this standalone
 line (decimal unsigned integers and lowercase SHA-256):
 
 ```text
-[haider:truncated truncated=true original_bytes=<uint> payload_bytes=<uint> sha256=<64 lowercase hex of the ORIGINAL bytes>]
+[haider:truncated truncated=true original_bytes=<uint> payload_bytes=<uint> sha256=<64 lowercase hex>]
 ```
 
 `/truncation` is its typed mirror:
@@ -167,11 +167,26 @@ line (decimal unsigned integers and lowercase SHA-256):
 {"truncated":true,"original_bytes":1048576,"payload_bytes":1234,"sha256":"<hex64>"}
 ```
 
-`original_bytes` counts the original captured bytes before the preview's
-reduction; `sha256` hashes those bytes, not the retained prefix/suffix, a
-lossy UTF-8 conversion, or the JSON wrapper. For a process, stdout and stderr
-are hashed in capture order. Bytes observed while draining after a process
-limit also count; bytes never read from a terminated producer cannot count.
+For output with no redaction, `original_bytes` counts the original captured
+bytes before the preview's reduction and `sha256` hashes those bytes. For an
+output with any redaction, both fields instead describe the complete redacted
+rendering before paging or head/tail reduction. This includes content-addressed
+artifact references and process transcript digests published with the result.
+Redacted file freshness uses a profile-derived, process-secret keyed digest;
+after daemon restart a new read is needed before writing that file.
+Turn workspace tree receipts and process workspace mutation receipts report
+generic incomplete coverage when a path or file content would be redacted.
+They do not journal raw filenames, content digests, or byte counts for those
+entries. A client may see `workspace tree receipt unavailable: redacted
+material` or `reason=redacted_material` instead of an exact tree receipt.
+For `fs_search` with redaction, `bytes_scanned` describes processed safe text;
+unredacted searches retain their previous source-byte measure.
+The historical field name remains for older decoders; clients must not use it
+as an exact size or digest of a secret-bearing original. Old clients that use
+these fields for raw capture integrity checks must treat a redacted result as
+a different byte stream. For unredacted processes, stdout and stderr are
+hashed in capture order. Bytes observed while draining after a process limit
+also count; bytes never read from a terminated producer cannot count.
 Enumeration/execution limits retain their existing separate incompleteness
 facts. For filesystem search/glob, the original is the materialized result
 text, not unvisited files. `payload_bytes` counts UTF-8 bytes of the unchanged

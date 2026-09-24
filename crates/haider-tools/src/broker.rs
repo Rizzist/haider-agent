@@ -1138,6 +1138,7 @@ pub struct EffectBroker {
     workspace_root: PathBuf,
     workspace_dir: Option<haider_platform::WorkspaceDirectory>,
     session_id: SessionId,
+    freshness_scope: String,
     worker_generation: u64,
     started_at_ms: u64,
     next_effect: u64,
@@ -1240,6 +1241,7 @@ impl EffectBroker {
             journal: BrokerJournal::new(journal),
             workspace_root,
             workspace_dir: None,
+            freshness_scope: session_id.as_str().to_owned(),
             session_id,
             worker_generation,
             started_at_ms: unix_time_ms(),
@@ -1314,6 +1316,7 @@ impl EffectBroker {
             journal: BrokerJournal::new(journal),
             workspace_root,
             workspace_dir: Some(workspace_dir),
+            freshness_scope: session_id.as_str().to_owned(),
             session_id,
             worker_generation,
             started_at_ms,
@@ -1429,6 +1432,14 @@ impl EffectBroker {
 
     pub(crate) fn freshness_digest(&self, relative_path: &Path) -> Option<String> {
         self.journal.freshness_digest(relative_path)
+    }
+
+    pub fn set_freshness_profile_scope(&mut self, profile_scope: impl Into<String>) {
+        self.freshness_scope = profile_scope.into();
+    }
+
+    pub(crate) fn freshness_profile_scope(&self) -> &str {
+        &self.freshness_scope
     }
 
     /// Drains finalizers, then reconciles unterminated dispatches to `Unknown`.
