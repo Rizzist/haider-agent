@@ -27,6 +27,7 @@ mod effort_tests;
 mod error_detail;
 mod gemini;
 mod idle;
+mod model_limits;
 pub use idle::{ProviderIdleDeadline, ProviderIdleTimeout};
 #[cfg(test)]
 mod gemini_tests;
@@ -1227,6 +1228,7 @@ pub use catalog::{
     PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition, catalog_request_url,
     compatible_model_id_is_display_safe, discover_models, discover_models_with_resolver,
     openai_compatible_catalog_endpoint, parse_catalog, pickable, provider_catalog_definition,
+    subscription_static_models,
 };
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
@@ -1239,6 +1241,7 @@ pub use gemini::{
     GeminiTransportConfig, gemini_http_client_build_count, gemini_model_http_client_build_count,
     replay_gemini_http_error, replay_gemini_sse, replay_gemini_sse_for_request,
 };
+pub use model_limits::{StaticModelLimits, UNKNOWN_OUTPUT_LIMIT, static_model_limits};
 pub use openai::{
     CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, GROK_OAUTH_BASE_URL,
     GROK_OAUTH_PROVIDER_NAME, GROK_SHELL_CLIENT_IDENTIFIER, GROK_SHELL_CLIENT_MODE,

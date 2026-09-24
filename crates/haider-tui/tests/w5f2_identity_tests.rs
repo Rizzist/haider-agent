@@ -52,6 +52,7 @@ fn provider_summary(
         model_details: models
             .iter()
             .map(|slug| haider_rpc::ModelDetailWire {
+                source: None,
                 name: (*slug).to_owned(),
                 display_name: None,
                 context_window: None,

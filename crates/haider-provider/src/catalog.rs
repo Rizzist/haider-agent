@@ -1,8 +1,8 @@
 //! Model discovery from the PROVIDERS' OWN sources (W5e-2).
 //!
-//! The owner requirement is that model choice never comes from a hardcoded
-//! slug table: it comes from the same place the vendors' own CLIs get it,
-//! authorized with the subscription credentials the vault already holds.
+//! Remote discovery is preferred. Subscription credentials may be allowed to
+//! run turns while their `/models` request is forbidden, so a small maintained
+//! static catalog keeps those providers usable on a fresh profile.
 //!
 //! - **OpenAI subscription**: `GET {OPENAI_SUBSCRIPTION_BASE_URL}/models`,
 //!   the endpoint the installed codex CLI uses
@@ -15,10 +15,8 @@
 //!   with the OAuth bearer and the same beta headers W5b.2 already proves
 //!   work for inference.
 //!
-//! DISCOVERY IS NEVER SYNTHESIZED. When a provider will not serve a list,
-//! [`CatalogError::Unavailable`] is returned so the caller can fall back to
-//! its last-known cache or say "unavailable" — this module never invents a
-//! model that the provider did not name.
+//! Discovery never synthesizes a successful response. The registry merges
+//! remote rows with the separately identified static subscription catalog.
 //!
 //! Requests use fixed origins and the same W5a discipline as the token
 //! endpoints: resolve-validate-pin through [`FixedOriginGuard`], proxies
@@ -158,14 +156,72 @@ pub enum CatalogSource {
     XaiApi,
 }
 
-/// Release-owned catalog taxonomy. Remote definitions cannot contain a
-/// fallback list. Offline model IDs are the catalog itself.
+/// Release-owned catalog taxonomy. Offline IDs are authoritative. The
+/// subscription fallback is separate so discovery remains enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCatalogDefinition {
     Offline { models: &'static [&'static str] },
     Public { source: CatalogSource },
     Authenticated { source: CatalogSource },
     Adapter,
+}
+
+/// Maintained subscription fallback IDs. Keep these conservative: remote
+/// discovery adds new rows and overrides metadata for matching IDs. Limits
+/// come from `model_limits`, which is also the turn-output limit authority.
+#[must_use]
+pub fn subscription_static_models(provider: &str) -> Vec<DiscoveredModel> {
+    let ids: &[&str] = match provider {
+        crate::ANTHROPIC_OAUTH_PROVIDER_NAME => &[
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ],
+        crate::OPENAI_OAUTH_PROVIDER_NAME => &[
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.6",
+            "gpt-5.5",
+            "gpt-5.3-codex",
+        ],
+        crate::KIMI_OAUTH_PROVIDER_NAME => &[
+            "kimi-for-coding",
+            "k3",
+            "k3-256k",
+            "kimi-for-coding-highspeed",
+        ],
+        crate::GROK_OAUTH_PROVIDER_NAME => &["grok-4.6", "grok-4.5", "grok-4.3"],
+        crate::HAIDER_CODE_PROVIDER_NAME => &["deepseek-v4-flash"],
+        _ => &[],
+    };
+    ids.iter()
+        .enumerate()
+        .map(|(priority, id)| {
+            let limits = crate::static_model_limits(provider, id);
+            DiscoveredModel {
+                slug: (*id).to_owned(),
+                display_name: (*id).to_owned(),
+                context_window: limits.context_window,
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: Some(priority as i64),
+                extensions: None,
+            }
+        })
+        .collect()
 }
 
 /// Public catalog coverage list used by the credential-free nightly probe.

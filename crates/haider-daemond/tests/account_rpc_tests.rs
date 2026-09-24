@@ -1081,13 +1081,14 @@ async fn session_create_accepts_gemini_when_account_active() {
 /// The e2e builder: accounts-backed RESOLUTION (active descriptor → vault
 /// secret) with a fake provider adapter, recording what it was handed.
 struct FakeAccountBuilder {
+    provider_id: &'static str,
     fake: Arc<haider_provider::FakeProvider>,
     built: StdMutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl haider_daemon::AccountProviderBuilder for FakeAccountBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::from(["fake".to_owned()])
+        std::collections::BTreeSet::from([self.provider_id.to_owned()])
     }
 
     fn build(
@@ -1107,12 +1108,35 @@ impl haider_daemon::AccountProviderBuilder for FakeAccountBuilder {
     }
 }
 
+#[derive(Default)]
+struct ForbiddenCatalog {
+    requested: StdMutex<Vec<haider_provider::CatalogSource>>,
+}
+
+#[async_trait::async_trait]
+impl haider_daemon::ProviderModelDiscoverer for ForbiddenCatalog {
+    async fn discover(
+        &self,
+        source: haider_provider::CatalogSource,
+        _access_token: Option<&str>,
+        _etag: Option<&str>,
+    ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
+        self.requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(source);
+        Err(haider_provider::CatalogError::Unavailable {
+            reason: "provider does not serve a model list to this credential (403)".into(),
+        })
+    }
+}
+
 // MUTATION CHECK (R6/R10 next-turn pickup): make the accounts-backed factory
 // resolve anything but the ACTIVE descriptor's vault secret (or stop
 // stamping `account_alias`). Expected failure: the builder-observed
 // alias/secret assertions or the Usage-envelope account assertion below.
 #[tokio::test]
-async fn committed_login_is_picked_up_by_the_next_fake_turn() {
+async fn fresh_login_survives_forbidden_catalog_and_runs_a_fake_turn() {
     use haider_protocol::EventPayload;
     use haider_provider::{FakeProvider, FakeStep};
 
@@ -1145,17 +1169,20 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
         },
     ]));
     let builder = Arc::new(FakeAccountBuilder {
+        provider_id: "haider-code",
         fake: fake.clone(),
         built: StdMutex::new(Vec::new()),
     });
+    let catalog = Arc::new(ForbiddenCatalog::default());
     let vault = Arc::new(MemoryVault::default());
-    let validator = ScriptedValidator::for_provider("fake", Vec::new());
+    let validator = ScriptedValidator::for_provider("haider-code", Vec::new());
     let dependencies = DaemonDependencies {
         provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
         accounts: AccountsDependencies {
             vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
             validator: validator.clone(),
             descriptor_store: None,
+            model_discoverer: Some(catalog.clone()),
             ..AccountsDependencies::default()
         },
         ..DaemonDependencies::default()
@@ -1163,8 +1190,8 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
     let task = ready_with_dependencies(&config, dependencies).await;
     let mut client = control_client(&config).await;
 
-    // /login for the fake provider (fake validator success writes the
-    // MemoryVault + descriptor).
+    // A fresh private profile receives an account before any model-list
+    // result; the fake inference adapter records the next turn.
     let reference = stage_secret(&mut client, "stage-e2e", "sk-e2e-fake-key").await;
     let descriptor = expect_descriptor(
         request(
@@ -1172,7 +1199,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
             "req-e2e-login",
             RequestBody::AccountLoginApi {
                 command_id: CommandId::new("command-e2e-login"),
-                provider: "fake".into(),
+                provider: "haider-code".into(),
                 alias: Some("e2e".into()),
                 vault_reference: reference,
                 validation_model: None,
@@ -1180,6 +1207,74 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
             },
         )
         .await,
+    );
+
+    let listed = request(
+        &mut client,
+        "req-e2e-list",
+        RequestBody::ProviderList {
+            provider: Some("haider-code".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list after login: {listed:?}");
+    };
+    let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.provider == "haider-code")
+    else {
+        panic!("Haider Code row missing");
+    };
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        provider
+            .models
+            .iter()
+            .any(|model| model == "deepseek-v4-flash")
+    );
+    assert!(
+        provider
+            .model_details
+            .iter()
+            .any(|row| row.name == "deepseek-v4-flash"
+                && row.source == Some(haider_rpc::ModelDetailSourceWire::Static))
+    );
+
+    let refreshed = request(
+        &mut client,
+        "req-e2e-refresh",
+        RequestBody::ProviderModelsRefresh {
+            provider: "haider-code".into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed else {
+        panic!("forbidden model list must be informational: {refreshed:?}");
+    };
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        matches!(provider.inventory, haider_rpc::ModelInventoryWire::Unavailable { ref reason } if reason.contains("(403)"))
+    );
+    assert!(
+        provider
+            .models
+            .iter()
+            .any(|model| model == "deepseek-v4-flash")
+    );
+    assert!(
+        catalog
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|source| source.endpoint().ends_with("/v1/models"))
     );
 
     // Next logical turn: create + attach + submit, then read the run to its
@@ -1191,8 +1286,8 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
         RequestBody::SessionCreate {
             command_id: CommandId::new("command-e2e-create"),
             cwd: workspace_text,
-            provider: "fake".into(),
-            model: "fake-model".into(),
+            provider: "haider-code".into(),
+            model: "deepseek-v4-flash".into(),
             max_tokens: 64,
         },
     )

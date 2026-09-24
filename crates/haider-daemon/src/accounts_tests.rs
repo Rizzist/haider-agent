@@ -107,6 +107,52 @@ pub(super) fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
 }
 
 #[test]
+fn subscription_availability_tracks_active_credential_health() {
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("subscription-health");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("add fixture credential");
+    assert!(provider_credential_ready_for_summary(&accounts)(
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+    ));
+    accounts
+        .set_status(&alias, CredentialStatus::Expired)
+        .expect("expire credential");
+    assert!(!provider_credential_ready_for_summary(&accounts)(
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+    ));
+    accounts
+        .add(CredentialDescriptor {
+            alias: CredentialAlias::new("offline-descriptor"),
+            provider: BEDROCK_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "offline fixture".into(),
+            status: CredentialStatus::Expired,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("add offline fixture");
+    assert!(provider_credential_ready_for_summary(&accounts)(
+        BEDROCK_PROVIDER_NAME
+    ));
+}
+
+#[test]
 fn chatgpt_model_rejection_names_the_resolved_account_only_once() {
     let error = ProviderError::new(
         haider_provider::ProviderErrorKind::Authentication,
@@ -1031,6 +1077,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "llama-fixture".to_owned(),
                 display_name: None,
                 context_window: Some(131_072),
@@ -1041,6 +1088,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "llama-other".to_owned(),
                 display_name: None,
                 context_window: Some(65_536),
@@ -1145,6 +1193,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         models: vec!["model-small".to_owned(), "model-large".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "model-small".to_owned(),
                 display_name: None,
                 context_window: Some(32_000),
@@ -1155,6 +1204,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "model-large".to_owned(),
                 display_name: None,
                 context_window: Some(128_000),
@@ -1285,6 +1335,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
         semantic_progress_timeout_ms: None,
         models: vec!["llama3.1:8b".to_owned()],
         model_details: vec![ModelDetailWire {
+            source: None,
             name: "llama3.1:8b".to_owned(),
             display_name: None,
             context_window: None,
@@ -8311,9 +8362,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             body: ResponseBody::ProviderModelsRefresh { provider, revision },
         } => {
             assert_eq!(request_id.as_str(), "refresh-models");
-            assert_eq!(revision, 1);
-            assert_eq!(provider.models, vec!["frontier-refresh"]);
-            assert_eq!(provider.default_model, None);
+            assert_eq!(revision, 2);
+            assert!(provider.models.contains(&"frontier-refresh".to_owned()));
+            assert!(provider.models.contains(&"gpt-6-astra".to_owned()));
+            assert_eq!(provider.default_model.as_deref(), Some("gpt-6-astra"));
         }
         other => panic!("unexpected refresh response: {other:?}"),
     }
@@ -8338,13 +8390,14 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert_eq!(cached_models[0].slug, "frontier-refresh");
     assert_eq!(cached.etag.as_deref(), Some(r#"W/"refresh-etag""#));
     let view = management.read().expect("management view");
-    assert_eq!(view.revision, 1);
+    assert_eq!(view.revision, 2);
     let summary = view
         .providers
         .iter()
         .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
         .expect("refreshed provider");
-    assert_eq!(summary.models, vec!["frontier-refresh"]);
+    assert!(summary.models.contains(&"frontier-refresh".to_owned()));
+    assert!(summary.models.contains(&"gpt-6-astra".to_owned()));
     assert_eq!(
         summary.inventory.fetched_at_ms(),
         Some(cached.fetched_at_ms)
@@ -8374,7 +8427,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert!(matches!(
         frame,
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 2, .. },
             ..
         }
     ));
@@ -8400,7 +8453,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         Some(touched.fetched_at_ms),
         "304 refresh must republish the cache timestamp without a revision bump"
     );
-    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    assert_eq!(store.management_revision().await.expect("revision"), 2);
     let seen = discoverer.seen.lock().expect("seen lock").clone();
     assert_eq!(
         seen.get(1).and_then(|(_, _, etag)| etag.as_deref()),
@@ -8456,7 +8509,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("cache remains"),
         before_unavailable
     );
-    assert_eq!(store.management_revision().await.expect("revision"), 2);
+    assert_eq!(store.management_revision().await.expect("revision"), 3);
     let failed_view = management.read().expect("failure snapshot");
     let failed_provider = failed_view
         .providers
@@ -8522,7 +8575,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("post-panic response deadline")
             .expect("post-panic response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 4, .. },
             ..
         }
     ));
@@ -8559,7 +8612,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("draining response deadline")
             .expect("draining response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 4, .. },
             ..
         }
     ));
@@ -9768,7 +9821,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     let management = ManagementSnapshot::new(
         0,
         accounts.list().to_vec(),
-        providers.summaries(&provider_has_credential(&accounts)),
+        providers.summaries(&provider_credential_ready_for_summary(&accounts)),
     );
     let native = Arc::new(StubAccountClaudeNative::with_bytes(
         CLAUDE_READ_THROUGH_FIXTURE,
@@ -11759,6 +11812,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
         models: vec!["gpt-5.5".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "gpt-5.5".to_owned(),
                 display_name: None,
                 context_window: Some(400_000),
@@ -11769,6 +11823,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "gpt-5.6-sol".to_owned(),
                 display_name: None,
                 context_window: Some(400_000),
@@ -12377,7 +12432,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     let management = ManagementSnapshot::new(
         0,
         Vec::new(),
-        providers.summaries(&provider_has_credential(&accounts)),
+        providers.summaries(&provider_credential_ready_for_summary(&accounts)),
     );
     let before = management
         .read()
@@ -12780,6 +12835,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         semantic_progress_timeout_ms: None,
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![ModelDetailWire {
+            source: None,
             name: "llama-fixture".to_owned(),
             display_name: None,
             context_window: Some(131_072),
@@ -14980,7 +15036,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
             .expect("public")
             .inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
+        haider_rpc::ModelInventoryWire::Static
     );
     let (sink, mut frames) = channel_sink();
     begin_provider_models_refresh(

@@ -645,6 +645,10 @@ pub struct AccountsDependencies {
     pub oauth_coordinator: OAuthCoordinatorConfig,
     /// Validates custom provider origins on the account actor's owned task.
     pub provider_endpoint_validator: Arc<dyn ProviderEndpointValidator>,
+    /// Model-list transport seam. Production uses the provider's guarded
+    /// HTTP client; tests can record a forbidden catalog independently of
+    /// the inference adapter.
+    pub model_discoverer: Option<Arc<dyn ProviderModelDiscoverer>>,
     /// G4b (LV2): the `gcloud auth print-access-token` shell-out behind the
     /// vertex gcloud device import and its auth-failure refresh. Tests
     /// inject scripted sources; production shells out.
@@ -660,6 +664,7 @@ impl Default for AccountsDependencies {
             oauth_catalog: OAuthProviderCatalog::default(),
             oauth_coordinator: OAuthCoordinatorConfig::default(),
             provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            model_discoverer: None,
             gcloud: Arc::new(crate::gcloud::GcloudCli),
         }
     }
@@ -1071,19 +1076,19 @@ impl DeviceDiscoverySnapshot {
     }
 }
 
-/// The account-truth predicate the registry's seeded-inventory availability
-/// rule consults (G4b, decision 6): at least one descriptor exists for the
-/// provider — any status; a limited/expired account is still a credential,
-/// and honesty about ITS state belongs to the account row, not the
-/// provider's availability dot.
-pub(crate) fn provider_has_credential<'a>(
+/// The account-truth predicate for provider availability. Subscription
+/// fallbacks require an active healthy account; the older offline catalogs
+/// retain their descriptor-presence rule. Catalog fetch health is separate.
+pub(crate) fn provider_credential_ready_for_summary<'a>(
     accounts: &'a AccountStore<Box<dyn StoreLike>>,
 ) -> impl Fn(&str) -> bool + 'a {
     move |provider| {
-        accounts
-            .list()
-            .iter()
-            .any(|descriptor| descriptor.provider == provider)
+        let subscription = !haider_provider::subscription_static_models(provider).is_empty();
+        accounts.list().iter().any(|descriptor| {
+            descriptor.provider == provider
+                && (!subscription
+                    || (descriptor.active && matches!(&descriptor.status, CredentialStatus::Ok)))
+        })
     }
 }
 
@@ -1558,7 +1563,10 @@ pub(crate) struct AccountActorConfig {
 }
 
 #[async_trait::async_trait]
-trait ProviderModelDiscoverer: Send + Sync {
+/// Resolves a provider's remote model list for the account actor. Test
+/// implementations can isolate catalog failures from credential validation.
+pub trait ProviderModelDiscoverer: Send + Sync {
+    /// Fetches one catalog using the credential and optional cache validator.
     async fn discover(
         &self,
         source: CatalogSource,
@@ -3102,7 +3110,7 @@ async fn finish_provider_models_refresh(
                 }
             };
             providers.replace_discovered_models(provider.clone(), catalog.models, fetched_at_ms);
-            let summaries = providers.summaries(&provider_has_credential(accounts));
+            let summaries = providers.summaries(&provider_credential_ready_for_summary(accounts));
             let Some(summary) = summaries
                 .iter()
                 .find(|summary| summary.provider == provider)
@@ -3167,7 +3175,7 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
-            let summaries = providers.summaries(&provider_has_credential(accounts));
+            let summaries = providers.summaries(&provider_credential_ready_for_summary(accounts));
             let Some(summary) = summaries
                 .iter()
                 .find(|summary| summary.provider == provider)
@@ -3189,6 +3197,21 @@ async fn finish_provider_models_refresh(
             });
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unavailable { reason })) => {
+            // A subscription may authorize inference while refusing model
+            // enumeration. The fallback remains selectable and the failed
+            // fetch is retained in inventory as informational provenance.
+            if reason.contains("(403)")
+                && !haider_provider::subscription_static_models(&provider).is_empty()
+                && let Some(summary) =
+                    providers.summary(&provider, &provider_credential_ready_for_summary(accounts))
+                && let Ok(revision) = store.management_revision().await
+            {
+                completed.complete(ResponseBody::ProviderModelsRefresh {
+                    provider: summary,
+                    revision,
+                });
+                return;
+            }
             if let Some(data) =
                 custom_probe_error_data(providers, &provider, ProviderProbeFailureWire::Unavailable)
             {
@@ -3285,7 +3308,7 @@ async fn publish_inventory_states(
     let Some(management) = management else {
         return;
     };
-    let summaries = providers.summaries(&provider_has_credential(accounts));
+    let summaries = providers.summaries(&provider_credential_ready_for_summary(accounts));
     if management
         .read()
         .is_some_and(|view| view.providers == summaries)
@@ -4544,7 +4567,7 @@ async fn handle_set_active(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     respond(
@@ -4771,7 +4794,7 @@ async fn handle_remove_account(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     respond(
@@ -4872,9 +4895,10 @@ async fn handle_set_default_model(
             return;
         }
     };
-    let Some(provider) =
-        providers.summary(&profile.provider_id, &provider_has_credential(accounts))
-    else {
+    let Some(provider) = providers.summary(
+        &profile.provider_id,
+        &provider_credential_ready_for_summary(accounts),
+    ) else {
         respond_management_error(
             &job.route,
             &HaiderError::new(
@@ -4907,7 +4931,7 @@ async fn handle_set_default_model(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     respond(
@@ -5346,7 +5370,10 @@ async fn handle_provider_configure(
         discovered_catalog = None;
     }
     let revision_unchanged_response = if revision_unchanged {
-        match providers.summary(&job.input.provider, &provider_has_credential(accounts)) {
+        match providers.summary(
+            &job.input.provider,
+            &provider_credential_ready_for_summary(accounts),
+        ) {
             Some(provider) => Some(ProviderReceipt {
                 provider,
                 revision_unchanged: true,
@@ -5524,9 +5551,10 @@ async fn handle_provider_configure(
             fetched_at_ms,
         );
     }
-    let Some(provider) =
-        providers.summary(&profile.provider_id, &provider_has_credential(accounts))
-    else {
+    let Some(provider) = providers.summary(
+        &profile.provider_id,
+        &provider_credential_ready_for_summary(accounts),
+    ) else {
         respond_management_error(
             &job.route,
             &HaiderError::new(
@@ -5574,7 +5602,7 @@ async fn handle_provider_configure(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     if discover_after_commit
@@ -5750,7 +5778,7 @@ async fn handle_provider_remove(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     respond(
@@ -5872,7 +5900,7 @@ async fn handle_provider_set_trust(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     respond(
@@ -5896,7 +5924,7 @@ async fn commit_provider_trust(
         provider: providers.preview_trust(
             &identity.provider,
             identity.trust,
-            &provider_has_credential(accounts),
+            &provider_credential_ready_for_summary(accounts),
         )?,
         revision_unchanged: false,
     };
@@ -7047,7 +7075,7 @@ async fn handle_gcloud_import(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     let Some(descriptor) = accounts.get(&alias).cloned() else {
@@ -8256,7 +8284,7 @@ async fn finalize_and_respond(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(accounts)),
         );
     }
     enqueue_catalog_discovery(&descriptor.provider, providers, pending_catalog_discoveries);
@@ -11628,7 +11656,10 @@ async fn reconcile_provider_receipts(
             );
         }
         let summary = providers
-            .summary(&profile.provider_id, &provider_has_credential(accounts))
+            .summary(
+                &profile.provider_id,
+                &provider_credential_ready_for_summary(accounts),
+            )
             .ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::StoreCorrupt,
@@ -12378,7 +12409,7 @@ impl AccountsRuntime {
         let management = ManagementSnapshot::new(
             management_revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_has_credential(&accounts)),
+            providers.summaries(&provider_credential_ready_for_summary(&accounts)),
         );
         let device_discovery = DeviceDiscoverySnapshot::new(discovery_disabled);
         let promotion_targets = management
@@ -12446,7 +12477,10 @@ impl AccountsRuntime {
                         )?
                         .with_gcloud_source(Arc::clone(&gcloud))
                     },
-                    Arc::new(ProductionProviderModelDiscoverer),
+                    dependencies
+                        .model_discoverer
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(ProductionProviderModelDiscoverer)),
                     Arc::clone(&gcloud),
                     Arc::new(StrictNoNativeCredentialStore),
                 )?;

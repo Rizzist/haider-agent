@@ -1288,6 +1288,9 @@ pub struct ModelDetailWire {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Origin of this row; older peers omit it and therefore leave it unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ModelDetailSourceWire>,
     /// The pair's effort ladder, in the provider's own vocabulary and order.
     /// EMPTY (absent on the wire) means "no declared ladder".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1314,6 +1317,16 @@ pub struct ModelDetailWire {
     /// nothing, and a client must then attach and let the daemon answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDetailSourceWire {
+    Static,
+    Remote,
+    Configured,
+    #[serde(other)]
+    Unknown,
 }
 
 /// One provider's read-only management projection.
@@ -1511,18 +1524,34 @@ pub struct ProviderSummaryWire {
 }
 
 impl ProviderSummaryWire {
+    #[must_use]
+    pub fn has_static_models(&self) -> bool {
+        self.model_details.iter().any(|detail| {
+            detail.source == Some(ModelDetailSourceWire::Static)
+                && self.models.iter().any(|model| model == &detail.name)
+        })
+    }
+
     /// Classifies `model` without changing the advertised/pickable inventory.
     /// In particular, an unlisted custom passthrough id is never appended to
     /// `models` or fabricated as an available [`ModelDetailWire`] row.
     #[must_use]
     pub fn model_inventory_status(&self, model: &str) -> ModelInventoryStatusWire {
-        if matches!(
+        if self.models.iter().any(|known| known == model)
+            && (!matches!(
+                self.inventory,
+                ModelInventoryWire::NeverFetched | ModelInventoryWire::Unavailable { .. }
+            ) || self.model_details.iter().any(|detail| {
+                detail.name == model && detail.source == Some(ModelDetailSourceWire::Static)
+            }))
+        {
+            ModelInventoryStatusWire::Listed
+        } else if matches!(
             self.inventory,
             ModelInventoryWire::NeverFetched | ModelInventoryWire::Unavailable { .. }
-        ) {
+        ) && !self.has_static_models()
+        {
             ModelInventoryStatusWire::Unknown
-        } else if self.models.iter().any(|known| known == model) {
-            ModelInventoryStatusWire::Listed
         } else {
             ModelInventoryStatusWire::Unlisted
         }

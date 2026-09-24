@@ -155,8 +155,8 @@ mod project_instructions_tests;
 
 pub use accounts::{
     AccountProviderBuilder, AccountsDependencies, AnthropicValidator, ConnectionTransport,
-    CredentialValidator, ProviderCredentialValidator, ValidatedIdentity, ValidationError,
-    ValidationFailureKind, VaultProvision,
+    CredentialValidator, ProviderCredentialValidator, ProviderModelDiscoverer, ValidatedIdentity,
+    ValidationError, ValidationFailureKind, VaultProvision,
 };
 pub use config::DaemonConfig;
 pub use diagnostics::{BUILD_UUID, BUILD_VERSION, process_started_unix_ms};
