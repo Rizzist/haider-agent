@@ -8456,22 +8456,8 @@ async fn refresh_context_economy_from_journal(
     Ok(economy)
 }
 
-/// Assembles and starts one accepted turn: provider resolution (R6 pinning —
-/// this is the once-per-logical-turn call), committed-history compilation
-/// (R4), tool dispatcher creation, harness registration under the lease, and
-/// submission.
-///
-/// Checkpoint resumption order is deliberate: the recovered harness
-/// registers FIRST, then the journal is scanned for an already-committed
-/// answer. An answer committed before registration is found by the scan; one
-/// committed after the scan is delivered by the hub's registered-harness
-/// wake; one committed between registration and the scan is sent TWICE (hub
-/// wake at commit, then the scan's apply). The duplicate is safe because
-/// both sends land in the harness's latest-value committed-menu watch before
-/// the checkpoint handler performs its first read. A blocking waiter
-/// collapses them into one observation; an autonomous plan recognizes that
-/// settlement before returning its fixed accepted result. Missing the answer
-/// is the failure mode this ordering exists to prevent.
+/// Applies the test-only hard-cap override while preserving a pinned tranche.
+/// Production turns use the pin unchanged and have no request cap when absent.
 fn request_budget_with_test_override(
     pinned: Option<haider_protocol::request_budget::RequestBudgetV1>,
     override_limit: Option<usize>,
@@ -8489,6 +8475,22 @@ fn request_budget_with_test_override(
         .or(pinned)
 }
 
+/// Assembles and starts one accepted turn: provider resolution (R6 pinning —
+/// this is the once-per-logical-turn call), committed-history compilation
+/// (R4), tool dispatcher creation, harness registration under the lease, and
+/// submission.
+///
+/// Checkpoint resumption order is deliberate: the recovered harness
+/// registers FIRST, then the journal is scanned for an already-committed
+/// answer. An answer committed before registration is found by the scan; one
+/// committed after the scan is delivered by the hub's registered-harness
+/// wake; one committed between registration and the scan is sent TWICE (hub
+/// wake at commit, then the scan's apply). The duplicate is safe because
+/// both sends land in the harness's latest-value committed-menu watch before
+/// the checkpoint handler performs its first read. A blocking waiter
+/// collapses them into one observation; an autonomous plan recognizes that
+/// settlement before returning its fixed accepted result. Missing the answer
+/// is the failure mode this ordering exists to prevent.
 async fn start_turn(
     dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,

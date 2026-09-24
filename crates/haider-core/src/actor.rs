@@ -684,7 +684,112 @@ pub struct PreviousCacheRequest {
     pub breakpoint_hashes: CacheBreakpointHashesV1,
     pub cache_domain_hash: Option<String>,
 }
+/// Consecutive provider continuations allowed without a new semantic result.
 const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
+
+/// Tracks distinct work within one turn. Request ordinals, generated call IDs,
+/// usage, opaque replay state, and the synthesized MaxTokens nudge do not prove
+/// progress. Only new assistant text, a completed local call with a new
+/// (name, arguments, result), or a provider-side tool result does. Fingerprints
+/// keep each observation small while still recognizing repeats after other work.
+#[derive(Default)]
+struct ContinuationProgress {
+    consecutive_without_progress: usize,
+    seen: HashSet<blake3::Hash>,
+    progress_in_response: bool,
+}
+
+impl ContinuationProgress {
+    fn begin_response(&mut self) {
+        self.progress_in_response = false;
+    }
+
+    fn observe(&mut self, kind: &[u8], parts: &[&[u8]]) {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(kind);
+        for part in parts {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        if self.seen.insert(hasher.finalize()) {
+            self.consecutive_without_progress = 0;
+            self.progress_in_response = true;
+        }
+    }
+
+    fn observe_assistant_text(&mut self, blocks: &[Block]) {
+        let mut content = String::new();
+        for block in blocks {
+            if let Block::Text { text } = block {
+                content.push_str(&text.to_owned_string());
+            }
+        }
+        if !content.trim().is_empty() {
+            self.observe(b"assistant_text", &[content.as_bytes()]);
+        }
+    }
+
+    fn observe_local_tools(&mut self, blocks: &[Block], results: &[Message]) {
+        for block in blocks {
+            let Block::ToolCall {
+                call_id,
+                name,
+                args,
+            } = block
+            else {
+                continue;
+            };
+            for result in results {
+                if let Some(Block::ToolResult {
+                    preview,
+                    truncated,
+                    images,
+                    ..
+                }) = result.tool_result_for(call_id)
+                {
+                    let args = args.to_string();
+                    let images = serde_json::to_string(images).unwrap_or_default();
+                    self.observe(
+                        b"local_tool_result",
+                        &[
+                            name.as_bytes(),
+                            args.as_bytes(),
+                            preview.as_bytes(),
+                            &[*truncated as u8],
+                            images.as_bytes(),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+
+    fn observe_server_tool(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        preview: &str,
+        is_error: bool,
+    ) {
+        let args = args.to_string();
+        self.observe(
+            b"server_tool_result",
+            &[
+                name.as_bytes(),
+                args.as_bytes(),
+                preview.as_bytes(),
+                &[is_error as u8],
+            ],
+        );
+    }
+
+    fn charge(&mut self) -> usize {
+        if !self.progress_in_response {
+            self.consecutive_without_progress = self.consecutive_without_progress.saturating_add(1);
+        }
+        self.consecutive_without_progress
+    }
+}
 /// Maximum time a provider-stream text, reasoning, or tool-argument delta may
 /// remain in memory before it is journaled. Contiguous deltas for one item and
 /// one variant coalesce during this window; every semantic boundary flushes
@@ -975,7 +1080,8 @@ pub struct HarnessConfig {
     /// cumulative baseline. Keep each durable response snapshot request-local
     /// while retaining cumulative accounting inside the actor.
     pub recovery_request_local_usage: bool,
-    /// Independent guard against providers repeatedly exhausting output.
+    /// Maximum consecutive MaxTokens/PauseTurn finishes without distinct
+    /// assistant content or a new completed local/provider-side tool result.
     pub max_continuations_per_turn: usize,
     /// Maximum number of submissions parked behind the active turn.
     pub deferred_command_capacity: usize,
@@ -3687,7 +3793,7 @@ impl HarnessActor {
                 Err(error) => return self.errored_state_outcome(&run_id, error).await,
             }
         }
-        let mut continuation_count = 0usize;
+        let mut continuation_progress = ContinuationProgress::default();
         let (workspace_before, mut pending_workspace_receipt) = match self
             .prepare_ceiling_workspace(&run_id, restore_budget, &cancel)
             .await
@@ -3867,6 +3973,7 @@ impl HarnessActor {
             }
         }
         'requests: loop {
+            continuation_progress.begin_response();
             if provider_attempt == 0
                 && let Some(budget) = self.config.provider_request_budget
             {
@@ -6243,6 +6350,9 @@ impl HarnessActor {
                         let (name, args) = server_calls
                             .remove(&call_id)
                             .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null));
+                        let result_preview = preview.clone();
+                        let result_name = name.clone();
+                        let result_args = args.clone();
                         async {
                             self.complete_text(&run_id, &mut message, false).await?;
                             self.complete_text(&run_id, &mut reasoning, true).await?;
@@ -6279,6 +6389,12 @@ impl HarnessActor {
                                 &run_id, &call_id, name, args, status, &result,
                             )
                             .await?;
+                            continuation_progress.observe_server_tool(
+                                &result_name,
+                                &result_args,
+                                &result_preview,
+                                is_error,
+                            );
                             Ok(None)
                         }
                         .await
@@ -6787,6 +6903,7 @@ impl HarnessActor {
                                     .await;
                             }
                         }
+                        continuation_progress.observe_assistant_text(&assistant_blocks);
                         let current_assistant_message_index = if !assistant_blocks.is_empty() {
                             let index = messages.len();
                             messages
@@ -6850,6 +6967,10 @@ impl HarnessActor {
                                     .await;
                             }
                             provider_attempt = 0;
+                            if let Some(index) = current_assistant_message_index {
+                                continuation_progress
+                                    .observe_local_tools(&messages[index].blocks, &tool_results);
+                            }
                             messages.append(&mut tool_results);
                             thinking_pending = true;
                             replay.reset_for_next_request();
@@ -6858,11 +6979,11 @@ impl HarnessActor {
                             continue 'requests;
                         }
                         // W-B (LW2): `pause_turn` shares the MaxTokens
-                        // continuation machinery (checkpoint + cap), but the
+                        // continuation machinery (checkpoint + no-progress cap), but the
                         // paused assistant message is resent UNCHANGED — no
                         // synthesized user nudge joins the conversation.
                         if reason == FinishReason::MaxTokens || reason == FinishReason::PauseTurn {
-                            continuation_count = continuation_count.saturating_add(1);
+                            let continuation_count = continuation_progress.charge();
                             if continuation_count > self.config.max_continuations_per_turn {
                                 return self
                                     .errored_outcome_with_items(
@@ -13267,7 +13388,9 @@ fn request_budget_error(status: &RequestBudgetStatusV1) -> HaiderError {
 fn continuation_limit_error(count: usize, limit: usize) -> HaiderError {
     let mut error = HaiderError::new(
         ErrorCode::LoopLimit,
-        format!("provider continuation limit exceeded at continuation {count} (limit {limit})"),
+        format!(
+            "provider no-progress continuation limit exceeded at consecutive continuation {count} (limit {limit})"
+        ),
         false,
     );
     error.details = Some(serde_json::json!({

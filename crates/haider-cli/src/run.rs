@@ -1108,7 +1108,7 @@ Permission options:\n\
 \n\
 Use --session ID to submit an ordinary turn to an existing native session.\n\
 Request limits are opt-in: --max-requests N uses tranche min(32, N);\n\
---request-tranche N alone uses hard cap 64. Neither flag leaves requests unbounded.\n\
+--request-tranche N alone uses hard cap 64. Supplying neither flag leaves requests unbounded.\n\
 \n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
 --timeout <duration>, --start, --status, --stop, and --replay.";

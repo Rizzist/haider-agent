@@ -335,6 +335,18 @@ Once a capped run emits its first request status, the TUI status strip and
 exposes the selected run's optional `request_budget` object. Unbounded runs
 omit both displays and the JSON field.
 
+The independent provider continuation guard counts consecutive `max_tokens`
+or `pause_turn` finishes without progress. Progress is new, nonblank assistant
+text; a completed local tool call with a distinct tool name, arguments, and
+model-visible result; or a distinct completed provider-side tool result with
+its name, arguments, preview, and status. Repeated content or identical calls
+and results, even with fresh call IDs, do not reset the streak. Usage updates,
+transport attempts, opaque replay state, and the automatic `max_tokens` nudge
+also do not reset it. The default permits eight no-progress continuations;
+the ninth ends in `loop_limit` (CLI exit 70). Productive turns may pass that
+many total continuations. This loop guard is separate from an explicit request
+budget and its `request_budget_exceeded` exit 78.
+
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
 request policy. With only `--max-requests N`, the implicit tranche is
 `min(32, N)`; for example, `--max-requests 5` permits exactly five requests

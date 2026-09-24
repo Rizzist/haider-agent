@@ -1017,6 +1017,183 @@ async fn repeated_max_tokens_is_bounded_independently() {
     );
 }
 
+#[tokio::test]
+async fn nine_empty_pause_turns_stop_at_the_no_progress_limit() {
+    let script = (0..9)
+        .map(|_| FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        })
+        .collect();
+    let (handle, _, provider) = runtime(script);
+    let accepted = handle
+        .submit_turn(SubmitTurn::new("wait for provider progress"))
+        .await
+        .expect("turn accepted");
+    let outcome = timeout(Duration::from_secs(30), accepted.wait())
+        .await
+        .expect("empty continuations must terminate")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("loop error").code,
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(provider.requests().len(), 9);
+}
+
+#[tokio::test]
+async fn a_progressing_pause_does_not_spend_the_empty_continuation_allowance() {
+    let mut script = vec![
+        FakeStep::EmitText {
+            text: "new finding".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ];
+    script.extend((0..8).map(|_| FakeStep::Finish {
+        reason: FinishReason::PauseTurn,
+    }));
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (handle, _, provider) = runtime(script);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("continue after new content"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 10);
+}
+
+#[tokio::test]
+async fn distinct_tool_results_reset_the_continuation_streak() {
+    let mut script = Vec::new();
+    for ordinal in 1..=9 {
+        let call_id = format!("read-{ordinal}");
+        script.extend([
+            FakeStep::EmitToolCall {
+                call_id: call_id.clone(),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": format!("part-{ordinal}.txt")}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult { call_id },
+            FakeStep::Finish {
+                reason: FinishReason::PauseTurn,
+            },
+        ]);
+    }
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 19);
+    assert_eq!(calls, 9);
+}
+
+#[tokio::test]
+async fn repeated_identical_tool_results_do_not_reset_the_continuation_streak() {
+    let mut script = vec![
+        FakeStep::EmitToolCall {
+            call_id: "first".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path": "same.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "first".into(),
+        },
+    ];
+    script.extend((0..8).map(|_| FakeStep::Finish {
+        reason: FinishReason::PauseTurn,
+    }));
+    script.extend([
+        FakeStep::EmitToolCall {
+            call_id: "second".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path": "same.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "second".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ]);
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("loop error").code,
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(requests.len(), 11);
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn repeated_identical_provider_tool_results_do_not_reset_the_streak() {
+    let mut script = vec![
+        FakeStep::EmitServerToolUse {
+            call_id: "first".into(),
+            name: "web_search".into(),
+            args: serde_json::json!({"query": "same topic"}),
+        },
+        FakeStep::EmitServerToolResult {
+            call_id: "first".into(),
+            preview: "same result".into(),
+            is_error: false,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ];
+    script.extend((0..8).map(|_| FakeStep::Finish {
+        reason: FinishReason::PauseTurn,
+    }));
+    script.extend([
+        FakeStep::EmitServerToolUse {
+            call_id: "second".into(),
+            name: "web_search".into(),
+            args: serde_json::json!({"query": "same topic"}),
+        },
+        FakeStep::EmitServerToolResult {
+            call_id: "second".into(),
+            preview: "same result".into(),
+            is_error: false,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+    ]);
+    let (handle, _, provider) = runtime(script);
+    let accepted = handle
+        .submit_turn(SubmitTurn::new("search for new results"))
+        .await
+        .expect("turn accepted");
+    let outcome = timeout(Duration::from_secs(30), accepted.wait())
+        .await
+        .expect("repeated provider results must terminate")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("loop error").code,
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(provider.requests().len(), 10);
+}
+
 #[derive(Debug, Default)]
 struct FakeContextCompactor {
     calls: AtomicUsize,
