@@ -12112,6 +12112,15 @@ impl HubConnection {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
         };
+        if let Err((message, data)) = resolve_session_output_limit(current.max_tokens, &validated) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &message,
+                false,
+                Some(data),
+            );
+        }
         if matches!(
             validated.inventory_status,
             haider_rpc::ModelInventoryStatusWire::Unlisted

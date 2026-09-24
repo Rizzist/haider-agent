@@ -3156,10 +3156,10 @@ async fn output_limited_tool_is_not_executed_and_gets_one_split_retry() {
             .expect("presentation")
             .subcode
             .as_str(),
-        "output-limit-tool-arguments"
+        "output-limit-truncation"
     );
     assert!(result.preview.contains("not executed"));
-    assert!(result.preview.contains("splitting large content"));
+    assert!(result.preview.contains("Split large content"));
     assert!(!result.preview.contains("malformed"));
     assert!(events.iter().any(|event| matches!(
         typed(event),
@@ -3171,30 +3171,135 @@ async fn output_limited_tool_is_not_executed_and_gets_one_split_retry() {
 }
 
 #[tokio::test]
-async fn second_consecutive_output_limited_tool_terminates_honestly() {
+async fn third_consecutive_output_limited_tool_returns_a_typed_error_and_run_continues() {
     let mut script = output_limited_tool_steps("limited-1", "{\"payload\":");
     script.extend(output_limited_tool_steps("limited-2", "{\"payload\":"));
+    script.push(FakeStep::EmitToolCall {
+        call_id: "complete-on-third".into(),
+        name: "inspect".into(),
+        args: serde_json::json!({"chunk": "small"}),
+    });
+    script.extend(output_limited_tool_steps("limited-3", "{\"payload\":"));
+    script.push(FakeStep::ExpectToolResult {
+        call_id: "limited-3".into(),
+    });
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
     let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
 
-    assert_eq!(outcome.state, RunState::Errored);
-    assert_eq!(requests.len(), 2);
-    assert_eq!(calls, 0);
-    let (message, presentation) = events
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        calls, 1,
+        "the completed call in the truncated response executes"
+    );
+    let result = events
         .iter()
         .find_map(|event| match typed(event) {
-            EventPayload::RunFailed {
-                message,
-                presentation,
-                ..
-            } => Some((message, presentation)),
+            EventPayload::ToolResult { call_id, result } if call_id == "limited-3" => Some(result),
             _ => None,
         })
-        .expect("typed terminal failure");
+        .expect("typed repeated truncation result");
     assert_eq!(
-        presentation.expect("presentation").subcode.as_str(),
-        "output-limit-tool-arguments"
+        result
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subcode
+            .as_str(),
+        "output-limit-truncation-repeated"
     );
-    assert!(!message.contains("malformed"));
+    assert!(result.preview.contains("output_limit_truncation_repeated"));
+    assert!(result.preview.contains("Split large content"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn output_truncation_does_not_consume_the_malformed_call_strike() {
+    let mut script = output_limited_tool_steps("limited-first", "{\"payload\":");
+    script.extend(malformed_tool_steps("bad-second", "{broken"));
+    script.extend([
+        FakeStep::EmitToolCall {
+            call_id: "valid-third".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"chunk": "small"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "valid-third".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn resumed_output_truncation_uses_the_same_third_call_policy() {
+    let mut script = output_limited_tool_steps("limited-before-1", "{");
+    script.extend(output_limited_tool_steps("limited-before-2", "{"));
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (_, events, _, _) = toolrepair_run(config(), script).await;
+    let run_id = events[0].run_id.clone().expect("run id");
+    let attempt = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            completed_extension(event, haider_core::ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND)
+                .then_some(index)
+        })
+        .nth(1)
+        .expect("third request epoch marker");
+    let mut prefix = events[..=attempt].to_vec();
+    let store = Arc::new(MemoryStore::new());
+    StoreHandle::append(store.as_ref(), &mut prefix)
+        .await
+        .expect("restore prefix");
+    let mut replay = output_limited_tool_steps("limited-after-restart", "{");
+    replay.push(FakeStep::ExpectToolResult {
+        call_id: "limited-after-restart".into(),
+    });
+    replay.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let provider = Arc::new(FakeProvider::new(replay));
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let outcome = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id,
+            messages: vec![Message::user_text("continue")],
+            checkpoint: RouteWaitCheckpoint {
+                response_epoch: 2,
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("resume")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 2);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert!(events.iter().any(|event| matches!(typed(event),
+        EventPayload::ToolResult { call_id, result }
+            if call_id == "limited-after-restart" && result.presentation.as_ref()
+                .is_some_and(|presentation| presentation.subcode.as_str() == "output-limit-truncation-repeated")
+    )));
+    handle.stop().await.expect("stop");
 }
 
 #[tokio::test]

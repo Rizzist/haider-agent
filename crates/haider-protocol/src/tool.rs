@@ -294,8 +294,9 @@ pub enum ToolResultData {
     OutputLimitTruncation {
         tool: String,
         message: String,
-        /// Whether this failure consumed the run's one automatic tool-call
-        /// repair allowance.
+        /// Whether the actor sent the ordinary split-write continuation.
+        /// A repeated truncation reports false and remains a tool error,
+        /// never a malformed-call strike or a run terminal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repaired: Option<bool>,
     },

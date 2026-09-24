@@ -114,6 +114,20 @@ fn session_output_limit_validation_is_exact_and_typed() {
         super::rpc::resolve_session_output_limit(0, &smaller).expect("model-bounded default"),
         8_192
     );
+    assert!(
+        matches!(
+            super::rpc::resolve_session_output_limit(30_000, &smaller),
+            Err((
+                _,
+                haider_rpc::ErrorData::ModelOutputLimit {
+                    requested: 30_000,
+                    max_output_tokens: 8_192,
+                    ..
+                }
+            ))
+        ),
+        "a session switching from a large-output model receives a typed refusal"
+    );
     assert_eq!(
         super::rpc::resolve_session_output_limit(128_000, &selection)
             .expect("exact explicit limit"),

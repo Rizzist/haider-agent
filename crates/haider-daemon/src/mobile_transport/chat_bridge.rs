@@ -148,26 +148,12 @@ impl DaemonMobileChatBridge {
             .to_string_lossy()
             .into_owned();
         let created = runtime
-            .request(RequestBody::SessionCreateWithPermissionOverrides {
-                command_id: CommandId::new(self.next_coordinate("create")),
+            .request(mobile_session_create_request(
+                self.next_coordinate("create"),
                 cwd,
                 provider,
                 model,
-                max_tokens: haider_client::DEFAULT_MAX_TOKENS,
-                permission_overrides: Some(SessionPermissionOverridesV1 {
-                    allow_mobile: true,
-                    ..SessionPermissionOverridesV1::default()
-                }),
-                workspace_allocation: None,
-                cache_policy: None,
-                interaction_mode: SessionInteractionModeV1::Interactive,
-                ssh_scope: None,
-                account_alias: None,
-                resolve_provider: false,
-                resolve_model: false,
-                effort: None,
-                fast: None,
-            })
+            ))
             .await?;
         let (session_id, created_seq, worker_generation) = match created.body {
             ResponseBody::SessionCreate {
@@ -276,6 +262,34 @@ impl DaemonMobileChatBridge {
                 responder.send(ChatEvent::SessionConfig(config)).await
             }
         }
+    }
+}
+
+fn mobile_session_create_request(
+    command_id: String,
+    cwd: String,
+    provider: String,
+    model: String,
+) -> RequestBody {
+    RequestBody::SessionCreateWithPermissionOverrides {
+        command_id: CommandId::new(command_id),
+        cwd,
+        provider,
+        model,
+        max_tokens: 0,
+        permission_overrides: Some(SessionPermissionOverridesV1 {
+            allow_mobile: true,
+            ..SessionPermissionOverridesV1::default()
+        }),
+        workspace_allocation: None,
+        cache_policy: None,
+        interaction_mode: SessionInteractionModeV1::Interactive,
+        ssh_scope: None,
+        account_alias: None,
+        resolve_provider: false,
+        resolve_model: false,
+        effort: None,
+        fast: None,
     }
 }
 

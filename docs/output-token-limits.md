@@ -15,11 +15,11 @@ window or the largest budget supported by a registered adapter (384,000).
 `haider models` exposes both values. Session creation rejects an explicit
 request above the resolved maximum instead of silently clamping it.
 
-Interactive sessions request the smaller of 30,000, the model output maximum,
-and the context window. A headless client without an override sends the
-feature-gated `session.create.max_tokens = 0` derivation sentinel; the daemon
-resolves the same model-bounded default and persists/emits the effective
-nonzero value. `haider run --max-tokens N` remains an exact per-response
+Every client without an explicit override sends `session.create.max_tokens = 0`.
+The daemon resolves the smaller of the shared 30,000 default and the selected
+model maximum, then persists/emits that effective nonzero value. TUI model
+details may be unavailable when a session is created; zero remains safe then.
+`haider run --max-tokens N` remains an exact per-response
 override. The separate `--max-total-tokens N` flag bounds cumulative run
 usage.
 
@@ -33,15 +33,18 @@ malformed model JSON. Adapters surface the start and argument deltas without a
 1. records the raw partial arguments and a typed `output_limit_truncation`
    result;
 2. never dispatches the truncated call;
-3. performs one automatic continuation with instructions to split large
-   content across smaller tool calls; and
-4. terminates with `output-limit-tool-arguments` if the next tool call is also
-   truncated before its end marker.
+3. auto-continues with instructions to split large content across smaller
+   tool calls; and
+4. after three consecutive truncations, gives the model a typed
+   `output_limit_truncation_repeated` tool error with guidance. The run remains
+   active and the model decides its next action.
 
-A valid completed tool call resets this shared tool-call repair allowance.
-Malformed calls retain their existing typed `invalid_tool_call` path.
+A provider response without an output-limited partial tool call resets the
+truncation streak. A completed call in the same truncated response does not.
+Malformed calls retain their existing typed `invalid_tool_call` strike path.
 The AX-2 malformed-call strike predicate in `haider-core` matches only
 `ToolResultData::InvalidToolCall`; keep `OutputLimitTruncation` outside that
-predicate when integrating the lanes. The shared repair allowance is tracked
-separately by `repairable_tool_call_result` in `actor.rs`; the closers live in
-`actor_tool_repair.rs`.
+predicate when integrating the lanes. The live path and
+`recover_tool_repair_state` both use `invalid_tool_call_result` for malformed
+strikes; the truncation streak is stored separately. This makes the
+973-ax2-tool-friction predicate change a no-op at integration.

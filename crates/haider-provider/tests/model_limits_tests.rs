@@ -16,6 +16,31 @@ fn known_subscription_models_have_large_static_limits() {
         128_000
     );
     assert_eq!(
+        static_model_limits("openai-oauth", "gpt-5.6-sol").context_window,
+        Some(1_050_000)
+    );
+    assert_eq!(
+        static_model_limits("openai", "gpt-4.1").context_window,
+        Some(1_047_576)
+    );
+    assert_eq!(
+        static_model_limits("openai", "gpt-5.4-mini").context_window,
+        Some(400_000)
+    );
+    assert_eq!(
+        static_model_limits("openai", "gpt-5.3-chat-latest").max_output_tokens,
+        16_384
+    );
+    for model in ["o3", "o4-mini"] {
+        assert_eq!(
+            static_model_limits("openai", model),
+            StaticModelLimits {
+                context_window: Some(200_000),
+                max_output_tokens: 100_000,
+            }
+        );
+    }
+    assert_eq!(
         static_model_limits("bedrock", "anthropic.claude-opus-4-8"),
         StaticModelLimits {
             context_window: Some(1_000_000),
@@ -33,6 +58,11 @@ fn known_subscription_models_have_large_static_limits() {
 
 #[test]
 fn unknown_models_still_clear_the_legacy_ceiling() {
+    assert_eq!(
+        static_model_limits("fake", "fake-model").max_output_tokens,
+        haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT,
+        "the local fake adapter preserves the shared default fixture budget"
+    );
     for provider in [
         "anthropic-oauth",
         "openai-oauth",
@@ -53,15 +83,34 @@ fn unknown_models_still_clear_the_legacy_ceiling() {
 fn conservative_context_fallbacks_match_adapter_capabilities() {
     assert_eq!(
         static_model_limits("anthropic", "future-model").context_window,
-        Some(100_000)
+        None
     );
     assert_eq!(
         static_model_limits("openai", "gpt-5.3").context_window,
-        Some(400_000)
+        None
     );
     assert_eq!(
         static_model_limits("gemini", "gemini-2.0-flash").context_window,
         Some(1_048_576)
+    );
+    assert_eq!(
+        static_model_limits("gemini", "gemini-1.5-flash").max_output_tokens,
+        8_192
+    );
+    assert_eq!(
+        static_model_limits("deepseek", "deepseek-v4-pro"),
+        StaticModelLimits {
+            context_window: Some(1_000_000),
+            max_output_tokens: 384_000,
+        }
+    );
+    assert_eq!(
+        static_model_limits("deepseek", "deepseek-reasoner").max_output_tokens,
+        8_192
+    );
+    assert_eq!(
+        static_model_limits("deepseek", "deepseek-reasoner").context_window,
+        None
     );
 }
 

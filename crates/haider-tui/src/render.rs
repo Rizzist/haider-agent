@@ -7263,13 +7263,18 @@ fn render_token_panel(
             let turns = u64::from(model.projection.user_row_count().max(1));
             let burn = (tokens / turns).max(6000);
             let to_threshold = (window.saturating_mul(85) / 100).saturating_sub(tokens);
-            let detail = format!(
-                "in ~{} · out ~{} · cached ~{} · ≈{} turns to auto-compaction",
+            let mut detail = format!(
+                "in ~{} · out ~{} · cached ~{}",
                 fmt_tok(tokens.saturating_mul(62) / 100),
                 fmt_tok(tokens.saturating_mul(28) / 100),
                 fmt_tok(tokens.saturating_mul(10) / 100),
-                to_threshold.div_ceil(burn).max(1),
             );
+            if window > 0 {
+                detail.push_str(&format!(
+                    " · ≈{} turns to auto-compaction",
+                    to_threshold.div_ceil(burn).max(1)
+                ));
+            }
             PanelRow {
                 label: main_label.clone(),
                 tokens,
@@ -7329,14 +7334,18 @@ fn render_token_panel(
         } else {
             row.tokens as f64 / row.window as f64
         };
-        let mut text = format!(
-            "{}  {} {}%  {}/{}",
-            row.label,
-            meter_cells(pct, 12),
-            (pct.clamp(0.0, 1.0) * 100.0).round(),
-            fmt_tok(row.tokens),
-            fmt_tok(row.window),
-        );
+        let mut text = if row.window == 0 {
+            format!("{}  {}/unknown", row.label, fmt_tok(row.tokens))
+        } else {
+            format!(
+                "{}  {} {}%  {}/{}",
+                row.label,
+                meter_cells(pct, 12),
+                (pct.clamp(0.0, 1.0) * 100.0).round(),
+                fmt_tok(row.tokens),
+                fmt_tok(row.window),
+            )
+        };
         if !row.detail.is_empty() {
             text.push_str(" · ");
             text.push_str(&row.detail);
@@ -14704,13 +14713,17 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     } else {
         tokens as f64 / window as f64
     };
-    let meter = format!(
-        "{approx}{} tok · {} {}% of {}",
-        fmt_tok(tokens),
-        meter_cells(pct, METER_CELLS_DEFAULT),
-        (pct.clamp(0.0, 1.0) * 100.0).round(),
-        fmt_tok(window)
-    );
+    let meter = if window == 0 {
+        format!("{approx}{} tok · context unknown", fmt_tok(tokens))
+    } else {
+        format!(
+            "{approx}{} tok · {} {}% of {}",
+            fmt_tok(tokens),
+            meter_cells(pct, METER_CELLS_DEFAULT),
+            (pct.clamp(0.0, 1.0) * 100.0).round(),
+            fmt_tok(window)
+        )
+    };
 
     // F2c: token usage sits DIRECTLY right of the state — the identity
     // block (model / auth / reasoning) moved to the composer's top rule.

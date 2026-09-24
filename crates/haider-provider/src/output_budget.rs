@@ -7,9 +7,8 @@ use crate::model_limits::static_model_limits;
 /// Budget a new session requests when the client does not override it:
 /// the smaller of this value and the resolved model maximum. It keeps the
 /// 30,000-token reserve the TUI (`SESSION_OUTPUT_CAP`) and the daemon's former
-/// `session.create` ceiling already used, so derivation raises only the
-/// headless path that previously sent 4,096.
-pub const DEFAULT_OUTPUT_LIMIT: u64 = 30_000;
+/// `session.create` ceiling already used. Clients send zero for derivation.
+pub use haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT;
 /// Largest response budget supported by any currently registered adapter
 /// (the DeepSeek V4 row in `model_limits`). Daemon admission applies this after
 /// catalog/model-specific resolution.

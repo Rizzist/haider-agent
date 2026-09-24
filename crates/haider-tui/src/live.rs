@@ -2409,25 +2409,9 @@ fn ssh_profile_command(
     }
 }
 
-/// Ceiling on the OUTPUT-token budget `session.create` requests (W5f-2).
-///
-/// `session.create`'s `max_tokens` reaches the providers as the per-request
-/// OUTPUT cap (`max_output_tokens` / `max_tokens`) — it was being fed the
-/// identity's CONTEXT window (200k), which Anthropic rejects outright and
-/// OpenAI clamps unpredictably. 30k sits inside every current subscription
-/// model's output limit while leaving real headroom; a context window
-/// smaller than the ceiling still wins.
-pub const SESSION_OUTPUT_CAP: u64 = 30_000;
-
-/// The output budget a new session may request: the ceiling, bounded by the
-/// context window and by the row's daemon-projected output maximum when one
-/// is declared.
-#[must_use]
-pub fn session_output_cap(context_window: u64, model_output_limit: Option<u64>) -> u64 {
-    SESSION_OUTPUT_CAP
-        .min(context_window.max(1))
-        .min(model_output_limit.unwrap_or(SESSION_OUTPUT_CAP).max(1))
-}
+/// Shared output-budget default retained for callers inspecting TUI policy.
+/// New sessions send zero so the daemon derives the limit for the exact model.
+pub use haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT as SESSION_OUTPUT_CAP;
 
 impl LiveDriver {
     /// A driver for one client instance. `instance` must be unique per
@@ -6609,13 +6593,7 @@ impl LiveDriver {
                         workspace_allocation,
                         provider: model.identity.provider.clone(),
                         model: model.identity.model_short.clone(),
-                        max_tokens: session_output_cap(
-                            model.identity.context_window,
-                            model.providers.declared_output_limit(
-                                &model.identity.provider,
-                                &model.identity.model_short,
-                            ),
-                        ),
+                        max_tokens: 0,
                         first_text: text,
                     },
                 )]

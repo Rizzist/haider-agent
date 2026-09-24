@@ -494,6 +494,7 @@ async fn spawn(
     deadline: Instant,
 ) -> Result<Value, Failure> {
     connection.require(haider_rpc::FEATURE_AGENT_CLI_V1)?;
+    connection.require(haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1)?;
     let prompt = options
         .flag("--prompt")
         .unwrap_or_else(|| options.positional.last().cloned().unwrap_or_default());
@@ -540,26 +541,7 @@ async fn spawn(
         .into_owned();
     let command = options.command_id();
     let (session_id, metadata) = match connection
-        .request(
-            RequestBody::SessionCreateWithPermissionOverrides {
-                command_id: CommandId::new(format!("{command}-session")),
-                cwd,
-                provider: spec.provider.clone().unwrap_or_default(),
-                model: spec.model.clone().unwrap_or_default(),
-                max_tokens: haider_client::DEFAULT_MAX_TOKENS,
-                permission_overrides: None,
-                workspace_allocation: None,
-                cache_policy: None,
-                interaction_mode: SessionInteractionModeV1::Autonomous,
-                ssh_scope: None,
-                account_alias: None,
-                resolve_provider: spec.provider.is_none(),
-                resolve_model: spec.model.is_none(),
-                effort: None,
-                fast: None,
-            },
-            deadline,
-        )
+        .request(agent_session_create_request(&command, cwd, &spec), deadline)
         .await?
     {
         ResponseBody::SessionCreate {
@@ -686,6 +668,34 @@ async fn spawn(
         }
     }
 }
+
+fn agent_session_create_request(
+    command: &str,
+    cwd: String,
+    spec: &AgentSpawnSpecV1,
+) -> RequestBody {
+    RequestBody::SessionCreateWithPermissionOverrides {
+        command_id: CommandId::new(format!("{command}-session")),
+        cwd,
+        provider: spec.provider.clone().unwrap_or_default(),
+        model: spec.model.clone().unwrap_or_default(),
+        max_tokens: 0,
+        permission_overrides: None,
+        workspace_allocation: None,
+        cache_policy: None,
+        interaction_mode: SessionInteractionModeV1::Autonomous,
+        ssh_scope: None,
+        account_alias: None,
+        resolve_provider: spec.provider.is_none(),
+        resolve_model: spec.model.is_none(),
+        effort: None,
+        fast: None,
+    }
+}
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod agent_tests;
 
 fn child_session(manifest: &AgentManifest) -> Result<SessionId, Failure> {
     manifest

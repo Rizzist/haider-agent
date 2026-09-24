@@ -935,12 +935,12 @@ fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
 
 #[tokio::test]
 async fn native_capability_doc_is_model_specific() {
-    let reasoning = native_provider("gpt-5.6-test").capabilities().await;
-    let classic = native_provider("gpt-4o-test").capabilities().await;
+    let reasoning = native_provider("gpt-5.6-sol").capabilities().await;
+    let classic = native_provider("gpt-4o").capabilities().await;
 
     assert_eq!(reasoning.provider, "openai");
     assert_eq!(reasoning.thinking_visible, FeatureResolve::Native);
-    assert_eq!(reasoning.context_limit, 1_000_000);
+    assert_eq!(reasoning.context_limit, 1_050_000);
     assert_eq!(classic.thinking_visible, FeatureResolve::Unsupported);
     assert_eq!(classic.context_limit, 128_000);
 }

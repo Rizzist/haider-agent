@@ -633,6 +633,7 @@ async fn issue(
 #[must_use]
 pub fn command_required_features(command: &LiveCommand) -> &'static [&'static str] {
     match command {
+        LiveCommand::Create { .. } => &[haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1],
         LiveCommand::LoomAuthorDraft { .. } | LiveCommand::LoomAuthorRevise { .. } => {
             &[haider_rpc::FEATURE_LOOM_AUTHORING_V1]
         }

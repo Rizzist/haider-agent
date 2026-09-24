@@ -13,9 +13,8 @@
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode};
-use haider_tui::live::{
-    LiveCommand, LiveDriver, LiveReply, SESSION_OUTPUT_CAP, session_output_cap,
-};
+use haider_tui::link::command_required_features;
+use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
 
 mod common;
@@ -233,23 +232,47 @@ fn session_create_requests_an_output_budget_not_the_context_window() {
         text: "hello".to_owned(),
     });
     let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
-    let created = pass
+    let create = pass
         .commands
         .iter()
-        .find_map(|command| match command {
-            LiveCommand::Create { max_tokens, .. } => Some(*max_tokens),
-            _ => None,
-        })
+        .find(|command| matches!(command, LiveCommand::Create { .. }))
         .expect("create command");
-    assert_eq!(created, SESSION_OUTPUT_CAP);
-
-    // A tinier declared window still wins.
-    assert_eq!(session_output_cap(4_096, None), 4_096);
-    assert_eq!(session_output_cap(200_000, Some(8_192)), 8_192);
+    let LiveCommand::Create {
+        max_tokens: created,
+        ..
+    } = create
+    else {
+        unreachable!()
+    };
     assert_eq!(
-        session_output_cap(0, None),
-        1,
-        "zero never reaches the daemon's reject"
+        *created, 0,
+        "the daemon derives the selected model's output budget"
+    );
+    assert!(
+        command_required_features(create).contains(&haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1)
+    );
+}
+
+#[test]
+fn session_create_before_model_details_requests_daemon_derivation() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("unknown-detail");
+    model.identity.provider = "gemini".into();
+    model.identity.model_short = "gemini-2.0-flash".into();
+    model.identity.context_window = 0;
+    model.requests.push(AppRequest::CreateSession {
+        text: "hello".into(),
+    });
+    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Create { max_tokens: 0, .. }))
+    );
+    assert!(
+        haider_tui::render::status_left_segments(&model, 120)
+            .iter()
+            .any(|segment| segment.text.contains("context unknown"))
     );
 }
 

@@ -1,15 +1,24 @@
 //! Provider-authored tool calls that must never dispatch: arguments that are
 //! not a JSON object, and arguments cut off by the response-token limit. Each
 //! is closed with a durable failed result, and the model receives an empty
-//! argument object paired with that result. Both kinds share the run's one
-//! automatic repair continuation (`repairable_tool_call_result`); only the
-//! malformed kind is `invalid_tool_call_result`.
+//! argument object paired with that result. Only malformed calls consume the
+//! strike (`invalid_tool_call_result`).
 
 use super::*;
 use haider_protocol::tool::ToolResultData;
 
-const OUTPUT_LIMIT_SUBCODE: &str = "output-limit-tool-arguments";
+const OUTPUT_LIMIT_SUBCODE: &str = "output_limit_truncation_repeated";
 const OUTPUT_LIMIT_TITLE: &str = "Tool call exceeded the output limit";
+
+/// Both live driving and journal recovery advance once per truncated provider
+/// response, even when that response contains more than one open tool call.
+pub(super) fn advance_output_truncation_count(current: u8) -> u8 {
+    current.saturating_add(1).min(3)
+}
+
+pub(super) fn repeated_output_truncation_on_next(current: u8) -> bool {
+    current >= 2
+}
 
 /// The kind-specific facts of one unexecuted call's failed result.
 struct UnexecutedToolFailure<'a> {
@@ -63,15 +72,14 @@ impl HarnessActor {
     /// `MaxTokens`. Every call without a `ToolCallEnd` (absent from
     /// `assistant_blocks`) is still accumulating arguments; each is closed
     /// with a durable `output_limit_truncation` result and never dispatched.
-    /// Returns whether any call was truncated, so the caller can spend or
-    /// exhaust the shared repair allowance.
+    /// Returns whether any call was truncated, once per provider response.
     pub(super) async fn close_output_limited_tool_calls(
         &mut self,
         run_id: &RunId,
         tools: &mut Vec<ToolAccumulator>,
         assistant_blocks: &mut Vec<Block>,
         tool_results: &mut Vec<Message>,
-        repaired: bool,
+        repeated: bool,
     ) -> Result<bool, DriveError> {
         let completed_call_ids = assistant_blocks
             .iter()
@@ -87,7 +95,7 @@ impl HarnessActor {
             .collect::<Vec<_>>();
         for call_id in &partial_call_ids {
             let (block, result) = self
-                .close_output_limit_tool_failure(run_id, tools, call_id, repaired)
+                .close_output_limit_tool_failure(run_id, tools, call_id, repeated)
                 .await?;
             assistant_blocks.push(block);
             tool_results.push(result);
@@ -103,7 +111,7 @@ impl HarnessActor {
         run_id: &RunId,
         tools: &mut Vec<ToolAccumulator>,
         call_id: &str,
-        repaired: bool,
+        repeated: bool,
     ) -> Result<(Block, Message), DriveError> {
         let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
             return Err(DriveError::Provider(provider_protocol_error(format!(
@@ -112,18 +120,30 @@ impl HarnessActor {
         };
         let message = "the provider stopped at its output limit before the tool arguments were complete; the truncated tool call was not executed";
         let failure = UnexecutedToolFailure {
-            kind: "output_limit_truncation",
+            kind: if repeated {
+                "output_limit_truncation_repeated"
+            } else {
+                "output_limit_truncation"
+            },
             message,
-            repair: "Retry by splitting large content across multiple smaller tool calls. A second consecutive truncated tool call terminates the run.",
+            repair: "Split large content across multiple smaller tool calls. After three consecutive truncations, choose how to proceed; the run remains active.",
             data: ToolResultData::OutputLimitTruncation {
                 tool: tools[index].name.clone(),
                 message: message.to_owned(),
-                repaired: Some(repaired),
+                repaired: Some(!repeated),
             },
             presentation: tool_error_presentation(
-                OUTPUT_LIMIT_SUBCODE,
+                if repeated {
+                    OUTPUT_LIMIT_SUBCODE
+                } else {
+                    "output_limit_truncation"
+                },
                 OUTPUT_LIMIT_TITLE,
-                "The provider stopped before the tool arguments were complete. The truncated call was not executed.",
+                if repeated {
+                    "Three consecutive responses stopped before tool arguments were complete. Split the write into smaller calls or choose another approach. The run remains active."
+                } else {
+                    "The provider stopped before the tool arguments were complete. The truncated call was not executed."
+                },
             ),
         };
         self.close_unexecuted_tool_call(run_id, tools, index, failure)
@@ -176,19 +196,4 @@ impl HarnessActor {
         tools.remove(index);
         Ok((block, message))
     }
-}
-
-/// The run terminal after a second consecutive output-limited tool call.
-pub(super) fn output_limit_tool_error() -> ProviderError {
-    ProviderError::new(
-        ProviderErrorKind::InvalidRequest,
-        "the provider repeatedly stopped at its output limit before completing tool arguments; no truncated tool call was executed",
-    )
-    .with_presentation(ErrorPresentation::new(
-        OUTPUT_LIMIT_SUBCODE,
-        OUTPUT_LIMIT_TITLE,
-        "The provider repeatedly exhausted its response limit while a tool call was open. Split large content across smaller tool calls.",
-        ErrorScope::Tool,
-        [ErrorAction::Retry],
-    ))
 }
