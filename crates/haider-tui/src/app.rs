@@ -4211,6 +4211,28 @@ pub struct ToolDetailView {
     pub scroll_max: std::cell::Cell<usize>,
     /// Display rows one page moves, as of the last frame.
     pub page: std::cell::Cell<usize>,
+    /// The wrapped body of the last paint, reused while its key holds
+    /// (973 repair: a scroll re-slices it instead of re-diffing).
+    pub layout: std::cell::RefCell<Option<DetailLayout>>,
+}
+
+/// Everything the full-detail body is a function of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailLayoutKey {
+    pub width: u16,
+    /// The viewed projection's entry storage (main vs. a subagent chip).
+    pub source: usize,
+    pub revision: u64,
+    pub mutation: u64,
+    pub anchors: u64,
+}
+
+/// A cached full-detail body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailLayout {
+    pub key: DetailLayoutKey,
+    pub result: Option<Vec<crate::toolfold::Segment>>,
+    pub rows: std::rc::Rc<Vec<crate::toolview::DisplayRow>>,
 }
 
 /// Incremental search over the currently attached transcript.  Matching is
@@ -16558,8 +16580,10 @@ impl AppModel {
     /// [`Self::note_tool_timings`], considers only successful edit calls
     /// whose START this client observed, records each row once its file
     /// is readable (bounded to [`EDIT_ANCHOR_MAX_BYTES`]), and records
-    /// `None` for any replacement it cannot place in that file — an empty
-    /// replacement, a file changed again before this beat. A file it cannot
+    /// `None` for any replacement it cannot place with CERTAINTY
+    /// ([`crate::toolview::resolve_edit_anchors`]: ambiguous or absent text,
+    /// `replace_all`, line-shifting multi-edits) and for every replacement
+    /// of an edit a later call may already have overtaken. A file it cannot
     /// read (a remote daemon's path) is retried while the row is in the
     /// scanned tail and otherwise never numbered.
     pub fn note_edit_anchors(&mut self) {
@@ -16567,7 +16591,7 @@ impl AppModel {
         let entries = self.projection.entries();
         let scan_from = entries.len().saturating_sub(TOOL_TIMING_SCAN);
         let mut resolved: Vec<(String, Vec<Option<usize>>)> = Vec::new();
-        for entry in &entries[scan_from..] {
+        for (offset, entry) in entries[scan_from..].iter().enumerate() {
             let crate::projection::TranscriptEntry::Item(block) = entry else {
                 continue;
             };
@@ -16586,6 +16610,24 @@ impl AppModel {
                 continue;
             }
             let pairs = crate::toolview::edit_pairs(args);
+            // A later tool call or command may already have changed the
+            // file again (another edit, a write, a shell `sed`): the file on
+            // disk no longer shows where THIS edit landed. Record the row as
+            // resolved-without-numbers rather than read a moved target.
+            let later_mutation = entries[scan_from + offset + 1..].iter().any(|later| {
+                matches!(
+                    later,
+                    crate::projection::TranscriptEntry::Item(crate::projection::ItemBlock {
+                        item: haider_protocol::item::TurnItem::ToolCall { .. }
+                            | haider_protocol::item::TurnItem::CommandExecution { .. },
+                        ..
+                    })
+                )
+            });
+            if later_mutation {
+                resolved.push((id.to_owned(), vec![None; pairs.len()]));
+                continue;
+            }
             let content = args
                 .get("path")
                 .or_else(|| args.get("file_path"))
@@ -16599,11 +16641,10 @@ impl AppModel {
             let Some(content) = content else {
                 continue;
             };
-            let anchors = pairs
-                .iter()
-                .map(|pair| crate::toolview::line_of(&content, &pair.new))
-                .collect();
-            resolved.push((id.to_owned(), anchors));
+            resolved.push((
+                id.to_owned(),
+                crate::toolview::resolve_edit_anchors(&pairs, &content),
+            ));
         }
         if resolved.is_empty() {
             return;

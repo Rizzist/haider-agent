@@ -80,6 +80,9 @@ struct EntryMarks {
     show_all: Option<usize>,
     /// Index of a collapsed row's `… +N lines (⌃O to expand)` affordance.
     detail: Option<usize>,
+    /// Index of the row's `⎿` result line — every row's click route into
+    /// the full-detail view.
+    result: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -138,6 +141,8 @@ struct CachedTranscriptEntry {
     /// Wrapped-row offset of the `(⌃O to expand)` affordance, measured the
     /// same way as `show_all_row`.
     detail_row: Option<u64>,
+    /// Wrapped-row offset of the `⎿` result line (opens the detail view).
+    result_row: Option<u64>,
 }
 
 impl TranscriptLayoutCache {
@@ -418,6 +423,10 @@ fn cache_transcript_entry_window(
         .detail
         .and_then(|index| lines.get(..index))
         .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
+    let result_row = marks
+        .result
+        .and_then(|index| lines.get(..index))
+        .map(|above| u64::from(wrapped_lines_height(above, ctx.width)));
     // Live tool AND model-command rows wear the spinner, so both re-render
     // on the animation clock.
     let dynamic = matches!(
@@ -445,6 +454,7 @@ fn cache_transcript_entry_window(
         show_all_row,
         summary_row,
         detail_row,
+        result_row,
     }
 }
 
@@ -563,6 +573,7 @@ fn cache_extreme_agent_entry(
             show_all_row: None,
             summary_row: None,
             detail_row: None,
+            result_row: None,
             windowed: true,
         };
     }
@@ -615,6 +626,7 @@ fn cache_extreme_agent_entry(
             show_all_row: None,
             summary_row: None,
             detail_row: None,
+            result_row: None,
             windowed: true,
         };
     };
@@ -681,6 +693,7 @@ fn cache_extreme_agent_entry(
         show_all_row: None,
         summary_row: None,
         detail_row: None,
+        result_row: None,
         windowed: true,
     }
 }
@@ -15742,12 +15755,12 @@ fn expanded_rows(
     extras: &ToolRowExtras,
     width: usize,
 ) -> Vec<crate::toolview::DisplayRow> {
-    let output = block.tool_output();
+    let output = block.compact_output();
     crate::toolview::detail_rows(
         &crate::toolview::DetailFacts {
             args: extras.inline_args.as_deref(),
             diff: extras.diff.as_ref(),
-            output: &output,
+            output: &output.text,
             ..crate::toolview::DetailFacts::default()
         },
         width,
@@ -15808,7 +15821,8 @@ fn tool_disclosure_lines<'a>(
     );
     lines.push(hover_band(summary, focused, ctx.width, theme));
     let extras = tool_extras(block, ctx.anchors);
-    let output = block.tool_output();
+    let compact = block.compact_output();
+    let output = &compact.text;
     let shows_subline = ctx.fold.verbosity().shows_subline();
     if shows_subline
         && let Some(segments) = tv::result_segments(
@@ -15817,7 +15831,7 @@ fn tool_disclosure_lines<'a>(
                 settle: extras.settle,
                 exit_code: extras.exit_code,
                 reason: block.tool_reason.as_deref(),
-                output: &output,
+                output,
                 output_cut: block.output_truncated,
                 diff: extras.diff.as_ref(),
                 matches: block.search_matches(),
@@ -15826,8 +15840,19 @@ fn tool_disclosure_lines<'a>(
             cells,
         )
     {
+        marks.result = Some(lines.len());
         lines.push(tool_line(&segments, theme));
     }
+    // A result the TOOL declared bounded says so on every disclosure state
+    // (973 repair): its payload can look complete otherwise.
+    let bound_note = compact
+        .result_bound
+        .map(|bound| format!("    {}", bound.note()))
+        .or_else(|| {
+            compact.limit_reached.then(|| {
+                "    ⋯ the tool stopped at its output limit — not the complete output".to_owned()
+            })
+        });
     if state.is_collapsed() {
         // The inline diff preview: a SUCCESSFUL write or edit shows a few
         // rows of what changed, then the door to the rest. A failed one
@@ -15837,13 +15862,23 @@ fn tool_disclosure_lines<'a>(
             && let Some(diff) = extras.diff.as_ref().filter(|diff| !diff.lines.is_empty())
         {
             let (start, end) = diff.preview_window(tv::DIFF_PREVIEW_ROWS);
-            for row in tv::diff_rows_clipped(diff, start..end, cells) {
-                lines.push(display_row_line(&row, theme, cells));
+            let preview = tv::diff_rows_clipped(diff, start..end, cells);
+            let clipped = preview
+                .iter()
+                .zip(&diff.lines[start..end])
+                .any(|(row, line)| row.text != tv::sanitize(&line.text));
+            for row in &preview {
+                lines.push(display_row_line(row, theme, cells));
             }
             let hidden = diff.lines.len().saturating_sub(end - start);
             if hidden > 0 {
                 marks.detail = Some(lines.len());
                 lines.push(tool_line(&tv::more_segments(hidden), theme));
+            } else if clipped {
+                // A one-line write wider than the row hid no LINES, but it
+                // still has more to show — the same door opens it.
+                marks.detail = Some(lines.len());
+                lines.push(tool_line(&tv::clipped_segments(), theme));
             }
         }
         // The honesty markers are NOT verbosity-gated and not disclosure-
@@ -15856,6 +15891,9 @@ fn tool_disclosure_lines<'a>(
                 "    ⋯ output is a bounded tail — earlier output truncated",
                 theme.dim_style(),
             ));
+        }
+        if let Some(note) = &bound_note {
+            lines.push(Line::styled(note.clone(), theme.dim_style()));
         }
         if block.output_decode_error {
             lines.push(Line::styled(
@@ -15893,6 +15931,9 @@ fn tool_disclosure_lines<'a>(
             "    ⋯ output above is a bounded tail — earlier output truncated",
             theme.dim_style(),
         ));
+    }
+    if let Some(note) = bound_note {
+        lines.push(Line::styled(note, theme.dim_style()));
     }
     if block.output_decode_error {
         lines.push(Line::styled(
@@ -16004,6 +16045,85 @@ fn tool_row_facts<'b>(block: &'b ItemBlock, ctx: LayoutCtx<'_>) -> crate::toolfo
     }
 }
 
+/// The full-detail view's `⎿` line and wrapped body for one tool row: the
+/// full arguments, the full diff, the AUTHORITATIVE output (the joined
+/// result wherever the streamed tail was capped — 973 repair), its honesty
+/// notes, and the unshortened reason.
+fn tool_detail_body(
+    block: &ItemBlock,
+    ctx: LayoutCtx<'_>,
+    cells: usize,
+) -> (
+    Option<Vec<crate::toolfold::Segment>>,
+    Vec<crate::toolview::DisplayRow>,
+) {
+    use crate::toolview as tv;
+    let extras = tool_extras(block, ctx.anchors);
+    let output = block.detail_output();
+    let result = tv::result_segments(
+        &tv::ResultFacts {
+            kind: extras.kind,
+            settle: extras.settle,
+            exit_code: extras.exit_code,
+            reason: block.tool_reason.as_deref(),
+            output: &output.text,
+            output_cut: output.tail_cut,
+            diff: extras.diff.as_ref(),
+            matches: block.search_matches(),
+            output_shown: true,
+        },
+        cells,
+    );
+    let full_args = match &block.item {
+        TurnItem::ToolCall { name, args, .. } => tv::full_args(name, args),
+        TurnItem::CommandExecution { command, .. } => Some(command.clone()),
+        _ => None,
+    };
+    // The unshortened reason: the typed presentation or the raw reason the
+    // result carried, before the transcript's one-line bound.
+    let full_reason = block
+        .tool_result
+        .as_ref()
+        .and_then(|result| {
+            result
+                .presentation
+                .as_ref()
+                .map(crate::projection::format_error_presentation)
+                .or_else(|| result.reason.clone())
+        })
+        .or_else(|| block.tool_reason.clone());
+    let mut notes: Vec<String> = Vec::new();
+    if output.stream_replaced {
+        notes.push(
+            "⋯ the streamed output was capped at 8 KiB — shown above is the tool's complete result"
+                .to_owned(),
+        );
+    }
+    if let Some(bound) = output.result_bound {
+        notes.push(bound.note());
+    }
+    if output.limit_reached {
+        notes.push(
+            "⋯ the tool stopped at its output limit — this result is not the complete output"
+                .to_owned(),
+        );
+    }
+    let rows = tv::detail_rows(
+        &tv::DetailFacts {
+            args: full_args.as_deref(),
+            diff: extras.diff.as_ref(),
+            output: &output.text,
+            output_truncated: output.tail_cut,
+            output_decode_error: block.output_decode_error,
+            source_notes: &notes,
+            reason: full_reason.as_deref(),
+            headings: true,
+        },
+        cells,
+    );
+    (result, rows)
+}
+
 /// The full-detail view of one tool row (973-tui-toolview): ⌃O on a focused
 /// row, or a click on its `(⌃O to expand)` door. It covers the body with the
 /// row's header, its `⎿` result, and then EVERYTHING the client holds for
@@ -16061,58 +16181,45 @@ fn render_tool_detail(
     let mut facts = tool_row_facts(block, ctx);
     // The header carries its outcome in full here; the `⎿` line follows.
     facts.subline_outcome = true;
-    let extras = tool_extras(block, ctx.anchors);
-    let output = block.tool_output();
     let mut head: Vec<Line<'static>> = vec![tool_line(
         &crate::toolfold::summary_segments(&facts, model.anim_phase, cells),
         theme,
     )];
-    if let Some(segments) = tv::result_segments(
-        &tv::ResultFacts {
-            kind: extras.kind,
-            settle: extras.settle,
-            exit_code: extras.exit_code,
-            reason: block.tool_reason.as_deref(),
-            output: &output,
-            output_cut: block.output_truncated,
-            diff: extras.diff.as_ref(),
-            matches: block.search_matches(),
-            output_shown: true,
-        },
-        cells,
-    ) {
-        head.push(tool_line(&segments, theme));
-    }
-    let full_args = match &block.item {
-        TurnItem::ToolCall { name, args, .. } => tv::full_args(name, args),
-        TurnItem::CommandExecution { command, .. } => Some(command.clone()),
-        _ => None,
+    // The wrapped body (and the `⎿` line, which needs the same diff) is
+    // cached on the view, keyed by everything it is a function of: a paint
+    // that only scrolls re-slices it instead of re-diffing a 120 KB write.
+    let key = crate::app::DetailLayoutKey {
+        width: area.width,
+        source: model
+            .viewed_tool_projection()
+            .map_or(0, |projection| projection.entries().as_ptr() as usize),
+        revision: model
+            .viewed_tool_projection()
+            .map_or(0, SessionProjection::render_revision),
+        mutation: model
+            .viewed_tool_projection()
+            .map_or(0, SessionProjection::entry_mutation_revision),
+        anchors: model.edit_anchor_revision,
     };
-    // The unshortened reason: the typed presentation or the raw reason the
-    // result carried, before the transcript's one-line bound.
-    let full_reason = block
-        .tool_result
+    let cached = view
+        .layout
+        .borrow()
         .as_ref()
-        .and_then(|result| {
-            result
-                .presentation
-                .as_ref()
-                .map(crate::projection::format_error_presentation)
-                .or_else(|| result.reason.clone())
-        })
-        .or_else(|| block.tool_reason.clone());
-    let rows = tv::detail_rows(
-        &tv::DetailFacts {
-            args: full_args.as_deref(),
-            diff: extras.diff.as_ref(),
-            output: &output,
-            output_truncated: block.output_truncated,
-            output_decode_error: block.output_decode_error,
-            reason: full_reason.as_deref(),
-            headings: true,
-        },
-        cells,
-    );
+        .filter(|layout| layout.key == key)
+        .map(|layout| (layout.result.clone(), std::rc::Rc::clone(&layout.rows)));
+    let (result, rows) = cached.unwrap_or_else(|| {
+        let (result, rows) = tool_detail_body(block, ctx, cells);
+        let rows = std::rc::Rc::new(rows);
+        *view.layout.borrow_mut() = Some(crate::app::DetailLayout {
+            key,
+            result: result.clone(),
+            rows: std::rc::Rc::clone(&rows),
+        });
+        (result, rows)
+    });
+    if let Some(segments) = &result {
+        head.push(tool_line(segments, theme));
+    }
     // Header rows + the hint row + one breathing row sit above the body.
     let chrome = head.len() + 2;
     let body_height = (area.height as usize).saturating_sub(chrome).max(1);
@@ -16217,6 +16324,14 @@ fn tool_row_hits(
         // The collapsed preview's `(⌃O to expand)` door opens the row's
         // full-detail view.
         if let Some(offset) = entry.detail_row
+            && let Some(rect) = row_rect(start.saturating_add(offset))
+        {
+            hits.push((rect, Hit::ToolDetail(item_id.clone())));
+        }
+        // 973 repair: EVERY row's `⎿` result line is a click route into the
+        // same full-detail view (shell, read, write, edit alike), so a click
+        // and ⌃O expand the same way and Esc returns the same way.
+        if let Some(offset) = entry.result_row
             && let Some(rect) = row_rect(start.saturating_add(offset))
         {
             hits.push((rect, Hit::ToolDetail(item_id.clone())));

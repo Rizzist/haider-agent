@@ -3,7 +3,7 @@
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×51
 01|    ⎿ Added 2 lines, removed 1 line                                             |
    ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×16; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×5; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×45
-02|      full detail · rows 1–19 of 20 · ↑↓ PgUp PgDn scroll · esc / ⌃O back       |
+02|      full detail · rows 1–13 of 13 · ↑↓ PgUp PgDn scroll · esc / ⌃O back       |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×67; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×7
 03|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
@@ -27,23 +27,23 @@
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/BOLD×9; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×65
 13|      {                                                                         |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-14|        "edits": [                                                              |
+14|        "path": "/work/haider/state/970-STATUS.md"                              |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-15|          {                                                                     |
+15|      }                                                                         |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-16|            "new": "## Stage\nRE-SCOPED by owner 2026-09-23\nimplementation unde|
+16|      (content: see the diff above)                                             |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-17|      r way\n## Owner",                                                         |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-18|            "old": "## Stage\nplanning (not started; 972 release chain first)\n#|
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-19|      # Owner"                                                                  |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-20|          }                                                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-21|        ],                                                                      |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
-22|        "path": "/work/haider/state/970-STATUS.md"                              |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×74
+17|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+18|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+19|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+20|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+21|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+22|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38

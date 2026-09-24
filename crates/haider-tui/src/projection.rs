@@ -174,13 +174,88 @@ impl ItemBlock {
     /// without its truncation marker line). Command rows only ever stream.
     #[must_use]
     pub fn tool_output(&self) -> std::borrow::Cow<'_, str> {
-        if !self.output_tail.is_empty() {
-            return self.output_text();
+        self.compact_output().text
+    }
+
+    /// What the FULL-DETAIL view shows as output (973-tui-toolview repair).
+    ///
+    /// The streamed tail is capped at [`OUTPUT_TAIL_MAX`]; the joined
+    /// `ToolResult` is the tool's own authoritative payload. A complete
+    /// (uncut) stream is shown as streamed. A stream the cap cut is replaced
+    /// by the joined result whenever one exists, so the view shows the
+    /// output from its FIRST byte instead of an 8 KiB tail. The returned
+    /// [`OutputView`] says which source it is and what bounds it still
+    /// carries, so the renderer never presents a bounded text as complete.
+    #[must_use]
+    pub fn detail_output(&self) -> OutputView<'_> {
+        let result_payload = self
+            .tool_result
+            .as_ref()
+            .map(|result| result.payload_text())
+            .filter(|payload| !payload.is_empty());
+        if let Some(payload) = result_payload
+            && (self.output_tail.is_empty() || self.output_truncated)
+        {
+            let (text, limit_reached) = readable_payload(payload);
+            return OutputView {
+                text,
+                tail_cut: false,
+                stream_replaced: self.output_truncated,
+                result_bound: self.result_bound(),
+                limit_reached,
+            };
         }
-        match &self.tool_result {
-            Some(result) => std::borrow::Cow::Borrowed(result.payload_text()),
-            None => std::borrow::Cow::Borrowed(""),
+        OutputView {
+            text: self.output_text(),
+            tail_cut: self.output_truncated,
+            stream_replaced: false,
+            result_bound: None,
+            limit_reached: false,
         }
+    }
+
+    /// What a COLLAPSED or inline-expanded row shows: the compact streamed
+    /// tail while a tool streams, the joined result otherwise — with the
+    /// same honesty facts as [`Self::detail_output`].
+    #[must_use]
+    pub fn compact_output(&self) -> OutputView<'_> {
+        if self.output_tail.is_empty()
+            && let Some(result) = &self.tool_result
+        {
+            let (text, limit_reached) = readable_payload(result.payload_text());
+            return OutputView {
+                text,
+                tail_cut: false,
+                stream_replaced: false,
+                result_bound: self.result_bound(),
+                limit_reached,
+            };
+        }
+        OutputView {
+            text: self.output_text(),
+            tail_cut: self.output_truncated,
+            stream_replaced: false,
+            result_bound: None,
+            limit_reached: false,
+        }
+    }
+
+    /// The joined result's TYPED truncation, when it declared one. Carries
+    /// byte counts and whether a continuation exists — never the digest or
+    /// the artifact id (provenance the transcript has no reason to print).
+    #[must_use]
+    pub fn result_bound(&self) -> Option<ResultBound> {
+        let result = self.tool_result.as_ref()?;
+        let declared = result.truncation.as_ref().filter(|t| t.truncated);
+        if !result.truncated && declared.is_none() {
+            return None;
+        }
+        Some(ResultBound {
+            shown_bytes: declared.map(|t| t.payload_bytes),
+            original_bytes: declared.map(|t| t.original_bytes),
+            pageable: result.cursor.is_some(),
+            stored: result.artifact.is_some(),
+        })
     }
 
     /// The typed search match count, when the joined result carries one.
@@ -190,6 +265,96 @@ impl ItemBlock {
             haider_protocol::tool::ToolResultData::FsSearch { matches, .. } => Some(matches.len()),
             _ => None,
         }
+    }
+}
+
+/// A tool row's output as one surface shows it, with its honesty facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputView<'a> {
+    pub text: std::borrow::Cow<'a, str>,
+    /// The text is the streamed tail and the cap cut its front.
+    pub tail_cut: bool,
+    /// The streamed output was capped, so the view shows the joined result
+    /// in its place.
+    pub stream_replaced: bool,
+    /// The shown text is a result the tool itself declared bounded.
+    pub result_bound: Option<ResultBound>,
+    /// The tool's own envelope says it stopped at its output limit.
+    pub limit_reached: bool,
+}
+
+/// Payloads larger than this are shown raw rather than parsed.
+const READABLE_PAYLOAD_MAX: usize = 4 * 1024 * 1024;
+
+/// A tool result's human-readable text. Execution tools answer with a JSON
+/// ENVELOPE (`{"output": "…", "exit_code": 0, "artifact": "blake3:…", …}`);
+/// the reader wants the output it carries, with its real newlines — not one
+/// escaped line of digests. `output` (or a plain `result` sentence) is
+/// extracted when present; anything else is shown exactly as sent. The
+/// second value is the envelope's own `limit_reached` flag.
+fn readable_payload(payload: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    let raw = (std::borrow::Cow::Borrowed(payload), false);
+    let trimmed = payload.trim_start();
+    if !trimmed.starts_with('{') || payload.len() > READABLE_PAYLOAD_MAX {
+        return raw;
+    }
+    let Ok(serde_json::Value::Object(envelope)) =
+        serde_json::from_str::<serde_json::Value>(payload)
+    else {
+        return raw;
+    };
+    let limit_reached = envelope
+        .get("limit_reached")
+        .is_some_and(|value| !value.is_null() && value != &serde_json::Value::Bool(false));
+    for key in ["output", "result"] {
+        if let Some(text) = envelope.get(key).and_then(serde_json::Value::as_str) {
+            return (std::borrow::Cow::Owned(text.to_owned()), limit_reached);
+        }
+    }
+    raw
+}
+
+/// A tool result's declared bound, as the transcript may show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultBound {
+    pub shown_bytes: Option<u64>,
+    pub original_bytes: Option<u64>,
+    /// The result carries a continuation cursor for paging the rest.
+    pub pageable: bool,
+    /// The full result is stored as an artifact.
+    pub stored: bool,
+}
+
+impl ResultBound {
+    /// One line naming the bound: counts when declared, and how the rest
+    /// can be reached.
+    #[must_use]
+    pub fn note(&self) -> String {
+        let mut note = match (self.shown_bytes, self.original_bytes) {
+            (Some(shown), Some(total)) => format!(
+                "⋯ result is bounded — {} of {} shown",
+                human_bytes(shown),
+                human_bytes(total)
+            ),
+            _ => "⋯ result is bounded by the tool — not the complete output".to_owned(),
+        };
+        if self.pageable {
+            note.push_str(" · the rest is pageable (continuation cursor)");
+        }
+        if self.stored {
+            note.push_str(" · full content kept as an artifact");
+        }
+        note
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 

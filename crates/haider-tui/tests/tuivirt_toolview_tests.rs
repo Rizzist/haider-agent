@@ -1010,3 +1010,447 @@ fn every_rendered_tool_row_cell_clears_4_5_in_every_theme() {
             .join("\n")
     );
 }
+
+// ---- 7. 973 repair 2: authoritative output, typed bounds, one click route
+
+/// Astra item 1: a streamed tool whose 24 KiB stream overflowed the 8 KiB
+/// tail but whose joined result is complete — the full-detail view shows the
+/// result from its FIRST line; the collapsed row keeps the compact tail.
+#[test]
+fn full_detail_shows_the_complete_result_not_the_capped_stream() {
+    let mut model = session_model();
+    let stream = format!(
+        "FIRST_STREAM_SENTINEL\n{}LAST_STREAM_SENTINEL\n",
+        "stream line of output\n".repeat(1200)
+    );
+    assert!(stream.len() > 24 * 1024);
+    push_tool(
+        &mut model,
+        "stream",
+        "process_exec",
+        serde_json::json!({"command": "produce a long log"}),
+        &stream,
+        ok(&stream),
+    );
+    let block = model
+        .projection
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            haider_tui::projection::TranscriptEntry::Item(block)
+                if block.item_id.as_str() == "stream" =>
+            {
+                Some(block)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        block.output_truncated,
+        "the stream really overflowed the tail"
+    );
+    assert!(
+        !block
+            .compact_output()
+            .text
+            .contains("FIRST_STREAM_SENTINEL")
+    );
+    let detail = block.detail_output();
+    assert!(detail.text.starts_with("FIRST_STREAM_SENTINEL"));
+    assert!(detail.stream_replaced && !detail.tail_cut);
+    // Collapsed: the compact tail and its honest marker.
+    let collapsed = draw(&model, 118, 36);
+    assert!(collapsed.contains("bounded tail"));
+    // Detail: the first line, reachable at the top; the last at the end.
+    assert!(model.open_tool_detail("stream"));
+    let top = draw(&model, 118, 36);
+    assert!(
+        top.contains("FIRST_STREAM_SENTINEL"),
+        "{}",
+        top.rows.join("\n")
+    );
+    assert!(top.contains("rows 1–"));
+    model.scroll_tool_detail(isize::MAX);
+    let end = draw(&model, 118, 36);
+    assert!(
+        end.contains("LAST_STREAM_SENTINEL"),
+        "{}",
+        end.rows.join("\n")
+    );
+    assert!(end.contains("shown above is the tool's complete result"));
+    assert!(
+        !end.contains("bounded tail"),
+        "the shown text is not a tail"
+    );
+}
+
+/// Astra item 3: a result the tool DECLARED bounded (typed `truncation`)
+/// says so collapsed and in detail — counts and continuation, never the
+/// digest.
+#[test]
+fn a_declared_bounded_result_says_so_in_every_view() {
+    let mut model = session_model();
+    let mut bounded = result("line one\nline two", ToolResultStatus::Completed, None);
+    bounded.declare_truncation(haider_protocol::tool::ToolTruncation::from_bytes(
+        &b"line one\nline two\nOMITTED THIRD LINE".repeat(200),
+        bounded.preview.len(),
+    ));
+    bounded.cursor = Some("page-2".to_owned());
+    let digest = bounded.truncation.as_ref().unwrap().sha256.clone();
+    push_tool(
+        &mut model,
+        "cut",
+        "fs_read",
+        serde_json::json!({"path": "cut.txt"}),
+        "",
+        (ToolStatus::Completed, bounded),
+    );
+    let collapsed = draw(&model, 118, 36);
+    assert!(
+        collapsed.contains("result is bounded — 17 B of")
+            && collapsed.contains("pageable (continuation cursor)"),
+        "{}",
+        collapsed.rows.join("\n")
+    );
+    assert!(
+        collapsed.contains("⎿ Read 2 lines"),
+        "the payload, without the marker line"
+    );
+    assert!(model.open_tool_detail("cut"));
+    let detail = draw(&model, 118, 36);
+    assert!(
+        detail.contains("result is bounded"),
+        "{}",
+        detail.rows.join("\n")
+    );
+    for frame in [&collapsed, &detail] {
+        assert!(
+            !frame.rows.join("\n").contains(&digest[..16]),
+            "no provenance digest"
+        );
+    }
+    // An undeclared, complete result carries no such note.
+    let mut plain = session_model();
+    push_tool(
+        &mut plain,
+        "ok",
+        "fs_read",
+        serde_json::json!({"path": "a"}),
+        "",
+        ok("a\nb"),
+    );
+    assert!(!draw(&plain, 118, 36).contains("result is bounded"));
+}
+
+/// Astra item 4 / owner: expand by key AND click, Esc back to the same
+/// place — for every row type. Each row's `⎿` line is a click route into
+/// the full-detail view; a one-line write wider than the row gets a door.
+#[test]
+fn every_row_type_clicks_into_the_detail_view_and_esc_returns() {
+    let mut model = session_model();
+    model.cwd = WORKSPACE.to_owned();
+    push_command(
+        &mut model,
+        "shell",
+        "cargo test",
+        "test result: ok\nmore\n",
+        0,
+    );
+    push_tool(
+        &mut model,
+        "read",
+        "fs_read",
+        serde_json::json!({"path": "a.rs"}),
+        "",
+        ok("1\n2\n3"),
+    );
+    push_agent(&mut model, "sep-1", "between the reads and the writes");
+    push_tool(
+        &mut model,
+        "write",
+        "fs_write",
+        serde_json::json!({"path": "b.md", "content": "one\ntwo\nthree\nfour\nfive\nsix\n"}),
+        "",
+        ok("wrote"),
+    );
+    push_tool(
+        &mut model,
+        "clip",
+        "fs_write",
+        serde_json::json!({"path": "wide.txt", "content": "W".repeat(400)}),
+        "",
+        ok("wrote"),
+    );
+    push_tool(
+        &mut model,
+        "edit",
+        "fs_edit",
+        serde_json::json!({"path": "c.rs", "edits": [{"old": "a", "new": "b"}]}),
+        "",
+        ok("edited"),
+    );
+    let before = draw(&model, 118, 36);
+    assert!(
+        before.contains("… line clipped (⌃O to expand)"),
+        "{}",
+        before.rows.join("\n")
+    );
+    for id in ["shell", "read", "write", "clip", "edit"] {
+        let result_line = before
+            .hits
+            .iter()
+            .filter(|(_, hit)| matches!(hit, Hit::ToolDetail(row) if row == id))
+            .map(|(rect, _)| usize::from(rect.y))
+            .collect::<Vec<_>>();
+        assert!(
+            result_line.iter().any(|y| before.rows[*y].contains('⎿')),
+            "{id}: its ⎿ line is a click target: {:?}",
+            result_line
+        );
+        let hit = before
+            .hits
+            .iter()
+            .find(|(rect, hit)| {
+                matches!(hit, Hit::ToolDetail(row) if row == id)
+                    && before.rows[usize::from(rect.y)].contains('⎿')
+            })
+            .map(|(_, hit)| hit.clone())
+            .unwrap();
+        model.handle_hit(hit);
+        let view = draw(&model, 118, 36);
+        assert!(
+            view.contains("full detail"),
+            "{id}: {}",
+            view.rows.join("\n")
+        );
+        model.handle(key(KeyCode::Esc));
+        assert!(model.tool_detail.is_none());
+        // Focus moved to the clicked row (the hover band); everything else
+        // is exactly where it was.
+        model.toolfold.set_focus(None);
+        assert_eq!(draw(&model, 118, 36).rows, before.rows, "{id}: Esc returns");
+    }
+    // The clipped write's door and ⌃O show the WHOLE line.
+    model.toolfold.set_focus(Some("clip"));
+    model.handle(ctrl('o'));
+    let view = draw(&model, 118, 36);
+    let content = view
+        .row_containing("Content · 1 line")
+        .unwrap_or_else(|| panic!("{}", view.rows.join("\n")));
+    let ws: usize = view.rows[content + 1..]
+        .iter()
+        .take_while(|row| !row.contains("Output") && !row.contains("Arguments"))
+        .map(|row| row.matches('W').count())
+        .sum();
+    assert_eq!(
+        ws, 400,
+        "every character of the clipped line is in the view"
+    );
+    model.handle(key(KeyCode::Char('q')));
+    assert!(model.tool_detail.is_none(), "q closes it too");
+}
+
+/// Astra item 2: an edit a LATER call may have overtaken is never
+/// numbered from the moved file.
+#[test]
+fn an_edit_overtaken_by_a_later_call_is_not_numbered() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.md"), "a\nb\nNEW\nc\n").unwrap();
+    let mut model = session_model();
+    model.cwd = dir.path().display().to_string();
+    model.clock_ms = 1_700_000_000_000;
+    let args = serde_json::json!({"path": "f.md", "edits": [{"old": "old", "new": "NEW"}]});
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("e1"),
+            item: tool("e1", "fs_edit", args.clone(), ToolStatus::InProgress),
+        }),
+    );
+    model.note_tool_timings();
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("e1"),
+            item: tool("e1", "fs_edit", args, ToolStatus::Completed),
+        }),
+    );
+    // Before the next beat, a later command already ran.
+    push_command(&mut model, "later", "sed -i '' 1d f.md", "", 0);
+    model.clock_ms += 20;
+    model.note_tool_timings();
+    model.note_edit_anchors();
+    assert_eq!(model.edit_anchors.get("e1"), Some(&vec![None]));
+    let frame = draw(&model, 118, 36);
+    assert!(
+        frame.contains("- old") && frame.contains("+ NEW"),
+        "{}",
+        frame.rows.join("\n")
+    );
+    assert!(
+        !frame.contains("3 + NEW"),
+        "never numbered from the moved file"
+    );
+}
+
+/// Astra item 5: the full-detail paint cost on a 1,000+ row transcript with
+/// a 120,000-byte write. Prints timings; asserts only a generous ceiling so
+/// the suite never flakes. `cargo test … -- --ignored --nocapture` for the
+/// numbers recorded in the lane result.
+#[test]
+#[ignore = "timing measurement; run explicitly"]
+fn detail_paint_cost_on_a_large_transcript() {
+    use std::time::Instant;
+    let mut model = session_model();
+    for i in 0..1_200 {
+        let (name, args, out) = match i % 4 {
+            0 => (
+                "fs_read",
+                serde_json::json!({"path": format!("f{i}.rs")}),
+                "one\ntwo\nthree",
+            ),
+            1 => (
+                "process_exec",
+                serde_json::json!({"command": "printf hello"}),
+                "hello",
+            ),
+            2 => (
+                "fs_edit",
+                serde_json::json!({"path": format!("f{i}.rs"), "edits": [{"old": "one\ntwo\n", "new": "one\nchanged\n"}]}),
+                "edited",
+            ),
+            _ => (
+                "fs_write",
+                serde_json::json!({"path": format!("f{i}.rs"), "content": "a\nb\nc\nd\ne\nf\n"}),
+                "wrote",
+            ),
+        };
+        push_tool(&mut model, &format!("t{i}"), name, args, "", ok(out));
+    }
+    let big: String = (1..=3000)
+        .map(|n| format!("{n:05} {}end\n", "data ".repeat(6)))
+        .collect();
+    assert_eq!(big.len(), 120_000);
+    push_tool(
+        &mut model,
+        "big",
+        "fs_write",
+        serde_json::json!({"path": "BIG.txt", "content": big}),
+        "",
+        ok("wrote 120000 bytes"),
+    );
+    let time = |model: &AppModel, width: u16, height: u16| {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            let start = Instant::now();
+            terminal
+                .draw(|frame| {
+                    haider_tui::render::render(model, frame);
+                })
+                .unwrap();
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let first = samples.remove(0);
+        samples.sort_by(f64::total_cmp);
+        (first, samples[10], samples[19])
+    };
+    for (width, height) in [(118u16, 36u16), (80, 24)] {
+        let collapsed = time(&model, width, height);
+        assert!(model.open_tool_detail("big"));
+        let detail = time(&model, width, height);
+        model.scroll_tool_detail(isize::MAX);
+        let detail_end = time(&model, width, height);
+        // A taller paint at the end shows the diff's last line above the
+        // closing sections (output, arguments).
+        let frame = draw(&model, width, 60);
+        assert!(
+            frame.contains("03000"),
+            "the last line is reachable:\n{}",
+            frame.rows.join("\n")
+        );
+        model.close_tool_detail();
+        println!(
+            "TIMING {width}x{height} transcript=1201 tools: collapsed first={:.2}ms p50={:.2}ms p95={:.2}ms | \
+             detail(120 KB write) first={:.2}ms p50={:.2}ms p95={:.2}ms | detail at end first={:.2}ms p50={:.2}ms p95={:.2}ms",
+            collapsed.0,
+            collapsed.1,
+            collapsed.2,
+            detail.0,
+            detail.1,
+            detail.2,
+            detail_end.0,
+            detail_end.1,
+            detail_end.2
+        );
+        assert!(detail.1 < 250.0, "warm detail paint stays interactive");
+    }
+}
+
+/// Live proof finding (repair 2): an execution tool's result is a JSON
+/// ENVELOPE. The detail view shows the output it carries, with real
+/// newlines — not one escaped line of digests — and says when the tool hit
+/// its output limit.
+#[test]
+fn an_execution_envelope_shows_its_output_not_its_json() {
+    let mut model = session_model();
+    let output = format!(
+        "FIRST_ENVELOPE_LINE\n{}LAST_ENVELOPE_LINE\n",
+        "n\n".repeat(40)
+    );
+    let envelope = serde_json::json!({
+        "artifact": "blake3:0123456789abcdef0123456789abcdef",
+        "exit_code": 0,
+        "limit_reached": null,
+        "output": output,
+        "status": "completed",
+    })
+    .to_string();
+    push_tool(
+        &mut model,
+        "env",
+        "process_exec",
+        serde_json::json!({"command": "run"}),
+        "",
+        ok(&envelope),
+    );
+    let collapsed = draw(&model, 118, 36);
+    assert!(
+        collapsed.contains("⎿ FIRST_ENVELOPE_LINE … +41 lines"),
+        "{}",
+        collapsed.rows.join("\n")
+    );
+    assert!(model.open_tool_detail("env"));
+    let view = draw(&model, 118, 60);
+    let text = view.rows.join("\n");
+    assert!(text.contains("      FIRST_ENVELOPE_LINE"), "{text}");
+    assert!(text.contains("      LAST_ENVELOPE_LINE"), "{text}");
+    assert!(!text.contains("blake3:"), "no digests: {text}");
+    assert!(!text.contains("output limit"), "{text}");
+    // An envelope whose tool hit its limit says so.
+    let mut limited = session_model();
+    let envelope =
+        serde_json::json!({"limit_reached": "max_output_bytes", "output": "partial\n"}).to_string();
+    push_tool(
+        &mut limited,
+        "lim",
+        "process_exec",
+        serde_json::json!({"command": "yes"}),
+        "",
+        ok(&envelope),
+    );
+    assert!(draw(&limited, 118, 36).contains("stopped at its output limit"));
+    // Anything that is not such an envelope is shown exactly as sent.
+    let mut raw = session_model();
+    push_tool(
+        &mut raw,
+        "raw",
+        "web_fetch",
+        serde_json::json!({"url": "https://x.test"}),
+        "",
+        ok("{\"a\": 1}"),
+    );
+    assert!(raw.open_tool_detail("raw"));
+    assert!(draw(&raw, 118, 36).contains("{\"a\": 1}"));
+}

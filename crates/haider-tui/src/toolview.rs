@@ -247,6 +247,28 @@ pub fn full_args(name: &str, args: &serde_json::Value) -> Option<String> {
     if empty {
         return None;
     }
+    // A write's content and an edit's replacements ARE its diff, which the
+    // view shows in full, wrapped and numbered: echoing them again as one
+    // escaped JSON string would double a 120 KB write into an unreadable
+    // wall. Only the fields the diff does not show stay here.
+    if matches!(tool_kind(name), ToolKind::Write | ToolKind::Edit)
+        && tool_diff(name, args, &[]).is_some()
+        && let Some(object) = args.as_object()
+    {
+        let rest: serde_json::Map<String, serde_json::Value> = object
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "content" | "edits" | "old_string" | "new_string" | "old" | "new"
+                )
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(rest)).ok()?;
+        text.push_str("\n(content: see the diff above)");
+        return Some(text);
+    }
     serde_json::to_string_pretty(args).ok()
 }
 
@@ -368,6 +390,8 @@ impl ToolDiff {
 pub struct EditPair {
     pub old: String,
     pub new: String,
+    /// Every occurrence was replaced — the edit has no single location.
+    pub replace_all: bool,
 }
 
 /// Every replacement an edit call carries: `edits[].{old,new}` (`fs_edit`),
@@ -380,6 +404,10 @@ pub fn edit_pairs(args: &serde_json::Value) -> Vec<EditPair> {
         Some(EditPair {
             old: old.to_owned(),
             new: new.to_owned(),
+            replace_all: value
+                .get("replace_all")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         })
     };
     if let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) {
@@ -520,14 +548,50 @@ pub fn line_diff(old: &str, new: &str, start: Option<usize>) -> Vec<DiffLine> {
     out
 }
 
-/// The 1-based line where `needle` first starts inside `haystack`.
+/// The 1-based line where `needle` starts inside `haystack` — ONLY when it
+/// occurs there exactly once. Zero or several occurrences are ambiguous and
+/// answer `None`: a location is never guessed.
 #[must_use]
-pub fn line_of(haystack: &str, needle: &str) -> Option<usize> {
+pub fn unique_line_of(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
-    let at = haystack.find(needle)?;
+    let mut hits = haystack.match_indices(needle);
+    let (at, _) = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
     Some(haystack[..at].matches('\n').count() + 1)
+}
+
+/// Resolve the file line each replacement of one edit call landed on, from
+/// the edited file as read right after the call settled (973-tui-toolview
+/// repair: the tools carry no edit coordinates, so this is the only source,
+/// and it answers `None` wherever it cannot be CERTAIN).
+///
+/// * A `replace_all` edit has no single location → `None`.
+/// * A replacement whose text occurs zero or several times in the file is
+///   ambiguous (`READY` already on line 1 when line 4 became `READY`) →
+///   `None`.
+/// * A call with several edits that change line counts numbers nothing:
+///   removed rows are numbered in the PRE-edit file, and an earlier edit's
+///   line shift would make those numbers wrong.
+#[must_use]
+pub fn resolve_edit_anchors(pairs: &[EditPair], content: &str) -> Vec<Option<usize>> {
+    let shifts = pairs.len() > 1
+        && pairs
+            .iter()
+            .any(|pair| pair.old.lines().count() != pair.new.lines().count());
+    pairs
+        .iter()
+        .map(|pair| {
+            if shifts || pair.replace_all {
+                None
+            } else {
+                unique_line_of(content, &pair.new)
+            }
+        })
+        .collect()
 }
 
 // ------------------------------------------------------- result summary ---
@@ -800,6 +864,17 @@ pub fn more_segments(hidden: usize) -> Vec<Segment> {
     ]
 }
 
+/// The door for a preview that hid no LINES but clipped one: a one-line
+/// write wider than the row still has more to show.
+#[must_use]
+pub fn clipped_segments() -> Vec<Segment> {
+    vec![
+        Segment::new(" ".repeat(DETAIL_INDENT), Tone::Structure),
+        Segment::new("… line clipped ", Tone::Meta),
+        Segment::new(format!("({EXPAND_KEY} to expand)"), Tone::Meta),
+    ]
+}
+
 // --------------------------------------------------------- display rows ---
 
 /// What one display row of an expanded tool row or the detail view is.
@@ -973,6 +1048,9 @@ pub struct DetailFacts<'a> {
     pub output: &'a str,
     pub output_truncated: bool,
     pub output_decode_error: bool,
+    /// Honesty notes about the SOURCE of `output` (a capped stream replaced
+    /// by the joined result; a result the tool declared bounded).
+    pub source_notes: &'a [String],
     /// The FULL reason (the detail view never shortens it).
     pub reason: Option<&'a str>,
     /// Label each section (the detail view does; in place does not).
@@ -1045,6 +1123,9 @@ pub fn detail_rows(facts: &DetailFacts<'_>, width: usize) -> Vec<DisplayRow> {
             width,
             &mut rows,
         );
+    }
+    for note in facts.source_notes {
+        text_rows(note, RowRole::Note(Tone::Meta), width, &mut rows);
     }
     if facts.headings
         && let Some(reason) = facts.reason.filter(|reason| !reason.is_empty())

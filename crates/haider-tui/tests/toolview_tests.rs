@@ -177,6 +177,24 @@ fn full_arguments_keep_everything_the_header_cut() {
     let pretty = tv::full_args("web_fetch", &json!({"url": "https://x.test"})).unwrap();
     assert!(pretty.contains("\"url\": \"https://x.test\""), "{pretty}");
     assert_eq!(tv::full_args("todo_write", &json!({})), None);
+    // A write's content is its diff: the arguments keep only the rest.
+    let write = tv::full_args("fs_write", &json!({"path": "a.md", "content": "BODY"})).unwrap();
+    assert!(
+        write.contains("\"path\": \"a.md\"") && !write.contains("BODY"),
+        "{write}"
+    );
+    let edit = tv::full_args(
+        "edit",
+        &json!({"file_path": "a", "old_string": "OLD", "new_string": "NEW"}),
+    )
+    .unwrap();
+    assert!(!edit.contains("OLD") && !edit.contains("NEW"), "{edit}");
+    // …but a malformed call with no diff keeps every byte it sent.
+    assert!(
+        tv::full_args("fs_write", &json!({"content": 3}))
+            .unwrap()
+            .contains('3')
+    );
 }
 
 // ---- 2. the diff model --------------------------------------------------
@@ -292,15 +310,73 @@ fn a_huge_replacement_falls_back_without_losing_a_line() {
 }
 
 #[test]
-fn line_of_finds_the_first_occurrence() {
-    assert_eq!(tv::line_of("a\nb\nc\nb", "b"), Some(2));
-    assert_eq!(tv::line_of("a\nb", "a"), Some(1));
-    assert_eq!(tv::line_of("a\nb", "zz"), None);
+fn a_location_is_only_ever_a_unique_occurrence() {
+    assert_eq!(tv::unique_line_of("a\nb\nc", "b"), Some(2));
+    assert_eq!(tv::unique_line_of("a\nb", "a"), Some(1));
     assert_eq!(
-        tv::line_of("a", ""),
+        tv::unique_line_of("a\nb\nc\nb", "b"),
+        None,
+        "two occurrences are ambiguous — never the first one"
+    );
+    assert_eq!(tv::unique_line_of("a\nb", "zz"), None);
+    assert_eq!(
+        tv::unique_line_of("a", ""),
         None,
         "an empty replacement has no place"
     );
+}
+
+fn pair(old: &str, new: &str) -> tv::EditPair {
+    tv::EditPair {
+        old: old.to_owned(),
+        new: new.to_owned(),
+        replace_all: false,
+    }
+}
+
+/// Astra review (973): line 1 already reads `READY`; the edit turned line 4
+/// (`old line`) into `READY`. The first occurrence is line 1 — the WRONG
+/// line — so the edit must stay unnumbered.
+#[test]
+fn an_edit_whose_text_already_existed_elsewhere_is_not_numbered() {
+    let after = "READY\nx\ny\nREADY\nend\n";
+    assert_eq!(
+        tv::resolve_edit_anchors(&[pair("old line", "READY")], after),
+        vec![None]
+    );
+    // The same edit into a file where its text is unique IS numbered.
+    let unique = "START\nx\ny\nREADY\nend\n";
+    assert_eq!(
+        tv::resolve_edit_anchors(&[pair("old line", "READY")], unique),
+        vec![Some(4)]
+    );
+}
+
+#[test]
+fn line_shifting_multi_edits_and_replace_all_are_not_numbered() {
+    let after = "a\nNEW1\nextra\nb\nNEW2\n";
+    // Edit 1 adds a line, so edit 2's PRE-edit line differs from its
+    // post-edit line: nothing in the call may be numbered.
+    assert_eq!(
+        tv::resolve_edit_anchors(&[pair("old1", "NEW1\nextra"), pair("old2", "NEW2")], after),
+        vec![None, None]
+    );
+    // Line-count-preserving edits keep both numberings equal.
+    let same = "a\nNEW1\nb\nNEW2\n";
+    assert_eq!(
+        tv::resolve_edit_anchors(&[pair("old1", "NEW1"), pair("old2", "NEW2")], same),
+        vec![Some(2), Some(4)]
+    );
+    let mut all = pair("x", "Y");
+    all.replace_all = true;
+    assert_eq!(tv::resolve_edit_anchors(&[all], "Y\n"), vec![None]);
+    // The flag is read from both edit schemas.
+    let fs_edit = tv::edit_pairs(
+        &json!({"path": "a", "edits": [{"old": "x", "new": "y", "replace_all": true}]}),
+    );
+    assert!(fs_edit[0].replace_all);
+    let edit = tv::edit_pairs(&json!({"file_path": "a", "old_string": "x", "new_string": "y"}));
+    assert!(!edit[0].replace_all);
 }
 
 #[test]
