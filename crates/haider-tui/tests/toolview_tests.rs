@@ -748,6 +748,35 @@ fn every_tool_row_text_ink_clears_4_5_on_its_ground_in_every_theme() {
         floor("failure phrase (err)", theme.err, theme.bg);
         floor("body", theme.text, theme.bg);
         floor("count (bright)", theme.bright, theme.bg);
+        // EVERY tone, as the tool-row renderer inks it, on the page ground
+        // and on the focused row's hover band (973 repair: Desert's accent
+        // gold was 4.01:1 on a `file:line` token).
+        for tone in [
+            Tone::Body,
+            Tone::Meta,
+            Tone::Structure,
+            Tone::Name,
+            Tone::Emphasis,
+            Tone::Accent,
+            Tone::Ok,
+            Tone::Warn,
+            Tone::Err,
+        ] {
+            for (ground_name, ground) in [("page", theme.bg), ("hover band", theme.sel_bg)] {
+                let ink = theme.legible(theme.tool_tone_ink(tone), ground);
+                floor(&format!("{tone:?} on the {ground_name}"), ink, ground);
+            }
+            // An ink already over the floor is never touched.
+            let raw = theme.tool_tone_ink(tone);
+            if contrast(raw, theme.bg) >= 4.5 {
+                assert_eq!(
+                    theme.legible(raw, theme.bg),
+                    raw,
+                    "{}: {tone:?}",
+                    theme.label
+                );
+            }
+        }
         // The two diff grounds must also read APART from the page.
         assert_ne!(theme.diff_added_ground(), theme.bg);
         assert_ne!(theme.diff_removed_ground(), theme.bg);

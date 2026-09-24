@@ -16,17 +16,17 @@
 07| ▏ Running the gate now — I will report the verdict.                                                                    |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×117
 08|  ● verify(wave-971 candidate) · 8s                                                                                     |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×85
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×85
 09|    ⎿ SHIP — wave-971 candidate clears every gate … +2 lines                                                            |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×50; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×60
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×50; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×60
 10|  Ran 3 shell commands                                                                                                  |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×98
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×1; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×98
 11|    ⎿ Resuming agent a830387                                                                                            |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×92
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×21; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×92
 12|  ● Search("todos_collapsed" *.rs)                                                                                      |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×86
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×86
 13|    ⎿ 12 lines of output                                                                                                |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×96
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×96
 14|      src/render.rs:5740:            if model.todos_collapsed {                                                         |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×38; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×57
 15|      src/render.rs:6336: let arrow = …                                                                                 |
@@ -48,9 +48,9 @@
 23|      src/render.rs:6389: if !model.todos_collapsed {                                                                   |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×67
 24|    ⎿ ⋯ 2 more rows · ⇟/⇞ page · ⏎ show all                                                                             |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×13; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×77
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×19; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×24; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×77
 25|  ◐ Monitor(Astra 971-tui-collapse verification (re-armed)) · running… 3s                                               |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×47
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×47
 26|                                                                                                                        |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×120
 27|                                                                                                                        |

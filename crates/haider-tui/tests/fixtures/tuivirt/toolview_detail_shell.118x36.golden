@@ -1,8 +1,8 @@
 # tuivirt golden · toolview_detail_shell · 118x36
 00|  ● Bash(cat >> experience-log.jsonl <<'EOF' …)                                                                       |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×71
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×39; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×71
 01|    ⎿ 1 line of output                                                                                                |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×96
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×22; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×96
 02|      full detail · rows 1–7 of 7 · ↑↓ PgUp PgDn scroll · esc / ⌃O back                                               |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×65; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×47
 03|                                                                                                                      |

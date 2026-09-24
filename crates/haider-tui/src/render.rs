@@ -15517,6 +15517,32 @@ fn toned_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'sta
     )
 }
 
+/// A tool-row segment list as a themed line held to the tool-row contrast
+/// floor on `ground` (973-tui-toolview repair: every tone a tool row draws —
+/// accent `file:line` tokens and Desert's green included — clears 4.5:1).
+fn tool_line_on(
+    segments: &[crate::toolfold::Segment],
+    theme: &Theme,
+    ground: crate::theme::Rgb,
+) -> Line<'static> {
+    Line::from(
+        segments
+            .iter()
+            .map(|segment| {
+                Span::styled(
+                    segment.text.clone(),
+                    theme.tool_tone_style_on(segment.tone, ground),
+                )
+            })
+            .collect::<Vec<Span<'static>>>(),
+    )
+}
+
+/// [`tool_line_on`] on the page ground.
+fn tool_line(segments: &[crate::toolfold::Segment], theme: &Theme) -> Line<'static> {
+    tool_line_on(segments, theme, theme.bg)
+}
+
 /// One DISPLAY row of an expanded tool row or the full-detail view, inked.
 ///
 /// Rows arrive already wrapped to the content width by
@@ -15546,12 +15572,15 @@ fn display_row_line(
         ]),
         RowRole::Note(tone) => Line::from(vec![
             indent,
-            Span::styled(row.text.clone(), theme.tone_style(tone)),
+            Span::styled(row.text.clone(), theme.tool_tone_style(tone)),
         ]),
         RowRole::Output => {
             let mut spans = vec![indent];
             for segment in crate::toolfold::meaning_segments(&row.text) {
-                spans.push(Span::styled(segment.text, theme.tone_style(segment.tone)));
+                spans.push(Span::styled(
+                    segment.text,
+                    theme.tool_tone_style(segment.tone),
+                ));
             }
             Line::from(spans)
         }
@@ -15560,7 +15589,7 @@ fn display_row_line(
                 DiffKind::Added => theme.diff_added_style(),
                 DiffKind::Removed => theme.diff_removed_style(),
                 DiffKind::Context => theme.dim_style(),
-                DiffKind::Gap => theme.faint_style(),
+                DiffKind::Gap => theme.tool_tone_style(crate::toolfold::Tone::Structure),
             };
             let marker = if first { kind.marker() } else { ' ' };
             let gutter = if row.gutter.is_empty() {
@@ -15756,27 +15785,28 @@ fn tool_disclosure_lines<'a>(
         // existing correction machinery.
         FoldRole::Member => return,
         FoldRole::Head(run) => {
-            lines.push(toned_line(&tf::fold_segments(run), theme));
+            lines.push(tool_line(&tf::fold_segments(run), theme));
             if ctx.fold.verbosity().shows_subline()
                 && let Some(text) = run.subline.as_deref()
                 && let Some(segments) = tf::subline_segments(text, cells)
             {
-                lines.push(toned_line(&segments, theme));
+                lines.push(tool_line(&segments, theme));
             }
             return;
         }
         FoldRole::Alone => {}
     }
     let state = ctx.fold.state_of(item_id);
-    let summary = toned_line(&tf::summary_segments(facts, ctx.phase, cells), theme);
     // The focused row wears the shared hover band (ground shifts, ink
-    // stays) so ⏎/Space always has a visible subject.
-    lines.push(hover_band(
-        summary,
-        ctx.fold.focus() == Some(item_id),
-        ctx.width,
+    // stays) so ⏎/Space always has a visible subject — its ink is held to
+    // the floor on THAT ground.
+    let focused = ctx.fold.focus() == Some(item_id);
+    let summary = tool_line_on(
+        &tf::summary_segments(facts, ctx.phase, cells),
         theme,
-    ));
+        if focused { theme.sel_bg } else { theme.bg },
+    );
+    lines.push(hover_band(summary, focused, ctx.width, theme));
     let extras = tool_extras(block, ctx.anchors);
     let output = block.tool_output();
     let shows_subline = ctx.fold.verbosity().shows_subline();
@@ -15796,7 +15826,7 @@ fn tool_disclosure_lines<'a>(
             cells,
         )
     {
-        lines.push(toned_line(&segments, theme));
+        lines.push(tool_line(&segments, theme));
     }
     if state.is_collapsed() {
         // The inline diff preview: a SUCCESSFUL write or edit shows a few
@@ -15813,7 +15843,7 @@ fn tool_disclosure_lines<'a>(
             let hidden = diff.lines.len().saturating_sub(end - start);
             if hidden > 0 {
                 marks.detail = Some(lines.len());
-                lines.push(toned_line(&tv::more_segments(hidden), theme));
+                lines.push(tool_line(&tv::more_segments(hidden), theme));
             }
         }
         // The honesty markers are NOT verbosity-gated and not disclosure-
@@ -15830,7 +15860,7 @@ fn tool_disclosure_lines<'a>(
         if block.output_decode_error {
             lines.push(Line::styled(
                 "    ⚠ some output could not be decoded",
-                theme.warn_style(),
+                theme.tool_tone_style(crate::toolfold::Tone::Warn),
             ));
         }
         return;
@@ -15854,7 +15884,7 @@ fn tool_disclosure_lines<'a>(
         // Remembered by LINE index; the cache measures it into a wrapped
         // row so the hit lands on the glyphs the reader sees (F6).
         marks.show_all = Some(lines.len());
-        lines.push(toned_line(&tf::show_all_segments(start, below), theme));
+        lines.push(tool_line(&tf::show_all_segments(start, below), theme));
     }
     // Honesty below the tail (r2: bottom-anchored viewport). Only where the
     // output was actually shown — a collapsed row has already returned.
@@ -15867,7 +15897,7 @@ fn tool_disclosure_lines<'a>(
     if block.output_decode_error {
         lines.push(Line::styled(
             "    ⚠ some output could not be decoded",
-            theme.warn_style(),
+            theme.tool_tone_style(crate::toolfold::Tone::Warn),
         ));
     }
 }
@@ -16033,7 +16063,7 @@ fn render_tool_detail(
     facts.subline_outcome = true;
     let extras = tool_extras(block, ctx.anchors);
     let output = block.tool_output();
-    let mut head: Vec<Line<'static>> = vec![toned_line(
+    let mut head: Vec<Line<'static>> = vec![tool_line(
         &crate::toolfold::summary_segments(&facts, model.anim_phase, cells),
         theme,
     )];
@@ -16051,7 +16081,7 @@ fn render_tool_detail(
         },
         cells,
     ) {
-        head.push(toned_line(&segments, theme));
+        head.push(tool_line(&segments, theme));
     }
     let full_args = match &block.item {
         TurnItem::ToolCall { name, args, .. } => tv::full_args(name, args),
@@ -16363,7 +16393,10 @@ fn item_lines<'a>(
             let (added, removed) = (*added as usize, *removed as usize);
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(format!("{} ", crate::toolview::BULLET), theme.ok_style()),
+                Span::styled(
+                    format!("{} ", crate::toolview::BULLET),
+                    theme.tool_tone_style(crate::toolfold::Tone::Ok),
+                ),
                 Span::styled("Edit", theme.maroon_style()),
                 Span::styled(format!("({})", ctx.paths.shorten(path)), theme.dim_style()),
             ]));
@@ -16380,7 +16413,7 @@ fn item_lines<'a>(
                 },
                 width as usize,
             ) {
-                lines.push(toned_line(&segments, theme));
+                lines.push(tool_line(&segments, theme));
             }
         }
         TurnItem::ChildSpawn { agent } => {

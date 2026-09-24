@@ -9,6 +9,10 @@ use ratatui::style::{Color, Modifier, Style};
 /// added and removed rows read apart at a glance.
 pub const DIFF_GROUND_ALPHA: u16 = 180;
 
+/// The contrast floor every character a tool row draws must clear on the
+/// ground it is drawn on (owner, 973-tui-toolview: ≥ 4.5:1 in every theme).
+pub const TOOL_TEXT_FLOOR: f64 = 4.5;
+
 impl From<Rgb> for Color {
     fn from(rgb: Rgb) -> Self {
         Color::Rgb(rgb.r, rgb.g, rgb.b)
@@ -263,6 +267,72 @@ impl Theme {
             Tone::Warn => self.warn_style(),
             Tone::Err => self.err_style(),
         }
+    }
+
+    /// `ink`, pulled toward the theme's readable body ink just far enough
+    /// to clear [`TOOL_TEXT_FLOOR`] on `ground` (973-tui-toolview repair).
+    /// An ink that already clears it is returned UNCHANGED, so a theme only
+    /// shifts where it was below the floor (Desert's gold and green, for
+    /// instance) and keeps its hue as far as the floor allows.
+    #[must_use]
+    pub fn legible(&self, ink: Rgb, ground: Rgb) -> Rgb {
+        if ink.contrast(ground) >= TOOL_TEXT_FLOOR {
+            return ink;
+        }
+        let toward = if self.text.contrast(ground) >= self.bright.contrast(ground) {
+            self.text
+        } else {
+            self.bright
+        };
+        let mut alpha = 0u16;
+        while alpha < 1000 {
+            alpha += 25;
+            let mixed = toward.over(ink, alpha);
+            if mixed.contrast(ground) >= TOOL_TEXT_FLOOR {
+                return mixed;
+            }
+        }
+        toward
+    }
+
+    /// The ink a tool-row [`crate::toolfold::Tone`] resolves to BEFORE the
+    /// legibility floor: [`Self::tone_style`]'s mapping, except that
+    /// `Structure` (the `⎿` elbow, the `⋯` gap) reads as metadata — on a
+    /// tool row every drawn glyph is read, none is decoration.
+    #[must_use]
+    pub fn tool_tone_ink(&self, tone: crate::toolfold::Tone) -> Rgb {
+        use crate::toolfold::Tone;
+        match tone {
+            Tone::Body => self.text,
+            Tone::Meta | Tone::Structure => self.dim,
+            Tone::Name => self.maroon,
+            Tone::Emphasis => self.bright,
+            Tone::Accent => self.gold,
+            Tone::Ok => self.ok,
+            Tone::Warn => self.warn,
+            Tone::Err => self.err,
+        }
+    }
+
+    /// A tool-row tone as ink on `ground`, held to [`TOOL_TEXT_FLOOR`]
+    /// (973-tui-toolview). Every span a tool row, its `⎿` line, its diff
+    /// preview, its expanded output and the full-detail view draws goes
+    /// through here — `toolview_tests` renders them all and measures every
+    /// cell in every theme.
+    #[must_use]
+    pub fn tool_tone_style_on(&self, tone: crate::toolfold::Tone, ground: Rgb) -> Style {
+        let style = Style::default().fg(self.legible(self.tool_tone_ink(tone), ground).into());
+        if tone == crate::toolfold::Tone::Emphasis {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }
+
+    /// [`Self::tool_tone_style_on`] on the page ground.
+    #[must_use]
+    pub fn tool_tone_style(&self, tone: crate::toolfold::Tone) -> Style {
+        self.tool_tone_style_on(tone, self.bg)
     }
 
     /// The ground an ADDED diff row sits on (973-tui-toolview): the success

@@ -201,8 +201,15 @@ fn toolview_model() -> AppModel {
     model.clock_ms = 1_700_000_000_000;
     push_user(&mut model, "re-scope the 973 lanes and log the experience");
     push_agent(&mut model, "reply-1", "Updating the lane table first.");
+    push_owner_tools(&mut model);
+    model
+}
+
+/// The owner's tool calls (write · edit · reads · heredoc · failing gate ·
+/// malformed write · budget tally), pushed onto `model`.
+fn push_owner_tools(model: &mut AppModel) {
     push_tool(
-        &mut model,
+        model,
         "write-lanes",
         "fs_write",
         serde_json::json!({
@@ -213,7 +220,7 @@ fn toolview_model() -> AppModel {
         ok("wrote 312 bytes to state/973-LANES.md"),
     );
     push_tool(
-        &mut model,
+        model,
         "edit-status",
         "fs_edit",
         serde_json::json!({
@@ -230,13 +237,13 @@ fn toolview_model() -> AppModel {
         .edit_anchors
         .insert("edit-status".to_owned(), vec![Some(41)]);
     model.edit_anchor_revision += 1;
-    apply(&mut model, budget_progress());
+    apply(model, budget_progress());
     for (n, file) in ["src/app.rs", "src/render.rs", "src/toolfold.rs"]
         .iter()
         .enumerate()
     {
         push_tool(
-            &mut model,
+            model,
             &format!("read-{n}"),
             "fs_read",
             serde_json::json!({ "path": format!("{WORKSPACE}/crates/haider-tui/{file}") }),
@@ -247,7 +254,7 @@ fn toolview_model() -> AppModel {
         );
     }
     push_tool(
-        &mut model,
+        model,
         "log",
         "process_exec",
         serde_json::json!({
@@ -257,14 +264,14 @@ fn toolview_model() -> AppModel {
         ok(""),
     );
     push_command(
-        &mut model,
+        model,
         "gate",
         "cargo test -p haider-tui --locked",
         "running 1636 tests\ntest render::golden ... FAILED\nerror: test failed, to rerun pass `-p haider-tui --lib`\n",
         101,
     );
     push_tool(
-        &mut model,
+        model,
         "bad-write",
         "fs_write",
         serde_json::json!({}),
@@ -287,7 +294,6 @@ fn toolview_model() -> AppModel {
             ended_ms: Some(model.clock_ms),
         },
     );
-    model
 }
 
 // ---- 1. goldens -----------------------------------------------------------
@@ -785,4 +791,222 @@ fn the_door_opens_the_detail_when_scrolled_back_under_the_origin_line() {
     model.handle_hit(hit);
     assert!(model.tool_detail.is_some());
     assert!(draw(&model, 118, 36).contains("full detail"));
+}
+
+// ---- 6. contrast, measured on the rendered cells ------------------------
+
+fn rgb_of(
+    color: ratatui::style::Color,
+    fallback: haider_tui::theme::Rgb,
+) -> haider_tui::theme::Rgb {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => haider_tui::theme::Rgb { r, g, b },
+        _ => fallback,
+    }
+}
+
+/// Every non-blank cell in `rows` must clear 4.5:1 against the ground it is
+/// actually drawn on. Returns the offenders for one readable failure.
+fn low_contrast_cells(
+    frame: &tuivirt_common::Snapshot,
+    rows: std::ops::Range<usize>,
+    theme: &haider_tui::theme::Theme,
+) -> Vec<String> {
+    let mut bad = Vec::new();
+    for y in rows {
+        for (x, (symbol, style)) in frame.cells[y].iter().enumerate() {
+            if symbol.trim().is_empty() {
+                continue;
+            }
+            let fg = rgb_of(style.fg, theme.text);
+            let bg = rgb_of(style.bg, theme.bg);
+            let ratio = fg.contrast(bg);
+            if ratio < 4.5 {
+                bad.push(format!(
+                    "{} ({x},{y}) {symbol:?} {ratio:.2} in {:?}",
+                    theme.label, frame.rows[y]
+                ));
+            }
+        }
+    }
+    bad
+}
+
+/// A transcript holding NOTHING but tool rows, covering every tone the
+/// renderer can emit: ok/err/cancelled/running bullets, the `⎿` line in
+/// each outcome, diff grounds, meaning-coloured output (verdicts, warning,
+/// ERROR, `file:line` accents, ids, exit codes), fold heads, honesty
+/// markers, bounded/show-all doors and a focused (hover-band) header.
+fn every_tone_model() -> AppModel {
+    let mut model = session_model();
+    model.cwd = WORKSPACE.to_owned();
+    model.clock_ms = 1_700_000_000_000;
+    push_owner_tools(&mut model);
+    let chatty: String = [
+        "SHIP — candidate clears every gate",
+        "HOLD pending evidence",
+        "NO-SHIP: gate FAILED",
+        "warning: 2 files skipped",
+        "ERROR one match could not be read",
+        "src/render.rs:5740:12 if model.todos_collapsed {",
+        "thread_a1b2c3d4 run 9f3a2b7c1d finished ok",
+        "exit 3 rc=0 status 0",
+    ]
+    .iter()
+    .map(|line| format!("{line}\n"))
+    .collect::<String>()
+    .repeat(3);
+    push_tool(
+        &mut model,
+        "grep",
+        "grep",
+        serde_json::json!({"query": "todos_collapsed", "glob": "*.rs"}),
+        &chatty,
+        ok(""),
+    );
+    push_tool(
+        &mut model,
+        "grep-all",
+        "fs_search",
+        serde_json::json!({"pattern": "x"}),
+        &chatty,
+        ok(""),
+    );
+    push_tool(
+        &mut model,
+        "recovered",
+        "web_fetch",
+        serde_json::json!({"url": "https://example.test"}),
+        "",
+        (
+            ToolStatus::Completed,
+            result(
+                "{}",
+                ToolResultStatus::Completed,
+                Some("transient failure — retry 2/2 succeeded"),
+            ),
+        ),
+    );
+    push_tool(
+        &mut model,
+        "cancelled",
+        "Monitor",
+        serde_json::json!({"desc": "watch gate"}),
+        "",
+        (
+            ToolStatus::Cancelled,
+            result("", ToolResultStatus::Cancelled, Some("cancelled by user")),
+        ),
+    );
+    for n in 0..2 {
+        push_command(
+            &mut model,
+            &format!("ok-{n}"),
+            "cargo fmt --check",
+            "fmt ok\n",
+            0,
+        );
+    }
+    // A cut tail and an undecodable chunk wear their honesty markers.
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("big"),
+            item: TurnItem::CommandExecution {
+                call_id: "call-big".to_owned(),
+                command: "yes | head -n 4000".to_owned(),
+                status: ToolStatus::InProgress,
+                exit_code: None,
+            },
+        }),
+    );
+    apply(
+        &mut model,
+        output_delta("big", &"y line of output\n".repeat(800)),
+    );
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Delta {
+            item_id: ItemId::new("big"),
+            delta: ItemDelta::CommandOutput {
+                stream: OutputStream::Stdout,
+                chunk_b64: "*** not base64 ***".to_owned(),
+            },
+        }),
+    );
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("live"),
+            item: tool(
+                "live",
+                "Monitor",
+                serde_json::json!({"desc": "still running"}),
+                ToolStatus::InProgress,
+            ),
+        }),
+    );
+    model
+        .edit_anchors
+        .insert("edit-status".to_owned(), vec![Some(41)]);
+    model.edit_anchor_revision += 1;
+    model
+}
+
+/// Owner: the new rows keep ≥ 4.5:1 in every theme. Measured on RENDERED
+/// cells — every glyph every tool-row state draws, against the ground it is
+/// drawn on — so a tone nobody intended (Desert's `file:line` gold was
+/// 4.01:1) cannot slip through again.
+#[test]
+fn every_rendered_tool_row_cell_clears_4_5_in_every_theme() {
+    use haider_tui::toolfold::{RowState, Verbosity};
+    let mut failures = Vec::new();
+    for key in ThemeKey::ALL {
+        let theme = key.theme();
+        let check = |model: &AppModel, failures: &mut Vec<String>, what: &str| {
+            let frame = draw(model, 120, 220);
+            let area = frame.transcript;
+            let rows = usize::from(area.y)..usize::from(area.y + area.height);
+            for bad in low_contrast_cells(&frame, rows, theme) {
+                failures.push(format!("{what}: {bad}"));
+            }
+        };
+        let mut model = every_tone_model();
+        model.theme = key;
+        check(&model, &mut failures, "collapsed");
+        model.toolfold.set_focus(Some("gate"));
+        check(&model, &mut failures, "focused");
+        model.toolfold.set_focus(None);
+        model.toolfold.set("grep", RowState::Expanded);
+        model.toolfold.set("grep-all", RowState::ShowAll);
+        model.toolfold.set("edit-status", RowState::ShowAll);
+        model.toolfold.set("big", RowState::Expanded);
+        check(&model, &mut failures, "expanded");
+        model.set_tool_verbosity(Verbosity::Verbose);
+        check(&model, &mut failures, "verbose");
+        model.set_tool_verbosity(Verbosity::Quiet);
+        check(&model, &mut failures, "quiet");
+        model.set_tool_verbosity(Verbosity::Normal);
+        // The full-detail view of every tool row: the whole body is its.
+        for id in model.tool_row_ids() {
+            assert!(model.open_tool_detail(&id));
+            let frame = draw(&model, 120, 220);
+            let body = 0..usize::from(frame.height) - 1;
+            for bad in low_contrast_cells(&frame, body, theme) {
+                failures.push(format!("detail {id}: {bad}"));
+            }
+            model.close_tool_detail();
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} low-contrast tool-row cells:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
