@@ -2020,6 +2020,7 @@ async fn run_account_actor(
                     );
                     continue;
                 };
+                let before = accounts.list().to_vec();
                 let result = source_registry
                     .lock()
                     .map_err(|_| {
@@ -2037,6 +2038,12 @@ async fn run_account_actor(
                     });
                 match result {
                     Ok(source_id) => {
+                        clear_catalogs_after_account_change(
+                            &before,
+                            &accounts,
+                            &providers,
+                            &mut pending_catalog_discoveries,
+                        );
                         refresh_resolver_snapshot(&snapshot, &accounts);
                         if let Err(error) = publish_next_management_revision(
                             &store,
@@ -2145,6 +2152,7 @@ async fn run_account_actor(
                 }
             }
             AccountCommand::SourceScan { completed } => {
+                let before = accounts.list().to_vec();
                 let result = source_registry
                     .lock()
                     .map_err(|_| {
@@ -2161,6 +2169,12 @@ async fn run_account_actor(
                     });
                 match result {
                     Ok(()) => {
+                        clear_catalogs_after_account_change(
+                            &before,
+                            &accounts,
+                            &providers,
+                            &mut pending_catalog_discoveries,
+                        );
                         refresh_resolver_snapshot(&snapshot, &accounts);
                         if let Err(error) = publish_next_management_revision(
                             &store,
@@ -2207,6 +2221,12 @@ async fn run_account_actor(
                     .map(|sources| source_metadata_changed(&before_sources, &sources))
                     .unwrap_or(false);
                 if reconciled.is_ok() && (before != accounts.list() || sources_changed) {
+                    clear_catalogs_after_account_change(
+                        &before,
+                        &accounts,
+                        &providers,
+                        &mut pending_catalog_discoveries,
+                    );
                     refresh_resolver_snapshot(&snapshot, &accounts);
                     let _ = publish_next_management_revision(
                         &store,
@@ -2460,7 +2480,8 @@ async fn run_account_actor(
                     crate::device_discovery::linked_kind_yields_access(source.kind)
                 }) {
                     let source_id = linked_source.id;
-                    source_registry
+                    let before = accounts.list().to_vec();
+                    let mut reconciled = source_registry
                         .lock()
                         .map_err(|_| {
                             HaiderError::new(
@@ -2474,7 +2495,26 @@ async fn run_account_actor(
                             publish_source_snapshot(&source_snapshot, &registry, &accounts);
                             refresh_resolver_snapshot(&snapshot, &accounts);
                             Ok(OAuthImportHealResult::LiveOwnerStore { source: source_id })
-                        })
+                        });
+                    if reconciled.is_ok() && before != accounts.list() {
+                        clear_catalogs_after_account_change(
+                            &before,
+                            &accounts,
+                            &providers,
+                            &mut pending_catalog_discoveries,
+                        );
+                        if let Err(error) = publish_next_management_revision(
+                            &store,
+                            &snapshot,
+                            management.as_ref(),
+                            &accounts,
+                        )
+                        .await
+                        {
+                            reconciled = Err(error);
+                        }
+                    }
+                    reconciled
                 } else {
                     handle_oauth_import_heal(
                         &store,
@@ -2987,7 +3027,7 @@ async fn begin_provider_models_refresh(
     };
     let cache_key = descriptor.as_ref().map_or_else(
         || provider.clone(),
-        |descriptor| account_provider_model_cache_key(&provider, descriptor.alias.as_str()),
+        |descriptor| account_provider_model_cache_key(&provider, descriptor),
     );
     let cached = match store.provider_models(cache_key.clone()).await {
         Ok(cached) => cached,
@@ -3433,9 +3473,44 @@ fn active_catalog_cache_key(
     match auth {
         ProviderAuthRequirementWire::OAuth | ProviderAuthRequirementWire::ApiKey => accounts
             .active_for_provider(provider)
-            .map(|account| account_provider_model_cache_key(provider, account.alias.as_str())),
+            .map(|account| account_provider_model_cache_key(provider, account)),
         ProviderAuthRequirementWire::None => Some(provider.to_owned()),
         _ => None,
+    }
+}
+
+fn clear_catalogs_after_account_change(
+    before: &[CredentialDescriptor],
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending: &mut AutomaticCatalogDiscoveryQueue,
+) {
+    let provider_ids = before
+        .iter()
+        .chain(accounts.list())
+        .map(|descriptor| descriptor.provider.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for provider in provider_ids {
+        let Some((_, auth)) = catalog_source(provider, providers) else {
+            continue;
+        };
+        if !matches!(
+            auth,
+            ProviderAuthRequirementWire::OAuth | ProviderAuthRequirementWire::ApiKey
+        ) {
+            continue;
+        }
+        let previous = before
+            .iter()
+            .find(|descriptor| descriptor.provider == provider && descriptor.active)
+            .map(|descriptor| account_provider_model_cache_key(provider, descriptor));
+        let current = accounts
+            .active_for_provider(provider)
+            .map(|descriptor| account_provider_model_cache_key(provider, descriptor));
+        if previous != current {
+            providers.clear_discovered_models(provider);
+            enqueue_catalog_discovery(provider, providers, pending);
+        }
     }
 }
 
@@ -4129,7 +4204,13 @@ async fn handle_refresh_identity(
         }
     };
     let identity = match current.auth_method {
-        AuthMethod::ApiKey => Some(api_key_identity(&current.provider, stored.expose_secret())),
+        AuthMethod::ApiKey => {
+            let mut identity = api_key_identity(&current.provider, stored.expose_secret());
+            if let Some(previous) = current.account_identity.as_ref() {
+                identity.captured_at = previous.captured_at;
+            }
+            Some(identity)
+        }
         AuthMethod::OAuth => {
             let bundle = match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
                 Ok(bundle) => bundle,
@@ -6447,11 +6528,17 @@ async fn handle_login(
     match validation {
         Ok(validated) => {
             let replacing = replace_existing || accounts.get(&alias).is_some();
+            let previous_cache_key = accounts
+                .get(&alias)
+                .map(|descriptor| account_provider_model_cache_key(&provider, descriptor));
             let prior_secret = if replacing {
                 vault.resolve(&alias).ok()
             } else {
                 None
             };
+            let same_key = prior_secret
+                .as_ref()
+                .is_some_and(|prior| bool::from(prior.expose_secret().ct_eq(secret.as_ref())));
             // Keychain first (R10 step 9).
             if let Err(error) = vault.put(&alias, &secret) {
                 pending.insert(
@@ -6469,7 +6556,22 @@ async fn handle_login(
                 );
                 return;
             }
-            let account_identity = api_key_identity(&provider, &secret);
+            let mut account_identity = api_key_identity(&provider, &secret);
+            if same_key {
+                if let Some(previous) = accounts
+                    .get(&alias)
+                    .and_then(|descriptor| descriptor.account_identity.clone())
+                {
+                    account_identity = previous;
+                }
+            } else if let Some(previous) = accounts
+                .get(&alias)
+                .and_then(|descriptor| descriptor.account_identity.as_ref())
+            {
+                account_identity.captured_at = account_identity
+                    .captured_at
+                    .max(previous.captured_at.saturating_add(1));
+            }
             drop(secret);
             pending.remove(&command_id);
             let descriptor = descriptor_for(
@@ -6478,6 +6580,7 @@ async fn handle_login(
                 Some(validated.identity),
                 Some(account_identity),
             );
+            let next_cache_key = account_provider_model_cache_key(&provider, &descriptor);
             let descriptor_result = if replacing {
                 accounts.replace(descriptor)
             } else {
@@ -6508,6 +6611,9 @@ async fn handle_login(
                     true,
                 );
                 return;
+            }
+            if previous_cache_key.is_some_and(|previous| previous != next_cache_key) {
+                providers.clear_discovered_models(&provider);
             }
             finalize_and_respond(
                 store,
@@ -6799,6 +6905,9 @@ async fn handle_oauth_add(
         );
         return;
     }
+    let previous_cache_key = accounts
+        .get(&alias)
+        .map(|descriptor| account_provider_model_cache_key(&provider, descriptor));
     if let Err(error) = persist_oauth_bundle(
         accounts,
         Arc::clone(&vault),
@@ -6816,6 +6925,13 @@ async fn handle_oauth_add(
             error.retryable,
         );
         return;
+    }
+    if previous_cache_key.is_some_and(|previous| {
+        accounts.get(&alias).is_some_and(|descriptor| {
+            previous != account_provider_model_cache_key(&provider, descriptor)
+        })
+    }) {
+        providers.clear_discovered_models(&provider);
     }
     finalize_oauth_commit(
         store,
@@ -7100,8 +7216,19 @@ async fn handle_gcloud_import(
             return;
         }
     };
-    let account_identity = api_key_identity(haider_provider::VERTEX_PROVIDER_NAME, &token);
+    let mut account_identity = api_key_identity(haider_provider::VERTEX_PROVIDER_NAME, &token);
     let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    let previous_cache_key = accounts.get(&alias).map(|descriptor| {
+        account_provider_model_cache_key(haider_provider::VERTEX_PROVIDER_NAME, descriptor)
+    });
+    if let Some(previous) = accounts
+        .get(&alias)
+        .and_then(|descriptor| descriptor.account_identity.as_ref())
+    {
+        account_identity.captured_at = account_identity
+            .captured_at
+            .max(previous.captured_at.saturating_add(1));
+    }
     let vault_for_write = Arc::clone(&vault);
     let alias_for_write = alias.clone();
     let written =
@@ -7148,6 +7275,17 @@ async fn handle_gcloud_import(
     if let Err(error) = result {
         respond_management_error(&job.route, &error);
         return;
+    }
+    if previous_cache_key.is_some_and(|previous| {
+        accounts.get(&alias).is_some_and(|descriptor| {
+            previous
+                != account_provider_model_cache_key(
+                    haider_provider::VERTEX_PROVIDER_NAME,
+                    descriptor,
+                )
+        })
+    }) {
+        providers.clear_discovered_models(haider_provider::VERTEX_PROVIDER_NAME);
     }
     let revision = match store.advance_management_revision().await {
         Ok(revision) => revision,
@@ -7840,6 +7978,9 @@ async fn handle_oauth_import(
         .await;
         return;
     }
+    let previous_cache_key = replacing
+        .as_ref()
+        .map(|descriptor| account_provider_model_cache_key(spec.provider, descriptor));
     if replacing.is_some() {
         refresh_fences.invalidate(&alias);
     }
@@ -7855,6 +7996,13 @@ async fn handle_oauth_import(
     {
         respond_management_error(&job.route, &error);
         return;
+    }
+    if previous_cache_key.is_some_and(|previous| {
+        accounts.get(&alias).is_some_and(|descriptor| {
+            previous != account_provider_model_cache_key(spec.provider, descriptor)
+        })
+    }) {
+        providers.clear_discovered_models(spec.provider);
     }
     finalize_oauth_commit(
         store,

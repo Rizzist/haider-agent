@@ -1007,30 +1007,6 @@ async fn session_create_accepts_gemini_when_account_active() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
     let config = DaemonConfig::new("profile-gemini", root.path().join("store"), root.path());
-    // Authenticated remote catalogs no longer fabricate built-in model rows.
-    // Seed an actually fetched fixture so this test remains about the active
-    // account/session-create wire path, not live Google catalog availability.
-    {
-        let store = haider_store::Store::open(&config.store_dir)
-            .unwrap_or_else(|error| panic!("seed Gemini catalog: {error:?}"));
-        let models = vec![haider_provider::DiscoveredModel {
-            slug: "gemini-2.5-flash".into(),
-            display_name: "Gemini 2.5 Flash".into(),
-            context_window: Some(1_048_576),
-            description: None,
-            default_effort: None,
-            supported_efforts: Vec::new(),
-            visible: true,
-            priority: None,
-            use_responses_lite: None,
-            extensions: None,
-        }];
-        let models_json = serde_json::to_string(&models)
-            .unwrap_or_else(|error| panic!("serialize Gemini catalog: {error}"));
-        store
-            .put_provider_models("gemini", &models_json, None, 1)
-            .unwrap_or_else(|error| panic!("write Gemini catalog: {error:?}"));
-    }
     let fixture = AccountFixture::for_provider("gemini", Vec::new());
     let task = ready_with_dependencies(&config, fixture.dependencies()).await;
     let mut client = control_client(&config).await;
@@ -1057,6 +1033,41 @@ async fn session_create_accepts_gemini_when_account_active() {
     );
     assert_eq!(descriptor.provider, "gemini");
     assert!(descriptor.active);
+    drop(client);
+    task.shutdown_handle()
+        .request("seed fetched Gemini catalog");
+    let _ = task.join().await;
+
+    // Seed a fetched row for the committed account, then load it through a
+    // real daemon restart. The validator fixture does not contact Google.
+    {
+        let store = haider_store::Store::open(&config.store_dir)
+            .unwrap_or_else(|error| panic!("seed Gemini catalog: {error:?}"));
+        let models = vec![haider_provider::DiscoveredModel {
+            slug: "gemini-2.5-flash".into(),
+            display_name: "Gemini 2.5 Flash".into(),
+            context_window: Some(1_048_576),
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: None,
+            extensions: None,
+        }];
+        let models_json = serde_json::to_string(&models)
+            .unwrap_or_else(|error| panic!("serialize Gemini catalog: {error}"));
+        store
+            .put_provider_models(
+                &haider_store::account_provider_model_cache_key("gemini", &descriptor),
+                &models_json,
+                None,
+                1,
+            )
+            .unwrap_or_else(|error| panic!("write Gemini catalog: {error:?}"));
+    }
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
 
     let created = request(
         &mut client,

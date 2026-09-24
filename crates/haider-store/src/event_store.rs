@@ -1806,11 +1806,40 @@ pub struct CachedModels {
     pub fetched_at_ms: u64,
 }
 
-/// Namespaces an authenticated catalog by the selected credential alias.
-/// The separator cannot occur in a provider ID, and the length keeps aliases
-/// unambiguous even if they contain separators.
-pub fn account_provider_model_cache_key(provider: &str, alias: &str) -> String {
-    format!("account:{}:{provider}:{alias}", provider.len())
+/// Namespaces an authenticated catalog by the selected account identity.
+/// The v2 prefix deliberately leaves old alias-only rows unused on upgrade.
+/// Hashing keeps public identity fields out of SQLite's provider key.
+pub fn account_provider_model_cache_key(
+    provider: &str,
+    descriptor: &haider_protocol::credential::CredentialDescriptor,
+) -> String {
+    let identity = descriptor.account_identity.as_ref();
+    let scope = identity
+        .and_then(|identity| identity.account_id.as_deref().map(|id| ("id", id)))
+        .or_else(|| {
+            identity.and_then(|identity| identity.email.as_deref().map(|email| ("email", email)))
+        })
+        .unwrap_or(("display", &descriptor.identity));
+    let mut material = format!(
+        "{provider}\0{}\0{:?}\0{}\0{}\0{}",
+        descriptor.alias.as_str(),
+        descriptor.auth_method,
+        identity
+            .and_then(|identity| identity.issuer.as_deref())
+            .unwrap_or(""),
+        scope.0,
+        scope.1,
+    );
+    if descriptor.auth_method == haider_protocol::credential::AuthMethod::ApiKey {
+        // API-key validators often return the same display identity for
+        // distinct keys. The intake timestamp is retained for a same-key
+        // re-login and advanced when a different key replaces it.
+        material.push_str(&format!(
+            "\0{}",
+            identity.map_or(0, |identity| identity.captured_at)
+        ));
+    }
+    format!("account-v2:{}", blake3::hash(material.as_bytes()).to_hex())
 }
 
 /// Atomic result of registering one typed Loom specialist. `install_job` is

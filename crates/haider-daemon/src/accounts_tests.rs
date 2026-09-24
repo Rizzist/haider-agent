@@ -50,6 +50,93 @@ fn empty_source_snapshot() -> AccountSourcesSnapshot {
 }
 
 #[test]
+fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relogin() {
+    let mut accounts = memory_accounts();
+    let providers = test_provider_registry();
+    let mut descriptor = CredentialDescriptor {
+        alias: CredentialAlias::new("reused-source-alias"),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "same display".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: Some("a@example.invalid".into()),
+            display_name: None,
+            account_id: Some("synthetic-a".into()),
+            plan: None,
+            issuer: Some("synthetic-issuer".into()),
+            captured_at: 1,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    accounts.add(descriptor.clone()).expect("add A");
+    let active_key = |accounts: &AccountStore<Box<dyn StoreLike>>| {
+        active_catalog_cache_key(OPENAI_OAUTH_PROVIDER_NAME, accounts, &providers)
+            .expect("active catalog key")
+    };
+    let a_key = active_key(&accounts);
+    descriptor
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .captured_at = 2;
+    accounts.replace(descriptor.clone()).expect("re-login A");
+    assert_eq!(
+        active_key(&accounts),
+        a_key,
+        "same identity keeps its cache"
+    );
+    providers.replace_discovered_models(
+        OPENAI_OAUTH_PROVIDER_NAME.into(),
+        vec![DiscoveredModel {
+            slug: "a-only".into(),
+            display_name: "A only".into(),
+            context_window: None,
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: Some(true),
+            extensions: None,
+        }],
+        1,
+    );
+    let before = accounts.list().to_vec();
+    descriptor
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .account_id = Some("synthetic-b".into());
+    accounts
+        .replace(descriptor)
+        .expect("import B into same alias");
+    assert_ne!(
+        active_key(&accounts),
+        a_key,
+        "B must not read A's durable row"
+    );
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    clear_catalogs_after_account_change(&before, &accounts, &providers, &mut pending);
+    assert!(
+        providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("summary")
+            .models
+            .is_empty(),
+        "B must not see A's live inventory"
+    );
+    assert_eq!(
+        pending.next_ready(&HashSet::new()).as_deref(),
+        Some(OPENAI_OAUTH_PROVIDER_NAME)
+    );
+}
+
+#[test]
 fn linked_source_failure_health_states_remain_distinct() {
     use crate::device_discovery::LinkedSourceReadFailure;
 
@@ -546,7 +633,9 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
             active_catalog_cache_key(OPENAI_OAUTH_PROVIDER_NAME, &accounts, &providers),
             Some(account_provider_model_cache_key(
                 OPENAI_OAUTH_PROVIDER_NAME,
-                alias
+                accounts
+                    .get(&CredentialAlias::new(alias))
+                    .expect("active descriptor")
             ))
         );
     }
@@ -8331,7 +8420,6 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
     let alias = CredentialAlias::new("model-refresh-active");
-    let cache_key = account_provider_model_cache_key(OPENAI_OAUTH_PROVIDER_NAME, alias.as_str());
     let descriptor = CredentialDescriptor {
         alias: alias.clone(),
         provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
@@ -8344,6 +8432,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         account_identity: None,
         created_at_ms: None,
     };
+    let cache_key = account_provider_model_cache_key(OPENAI_OAUTH_PROVIDER_NAME, &descriptor);
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));

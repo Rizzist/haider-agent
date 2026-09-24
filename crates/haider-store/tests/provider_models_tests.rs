@@ -1,5 +1,9 @@
 #![allow(clippy::expect_used)]
 
+use haider_protocol::credential::{
+    AccountIdentity, AuthMethod, CredentialDescriptor, CredentialStatus,
+};
+use haider_protocol::ids::CredentialAlias;
 use haider_store::{CachedModels, Store, account_provider_model_cache_key};
 use rusqlite::Connection;
 
@@ -84,11 +88,66 @@ fn provider_model_cache_is_durable_provider_scoped_and_replaced() {
 #[test]
 fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
     let root = tempfile::tempdir().expect("tempdir");
-    let a = account_provider_model_cache_key("openai-oauth", "account-a");
-    let b = account_provider_model_cache_key("openai-oauth", "account-b");
-    let other = account_provider_model_cache_key("anthropic-oauth", "account-a");
+    let descriptor = |alias: &str, account_id: &str| CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: "openai-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "same display".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: None,
+            display_name: None,
+            account_id: Some(account_id.into()),
+            plan: None,
+            issuer: Some("issuer".into()),
+            captured_at: 1,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    let a =
+        account_provider_model_cache_key("openai-oauth", &descriptor("shared-alias", "account-a"));
+    let b =
+        account_provider_model_cache_key("openai-oauth", &descriptor("shared-alias", "account-b"));
+    let other = account_provider_model_cache_key(
+        "anthropic-oauth",
+        &descriptor("shared-alias", "account-a"),
+    );
+    assert_ne!(
+        a, b,
+        "a reused alias must not reuse another identity's catalog"
+    );
+    let mut api_key = descriptor("same-api-alias", "ignored");
+    api_key.auth_method = AuthMethod::ApiKey;
+    api_key
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .account_id = None;
+    let first_api_key = account_provider_model_cache_key("gemini", &api_key);
+    api_key
+        .account_identity
+        .as_mut()
+        .expect("identity")
+        .captured_at = 2;
+    assert_ne!(
+        first_api_key,
+        account_provider_model_cache_key("gemini", &api_key),
+        "replacing an API key must change its cache even if the display identity is unchanged"
+    );
     {
         let store = Store::open(root.path()).expect("open store");
+        store
+            .put_provider_models(
+                "account:12:openai-oauth:shared-alias",
+                "[\"legacy\"]",
+                None,
+                5,
+            )
+            .expect("put old alias-only catalog");
         store
             .put_provider_models(&a, "[\"a\"]", Some("etag-a"), 10)
             .expect("put A");
@@ -100,6 +159,13 @@ fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
             .expect("put other");
     }
     let store = Store::open(root.path()).expect("reopen store");
+    assert!(
+        store
+            .provider_models("account:12:openai-oauth:shared-alias")
+            .expect("old alias key")
+            .is_some(),
+        "the migration leaves old rows present but no v2 key reads them"
+    );
     assert_eq!(
         store.provider_models("openai-oauth").expect("legacy key"),
         None
