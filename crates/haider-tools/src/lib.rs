@@ -25,6 +25,7 @@ mod mobile;
 mod monitor;
 mod output_redactor;
 mod plan;
+pub mod presence;
 mod process;
 pub use output_redactor::{OutputRedactor, redact_process_output};
 mod redact;

@@ -361,6 +361,11 @@ pub struct SessionProjection {
     /// control banner reads this ingest-time index in O(1); it must never
     /// scan transcript history on the frame path.
     screen_control_items: std::collections::HashSet<ItemId>,
+    /// Session-scoped computer-use presence for the header chip: raised by
+    /// the first `computer`/`mobile` screen action of the current run,
+    /// refreshed by every later one, and retired at run end or after
+    /// `CU_PRESENCE_IDLE_SECS` without one (mirroring the daemon's overlay).
+    cu_presence: Option<(CuPresenceSurface, std::time::Instant)>,
     /// Unique append authorities for live assistant/reasoning rows. Completed
     /// transcript items retain only their shared reply range.
     reply_writers: std::collections::HashMap<ItemId, haider_protocol::reply::ReplyArenaWriter>,
@@ -442,6 +447,41 @@ pub struct SessionProjection {
     orphan_deltas: u64,
     unknown_payloads: u64,
     duplicate_items: u64,
+}
+
+/// What a live computer-use session is controlling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuPresenceSurface {
+    Screen,
+    Phone,
+}
+
+impl CuPresenceSurface {
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+            Self::Phone => "phone",
+        }
+    }
+}
+
+/// The presence surface a tool call operates, if any. Every `computer`
+/// action counts (the daemon overlay appears for observation too); SMS reads
+/// and app listing do not operate the phone's screen.
+fn cu_presence_surface(item: &TurnItem) -> Option<CuPresenceSurface> {
+    let TurnItem::ToolCall { name, args, .. } = item else {
+        return None;
+    };
+    match name.as_str() {
+        "computer" => Some(CuPresenceSurface::Screen),
+        "mobile" => (!matches!(
+            args.get("action").and_then(|value| value.as_str()),
+            Some("sms_read") | Some("list_apps") | None
+        ))
+        .then_some(CuPresenceSurface::Phone),
+        _ => None,
+    }
 }
 
 fn is_screen_control_item(item: &TurnItem) -> bool {
@@ -729,6 +769,7 @@ impl SessionProjection {
             }
             EventPayload::RunState(run) => {
                 if run.is_terminal() {
+                    self.cu_presence = None;
                     self.flush_pending_effect_failures();
                     self.effect_tool_owners.clear();
                     // The OS-permission grant card is TURN-SCOPED: it exists
@@ -1480,6 +1521,9 @@ impl SessionProjection {
                 } else {
                     if is_screen_control_item(item) {
                         self.screen_control_items.insert(item_id.clone());
+                    }
+                    if let Some(surface) = cu_presence_surface(item) {
+                        self.cu_presence = Some((surface, std::time::Instant::now()));
                     }
                     if let Some(text) = item_reply_text(item) {
                         let mut writer = haider_protocol::reply::ReplyArenaWriter::new();
@@ -2233,6 +2277,22 @@ impl SessionProjection {
     #[must_use]
     pub fn screen_control_active(&self) -> bool {
         !self.screen_control_items.is_empty()
+    }
+
+    /// The session-header presence chip: what the current run is
+    /// controlling, while it has used `computer`/`mobile` within the shared
+    /// idle window. Esc (the existing turn cancel) is its Stop.
+    #[must_use]
+    pub fn cu_presence(&self) -> Option<CuPresenceSurface> {
+        self.cu_presence_at(std::time::Instant::now())
+    }
+
+    #[must_use]
+    pub fn cu_presence_at(&self, now: std::time::Instant) -> Option<CuPresenceSurface> {
+        let idle = std::time::Duration::from_secs(haider_protocol::computer::CU_PRESENCE_IDLE_SECS);
+        self.cu_presence
+            .filter(|(_, last)| now.saturating_duration_since(*last) < idle)
+            .map(|(surface, _)| surface)
     }
 
     /// View-cache invalidation token; no semantic state is derived from it.

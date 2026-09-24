@@ -7,6 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Seconds without any `computer`/`mobile` action after which the visible
+/// "Haider is controlling …" presence indicator retires. Shared by the
+/// daemon's overlay controller, the TUI header chip and the Android overlay
+/// (mirrored as a Kotlin constant) so every surface appears and disappears
+/// on the same schedule. The next action re-shows it immediately.
+pub const CU_PRESENCE_IDLE_SECS: u64 = 30;
+
 /// One point in the model-visible screenshot coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -8,6 +8,8 @@ import android.graphics.Rect
 import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import ai.diffforge.haider.service.presence.AccessibilityPresenceOverlay
+import ai.diffforge.haider.service.presence.CuPresence
 import ai.diffforge.haider.transport.CapabilityBus
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONArray
@@ -16,10 +18,16 @@ import java.util.ArrayDeque
 import kotlin.coroutines.resume
 
 class HaiderAccessibilityService : AccessibilityService() {
+    private var presenceOverlay: AccessibilityPresenceOverlay? = null
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         CapabilityBus.set(CAPABILITY, true)
+        val overlay = AccessibilityPresenceOverlay(this)
+        presenceOverlay = overlay
+        CuPresence.captureShield = overlay
+        CuPresence.controller.attach(overlay)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
@@ -150,6 +158,11 @@ class HaiderAccessibilityService : AccessibilityService() {
     }
 
     private fun clearInstance() {
+        presenceOverlay?.let { overlay ->
+            CuPresence.controller.detach(overlay)
+            if (CuPresence.captureShield === overlay) CuPresence.captureShield = null
+        }
+        presenceOverlay = null
         if (instance === this) {
             instance = null
             CapabilityBus.set(CAPABILITY, false)

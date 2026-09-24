@@ -1656,3 +1656,147 @@ async fn screenshot_region_redacts_before_crop_and_installs_delivered_mapping() 
             .any(|attachment| attachment.artifact == image.artifact)
     );
 }
+
+/// A backend that honours its action cancel token the way the real macOS
+/// backend does (returns `Cancelled` promptly instead of being dropped).
+struct CancelAwareBackend {
+    entered: Notify,
+}
+
+#[async_trait]
+impl ComputerBackend for CancelAwareBackend {
+    async fn execute(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<ComputerOutput> {
+        cancel.check()?;
+        if matches!(action, ComputerAction::Wait { .. }) {
+            self.entered.notify_one();
+            while !cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            return Err(ComputerError::Cancelled);
+        }
+        Ok(ComputerOutput::Confirmed {
+            action: "confirmed".into(),
+        })
+    }
+}
+
+/// Owner 2026-09-24 (cu-presence): the overlay's Stop button cancels the
+/// in-flight computer action at once AND the run, through the same
+/// receipt-backed turn cancellation as ESC, and no later CU action runs.
+/// MUTATION CHECK: drop the run cancel hook (or the in-flight cancel) from
+/// `CuPresence::stop`. Expected runtime failure: the run never reaches
+/// `Cancelled` / the follow-up click is executed.
+#[tokio::test]
+async fn presence_stop_cancels_the_in_flight_action_and_the_run() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "presence-wait".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "wait", "ms": 60_000}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "presence-wait".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "presence-click".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "left_click", "x": 1, "y": 1}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]));
+    let backend = Arc::new(CancelAwareBackend {
+        entered: Notify::new(),
+    });
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory::with_computer_backend(
+        Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+    ));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("presence-stop-session");
+    let run_id = RunId::new("presence-stop-run");
+    let device_id = DeviceId::new("presence-stop-device");
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    timeout(Duration::from_secs(8), backend.entered.notified())
+        .await
+        .expect("backend enters the in-flight wait");
+
+    // The human presses Stop on the overlay.
+    assert!(
+        crate::cu_presence::global().stop(haider_tools::presence::PresenceSurface::Screen) >= 1,
+        "the running computer-use run holds a screen presence lease"
+    );
+
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    // The provider may race ahead and REQUEST another action before the
+    // turn cancellation lands; it may be authorized but must never be
+    // dispatched to the OS.
+    let click_effects: Vec<EffectId> = events
+        .iter()
+        .filter_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::Effect(EffectPhase::Intent(intent)))
+                if intent.summary == "computer left_click" =>
+            {
+                Some(intent.effect)
+            }
+            _ => None,
+        })
+        .collect();
+    let dispatched_click = events.iter().any(|event| {
+        matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Effect(EffectPhase::Dispatched { ref effect }))
+                if click_effects.contains(effect)
+        )
+    });
+    assert!(
+        !dispatched_click,
+        "no CU action may be dispatched after Stop"
+    );
+    let wait_cancelled = events.iter().any(|event| {
+        matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Effect(EffectPhase::Outcome {
+                outcome: EffectOutcome::Cancelled,
+                ..
+            }))
+        )
+    });
+    assert!(wait_cancelled, "the in-flight wait is journaled Cancelled");
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}

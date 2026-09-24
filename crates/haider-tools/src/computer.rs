@@ -413,6 +413,14 @@ pub trait ComputerBackend: Send + Sync {
         self.set_viewport(width, height)
     }
 
+    /// The global desktop point (see [`crate::presence::PresencePoint`]) an
+    /// action will target, so the presence overlay can animate its agent
+    /// pointer there. `None` for actions without coordinates or before a
+    /// screenshot established the viewport.
+    fn presence_point(&self, _action: &ComputerAction) -> Option<crate::presence::PresencePoint> {
+        None
+    }
+
     /// Finalizes metadata against the image dimensions actually delivered.
     fn finalize_inspection(&self, _inspection: &mut ComputerInspection) -> ComputerResult<()> {
         Ok(())
