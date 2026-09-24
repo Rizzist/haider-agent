@@ -3175,6 +3175,10 @@ the original preceding provider error, including its retryability and typed
 timeout reason when present. A request that was silent from its first attempt
 has no preceding error. Genuine per-request response-open timeouts keep
 `provider_timeout` and their existing CLI exit 65. No RPC method is added.
+`elapsed_ms` is active logical-request time from the first attempt and excludes
+time spent uploading request bodies. It is not wall-clock request duration;
+`idle_elapsed_ms` is time since the last received provider progress, also
+excluding upload intervals.
 
 ### 15.7 Custom OpenAI-compatible providers (local or web)
 

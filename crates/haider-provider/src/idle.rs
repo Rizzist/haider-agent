@@ -15,6 +15,8 @@ tokio::task_local! {
 /// an initially silent request has no preceding failure to report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderIdleTimeout {
+    /// Active logical-request time; request-body upload intervals are excluded.
+    /// This is not wall-clock time from the first attempt to the timeout.
     pub elapsed_ms: u64,
     pub idle_elapsed_ms: u64,
     pub budget_ms: u64,

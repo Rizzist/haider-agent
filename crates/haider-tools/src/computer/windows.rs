@@ -6,8 +6,9 @@
 //! virtual-desktop space. CU-1 still owns image admission and downscaling:
 //! [`ComputerBackend::set_viewport`] records the dimensions delivered to the
 //! model, and model pixels map back with
-//! `floor(model_pixel * virtual_extent / admitted_extent)` before conversion
-//! to SendInput's inclusive 0..=65535 absolute range.
+//! `floor(model_pixel * image_region_extent / admitted_extent)` within the
+//! captured region before conversion against the full virtual desktop to
+//! SendInput's inclusive 0..=65535 absolute range.
 //!
 //! Windows has no TCC-style prompt. Screen capture and input do require an
 //! interactive desktop (services in session 0 do not have one). Windows UIPI
@@ -77,7 +78,8 @@ struct NativePoint {
 
 #[derive(Debug, Clone, Copy)]
 struct Viewport {
-    screen: VirtualScreen,
+    desktop: VirtualScreen,
+    image_region: VirtualScreen,
     image_width: u32,
     image_height: u32,
 }
@@ -344,27 +346,26 @@ impl WindowsComputerBackend {
     fn model_cursor_position(&self) -> ComputerResult<(u32, u32)> {
         let viewport = self.viewport()?;
         let point = Self::current_native_point()?;
-        let relative_x = i64::from(point.x) - i64::from(viewport.screen.left);
-        let relative_y = i64::from(point.y) - i64::from(viewport.screen.top);
+        let relative_x = i64::from(point.x) - i64::from(viewport.image_region.left);
+        let relative_y = i64::from(point.y) - i64::from(viewport.image_region.top);
         if relative_x < 0
             || relative_y < 0
-            || relative_x >= i64::from(viewport.screen.width)
-            || relative_y >= i64::from(viewport.screen.height)
+            || relative_x >= i64::from(viewport.image_region.width)
+            || relative_y >= i64::from(viewport.image_region.height)
         {
             return Err(ComputerError::InvalidAction {
-                message:
-                    "cursor is outside the virtual screen captured by the latest computer screenshot"
-                        .into(),
+                message: "cursor is outside the region captured by the latest computer screenshot"
+                    .into(),
             });
         }
         let x = u64::try_from(relative_x).map_err(|_| ComputerError::Backend {
             message: "Windows cursor X coordinate conversion failed".into(),
         })? * u64::from(viewport.image_width)
-            / u64::from(viewport.screen.width);
+            / u64::from(viewport.image_region.width);
         let y = u64::try_from(relative_y).map_err(|_| ComputerError::Backend {
             message: "Windows cursor Y coordinate conversion failed".into(),
         })? * u64::from(viewport.image_height)
-            / u64::from(viewport.screen.height);
+            / u64::from(viewport.image_region.height);
         Ok((x as u32, y as u32))
     }
 
@@ -387,7 +388,7 @@ impl WindowsComputerBackend {
 
     fn move_mouse(&self, point: NativePoint) -> ComputerResult<()> {
         let viewport = self.viewport()?;
-        let (dx, dy) = normalize_absolute(viewport.screen, point)?;
+        let (dx, dy) = normalize_viewport_point(viewport, point)?;
         Self::send_mouse(
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             dx,
@@ -810,21 +811,16 @@ impl ComputerBackend for WindowsComputerBackend {
             });
         }
         let mut state = self.lock_state()?;
-        let mut screen = state.pending_screen.ok_or_else(|| ComputerError::Backend {
+        let desktop = state.pending_screen.ok_or_else(|| ComputerError::Backend {
             message: "CU-1 viewport arrived without a matching Windows capture".into(),
         })?;
-        if let Some(crop) = crop {
-            screen.left += i32::try_from(crop.x).map_err(|_| ComputerError::InvalidAction {
-                message: "region x exceeds native range".into(),
-            })?;
-            screen.top += i32::try_from(crop.y).map_err(|_| ComputerError::InvalidAction {
-                message: "region y exceeds native range".into(),
-            })?;
-            screen.width = crop.width;
-            screen.height = crop.height;
-        }
+        let image_region = match crop {
+            Some(crop) => crop_region(desktop, crop)?,
+            None => desktop,
+        };
         state.viewport = Some(Viewport {
-            screen,
+            desktop,
+            image_region,
             image_width: width,
             image_height: height,
         });
@@ -896,6 +892,35 @@ fn no_interactive_desktop(message: String) -> ComputerError {
     }
 }
 
+fn crop_region(
+    desktop: VirtualScreen,
+    crop: super::ComputerScreenshotCrop,
+) -> ComputerResult<VirtualScreen> {
+    if crop.source_width != desktop.width
+        || crop.source_height != desktop.height
+        || crop.width == 0
+        || crop.height == 0
+        || u64::from(crop.x) + u64::from(crop.width) > u64::from(desktop.width)
+        || u64::from(crop.y) + u64::from(crop.height) > u64::from(desktop.height)
+    {
+        return Err(ComputerError::InvalidAction {
+            message: "invalid Windows screenshot crop bounds".into(),
+        });
+    }
+    let left = i64::from(desktop.left) + i64::from(crop.x);
+    let top = i64::from(desktop.top) + i64::from(crop.y);
+    Ok(VirtualScreen {
+        left: i32::try_from(left).map_err(|_| ComputerError::InvalidAction {
+            message: "region x exceeds native range".into(),
+        })?,
+        top: i32::try_from(top).map_err(|_| ComputerError::InvalidAction {
+            message: "region y exceeds native range".into(),
+        })?,
+        width: crop.width,
+        height: crop.height,
+    })
+}
+
 fn map_delivered_pixel(viewport: Viewport, point: ScreenPoint) -> ComputerResult<NativePoint> {
     if point.x >= viewport.image_width || point.y >= viewport.image_height {
         return Err(ComputerError::InvalidAction {
@@ -905,11 +930,11 @@ fn map_delivered_pixel(viewport: Viewport, point: ScreenPoint) -> ComputerResult
             ),
         });
     }
-    let relative_x =
-        u64::from(point.x) * u64::from(viewport.screen.width) / u64::from(viewport.image_width);
-    let relative_y =
-        u64::from(point.y) * u64::from(viewport.screen.height) / u64::from(viewport.image_height);
-    let x = i64::from(viewport.screen.left)
+    let relative_x = u64::from(point.x) * u64::from(viewport.image_region.width)
+        / u64::from(viewport.image_width);
+    let relative_y = u64::from(point.y) * u64::from(viewport.image_region.height)
+        / u64::from(viewport.image_height);
+    let x = i64::from(viewport.image_region.left)
         .checked_add(
             i64::try_from(relative_x).map_err(|_| ComputerError::Backend {
                 message: "mapped Windows x coordinate conversion failed".into(),
@@ -919,7 +944,7 @@ fn map_delivered_pixel(viewport: Viewport, point: ScreenPoint) -> ComputerResult
         .ok_or_else(|| ComputerError::InvalidAction {
             message: "mapped Windows x coordinate exceeds the virtual-screen range".into(),
         })?;
-    let y = i64::from(viewport.screen.top)
+    let y = i64::from(viewport.image_region.top)
         .checked_add(
             i64::try_from(relative_y).map_err(|_| ComputerError::Backend {
                 message: "mapped Windows y coordinate conversion failed".into(),
@@ -948,6 +973,12 @@ fn normalize_absolute(screen: VirtualScreen, point: NativePoint) -> ComputerResu
         normalize_axis(relative_x as u32, screen.width),
         normalize_axis(relative_y as u32, screen.height),
     ))
+}
+
+fn normalize_viewport_point(viewport: Viewport, point: NativePoint) -> ComputerResult<(i32, i32)> {
+    // SendInput's VIRTUALDESK flag always uses the complete virtual desktop,
+    // even when the last screenshot shown to the model was a crop.
+    normalize_absolute(viewport.desktop, point)
 }
 
 fn normalize_axis(offset: u32, extent: u32) -> i32 {
@@ -1214,13 +1245,15 @@ mod tests {
 
     #[test]
     fn delivered_cu1_pixels_map_through_negative_virtual_origin() {
+        let desktop = VirtualScreen {
+            left: -1_920,
+            top: -200,
+            width: 5_120,
+            height: 1_800,
+        };
         let viewport = Viewport {
-            screen: VirtualScreen {
-                left: -1_920,
-                top: -200,
-                width: 5_120,
-                height: 1_800,
-            },
+            desktop,
+            image_region: desktop,
             image_width: 2_560,
             image_height: 900,
         };
@@ -1230,6 +1263,143 @@ mod tests {
         };
         assert_eq!(point, NativePoint { x: 0, y: 700 });
         assert!(map_delivered_pixel(viewport, ScreenPoint { x: 2_560, y: 0 }).is_err());
+    }
+
+    fn cropped_viewport(
+        desktop: VirtualScreen,
+        crop: super::super::ComputerScreenshotCrop,
+        image_width: u32,
+        image_height: u32,
+    ) -> Viewport {
+        Viewport {
+            desktop,
+            image_region: crop_region(desktop, crop)
+                .unwrap_or_else(|error| panic!("valid crop: {error}")),
+            image_width,
+            image_height,
+        }
+    }
+
+    #[test]
+    fn offset_crop_normalizes_against_full_desktop() {
+        let desktop = VirtualScreen {
+            left: 0,
+            top: 0,
+            width: 1_920,
+            height: 1_080,
+        };
+        let viewport = cropped_viewport(
+            desktop,
+            super::super::ComputerScreenshotCrop {
+                x: 400,
+                y: 200,
+                width: 800,
+                height: 600,
+                source_width: 1_920,
+                source_height: 1_080,
+            },
+            800,
+            600,
+        );
+        for (model, native, normalized) in [
+            (
+                ScreenPoint { x: 0, y: 0 },
+                NativePoint { x: 400, y: 200 },
+                (13_660, 12_147),
+            ),
+            (
+                ScreenPoint { x: 799, y: 599 },
+                NativePoint { x: 1_199, y: 799 },
+                (40_946, 48_528),
+            ),
+        ] {
+            assert_eq!(map_delivered_pixel(viewport, model), Ok(native));
+            assert_eq!(normalize_viewport_point(viewport, native), Ok(normalized));
+        }
+        assert_ne!(
+            normalize_absolute(desktop, NativePoint { x: 400, y: 200 }),
+            Ok((0, 0))
+        );
+    }
+
+    #[test]
+    fn negative_origin_downscaled_crop_maps_edge_pixels() {
+        let desktop = VirtualScreen {
+            left: -1_920,
+            top: -200,
+            width: 5_120,
+            height: 1_800,
+        };
+        let viewport = cropped_viewport(
+            desktop,
+            super::super::ComputerScreenshotCrop {
+                x: 400,
+                y: 200,
+                width: 800,
+                height: 600,
+                source_width: 5_120,
+                source_height: 1_800,
+            },
+            400,
+            300,
+        );
+        assert_eq!(
+            map_delivered_pixel(viewport, ScreenPoint { x: 0, y: 0 }),
+            Ok(NativePoint { x: -1_520, y: 0 })
+        );
+        assert_eq!(
+            map_delivered_pixel(viewport, ScreenPoint { x: 399, y: 299 }),
+            Ok(NativePoint { x: -722, y: 598 })
+        );
+        assert!(map_delivered_pixel(viewport, ScreenPoint { x: 400, y: 0 }).is_err());
+        assert!(map_delivered_pixel(viewport, ScreenPoint { x: 0, y: 300 }).is_err());
+    }
+
+    #[test]
+    fn mapped_pixels_round_trip_through_absolute_virtual_desktop() {
+        let desktops = [
+            VirtualScreen {
+                left: 0,
+                top: 0,
+                width: 1_920,
+                height: 1_080,
+            },
+            VirtualScreen {
+                left: -1_920,
+                top: -200,
+                width: 5_120,
+                height: 1_800,
+            },
+        ];
+        for desktop in desktops {
+            let crop = super::super::ComputerScreenshotCrop {
+                x: 400,
+                y: 200,
+                width: 800,
+                height: 600,
+                source_width: desktop.width,
+                source_height: desktop.height,
+            };
+            for (width, height) in [(800, 600), (400, 300), (1_429, 804)] {
+                let viewport = cropped_viewport(desktop, crop, width, height);
+                for y in (0..height).step_by(7).chain(std::iter::once(height - 1)) {
+                    for x in (0..width).step_by(7).chain(std::iter::once(width - 1)) {
+                        let native = map_delivered_pixel(viewport, ScreenPoint { x, y })
+                            .unwrap_or_else(|error| panic!("pixel maps into desktop: {error}"));
+                        let (dx, dy) = normalize_viewport_point(viewport, native)
+                            .unwrap_or_else(|error| panic!("native point normalizes: {error}"));
+                        // Approximate SendInput's inclusive 0..=65535 ->
+                        // virtual-desktop pixel conversion at each axis.
+                        let landed_x = i64::from(desktop.left)
+                            + i64::from(dx) * i64::from(desktop.width - 1) / 65_535;
+                        let landed_y = i64::from(desktop.top)
+                            + i64::from(dy) * i64::from(desktop.height - 1) / 65_535;
+                        assert!((landed_x - i64::from(native.x)).abs() <= 1);
+                        assert!((landed_y - i64::from(native.y)).abs() <= 1);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
