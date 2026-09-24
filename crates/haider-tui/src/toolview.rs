@@ -567,25 +567,48 @@ pub fn unique_line_of(haystack: &str, needle: &str) -> Option<usize> {
 /// Resolve the file line each replacement of one edit call landed on, from
 /// the edited file as read right after the call settled (973-tui-toolview
 /// repair: the tools carry no edit coordinates, so this is the only source,
-/// and it answers `None` wherever it cannot be CERTAIN).
+/// and it answers `None` wherever it cannot PROVE the number).
 ///
 /// * A `replace_all` edit has no single location → `None`.
 /// * A replacement whose text occurs zero or several times in the file is
 ///   ambiguous (`READY` already on line 1 when line 4 became `READY`) →
 ///   `None`.
-/// * A call with several edits that change line counts numbers nothing:
-///   removed rows are numbered in the PRE-edit file, and an earlier edit's
-///   line shift would make those numbers wrong.
+/// * A call with several edits is numbered only when EVERY replacement
+///   keeps its newline count (`'\n'` bytes — so a joined or split line
+///   boundary, a trailing-newline change, a CRLF line added or removed, or
+///   an insertion all count as a shift). Removed rows are numbered in the
+///   PRE-edit file, so any shift above a later replacement would make its
+///   numbers wrong: `"a\n" → "a"` then `c → C` moves `c` from line 3 to 2
+///   while `lines()` still counts one line on each side (verify 3).
+/// * A call with several edits is also refused when one replacement's text
+///   occurs inside another's old or new text, or its old text inside
+///   another's new text: one edit may have consumed, re-created or created
+///   the other's text, so an occurrence may not be where THIS edit acted.
+///
+/// A single edit needs neither guard: its old text started on the same line
+/// its new text starts on, and nothing else in the call moved either.
 #[must_use]
 pub fn resolve_edit_anchors(pairs: &[EditPair], content: &str) -> Vec<Option<usize>> {
-    let shifts = pairs.len() > 1
+    let newlines = |text: &str| text.bytes().filter(|byte| *byte == b'\n').count();
+    let several = pairs.len() > 1;
+    let shifts = several
         && pairs
             .iter()
-            .any(|pair| pair.old.lines().count() != pair.new.lines().count());
+            .any(|pair| newlines(&pair.old) != newlines(&pair.new));
+    let entangled = several
+        && pairs.iter().enumerate().any(|(index, pair)| {
+            !pair.new.is_empty()
+                && pairs.iter().enumerate().any(|(other_index, other)| {
+                    other_index != index
+                        && (other.old.contains(&pair.new)
+                            || other.new.contains(&pair.new)
+                            || (!pair.old.is_empty() && other.new.contains(&pair.old)))
+                })
+        });
     pairs
         .iter()
         .map(|pair| {
-            if shifts || pair.replace_all {
+            if shifts || entangled || pair.replace_all {
                 None
             } else {
                 unique_line_of(content, &pair.new)

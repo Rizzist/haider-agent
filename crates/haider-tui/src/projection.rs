@@ -196,7 +196,7 @@ impl ItemBlock {
         if let Some(payload) = result_payload
             && (self.output_tail.is_empty() || self.output_truncated)
         {
-            let (text, limit_reached) = readable_payload(payload);
+            let (text, limit_reached) = self.readable_payload(payload);
             return OutputView {
                 text,
                 tail_cut: false,
@@ -222,7 +222,7 @@ impl ItemBlock {
         if self.output_tail.is_empty()
             && let Some(result) = &self.tool_result
         {
-            let (text, limit_reached) = readable_payload(result.payload_text());
+            let (text, limit_reached) = self.readable_payload(result.payload_text());
             return OutputView {
                 text,
                 tail_cut: false,
@@ -256,6 +256,28 @@ impl ItemBlock {
             pageable: result.cursor.is_some(),
             stored: result.artifact.is_some(),
         })
+    }
+
+    /// [`readable_payload`] only for tools whose result IS an envelope
+    /// (verify 3): execution (`{"output": …}`) and workspace writes/edits
+    /// (`{"result": "edited …", "mutation_digest": …}`). Any other tool's
+    /// JSON that merely has an `output`/`result` key (a fetched API
+    /// response, a file read) is content, and is shown exactly as sent.
+    fn readable_payload<'a>(&self, payload: &'a str) -> (std::borrow::Cow<'a, str>, bool) {
+        use crate::toolview::ToolKind;
+        let execution = match &self.item {
+            TurnItem::ToolCall { name, .. } => matches!(
+                crate::toolview::tool_kind(name),
+                ToolKind::Shell | ToolKind::Write | ToolKind::Edit
+            ),
+            TurnItem::CommandExecution { .. } => true,
+            _ => false,
+        };
+        if execution {
+            readable_payload(payload)
+        } else {
+            (std::borrow::Cow::Borrowed(payload), false)
+        }
     }
 
     /// The typed search match count, when the joined result carries one.

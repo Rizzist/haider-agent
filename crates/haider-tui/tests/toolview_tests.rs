@@ -859,3 +859,197 @@ fn every_tool_row_text_ink_clears_4_5_on_its_ground_in_every_theme() {
         assert_ne!(theme.diff_added_ground(), theme.diff_removed_ground());
     }
 }
+
+// ---- 973 repair 3: line numbers only when PROVABLY right ----------------
+
+/// Apply an edit call the way the filesystem tool does: each replacement
+/// on the current text, first occurrence.
+fn apply_edits(before: &str, pairs: &[tv::EditPair]) -> String {
+    let mut text = before.to_owned();
+    for pair in pairs {
+        text = text.replacen(&pair.old, &pair.new, 1);
+    }
+    text
+}
+
+/// The file line of `needle` in `text` (test oracle, first occurrence).
+fn line_in(text: &str, needle: &str) -> usize {
+    let at = text.find(needle).expect("needle present");
+    text[..at].matches('\n').count() + 1
+}
+
+/// Every number the resolver hands out must be the replacement's REAL line
+/// in the pre-edit file (removed rows) and the post-edit file (added rows).
+fn assert_numbers_are_true(before: &str, pairs: &[tv::EditPair]) -> Vec<Option<usize>> {
+    let after = apply_edits(before, pairs);
+    let anchors = tv::resolve_edit_anchors(pairs, &after);
+    // The TRUE lines, simulated: where each replacement's old text was
+    // found (in the text as it stood when that replacement ran) and where
+    // its new text ended up.
+    let mut text = before.to_owned();
+    let mut found = Vec::new();
+    let mut shifted = false;
+    for pair in pairs {
+        found.push(line_in(&text, &pair.old));
+        shifted |= pair.old.matches('\n').count() != pair.new.matches('\n').count();
+        text = text.replacen(&pair.old, &pair.new, 1);
+    }
+    for ((pair, anchor), old_line) in pairs.iter().zip(&anchors).zip(&found) {
+        if let Some(line) = anchor {
+            assert_eq!(
+                *line,
+                line_in(&after, &pair.new),
+                "post-edit line of {pair:?}"
+            );
+            assert_eq!(line, old_line, "pre-edit line of {pair:?}");
+            if pairs.len() > 1 {
+                // With several edits, the intermediate text's lines are the
+                // ORIGINAL file's lines only because nothing shifted.
+                assert!(!shifted, "a shifting call was numbered: {pairs:?}");
+            }
+        }
+    }
+    anchors
+}
+
+/// Verify 3's exact case: deleting the boundary newline joins `a` and `b`,
+/// so `c` moves from line 3 to line 2 while `lines()` counts one line on
+/// each side of the first replacement. Nothing may be numbered.
+#[test]
+fn a_deleted_line_boundary_unnumbers_the_call() {
+    let before = "a\nb\nc\n";
+    let pairs = [pair("a\n", "a"), pair("c", "C")];
+    assert_eq!(apply_edits(before, &pairs), "ab\nC\n");
+    assert_eq!(assert_numbers_are_true(before, &pairs), vec![None, None]);
+    // …and the mirror case, verify 3's second repro: an ADDED boundary.
+    let before = "a\nb\n";
+    let pairs = [pair("a", "a\n"), pair("b", "B")];
+    assert_eq!(apply_edits(before, &pairs), "a\n\nB\n");
+    assert_eq!(assert_numbers_are_true(before, &pairs), vec![None, None]);
+}
+
+#[test]
+fn crlf_boundaries_count_as_shifts_and_crlf_preserving_edits_are_numbered() {
+    let before = "a\r\nb\r\nc\r\n";
+    let joined = [pair("a\r\n", "a"), pair("c", "C")];
+    assert_eq!(assert_numbers_are_true(before, &joined), vec![None, None]);
+    let kept = [pair("a\r\n", "A\r\n"), pair("c", "C")];
+    assert_eq!(
+        assert_numbers_are_true(before, &kept),
+        vec![Some(1), Some(3)]
+    );
+}
+
+#[test]
+fn a_trailing_newline_change_at_eof_counts_as_a_shift() {
+    // EOF without a newline: adding one is a newline-count change.
+    let before = "x\ny\nlast";
+    let added = [pair("x", "X"), pair("last", "last\n")];
+    assert_eq!(assert_numbers_are_true(before, &added), vec![None, None]);
+    // A single edit at EOF needs no guard and is numbered truly.
+    assert_eq!(
+        assert_numbers_are_true(before, &[pair("last", "LAST")]),
+        vec![Some(3)]
+    );
+    // Removing the final newline in a multi-edit call is also a shift.
+    let before = "x\ny\n";
+    let removed = [pair("x", "X"), pair("y\n", "y")];
+    assert_eq!(assert_numbers_are_true(before, &removed), vec![None, None]);
+}
+
+#[test]
+fn insertions_shift_every_later_replacement() {
+    let before = "a\nb\nc\nd\n";
+    let inserted = [pair("b\n", "b\nNEW\n"), pair("d", "D")];
+    assert_eq!(assert_numbers_are_true(before, &inserted), vec![None, None]);
+    // Alone, an insertion is numbered at the line it starts on.
+    assert_eq!(
+        assert_numbers_are_true(before, &[pair("b\n", "b\nNEW\n")]),
+        vec![Some(2)]
+    );
+    let diff = tv::tool_diff(
+        "edit",
+        &json!({"file_path": "a", "old_string": "b\n", "new_string": "b\nNEW\n"}),
+        &[Some(2)],
+    )
+    .unwrap();
+    let numbered: Vec<(DiffKind, Option<usize>, &str)> = diff
+        .lines
+        .iter()
+        .map(|line| (line.kind, line.number, line.text.as_str()))
+        .collect();
+    assert_eq!(
+        numbered,
+        vec![
+            (DiffKind::Context, Some(2), "b"),
+            (DiffKind::Added, Some(3), "NEW"),
+        ],
+        "the inserted line is the file's line 3"
+    );
+}
+
+#[test]
+fn replacements_that_touch_each_others_text_are_not_numbered() {
+    // Edit 2 consumes edit 1's text and re-creates it elsewhere: its one
+    // occurrence is edit 2's, not edit 1's.
+    let before = "p\nq\nr\n";
+    let pairs = [pair("p", "Z"), pair("r", "Z-r")];
+    assert_eq!(assert_numbers_are_true(before, &pairs), vec![None, None]);
+    // Independent, newline-preserving replacements ARE numbered.
+    let pairs = [pair("p", "P"), pair("r", "R")];
+    assert_eq!(
+        assert_numbers_are_true(before, &pairs),
+        vec![Some(1), Some(3)]
+    );
+}
+
+/// Exhaustive sweep: over many small files and edit pairs, the resolver
+/// never hands out a number that is not the true pre- AND post-edit line.
+#[test]
+fn no_resolved_number_is_ever_wrong_over_a_sweep() {
+    let files = [
+        "a\nb\nc\n",
+        "a\nb\nc",
+        "a\r\nb\r\nc\r\n",
+        "\na\n\nb\n",
+        "ab\ncd\nef\n",
+    ];
+    let edits = [
+        ("a", "A"),
+        ("a\n", "a"),
+        ("a", "a\n"),
+        ("b\n", ""),
+        ("b", "b\nX"),
+        ("c", "C"),
+        ("\n", ""),
+        ("cd", "c\nd"),
+        ("ef", "EF"),
+        ("b", "BB"),
+    ];
+    let mut numbered = 0usize;
+    for file in files {
+        for first in edits {
+            for second in edits {
+                let pairs = [pair(first.0, first.1), pair(second.0, second.1)];
+                // Only calls the tool would accept: each old text matches.
+                let mut text = file.to_owned();
+                let mut valid = true;
+                for p in &pairs {
+                    if !text.contains(&p.old) {
+                        valid = false;
+                        break;
+                    }
+                    text = text.replacen(&p.old, &p.new, 1);
+                }
+                if !valid {
+                    continue;
+                }
+                numbered += assert_numbers_are_true(file, &pairs)
+                    .iter()
+                    .flatten()
+                    .count();
+            }
+        }
+    }
+    assert!(numbered > 0, "the sweep exercises numbered cases too");
+}

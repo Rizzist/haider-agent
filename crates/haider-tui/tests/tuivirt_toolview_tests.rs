@@ -1453,4 +1453,88 @@ fn an_execution_envelope_shows_its_output_not_its_json() {
     );
     assert!(raw.open_tool_detail("raw"));
     assert!(draw(&raw, 118, 36).contains("{\"a\": 1}"));
+    // Verify 3: a NON-execution tool's JSON that merely has an `output`
+    // key is content, never unwrapped.
+    let mut api = session_model();
+    let body = serde_json::json!({"output": "ONLY_THE_OUTPUT", "other": "KEEP_ME"}).to_string();
+    push_tool(
+        &mut api,
+        "api",
+        "web_fetch",
+        serde_json::json!({"url": "https://api.test"}),
+        "",
+        ok(&body),
+    );
+    assert!(api.open_tool_detail("api"));
+    let view = draw(&api, 118, 36);
+    assert!(view.contains("KEEP_ME"), "{}", view.rows.join("\n"));
+    // A workspace write/edit result IS an envelope: its sentence is shown,
+    // not its digests (live finding, repair 3).
+    let mut edit = session_model();
+    let body = serde_json::json!({
+        "mutation_digest": "blake3:feedface",
+        "result": "edited notes.md (2 replacements)",
+    })
+    .to_string();
+    push_tool(
+        &mut edit,
+        "edit",
+        "fs_edit",
+        serde_json::json!({"path": "notes.md", "edits": [{"old": "a", "new": "b"}]}),
+        "",
+        ok(&body),
+    );
+    assert!(edit.open_tool_detail("edit"));
+    let view = draw(&edit, 118, 36);
+    assert!(
+        view.contains("edited notes.md (2 replacements)"),
+        "{}",
+        view.rows.join("\n")
+    );
+    assert!(!view.contains("blake3:feedface"));
+}
+
+/// Verify 3's live repro, end to end through the real anchor path: a
+/// boundary-newline deletion followed by `c → C` is shown UNNUMBERED.
+#[test]
+fn the_boundary_newline_edit_is_shown_unnumbered() {
+    let dir = tempfile::tempdir().unwrap();
+    // The file as the edit left it: `a\nb\nc\n` → `ab\nC\n`.
+    std::fs::write(dir.path().join("boundary.txt"), "ab\nC\n").unwrap();
+    let mut model = session_model();
+    model.cwd = dir.path().display().to_string();
+    model.clock_ms = 1_700_000_000_000;
+    let args = serde_json::json!({
+        "path": "boundary.txt",
+        "edits": [{"old": "a\n", "new": "a"}, {"old": "c", "new": "C"}],
+    });
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("eb"),
+            item: tool("eb", "fs_edit", args.clone(), ToolStatus::InProgress),
+        }),
+    );
+    model.note_tool_timings();
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("eb"),
+            item: tool("eb", "fs_edit", args, ToolStatus::Completed),
+        }),
+    );
+    model.clock_ms += 20;
+    model.note_tool_timings();
+    model.note_edit_anchors();
+    assert_eq!(model.edit_anchors.get("eb"), Some(&vec![None, None]));
+    let frame = draw(&model, 118, 36);
+    let text = frame.rows.join("\n");
+    assert!(
+        frame.contains("      - c") && frame.contains("      + C"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("2 - c") && !text.contains("3 - c"),
+        "never numbered: {text}"
+    );
 }
