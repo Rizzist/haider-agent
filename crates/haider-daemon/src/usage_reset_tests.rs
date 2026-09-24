@@ -35,6 +35,7 @@ fn journal_identifiers_derive_from_the_approval_id() {
         event_id("dispatched", approval).as_str(),
         "usage-reset-dispatched-usage-reset-abc"
     );
+    assert_eq!(notification_id(approval), "usage-reset-abc");
 }
 
 #[test]
@@ -76,6 +77,20 @@ fn approval_menu_is_nonblocking_human_only_and_secret_free() {
     assert_eq!(
         intent.args_digest,
         format!("blake3:{}", blake3::hash(b"work-chatgpt").to_hex())
+    );
+}
+
+#[test]
+fn reset_policy_denial_precedes_a_deferred_menu_even_with_auto_allow() {
+    let account = CredentialAlias::new("work-chatgpt");
+    let intent = intent("usage-reset-abc", &account);
+    let mut policy = haider_tools::PermissionPolicy::default();
+    policy.auto_allow_asks();
+    assert_eq!(policy.denial_reason(&intent), None);
+    policy.deny(EffectClass::UsageResetApply, "account reset denied");
+    assert_eq!(
+        policy.denial_reason(&intent).as_deref(),
+        Some("account reset denied")
     );
 }
 

@@ -3594,10 +3594,29 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
         )
         .await
         .expect("deny commits");
-    let events = store
-        .read(&session, 0, 64)
-        .await
-        .expect("read denied approval");
+    let events = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = store
+                .read(&session, 0, 64)
+                .await
+                .expect("read denied approval");
+            if events.iter().any(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { ref kind, ref data },
+                        ..
+                    })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+                        && data["status"] == "denied"
+                )
+            }) {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("denial publishes a typed result without blocking the answer");
     assert!(events.iter().any(|event| matches!(
         event.payload.decode_event(),
         Ok(EventPayload::Effect(EffectPhase::Authorized {
@@ -3654,6 +3673,365 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
     drop(connection);
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
+}
+
+struct ResetTestTokens;
+
+fn reset_test_descriptor(
+    account: haider_protocol::ids::CredentialAlias,
+) -> haider_protocol::credential::CredentialDescriptor {
+    haider_protocol::credential::CredentialDescriptor {
+        alias: account,
+        provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::OAuth,
+        identity: "fake@example.invalid".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(haider_protocol::credential::AccountIdentity {
+            email: None,
+            display_name: None,
+            account_id: Some("synthetic-account".into()),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+        created_at_ms: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::usage_report::MeterTokenSource for ResetTestTokens {
+    async fn bearer(
+        &self,
+        _descriptor: &haider_protocol::credential::CredentialDescriptor,
+    ) -> Result<haider_accounts::SecretHandle, haider_provider::MeterUnavailable> {
+        let vault = haider_accounts::MemoryVault::default();
+        let alias = haider_protocol::ids::CredentialAlias::new("fake-reset-token");
+        vault.put(&alias, b"fake-token").expect("mint fake token");
+        vault
+            .resolve(&alias)
+            .map_err(|_| haider_provider::MeterUnavailable::new("fake_token_unavailable"))
+    }
+}
+
+#[derive(Default)]
+struct SlowResetHttp {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    posts: AtomicUsize,
+    request_ids: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::usage_report::UsageMeterHttp for SlowResetHttp {
+    async fn get(
+        &self,
+        _url: &str,
+        _bearer: &haider_accounts::SecretHandle,
+        _extra_headers: &[(&'static str, &'static str)],
+        _chatgpt_account_id: Option<&str>,
+    ) -> Result<crate::usage_report::UsageMeterHttpResponse, haider_provider::MeterUnavailable>
+    {
+        panic!("reset test must not fetch a meter");
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        _bearer: &haider_accounts::SecretHandle,
+        _extra_headers: &[(&'static str, &'static str)],
+        _chatgpt_account_id: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<crate::usage_report::UsageMeterHttpResponse, haider_provider::MeterUnavailable>
+    {
+        assert_eq!(url, haider_provider::OPENAI_OAUTH_RESET_CONSUME_URL);
+        self.request_ids.lock().expect("request ids").push(
+            body["redeem_request_id"]
+                .as_str()
+                .expect("idempotency key")
+                .to_owned(),
+        );
+        self.posts.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(crate::usage_report::UsageMeterHttpResponse {
+            status: 200,
+            body: br#"{"code":"reset","windows_reset":1}"#.to_vec(),
+            retry_after: None,
+        })
+    }
+}
+
+/// MUTATION CHECK: awaiting the fake POST in `menu_answer` times out before
+/// the correlated response and blocks the replay request on that connection.
+#[tokio::test]
+async fn usage_reset_answer_replies_while_post_waits_and_crash_never_retries() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("slow-usage-reset");
+    hub.create_internal_session(create_command(&session, "slow-usage-reset"))
+        .await
+        .expect("session created");
+    let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+    let snapshot = Arc::new(Mutex::new(vec![reset_test_descriptor(account.clone())]));
+    let http = Arc::new(SlowResetHttp::default());
+    hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+        snapshot,
+        Some(Arc::new(ResetTestTokens)),
+        http.clone(),
+    )))
+    .expect("usage service installs");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("slow-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attached");
+    connection
+        .request(
+            haider_rpc::RequestId::new("slow-open"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("slow-command"),
+                session_id: session.clone(),
+                account: account.clone(),
+            },
+        )
+        .await
+        .expect("approval opened");
+    let (approval_id, menu_id, request_seq, generation) = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    haider_rpc::ResponseBody::UsageResetApply {
+                        result,
+                        menu_id,
+                        request_seq,
+                        worker_generation,
+                    },
+            } if request_id.as_str() == "slow-open" => Some((
+                result.approval_id.clone(),
+                menu_id.clone(),
+                *request_seq,
+                *worker_generation,
+            )),
+            _ => None,
+        })
+        .expect("pending response");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        connection.menu_answer(
+            Some(haider_rpc::RequestId::new("slow-approve")),
+            haider_rpc::CommandId::new("slow-answer"),
+            session.clone(),
+            menu_id.clone(),
+            request_seq,
+            generation,
+            "approve".into(),
+            0,
+            None,
+        ),
+    )
+    .await
+    .expect("answer must not await provider")
+    .expect("answer committed");
+    tokio::time::timeout(Duration::from_secs(3), http.started.notified())
+        .await
+        .expect("fake POST started");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::MenuAnswer { .. },
+        } if request_id.as_str() == "slow-approve"
+    )));
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        connection.request(
+            haider_rpc::RequestId::new("slow-replay"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("slow-command"),
+                session_id: session.clone(),
+                account: account.clone(),
+            },
+        ),
+    )
+    .await
+    .expect("same connection remains responsive")
+    .expect("replay request answered");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        connection.menu_answer(
+            Some(haider_rpc::RequestId::new("duplicate-approve")),
+            haider_rpc::CommandId::new("duplicate-answer"),
+            session.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            "approve".into(),
+            0,
+            None,
+        ),
+    )
+    .await
+    .expect("duplicate answer is responsive")
+    .expect("duplicate gets typed refusal");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::Error { .. },
+        } if request_id.as_str() == "duplicate-approve"
+    )));
+    assert_eq!(http.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        http.request_ids.lock().expect("ids").as_slice(),
+        std::slice::from_ref(&approval_id)
+    );
+
+    // Simulate a process dying while the provider request is in flight. The
+    // durable claim has already committed; no terminal outcome can be known.
+    let task = hub
+        .inner
+        .actor_tasks
+        .lock()
+        .expect("tasks")
+        .pop()
+        .expect("reset task");
+    task.abort();
+    let _ = task.await;
+    let events = store.read(&session, 0, 128).await.expect("journal");
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Outcome { .. }))
+    )));
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen journal");
+    assert!(reopened.worker_generation() > generation);
+    let restarted_hub =
+        SessionHub::new(reopened.clone(), SessionHubConfig::default()).expect("restart hub");
+    let replay_snapshot = Arc::new(Mutex::new(vec![reset_test_descriptor(account.clone())]));
+    restarted_hub
+        .install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+            replay_snapshot,
+            Some(Arc::new(ResetTestTokens)),
+            http.clone(),
+        )))
+        .expect("restart service");
+    let replay_sink = Arc::new(CapturingFrameSink::default());
+    let replay_connection = restarted_hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            replay_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("restart connection");
+    let head_before_replay = reopened.latest_seq(&session).await.expect("restart head");
+    replay_connection
+        .request(
+            haider_rpc::RequestId::new("after-crash-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head_before_replay,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("restart control attachment");
+    replay_connection
+        .request(
+            haider_rpc::RequestId::new("after-crash-replay"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("slow-command"),
+                session_id: session.clone(),
+                account: account.clone(),
+            },
+        )
+        .await
+        .expect("durable replay");
+    assert_eq!(
+        reopened
+            .latest_seq(&session)
+            .await
+            .expect("head after replay"),
+        head_before_replay,
+        "restart must not create another approval or dispatch"
+    );
+    assert!(
+        replay_sink
+            .0
+            .lock()
+            .expect("frames")
+            .iter()
+            .any(|frame| matches!(
+                frame,
+                WireFrame::Response {
+                    request_id,
+                    body: haider_rpc::ResponseBody::UsageResetApply { result, .. },
+                } if request_id.as_str() == "after-crash-replay"
+                    && result.approval_id == approval_id
+            ))
+    );
+    assert_eq!(
+        http.posts.load(Ordering::SeqCst),
+        1,
+        "restart cannot retry a POST"
+    );
+    let status = crate::usage_reset::unresolved_status(
+        &approval_id,
+        &account,
+        &crate::usage_reset::UnresolvedApproval {
+            answer: Some("approve".into()),
+            answer_generation: Some(generation),
+            dispatched_generation: Some(generation),
+        },
+        reopened.worker_generation(),
+    );
+    assert_eq!(
+        status.reason.as_deref(),
+        Some("provider_outcome_unconfirmed")
+    );
+    drop(replay_connection);
+    restarted_hub.shutdown().await.expect("restarted hub stops");
+    reopened.close().await.expect("reopened store closes");
 }
 
 /// An available empty history read is successful absence, not subsystem

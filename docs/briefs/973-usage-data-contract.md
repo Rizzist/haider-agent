@@ -53,9 +53,12 @@ The agent can also call `usage_reset_apply` again with `approval_id` to poll
 the durable state. Denial never sends a consume request. A failed or lost
 provider response can leave the spending outcome unknown.
 
-The only consume caller is the human-facing RPC `menu_answer` completion in
-`session_hub/usage_reset_rpc.rs::finish_usage_reset_approval`. It persists `Dispatched`
-before the POST. Agent polling in `worker_usage_reset.rs::usage_reset_status` reads the
+The only consume caller is the hub-owned completion task launched by a committed
+human `menu_answer` in `session_hub/usage_reset_rpc.rs`. The RPC persists
+`Dispatched` before handing off the single POST and replies without waiting
+for the provider or steer delivery. A hub shutdown joins the task; forced
+shutdown can leave its outcome unconfirmed. Agent polling in
+`worker_usage_reset.rs::usage_reset_status` reads the
 result and never calls the provider. Shared identifiers, the approval menu
 and the poll-status derivation live in `usage_reset.rs`. If the daemon stops after dispatch but
 before recording a result, polling reports `provider_outcome_unconfirmed` and
@@ -67,3 +70,16 @@ approval mechanism; retain the human-only policy and dispatch-before-POST
 ordering.
 An interrupted approval with no durable dispatch is reported as
 `approval_interrupted_before_dispatch`; it is safe to open a fresh approval.
+
+The notification id for new completions is the already-prefixed approval id
+(`usage-reset-<hex>`). Earlier `usage-reset-usage-reset-<hex>` notification
+ids, and all persisted menu, item, effect, and event ids, remain valid as
+written; no journal migration or replay rewrite is needed.
+
+The active Haider Code account poller fetches `/v1/account` even when no
+provider session is attached. That network behavior is intentional so the
+account meter stays current. It never polls without an active account; a
+provider refresh hint is floored at 15 seconds, and missing hints or
+transient failures use a 60-second fallback. Switching the active account
+starts a fresh request immediately, so the 15-second floor bounds refreshes
+for an unchanged active account rather than user-driven account switches.

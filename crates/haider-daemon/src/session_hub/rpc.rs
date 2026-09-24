@@ -18937,14 +18937,26 @@ impl HubConnection {
                     effect: EffectClass::UsageResetApply,
                     account: Some(account),
                 } = &menu.kind
+                    && let Err(error) = self
+                        .finish_usage_reset_approval(
+                            envelope,
+                            account,
+                            approval_id,
+                            &recovery_answer,
+                        )
+                        .await
                 {
-                    self.finish_usage_reset_approval(
-                        envelope,
-                        account,
-                        approval_id,
-                        &recovery_answer,
-                    )
-                    .await?;
+                    // The answer has already committed. A dispatch or
+                    // encode failure must still get a correlated reply;
+                    // the journal remains the authority for a later poll.
+                    tracing::error!(%approval_id, ?error, "usage reset dispatch failed");
+                    return self.menu_error(
+                        request_id,
+                        "usage_reset_dispatch_failed",
+                        "usage reset could not be dispatched; inspect approval status",
+                        false,
+                        None,
+                    );
                 }
                 if let Some(resolved) = command_menu {
                     return self

@@ -50,6 +50,13 @@ pub(crate) fn event_id(stage: &str, approval_id: &str) -> EventId {
     EventId::new(format!("usage-reset-{stage}-{approval_id}"))
 }
 
+/// The approval id already carries the `usage-reset-` prefix. Older doubled
+/// notification ids remain in persisted turns; only new delivery ids use
+/// this form. Journal event and item ids retain their established formats.
+pub(crate) fn notification_id(approval_id: &str) -> &str {
+    approval_id
+}
+
 pub(crate) fn intent(approval_id: &str, account: &CredentialAlias) -> EffectIntent {
     EffectIntent {
         effect: effect_id(approval_id),

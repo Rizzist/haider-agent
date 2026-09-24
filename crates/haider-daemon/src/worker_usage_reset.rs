@@ -80,6 +80,9 @@ impl BrokerToolDispatcher {
         }
         let menu = usage_reset::approval_menu(&approval_id, &request.account);
         let intent = usage_reset::intent(&approval_id, &request.account);
+        if let Some(reason) = self.policy.lock().await.denial_reason(&intent) {
+            return Ok(self.permission_denial_result(reason).await);
+        }
         let effect = intent.effect.clone();
         append_payloads(
             &self.output.store,

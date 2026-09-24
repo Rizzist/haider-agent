@@ -938,7 +938,13 @@ async fn collect_device_reset_history(
         }
     }
     for entries in histories.values_mut() {
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.reset_at_ms));
+        entries.sort_by(|left, right| {
+            right
+                .reset_at_ms
+                .cmp(&left.reset_at_ms)
+                .then_with(|| left.window.cmp(&right.window))
+                .then_with(|| left.observed_at_ms.cmp(&right.observed_at_ms))
+        });
         entries.truncate(PREVIOUS_RESETS_LIMIT);
     }
     Ok(histories)

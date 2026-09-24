@@ -476,6 +476,17 @@ impl PermissionPolicy {
         self.denylist.iter().map(|rule| &rule.class)
     }
 
+    /// Checks explicit and daemon deny rules without recording an effect or
+    /// opening a broker menu. Deferred human approvals use this before they
+    /// journal their own nonblocking menu; ordinary allows still require a
+    /// fresh human answer for a finite usage reset credit.
+    pub fn denial_reason(&self, intent: &EffectIntent) -> Option<String> {
+        match self.decision(intent) {
+            PolicyDecision::Deny { reason } => Some(reason),
+            PolicyDecision::Allow | PolicyDecision::Ask => None,
+        }
+    }
+
     fn remove_class(&mut self, class: &EffectClass) {
         self.allowlist.retain(|listed| listed != class);
         self.asklist.retain(|listed| listed != class);

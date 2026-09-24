@@ -121,7 +121,7 @@ impl HubConnection {
             authority_epoch: head.authority_epoch,
             causation_id: &head.event_id,
         };
-        let mut envelopes = self.usage_reset_envelopes(
+        let mut envelopes = self.hub.usage_reset_envelopes(
             &scope,
             &approval_id,
             "approval",
@@ -265,9 +265,9 @@ impl HubConnection {
         Ok(menu.id == *menu_id && matches!(menu.kind, MenuKind::DeferredApproval { .. }))
     }
 
-    /// Runs once per committed human answer. Authorization (and, on approval,
-    /// `Dispatched`) is journaled before the single provider call; the typed
-    /// result is then delivered to an active run and journaled for polling.
+    /// Claims one committed human answer. The durable `Dispatched` fact is
+    /// written before handing provider work to a hub-owned task. A restart
+    /// never resumes that task, even when its provider outcome is unknown.
     pub(super) async fn finish_usage_reset_approval(
         &self,
         answered: &RawEnvelope,
@@ -305,9 +305,45 @@ impl HubConnection {
             ));
         }
         let mut authorization =
-            self.usage_reset_envelopes(&scope, approval_id, "authorization", authorization)?;
+            self.hub
+                .usage_reset_envelopes(&scope, approval_id, "authorization", authorization)?;
         self.hub.append(&mut authorization).await?;
 
+        let hub = self.hub.clone();
+        let answered = answered.clone();
+        let account = account.clone();
+        let approval_id = approval_id.to_owned();
+        // The hub joins these tasks during graceful shutdown and aborts them
+        // on forced shutdown. An aborted POST remains unconfirmed in the
+        // journal and is deliberately never retried by a poll or restart.
+        let mut tasks = lock(&self.hub.inner.actor_tasks)?;
+        if self.hub.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Task(
+                "usage reset dispatch interrupted by daemon drain".into(),
+            ));
+        }
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) = hub
+                .complete_usage_reset_approval(&answered, &account, &approval_id, approved)
+                .await
+            {
+                tracing::error!(%approval_id, ?error, "usage reset completion failed");
+            }
+        }));
+        Ok(())
+    }
+}
+
+impl SessionHub {
+    async fn complete_usage_reset_approval(
+        &self,
+        answered: &RawEnvelope,
+        account: &CredentialAlias,
+        approval_id: &str,
+        approved: bool,
+    ) -> Result<(), SessionHubError> {
+        let effect = usage_reset::effect_id(approval_id);
+        let scope = ResetEventScope::after(answered);
         let result = if approved {
             self.apply_approved_usage_reset(account, approval_id)
                 .await?
@@ -363,7 +399,7 @@ impl HubConnection {
         ));
         let mut terminal =
             self.usage_reset_envelopes(&scope, approval_id, "result event", terminal)?;
-        self.hub.append(&mut terminal).await?;
+        self.append(&mut terminal).await?;
         Ok(())
     }
 
@@ -372,7 +408,7 @@ impl HubConnection {
         account: &CredentialAlias,
         approval_id: &str,
     ) -> Result<UsageResetApplyResultV1, SessionHubError> {
-        let Some(service) = self.hub.usage_report_service()? else {
+        let Some(service) = self.usage_report_service()? else {
             return Ok(usage_reset::failed(
                 approval_id,
                 account,
@@ -402,8 +438,12 @@ impl HubConnection {
                 SessionHubError::Task(format!("cannot encode usage reset notice: {error}"))
             })?
         );
-        match crate::tasks::TaskFacade::new(self.hub.clone())
-            .deliver_notification(session_id, &format!("usage-reset-{approval_id}"), &notice)
+        match crate::tasks::TaskFacade::new(self.clone())
+            .deliver_notification(
+                session_id,
+                usage_reset::notification_id(approval_id),
+                &notice,
+            )
             .await
         {
             Ok(delivered) => Ok(delivered),
@@ -437,9 +477,9 @@ impl HubConnection {
                     branch_id: scope.branch_id.clone(),
                     run_id: scope.run_id.clone(),
                     agent_id: scope.agent_id.clone(),
-                    device_id: self.hub.inner.device_id.clone(),
+                    device_id: self.inner.device_id.clone(),
                     authority_epoch: scope.authority_epoch,
-                    worker_generation: self.hub.worker_generation(),
+                    worker_generation: self.worker_generation(),
                     causation_id: Some(scope.causation_id.clone()),
                     correlation_id: None,
                     committed_at_ms: 0,

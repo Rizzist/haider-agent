@@ -416,6 +416,49 @@ async fn prior_resets_fall_back_to_exact_device_journal_timestamps() {
     assert_eq!(reset.observed_at_ms, Some(now - 1_000));
 }
 
+#[tokio::test]
+async fn same_millisecond_device_resets_have_stable_window_order() {
+    let now = 1_777_075_200_000;
+    let service = service_with_clock(
+        vec![descriptor("openai", "billing-key", AuthMethod::ApiKey)],
+        None,
+        Arc::new(StubHttp::new([])),
+        Arc::new(AtomicU64::new(now)),
+    );
+    let (_root, store) = empty_store().await;
+    for window in ["weekly", "five_hour"] {
+        for (sampled_at_ms, resets_at_ms) in [
+            (now - 172_800_000, now - 86_400_000),
+            (now - 1_000, now + 86_400_000),
+        ] {
+            store
+                .append_usage_meter_sample(haider_protocol::usage::UsageHistoryMeterSampleV1 {
+                    account: "billing-key".into(),
+                    window: window.into(),
+                    basis_points: 1_000,
+                    resets_at_ms: Some(resets_at_ms),
+                    grace_until_ms: None,
+                    sampled_at_ms,
+                    plan: None,
+                    credits: None,
+                    hold: None,
+                    stale: None,
+                })
+                .await
+                .expect("append sample");
+        }
+    }
+    for _ in 0..10 {
+        let report = service.report(&store).await.expect("report");
+        let windows = report.accounts[0]
+            .previous_resets
+            .iter()
+            .map(|entry| entry.window.as_deref().expect("window"))
+            .collect::<Vec<_>>();
+        assert_eq!(windows, ["five_hour", "weekly"]);
+    }
+}
+
 /// MUTATION CHECK: drop `meter.credits` at the capture-to-ledger seam.
 /// Expected runtime failure: the raw provider integer no longer reaches the
 /// frozen sample verbatim even though classification retained its provenance.
