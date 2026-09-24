@@ -674,3 +674,94 @@ fn pre_segment_request_rows_remain_verifiable_after_upgrade() {
         vec![b'l'; 64]
     );
 }
+
+fn persist_history_attempt(
+    store: &Store,
+    session_id: &SessionId,
+    history_text: &[&str],
+    attempt: u64,
+) -> Vec<RawEnvelope> {
+    let system = ProviderViewBlobV1::new(b"compact-system".to_vec());
+    let tools = ProviderViewBlobV1::new(b"compact-tools".to_vec());
+    let history = history_text
+        .iter()
+        .map(|text| ProviderViewBlobV1::new(text.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    let mut ledger = provider_view("fixed", 16).0;
+    ledger.system_block = system.block.clone();
+    ledger.tool_schema_block = tools.block.clone();
+    ledger.history_blocks = history.iter().map(|blob| blob.block.clone()).collect();
+    let mut blobs = vec![system, tools];
+    blobs.extend(history);
+    let mut envelopes = provider_attempt_envelopes(session_id, &ledger, attempt);
+    for (index, envelope) in envelopes.iter_mut().enumerate() {
+        envelope.event_id = EventId::new(format!("compact-{attempt}-{index}"));
+    }
+    store
+        .persist_provider_view_and_append_owned(session_id, ledger, blobs, attempt, &mut envelopes)
+        .expect("persist view and attempt facts");
+    envelopes
+}
+
+fn stored_record(store: &Store, session_id: &SessionId, seq: u64) -> Vec<u8> {
+    Connection::open(store.database_path())
+        .expect("observer")
+        .query_row(
+            "SELECT envelope_json FROM events WHERE session_id = ?1 AND seq = ?2",
+            params![
+                session_id.as_str(),
+                i64::try_from(seq).expect("sequence fits i64")
+            ],
+            |row| row.get(0),
+        )
+        .expect("stored journal record")
+}
+
+/// MUTATION CHECK: dropping the digest comparison in the compact-record
+/// hydration must fail the tampered read below; lowering the compaction
+/// minimum must fail the three-block inline assertion.
+#[test]
+fn compact_history_record_round_trips_and_fails_closed_on_segment_drift() {
+    const INDIRECT_RECORD_MARKER: u8 = 0xc1;
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("provider-view-compact-record");
+    let (short, long) = {
+        let store = Store::open(root.path()).expect("store");
+        create_session(&store, &session_id);
+        let short = persist_history_attempt(&store, &session_id, &["one", "two", "three"], 1);
+        let long =
+            persist_history_attempt(&store, &session_id, &["one", "two", "three", "four"], 2);
+        assert_ne!(
+            stored_record(&store, &session_id, short[0].seq)[0],
+            INDIRECT_RECORD_MARKER,
+            "short history ledgers stay self-contained"
+        );
+        assert_eq!(
+            stored_record(&store, &session_id, long[0].seq)[0],
+            INDIRECT_RECORD_MARKER,
+            "longer history ledgers are stored as a segment cursor"
+        );
+        (short, long)
+    };
+    let store = Store::open(root.path()).expect("reopen store");
+    assert_eq!(
+        store
+            .read(&session_id, short[0].seq - 1, 4)
+            .expect("replay inline and compact records"),
+        [short, long.clone()].concat(),
+        "hydration reproduces the exact public envelopes"
+    );
+    drop(store);
+    Connection::open(root.path().join("store.sqlite"))
+        .expect("tamper connection")
+        .execute(
+            "UPDATE provider_view_history_blocks SET byte_len = byte_len + 1",
+            [],
+        )
+        .expect("tamper segment rows");
+    let store = Store::open(root.path()).expect("reopen tampered store");
+    assert!(
+        store.read(&session_id, long[0].seq - 1, 2).is_err(),
+        "a compact record whose segment rows drifted must fail closed"
+    );
+}

@@ -29,6 +29,13 @@ const RECORD_PREFIX: &[u8] = b"\xc1haider.text-cas\x01";
 // The following fixed-width decimal field lets metadata-only SQL readers
 // retain their logical envelope-byte budget without loading CAS text.
 const LENGTH_HEADER_BYTES: usize = 20;
+/// JSON pointer of a provider-view attempt's history ledger inside an item
+/// payload. A compact record stores `[]` here and names the segment prefix.
+const HISTORY_BLOCKS_POINTER: &str = "/item/data/view/history_blocks";
+/// Shorter ledgers stay self-contained: their few inline block references are
+/// comparable in size to the cursor (session, segment, count, 64-hex digest)
+/// that would replace them, and they avoid a segment read on replay.
+const MIN_COMPACT_HISTORY_BLOCKS: usize = 4;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +71,11 @@ struct HistoryPrefix {
     digest: String,
 }
 
+/// Returns the segment cursor that may replace this envelope's history
+/// ledger, or `None` when the fact must stay self-contained. Compaction
+/// requires a clean attempt decode, a live request cursor recorded earlier in
+/// the same append transaction, and an exact count and digest match, so that
+/// [`hydrate_history`] reproduces the original ledger bit for bit.
 fn history_prefix(
     connection: &Connection,
     envelope: &RawEnvelope,
@@ -110,7 +122,7 @@ fn history_prefix(
             false,
         )
     })?;
-    if count != attempt.view.history_blocks.len() || count < 4 {
+    if count != attempt.view.history_blocks.len() || count < MIN_COMPACT_HISTORY_BLOCKS {
         return Ok(None);
     }
     // An appended extension can carry an existing storage cursor without
@@ -125,6 +137,52 @@ fn history_prefix(
         count,
         digest,
     }))
+}
+
+/// Replaces the compacted ledger with the `[]` placeholder that
+/// [`hydrate_history`] requires.
+fn clear_history_slot(skeleton: &mut Value) -> StoreResult<()> {
+    let slot = skeleton
+        .pointer_mut(HISTORY_BLOCKS_POINTER)
+        .ok_or_else(|| {
+            store_error(
+                ErrorCode::StoreCorrupt,
+                "provider-view history slot disappeared",
+                false,
+            )
+        })?;
+    *slot = Value::Array(Vec::new());
+    Ok(())
+}
+
+/// Restores a compacted ledger from its immutable segment prefix. The digest
+/// check fails closed if the segment rows no longer match the recorded ledger.
+fn hydrate_history(
+    connection: &Connection,
+    history: &HistoryPrefix,
+    envelope: &mut RawEnvelope,
+) -> Result<(), String> {
+    let blocks = history_segment_prefix(
+        connection,
+        &history.session_id,
+        history.segment_id,
+        history.count,
+    )
+    .map_err(|error| error.to_string())?;
+    if history_digest(&blocks) != history.digest {
+        return Err("provider-view history segment digest differs".to_owned());
+    }
+    let mut payload = envelope.payload.to_json_value();
+    let slot = payload
+        .pointer_mut(HISTORY_BLOCKS_POINTER)
+        .ok_or_else(|| "provider-view history slot is absent".to_owned())?;
+    if slot.as_array().is_none_or(|values| !values.is_empty()) {
+        return Err("provider-view history placeholder is invalid".to_owned());
+    }
+    *slot = serde_json::to_value(blocks)
+        .map_err(|error| format!("provider-view history cannot serialize: {error}"))?;
+    envelope.payload = payload.into();
+    Ok(())
 }
 
 fn profile_cas(connection: &Connection) -> StoreResult<Option<FileCas>> {
@@ -196,19 +254,9 @@ pub(super) fn encode(
     // RawPayload dereferences to its reply-free skeleton. Borrowing it avoids
     // cloning large generic strings, even when they share a payload with an
     // arena reply. Re-promote the small skeleton and bind its reply below.
-    let skeleton = externalize(&envelope.payload, &cas, "", &mut strings)?;
-    let mut skeleton = skeleton;
+    let mut skeleton = externalize(&envelope.payload, &cas, "", &mut strings)?;
     if history.is_some() {
-        let slot = skeleton
-            .pointer_mut("/item/data/view/history_blocks")
-            .ok_or_else(|| {
-                store_error(
-                    ErrorCode::StoreCorrupt,
-                    "provider-view history slot disappeared",
-                    false,
-                )
-            })?;
-        *slot = Value::Array(Vec::new());
+        clear_history_slot(&mut skeleton)?;
     }
     let mut payload: RawPayload = skeleton.into();
     if let Some(text) = envelope.payload.reply_text() {
@@ -326,27 +374,8 @@ pub(super) fn decode(connection: &Connection, bytes: &[u8]) -> Result<RawEnvelop
     if stored.reply.is_none() && stored.strings.is_empty() && stored.history.is_none() {
         return Err("indirect envelope contains no references".to_owned());
     }
-    if let Some(history) = stored.history {
-        let blocks = history_segment_prefix(
-            connection,
-            &history.session_id,
-            history.segment_id,
-            history.count,
-        )
-        .map_err(|error| error.to_string())?;
-        if history_digest(&blocks) != history.digest {
-            return Err("provider-view history segment digest differs".to_owned());
-        }
-        let mut payload = stored.envelope.payload.to_json_value();
-        let slot = payload
-            .pointer_mut("/item/data/view/history_blocks")
-            .ok_or_else(|| "provider-view history slot is absent".to_owned())?;
-        if slot.as_array().is_none_or(|values| !values.is_empty()) {
-            return Err("provider-view history placeholder is invalid".to_owned());
-        }
-        *slot = serde_json::to_value(blocks)
-            .map_err(|error| format!("provider-view history cannot serialize: {error}"))?;
-        stored.envelope.payload = payload.into();
+    if let Some(history) = &stored.history {
+        hydrate_history(connection, history, &mut stored.envelope)?;
     }
     let cas = if stored.reply.is_some() || !stored.strings.is_empty() {
         Some(

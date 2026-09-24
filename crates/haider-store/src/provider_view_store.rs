@@ -42,9 +42,15 @@ pub(crate) struct PreparedProviderView {
     expected: HashSet<ProviderViewBlockRefV1>,
 }
 
+/// Domain separator for [`history_digest`]. Persisted in request cursors and
+/// compact journal records, so changing it invalidates existing profiles.
+const HISTORY_DIGEST_DOMAIN: &[u8] = b"haider.provider-view.history-prefix.v1\0";
+
+/// Digest of an ordered history ledger (hash and length of every block). It
+/// binds a request cursor or compact journal record to its exact ledger.
 pub(crate) fn history_digest(blocks: &[ProviderViewBlockRefV1]) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"haider.provider-view.history-prefix.v1\0");
+    hasher.update(HISTORY_DIGEST_DOMAIN);
     for block in blocks {
         hasher.update(block.content_hash.as_bytes());
         hasher.update(&block.byte_len.to_be_bytes());
@@ -138,6 +144,175 @@ pub(crate) fn history_segment_prefix(
         ));
     }
     Ok(blocks)
+}
+
+/// Where one request's history ledger lives in the trunk/leaf segment tree.
+///
+/// Invariants (schema v32):
+/// - Segment rows and block rows are immutable once a later row refers to
+///   them. A trunk only grows past its current end; a leaf never grows.
+/// - A segment's own blocks occupy ordinals `parent_block_count..`; ordinals
+///   below `parent_block_count` are read from the parent, cut at that count.
+///   Parents always have smaller ids, so every chain is finite.
+/// - Each request owns one leaf whose parent cutoff equals its trunk's length
+///   when the leaf was created (`prefix_len`). Later trunk growth is therefore
+///   invisible to older leaves, which keeps journal replay deterministic.
+/// - A trunk holds only blocks that two consecutive requests agreed on, so a
+///   request writes O(changed tail) rows, never its whole history again.
+struct HistoryPlacement {
+    trunk_id: i64,
+    /// Trunk length before this request; `trunk_end..prefix_len` is appended.
+    trunk_end: usize,
+    leaf_id: i64,
+    /// Blocks shared with the trunk; `prefix_len..` is stored in the leaf.
+    prefix_len: usize,
+}
+
+/// Chooses or creates this request's trunk and inserts its new leaf segment.
+/// The caller inserts the block rows from the returned ranges. Each request
+/// gets a short immutable leaf. Its parent trunk contains blocks confirmed
+/// stable by the next request and only grows by the newly confirmed delta.
+/// When an earlier stable block changes, a new trunk branches from the common
+/// prefix (or starts empty), leaving the old trunk and its leaves untouched.
+fn place_history_segments(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    history_blocks: &[ProviderViewBlockRefV1],
+) -> StoreResult<HistoryPlacement> {
+    let previous: Option<(Option<i64>, Option<i64>)> = transaction
+        .query_row(
+            "SELECT h.segment_id, h.block_count
+             FROM provider_view_requests r
+             LEFT JOIN provider_view_request_history h
+               ON h.session_id = r.session_id
+              AND h.request_ordinal = r.request_ordinal
+             WHERE r.session_id = ?1
+             ORDER BY r.request_ordinal DESC LIMIT 1",
+            [session_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_read_error)?;
+    let (trunk_id, trunk_end, prefix_len) = match previous {
+        Some((Some(leaf_id), Some(count))) => {
+            let count = usize::try_from(count)
+                .map_err(|_| corrupt("provider-view history count is negative"))?;
+            let earlier = history_segment_prefix(transaction, session_id, leaf_id, count)?;
+            let common = earlier
+                .iter()
+                .zip(history_blocks)
+                .take_while(|(left, right)| left == right)
+                .count();
+            let trunk_id: i64 = transaction
+                .query_row(
+                    "SELECT parent_segment_id FROM provider_view_history_segments
+                     WHERE id = ?1",
+                    [leaf_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(sqlite_read_error)?
+                .ok_or_else(|| corrupt("provider-view history leaf has no trunk"))?;
+            let (parent_count, local_end): (i64, i64) = transaction
+                .query_row(
+                    "SELECT s.parent_block_count, COALESCE(MAX(b.block_ordinal) + 1, 0)
+                     FROM provider_view_history_segments s
+                     LEFT JOIN provider_view_history_blocks b ON b.segment_id = s.id
+                     WHERE s.id = ?1 GROUP BY s.id",
+                    [trunk_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(sqlite_read_error)?;
+            let trunk_end = usize::try_from(parent_count.max(local_end))
+                .map_err(|_| corrupt("provider-view trunk length is negative"))?;
+            if common >= trunk_end {
+                (trunk_id, trunk_end, common)
+            } else {
+                let new_trunk = if common == 0 {
+                    transaction
+                        .execute(
+                            "INSERT INTO provider_view_history_segments(session_id)
+                             VALUES (?1)",
+                            [session_id.as_str()],
+                        )
+                        .map_err(sqlite_write_error)?;
+                    transaction.last_insert_rowid()
+                } else {
+                    transaction
+                        .execute(
+                            "INSERT INTO provider_view_history_segments(
+                                session_id, parent_segment_id, parent_block_count
+                             ) VALUES (?1, ?2, ?3)",
+                            params![
+                                session_id.as_str(),
+                                trunk_id,
+                                i64::try_from(common).map_err(|_| invalid(
+                                    "provider-view history prefix exceeds SQLite integer space"
+                                ))?,
+                            ],
+                        )
+                        .map_err(sqlite_write_error)?;
+                    transaction.last_insert_rowid()
+                };
+                (new_trunk, common, common)
+            }
+        }
+        _ => {
+            transaction
+                .execute(
+                    "INSERT INTO provider_view_history_segments(session_id) VALUES (?1)",
+                    [session_id.as_str()],
+                )
+                .map_err(sqlite_write_error)?;
+            (transaction.last_insert_rowid(), 0, 0)
+        }
+    };
+    transaction
+        .execute(
+            "INSERT INTO provider_view_history_segments(
+                session_id, parent_segment_id, parent_block_count
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                session_id.as_str(),
+                trunk_id,
+                i64::try_from(prefix_len).map_err(|_| invalid(
+                    "provider-view history prefix exceeds SQLite integer space"
+                ))?,
+            ],
+        )
+        .map_err(sqlite_write_error)?;
+    Ok(HistoryPlacement {
+        trunk_id,
+        trunk_end,
+        leaf_id: transaction.last_insert_rowid(),
+        prefix_len,
+    })
+}
+
+/// Inserts `blocks` into `segment_id` at ordinals starting from `start`.
+fn insert_history_blocks(
+    transaction: &rusqlite::Transaction<'_>,
+    segment_id: i64,
+    start: usize,
+    blocks: &[ProviderViewBlockRefV1],
+) -> StoreResult<()> {
+    for (offset, block) in blocks.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO provider_view_history_blocks(
+                    segment_id, block_ordinal, content_hash, byte_len
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    segment_id,
+                    i64::try_from(start + offset).map_err(|_| invalid(
+                        "provider-view history ordinal exceeds SQLite integer space"
+                    ))?,
+                    &block.content_hash,
+                    to_sqlite_integer(block.byte_len)?,
+                ],
+            )
+            .map_err(sqlite_write_error)?;
+    }
+    Ok(())
 }
 
 /// Monotonic provider-view maintenance watermark. The count bound prevents a
@@ -275,111 +450,12 @@ impl ProviderViewStore {
             mut ledger,
             expected,
         } = prepared;
-        let previous: Option<(Option<i64>, Option<i64>)> = transaction
-            .query_row(
-                "SELECT h.segment_id, h.block_count
-                 FROM provider_view_requests r
-                 LEFT JOIN provider_view_request_history h
-                   ON h.session_id = r.session_id
-                  AND h.request_ordinal = r.request_ordinal
-                 WHERE r.session_id = ?1
-                 ORDER BY r.request_ordinal DESC LIMIT 1",
-                [session_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sqlite_read_error)?;
-        // Each request gets a short immutable leaf. Its parent trunk contains
-        // blocks confirmed stable by the next request and only grows by the
-        // newly confirmed delta. Old leaves keep their fixed parent cutoff.
-        let (trunk_id, trunk_end, prefix_len) = match previous {
-            Some((Some(leaf_id), Some(count))) => {
-                let count = usize::try_from(count)
-                    .map_err(|_| corrupt("provider-view history count is negative"))?;
-                let earlier = history_segment_prefix(transaction, session_id, leaf_id, count)?;
-                let common = earlier
-                    .iter()
-                    .zip(&ledger.history_blocks)
-                    .take_while(|(left, right)| left == right)
-                    .count();
-                let trunk_id: i64 = transaction
-                    .query_row(
-                        "SELECT parent_segment_id FROM provider_view_history_segments
-                         WHERE id = ?1",
-                        [leaf_id],
-                        |row| row.get::<_, Option<i64>>(0),
-                    )
-                    .map_err(sqlite_read_error)?
-                    .ok_or_else(|| corrupt("provider-view history leaf has no trunk"))?;
-                let (parent_count, local_end): (i64, i64) = transaction
-                    .query_row(
-                        "SELECT s.parent_block_count, COALESCE(MAX(b.block_ordinal) + 1, 0)
-                         FROM provider_view_history_segments s
-                         LEFT JOIN provider_view_history_blocks b ON b.segment_id = s.id
-                         WHERE s.id = ?1 GROUP BY s.id",
-                        [trunk_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .map_err(sqlite_read_error)?;
-                let trunk_end = usize::try_from(parent_count.max(local_end))
-                    .map_err(|_| corrupt("provider-view trunk length is negative"))?;
-                if common >= trunk_end {
-                    (trunk_id, trunk_end, common)
-                } else {
-                    let new_trunk = if common == 0 {
-                        transaction
-                            .execute(
-                                "INSERT INTO provider_view_history_segments(session_id)
-                                 VALUES (?1)",
-                                [session_id.as_str()],
-                            )
-                            .map_err(sqlite_write_error)?;
-                        transaction.last_insert_rowid()
-                    } else {
-                        transaction
-                            .execute(
-                                "INSERT INTO provider_view_history_segments(
-                                    session_id, parent_segment_id, parent_block_count
-                                 ) VALUES (?1, ?2, ?3)",
-                                params![
-                                    session_id.as_str(),
-                                    trunk_id,
-                                    i64::try_from(common).map_err(|_| invalid(
-                                        "provider-view history prefix exceeds SQLite integer space"
-                                    ))?,
-                                ],
-                            )
-                            .map_err(sqlite_write_error)?;
-                        transaction.last_insert_rowid()
-                    };
-                    (new_trunk, common, common)
-                }
-            }
-            _ => {
-                transaction
-                    .execute(
-                        "INSERT INTO provider_view_history_segments(session_id) VALUES (?1)",
-                        [session_id.as_str()],
-                    )
-                    .map_err(sqlite_write_error)?;
-                (transaction.last_insert_rowid(), 0, 0)
-            }
-        };
-        transaction
-            .execute(
-                "INSERT INTO provider_view_history_segments(
-                    session_id, parent_segment_id, parent_block_count
-                 ) VALUES (?1, ?2, ?3)",
-                params![
-                    session_id.as_str(),
-                    trunk_id,
-                    i64::try_from(prefix_len).map_err(|_| invalid(
-                        "provider-view history prefix exceeds SQLite integer space"
-                    ))?,
-                ],
-            )
-            .map_err(sqlite_write_error)?;
-        let segment_id = transaction.last_insert_rowid();
+        let HistoryPlacement {
+            trunk_id,
+            trunk_end,
+            leaf_id: segment_id,
+            prefix_len,
+        } = place_history_segments(transaction, session_id, &ledger.history_blocks)?;
         let newly_stable = &ledger.history_blocks[trunk_end..prefix_len];
         let suffix = &ledger.history_blocks[prefix_len..];
         let mut gc_candidates = HashSet::from([
@@ -468,28 +544,8 @@ impl ProviderViewStore {
             &ledger.tool_schema_block,
             expires_at_ms,
         )?;
-        for (owner, start, blocks) in [
-            (trunk_id, trunk_end, newly_stable),
-            (segment_id, prefix_len, suffix),
-        ] {
-            for (offset, block) in blocks.iter().enumerate() {
-                transaction
-                    .execute(
-                        "INSERT INTO provider_view_history_blocks(
-                            segment_id, block_ordinal, content_hash, byte_len
-                         ) VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            owner,
-                            i64::try_from(start + offset).map_err(|_| invalid(
-                                "provider-view history ordinal exceeds SQLite integer space"
-                            ))?,
-                            &block.content_hash,
-                            to_sqlite_integer(block.byte_len)?,
-                        ],
-                    )
-                    .map_err(sqlite_write_error)?;
-            }
-        }
+        insert_history_blocks(transaction, trunk_id, trunk_end, newly_stable)?;
+        insert_history_blocks(transaction, segment_id, prefix_len, suffix)?;
         {
             let mut delete_gc = transaction
                 .prepare_cached("DELETE FROM provider_view_gc WHERE content_hash = ?1")

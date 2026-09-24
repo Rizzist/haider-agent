@@ -25532,7 +25532,9 @@ fn same_session_batch(envelopes: &[RawEnvelope]) -> StoreResult<(SessionId, u64)
 }
 
 /// Opens the profile's long-lived journal connection with the required pragmas
-/// (WAL, configured synchronous policy, foreign keys, busy timeout).
+/// (busy timeout, foreign keys, WAL with its size limit and checkpoint
+/// interval, page-cache ceiling, in-memory temp store, configured synchronous
+/// policy). [`open_connection_with`] is the single place they are set.
 #[cfg(test)]
 fn open_connection(path: &Path) -> StoreResult<Connection> {
     open_connection_with(path, configured_store_synchronous()?)
