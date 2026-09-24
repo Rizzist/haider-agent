@@ -1,7 +1,7 @@
 //! Per-provider usage meter collectors (U1).
 //!
 //! OAuth providers with verified server-side meters are parsed here as pure
-//! pure function over recorded response bytes so fixtures replay without a
+//! functions over recorded response bytes so fixtures replay without a
 //! network. Response shapes were research-verified against real payloads:
 //!
 //! - codex/openai-oauth: `GET https://chatgpt.com/backend-api/wham/usage`
@@ -11,6 +11,11 @@
 //!   `used_percent`/`reset_at`/`limit_window_seconds`,
 //!   `additional_rate_limits[]` with `limit_name`) and
 //!   luisleineweber/usagebar `docs/providers/codex.md` (sample payload).
+//!   The current live shape (nullable `additional_rate_limits`, a
+//!   `rate_limit_reset_credits` summary) is pinned by the redacted fixture
+//!   `tests/fixtures/usage/openai_wham_usage_live_redacted.json`. The
+//!   reset-credit inventory and consume endpoints follow the official
+//!   openai/codex `backend-client/src/client/rate_limit_resets.rs`.
 //! - anthropic-oauth: `GET https://api.anthropic.com/api/oauth/usage`
 //!   (Bearer + `anthropic-beta: oauth-2025-04-20` + mandatory `User-Agent:
 //!   claude-code/<ver>` — the endpoint 403s without a Claude Code UA).
@@ -139,8 +144,12 @@ pub enum UsageMeterEndpoint {
 pub const ANTHROPIC_OAUTH_USAGE_USER_AGENT: &str = "claude-code/2.0.19";
 /// codex/openai-oauth usage meter URL.
 pub const OPENAI_OAUTH_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// codex/openai-oauth reset-credit inventory (counts plus per-credit detail).
 pub const OPENAI_OAUTH_RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+/// codex/openai-oauth reset-credit consume operation. It spends a real,
+/// limited account resource; the body's `redeem_request_id` is the
+/// caller-supplied idempotency key.
 pub const OPENAI_OAUTH_RESET_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 pub const OPENAI_OAUTH_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
@@ -295,16 +304,32 @@ struct WhamUsage {
     plan_type: Option<String>,
     rate_limit: Option<WhamRateLimit>,
     additional_rate_limits: Option<Vec<WhamAdditionalRateLimit>>,
-    rate_limit_reset_credits: Option<WhamResetCreditsSummary>,
+    rate_limit_reset_credits: Option<WhamResetCreditCounts>,
 }
 
+/// Reset-credit counters shared by the WHAM usage summary and the detail
+/// endpoint. Optional counters stay absent unless the provider named them.
 #[derive(Debug, Deserialize)]
-struct WhamResetCreditsSummary {
+struct WhamResetCreditCounts {
     available_count: u64,
     applicable_available_count: Option<u64>,
     total_earned_count: Option<u64>,
     used_count: Option<u64>,
     remaining_count: Option<u64>,
+}
+
+impl WhamResetCreditCounts {
+    fn into_wire(self, credits: Vec<UsageResetCreditV1>) -> UsageResetCreditsV1 {
+        UsageResetCreditsV1 {
+            available_count: self.available_count,
+            applicable_available_count: self.applicable_available_count,
+            total_earned_count: self.total_earned_count,
+            used_count: self.used_count,
+            remaining_count: self.remaining_count,
+            credits,
+            apply_supported: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,6 +358,10 @@ struct WhamAdditionalRateLimit {
     rate_limit: Option<WhamRateLimit>,
 }
 
+/// Seven days: the `limit_window_seconds` of the weekly window in the live
+/// WHAM capture. Other exact durations get a derived `Nd`/`Nh`/`Nm` label.
+const WHAM_WEEKLY_WINDOW_SECONDS: u64 = 7 * 86_400;
+
 fn wham_window_label(window: &WhamWindow, fallback: &str) -> String {
     let seconds = window.limit_window_seconds.or_else(|| {
         window
@@ -340,7 +369,7 @@ fn wham_window_label(window: &WhamWindow, fallback: &str) -> String {
             .map(|minutes| minutes.saturating_mul(60))
     });
     match seconds {
-        Some(604_800) => "weekly".to_owned(),
+        Some(WHAM_WEEKLY_WINDOW_SECONDS) => "weekly".to_owned(),
         Some(seconds) if seconds > 0 && seconds.is_multiple_of(86_400) => {
             format!("{}d", seconds / 86_400)
         }
@@ -443,15 +472,7 @@ pub fn parse_openai_wham_usage_at(
         plan: usage.plan_type,
         reset_credits: usage
             .rate_limit_reset_credits
-            .map(|credits| UsageResetCreditsV1 {
-                available_count: credits.available_count,
-                applicable_available_count: credits.applicable_available_count,
-                total_earned_count: credits.total_earned_count,
-                used_count: credits.used_count,
-                remaining_count: credits.remaining_count,
-                credits: Vec::new(),
-                apply_supported: true,
-            }),
+            .map(|counts| counts.into_wire(Vec::new())),
         previous_resets: Vec::new(),
     })
 }
@@ -460,11 +481,8 @@ pub fn parse_openai_wham_usage_at(
 struct WhamResetCreditsDetails {
     #[serde(default)]
     credits: Vec<WhamResetCredit>,
-    available_count: u64,
-    applicable_available_count: Option<u64>,
-    total_earned_count: Option<u64>,
-    used_count: Option<u64>,
-    remaining_count: Option<u64>,
+    #[serde(flatten)]
+    counts: WhamResetCreditCounts,
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,18 +538,7 @@ pub fn parse_openai_reset_credits(
             }
         })
         .collect();
-    Ok((
-        UsageResetCreditsV1 {
-            available_count: details.available_count,
-            applicable_available_count: details.applicable_available_count,
-            total_earned_count: details.total_earned_count,
-            used_count: details.used_count,
-            remaining_count: details.remaining_count,
-            credits,
-            apply_supported: true,
-        },
-        previous_resets,
-    ))
+    Ok((details.counts.into_wire(credits), previous_resets))
 }
 
 // --- anthropic-oauth ------------------------------------------------------

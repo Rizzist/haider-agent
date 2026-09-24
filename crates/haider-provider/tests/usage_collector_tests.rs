@@ -175,6 +175,42 @@ fn openai_reset_credit_details_publish_only_provider_fields() {
     );
 }
 
+#[test]
+fn openai_reset_credit_details_require_the_available_count_and_keep_absent_counters_absent() {
+    let missing = haider_provider::parse_openai_reset_credits(br#"{"credits":[]}"#)
+        .expect_err("available_count is required");
+    assert_eq!(missing.reason, "malformed_response");
+
+    let (credits, history) = haider_provider::parse_openai_reset_credits(
+        br#"{
+            "available_count": 1,
+            "credits": [{
+                "reset_type": "weekly",
+                "status": "redeemed",
+                "redeemed_at": "2026-09-02T00:00:00Z"
+            }]
+        }"#,
+    )
+    .expect("minimal detail shape parses");
+    assert_eq!(credits.available_count, 1);
+    assert_eq!(credits.applicable_available_count, None);
+    assert_eq!(credits.total_earned_count, None);
+    assert_eq!(credits.used_count, None);
+    assert_eq!(credits.remaining_count, None);
+    assert!(credits.apply_supported);
+    assert_eq!(
+        credits.credits[0].redeemed_at_ms,
+        Some(1_788_307_200_000),
+        "RFC 3339 redemption instant is copied exactly"
+    );
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].reset_at_ms, 1_788_307_200_000);
+    assert_eq!(
+        history[0].source,
+        haider_protocol::usage::UsageResetHistorySourceV1::Provider
+    );
+}
+
 /// LAW (anthropic_live_fixture_normalizes_percent_scale_and_rfc3339_resets):
 /// the LIVE-captured anthropic payload (percent scale: `utilization: 60.0`
 /// with `limits[].percent: 60` corroborating) lands on the wire as the 0.6

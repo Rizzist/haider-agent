@@ -144,6 +144,7 @@ mod typed_agent_executor;
 mod typed_agent_installer;
 mod typed_agent_runtime;
 mod usage_report;
+mod usage_reset;
 #[cfg(test)]
 mod wb_web_runtime_tests;
 mod web_search;

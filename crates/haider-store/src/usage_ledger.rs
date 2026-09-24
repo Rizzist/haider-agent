@@ -443,6 +443,21 @@ pub(crate) fn read_usage_meter_samples_for_device(
     days: u16,
     expected_device_id: &str,
 ) -> StoreResult<Vec<UsageHistoryMeterSampleV1>> {
+    let mut samples = Vec::new();
+    for date in range_dates(through_date, days)? {
+        let Some(day) = read_usage_day(profile_root, &date)? else {
+            continue;
+        };
+        ensure_day_device(&day, &date, expected_device_id)?;
+        samples.extend(day.meter_samples);
+    }
+    samples.sort_by_key(|sample| sample.sampled_at_ms);
+    Ok(samples)
+}
+
+/// Validates a bounded `days`-long range ending at `through_date` and yields
+/// its UTC dates oldest first.
+fn range_dates(through_date: &str, days: u16) -> StoreResult<impl Iterator<Item = String>> {
     if days == 0 || days > USAGE_HISTORY_MAX_RANGE_DAYS {
         return Err(invalid(format!(
             "usage-history range days must be in 1..={USAGE_HISTORY_MAX_RANGE_DAYS}"
@@ -452,22 +467,17 @@ pub(crate) fn read_usage_meter_samples_for_device(
     let first = through
         .checked_sub(i64::from(days) - 1)
         .ok_or_else(|| invalid("usage-history range is before the supported calendar"))?;
-    let mut samples = Vec::new();
-    for offset in 0..days {
-        let date = date_from_days(first + i64::from(offset));
-        let Some(day) = read_usage_day(profile_root, &date)? else {
-            continue;
-        };
-        if day.device_id != expected_device_id {
-            return Err(corrupt(format!(
-                "usage-history day {date} belongs to device {}, expected {expected_device_id}",
-                day.device_id
-            )));
-        }
-        samples.extend(day.meter_samples);
+    Ok((0..days).map(move |offset| date_from_days(first + i64::from(offset))))
+}
+
+fn ensure_day_device(day: &UsageHistoryDayV1, date: &str, expected: &str) -> StoreResult<()> {
+    if day.device_id == expected {
+        return Ok(());
     }
-    samples.sort_by_key(|sample| sample.sampled_at_ms);
-    Ok(samples)
+    Err(corrupt(format!(
+        "usage-history day {date} belongs to device {}, expected {expected}",
+        day.device_id
+    )))
 }
 
 fn read_usage_range_inner(
@@ -476,26 +486,12 @@ fn read_usage_range_inner(
     days: u16,
     expected_device_id: Option<&str>,
 ) -> StoreResult<Vec<UsageHistoryRangeDayV1>> {
-    if days == 0 || days > USAGE_HISTORY_MAX_RANGE_DAYS {
-        return Err(invalid(format!(
-            "usage-history range days must be in 1..={USAGE_HISTORY_MAX_RANGE_DAYS}"
-        )));
-    }
-    let through = days_from_date(through_date)?;
-    let first = through
-        .checked_sub(i64::from(days) - 1)
-        .ok_or_else(|| invalid("usage-history range is before the supported calendar"))?;
+    let dates = range_dates(through_date, days)?;
     let mut range = Vec::with_capacity(usize::from(days));
-    for offset in 0..days {
-        let date = date_from_days(first + i64::from(offset));
+    for date in dates {
         let day = read_usage_day(profile_root, &date)?;
-        if let (Some(expected), Some(day)) = (expected_device_id, day.as_ref())
-            && day.device_id != expected
-        {
-            return Err(corrupt(format!(
-                "usage-history day {date} belongs to device {}, expected {expected}",
-                day.device_id
-            )));
+        if let (Some(expected), Some(day)) = (expected_device_id, day.as_ref()) {
+            ensure_day_device(day, &date, expected)?;
         }
         let total = day.as_ref().and_then(fold_daily_total);
         let models = day.as_ref().map_or_else(Vec::new, fold_model_totals);

@@ -776,7 +776,24 @@ async fn authorization_failures_publish_specific_relogin_reasons() {
 
 struct ApplyHttp {
     post: std::sync::Mutex<Vec<(String, Option<String>, serde_json::Value)>>,
+    status: u16,
     response_body: Vec<u8>,
+    retry_after: Option<String>,
+}
+
+impl ApplyHttp {
+    fn replying(status: u16, body: &[u8]) -> Self {
+        Self {
+            post: std::sync::Mutex::new(Vec::new()),
+            status,
+            response_body: body.to_vec(),
+            retry_after: None,
+        }
+    }
+
+    fn posts(&self) -> usize {
+        self.post.lock().expect("post capture").len()
+    }
 }
 
 #[async_trait::async_trait]
@@ -805,19 +822,19 @@ impl UsageMeterHttp for ApplyHttp {
             body.clone(),
         ));
         Ok(super::UsageMeterHttpResponse {
-            status: 200,
+            status: self.status,
             body: self.response_body.clone(),
-            retry_after: None,
+            retry_after: self.retry_after.clone(),
         })
     }
 }
 
 #[tokio::test]
 async fn reset_apply_uses_verified_endpoint_account_scope_and_idempotency_key() {
-    let http = Arc::new(ApplyHttp {
-        post: std::sync::Mutex::new(Vec::new()),
-        response_body: br#"{"code":"reset","windows_reset":2}"#.to_vec(),
-    });
+    let http = Arc::new(ApplyHttp::replying(
+        200,
+        br#"{"code":"reset","windows_reset":2}"#,
+    ));
     let service = service_with_clock(
         vec![openai_descriptor(
             "work-chatgpt",
@@ -851,10 +868,7 @@ async fn reset_apply_uses_verified_endpoint_account_scope_and_idempotency_key() 
 
 #[tokio::test]
 async fn reset_apply_idempotent_replay_accepts_already_redeemed_without_a_count() {
-    let http = Arc::new(ApplyHttp {
-        post: std::sync::Mutex::new(Vec::new()),
-        response_body: br#"{"code":"already_redeemed"}"#.to_vec(),
-    });
+    let http = Arc::new(ApplyHttp::replying(200, br#"{"code":"already_redeemed"}"#));
     let service = service_with_clock(
         vec![openai_descriptor(
             "work-chatgpt",
@@ -876,6 +890,108 @@ async fn reset_apply_idempotent_replay_accepts_already_redeemed_without_a_count(
             .expect("idempotent replay"),
         0
     );
+}
+
+fn reset_apply_service(
+    http: Arc<ApplyHttp>,
+    descriptor: CredentialDescriptor,
+) -> UsageReportService {
+    service_with_clock(
+        vec![descriptor],
+        Some(Arc::new(StubTokens {
+            bytes: b"redacted-test-token".to_vec(),
+        })),
+        http,
+        Arc::new(AtomicU64::new(9_000_000)),
+    )
+}
+
+/// Pins every typed apply failure: the auth/rate-limit reasons are shared
+/// with the meter, other statuses and provider codes stay distinct.
+#[tokio::test]
+async fn reset_apply_failures_are_typed_and_bounded() {
+    for (status, body, retry_after, expected, expected_retry_at) in [
+        (401, &b"{}"[..], None, "credential_expired", None),
+        (403, &b"{}"[..], None, "http_403_forbidden_relogin", None),
+        (
+            429,
+            &b"{}"[..],
+            Some("30"),
+            "http_429_rate_limited",
+            Some(9_030_000),
+        ),
+        (500, &b"{}"[..], None, "http_status_500", None),
+        (200, &b"not json"[..], None, "malformed_response", None),
+        (
+            200,
+            &br#"{"code":"nothing_to_reset"}"#[..],
+            None,
+            "no_eligible_window",
+            None,
+        ),
+        (
+            200,
+            &br#"{"code":"no_credit"}"#[..],
+            None,
+            "no_reset_credit",
+            None,
+        ),
+        (
+            200,
+            &br#"{"code":"surprise"}"#[..],
+            None,
+            "unexpected_response",
+            None,
+        ),
+    ] {
+        let mut http = ApplyHttp::replying(status, body);
+        http.retry_after = retry_after.map(str::to_owned);
+        let http = Arc::new(http);
+        let service = reset_apply_service(
+            Arc::clone(&http),
+            openai_descriptor("work-chatgpt", "redacted-account-coordinate"),
+        );
+        let error = service
+            .apply_reset(&CredentialAlias::new("work-chatgpt"), "approval-key")
+            .await
+            .expect_err("typed failure");
+        assert_eq!(error.reason, expected, "status {status}");
+        assert_eq!(error.retry_at_ms, expected_retry_at, "status {status}");
+        assert_eq!(http.posts(), 1, "exactly one consume request");
+    }
+}
+
+#[tokio::test]
+async fn reset_apply_refuses_unsupported_accounts_before_any_request() {
+    for (descriptor, expected) in [
+        (
+            descriptor("anthropic-oauth", "max-sub", AuthMethod::OAuth),
+            "provider_reset_not_supported",
+        ),
+        (
+            descriptor("openai-oauth", "max-sub", AuthMethod::ApiKey),
+            "provider_reset_not_supported",
+        ),
+        (
+            descriptor("openai-oauth", "max-sub", AuthMethod::OAuth),
+            "credential_identity_incomplete",
+        ),
+    ] {
+        let http = Arc::new(ApplyHttp::replying(200, br#"{"code":"reset"}"#));
+        let service = reset_apply_service(Arc::clone(&http), descriptor);
+        let error = service
+            .apply_reset(&CredentialAlias::new("max-sub"), "approval-key")
+            .await
+            .expect_err("refused");
+        assert_eq!(error.reason, expected);
+        assert_eq!(http.posts(), 0, "no consume request may be sent");
+    }
+    let service = reset_apply_service(
+        Arc::new(ApplyHttp::replying(200, b"{}")),
+        descriptor("openai-oauth", "api-key", AuthMethod::ApiKey),
+    );
+    assert!(!service.reset_apply_supported(&CredentialAlias::new("api-key")));
+    assert!(!service.reset_apply_supported(&CredentialAlias::new("missing")));
 }
 
 fn jwt_with_claims(claims: &serde_json::Value) -> Vec<u8> {

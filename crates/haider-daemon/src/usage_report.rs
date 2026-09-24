@@ -39,12 +39,10 @@ use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageBreakdown, AgentUsa
 use haider_protocol::credential::{
     AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
 };
-use haider_protocol::effect::{EffectClass, EffectIntent};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{AgentId, CredentialAlias, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::orchestration::{
     ORCHESTRATION_TERMINAL_EXTENSION, OrchestrationUsageV1, ScriptTerminalV1,
 };
@@ -56,8 +54,8 @@ use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageRequestScopeV1,
     CacheUsageRequestV1, CacheUsageStatsV1, HaiderCodePlanSnapshotV1, LocalUsageStatsV1,
-    UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1, UsageReportV1, UsageResetCreditsV1,
-    UsageResetHistoryEntryV1, UsageResetHistorySourceV1, UsageWindowV1,
+    USAGE_HISTORY_MAX_RANGE_DAYS, UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1, UsageReportV1,
+    UsageResetCreditsV1, UsageResetHistoryEntryV1, UsageResetHistorySourceV1, UsageWindowV1,
 };
 use haider_provider::{MeterReading, MeterUnavailable, UsageMeterEndpoint};
 use serde::Deserialize;
@@ -122,8 +120,9 @@ fn credential_meter_unavailable_reason(status: &CredentialStatus) -> Option<&'st
     }
 }
 
-/// Injected HTTP seam for meter fetches: one authenticated GET, no retries
-/// (the cache floor owns pacing). Every failure is a typed reason.
+/// Injected HTTP seam for meter fetches (one authenticated GET, no retries;
+/// the cache floor owns pacing) and the single reset-credit POST. Every
+/// failure is a typed reason.
 #[async_trait::async_trait]
 pub(crate) trait UsageMeterHttp: Send + Sync {
     async fn get(
@@ -181,47 +180,7 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         let Some(client) = self.transport.client() else {
             return Err(MeterUnavailable::new("transport_unavailable"));
         };
-        let token = std::str::from_utf8(bearer.expose_secret())
-            .map_err(|_| MeterUnavailable::new("credential_not_utf8"))?;
-        let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| MeterUnavailable::new("credential_not_header_safe"))?;
-        authorization.set_sensitive(true);
-        let mut request = client
-            .get(url)
-            .timeout(Duration::from_secs(15))
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .header(reqwest::header::AUTHORIZATION, authorization);
-        for (name, value) in extra_headers {
-            request = request.header(*name, *value);
-        }
-        if let Some(account_id) = chatgpt_account_id {
-            let mut account_id = reqwest::header::HeaderValue::from_str(account_id)
-                .map_err(|_| MeterUnavailable::new("credential_account_id_not_header_safe"))?;
-            account_id.set_sensitive(true);
-            request = request.header(haider_provider::OPENAI_OAUTH_ACCOUNT_ID_HEADER, account_id);
-        }
-        let response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                MeterUnavailable::new("transport_timeout")
-            } else {
-                MeterUnavailable::new("transport_error")
-            }
-        })?;
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response
-            .bytes()
-            .await
-            .map_err(|_| MeterUnavailable::new("transport_error"))?;
-        Ok(UsageMeterHttpResponse {
-            status,
-            body: body.to_vec(),
-            retry_after,
-        })
+        send_authorized(client.get(url), bearer, extra_headers, chatgpt_account_id).await
     }
 
     async fn post_json(
@@ -235,48 +194,90 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         let Some(client) = self.transport.client() else {
             return Err(MeterUnavailable::new("transport_unavailable"));
         };
-        let token = std::str::from_utf8(bearer.expose_secret())
-            .map_err(|_| MeterUnavailable::new("credential_not_utf8"))?;
-        let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| MeterUnavailable::new("credential_not_header_safe"))?;
-        authorization.set_sensitive(true);
-        let mut request = client
-            .post(url)
-            .timeout(Duration::from_secs(15))
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .header(reqwest::header::AUTHORIZATION, authorization)
-            .json(body);
-        for (name, value) in extra_headers {
-            request = request.header(*name, *value);
+        send_authorized(
+            client.post(url).json(body),
+            bearer,
+            extra_headers,
+            chatgpt_account_id,
+        )
+        .await
+    }
+}
+
+/// Adds the bearer, fixed provider headers and the optional ChatGPT account
+/// coordinate (both credentials marked sensitive), sends once, and reads the
+/// whole body.
+async fn send_authorized(
+    request: reqwest::RequestBuilder,
+    bearer: &SecretHandle,
+    extra_headers: &[(&'static str, &'static str)],
+    chatgpt_account_id: Option<&str>,
+) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+    let token = std::str::from_utf8(bearer.expose_secret())
+        .map_err(|_| MeterUnavailable::new("credential_not_utf8"))?;
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| MeterUnavailable::new("credential_not_header_safe"))?;
+    authorization.set_sensitive(true);
+    // The workspace reqwest build has no response-decompression features, so
+    // a compressed body would be unparseable (the original WHAM
+    // `malformed_response`). Ask for an uncompressed representation.
+    let mut request = request
+        .timeout(Duration::from_secs(15))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .header(reqwest::header::AUTHORIZATION, authorization);
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    if let Some(account_id) = chatgpt_account_id {
+        let mut account_id = reqwest::header::HeaderValue::from_str(account_id)
+            .map_err(|_| MeterUnavailable::new("credential_account_id_not_header_safe"))?;
+        account_id.set_sensitive(true);
+        request = request.header(haider_provider::OPENAI_OAUTH_ACCOUNT_ID_HEADER, account_id);
+    }
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            MeterUnavailable::new("transport_timeout")
+        } else {
+            MeterUnavailable::new("transport_error")
         }
-        if let Some(account_id) = chatgpt_account_id {
-            let mut account_id = reqwest::header::HeaderValue::from_str(account_id)
-                .map_err(|_| MeterUnavailable::new("credential_account_id_not_header_safe"))?;
-            account_id.set_sensitive(true);
-            request = request.header(haider_provider::OPENAI_OAUTH_ACCOUNT_ID_HEADER, account_id);
-        }
-        let response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                MeterUnavailable::new("transport_timeout")
-            } else {
-                MeterUnavailable::new("transport_error")
-            }
-        })?;
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response
-            .bytes()
-            .await
-            .map_err(|_| MeterUnavailable::new("transport_error"))?;
-        Ok(UsageMeterHttpResponse {
-            status,
-            body: body.to_vec(),
-            retry_after,
-        })
+    })?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| MeterUnavailable::new("transport_error"))?;
+    Ok(UsageMeterHttpResponse {
+        status,
+        body: body.to_vec(),
+        retry_after,
+    })
+}
+
+/// Maps the HTTP statuses that need a specific, actionable reason: 401 asks
+/// for a re-login, 403 names the refusal, and 429 carries the exact
+/// `Retry-After` instant when the provider supplied one. Other statuses are
+/// left to the caller's own classification.
+fn http_failure(
+    response: &UsageMeterHttpResponse,
+    received_at_ms: u64,
+) -> Option<MeterUnavailable> {
+    match response.status {
+        401 => Some(MeterUnavailable::new("credential_expired")),
+        403 => Some(MeterUnavailable::new("http_403_forbidden_relogin")),
+        429 => Some(
+            MeterUnavailable::new("http_429_rate_limited").with_retry_at_ms(
+                haider_provider::parse_retry_after_at_ms(
+                    response.retry_after.as_deref(),
+                    received_at_ms,
+                ),
+            ),
+        ),
+        _ => None,
     }
 }
 
@@ -285,21 +286,8 @@ fn classify_meter_response(
     response: UsageMeterHttpResponse,
     fetched_at_ms: u64,
 ) -> Result<MeterReading, MeterUnavailable> {
-    if response.status == 401 {
-        return Err(MeterUnavailable::new("credential_expired"));
-    }
-    if response.status == 403 {
-        return Err(MeterUnavailable::new("http_403_forbidden_relogin"));
-    }
-    if response.status == 429 {
-        return Err(
-            MeterUnavailable::new("http_429_rate_limited").with_retry_at_ms(
-                haider_provider::parse_retry_after_at_ms(
-                    response.retry_after.as_deref(),
-                    fetched_at_ms,
-                ),
-            ),
-        );
+    if let Some(failure) = http_failure(&response, fetched_at_ms) {
+        return Err(failure);
     }
     endpoint.parse_at(response.status, &response.body, fetched_at_ms)
 }
@@ -478,58 +466,6 @@ fn system_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn usage_reset_effect_id(approval_id: &str) -> haider_protocol::ids::EffectId {
-    haider_protocol::ids::EffectId::new(format!("effect-{approval_id}"))
-}
-
-pub(crate) fn usage_reset_intent(approval_id: &str, account: &CredentialAlias) -> EffectIntent {
-    EffectIntent {
-        effect: usage_reset_effect_id(approval_id),
-        class: EffectClass::UsageResetApply,
-        summary: format!("apply one usage reset credit for {account}"),
-        args_digest: format!(
-            "blake3:{}",
-            blake3::hash(account.as_str().as_bytes()).to_hex()
-        ),
-        workspace_revision: None,
-    }
-}
-
-pub(crate) fn usage_reset_approval_menu(approval_id: &str, account: &CredentialAlias) -> Menu {
-    Menu {
-        id: haider_protocol::ids::MenuId::new(format!("deferred-{approval_id}")),
-        kind: MenuKind::DeferredApproval {
-            approval_id: approval_id.to_owned(),
-            effect: EffectClass::UsageResetApply,
-            account: Some(account.clone()),
-        },
-        title: "Apply a usage reset credit?".into(),
-        body: vec![
-            format!("Account: {account}"),
-            "This spends one limited provider-issued reset credit. Work continues while this decision is pending.".into(),
-        ],
-        options: vec![
-            MenuOption {
-                key: "approve".into(),
-                label: "Apply one reset".into(),
-                detail: Some("Spend one applicable reset credit now.".into()),
-                decision: Some(DecisionKind::AllowOnce),
-            },
-            MenuOption {
-                key: "deny".into(),
-                label: "Deny".into(),
-                detail: Some("Do not spend a reset credit.".into()),
-                decision: Some(DecisionKind::RejectOnce),
-            },
-        ],
-        blocking: false,
-        scope: MenuScope::Session,
-        origin: "deferred_approval_v1".into(),
-        ttl_ms: None,
-        timeout_option: None,
-    }
-}
-
 impl UsageReportService {
     pub(crate) fn new(
         snapshot: AccountsSnapshot,
@@ -627,9 +563,7 @@ impl UsageReportService {
             .into_iter()
             .find(|descriptor| &descriptor.alias == account_alias)
             .ok_or_else(|| MeterUnavailable::new("account_not_found"))?;
-        if descriptor.provider != haider_provider::OPENAI_OAUTH_PROVIDER_NAME
-            || descriptor.auth_method != AuthMethod::OAuth
-        {
+        if !supports_reset_apply(&descriptor) {
             return Err(MeterUnavailable::new("provider_reset_not_supported"));
         }
         let Some(tokens) = &self.tokens else {
@@ -652,21 +586,8 @@ impl UsageReportService {
                 &serde_json::json!({ "redeem_request_id": approval_id }),
             )
             .await?;
-        if response.status == 401 {
-            return Err(MeterUnavailable::new("credential_expired"));
-        }
-        if response.status == 403 {
-            return Err(MeterUnavailable::new("http_403_forbidden_relogin"));
-        }
-        if response.status == 429 {
-            return Err(
-                MeterUnavailable::new("http_429_rate_limited").with_retry_at_ms(
-                    haider_provider::parse_retry_after_at_ms(
-                        response.retry_after.as_deref(),
-                        (self.clock)(),
-                    ),
-                ),
-            );
+        if let Some(failure) = http_failure(&response, (self.clock)()) {
+            return Err(failure);
         }
         if !(200..300).contains(&response.status) {
             return Err(MeterUnavailable::new(format!(
@@ -705,10 +626,8 @@ impl UsageReportService {
     }
 
     pub(crate) fn reset_apply_supported(&self, account_alias: &CredentialAlias) -> bool {
-        self.descriptors().into_iter().any(|descriptor| {
-            &descriptor.alias == account_alias
-                && descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME
-                && descriptor.auth_method == AuthMethod::OAuth
+        self.descriptors().iter().any(|descriptor| {
+            &descriptor.alias == account_alias && supports_reset_apply(descriptor)
         })
     }
 
@@ -756,7 +675,7 @@ impl UsageReportService {
                         match entry.outcome {
                             Ok(reading) => {
                                 reset_credits = reading.reset_credits.clone();
-                                merge_reset_history(
+                                prefer_provider_reset_history(
                                     &mut previous_resets,
                                     reading.previous_resets.clone(),
                                 );
@@ -946,21 +865,16 @@ impl UsageReportService {
     }
 }
 
-fn utc_date_from_ms(timestamp_ms: u64) -> String {
-    let days = i64::try_from(timestamp_ms / 86_400_000).unwrap_or(i64::MAX);
-    let z = days.saturating_add(719_468);
-    let era = z.div_euclid(146_097);
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
+/// Accounts are OpenAI ChatGPT OAuth logins: the only provider with a
+/// verified reset-credit consume operation.
+fn supports_reset_apply(descriptor: &CredentialDescriptor) -> bool {
+    descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME
+        && descriptor.auth_method == AuthMethod::OAuth
 }
+
+const MILLIS_PER_DAY: u64 = 86_400_000;
+/// Newest-first bound on published prior resets per account.
+const PREVIOUS_RESETS_LIMIT: usize = 128;
 
 async fn collect_device_reset_history(
     store: &haider_core::SqliteStoreHandle,
@@ -971,10 +885,11 @@ async fn collect_device_reset_history(
 > {
     // The ledger rejects dates before 1970. Synthetic clocks near the epoch
     // still have a valid report; limit the lookback to elapsed calendar days.
-    let elapsed_days = (now_ms / 86_400_000).saturating_add(1);
-    let days = u16::try_from(elapsed_days.min(366)).unwrap_or(366);
+    let max_days = USAGE_HISTORY_MAX_RANGE_DAYS;
+    let elapsed_days = (now_ms / MILLIS_PER_DAY).saturating_add(1);
+    let days = u16::try_from(elapsed_days.min(u64::from(max_days))).unwrap_or(max_days);
     let samples = store
-        .usage_meter_samples_range(utc_date_from_ms(now_ms), days)
+        .usage_meter_samples_range(haider_store::slot_address(now_ms).date, days)
         .await?;
     let mut by_window = HashMap::<(String, String), Vec<UsageHistoryMeterSampleV1>>::new();
     for sample in samples {
@@ -1024,12 +939,14 @@ async fn collect_device_reset_history(
     }
     for entries in histories.values_mut() {
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.reset_at_ms));
-        entries.truncate(128);
+        entries.truncate(PREVIOUS_RESETS_LIMIT);
     }
     Ok(histories)
 }
 
-fn merge_reset_history(
+/// Provider-published history wins over this device's journal whenever the
+/// provider supplied any exact entry; the two sources are never interleaved.
+fn prefer_provider_reset_history(
     existing: &mut Vec<UsageResetHistoryEntryV1>,
     mut provider: Vec<UsageResetHistoryEntryV1>,
 ) {
@@ -1040,7 +957,7 @@ fn merge_reset_history(
     provider
         .retain(|entry| seen.insert((entry.reset_at_ms, entry.window.clone(), entry.kind.clone())));
     provider.sort_by_key(|entry| std::cmp::Reverse(entry.reset_at_ms));
-    provider.truncate(128);
+    provider.truncate(PREVIOUS_RESETS_LIMIT);
     *existing = provider;
 }
 

@@ -54,9 +54,10 @@ the durable state. Denial never sends a consume request. A failed or lost
 provider response can leave the spending outcome unknown.
 
 The only consume caller is the human-facing RPC `menu_answer` completion in
-`session_hub/rpc.rs::finish_usage_reset_approval`. It persists `Dispatched`
-before the POST. Agent polling in `worker.rs::usage_reset_status` reads the
-result and never calls the provider. If the daemon stops after dispatch but
+`session_hub/usage_reset_rpc.rs::finish_usage_reset_approval`. It persists `Dispatched`
+before the POST. Agent polling in `worker_usage_reset.rs::usage_reset_status` reads the
+result and never calls the provider. Shared identifiers, the approval menu
+and the poll-status derivation live in `usage_reset.rs`. If the daemon stops after dispatch but
 before recording a result, polling reports `provider_outcome_unconfirmed` and
 does not reissue the POST. The same approval id is sent as OpenAI's
 `redeem_request_id` for provider-side idempotency. At integration with lane
