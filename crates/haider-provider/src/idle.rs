@@ -34,6 +34,18 @@ struct State {
     finished: bool,
 }
 
+impl State {
+    /// Ends an upload pause, shifting the idle deadline by the paused time
+    /// so upload is charged to neither idle nor elapsed evidence.
+    fn end_upload_pause(&mut self) {
+        if let Some(paused_at) = self.upload_pause_started.take() {
+            let excluded = Instant::now().saturating_duration_since(paused_at);
+            self.excluded_upload = self.excluded_upload.saturating_add(excluded);
+            self.last_progress += excluded;
+        }
+    }
+}
+
 /// Shared only by attempts of the same logical provider request. Opening an
 /// attempt, returning response headers, and sleeping for backoff are not
 /// progress. Native adapters report raw nonempty chunks before decoding.
@@ -44,11 +56,14 @@ pub struct ProviderIdleDeadline {
 }
 
 impl ProviderIdleDeadline {
-    pub fn begin_attempt(&self, budget: Option<Duration>) {
-        let mut state = self
-            .state
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<State>> {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn begin_attempt(&self, budget: Option<Duration>) {
+        let mut state = self.lock();
         if state.is_none() {
             let Some(budget) = budget else { return };
             let now = Instant::now();
@@ -76,10 +91,7 @@ impl ProviderIdleDeadline {
     /// being uploaded. Response-open and provider-silence attribution begin
     /// only after the HTTP body producer reaches EOF.
     pub(crate) fn pause_for_upload(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         if let Some(state) = state.as_mut()
             && !state.finished
             && state.upload_pause_started.is_none()
@@ -93,33 +105,17 @@ impl ProviderIdleDeadline {
 
     /// Resumes the logical idle clock without charging the upload interval.
     pub(crate) fn resume_after_upload(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(state) = state.as_mut()
-            && let Some(paused_at) = state.upload_pause_started.take()
-        {
-            let excluded = Instant::now().saturating_duration_since(paused_at);
-            state.excluded_upload = state.excluded_upload.saturating_add(excluded);
-            state.last_progress += excluded;
+        let mut state = self.lock();
+        if let Some(state) = state.as_mut() {
+            state.end_upload_pause();
         }
         drop(state);
         self.changed.notify_one();
     }
 
     pub fn observe_progress(&self) {
-        if let Some(state) = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-        {
-            if let Some(paused_at) = state.upload_pause_started.take() {
-                let excluded = Instant::now().saturating_duration_since(paused_at);
-                state.excluded_upload = state.excluded_upload.saturating_add(excluded);
-                state.last_progress += excluded;
-            }
+        if let Some(state) = self.lock().as_mut() {
+            state.end_upload_pause();
             let now = Instant::now();
             // A late chunk cannot resurrect an already exhausted operation.
             if now < state.last_progress + state.budget {
@@ -132,12 +128,7 @@ impl ProviderIdleDeadline {
         if error.timeout_reason == Some(ProviderTimeoutReason::IdleTimeout) {
             return;
         }
-        if let Some(state) = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-        {
+        if let Some(state) = self.lock().as_mut() {
             state.cause = Some(error.clone());
         }
     }
@@ -154,11 +145,7 @@ impl ProviderIdleDeadline {
         }) {
             return;
         }
-        if let Some(state) = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
+        if let Some(state) = self.lock().as_mut()
             && Instant::now() < state.last_progress + state.budget
         {
             state.finished = true;
@@ -166,10 +153,7 @@ impl ProviderIdleDeadline {
     }
 
     pub fn expired(&self) -> Option<ProviderError> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.lock();
         let state = state.as_ref()?;
         let now = Instant::now();
         if state.finished
@@ -220,9 +204,7 @@ impl ProviderIdleDeadline {
         loop {
             let changed = self.changed.notified();
             let deadline = self
-                .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .filter(|state| !state.finished && state.upload_pause_started.is_none())
                 .map(|state| state.last_progress + state.budget);
@@ -251,53 +233,5 @@ impl ProviderIdleDeadline {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn request_upload_does_not_consume_idle_budget() {
-        let idle = ProviderIdleDeadline::default();
-        idle.begin_attempt(Some(Duration::from_secs(30)));
-        idle.pause_for_upload();
-        tokio::time::advance(Duration::from_secs(45)).await;
-        assert!(idle.expired().is_none());
-
-        idle.resume_after_upload();
-        tokio::time::advance(Duration::from_secs(29)).await;
-        assert!(idle.expired().is_none());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let error = match idle.expired() {
-            Some(error) => error,
-            None => panic!("active idle budget did not expire"),
-        };
-        let evidence = match error.idle_timeout {
-            Some(evidence) => evidence,
-            None => panic!("idle timeout omitted typed evidence"),
-        };
-        assert_eq!(evidence.idle_elapsed_ms, 30_000);
-        assert_eq!(evidence.elapsed_ms, 30_000);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn terminal_idle_error_names_the_last_response_open_cause() {
-        let idle = ProviderIdleDeadline::default();
-        idle.begin_attempt(Some(Duration::from_secs(1)));
-        idle.record_error(&ProviderError::new(
-            ProviderErrorKind::Transport,
-            "Anthropic response did not open within 60 seconds",
-        ));
-        tokio::time::advance(Duration::from_secs(1)).await;
-
-        let error = match idle.expired() {
-            Some(error) => error,
-            None => panic!("idle timeout did not expire"),
-        };
-        assert!(error.message.contains("Anthropic response did not open"));
-        assert!(
-            error
-                .presentation
-                .detail
-                .contains("Anthropic response did not open")
-        );
-    }
-}
+#[path = "idle_tests.rs"]
+mod tests;

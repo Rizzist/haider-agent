@@ -1,15 +1,10 @@
 //! Anthropic Messages API adapter.
 
-use std::convert::Infallible;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures_util::Stream;
 use haider_accounts::SecretHandle;
 use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
@@ -18,7 +13,7 @@ use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RETRY_AFTER,
 };
 use serde::Deserialize;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 /// Anthropic documents this as a limit on the complete JSON request, not the
 /// decoded PDF. Check the final payload because base64 expansion and prompt
@@ -103,89 +98,6 @@ const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
 };
 
 static ANTHROPIC_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
-const REQUEST_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone)]
-struct RequestUploadBoundary {
-    complete: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-    idle_deadline: Option<crate::ProviderIdleDeadline>,
-}
-
-impl RequestUploadBoundary {
-    fn new() -> Self {
-        let idle_deadline = crate::ProviderIdleDeadline::current();
-        if let Some(idle_deadline) = &idle_deadline {
-            idle_deadline.pause_for_upload();
-        }
-        Self {
-            complete: Arc::new(AtomicBool::new(false)),
-            notify: Arc::new(Notify::new()),
-            idle_deadline,
-        }
-    }
-
-    fn complete(&self) {
-        if self.complete.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Some(idle_deadline) = &self.idle_deadline {
-            idle_deadline.resume_after_upload();
-        }
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) {
-        while !self.complete.load(Ordering::Acquire) {
-            let notified = self.notify.notified();
-            if self.complete.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-struct RequestUploadBody {
-    bytes: Bytes,
-    offset: usize,
-    boundary: RequestUploadBoundary,
-}
-
-impl RequestUploadBody {
-    fn new(bytes: Vec<u8>, boundary: RequestUploadBoundary) -> Self {
-        Self {
-            bytes: Bytes::from(bytes),
-            offset: 0,
-            boundary,
-        }
-    }
-}
-
-impl Stream for RequestUploadBody {
-    type Item = Result<Bytes, Infallible>;
-
-    fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.offset == self.bytes.len() {
-            self.boundary.complete();
-            return Poll::Ready(None);
-        }
-        let end = self
-            .offset
-            .saturating_add(REQUEST_UPLOAD_CHUNK_BYTES)
-            .min(self.bytes.len());
-        let chunk = self.bytes.slice(self.offset..end);
-        self.offset = end;
-        Poll::Ready(Some(Ok(chunk)))
-    }
-}
-
-impl Drop for RequestUploadBody {
-    fn drop(&mut self) {
-        self.boundary.complete();
-    }
-}
-
 /// Anthropic's model-keyed native computer tool dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnthropicComputerToolVersion {
@@ -1006,16 +918,14 @@ impl AnthropicProvider {
     async fn request_body_prepared_for_send(
         &self,
         prepared: crate::PreparedWire,
-    ) -> Result<(reqwest::Request, RequestUploadBoundary), ProviderError> {
-        let boundary = RequestUploadBoundary::new();
+    ) -> Result<(reqwest::Request, crate::RequestUploadBoundary), ProviderError> {
+        let boundary = crate::RequestUploadBoundary::new();
         let result = async {
             let request = self.request_builder(&prepared.payload).await?;
             let body = crate::serialize_prepared_json_body(prepared)?;
-            let body_len = body.len();
-            let upload = RequestUploadBody::new(body, boundary.clone());
             request
-                .header(CONTENT_LENGTH, body_len)
-                .body(reqwest::Body::wrap_stream(upload))
+                .header(CONTENT_LENGTH, body.len())
+                .body(boundary.body(body))
                 .build()
                 .map_err(transport_error)
         }
@@ -1131,6 +1041,9 @@ impl AnthropicProvider {
         };
         let (request, upload) = self.request_body_prepared_for_send(prepared).await?;
         let route_gating = self.route_gating();
+        // The response-open budget covers only the wait after the body
+        // producer reaches EOF; a response that opens mid-upload (e.g. an
+        // early error status) is taken as-is.
         let mut opening = Box::pin(self.client.execute(request));
         let opened_during_upload = tokio::select! {
             response = &mut opening => Some(response),

@@ -116,7 +116,7 @@ use haider_provider::{
     before_provider_request_deadline, canonical_tool_definitions,
     canonical_tool_definitions_digest, deadline_exhausted_error,
     degrade_tool_result_images_to_placeholders, effective_request_budget,
-    validate_provider_view_prefix,
+    has_stale_computer_screenshots, validate_provider_view_prefix,
 };
 
 #[path = "actor_wake.rs"]
@@ -4209,7 +4209,7 @@ impl HarnessActor {
             let request_images_will_mutate = !self.config.tool_result_images_supported
                 || request_image_count > TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
                 || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN
-                || stale_computer_screenshot_projection(&request_messages);
+                || has_stale_computer_screenshots(&request_messages);
             let mut request_only_tool_results =
                 if request_images_will_mutate {
                     request_messages
@@ -4288,15 +4288,10 @@ impl HarnessActor {
                             .await;
                     }
                 };
-            let request_view_snapshot = match (
+            let request_view_snapshot = combine_provider_view_epochs(
                 volatile_context_epoch.as_deref(),
                 request_image_projection_epoch.as_deref(),
-            ) {
-                (None, None) => None,
-                (Some(volatile), None) => Some(volatile.to_owned()),
-                (None, Some(images)) => Some(images.to_owned()),
-                (Some(volatile), Some(images)) => Some(digest_json(&(volatile, images))),
-            };
+            );
             // Cache metadata must exist before provider preparation, so this
             // is the last provider-neutral request-send boundary available to
             // the TTL selector. Sample every request at this same boundary;
@@ -15421,31 +15416,16 @@ fn tool_image_corrupt(message: impl Into<String>) -> HaiderError {
     HaiderError::new(ErrorCode::StoreCorrupt, message, false)
 }
 
-fn stale_computer_screenshot_projection(messages: &[Message]) -> bool {
-    let computer_calls = messages
-        .iter()
-        .flat_map(|message| &message.blocks)
-        .filter_map(|block| match block {
-            Block::ToolCall { call_id, name, .. } if name == "computer" => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    messages
-        .iter()
-        .flat_map(|message| &message.blocks)
-        .filter(|block| {
-            matches!(
-                block,
-                Block::ToolResult {
-                    call_id,
-                    images,
-                    ..
-                } if !images.is_empty() && computer_calls.contains(call_id.as_str())
-            )
-        })
-        .take(2)
-        .count()
-        > 1
+/// A request-only image projection and a volatile-context snapshot are both
+/// provider-view epochs; the request declares one digest covering whichever
+/// are present.
+fn combine_provider_view_epochs(volatile: Option<&str>, images: Option<&str>) -> Option<String> {
+    match (volatile, images) {
+        (None, None) => None,
+        (Some(volatile), None) => Some(volatile.to_owned()),
+        (None, Some(images)) => Some(images.to_owned()),
+        (Some(volatile), Some(images)) => Some(digest_json(&(volatile, images))),
+    }
 }
 
 /// E2 normalization point: every tool result passes through the actor before
@@ -15618,15 +15598,15 @@ mod cu1_actor_tests {
     #[test]
     fn second_computer_screenshot_declares_request_only_history_rewrite() {
         let first = computer_screenshot("screenshot-1");
-        assert!(!stale_computer_screenshot_projection(&first));
+        assert!(!has_stale_computer_screenshots(&first));
 
         let mut repeated = first.to_vec();
         repeated.extend(computer_screenshot("screenshot-2"));
-        assert!(stale_computer_screenshot_projection(&repeated));
+        assert!(has_stale_computer_screenshots(&repeated));
 
         repeated.push(Message::tool_result("ordinary-tool", "done", false));
         assert!(
-            stale_computer_screenshot_projection(&repeated),
+            has_stale_computer_screenshots(&repeated),
             "an unrelated result must not hide the request-local rewrite"
         );
     }

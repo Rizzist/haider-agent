@@ -18161,7 +18161,9 @@ impl BrokerToolDispatcher {
         })?
         .map_err(ToolError::Computer)?;
         cancel.check().map_err(ToolError::Computer)?;
-        let redacted = tokio::task::spawn_blocking(move || {
+        // Bound after crop so the CAS dimensions are the delivered size that
+        // model coordinates are later mapped from.
+        let bounded = tokio::task::spawn_blocking(move || {
             haider_tools::bound_computer_screenshot_png(&redacted)
         })
         .await
@@ -18171,7 +18173,7 @@ impl BrokerToolDispatcher {
         .map_err(ToolError::Computer)?;
         cancel.check().map_err(ToolError::Computer)?;
         let mut cas = self.cas.lock().await;
-        cas.put_image(redacted, "image/png")
+        cas.put_image(bounded, "image/png")
             .await
             .map(|image| (image, crop))
     }

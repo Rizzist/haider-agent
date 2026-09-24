@@ -29,6 +29,10 @@ mod windows;
 mod region;
 pub use region::{ComputerScreenshotCrop, ComputerScreenshotRegion, crop_screenshot_png};
 
+#[path = "computer/screenshot_bounds.rs"]
+mod screenshot_bounds;
+pub use screenshot_bounds::bound_computer_screenshot_png;
+
 use crate::broker::EffectOperation;
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
@@ -45,68 +49,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const COMPUTER_WAIT_MAX_MS: u64 = 60_000;
 pub const COMPUTER_TEXT_MAX_CHARS: usize = 100_000;
 pub const COMPUTER_REDACT_REGIONS_ENV: &str = "HAIDER_COMPUTER_REDACT_REGIONS";
-
-/// Resizes a PNG into the computer-use compatibility envelope while keeping
-/// both axes available to the backend's exact delivered-to-native mapping.
-/// Generic tool images retain their wider CU-1 allowance.
-pub fn bound_computer_screenshot_png(png: &[u8]) -> ComputerResult<Vec<u8>> {
-    use haider_protocol::tool::{
-        COMPUTER_SCREENSHOT_MAX_DIMENSION, COMPUTER_SCREENSHOT_MAX_PIXELS,
-        TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC, TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES,
-        TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS,
-    };
-    use image::imageops::FilterType;
-    use image::{DynamicImage, ImageFormat, ImageReader, Limits};
-    use std::io::Cursor;
-
-    let failure = |error: String| ComputerError::Backend {
-        message: format!("computer screenshot resize: {error}"),
-    };
-    if png.len() > TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES {
-        return Err(failure("source exceeds image byte limit".into()));
-    }
-    let (width, height) = ImageReader::with_format(Cursor::new(png), ImageFormat::Png)
-        .into_dimensions()
-        .map_err(|error| failure(error.to_string()))?;
-    let pixels = u64::from(width).saturating_mul(u64::from(height));
-    if width == 0 || height == 0 || pixels > TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS {
-        return Err(failure(format!(
-            "source dimensions {width}x{height} exceed the safe image limit"
-        )));
-    }
-    if width <= COMPUTER_SCREENSHOT_MAX_DIMENSION
-        && height <= COMPUTER_SCREENSHOT_MAX_DIMENSION
-        && pixels <= COMPUTER_SCREENSHOT_MAX_PIXELS
-    {
-        return Ok(png.to_vec());
-    }
-
-    let dimension_scale =
-        f64::from(COMPUTER_SCREENSHOT_MAX_DIMENSION) / f64::from(width.max(height));
-    let pixel_scale = (COMPUTER_SCREENSHOT_MAX_PIXELS as f64 / pixels as f64).sqrt();
-    let scale = dimension_scale.min(pixel_scale).min(1.0);
-    let target_width = (f64::from(width) * scale).floor().max(1.0) as u32;
-    let target_height = (f64::from(height) * scale).floor().max(1.0) as u32;
-    debug_assert!(target_width <= COMPUTER_SCREENSHOT_MAX_DIMENSION);
-    debug_assert!(target_height <= COMPUTER_SCREENSHOT_MAX_DIMENSION);
-    debug_assert!(
-        u64::from(target_width) * u64::from(target_height) <= COMPUTER_SCREENSHOT_MAX_PIXELS
-    );
-
-    let mut reader = ImageReader::with_format(Cursor::new(png), ImageFormat::Png);
-    let mut limits = Limits::default();
-    limits.max_alloc = Some(TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC);
-    reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|error| failure(error.to_string()))?;
-    let resized = image.resize_exact(target_width, target_height, FilterType::Lanczos3);
-    let mut output = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(resized.into_rgba8())
-        .write_to(&mut output, ImageFormat::Png)
-        .map_err(|error| failure(error.to_string()))?;
-    Ok(output.into_inner())
-}
 
 /// Typed native-computer failure. Platform/TCC failures stay distinguishable
 /// across the backend seam instead of collapsing into a silent empty capture.

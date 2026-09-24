@@ -34,6 +34,8 @@ mod oauth_identity;
 mod openai;
 mod origin;
 mod pricing;
+mod request_upload;
+pub(crate) use request_upload::RequestUploadBoundary;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 #[path = "../tests/support/prompt_cache_fake.rs"]
@@ -1622,7 +1624,7 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
             };
             let first_omitted = bounded_context_field(first_omitted.as_str(), 96);
             preview.push_str(&tool_image_elision_marker(
-                "tool_result_image_budget",
+                ImageElisionScope::TurnBudget,
                 omitted_count,
                 omitted_bytes,
                 Some(&first_omitted),
@@ -1631,19 +1633,51 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
     }
 }
 
+/// Tool name whose image results are screenshots of the live desktop.
+const COMPUTER_TOOL_NAME: &str = "computer";
+
+fn computer_call_ids(messages: &[Message]) -> HashSet<String> {
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolCall { call_id, name, .. } if name == COMPUTER_TOOL_NAME => {
+                Some(call_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether [`apply_tool_result_image_budget`] will elide at least one older
+/// computer screenshot, i.e. more than one computer tool result still carries
+/// images. Callers use this to declare the request-only rewrite up front.
+pub fn has_stale_computer_screenshots(messages: &[Message]) -> bool {
+    let computer_calls = computer_call_ids(messages);
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| {
+            matches!(
+                block,
+                Block::ToolResult {
+                    call_id,
+                    images,
+                    ..
+                } if !images.is_empty() && computer_calls.contains(call_id)
+            )
+        })
+        .take(2)
+        .count()
+        > 1
+}
+
 /// The latest computer observation is the only full screenshot useful for
 /// subsequent coordinate decisions. Older captures remain durable and
 /// retrievable through their artifact refs, but do not grow every later
 /// provider request.
 fn elide_stale_computer_screenshots(messages: &mut [Message]) {
-    let computer_calls = messages
-        .iter()
-        .flat_map(|message| &message.blocks)
-        .filter_map(|block| match block {
-            Block::ToolCall { call_id, name, .. } if name == "computer" => Some(call_id.clone()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
+    let computer_calls = computer_call_ids(messages);
     let mut retained_latest = false;
     for message in messages.iter_mut().rev() {
         for block in message.blocks.iter_mut().rev() {
@@ -1664,20 +1698,11 @@ fn elide_stale_computer_screenshots(messages: &mut [Message]) {
                 continue;
             }
             let removed = std::mem::take(images);
-            let omitted_count = removed.len();
-            let omitted_bytes = removed
-                .iter()
-                .map(|image| image.byte_len)
-                .fold(0_u64, u64::saturating_add);
-            let first_omitted = removed
-                .first()
-                .map(|image| bounded_context_field(image.artifact.as_str(), 96));
-            preview.push_str(&tool_image_elision_marker(
-                "computer_screenshot_history",
-                omitted_count,
-                omitted_bytes,
-                first_omitted.as_deref(),
-            ));
+            push_image_elision_marker(
+                preview,
+                ImageElisionScope::ComputerScreenshotHistory,
+                &removed,
+            );
         }
     }
 }
@@ -1695,21 +1720,12 @@ pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
                 continue;
             };
             let removed = std::mem::take(images);
-            let omitted_count = removed.len();
-            let omitted_bytes = removed
-                .iter()
-                .map(|image| image.byte_len)
-                .fold(0_u64, u64::saturating_add);
-            let first_omitted = removed
-                .first()
-                .map(|image| bounded_context_field(image.artifact.as_str(), 96));
-            if omitted_count > 0 {
-                preview.push_str(&tool_image_elision_marker(
-                    "tool_result_image_capability_degradation",
-                    omitted_count,
-                    omitted_bytes,
-                    first_omitted.as_deref(),
-                ));
+            if !removed.is_empty() {
+                push_image_elision_marker(
+                    preview,
+                    ImageElisionScope::CapabilityDegradation,
+                    &removed,
+                );
                 for image in removed {
                     preview.push('\n');
                     preview.push_str(&tool_image_placeholder(&image));
@@ -1719,25 +1735,68 @@ pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
     }
 }
 
+/// Why a provider-bound clone lost tool-result images. The scope string is
+/// part of the `haider_elision_v1` marker the model reads.
+#[derive(Debug, Clone, Copy)]
+enum ImageElisionScope {
+    TurnBudget,
+    ComputerScreenshotHistory,
+    CapabilityDegradation,
+}
+
+impl ImageElisionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnBudget => "tool_result_image_budget",
+            Self::ComputerScreenshotHistory => "computer_screenshot_history",
+            Self::CapabilityDegradation => "tool_result_image_capability_degradation",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::TurnBudget => "oldest first",
+            Self::ComputerScreenshotHistory => {
+                "newest computer screenshot retained; full image retrievable from CAS"
+            }
+            Self::CapabilityDegradation => "unsupported image capability",
+        }
+    }
+}
+
+/// Appends the marker for images removed wholesale from one tool result.
+fn push_image_elision_marker(
+    preview: &mut String,
+    scope: ImageElisionScope,
+    removed: &[ImageBlockRef],
+) {
+    let omitted_bytes = removed
+        .iter()
+        .map(|image| image.byte_len)
+        .fold(0_u64, u64::saturating_add);
+    let first_omitted = removed
+        .first()
+        .map(|image| bounded_context_field(image.artifact.as_str(), 96));
+    preview.push_str(&tool_image_elision_marker(
+        scope,
+        removed.len(),
+        omitted_bytes,
+        first_omitted.as_deref(),
+    ));
+}
+
 fn tool_image_elision_marker(
-    scope: &str,
+    scope: ImageElisionScope,
     omitted_count: usize,
     omitted_bytes: u64,
     first_omitted: Option<&str>,
 ) -> String {
-    let reason = match scope {
-        "tool_result_image_budget" => "oldest first",
-        "computer_screenshot_history" => {
-            "newest computer screenshot retained; full image retrievable from CAS"
-        }
-        _ => "unsupported image capability",
-    };
     format!(
         "\n{}\n",
         serde_json::json!({
             "haider_elision_v1": {
-                "scope": scope,
-                "reason": reason,
+                "scope": scope.as_str(),
+                "reason": scope.reason(),
                 "omitted_bytes": omitted_bytes,
                 "omitted_bytes_exact": true,
                 "omitted_images": omitted_count,
