@@ -1,0 +1,227 @@
+//! Which account(s) a provider model-catalog refresh may authenticate with,
+//! and how an account-specific failure is reported (973-accounts-ux).
+//!
+//! This is the ONE home of the dead-default fallback rule:
+//!
+//! * An explicit account alias (a session/run pinned with `--account`) is
+//!   honoured exactly — it is the only attempt, healthy or not.
+//! * Otherwise the attempts are: the active default when it is healthy, else
+//!   the first healthy account of the provider; then every other healthy
+//!   account in store order. A dead default is used only when no healthy
+//!   account exists, solely to surface an actionable error.
+//! * "Healthy" here means [`CredentialStatus::Ok`] with the catalog's
+//!   required auth method.
+//!
+//! Only the catalog credential falls back. The provider default and any
+//! session's pinned account are never changed by this module.
+//!
+//! Cache seam (catalog-accuracy lane): the refreshed catalog is stored per
+//! provider, and the alias that actually served it is reported back in
+//! `ProviderModelsRefreshCompleted::account_alias`. An account-scoped cache
+//! key (`account-v2:`) belongs where that alias is consumed.
+
+use super::*;
+
+/// Whether `descriptor` may serve a fallback catalog refresh for `provider`.
+fn is_healthy_catalog_account(
+    descriptor: &CredentialDescriptor,
+    provider: &str,
+    expected_auth: AuthMethod,
+) -> bool {
+    descriptor.provider == provider
+        && descriptor.auth_method == expected_auth
+        && descriptor.status == CredentialStatus::Ok
+}
+
+/// The primary account for a refresh (see the module rule), validated
+/// against the provider and the catalog's auth requirement.
+fn model_refresh_descriptor<'a>(
+    accounts: &'a AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+    expected_auth: AuthMethod,
+    account_alias: Option<&CredentialAlias>,
+) -> Result<&'a CredentialDescriptor, HaiderError> {
+    let descriptor = if let Some(alias) = account_alias {
+        accounts.get(alias).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!("account `{alias}` does not exist"),
+                false,
+            )
+        })?
+    } else {
+        accounts
+            .active_for_provider(provider)
+            .filter(|descriptor| is_healthy_catalog_account(descriptor, provider, expected_auth))
+            .or_else(|| {
+                accounts.list().iter().find(|descriptor| {
+                    is_healthy_catalog_account(descriptor, provider, expected_auth)
+                })
+            })
+            .or_else(|| accounts.active_for_provider(provider))
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    "provider has no active credential",
+                    false,
+                )
+            })?
+    };
+    if descriptor.provider != provider {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "account `{}` belongs to provider `{}`, not `{provider}`",
+                descriptor.alias, descriptor.provider
+            ),
+            false,
+        ));
+    }
+    if descriptor.auth_method != expected_auth {
+        let requirement = if expected_auth == AuthMethod::OAuth {
+            "OAuth"
+        } else {
+            "API-key"
+        };
+        let message = account_alias.map_or_else(
+            || format!("provider model discovery requires an active {requirement} credential"),
+            |_| {
+                format!(
+                    "account `{}` cannot serve the model catalog; {requirement} authentication is required",
+                    descriptor.alias
+                )
+            },
+        );
+        return Err(HaiderError::new(
+            ErrorCode::CredentialMissing,
+            message,
+            false,
+        ));
+    }
+    Ok(descriptor)
+}
+
+/// The ordered accounts a catalog refresh tries until one succeeds or a
+/// failure is not account-specific (see the module rule).
+pub(super) fn model_refresh_candidates(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+    expected_auth: AuthMethod,
+    account_alias: Option<&CredentialAlias>,
+) -> Result<Vec<CredentialDescriptor>, HaiderError> {
+    let primary = model_refresh_descriptor(accounts, provider, expected_auth, account_alias)?;
+    let mut candidates = vec![primary.clone()];
+    if account_alias.is_none() {
+        candidates.extend(
+            accounts
+                .list()
+                .iter()
+                .filter(|candidate| {
+                    candidate.alias != primary.alias
+                        && is_healthy_catalog_account(candidate, provider, expected_auth)
+                })
+                .cloned(),
+        );
+    }
+    Ok(candidates)
+}
+
+/// Whether a provider has a usable account other than `selected`; an explicit
+/// account's credential failure then must not mark the whole provider
+/// unavailable.
+pub(super) fn provider_has_other_usable_account(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+    selected: &CredentialAlias,
+) -> bool {
+    accounts.list().iter().any(|descriptor| {
+        descriptor.provider == provider
+            && descriptor.alias != *selected
+            && descriptor.status == CredentialStatus::Ok
+    })
+}
+
+pub(super) async fn discover_models_with_account(
+    broker: &CredentialBroker,
+    descriptor: &CredentialDescriptor,
+    model_discoverer: &dyn ProviderModelDiscoverer,
+    source: CatalogSource,
+    etag: Option<&str>,
+) -> ProviderModelsRefreshResult {
+    match broker.resolve(descriptor).await {
+        Ok(access_token) => {
+            let access_token = std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
+                let message = if descriptor.auth_method == AuthMethod::OAuth {
+                    "OAuth access token is not valid UTF-8"
+                } else {
+                    "API key is not valid UTF-8"
+                };
+                HaiderError::new(ErrorCode::CredentialMissing, message, false)
+            });
+            match access_token {
+                Ok(access_token) => ProviderModelsRefreshResult::Discovery(
+                    discover_provider_models_bounded(
+                        model_discoverer,
+                        source,
+                        Some(access_token),
+                        etag,
+                    )
+                    .await,
+                ),
+                Err(error) => ProviderModelsRefreshResult::Credential(error),
+            }
+        }
+        Err(error) => ProviderModelsRefreshResult::Credential(error),
+    }
+}
+
+impl ProviderModelsRefreshResult {
+    /// Whether this outcome belongs to the credential that was tried, so
+    /// another account of the provider may still succeed.
+    pub(super) fn is_account_specific_failure(&self) -> bool {
+        match self {
+            Self::Discovery(Err(error)) => error.is_account_specific(),
+            Self::Credential(_) => true,
+            Self::Discovery(Ok(_)) => false,
+        }
+    }
+}
+
+pub(super) fn catalog_auth_failure_message(account_alias: Option<&CredentialAlias>) -> String {
+    account_alias.map_or_else(
+        || "model catalog authentication failed".to_owned(),
+        |alias| {
+            format!(
+                "account `{alias}` cannot authenticate the model catalog; switch to a live account or re-authenticate it"
+            )
+        },
+    )
+}
+
+pub(super) fn catalog_credential_failure_message(
+    account_alias: Option<&CredentialAlias>,
+    message: &str,
+) -> String {
+    account_alias.map_or_else(
+        || message.to_owned(),
+        |alias| format!("account `{alias}` cannot supply a model-catalog credential: {message}"),
+    )
+}
+
+pub(super) fn catalog_discovery_failure_message(
+    account_alias: Option<&CredentialAlias>,
+    error: &CatalogError,
+) -> String {
+    if error.is_account_specific() {
+        account_alias.map_or_else(
+            || error.to_string(),
+            |alias| {
+                format!(
+                    "account `{alias}` cannot authenticate the model catalog: {error}; switch to a live account or re-authenticate it"
+                )
+            },
+        )
+    } else {
+        error.to_string()
+    }
+}

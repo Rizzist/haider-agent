@@ -4707,29 +4707,13 @@ struct TokenResponse {
     id_token: Option<SecretJson>,
 }
 
-#[derive(Deserialize)]
-struct OAuthProfileResponse {
-    account: OAuthProfileAccount,
-    organization: OAuthProfileOrganization,
-}
-
-#[derive(Deserialize)]
-struct OAuthProfileAccount {
-    uuid: String,
-    email: String,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    full_name: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OAuthProfileOrganization {
-    uuid: String,
-    #[serde(default)]
-    organization_type: Option<String>,
-}
-
+/// Fetches and parses a provider's authenticated identity document (today:
+/// Claude's OAuth profile, see [`haider_provider::ANTHROPIC_OAUTH_PROFILE_URL`]).
+///
+/// The access token rides only a sensitive `Authorization` header; redirects
+/// are refused (the OAuth client never follows them); the body is bounded.
+/// Parsing belongs to the provider's identity source. The result is promoted
+/// to `verified` because this request itself authenticated the facts.
 async fn account_identity_from_endpoint(
     client: &reqwest::Client,
     registration: &OAuthProviderRegistration,
@@ -4739,6 +4723,7 @@ async fn account_identity_from_endpoint(
     let Some(endpoint) = registration.identity_endpoint.clone() else {
         return Ok(None);
     };
+    let source = haider_provider::oauth_identity_source(&registration.provider_id);
     let mut authorization = Zeroizing::new(b"Bearer ".to_vec());
     authorization.extend_from_slice(access_token);
     let mut authorization = reqwest::header::HeaderValue::from_bytes(&authorization)
@@ -4750,11 +4735,11 @@ async fn account_identity_from_endpoint(
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .header(reqwest::header::CONNECTION, "close");
-    if registration.provider_id == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
-        request = request.header(
-            haider_provider::ANTHROPIC_OAUTH_BETA_HEADER,
-            haider_provider::ANTHROPIC_OAUTH_BETA_VALUE,
-        );
+    for &(name, value) in source
+        .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
+        .map_or(&[][..], |endpoint| endpoint.headers)
+    {
+        request = request.header(name, value);
     }
     let response = request
         .send()
@@ -4767,44 +4752,20 @@ async fn account_identity_from_endpoint(
         return Err(OAuthPublicError::new("identity_endpoint_rejected", false));
     }
     let bytes = bounded_response(response).await?;
-    let profile = serde_json::from_slice::<OAuthProfileResponse>(&bytes)
-        .map_err(|_| OAuthPublicError::new("identity_response_invalid", false))?;
-    let account_id = AccountIdentity::sanitized_field(&profile.account.uuid)
+    let mut account_identity = source
+        .and_then(|source| {
+            source
+                .identity_from_endpoint_document(&bytes, captured_at)
+                .ok()
+                .flatten()
+        })
         .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
-    let email = AccountIdentity::sanitized_field(&profile.account.email)
-        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
-    // A subscription credential is scoped by both the user account and the
-    // selected organization. Keep that pair as one public stable coordinate
-    // in today's AccountIdentity schema so separate organizations cannot be
-    // collapsed merely because they share an owner.
-    let organization_id = AccountIdentity::sanitized_field(&profile.organization.uuid)
-        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
-    let stable_account_coordinate = format!("account={account_id};organization={organization_id}");
-    let display_name = profile
-        .account
-        .display_name
+    account_identity.issuer = Some(registration.issuer.clone());
+    account_identity.verified = true;
+    let stable_account_coordinate = account_identity
+        .account_id
         .as_deref()
-        .and_then(AccountIdentity::sanitized_field)
-        .or_else(|| {
-            profile
-                .account
-                .full_name
-                .as_deref()
-                .and_then(AccountIdentity::sanitized_field)
-        });
-    let account_identity = AccountIdentity {
-        email: Some(email),
-        display_name,
-        account_id: Some(stable_account_coordinate.clone()),
-        plan: profile
-            .organization
-            .organization_type
-            .as_deref()
-            .and_then(AccountIdentity::sanitized_field),
-        issuer: Some(registration.issuer.clone()),
-        captured_at,
-        verified: true,
-    };
+        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
     Ok(Some((
         OAuthIdentityV1 {
             subject_hash: blake3::hash(stable_account_coordinate.as_bytes())

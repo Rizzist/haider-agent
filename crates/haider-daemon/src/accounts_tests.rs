@@ -7950,31 +7950,22 @@ fn model_refresh_skips_dead_default_and_honours_explicit_alias() {
             .expect("seed account");
     }
 
-    assert_eq!(
-        model_refresh_descriptor(
+    let aliases = |account_alias: Option<&CredentialAlias>| {
+        model_refresh_candidates(
             &accounts,
             OPENAI_OAUTH_PROVIDER_NAME,
             AuthMethod::OAuth,
-            None
+            account_alias,
         )
-        .expect("healthy fallback")
-        .alias
-        .as_str(),
-        "live-fallback"
-    );
+        .expect("refresh candidates")
+        .into_iter()
+        .map(|descriptor| descriptor.alias.as_str().to_owned())
+        .collect::<Vec<_>>()
+    };
+    // The dead default is skipped entirely while healthy accounts exist.
+    assert_eq!(aliases(None), ["live-fallback", "live-explicit"]);
     let explicit = CredentialAlias::new("live-explicit");
-    assert_eq!(
-        model_refresh_descriptor(
-            &accounts,
-            OPENAI_OAUTH_PROVIDER_NAME,
-            AuthMethod::OAuth,
-            Some(&explicit),
-        )
-        .expect("explicit account")
-        .alias
-        .as_str(),
-        "live-explicit"
-    );
+    assert_eq!(aliases(Some(&explicit)), ["live-explicit"]);
     assert_eq!(
         catalog_auth_failure_message(Some(&CredentialAlias::new("dead-default"))),
         "account `dead-default` cannot authenticate the model catalog; switch to a live account or re-authenticate it"

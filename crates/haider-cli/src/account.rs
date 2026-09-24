@@ -124,6 +124,12 @@ struct AccountView {
     created: Option<u64>,
 }
 
+impl AccountView {
+    fn principal(&self) -> Option<haider_protocol::credential::AccountPrincipal<'_>> {
+        haider_protocol::credential::AccountPrincipal::new(&self.provider, self.identity.as_ref())
+    }
+}
+
 #[derive(Serialize)]
 struct CustomAccountDocument {
     schema: &'static str,
@@ -1472,13 +1478,11 @@ fn write_human(document: &AccountsDocument) -> ExitCode {
                 |created| created.to_string(),
             )
         ));
-        if let Some(identity) = account.identity.as_ref()
+        if let Some(principal) = account.principal()
             && let Some(canonical) = document.accounts[..index].iter().find(|prior| {
-                prior.provider == account.provider
-                    && prior
-                        .identity
-                        .as_ref()
-                        .is_some_and(|prior| prior.same_stable_principal(identity))
+                prior
+                    .principal()
+                    .is_some_and(|prior| prior.same_account(principal))
             })
         {
             text.push_str(&format!(

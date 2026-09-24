@@ -294,6 +294,15 @@ impl AccountRow {
             base_url: descriptor.base_url.clone(),
         }
     }
+
+    /// This row's provider-scoped dedupe key, if it captured an identity.
+    #[must_use]
+    pub fn principal(&self) -> Option<haider_protocol::credential::AccountPrincipal<'_>> {
+        haider_protocol::credential::AccountPrincipal::new(
+            &self.provider,
+            self.account_identity.as_ref(),
+        )
+    }
 }
 
 /// Secret-free source metadata paired with an account descriptor by alias.
@@ -714,23 +723,20 @@ impl AccountsState {
     pub fn apply_sources(&mut self, sources: Vec<AccountSourceRow>) {
         self.sources = sources;
     }
+
+    /// Appends a locally fabricated row (demo/sim flows) and restores the
+    /// grouped display order, so the cursor keeps walking what is drawn.
+    pub fn push_row(&mut self, row: AccountRow) {
+        self.rows.push(row);
+        self.rows = group_account_rows(std::mem::take(&mut self.rows));
+    }
 }
 
+/// `/accounts` display order: provider groups in first-seen order, snapshot
+/// order within a group. `rows` is ALWAYS stored in this order, so ↑/↓
+/// step through exactly what the renderer (same rule, a no-op here) draws.
 fn group_account_rows(rows: Vec<AccountRow>) -> Vec<AccountRow> {
-    let mut providers = Vec::new();
-    for row in &rows {
-        if !providers.contains(&row.provider) {
-            providers.push(row.provider.clone());
-        }
-    }
-    providers
-        .into_iter()
-        .flat_map(|provider| {
-            rows.iter()
-                .filter(move |row| row.provider == provider)
-                .cloned()
-        })
-        .collect()
+    crate::display_order::group_by_first_seen(rows, |row| row.provider.clone())
 }
 
 /// The `/accounts` OAuth add card (sim authFlow, tui.js:3629-3682): a
@@ -12620,18 +12626,16 @@ impl AppModel {
                 descriptor.alias,
                 crate::format::mask_identity(&descriptor.identity)
             );
-            if let Some(identity) = descriptor.account_identity.as_ref() {
+            if let Some(principal) = descriptor.principal() {
                 let duplicates = self
                     .accounts
                     .rows
                     .iter()
                     .filter(|row| {
-                        row.provider == descriptor.provider
-                            && row.alias != descriptor.alias.as_str()
+                        row.alias != descriptor.alias.as_str()
                             && row
-                                .account_identity
-                                .as_ref()
-                                .is_some_and(|prior| prior.same_stable_principal(identity))
+                                .principal()
+                                .is_some_and(|prior| prior.same_account(principal))
                     })
                     .map(|row| row.alias.as_str())
                     .collect::<Vec<_>>();
@@ -12722,7 +12726,7 @@ impl AppModel {
                                 row.selected = false;
                             }
                         }
-                        self.accounts.rows.push(AccountRow {
+                        self.accounts.push_row(AccountRow {
                             alias: alias.clone(),
                             provider: provider.to_owned(),
                             method: haider_protocol::credential::AuthMethod::OAuth,
@@ -13856,7 +13860,7 @@ impl AppModel {
                 row.selected = false;
             }
         }
-        self.accounts.rows.push(AccountRow {
+        self.accounts.push_row(AccountRow {
             alias: alias.clone(),
             provider: provider.clone(),
             method: haider_protocol::credential::AuthMethod::ApiKey,

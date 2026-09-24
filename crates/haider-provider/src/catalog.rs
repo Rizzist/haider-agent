@@ -119,6 +119,28 @@ pub enum CatalogError {
     Empty,
 }
 
+/// Leading text of the [`CatalogError::Unavailable`] reason a subscription
+/// catalog produces when it refuses THIS credential (401/403/404) rather than
+/// failing provider-wide. [`CatalogError::is_account_specific`] keys off it.
+pub const MODEL_LIST_REFUSED_FOR_CREDENTIAL: &str =
+    "provider does not serve a model list to this credential";
+
+impl CatalogError {
+    /// Whether the failure belongs to the credential that asked (another
+    /// account of the same provider may still succeed) rather than to the
+    /// provider or transport.
+    #[must_use]
+    pub fn is_account_specific(&self) -> bool {
+        match self {
+            Self::Unauthorized => true,
+            Self::Unavailable { reason } => reason.contains(MODEL_LIST_REFUSED_FOR_CREDENTIAL),
+            Self::NotModified | Self::Transport { .. } | Self::InvalidBody { .. } | Self::Empty => {
+                false
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -507,7 +529,7 @@ pub async fn discover_models_with_resolver(
         // credential" case the brief anticipated: honest unavailability, and
         // the caller keeps its last-known list.
         return Err(CatalogError::Unavailable {
-            reason: format!("provider does not serve a model list to this credential ({status})"),
+            reason: format!("{MODEL_LIST_REFUSED_FOR_CREDENTIAL} ({status})"),
         });
     }
     let response_etag = response

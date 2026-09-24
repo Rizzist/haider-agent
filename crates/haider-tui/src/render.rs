@@ -2808,10 +2808,16 @@ fn render_accounts(
     lines.push(Line::raw(""));
 
     // Provider groups in FIRST-SEEN order (sim: Set insertion order over
-    // the account list, tui.js:3593).
+    // the account list, tui.js:3593) — the ONE display-order rule, shared
+    // with the cursor: `AccountsState` stores `rows` in this order, so the
+    // stored index drawn here is the index ↑/↓ step through.
+    let ordered_rows = crate::display_order::group_by_first_seen(
+        model.accounts.rows.iter().enumerate().collect::<Vec<_>>(),
+        |&(_, row)| row.provider.as_str(),
+    );
     let mut providers: Vec<&str> = Vec::new();
-    for row in &model.accounts.rows {
-        if !providers.contains(&row.provider.as_str()) {
+    for (_, row) in &ordered_rows {
+        if providers.last() != Some(&row.provider.as_str()) {
             providers.push(&row.provider);
         }
     }
@@ -2840,11 +2846,8 @@ fn render_accounts(
             header.push(Span::styled(format!(" · {url}"), theme.faint_style()));
         }
         lines.push(Line::from(header));
-        for (index, row) in model
-            .accounts
-            .rows
+        for &(index, row) in ordered_rows
             .iter()
-            .enumerate()
             .filter(|(_, row)| row.provider == provider)
         {
             let selected = row.selected;

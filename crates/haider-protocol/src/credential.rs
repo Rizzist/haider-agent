@@ -105,6 +105,44 @@ pub struct CredentialDescriptor {
     pub created_at_ms: Option<u64>,
 }
 
+impl CredentialDescriptor {
+    /// This row's provider-scoped dedupe key, if it captured an identity.
+    #[must_use]
+    pub fn principal(&self) -> Option<AccountPrincipal<'_>> {
+        AccountPrincipal::new(&self.provider, self.account_identity.as_ref())
+    }
+}
+
+/// One provider-scoped public account identity: the ONLY key OAuth
+/// re-login dedupe compares (daemon alias matching, the `haider account list`
+/// duplicate hint, and the TUI login notice all go through
+/// [`Self::same_account`]).
+///
+/// It borrows public, secret-free facts only — a provider id and an
+/// [`AccountIdentity`] — so no credential byte can reach identity matching.
+/// Identities from different providers never match, even with equal ids.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountPrincipal<'a> {
+    provider: &'a str,
+    identity: &'a AccountIdentity,
+}
+
+impl<'a> AccountPrincipal<'a> {
+    /// Returns `None` when the record captured no identity: such rows stay
+    /// alias-scoped and are never deduplicated.
+    #[must_use]
+    pub fn new(provider: &'a str, identity: Option<&'a AccountIdentity>) -> Option<Self> {
+        identity.map(|identity| Self { provider, identity })
+    }
+
+    /// Same provider and same stable account
+    /// (see [`AccountIdentity::same_stable_principal`]).
+    #[must_use]
+    pub fn same_account(self, other: AccountPrincipal<'_>) -> bool {
+        self.provider == other.provider && self.identity.same_stable_principal(other.identity)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {

@@ -48,11 +48,32 @@ pub enum IdentityError {
 }
 
 /// Optional authenticated identity lookup metadata. Fetching is owned by the
-/// OAuth completion path and happens at capture time only.
+/// OAuth completion path and happens at capture time only; the fetched
+/// document is parsed by [`OAuthIdentitySource::identity_from_endpoint_document`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityEndpoint {
     pub url: &'static str,
+    /// Request headers the endpoint requires besides the bearer token.
+    pub headers: &'static [(&'static str, &'static str)],
 }
+
+/// Claude's authenticated OAuth profile document: the only place a Claude
+/// subscription credential exposes a stable account coordinate (its token
+/// response carries no ID token or account id).
+///
+/// Provenance: the endpoint the first-party Claude Code client calls after
+/// OAuth sign-in, covered by the `user:profile` scope Haider already requests
+/// (Claude Code parity, W5g-7). It requires the OAuth beta header
+/// ([`crate::ANTHROPIC_OAUTH_BETA_HEADER`]: [`crate::ANTHROPIC_OAUTH_BETA_VALUE`]).
+/// Response shape used here: `{"account": {"uuid", "email", "display_name"?,
+/// "full_name"?}, "organization": {"uuid", "organization_type"?}}` — pinned by
+/// the daemon's fake `/profile` server test.
+pub const ANTHROPIC_OAUTH_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+
+const ANTHROPIC_OAUTH_PROFILE_HEADERS: &[(&str, &str)] = &[(
+    crate::ANTHROPIC_OAUTH_BETA_HEADER,
+    crate::ANTHROPIC_OAUTH_BETA_VALUE,
+)];
 
 /// One provider-generic identity seam for every OAuth adapter.
 pub trait OAuthIdentitySource: Send + Sync {
@@ -63,6 +84,18 @@ pub trait OAuthIdentitySource: Send + Sync {
 
     fn identity_endpoint(&self) -> Option<IdentityEndpoint> {
         None
+    }
+
+    /// Parses the document fetched from [`Self::identity_endpoint`]. Like
+    /// token decoding, the result is informational (`verified = false`,
+    /// `issuer = None`); the fetching owner may promote `verified` because it
+    /// authenticated the request itself, and records the issuer it trusts.
+    fn identity_from_endpoint_document(
+        &self,
+        _document: &[u8],
+        _captured_at: u64,
+    ) -> Result<Option<AccountIdentity>, IdentityError> {
+        Ok(None)
     }
 
     /// Documents why a registered OAuth adapter intentionally has no local
@@ -169,9 +202,68 @@ impl OAuthIdentitySource for AnthropicOAuthIdentitySource {
 
     fn identity_endpoint(&self) -> Option<IdentityEndpoint> {
         Some(IdentityEndpoint {
-            url: "https://api.anthropic.com/api/oauth/profile",
+            url: ANTHROPIC_OAUTH_PROFILE_URL,
+            headers: ANTHROPIC_OAUTH_PROFILE_HEADERS,
         })
     }
+
+    fn identity_from_endpoint_document(
+        &self,
+        document: &[u8],
+        captured_at: u64,
+    ) -> Result<Option<AccountIdentity>, IdentityError> {
+        #[derive(Deserialize)]
+        struct Profile {
+            account: ProfileAccount,
+            organization: ProfileOrganization,
+        }
+        #[derive(Deserialize)]
+        struct ProfileAccount {
+            uuid: String,
+            email: String,
+            #[serde(default)]
+            display_name: Option<String>,
+            #[serde(default)]
+            full_name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct ProfileOrganization {
+            uuid: String,
+            #[serde(default)]
+            organization_type: Option<String>,
+        }
+
+        let profile = serde_json::from_slice::<Profile>(document)
+            .map_err(|_| IdentityError::ClaimsMalformed)?;
+        let required = |value: &str| {
+            AccountIdentity::sanitized_field(value).ok_or(IdentityError::ClaimsMalformed)
+        };
+        let account_id = required(&profile.account.uuid)?;
+        let email = required(&profile.account.email)?;
+        let organization_id = required(&profile.organization.uuid)?;
+        let optional = |value: Option<&str>| value.and_then(AccountIdentity::sanitized_field);
+        Ok(Some(AccountIdentity {
+            email: Some(email),
+            display_name: optional(profile.account.display_name.as_deref())
+                .or_else(|| optional(profile.account.full_name.as_deref())),
+            account_id: Some(anthropic_stable_account_coordinate(
+                &account_id,
+                &organization_id,
+            )),
+            plan: optional(profile.organization.organization_type.as_deref()),
+            issuer: None,
+            captured_at,
+            verified: false,
+        }))
+    }
+}
+
+/// A Claude subscription credential is scoped by both the user account and
+/// the selected organization. The pair is kept as ONE public stable
+/// coordinate in today's `AccountIdentity::account_id` so separate
+/// organizations cannot be collapsed merely because they share an owner.
+fn anthropic_stable_account_coordinate(account_id: &str, organization_id: &str) -> String {
+    format!("account={account_id};organization={organization_id}")
 }
 
 impl OAuthIdentitySource for KimiOAuthIdentitySource {
@@ -280,7 +372,8 @@ mod tests {
         assert_eq!(
             anthropic.identity_endpoint(),
             Some(IdentityEndpoint {
-                url: "https://api.anthropic.com/api/oauth/profile"
+                url: "https://api.anthropic.com/api/oauth/profile",
+                headers: &[("anthropic-beta", "oauth-2025-04-20")],
             })
         );
         assert_eq!(anthropic.unavailable_reason(), None);
