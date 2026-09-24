@@ -1,16 +1,128 @@
-//! Public provider diagnostics. Provider prose is untrusted account data.
+//! Public provider diagnostics policy. Provider prose is untrusted account
+//! data: this module is the only place that decides which provider-supplied
+//! text may reach a durable [`haider_protocol::error::ErrorPresentation`].
+//!
+//! Entry points (all fail closed):
+//! - [`sanitize_provider_error_detail`] — provider prose; called only by
+//!   `ProviderError::with_provider_detail`, the single boundary every adapter
+//!   (Anthropic, OpenAI, Gemini, ACP) passes its raw prose through.
+//! - [`safe_error_type`] — provider error `type`/`code`, exact allowlist.
+//! - [`safe_request_id`] — provider request-id header, exact shape.
+//!
+//! Adapters use [`http_error_prose`] / [`provider_error_message`] only to
+//! locate raw prose (and to classify it); they never publish it themselves.
 
-pub(crate) const WITHHELD_MESSAGE: &str = "message withheld: may contain account data";
+use haider_protocol::error::PROVIDER_DETAIL_WITHHELD;
 
-pub(crate) fn http_error_detail(body: &[u8]) -> Option<String> {
+/// Raw prose longer than this is withheld outright. Mirrors the protocol's
+/// durable `ErrorPresentation.detail` bound (512 UTF-8 bytes).
+const MAX_RAW_DETAIL_BYTES: usize = 512;
+/// A publishable sentence, after trimming, is at most this long.
+const MAX_SENTENCE_BYTES: usize = 256;
+/// A single word (edge punctuation trimmed) is at most this long; longer
+/// alphabetic runs are treated as opaque identifiers.
+const MAX_WORD_BYTES: usize = 32;
+/// Single-token prose ("Overloaded", "req_x") carries no explanation and is
+/// indistinguishable from an echoed identifier.
+const MIN_SENTENCE_WORDS: usize = 2;
+/// Punctuation allowed at the edges of an otherwise ASCII-alphabetic word.
+const WORD_EDGE_PUNCTUATION: [char; 6] = ['.', ',', '!', '?', '-', '\''];
+
+/// Case-insensitive substrings that withhold the whole sentence: account,
+/// identity, request-echo, URL and credential vocabulary. Substring match is
+/// deliberate ("org" also covers "organization"/"org_id"; "body" covers
+/// "request body"), so it errs towards withholding.
+const ACCOUNT_DATA_MARKERS: &[&str] = &[
+    "cookie",
+    "account",
+    "acct_",
+    "org",
+    "user",
+    "customer",
+    "tenant",
+    "credit",
+    "email",
+    "session",
+    "identifier",
+    "prompt",
+    "body",
+    "http",
+    "www.",
+    "api_key",
+    "authorization",
+    "bearer",
+    "token",
+    "secret",
+];
+
+/// Provider error `type`/`code` values that may be published verbatim. Any
+/// other value is dropped (not shown, and not used for classification).
+/// Sources: Anthropic API error types; OpenAI error types/codes (including
+/// the Codex backend and compatible servers); Google `INVALID_ARGUMENT`.
+const PUBLIC_PROVIDER_ERROR_TYPES: &[&str] = &[
+    // Permission / authentication.
+    "permission_error",
+    "permission_denied",
+    "insufficient_permissions",
+    "invalid_request_error",
+    "authentication_error",
+    "invalid_api_key",
+    // Rate, capacity and transport.
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "overloaded_error",
+    "api_error",
+    "server_error",
+    "timeout_error",
+    "timeout",
+    // Billing and quota.
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "credit_balance_too_low",
+    // Account lifecycle.
+    "account_deleted",
+    "account_not_found",
+    "account_deactivated",
+    "account_revoked",
+    "account_deleted_error",
+    "account_not_found_error",
+    "account_deactivated_error",
+    "account_revoked_error",
+    "organization_deactivated",
+    // Context window.
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "model_context_window_exceeded",
+    "prompt_too_long",
+    "input_too_large",
+    "INVALID_ARGUMENT",
+];
+
+/// Request ids must start with one of these (Anthropic `request-id` and
+/// OpenAI `x-request-id` both use `req_`).
+const REQUEST_ID_PREFIXES: [&str; 2] = ["req_", "req-"];
+/// Accepted request-id length in bytes; the upper bound mirrors the
+/// protocol's `provider_request_id` bound (128 bytes).
+const REQUEST_ID_BYTES: std::ops::RangeInclusive<usize> = 7..=128;
+/// Case-insensitive substrings that reject a request id which may carry an
+/// account/session identifier instead of an opaque request token.
+const REQUEST_ID_ACCOUNT_MARKERS: &[&str] = &[
+    "acct_", "account", "org_", "user_", "credit", "cookie", "session", "token", "prompt", "body",
+    "email",
+];
+
+/// Locates the provider's own error prose in an HTTP error body (JSON
+/// envelope, or the raw UTF-8 body). Raw and untrusted: callers may classify
+/// it but must publish it only through `ProviderError::with_provider_detail`.
+pub(crate) fn http_error_prose(body: &[u8]) -> Option<String> {
     match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(value) => provider_error_message(&value).and_then(sanitize_provider_error_detail),
-        Err(_) => std::str::from_utf8(body)
-            .ok()
-            .and_then(sanitize_provider_error_detail),
+        Ok(value) => provider_error_message(&value).map(str::to_owned),
+        Err(_) => std::str::from_utf8(body).ok().map(str::to_owned),
     }
 }
 
+/// Locates the provider's own error prose in a parsed error value. Raw and
+/// untrusted; see [`http_error_prose`].
 pub(crate) fn provider_error_message(value: &serde_json::Value) -> Option<&str> {
     value
         .pointer("/error/message")
@@ -31,17 +143,22 @@ pub(crate) fn provider_error_message(value: &serde_json::Value) -> Option<&str> 
         .or_else(|| value.as_str())
 }
 
+/// The public-detail decision for untrusted provider prose. `None` means
+/// there is no prose at all (blank); otherwise the result is either the
+/// trimmed prose, when it passes every rule below, or the fixed
+/// [`PROVIDER_DETAIL_WITHHELD`] text. Idempotent.
 pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
-    // Apply the same complete consumer used for tool output before deciding
-    // whether any provider prose is suitable for a durable public field.
+    // Apply the same complete consumer used for tool output, plus the
+    // credential consumer below; any change either makes means the prose
+    // carried something secret-shaped, so none of it is published.
     let redacted = haider_tools::redact_output_text(detail);
     let credential_redacted = redact_credentials(&redacted)?;
-    if detail.len() > 512
+    if detail.len() > MAX_RAW_DETAIL_BYTES
         || redacted != detail
         || credential_redacted != detail
         || !plain_sentence(detail)
     {
-        return Some(WITHHELD_MESSAGE.to_owned());
+        return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
     }
     Some(detail.trim().to_owned())
 }
@@ -51,111 +168,50 @@ pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
 /// message so that partially scrubbed request bodies cannot leak a suffix.
 fn plain_sentence(detail: &str) -> bool {
     let detail = detail.trim();
-    if detail.is_empty() || detail.len() > 256 || detail.contains(char::is_control) {
+    if detail.is_empty() || detail.len() > MAX_SENTENCE_BYTES || detail.contains(char::is_control) {
         return false;
     }
-    let lower = detail.to_ascii_lowercase();
-    if [
-        "cookie",
-        "set-cookie",
-        "account",
-        "organization",
-        "user",
-        "org",
-        "credit",
-        "email",
-        "session",
-        "tenant",
-        "customer",
-        "request body",
-        "prompt",
-        "body",
-        "identifier",
-        "account_id",
-        "org_id",
-        "user_id",
-        "credit_id",
-        "request_body",
-        "prompt=",
-        "http",
-        "www.",
-        "acct_",
-        "org_",
-        "user_",
-        "credit_",
-        "api_key",
-        "authorization",
-        "bearer",
-        "token",
-        "secret",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    if contains_marker(detail, ACCOUNT_DATA_MARKERS) {
+        return false;
+    }
+    if detail.split_whitespace().count() < MIN_SENTENCE_WORDS
+        || !detail.chars().any(char::is_alphabetic)
     {
         return false;
     }
-    if detail.split_whitespace().count() < 2 || !detail.chars().any(char::is_alphabetic) {
-        return false;
-    }
     detail.split_whitespace().all(|word| {
-        let plain = word.trim_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | '-' | '\''));
-        !plain.is_empty() && plain.len() <= 32 && plain.chars().all(|c| c.is_ascii_alphabetic())
+        let plain = word.trim_matches(WORD_EDGE_PUNCTUATION);
+        !plain.is_empty()
+            && plain.len() <= MAX_WORD_BYTES
+            && plain.chars().all(|c| c.is_ascii_alphabetic())
     })
 }
 
+/// Publishes a provider error `type`/`code` only when it is an exact member
+/// of [`PUBLIC_PROVIDER_ERROR_TYPES`].
 pub(crate) fn safe_error_type(value: &str) -> Option<&str> {
-    const TYPES: &[&str] = &[
-        "permission_error",
-        "permission_denied",
-        "insufficient_permissions",
-        "invalid_request_error",
-        "authentication_error",
-        "invalid_api_key",
-        "rate_limit_error",
-        "rate_limit_exceeded",
-        "overloaded_error",
-        "api_error",
-        "server_error",
-        "timeout_error",
-        "timeout",
-        "insufficient_quota",
-        "billing_hard_limit_reached",
-        "credit_balance_too_low",
-        "account_deleted",
-        "account_not_found",
-        "account_deactivated",
-        "account_revoked",
-        "account_deleted_error",
-        "account_not_found_error",
-        "account_deactivated_error",
-        "account_revoked_error",
-        "organization_deactivated",
-        "context_length_exceeded",
-        "context_window_exceeded",
-        "model_context_window_exceeded",
-        "prompt_too_long",
-        "input_too_large",
-        "INVALID_ARGUMENT",
-    ];
-    TYPES.contains(&value).then_some(value)
+    PUBLIC_PROVIDER_ERROR_TYPES
+        .contains(&value)
+        .then_some(value)
 }
 
+/// Publishes a provider request id only when it is a bounded `req_`/`req-`
+/// ASCII token (`[A-Za-z0-9_-]`) free of account markers.
 pub(crate) fn safe_request_id(value: &str) -> Option<&str> {
-    if !(7..=128).contains(&value.len()) {
-        return None;
-    }
-    let lower = value.to_ascii_lowercase();
-    ((value.starts_with("req_") || value.starts_with("req-"))
-        && ![
-            "acct_", "account", "org_", "user_", "credit", "cookie", "session", "token", "prompt",
-            "body", "email",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    (REQUEST_ID_BYTES.contains(&value.len())
+        && REQUEST_ID_PREFIXES
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+        && !contains_marker(value, REQUEST_ID_ACCOUNT_MARKERS)
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
     .then_some(value)
+}
+
+fn contains_marker(value: &str, markers: &[&str]) -> bool {
+    let lower = value.to_ascii_lowercase();
+    markers.iter().any(|marker| lower.contains(marker))
 }
 
 fn redact_credentials(detail: &str) -> Option<String> {
@@ -482,4 +538,32 @@ fn consume_credential_value(
         return (None, end);
     }
     (Some(start), end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Adapters hand raw prose to the single `with_provider_detail` boundary;
+    /// re-applying the policy to its own output must never change it.
+    #[test]
+    fn sanitizing_is_idempotent_so_one_boundary_suffices() {
+        for prose in [
+            "You do not have permission to use this model.",
+            "  Rate limit reached  ",
+            "Overloaded",
+            "Unsupported parameter: service_tier",
+            "Credential Bearer sk-provider-secret-value was rejected",
+            "missing apikey.",
+            "contact owner@example.test",
+            PROVIDER_DETAIL_WITHHELD,
+        ] {
+            let once = sanitize_provider_error_detail(prose);
+            assert_eq!(
+                once.as_deref().and_then(sanitize_provider_error_detail),
+                once
+            );
+        }
+        assert_eq!(sanitize_provider_error_detail("   "), None);
+    }
 }

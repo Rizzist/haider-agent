@@ -1972,9 +1972,8 @@ pub fn replay_anthropic_http_error(
             _ => ProviderError::new(kind, message),
         }
     };
-    let detail = crate::error_detail::http_error_detail(body);
-    if let Some(detail) = detail {
-        error = error.with_provider_detail(&detail);
+    if let Some(prose) = crate::error_detail::http_error_prose(body) {
+        error = error.with_provider_detail(&prose);
     }
     error
         .with_provider_error_type(body_kind)

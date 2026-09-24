@@ -5644,8 +5644,7 @@ impl HarnessActor {
                         if message.as_ref().is_some_and(|partial| !partial.is_empty()) {
                             let mut presentation = stream_interruption_presentation(&error);
                             if self.config.provider_lockdown {
-                                presentation.detail =
-                                    "message withheld: may contain account data".to_owned();
+                                presentation.withhold_provider_detail();
                             }
                             let (source_item, partial) = match self
                                 .complete_incomplete_message(
@@ -11090,8 +11089,7 @@ impl HarnessActor {
         }
         specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
         if self.config.provider_lockdown {
-            provider_error.presentation.detail =
-                "message withheld: may contain account data".to_owned();
+            provider_error.presentation.withhold_provider_detail();
         }
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(
@@ -11197,7 +11195,7 @@ impl HarnessActor {
                 ErrorCode::ProviderError | ErrorCode::ProviderTimeout | ErrorCode::IdleTimeout
             )
         {
-            presentation.detail = "message withheld: may contain account data".to_owned();
+            presentation.withhold_provider_detail();
         }
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);

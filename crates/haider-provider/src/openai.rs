@@ -3996,11 +3996,9 @@ pub fn replay_openai_http_error(
     body: &[u8],
 ) -> ProviderError {
     let parsed = serde_json::from_slice::<OpenAiErrorEnvelope>(body).ok();
-    let provider_detail = crate::error_detail::http_error_detail(body);
-    let raw_detail = match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(value) => crate::error_detail::provider_error_message(&value).map(str::to_owned),
-        Err(_) => std::str::from_utf8(body).ok().map(str::to_owned),
-    };
+    // Raw, untrusted prose: classified here, published only through
+    // `with_provider_detail`'s shape policy.
+    let raw_detail = crate::error_detail::http_error_prose(body);
     let error_type = parsed
         .as_ref()
         .and_then(|envelope| envelope.error.kind.as_deref());
@@ -4081,7 +4079,7 @@ pub fn replay_openai_http_error(
         }
         _ => ProviderError::new(kind, message),
     };
-    let error = match provider_detail.as_deref() {
+    let error = match raw_detail.as_deref() {
         Some(detail) => error.with_provider_detail(detail),
         None => error,
     };
@@ -4132,7 +4130,6 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
     let safe_type = error_type.and_then(crate::error_detail::safe_error_type);
     let kind = safe_code.or(safe_type);
     let raw_detail = crate::error_detail::provider_error_message(error);
-    let provider_detail = raw_detail.and_then(crate::error_detail::sanitize_provider_error_detail);
     let provider_kind = match kind {
         Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
         Some("permission_denied") => ProviderErrorKind::PermissionDenied,
@@ -4169,14 +4166,13 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
         ),
     )
     .with_provider_error_type(kind);
-    match provider_detail.as_deref() {
+    match raw_detail {
         Some(detail) => provider_error.with_provider_detail(detail),
         None => provider_error,
     }
 }
 
 fn openai_stream_error_prose(detail: &str) -> ProviderError {
-    let provider_detail = crate::error_detail::sanitize_provider_error_detail(detail);
     let provider_kind = if openai_error_message_is_authentication(detail) {
         ProviderErrorKind::Authentication
     } else if openai_error_message_is_overload(detail) {
@@ -4191,10 +4187,7 @@ fn openai_stream_error_prose(detail: &str) -> ProviderError {
             provider_kind_name(provider_kind)
         ),
     );
-    match provider_detail.as_deref() {
-        Some(detail) => provider_error.with_provider_detail(detail),
-        None => provider_error,
-    }
+    provider_error.with_provider_detail(detail)
 }
 
 fn responses_request_json(

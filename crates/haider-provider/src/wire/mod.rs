@@ -1963,16 +1963,12 @@ pub(crate) fn api_error(error: WireApiError) -> ProviderError {
             _ => ProviderErrorKind::InvalidRequest,
         }
     };
-    let detail = crate::error_detail::sanitize_provider_error_detail(&error.message);
-    let provider_error = ProviderError::new(
+    ProviderError::new(
         kind,
         format!("Anthropic API returned {}", provider_kind_name(kind)),
     )
-    .with_provider_error_type(Some(&error.kind));
-    match detail.as_deref() {
-        Some(detail) => provider_error.with_provider_detail(detail),
-        None => provider_error,
-    }
+    .with_provider_error_type(Some(&error.kind))
+    .with_provider_detail(&error.message)
 }
 
 pub(crate) const fn provider_kind_name(kind: ProviderErrorKind) -> &'static str {

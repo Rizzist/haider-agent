@@ -11766,20 +11766,12 @@ fn wrapped_menu_body(
             .flat_map(|logical| wrap_body(logical, budget))
             .map(|row| (row, DiffTone::Body))
             .collect();
-        if let Some(error_type) = &presentation.provider_error_type {
-            rows.extend(
-                wrap_body(&format!("Provider error type: {error_type}"), budget)
-                    .into_iter()
-                    .map(|row| (row, DiffTone::Body)),
-            );
-        }
-        if let Some(request_id) = &presentation.provider_request_id {
-            rows.extend(
-                wrap_body(&format!("Request ID: {request_id}"), budget)
-                    .into_iter()
-                    .map(|row| (row, DiffTone::Body)),
-            );
-        }
+        rows.extend(
+            crate::projection::error_identity_lines(presentation)
+                .iter()
+                .flat_map(|line| wrap_body(line, budget))
+                .map(|row| (row, DiffTone::Body)),
+        );
         let facts = crate::projection::error_fact_segments(presentation, Some(now_ms));
         rows.push((shed_fact_line(&facts, budget), DiffTone::Body));
         return rows;

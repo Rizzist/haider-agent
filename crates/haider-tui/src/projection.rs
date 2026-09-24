@@ -2425,6 +2425,21 @@ pub const FACT_RANK_HTTP: u8 = 3;
 pub const FACT_RANK_REQUEST: u8 = 4;
 pub const FACT_RANK_ERROR_TYPE: u8 = 5;
 
+/// The expanded error card's full-length provider identity lines (provider
+/// error type, then the unshortened request id), shared by the styled and
+/// plain renderers. Absent fields produce no line.
+#[must_use]
+pub fn error_identity_lines(presentation: &ErrorPresentation) -> Vec<String> {
+    let mut lines = Vec::with_capacity(2);
+    if let Some(error_type) = &presentation.provider_error_type {
+        lines.push(format!("Provider error type: {error_type}"));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        lines.push(format!("Request ID: {request_id}"));
+    }
+    lines
+}
+
 /// The compact fact line's segments, display-ordered (`subcode · HTTP 429
 /// · req 8f3a2c1d… · resets in 2m 14s`), each with its shed rank. A
 /// missing datum DROPS its whole segment — never a placeholder. The

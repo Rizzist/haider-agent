@@ -2723,9 +2723,9 @@ pub fn replay_gemini_http_error(
     };
     let mut error = ProviderError::new(kind, message);
     if kind == ProviderErrorKind::InvalidRequest
-        && let Some(detail) = crate::error_detail::http_error_detail(body)
+        && let Some(prose) = crate::error_detail::http_error_prose(body)
     {
-        error = error.with_provider_detail(&detail);
+        error = error.with_provider_detail(&prose);
     }
     error
         .with_retry_after_ms(retry_after_ms)

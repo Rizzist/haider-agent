@@ -233,11 +233,10 @@ fn render_plain_impl_with_status(
                 out.push_str(line);
                 out.push('\n');
             }
-            if let Some(error_type) = &presentation.provider_error_type {
-                out.push_str(&format!("  Provider error type: {error_type}\n"));
-            }
-            if let Some(request_id) = &presentation.provider_request_id {
-                out.push_str(&format!("  Request ID: {request_id}\n"));
+            for line in crate::projection::error_identity_lines(presentation) {
+                out.push_str("  ");
+                out.push_str(&line);
+                out.push('\n');
             }
             let facts = crate::projection::error_fact_segments(presentation, None);
             out.push_str("  ");

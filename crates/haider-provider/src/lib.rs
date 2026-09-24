@@ -2874,8 +2874,11 @@ impl ProviderError {
     }
 
     /// Replaces only the operator-facing explanation while retaining the
-    /// typed recovery contract and provider metadata. This is the final
-    /// provider-prose boundary, including adapters that supply stderr tails.
+    /// typed recovery contract and provider metadata. This is the single
+    /// provider-prose boundary: adapters (including ACP stderr tails) pass
+    /// raw, untrusted prose here and the `error_detail` shape policy decides
+    /// between the trimmed prose and the fixed withheld text. Blank prose
+    /// leaves the existing presentation untouched.
     #[must_use]
     pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
         let Some(detail) = crate::error_detail::sanitize_provider_error_detail(detail) else {
