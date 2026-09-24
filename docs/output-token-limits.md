@@ -9,7 +9,8 @@ The daemon owns model-limit truth. A provider catalog's positive
 When discovery is unavailable or the row omits limits, the daemon uses the
 pinned provider/model-family table in `haider-provider::model_limits`; exact
 known generations take precedence over a conservative provider-family
-default. The resulting output maximum is never larger than a known context
+default. `haider-provider::output_budget::model_output_limit` applies the
+bounds: the resulting output maximum is never larger than a known context
 window or the largest budget supported by a registered adapter (384,000).
 `haider models` exposes both values. Session creation rejects an explicit
 request above the resolved maximum instead of silently clamping it.
@@ -42,4 +43,5 @@ Malformed calls retain their existing typed `invalid_tool_call` path.
 The AX-2 malformed-call strike predicate in `haider-core` matches only
 `ToolResultData::InvalidToolCall`; keep `OutputLimitTruncation` outside that
 predicate when integrating the lanes. The shared repair allowance is tracked
-separately by `repairable_tool_call_result` in `actor.rs`.
+separately by `repairable_tool_call_result` in `actor.rs`; the closers live in
+`actor_tool_repair.rs`.

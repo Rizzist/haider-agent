@@ -3624,6 +3624,10 @@ fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::S
     }
 }
 
+/// Negotiates `session.create.max_tokens` against the validated model row:
+/// zero derives the default budget bounded by the row maximum, a positive
+/// value is an exact override, and an override above the row maximum is a
+/// typed refusal rather than a silent clamp.
 pub(super) fn resolve_session_output_limit(
     requested: u64,
     selection: &crate::model_select::ValidatedModelSelection,
@@ -16689,12 +16693,15 @@ impl HubConnection {
                 None,
             );
         }
-        const MAX_DAEMON_OUTPUT_RESERVE: u64 = haider_provider::MAX_OUTPUT_LIMIT;
-        if model.trim().is_empty() || max_tokens > MAX_DAEMON_OUTPUT_RESERVE {
+        if model.trim().is_empty() || max_tokens > haider_provider::MAX_OUTPUT_LIMIT {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "session model must be non-empty and max_tokens must be in 0..=384000 (0 derives the model default)",
+                &format!(
+                    "session model must be non-empty and max_tokens must be in 0..={} \
+                     (0 derives the model default)",
+                    haider_provider::MAX_OUTPUT_LIMIT
+                ),
                 false,
                 None,
             );

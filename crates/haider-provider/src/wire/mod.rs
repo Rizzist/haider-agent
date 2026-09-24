@@ -1374,28 +1374,7 @@ impl StreamState {
                     }
                     self.stop_reason = Some(normalized);
                 }
-                // A message-level delta ends the content phase even when the
-                // provider omits or delays a block stop. A max-token stop is
-                // different: an open tool is partial and must not gain a
-                // synthetic, executable ToolCallEnd.
-                let mut events = Vec::new();
-                while let Some((&index, _)) = self.open_blocks.first_key_value() {
-                    let output_limited_tool = self.stop_reason == Some(FinishReason::MaxTokens)
-                        && matches!(self.open_blocks.get(&index), Some(OpenBlock::Tool { .. }));
-                    if output_limited_tool {
-                        self.open_blocks.remove(&index);
-                    } else {
-                        events.extend(self.close_block(index)?);
-                    }
-                    self.implicitly_closed_blocks.insert(index);
-                }
-                let closed_tool_blocks = std::mem::take(&mut self.closed_tool_blocks);
-                if self.stop_reason != Some(FinishReason::MaxTokens) {
-                    for (index, block) in closed_tool_blocks {
-                        self.open_blocks.insert(index, block);
-                        events.extend(self.close_block(index)?);
-                    }
-                }
+                let mut events = self.end_content_phase()?;
                 self.message_delta_seen = true;
                 let Some(usage) = usage else {
                     return Ok(events);
@@ -1438,6 +1417,32 @@ impl StreamState {
             WireEvent::Ping | WireEvent::Unknown => Ok(Vec::new()),
             WireEvent::Error { error } => Err(api_error(error)),
         }
+    }
+
+    /// A message-level delta ends the content phase even when the provider
+    /// omits or delays a block stop: finalize every open block and release
+    /// the tool ends deferred at `content_block_stop`. A max-token stop is
+    /// different: every client tool is partial and must not gain an
+    /// executable ToolCallEnd.
+    fn end_content_phase(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
+        let output_limited = self.stop_reason == Some(FinishReason::MaxTokens);
+        let mut events = Vec::new();
+        while let Some((&index, block)) = self.open_blocks.first_key_value() {
+            if output_limited && matches!(block, OpenBlock::Tool { .. }) {
+                self.open_blocks.remove(&index);
+            } else {
+                events.extend(self.close_block(index)?);
+            }
+            self.implicitly_closed_blocks.insert(index);
+        }
+        let closed_tool_blocks = std::mem::take(&mut self.closed_tool_blocks);
+        if !output_limited {
+            for (index, block) in closed_tool_blocks {
+                self.open_blocks.insert(index, block);
+                events.extend(self.close_block(index)?);
+            }
+        }
+        Ok(events)
     }
 
     fn close_block(&mut self, index: usize) -> Result<Vec<StreamEvent>, ProviderError> {

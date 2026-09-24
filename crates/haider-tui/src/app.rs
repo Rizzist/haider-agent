@@ -1269,15 +1269,7 @@ impl ProvidersState {
     /// the caller keeps its current figure rather than inventing a number.
     #[must_use]
     pub fn declared_window(&self, provider: &str, model: &str) -> Option<u64> {
-        self.providers
-            .iter()
-            .find(|summary| summary.provider == provider)
-            .and_then(|summary| {
-                summary
-                    .model_details
-                    .iter()
-                    .find(|detail| detail.name == model)
-            })
+        self.model_detail(provider, model)
             .and_then(|detail| detail.context_window)
     }
 
@@ -1286,6 +1278,11 @@ impl ProvidersState {
     /// compatibility with older daemons.
     #[must_use]
     pub fn declared_output_limit(&self, provider: &str, model: &str) -> Option<u64> {
+        self.model_detail(provider, model)
+            .and_then(|detail| detail.max_output_tokens)
+    }
+
+    fn model_detail(&self, provider: &str, model: &str) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
             .iter()
             .find(|summary| summary.provider == provider)
@@ -1295,7 +1292,6 @@ impl ProvidersState {
                     .iter()
                     .find(|detail| detail.name == model)
             })
-            .and_then(|detail| detail.max_output_tokens)
     }
 }
 
@@ -7101,15 +7097,7 @@ impl AppModel {
     #[must_use]
     pub fn current_pair_detail(&self) -> Option<&haider_rpc::ModelDetailWire> {
         self.providers
-            .providers
-            .iter()
-            .find(|summary| summary.provider == self.identity.provider)
-            .and_then(|summary| {
-                summary
-                    .model_details
-                    .iter()
-                    .find(|detail| detail.name == self.identity.model_short)
-            })
+            .model_detail(&self.identity.provider, &self.identity.model_short)
     }
 
     /// Whether the session's CURRENT pair accepts image attachments, as the

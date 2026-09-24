@@ -1185,7 +1185,6 @@ fn offline_model(_provider: &str, slug: &str) -> DiscoveredModel {
 /// source of this truth — clients hold no tables.
 fn model_detail_wire(profile: &ProviderProfileV1, model: DiscoveredModel) -> ModelDetailWire {
     let provider = profile.provider_id.as_str();
-    let static_limits = haider_provider::static_model_limits(provider, &model.slug);
     let static_ladder: &[&str] = if model.supported_efforts.is_empty() {
         match provider {
             // G4b: bedrock/vertex serve the same Claude families — the
@@ -1234,7 +1233,7 @@ fn model_detail_wire(profile: &ProviderProfileV1, model: DiscoveredModel) -> Mod
     };
     let context_window = model
         .context_window
-        .or(static_limits.context_window)
+        .or(haider_provider::static_model_limits(provider, &model.slug).context_window)
         .or_else(|| {
             (provider == XAI_PROVIDER_NAME)
                 .then(|| {
@@ -1244,13 +1243,12 @@ fn model_detail_wire(profile: &ProviderProfileV1, model: DiscoveredModel) -> Mod
                 })
                 .flatten()
         });
-    let max_output_tokens = model
-        .max_output_tokens
-        .unwrap_or(static_limits.max_output_tokens);
-    let max_output_tokens = max_output_tokens.min(haider_provider::MAX_OUTPUT_LIMIT);
-    let max_output_tokens = context_window.map_or(max_output_tokens, |context_window| {
-        max_output_tokens.min(context_window)
-    });
+    let max_output_tokens = haider_provider::model_output_limit(
+        provider,
+        &model.slug,
+        model.max_output_tokens,
+        context_window,
+    );
     ModelDetailWire {
         name: model.slug.clone(),
         display_name: Some(model.display_name),

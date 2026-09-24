@@ -139,9 +139,9 @@ fn zero_codex_context_window_is_absent() {
 
 /// MUTATION CHECK: read `context_window` through a provider-agnostic parse
 /// path. Expected runtime failure: the injected Anthropic value appears even
-/// though Anthropic's catalog contract never declares context windows.
+/// though Anthropic's catalog declares its window only as `max_input_tokens`.
 #[test]
-fn anthropic_context_window_is_always_none() {
+fn anthropic_context_window_ignores_foreign_field_names() {
     let models = parse_catalog(
         CatalogSource::AnthropicSubscription,
         &serde_json::json!({
@@ -180,6 +180,24 @@ fn provider_catalog_token_limits_are_preserved_when_declared() {
     )
     .expect("Gemini payload parses");
     assert_eq!(gemini[0].max_output_tokens, Some(65_536));
+}
+
+/// A present-but-unusable limit declares nothing; it never falls through to a
+/// later alias of the same field.
+#[test]
+fn unusable_declared_token_limit_does_not_fall_back_to_an_alias() {
+    let models = parse_catalog(
+        CatalogSource::AnthropicSubscription,
+        &serde_json::json!({
+            "data": [
+                {"id": "zero-output", "max_output_tokens": 0, "max_tokens": 64_000},
+                {"id": "alias-output", "max_tokens": 64_000}
+            ]
+        }),
+    )
+    .expect("anthropic payload parses");
+    assert_eq!(models[0].max_output_tokens, None);
+    assert_eq!(models[1].max_output_tokens, Some(64_000));
 }
 
 /// MUTATION CHECK: make `visible` unconditionally `true` (drop the

@@ -13,9 +13,10 @@ use haider_protocol::tool::ImageBlockRef;
 use haider_provider::{
     Message, MessageRole, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_SUBSCRIPTION_BASE_URL,
     OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, PromptCacheMetadata, Provider,
-    ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
-    degrade_tool_result_images_to_placeholders, replay_deepseek_chat_sse, replay_openai_chat_sse,
-    replay_openai_http_error, replay_openai_models_response, replay_openai_responses_sse,
+    ProviderError, ProviderErrorKind, ProviderStreamItem, ResolvedAttachment, ToolDefinition,
+    TurnRequest, degrade_tool_result_images_to_placeholders, replay_deepseek_chat_sse,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_responses_sse,
 };
 use serde::Deserialize;
 
@@ -333,19 +334,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
 
     let items = replay_openai_responses_sse(wire);
 
-    assert!(items.iter().any(|item| matches!(
-        item,
-        Ok(StreamEvent::ToolCallStart { call_id, .. }) if call_id == "call_partial"
-    )));
-    assert!(items.iter().any(|item| matches!(
-        item,
-        Ok(StreamEvent::ToolCallArgsDelta { call_id, args_fragment })
-            if call_id == "call_partial" && args_fragment == "{\"path\":"
-    )));
-    assert!(!items.iter().any(|item| matches!(
-        item,
-        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "call_partial"
-    )));
+    assert_partial_tool_without_end(&items, "call_partial", "{\"path\":");
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {
@@ -356,6 +345,24 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
 
 /// MUTATION CHECK: classify `context_length_exceeded` as InvalidRequest.
 /// Expected runtime failure: forced compaction cannot distinguish overflow.
+/// An output-limit terminal surfaces the open call's Start and argument bytes
+/// for actor classification but never an executable End.
+fn assert_partial_tool_without_end(items: &[ProviderStreamItem], call_id: &str, args: &str) {
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallStart { call_id: actual, .. }) if actual == call_id
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallArgsDelta { call_id: actual, args_fragment })
+            if actual == call_id && args_fragment == args
+    )));
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id: actual }) if actual == call_id
+    )));
+}
+
 #[test]
 fn context_exceeded_http_fixture_has_a_distinct_non_retryable_kind() {
     let error = replay_openai_http_error(
@@ -380,19 +387,7 @@ data: [DONE]
 
     let items = replay_openai_chat_sse(wire);
 
-    assert!(items.iter().any(|item| matches!(
-        item,
-        Ok(StreamEvent::ToolCallStart { call_id, .. }) if call_id == "call_partial"
-    )));
-    assert!(items.iter().any(|item| matches!(
-        item,
-        Ok(StreamEvent::ToolCallArgsDelta { call_id, args_fragment })
-            if call_id == "call_partial" && args_fragment == "{\"path\":"
-    )));
-    assert!(!items.iter().any(|item| matches!(
-        item,
-        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "call_partial"
-    )));
+    assert_partial_tool_without_end(&items, "call_partial", "{\"path\":");
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {

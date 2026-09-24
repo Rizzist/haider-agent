@@ -2964,13 +2964,7 @@ impl ResponsesDecoder {
             FinishReason::EndTurn
         };
         let mut events = if reason == FinishReason::MaxTokens {
-            // Preserve Start/ArgsDelta so the actor can classify the open
-            // invocation as output-limit truncation. Never forward an End:
-            // partial arguments must not execute.
-            std::mem::take(&mut self.pending_tool_events)
-                .into_iter()
-                .filter(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }))
-                .collect()
+            output_limited_tool_events(&mut self.pending_tool_events)
         } else if incomplete {
             self.pending_tool_events.clear();
             Vec::new()
@@ -3760,9 +3754,9 @@ impl ChatDecoder {
         // G4a LK8 tolerance: some OSS servers emit tool-call deltas yet
         // close with finish_reason "stop" instead of "tool_calls". The calls
         // are real — complete them and finish as tool use rather than
-        // silently discarding a tool invocation the model asked for. Every
-        // Refusal drops partials. MaxTokens preserves starts/deltas without
-        // an End marker so the actor can request a safe split retry.
+        // silently discarding a tool invocation the model asked for. A
+        // max-token stop surfaces the partial calls without an End marker;
+        // every other reason drops them.
         let reason = if reason == FinishReason::EndTurn && !self.open_calls.is_empty() {
             FinishReason::ToolUse
         } else {
@@ -3771,10 +3765,7 @@ impl ChatDecoder {
         let mut events = if reason == FinishReason::ToolUse {
             self.close_calls()
         } else if reason == FinishReason::MaxTokens {
-            std::mem::take(&mut self.pending_tool_events)
-                .into_iter()
-                .filter(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }))
-                .collect()
+            output_limited_tool_events(&mut self.pending_tool_events)
         } else {
             self.pending_tool_events.clear();
             Vec::new()
@@ -3793,6 +3784,17 @@ impl ChatDecoder {
         self.terminal = true;
         vec![Err(error)]
     }
+}
+
+/// Drains buffered tool events at an output-limit terminal. Start and argument
+/// deltas cross so the actor can classify each open call as an output-limit
+/// truncation; End markers never do, because partial arguments must not
+/// execute. Shared by the Responses and chat decoders.
+fn output_limited_tool_events(pending: &mut Vec<StreamEvent>) -> Vec<StreamEvent> {
+    std::mem::take(pending)
+        .into_iter()
+        .filter(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }))
+        .collect()
 }
 
 /// Replays native Responses SSE bytes through the live incremental decoder.

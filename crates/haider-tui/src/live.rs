@@ -2420,7 +2420,8 @@ fn ssh_profile_command(
 pub const SESSION_OUTPUT_CAP: u64 = 30_000;
 
 /// The output budget a new session may request: the ceiling, bounded by the
-/// (smaller) context window when one is declared.
+/// context window and by the row's daemon-projected output maximum when one
+/// is declared.
 #[must_use]
 pub fn session_output_cap(context_window: u64, model_output_limit: Option<u64>) -> u64 {
     SESSION_OUTPUT_CAP

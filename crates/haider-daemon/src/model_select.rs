@@ -371,12 +371,12 @@ impl ModelSelectionAuthority {
                             haider_protocol::provider::FeatureResolve::Unsupported
                         ),
                         context_window: detail.and_then(|detail| detail.context_window),
-                        max_output_tokens: detail
-                            .and_then(|detail| detail.max_output_tokens)
-                            .unwrap_or_else(|| {
-                                haider_provider::static_model_limits(&summary.provider, model)
-                                    .max_output_tokens
-                            }),
+                        max_output_tokens: haider_provider::model_output_limit(
+                            &summary.provider,
+                            model,
+                            detail.and_then(|detail| detail.max_output_tokens),
+                            detail.and_then(|detail| detail.context_window),
+                        ),
                     },
                     aliases,
                 });
@@ -523,17 +523,15 @@ impl ModelSelectionAuthority {
                 .iter()
                 .find(|detail| detail.name == resolved_model)
         });
-        let static_limits = haider_provider::static_model_limits(provider, &resolved_model);
-        let context_window = detail
-            .and_then(|detail| detail.context_window)
-            .or(static_limits.context_window);
-        let max_output_tokens = detail
-            .and_then(|detail| detail.max_output_tokens)
-            .unwrap_or(static_limits.max_output_tokens);
-        let max_output_tokens = max_output_tokens.min(haider_provider::MAX_OUTPUT_LIMIT);
-        let max_output_tokens = context_window.map_or(max_output_tokens, |context_window| {
-            max_output_tokens.min(context_window)
+        let context_window = detail.and_then(|detail| detail.context_window).or_else(|| {
+            haider_provider::static_model_limits(provider, &resolved_model).context_window
         });
+        let max_output_tokens = haider_provider::model_output_limit(
+            provider,
+            &resolved_model,
+            detail.and_then(|detail| detail.max_output_tokens),
+            context_window,
+        );
         Ok(ValidatedModelSelection {
             provider: provider.to_owned(),
             model: resolved_model,
