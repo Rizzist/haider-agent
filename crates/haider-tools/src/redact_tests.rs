@@ -132,6 +132,49 @@ fn explicit_context_overrides_generic_jwt_lookalike_label() {
 }
 
 #[test]
+fn marker_table_bytes_are_pinned() {
+    use super::SecretKind::*;
+    for (kind, marker) in [
+        (PrivateKey, "[REDACTED:private_key]"),
+        (PrivateKeyMaterial, "[REDACTED:private_key_material]"),
+        (AwsAccessKey, "[REDACTED:aws_access_key]"),
+        (ApiKey, "[REDACTED:api_key]"),
+        (GithubToken, "[REDACTED:github_token]"),
+        (SlackToken, "[REDACTED:slack_token]"),
+        (GitlabToken, "[REDACTED:gitlab_token]"),
+        (NpmToken, "[REDACTED:npm_token]"),
+        (StripeApiKey, "[REDACTED:stripe_api_key]"),
+        (GoogleApiKey, "[REDACTED:google_api_key]"),
+        (Jwt, "[REDACTED:jwt]"),
+        (BearerToken, "[REDACTED:bearer_token]"),
+        (BasicAuth, "[REDACTED:basic_auth]"),
+        (Password, "[REDACTED:password]"),
+        (SecretValue, "[REDACTED:secret_value]"),
+        (HighEntropy, "[REDACTED:high_entropy]"),
+    ] {
+        assert_eq!(kind.marker(), marker);
+    }
+}
+
+#[test]
+fn every_context_class_keeps_its_label_on_each_quoted_line() {
+    for (label, kind) in [
+        ("password=", "password"),
+        ("api_key=", "api_key"),
+        ("Bearer ", "bearer_token"),
+        ("Basic ", "basic_auth"),
+        ("secret=", "secret_value"),
+    ] {
+        let marker = format!("[REDACTED:{kind}]");
+        assert_eq!(
+            super::redact_output_text(&format!("{label}'single quoted\nsecond line\nthird' after")),
+            format!("{label}{marker}\n{marker}\n{marker} after"),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn bounded_redaction_is_the_exact_full_redaction_prefix() {
     let input = format!(
         "éprefix {} middle sk-abcdefghijklmnopQRSTUV suffix {}",
