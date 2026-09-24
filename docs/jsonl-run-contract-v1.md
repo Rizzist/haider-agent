@@ -342,10 +342,14 @@ model-visible result; or a distinct completed provider-side tool result with
 its name, arguments, preview, and status. Repeated content or identical calls
 and results, even with fresh call IDs, do not reset the streak. Usage updates,
 transport attempts, opaque replay state, and the automatic `max_tokens` nudge
-also do not reset it. The default permits eight no-progress continuations;
-the ninth ends in `loop_limit` (CLI exit 70). Productive turns may pass that
-many total continuations. This loop guard is separate from an explicit request
-budget and its `request_budget_exceeded` exit 78.
+also do not reset it. Fingerprints normalize assistant Unicode and whitespace,
+collapse whitespace inside JSON argument strings, and ignore timestamps,
+generated IDs, and long encoded tokens in tool-result previews. A changed
+count or ordinary result text remains progress. The default permits eight
+no-progress continuations; the ninth ends in `loop_limit` (CLI exit 70).
+Productive turns may pass that many total continuations. This loop guard is
+separate from an explicit request budget and its `request_budget_exceeded` exit
+78.
 
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
 request policy. With only `--max-requests N`, the implicit tranche is

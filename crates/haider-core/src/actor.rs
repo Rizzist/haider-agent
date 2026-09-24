@@ -691,7 +691,7 @@ const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
 /// usage, opaque replay state, and the synthesized MaxTokens nudge do not prove
 /// progress. Only new assistant text, a completed local call with a new
 /// (name, arguments, result), or a provider-side tool result does. Fingerprints
-/// keep each observation small while still recognizing repeats after other work.
+/// compare normalized semantic content, recognizing repeats after other work.
 #[derive(Default)]
 struct ContinuationProgress {
     consecutive_without_progress: usize,
@@ -724,7 +724,8 @@ impl ContinuationProgress {
                 content.push_str(&text.to_owned_string());
             }
         }
-        if !content.trim().is_empty() {
+        let content = crate::continuation_fingerprint::assistant_text(&content);
+        if !content.is_empty() {
             self.observe(b"assistant_text", &[content.as_bytes()]);
         }
     }
@@ -747,7 +748,8 @@ impl ContinuationProgress {
                     ..
                 }) = result.tool_result_for(call_id)
                 {
-                    let args = args.to_string();
+                    let args = crate::continuation_fingerprint::arguments(args);
+                    let preview = crate::continuation_fingerprint::result(preview);
                     let images = serde_json::to_string(images).unwrap_or_default();
                     self.observe(
                         b"local_tool_result",
@@ -771,7 +773,8 @@ impl ContinuationProgress {
         preview: &str,
         is_error: bool,
     ) {
-        let args = args.to_string();
+        let args = crate::continuation_fingerprint::arguments(args);
+        let preview = crate::continuation_fingerprint::result(preview);
         self.observe(
             b"server_tool_result",
             &[
@@ -788,6 +791,106 @@ impl ContinuationProgress {
             self.consecutive_without_progress = self.consecutive_without_progress.saturating_add(1);
         }
         self.consecutive_without_progress
+    }
+}
+
+#[cfg(test)]
+mod continuation_progress_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn continuation_until_stop(case: &str) -> usize {
+        let mut progress = ContinuationProgress::default();
+        for n in 1..=30 {
+            progress.begin_response();
+            match case {
+                "alternating_ab" | "provider_repeat" | "query_whitespace" | "preview_timestamp"
+                | "preview_id" | "arg_key_order" => {
+                    let key = if n % 2 == 0 { "B" } else { "A" };
+                    let query = match case {
+                        "alternating_ab" => key.to_owned(),
+                        "query_whitespace" => format!("same topic{}", " ".repeat(n)),
+                        _ => "same topic".to_owned(),
+                    };
+                    let args = if case == "arg_key_order" && n % 2 == 0 {
+                        serde_json::from_str(r#"{"limit":5,"query":"same topic"}"#).unwrap()
+                    } else if case == "arg_key_order" {
+                        serde_json::from_str(r#"{"query":"same topic","limit":5}"#).unwrap()
+                    } else {
+                        serde_json::json!({"query": query})
+                    };
+                    let preview = match case {
+                        "alternating_ab" => format!("same result {key}"),
+                        "preview_timestamp" => {
+                            format!("same result; time=2026-09-24T00:00:{n:02}Z")
+                        }
+                        "preview_id" => format!("same result; request_id={n}"),
+                        _ => "same result".to_owned(),
+                    };
+                    progress.observe_server_tool("web_search", &args, &preview, false);
+                }
+                "local_alternating_ab" => {
+                    let key = if n % 2 == 0 { "B" } else { "A" };
+                    let call_id = n.to_string();
+                    let block = Block::ToolCall {
+                        call_id: call_id.clone(),
+                        name: "fs_read".into(),
+                        args: serde_json::json!({"path": format!("{key}.txt")}),
+                    };
+                    let result = Message::tool_result(call_id, "same stable file contents", false);
+                    progress.observe_local_tools(&[block], &[result]);
+                }
+                "text_whitespace" | "text_blank" | "text_repeat" => {
+                    let content = match case {
+                        "text_blank" => " ".repeat(n),
+                        "text_whitespace" => format!("same answer{}", " ".repeat(n)),
+                        _ => "same answer".to_owned(),
+                    };
+                    progress.observe_assistant_text(&[Block::Text {
+                        text: content.into(),
+                    }]);
+                }
+                _ => panic!("unknown continuation case"),
+            }
+            if progress.charge() > DEFAULT_MAX_CONTINUATIONS_PER_TURN {
+                return n;
+            }
+        }
+        panic!("{case} bypassed the no-progress limit");
+    }
+
+    #[test]
+    fn adversarial_repeats_stop_after_ninth_no_progress_continuation() {
+        for (case, expected) in [
+            ("alternating_ab", 11),
+            ("local_alternating_ab", 11),
+            ("query_whitespace", 10),
+            ("preview_timestamp", 10),
+            ("preview_id", 10),
+            ("text_whitespace", 10),
+            ("text_blank", 9),
+            ("text_repeat", 10),
+            ("provider_repeat", 10),
+            ("arg_key_order", 10),
+        ] {
+            assert_eq!(continuation_until_stop(case), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn substantive_result_changes_keep_long_turn_alive_but_timestamps_do_not() {
+        let mut progress = ContinuationProgress::default();
+        for n in 1..=30 {
+            progress.begin_response();
+            progress.observe_server_tool(
+                "web_search",
+                &serde_json::json!({"query": "same topic"}),
+                &format!("count={n}; text=page {n}; time=2026-09-24T00:00:{n:02}Z"),
+                false,
+            );
+            assert_eq!(progress.charge(), 0);
+        }
+        assert_eq!(continuation_until_stop("preview_timestamp"), 10);
     }
 }
 /// Maximum time a provider-stream text, reasoning, or tool-argument delta may
