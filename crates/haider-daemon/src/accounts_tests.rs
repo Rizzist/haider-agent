@@ -631,7 +631,7 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
         );
         assert_eq!(
             active_catalog_cache_key(OPENAI_OAUTH_PROVIDER_NAME, &accounts, &providers),
-            Some(account_provider_model_cache_key(
+            Some(ProviderModelCacheKey::for_account(
                 OPENAI_OAUTH_PROVIDER_NAME,
                 accounts
                     .get(&CredentialAlias::new(alias))
@@ -8432,7 +8432,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         account_identity: None,
         created_at_ms: None,
     };
-    let cache_key = account_provider_model_cache_key(OPENAI_OAUTH_PROVIDER_NAME, &descriptor);
+    let cache_key = ProviderModelCacheKey::for_account(OPENAI_OAUTH_PROVIDER_NAME, &descriptor);
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
@@ -8572,7 +8572,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         "discovery receives the broker-extracted access token, never the encoded bundle"
     );
     let cached = store
-        .provider_models(cache_key.clone())
+        .provider_models(cache_key.clone().into())
         .await
         .expect("cache read")
         .expect("cache row");
@@ -8622,7 +8622,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         }
     ));
     let touched = store
-        .provider_models(cache_key.clone())
+        .provider_models(cache_key.clone().into())
         .await
         .expect("touched cache read")
         .expect("touched cache row");
@@ -8693,7 +8693,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     }
     assert_eq!(
         store
-            .provider_models(cache_key.clone())
+            .provider_models(cache_key.clone().into())
             .await
             .expect("cache after unavailable")
             .expect("cache remains"),

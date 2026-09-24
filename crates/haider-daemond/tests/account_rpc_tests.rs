@@ -1059,7 +1059,7 @@ async fn session_create_accepts_gemini_when_account_active() {
             .unwrap_or_else(|error| panic!("serialize Gemini catalog: {error}"));
         store
             .put_provider_models(
-                &haider_store::account_provider_model_cache_key("gemini", &descriptor),
+                haider_store::ProviderModelCacheKey::for_account("gemini", &descriptor).as_str(),
                 &models_json,
                 None,
                 1,

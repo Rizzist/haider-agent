@@ -72,7 +72,7 @@ use haider_rpc::{
     ProviderAvailabilityWire, ProviderProbeFailureWire, ProviderRemoveRefusalReasonWire,
     ProviderSummaryWire, ProviderTrustWire, RequestId, ResponseBody, StagePurpose, WireFrame,
 };
-use haider_store::account_provider_model_cache_key;
+use haider_store::ProviderModelCacheKey;
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -1436,7 +1436,7 @@ pub(crate) enum AccountCommand {
     },
     ProviderModelsRefreshCompleted {
         provider: String,
-        cache_key: String,
+        cache_key: ProviderModelCacheKey,
         cached: Option<haider_core::CachedModels>,
         result: ProviderModelsRefreshResult,
         completed: ProviderModelsRefreshCompletion,
@@ -2402,8 +2402,8 @@ async fn run_account_actor(
                 completed,
             } => {
                 refreshing_providers.remove(&provider);
-                if active_catalog_cache_key(&provider, &accounts, &providers).as_deref()
-                    != Some(cache_key.as_str())
+                if active_catalog_cache_key(&provider, &accounts, &providers).as_ref()
+                    != Some(&cache_key)
                 {
                     // A switch happened during the network flight. Its new
                     // discovery remains queued; never publish the old rows.
@@ -3026,10 +3026,10 @@ async fn begin_provider_models_refresh(
         None
     };
     let cache_key = descriptor.as_ref().map_or_else(
-        || provider.clone(),
-        |descriptor| account_provider_model_cache_key(&provider, descriptor),
+        || ProviderModelCacheKey::public(&provider),
+        |descriptor| ProviderModelCacheKey::for_account(&provider, descriptor),
     );
-    let cached = match store.provider_models(cache_key.clone()).await {
+    let cached = match store.provider_models(cache_key.clone().into()).await {
         Ok(cached) => cached,
         Err(error) => {
             providers.models_unavailable(&provider, error.message.clone());
@@ -3139,7 +3139,7 @@ struct ProviderModelsRefreshContext<'a> {
 async fn finish_provider_models_refresh(
     context: ProviderModelsRefreshContext<'_>,
     provider: String,
-    cache_key: String,
+    cache_key: ProviderModelCacheKey,
     cached: Option<haider_core::CachedModels>,
     result: ProviderModelsRefreshResult,
 ) {
@@ -3178,7 +3178,7 @@ async fn finish_provider_models_refresh(
             let fetched_at_ms = unix_ms_after(Duration::ZERO);
             let revision = match store
                 .put_provider_models_and_advance_management_revision(
-                    cache_key.clone(),
+                    cache_key.clone().into(),
                     models_json,
                     catalog.etag,
                     fetched_at_ms,
@@ -3233,7 +3233,7 @@ async fn finish_provider_models_refresh(
             let fetched_at_ms = unix_ms_after(Duration::ZERO);
             if let Err(error) = store
                 .put_provider_models(
-                    cache_key,
+                    cache_key.into(),
                     cached.models_json.clone(),
                     cached.etag,
                     fetched_at_ms,
@@ -3462,23 +3462,70 @@ fn catalog_source(
     }
 }
 
-/// Authenticated inventories are durable only for the account that fetched
-/// them. Legacy provider-only rows are intentionally ignored on upgrade.
-fn active_catalog_cache_key(
+/// The single daemon-side rule mapping a provider's catalog authentication
+/// to its durable cache key. Authenticated inventories are durable only for
+/// the account that fetched them (legacy provider-only rows are ignored on
+/// upgrade); credential-free catalogs keep the bare provider key. `None`
+/// means the catalog has no durable key (no active account, or an
+/// unsupported authentication requirement).
+fn catalog_cache_key(
     provider: &str,
-    accounts: &AccountStore<Box<dyn StoreLike>>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
-) -> Option<String> {
-    let (_, auth) = catalog_source(provider, providers)?;
+    auth: ProviderAuthRequirementWire,
+    active: Option<&CredentialDescriptor>,
+) -> Option<ProviderModelCacheKey> {
     match auth {
-        ProviderAuthRequirementWire::OAuth | ProviderAuthRequirementWire::ApiKey => accounts
-            .active_for_provider(provider)
-            .map(|account| account_provider_model_cache_key(provider, account)),
-        ProviderAuthRequirementWire::None => Some(provider.to_owned()),
+        ProviderAuthRequirementWire::OAuth | ProviderAuthRequirementWire::ApiKey => {
+            active.map(|account| ProviderModelCacheKey::for_account(provider, account))
+        }
+        ProviderAuthRequirementWire::None => Some(ProviderModelCacheKey::public(provider)),
         _ => None,
     }
 }
 
+fn active_catalog_cache_key(
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<ProviderModelCacheKey> {
+    let (_, auth) = catalog_source(provider, providers)?;
+    catalog_cache_key(provider, auth, accounts.active_for_provider(provider))
+}
+
+/// Cache key of `alias`'s own catalog, captured before an import or
+/// replacement so [`clear_catalog_if_alias_identity_changed`] can compare it.
+fn alias_catalog_cache_key(
+    provider: &str,
+    alias: &CredentialAlias,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) -> Option<ProviderModelCacheKey> {
+    accounts
+        .get(alias)
+        .map(|descriptor| ProviderModelCacheKey::for_account(provider, descriptor))
+}
+
+/// Import/replace rule: when a same-alias commit changed the account identity
+/// behind `alias`, drop the provider's live rows so the previous identity's
+/// catalog is not served. Discovery is queued by the caller's finalize step.
+/// `previous` is `None` for a new alias, which never clears.
+fn clear_catalog_if_alias_identity_changed(
+    provider: &str,
+    alias: &CredentialAlias,
+    previous: Option<ProviderModelCacheKey>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if alias_catalog_cache_key(provider, alias, accounts).is_some_and(|current| current != previous)
+    {
+        providers.clear_discovered_models(provider);
+    }
+}
+
+/// Source-reconciliation rule: compares every provider's active catalog key
+/// before and after a bulk account change; each changed provider drops its
+/// live rows and queues discovery for the new active account.
 fn clear_catalogs_after_account_change(
     before: &[CredentialDescriptor],
     accounts: &AccountStore<Box<dyn StoreLike>>,
@@ -3494,19 +3541,11 @@ fn clear_catalogs_after_account_change(
         let Some((_, auth)) = catalog_source(provider, providers) else {
             continue;
         };
-        if !matches!(
-            auth,
-            ProviderAuthRequirementWire::OAuth | ProviderAuthRequirementWire::ApiKey
-        ) {
-            continue;
-        }
-        let previous = before
+        let previous_active = before
             .iter()
-            .find(|descriptor| descriptor.provider == provider && descriptor.active)
-            .map(|descriptor| account_provider_model_cache_key(provider, descriptor));
-        let current = accounts
-            .active_for_provider(provider)
-            .map(|descriptor| account_provider_model_cache_key(provider, descriptor));
+            .find(|descriptor| descriptor.provider == provider && descriptor.active);
+        let previous = catalog_cache_key(provider, auth, previous_active);
+        let current = catalog_cache_key(provider, auth, accounts.active_for_provider(provider));
         if previous != current {
             providers.clear_discovered_models(provider);
             enqueue_catalog_discovery(provider, providers, pending);
@@ -5702,9 +5741,9 @@ async fn handle_provider_configure(
         };
         let fetched_at_ms = unix_ms_after(Duration::ZERO);
         let cache_key = active_catalog_cache_key(&profile.provider_id, accounts, providers)
-            .unwrap_or_else(|| profile.provider_id.clone());
+            .unwrap_or_else(|| ProviderModelCacheKey::public(&profile.provider_id));
         if let Err(error) = store
-            .put_provider_models(cache_key, models_json, catalog.etag, fetched_at_ms)
+            .put_provider_models(cache_key.into(), models_json, catalog.etag, fetched_at_ms)
             .await
         {
             respond_error(
@@ -6528,9 +6567,7 @@ async fn handle_login(
     match validation {
         Ok(validated) => {
             let replacing = replace_existing || accounts.get(&alias).is_some();
-            let previous_cache_key = accounts
-                .get(&alias)
-                .map(|descriptor| account_provider_model_cache_key(&provider, descriptor));
+            let previous_cache_key = alias_catalog_cache_key(&provider, &alias, accounts);
             let prior_secret = if replacing {
                 vault.resolve(&alias).ok()
             } else {
@@ -6564,13 +6601,13 @@ async fn handle_login(
                 {
                     account_identity = previous;
                 }
-            } else if let Some(previous) = accounts
-                .get(&alias)
-                .and_then(|descriptor| descriptor.account_identity.as_ref())
-            {
-                account_identity.captured_at = account_identity
-                    .captured_at
-                    .max(previous.captured_at.saturating_add(1));
+            } else {
+                advance_api_key_intake_epoch(
+                    &mut account_identity,
+                    accounts
+                        .get(&alias)
+                        .and_then(|descriptor| descriptor.account_identity.as_ref()),
+                );
             }
             drop(secret);
             pending.remove(&command_id);
@@ -6580,7 +6617,6 @@ async fn handle_login(
                 Some(validated.identity),
                 Some(account_identity),
             );
-            let next_cache_key = account_provider_model_cache_key(&provider, &descriptor);
             let descriptor_result = if replacing {
                 accounts.replace(descriptor)
             } else {
@@ -6612,9 +6648,13 @@ async fn handle_login(
                 );
                 return;
             }
-            if previous_cache_key.is_some_and(|previous| previous != next_cache_key) {
-                providers.clear_discovered_models(&provider);
-            }
+            clear_catalog_if_alias_identity_changed(
+                &provider,
+                &alias,
+                previous_cache_key,
+                accounts,
+                providers,
+            );
             finalize_and_respond(
                 store,
                 accounts,
@@ -6905,9 +6945,7 @@ async fn handle_oauth_add(
         );
         return;
     }
-    let previous_cache_key = accounts
-        .get(&alias)
-        .map(|descriptor| account_provider_model_cache_key(&provider, descriptor));
+    let previous_cache_key = alias_catalog_cache_key(&provider, &alias, accounts);
     if let Err(error) = persist_oauth_bundle(
         accounts,
         Arc::clone(&vault),
@@ -6926,13 +6964,13 @@ async fn handle_oauth_add(
         );
         return;
     }
-    if previous_cache_key.is_some_and(|previous| {
-        accounts.get(&alias).is_some_and(|descriptor| {
-            previous != account_provider_model_cache_key(&provider, descriptor)
-        })
-    }) {
-        providers.clear_discovered_models(&provider);
-    }
+    clear_catalog_if_alias_identity_changed(
+        &provider,
+        &alias,
+        previous_cache_key,
+        accounts,
+        providers,
+    );
     finalize_oauth_commit(
         store,
         accounts,
@@ -7218,17 +7256,14 @@ async fn handle_gcloud_import(
     };
     let mut account_identity = api_key_identity(haider_provider::VERTEX_PROVIDER_NAME, &token);
     let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
-    let previous_cache_key = accounts.get(&alias).map(|descriptor| {
-        account_provider_model_cache_key(haider_provider::VERTEX_PROVIDER_NAME, descriptor)
-    });
-    if let Some(previous) = accounts
-        .get(&alias)
-        .and_then(|descriptor| descriptor.account_identity.as_ref())
-    {
-        account_identity.captured_at = account_identity
-            .captured_at
-            .max(previous.captured_at.saturating_add(1));
-    }
+    let previous_cache_key =
+        alias_catalog_cache_key(haider_provider::VERTEX_PROVIDER_NAME, &alias, accounts);
+    advance_api_key_intake_epoch(
+        &mut account_identity,
+        accounts
+            .get(&alias)
+            .and_then(|descriptor| descriptor.account_identity.as_ref()),
+    );
     let vault_for_write = Arc::clone(&vault);
     let alias_for_write = alias.clone();
     let written =
@@ -7276,17 +7311,13 @@ async fn handle_gcloud_import(
         respond_management_error(&job.route, &error);
         return;
     }
-    if previous_cache_key.is_some_and(|previous| {
-        accounts.get(&alias).is_some_and(|descriptor| {
-            previous
-                != account_provider_model_cache_key(
-                    haider_provider::VERTEX_PROVIDER_NAME,
-                    descriptor,
-                )
-        })
-    }) {
-        providers.clear_discovered_models(haider_provider::VERTEX_PROVIDER_NAME);
-    }
+    clear_catalog_if_alias_identity_changed(
+        haider_provider::VERTEX_PROVIDER_NAME,
+        &alias,
+        previous_cache_key,
+        accounts,
+        providers,
+    );
     let revision = match store.advance_management_revision().await {
         Ok(revision) => revision,
         Err(error) => {
@@ -7980,7 +8011,7 @@ async fn handle_oauth_import(
     }
     let previous_cache_key = replacing
         .as_ref()
-        .map(|descriptor| account_provider_model_cache_key(spec.provider, descriptor));
+        .map(|descriptor| ProviderModelCacheKey::for_account(spec.provider, descriptor));
     if replacing.is_some() {
         refresh_fences.invalidate(&alias);
     }
@@ -7997,13 +8028,13 @@ async fn handle_oauth_import(
         respond_management_error(&job.route, &error);
         return;
     }
-    if previous_cache_key.is_some_and(|previous| {
-        accounts.get(&alias).is_some_and(|descriptor| {
-            previous != account_provider_model_cache_key(spec.provider, descriptor)
-        })
-    }) {
-        providers.clear_discovered_models(spec.provider);
-    }
+    clear_catalog_if_alias_identity_changed(
+        spec.provider,
+        &alias,
+        previous_cache_key,
+        accounts,
+        providers,
+    );
     finalize_oauth_commit(
         store,
         accounts,
@@ -8441,6 +8472,21 @@ fn descriptor_for(
         // method. Replacement preserves the prior value, including legacy
         // None, instead of turning a re-key into a new account.
         created_at_ms: None,
+    }
+}
+
+/// A different API key replacing `previous` must derive a new catalog cache
+/// key even when its display identity is unchanged: `captured_at` is the
+/// key's intake epoch (see `ProviderModelCacheKey::for_account`), so it is
+/// moved strictly past the previous epoch.
+fn advance_api_key_intake_epoch(
+    identity: &mut AccountIdentity,
+    previous: Option<&AccountIdentity>,
+) {
+    if let Some(previous) = previous {
+        identity.captured_at = identity
+            .captured_at
+            .max(previous.captured_at.saturating_add(1));
     }
 }
 
@@ -11880,9 +11926,9 @@ async fn reconcile_provider_receipts(
             })?;
             let fetched_at_ms = unix_ms_after(Duration::ZERO);
             let cache_key = active_catalog_cache_key(&profile.provider_id, accounts, providers)
-                .unwrap_or_else(|| profile.provider_id.clone());
+                .unwrap_or_else(|| ProviderModelCacheKey::public(&profile.provider_id));
             store
-                .put_provider_models(cache_key, models_json, catalog.etag, fetched_at_ms)
+                .put_provider_models(cache_key.into(), models_json, catalog.etag, fetched_at_ms)
                 .await?;
             providers.replace_discovered_models(
                 profile.provider_id.clone(),
@@ -12541,7 +12587,7 @@ impl AccountsRuntime {
                 else {
                     continue;
                 };
-                if let Some(cached) = store.provider_models(cache_key).await? {
+                if let Some(cached) = store.provider_models(cache_key.into()).await? {
                     let models = serde_json::from_str(&cached.models_json).map_err(|error| {
                         HaiderError::new(
                             ErrorCode::StoreCorrupt,
