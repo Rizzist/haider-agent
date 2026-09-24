@@ -4168,9 +4168,8 @@ fn render_usage(
     let mut chip_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
     // F2b: each provider group's header line, for cursor-follow scrolling.
     let mut header_lines: Vec<usize> = Vec::new();
-    // 973: the last line of the selected account's block (calendar detail
-    // panel), so the follow shows the whole block, header first.
-    let mut follow_end: Option<usize> = None;
+    // 973: the calendar's selected block end (follow) and pinned summary.
+    let mut calendar_layout = usage_calendar::CalendarLayout::default();
 
     let global = model.usage.scope == crate::app::UsageScope::Global;
     let history = model.usage.scope == crate::app::UsageScope::History;
@@ -4281,7 +4280,7 @@ fn render_usage(
             area.width,
             &mut lines,
             &mut header_lines,
-            &mut follow_end,
+            &mut calendar_layout,
         );
     }
 
@@ -5087,7 +5086,10 @@ fn render_usage(
                 .saturating_sub(report_area.height)
                 .min(max_scroll);
         }
-        if let Some(end) = follow_end.and_then(|line| u16::try_from(line).ok()) {
+        if let Some(end) = calendar_layout
+            .follow_end
+            .and_then(|line| u16::try_from(line).ok())
+        {
             // Bring the block's end into view, but never past its header.
             if end >= scroll + report_area.height {
                 scroll = (end + 1)
@@ -5097,8 +5099,33 @@ fn render_usage(
             }
         }
     }
+    // 973: once scrolling hides the calendar's selected-account summary,
+    // it is pinned over the top row so the selected account's reset dates
+    // stay in view (the 80x24 case). A followed header that would sit
+    // under the pin is scrolled one row further up.
+    let pinned = calendar_layout
+        .pinned_summary
+        .filter(|(line, _)| usize::from(scroll) > *line && report_area.height > 2);
+    if pinned.is_some() {
+        let header = header_lines
+            .get(model.usage.cursor)
+            .and_then(|&line| u16::try_from(line).ok());
+        if header == Some(scroll) {
+            scroll = scroll.saturating_sub(1);
+        }
+    }
+    let pinned = pinned.filter(|(line, _)| usize::from(scroll) > *line);
     model.usage.scroll.set(scroll);
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), report_area);
+    if let Some((_, summary)) = pinned {
+        frame.render_widget(
+            Paragraph::new(summary),
+            Rect {
+                height: 1,
+                ..report_area
+            },
+        );
+    }
     // The house scroll indicator: `⋮` gutter marks on the edge rows while
     // content hides beyond them.
     if scroll > 0 && report_area.height > 0 {

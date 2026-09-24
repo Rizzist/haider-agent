@@ -10,9 +10,16 @@
 //!   grid in a style distinct from today, other accounts' markers dim;
 //! - the selected account opens a DETAIL panel ([`crate::usage_detail`]).
 //!
-//! The report timestamp is the sole `today` authority and relative deltas
-//! are measured from it, so a frozen fixture renders byte-for-byte stable
-//! frames. Unknown is never inferred: a missing window or reset says so.
+//! SNAPSHOT BASIS (973 repair 2, UX call): the report's `generated_at_ms`
+//! is the "as of" instant — the marked grid day is the SNAPSHOT day and
+//! every `in …` counts from it, and the screen says so in its own header
+//! line (`as of <snapshot> · countdowns count from it · f refreshes`).
+//! Rationale: `/usage` is a static screen that never redraws on its own
+//! (no animation gate, by design for idle CPU), so a wall-clock countdown
+//! would freeze between key presses and silently go stale anyway; the
+//! labelled snapshot basis is always true, frames stay pure functions of
+//! the report, and `f` re-reads a fresh snapshot. Unknown is never
+//! inferred: a missing window or reset says so.
 //!
 //! [`UsageState::display_order`]: crate::app::UsageState::display_order
 
@@ -69,7 +76,7 @@ fn bold(style: Style) -> Style {
     style.add_modifier(Modifier::BOLD)
 }
 
-/// Today's cell: the gold soft ground (unchanged from 970).
+/// The snapshot day's cell: the gold soft ground (unchanged from 970).
 fn today_style(theme: &Theme) -> Style {
     bold(theme.gold_style().bg(theme.gold_soft.into()))
 }
@@ -90,21 +97,44 @@ fn detail_style(theme: &Theme, tone: DetailTone) -> Style {
         DetailTone::Dim => theme.dim_style(),
         DetailTone::Warn => theme.warn_style(),
         DetailTone::Action => theme.gold_style(),
-        DetailTone::Disabled => theme.faint_style(),
+        // A disabled affordance still has to be READABLE (≥4.5:1): the
+        // secondary ink (dim, ≈6.2:1 dark / ≈5.0:1 light) in italics, never
+        // the faint ink (≈1.7:1 / ≈1.4:1) that marks decoration.
+        DetailTone::Disabled => theme.dim_style().add_modifier(Modifier::ITALIC),
     }
 }
 
 /// One plotted reset: (grid day, display index, kind).
 type Event = (i64, usize, ResetKind);
 
+/// Everything the calendar's row/cell renderers share for one frame.
+struct CalendarCtx<'a> {
+    theme: &'a Theme,
+    zone: UsageTimeZone,
+    snapshot_ms: u64,
+    /// The calendar year (dates in other years name their year).
+    year: i64,
+    area_width: u16,
+    wide: bool,
+}
+
+/// The per-cell facts of the month grid.
+struct GridCtx<'a> {
+    /// The snapshot's day (the grid's marked day).
+    snapshot_day: i64,
+    month: u32,
+    cell_width: usize,
+    events: &'a [Event],
+    selected_index: Option<usize>,
+    selected_days: &'a [i64],
+}
+
 /// The one-line answer to "which account, and when": the selected account's
-/// resets, relative first.
+/// resets, relative (as of the snapshot) first.
 fn selection_summary(
+    ctx: &CalendarCtx<'_>,
     account: &AccountUsageReportV1,
     marker: &str,
-    snapshot_ms: u64,
-    zone: UsageTimeZone,
-    year: i64,
 ) -> String {
     let parts = ResetKind::BOTH
         .iter()
@@ -115,8 +145,8 @@ fn selection_summary(
                     format!(
                         "{} {} ({})",
                         kind.label(),
-                        fmt_relative(snapshot_ms, at),
-                        fmt_reset_short(at, zone, year)
+                        fmt_relative(ctx.snapshot_ms, at),
+                        fmt_reset_short(at, ctx.zone, ctx.year)
                     )
                 },
             )
@@ -129,6 +159,18 @@ fn selection_summary(
     )
 }
 
+/// What the calendar hands back to the screen besides its lines.
+#[derive(Default)]
+pub(super) struct CalendarLayout {
+    /// The last line of the selected account's block (detail panel), so the
+    /// follow shows the whole block.
+    pub follow_end: Option<usize>,
+    /// The selected-account summary line: its body index and a copy that
+    /// the screen PINS to the top row once scrolling hides it, so the
+    /// selected account's reset context stays visible (80x24).
+    pub pinned_summary: Option<(usize, Line<'static>)>,
+}
+
 /// The provider reset calendar. See the module docs.
 pub(super) fn render_usage_calendar(
     model: &AppModel,
@@ -136,7 +178,7 @@ pub(super) fn render_usage_calendar(
     area_width: u16,
     lines: &mut Vec<Line<'_>>,
     header_lines: &mut Vec<usize>,
-    follow_end: &mut Option<usize>,
+    layout: &mut CalendarLayout,
 ) {
     let Some(report) = &model.usage.report else {
         if !model.usage.fetching && model.usage.error.is_none() {
@@ -174,6 +216,14 @@ pub(super) fn render_usage_calendar(
     let local = zone.offset_at_ms(snapshot_ms).is_some();
     let today = zoned_day(snapshot_ms, zone);
     let (year, month, today_date) = crate::format::civil_from_days(today);
+    let ctx = CalendarCtx {
+        theme,
+        zone,
+        snapshot_ms,
+        year,
+        area_width,
+        wide: area_width >= 100,
+    };
     let month_start = crate::format::days_from_civil(year, month, 1);
     let grid_start = month_start - i64::from(crate::format::weekday_from_days(month_start));
     let month_end = month_start + i64::from(days_in_month(year, month)) - 1;
@@ -224,8 +274,28 @@ pub(super) fn render_usage_calendar(
         ),
     ]));
     let budget = usize::from(area_width).saturating_sub(1);
+    // The basis every countdown and the marked day share — stated once,
+    // prominently (see the module docs for why it is the snapshot).
+    lines.push(Line::styled(
+        ellipsize(
+            &format!(
+                "  as of {} · {} · f refreshes",
+                fmt_reset_instant(snapshot_ms, zone, year),
+                if ctx.wide {
+                    "every countdown below counts from this snapshot"
+                } else {
+                    "countdowns count from it"
+                }
+            ),
+            budget,
+        ),
+        theme.text_style(),
+    ));
     lines.push(Line::from(vec![
-        Span::styled(format!("  [{today_date:02}] today · "), theme.dim_style()),
+        Span::styled(
+            format!("  [{today_date:02}] snapshot day · "),
+            theme.dim_style(),
+        ),
         Span::styled("  ", selected_day_style(theme)),
         Span::styled(
             " selected account's resets · others dim · ↑↓ ←→ step the list",
@@ -233,19 +303,22 @@ pub(super) fn render_usage_calendar(
         ),
     ]));
     if let (Some(slot), Some(index)) = (selected_slot, selected_index) {
-        lines.push(Line::styled(
-            ellipsize(
-                &selection_summary(
-                    &report.accounts[slot],
-                    &account_marker(index),
-                    snapshot_ms,
-                    zone,
-                    year,
-                ),
-                budget,
-            ),
-            theme.gold_style(),
+        let full = selection_summary(&ctx, &report.accounts[slot], &account_marker(index));
+        let summary = ellipsize(&full, budget);
+        // The pinned copy stands alone (the "as of" header has scrolled
+        // away), so it carries the countdown basis itself.
+        let pinned = ellipsize(
+            &full.replacen("  selected ", "  as of snapshot · ", 1),
+            budget,
+        );
+        layout.pinned_summary = Some((
+            lines.len(),
+            Line::from(Span::styled(
+                format!("{pinned:<budget$}"),
+                bold(theme.gold_style()).bg(theme.bar_bg.into()),
+            )),
         ));
+        lines.push(Line::styled(summary, theme.gold_style()));
     }
     lines.push(Line::raw(""));
 
@@ -259,21 +332,20 @@ pub(super) fn render_usage_calendar(
     }
     lines.push(Line::from(weekday_line));
 
+    let grid = GridCtx {
+        snapshot_day: today,
+        month,
+        cell_width,
+        events: &events,
+        selected_index,
+        selected_days: &selected_days,
+    };
     let mut week_start = grid_start;
     while week_start <= grid_end {
         let mut week = vec![Span::raw("  ")];
         for offset in 0_i64..7 {
             let day = week_start + offset;
-            week.extend(grid_cell(
-                theme,
-                day,
-                today,
-                month,
-                cell_width,
-                &events,
-                selected_index,
-                selected_days.contains(&day),
-            ));
+            week.extend(grid_cell(&ctx, &grid, day));
         }
         lines.push(Line::from(week));
         week_start += 7;
@@ -287,26 +359,14 @@ pub(super) fn render_usage_calendar(
             theme.dim_style(),
         ),
     ]));
-    let wide = area_width >= 100;
     let mut account_lines = vec![None; report.accounts.len()];
     for (index, &slot) in order.iter().enumerate() {
         let account = &report.accounts[slot];
         account_lines[slot] = Some(lines.len());
         let selected = selected_slot == Some(slot);
-        push_account_rows(
-            lines,
-            theme,
-            account,
-            &account_marker(index),
-            selected,
-            wide,
-            area_width,
-            zone,
-            snapshot_ms,
-            year,
-        );
+        push_account_rows(&ctx, lines, account, &account_marker(index), selected);
         if selected {
-            *follow_end = Some(lines.len().saturating_sub(1));
+            layout.follow_end = Some(lines.len().saturating_sub(1));
         }
     }
     for group in &model.usage.groups() {
@@ -323,19 +383,17 @@ pub(super) fn render_usage_calendar(
     }
 }
 
-/// One grid cell as styled spans: the date (bracketed when today) and each
-/// account marker, the selected account's in the cell style, others dim.
-#[allow(clippy::too_many_arguments)]
-fn grid_cell(
-    theme: &Theme,
-    day: i64,
-    today: i64,
-    month: u32,
-    cell_width: usize,
-    events: &[Event],
-    selected_index: Option<usize>,
-    selected_day: bool,
-) -> Vec<Span<'static>> {
+/// One grid cell as styled spans: the date (bracketed on the snapshot day)
+/// and each account marker, the selected account's in the cell style,
+/// others dim.
+fn grid_cell(ctx: &CalendarCtx<'_>, grid: &GridCtx<'_>, day: i64) -> Vec<Span<'static>> {
+    let theme = ctx.theme;
+    let today = grid.snapshot_day;
+    let month = grid.month;
+    let cell_width = grid.cell_width;
+    let events = grid.events;
+    let selected_index = grid.selected_index;
+    let selected_day = grid.selected_days.contains(&day);
     let (_, cell_month, date) = crate::format::civil_from_days(day);
     let date = if day == today {
         format!("[{date:02}]")
@@ -421,19 +479,21 @@ fn grid_cell(
 /// The account's list rows: the identity header, one row per reset kind
 /// (or the typed unavailability), then — for the selected account — the
 /// detail panel.
-#[allow(clippy::too_many_arguments)]
 fn push_account_rows(
+    ctx: &CalendarCtx<'_>,
     lines: &mut Vec<Line<'_>>,
-    theme: &Theme,
     account: &AccountUsageReportV1,
     marker: &str,
     selected: bool,
-    wide: bool,
-    area_width: u16,
-    zone: UsageTimeZone,
-    snapshot_ms: u64,
-    year: i64,
 ) {
+    let CalendarCtx {
+        theme,
+        zone,
+        snapshot_ms,
+        year,
+        area_width,
+        wide,
+    } = *ctx;
     let head = if wide {
         let identity = account
             .identity

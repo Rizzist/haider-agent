@@ -9,54 +9,54 @@
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
 04|  September 2026 · UTC reset calendar · provider timestamps only                                                                                                |
    ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×16; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×48; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×96
-05|  [04] today ·    selected account's resets · others dim · ↑↓ ←→ step the list                                                                                  |
-   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×15; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×61; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×82
-06|  selected a anthropic — 5h in 4h 42m (Fri 04 Sep 16:42 UTC) · weekly in 5d 20h (Thu 10 Sep 08:15 UTC)                                                          |
+05|  as of Fri 04 Sep · 12:00 UTC · every countdown below counts from this snapshot · f refreshes                                                                  |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
+06|  [04] snapshot day ·    selected account's resets · others dim · ↑↓ ←→ step the list                                                                           |
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×22; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×61; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×75
+07|  selected a anthropic — 5h in 4h 42m (Fri 04 Sep 16:42 UTC) · weekly in 5d 20h (Thu 10 Sep 08:15 UTC)                                                          |
    ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×102; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×58
-07|                                                                                                                                                                |
+08|                                                                                                                                                                |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-08|  Sun                   Mon                   Tue                   Wed                   Thu                   Fri                   Sat                       |
+09|  Sun                   Mon                   Tue                   Wed                   Thu                   Fri                   Sat                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×154; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×4
-09|   30                    31                    01                    02                    03                   [04] a5                05  c5                   |
+10|   30                    31                    01                    02                    03                   [04] a5                05  c5                   |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×84; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×22; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×5; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×2; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×19
-10|   06                    07                    08                    09                    10  aW                11  cW                12                       |
+11|   06                    07                    08                    09                    10  aW                11  cW                12                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×90; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×22; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×5; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×2; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×41
-11|   13                    14                    15                    16                    17                    18                    19                       |
+12|   13                    14                    15                    16                    17                    18                    19                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-12|   20                    21                    22                    23                    24                    25                    26                       |
+13|   20                    21                    22                    23                    24                    25                    26                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-13|   27                    28                    29                    30                    01                    02                    03                       |
+14|   27                    28                    29                    30                    01                    02                    03                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×90; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×22
-14|                                                                                                                                                                |
+15|                                                                                                                                                                |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-15|  RESET MARKERS — exact meter fields · unknown is never inferred                                                                                                |
+16|  RESET MARKERS — exact meter fields · unknown is never inferred                                                                                                |
    ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×15; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×49; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×96
-16|  > a  anthropic · anthropic-oauth · m**@e******.com · max_20x                                                                                                  |
+17|  > a  anthropic · anthropic-oauth · m**@e******.com · max_20x                                                                                                  |
    ~ Rgb(125, 90, 5)/Rgb(232, 232, 232)/BOLD×62; Rgb(54, 54, 54)/Rgb(232, 232, 232)/NONE×98
-17|      5h Fri 04 Sep · 16:42 UTC · in 4h 42m · five_hour                                                                                                         |
+18|      5h Fri 04 Sep · 16:42 UTC · in 4h 42m · five_hour                                                                                                         |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-18|      weekly Thu 10 Sep · 08:15 UTC · in 5d 20h · seven_day                                                                                                     |
+19|      weekly Thu 10 Sep · 08:15 UTC · in 5d 20h · seven_day                                                                                                     |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-19|      │ DETAIL anthropic — provider-reported extras                                                                                                             |
+20|      │ DETAIL anthropic — provider-reported extras                                                                                                             |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×6; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×37; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×109
-20|      │ previous resets  not reported by provider                                                                                                               |
+21|      │ previous resets  not reported by provider                                                                                                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
-21|      │ banked resets    not reported by provider                                                                                                               |
+22|      │ banked resets    not reported by provider                                                                                                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
-22|      │ use banked reset no operation reported for this account                                                                                                 |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×97
-23|    b  anthropic2 · anthropic-oauth · w***@c***.dev · plan unknown                                                                                              |
+23|      │ use banked reset no operation reported for this account                                                                                                 |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(110, 110, 110)/Rgb(253, 253, 253)/ITALIC×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×97
+24|    b  anthropic2 · anthropic-oauth · w***@c***.dev · plan unknown                                                                                              |
    ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/NONE×66; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×94
-24|      5h reset unknown · weekly reset unknown · meter unavailable · credential unavailable — could not load the login · try /login                              |
+25|      5h reset unknown · weekly reset unknown · meter unavailable · credential unavailable — could not load the login · try /login                              |
    ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×130; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×30
-25|    c  codex-work · openai-oauth · d**@c***.dev · plus                                                                                                          |
+26|    c  codex-work · openai-oauth · d**@c***.dev · plus                                                                                                          |
    ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/NONE×54; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×106
-26|      5h Sat 05 Sep · 02:30 UTC · in 14h 30m · 5h                                                                                                               |
+27|      5h Sat 05 Sep · 02:30 UTC · in 14h 30m · 5h                                                                                                               |
    ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×49; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
-27|      weekly Fri 11 Sep · 18:05 UTC · in 7d 6h · weekly                                                                                                         |
+28|      weekly Fri 11 Sep · 18:05 UTC · in 7d 6h · weekly                                                                                                         |
    ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×55; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×105
-28|                                                                                                                                                                |
-   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
 29|                                                                                                                                                                |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
 30|                                                                                                                                                                |

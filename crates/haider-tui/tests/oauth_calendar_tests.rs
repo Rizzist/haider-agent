@@ -150,7 +150,10 @@ fn calendar_uses_exact_fixture_resets_and_names_unknowns_without_guessing() {
     let model = calendar_model();
     let frame = draw(&model, 118, 36);
     let text = frame.rows.join("\n");
-    assert!(text.contains("[04] today"), "report date is calendar today");
+    assert!(
+        text.contains("[04] snapshot day"),
+        "the report date is the marked snapshot day"
+    );
     assert!(
         text.contains("[04] a5"),
         "Anthropic five-hour day is marked"
@@ -274,7 +277,7 @@ fn calendar_spills_past_month_end_and_never_guesses_ambiguous_windows() {
     let text = draw(&calendar_model_from_report(report), 118, 42)
         .rows
         .join("\n");
-    assert!(text.contains("[29] today"));
+    assert!(text.contains("[29] snapshot day"));
     assert!(
         text.contains("13  aW"),
         "the Oct 13 weekly marker proves the grid reaches two weeks past Sep 29"

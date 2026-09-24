@@ -37,6 +37,10 @@ pub enum CivilDateError {
     ClockBeforeEpoch,
     /// The OS local offset could not be resolved.
     OffsetUnavailable,
+    /// This platform cannot resolve the offset AT an arbitrary instant
+    /// (only the offset in effect now), so a per-instant answer would be a
+    /// guess across daylight-saving changes.
+    PerInstantOffsetUnsupported,
 }
 
 impl std::fmt::Display for CivilDateError {
@@ -44,6 +48,9 @@ impl std::fmt::Display for CivilDateError {
         let text = match self {
             Self::ClockBeforeEpoch => "system clock is before the Unix epoch",
             Self::OffsetUnavailable => "local UTC offset is unavailable",
+            Self::PerInstantOffsetUnsupported => {
+                "local UTC offset at an arbitrary instant is unsupported on this platform"
+            }
         };
         f.write_str(text)
     }
@@ -65,15 +72,28 @@ pub fn sample_utc_civil_date() -> Result<CivilDateSample, CivilDateError> {
     Ok(sample_with_offset(utc_ms, 0))
 }
 
+/// Whether [`local_utc_offset_seconds`] can answer for an arbitrary
+/// instant on this platform.
+pub const LOCAL_OFFSET_PER_INSTANT: bool = cfg!(unix);
+
 /// The OS local offset (seconds east of UTC) in effect AT `unix_seconds`.
 ///
 /// On Unix this is the zone rule for that instant (`localtime_r`), so a
-/// daylight-saving transition between now and the instant is honoured. On
-/// Windows the offset is the one in effect now (the documented limit of the
-/// wall-clock difference method below). An unresolvable offset is an error,
-/// never a silent UTC.
+/// daylight-saving transition between now and the instant is honoured.
+/// Windows' offset source here is the CURRENT wall-clock difference, which
+/// would be wrong for an instant across a DST change, so it answers
+/// [`CivilDateError::PerInstantOffsetUnsupported`] instead of guessing.
+/// An unresolvable offset is always an error, never a silent UTC.
 pub fn local_utc_offset_seconds(unix_seconds: u64) -> Result<i32, CivilDateError> {
-    local_offset_seconds(unix_seconds)
+    #[cfg(unix)]
+    {
+        local_offset_seconds(unix_seconds)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = unix_seconds;
+        Err(CivilDateError::PerInstantOffsetUnsupported)
+    }
 }
 
 fn unix_millis_now() -> Result<u64, CivilDateError> {

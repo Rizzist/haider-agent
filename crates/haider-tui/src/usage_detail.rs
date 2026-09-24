@@ -11,7 +11,11 @@
 //! reset-history fields yet, so [`account_extras`] fills only what the
 //! current wire can prove (a Haider Code account's published `weekly`
 //! window). The typed [`AccountResetExtras`] is the landing surface for the
-//! backend follow-up: mapping new report fields into it is the whole change.
+//! backend follow-up: mapping new report fields into it covers the DISPLAY.
+//! Enabling the action additionally needs a request path: `b` today only
+//! explains unavailable states, and an `Available` action must send the
+//! daemon's banked-reset request (which owns the always-ask approval) and
+//! render its pending/approved/denied result.
 
 use haider_protocol::usage::{AccountMeterStateV1, AccountUsageReportV1, UsageWindowV1};
 
@@ -411,7 +415,10 @@ pub fn fmt_meter_reason_friendly(reason: &str) -> String {
         "credential_origin_client_required" => Some("refresh in the origin client"),
         "credential_policy_blocked" => Some("use a supported credential"),
         "transport_timeout" => Some("provider did not answer · f retries"),
-        "transport_error" | "transport_unavailable" => Some("network error · f retries"),
+        "transport_error" => Some("network error · f retries"),
+        // Emitted when the daemon could not construct its meter HTTP client
+        // — before any request, so no network cause is established.
+        "transport_unavailable" => Some("meter client unavailable on this device"),
         "malformed_response" => Some("meter reply not understood"),
         _ => reason
             .strip_prefix("http_status_")

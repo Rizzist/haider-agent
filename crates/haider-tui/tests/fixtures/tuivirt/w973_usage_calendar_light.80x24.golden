@@ -1,6 +1,6 @@
 # tuivirt golden · w973_usage_calendar_light · 80x24
-00|⋮  06         07         08         09         10         11         12         |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×1; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×79
+00|⋮ as of snapshot · d anthropic-oauth-2 — 5h in 4h 9m (Thu 24 Sep 00:39 local) … |
+   ~ Rgb(217, 217, 217)/Rgb(244, 244, 244)/BOLD×1; Rgb(125, 90, 5)/Rgb(244, 244, 244)/BOLD×78; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1
 01|   13         14         15         16         17         18         19         |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
 02|   20         21         22        [23]        24  d5,e5  25  dW     26         |
@@ -38,7 +38,7 @@
 18|      │ banked resets    not reported by provider                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×31
 19|⋮     │ use banked reset no operation reported for this account                 |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×17
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(110, 110, 110)/Rgb(253, 253, 253)/ITALIC×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×17
 20|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×80
 21|↑↓ account · ⇞⇟ scroll · b banked · f refresh · s scope · esc back              |

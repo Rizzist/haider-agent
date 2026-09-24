@@ -9,36 +9,36 @@
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 04|  September 2026 · UTC reset calendar · provider timestamps only                |
    ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×48; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×16
-05|  [04] today ·    selected account's resets · others dim · ↑↓ ←→ step the list  |
-   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×15; Rgb(15, 15, 15)/Rgb(134, 196, 147)/BOLD×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×61; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2
-06|  selected a google-antigravity — 5h unknown · weekly unknown                   |
+05|  as of Fri 04 Sep · 12:00 UTC · countdowns count from it · f refreshes         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+06|  [04] snapshot day ·    selected account's resets · others dim · ↑↓ ←→ step the|
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×22; Rgb(15, 15, 15)/Rgb(134, 196, 147)/BOLD×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×56
+07|  selected a google-antigravity — 5h unknown · weekly unknown                   |
    ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×61; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×19
-07|                                                                                |
+08|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-08|  Sun        Mon        Tue        Wed        Thu        Fri        Sat         |
+09|  Sun        Mon        Tue        Wed        Thu        Fri        Sat         |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×77; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
-09|   30         31         01         02         03        [04]        05         |
+10|   30         31         01         02         03        [04]        05         |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×7; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×40; Rgb(217, 181, 68)/Rgb(39, 35, 21)/BOLD×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12
-10|   06         07         08         09         10         11         12         |
+11|   06         07         08         09         10         11         12         |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-11|   13         14         15         16         17         18         19         |
+12|   13         14         15         16         17         18         19         |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-12|   20         21         22         23         24         25         26         |
+13|   20         21         22         23         24         25         26         |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-13|   27         28         29         30         01         02         03         |
+14|   27         28         29         30         01         02         03         |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×46; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×7; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×7; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×8
-14|                                                                                |
+15|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-15|  RESET MARKERS — exact meter fields · unknown is never inferred                |
+16|  RESET MARKERS — exact meter fields · unknown is never inferred                |
    ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×15; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×49; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×16
-16|  > a  google-antigravity · google-antigravity                                  |
+17|  > a  google-antigravity · google-antigravity                                  |
    ~ Rgb(217, 181, 68)/Rgb(39, 39, 39)/BOLD×46; Rgb(212, 212, 212)/Rgb(39, 39, 39)/NONE×34
-17|      resets unknown · meter unavailable · acp agent publishes no quota         |
+18|      resets unknown · meter unavailable · acp agent publishes no quota         |
    ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×71; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×9
-18|      │ DETAIL google-antigravity — provider-reported extras                    |
+19|⋮     │ DETAIL google-antigravity — provider-reported extras                    |
    ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×46; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×20
-19|⋮     │ previous resets  not reported by provider                               |
-   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×31
 20|────────────────────────────────────────────────────────────────────────────────|
    ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
 21|↑↓ account · ⇞⇟ scroll · b banked · f refresh · s scope · esc back              |

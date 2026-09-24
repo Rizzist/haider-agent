@@ -60,3 +60,20 @@ fn live_samples_agree_with_pure_math() {
     assert_eq!(local.offset_seconds % 60, 0);
     assert!(local.offset_seconds.abs() <= 26 * 3600);
 }
+
+#[cfg(unix)]
+#[test]
+fn per_instant_offsets_are_supported_on_unix() {
+    const { assert!(super::LOCAL_OFFSET_PER_INSTANT) };
+}
+
+/// Windows never answers with the current offset for another instant.
+#[cfg(windows)]
+#[test]
+fn windows_refuses_a_per_instant_offset_instead_of_guessing() {
+    const { assert!(!super::LOCAL_OFFSET_PER_INSTANT) };
+    assert_eq!(
+        super::local_utc_offset_seconds(1_793_534_400),
+        Err(super::CivilDateError::PerInstantOffsetUnsupported)
+    );
+}

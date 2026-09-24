@@ -862,6 +862,14 @@ fn meter_failures_keep_the_code_and_add_only_what_it_establishes() {
             "transport timeout — provider did not answer · f retries",
         ),
         (
+            "transport_unavailable",
+            "transport unavailable — meter client unavailable on this device",
+        ),
+        (
+            "transport_error",
+            "transport error — network error · f retries",
+        ),
+        (
             "malformed_response",
             "malformed response — meter reply not understood",
         ),
@@ -872,6 +880,10 @@ fn meter_failures_keep_the_code_and_add_only_what_it_establishes() {
     assert!(
         !fmt_meter_reason_friendly("credential_unavailable").contains("expired"),
         "unavailable is never relabelled expired"
+    );
+    assert!(
+        !fmt_meter_reason_friendly("transport_unavailable").contains("network"),
+        "a client that could not be built is never called a network error"
     );
 }
 
@@ -1002,7 +1014,7 @@ fn plain_mode_without_a_local_zone_says_utc_and_marks_today() {
     assert!(plain.contains("    5h reset: Wed 23 Sep · 21:09 UTC · in 4h 9m · five_hour"));
     assert!(
         plain.contains(
-            "  Wed 23 Sep (today): d anthropic-oauth-2 5h at Wed 23 Sep 21:09 UTC (selected)"
+            "  Wed 23 Sep (snapshot day): d anthropic-oauth-2 5h at Wed 23 Sep 21:09 UTC (selected)"
         ),
         "{plain}"
     );
@@ -1038,4 +1050,158 @@ fn plain_mode_haider_code_allowance_and_no_report_states() {
     let mut empty = launcher_model();
     run_slash(&mut empty, "/usage");
     assert!(haider_tui::plain::usage_plain(&empty).ends_with("never fabricated\n"));
+}
+
+// ---- 9. repair 2: snapshot basis, pin, contrast, host zone ----------------
+
+/// The countdowns and the marked day are the SNAPSHOT's, and the screen
+/// says so in its own header at both owner sizes.
+#[test]
+fn countdowns_are_labelled_as_of_the_snapshot() {
+    let model = calendar(UsageTimeZone::Fixed(OWNER_OFFSET));
+    let wide = draw(&model, 118, 36);
+    assert!(
+        wide.contains(
+            "as of Wed 23 Sep · 20:30 local (17:00 UTC) · every countdown below counts from this snapshot · f refreshes"
+        ),
+        "{:#?}",
+        wide.rows
+    );
+    assert!(wide.contains("[23] snapshot day"));
+    assert!(
+        !wide.contains("] today"),
+        "the snapshot day is never called today"
+    );
+    let narrow = draw(&model, 80, 24);
+    assert!(
+        narrow.contains("as of Wed 23 Sep · 20:30 local (17:00 UTC) · countdowns count from it"),
+        "{:#?}",
+        narrow.rows
+    );
+}
+
+/// 80x24: once the list scrolls, the selected account's summary (with its
+/// reset dates) is pinned over the top row, and the selected row itself is
+/// still visible below it.
+#[test]
+fn the_selected_summary_stays_pinned_while_the_list_scrolls() {
+    let theme = ThemeKey::Dark.theme();
+    let bar_bg: Color = theme.bar_bg.into();
+    let mut model = calendar(UsageTimeZone::Fixed(OWNER_OFFSET));
+    model.theme = ThemeKey::Dark;
+    for (steps, alias, dates) in [
+        (
+            3,
+            "d anthropic-oauth-2",
+            "5h in 4h 9m (Thu 24 Sep 00:39 local)",
+        ),
+        (
+            1,
+            "e anthropic-oauth-3",
+            "5h in 9h 15m (Thu 24 Sep 05:45 local)",
+        ),
+        (1, "f haider-code-api", "5h unknown"),
+    ] {
+        for _ in 0..steps {
+            model.handle(key(KeyCode::Down));
+        }
+        let frame = draw(&model, 80, 24);
+        let top = frame
+            .rows
+            .iter()
+            .position(|row| {
+                (row.contains("selected ") || row.contains("as of snapshot · "))
+                    && row.contains(alias)
+            })
+            .unwrap_or_else(|| panic!("{alias} summary not visible: {:#?}", frame.rows));
+        assert!(frame.rows[top].contains(dates), "{:#?}", frame.rows);
+        assert!(
+            frame.rows.iter().any(|row| row.starts_with("  > ")),
+            "the selected row is not hidden under the pin: {:#?}",
+            frame.rows
+        );
+        if frame.rows[..top]
+            .iter()
+            .all(|row| !row.contains("RESET MARKERS"))
+            && !frame.contains("Sun ")
+        {
+            // Scrolled past the grid: this is the PINNED copy.
+            assert_eq!(frame.cells[top][4].1.bg, bar_bg, "pinned band ground");
+        }
+    }
+    // After the last step the grid is scrolled away, so the summary shown
+    // must be the pinned one.
+    let frame = draw(&model, 80, 24);
+    assert!(!frame.contains("Sun "), "{:#?}", frame.rows);
+    assert!(
+        frame
+            .rows
+            .iter()
+            .any(|row| row.contains("as of snapshot · f haider-code-api — 5h unknown")),
+        "the pinned copy names its countdown basis: {:#?}",
+        frame.rows
+    );
+}
+
+/// The required disabled explanation is readable: ≥4.5:1 against the
+/// ground in EVERY theme, while still styled as disabled (italic).
+#[test]
+fn the_disabled_explanation_meets_contrast_in_every_theme() {
+    fn luminance(color: Color) -> f64 {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("theme colours are RGB: {color:?}");
+        };
+        let channel = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+    for theme_key in ThemeKey::ALL {
+        let mut model = calendar(UsageTimeZone::UtcOnly);
+        model.theme = theme_key;
+        for _ in 0..3 {
+            model.handle(key(KeyCode::Down));
+        }
+        let frame = draw(&model, 118, 60);
+        let needle = "no operation reported for this account";
+        let row = frame.row_containing(needle).expect(needle);
+        let column = frame.rows[row][..frame.rows[row].find(needle).expect(needle)]
+            .chars()
+            .count();
+        let style = frame.cells[row][column].1;
+        let (fg, bg) = (luminance(style.fg), luminance(style.bg));
+        let ratio = (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05);
+        assert!(ratio >= 4.5, "{theme_key:?}: {ratio:.3}:1");
+        assert!(
+            style.modifier.contains(ratatui::style::Modifier::ITALIC),
+            "{theme_key:?}: still reads as disabled"
+        );
+    }
+}
+
+/// The host zone is per-instant where the platform supports it; elsewhere
+/// the calendar stays UTC and says why instead of guessing across DST.
+#[test]
+fn host_zone_is_per_instant_or_honestly_utc() {
+    let zone = UsageTimeZone::Host;
+    if haider_platform::LOCAL_OFFSET_PER_INSTANT {
+        // Unix: whatever the runner's zone, an offset resolves per instant.
+        assert!(zone.offset_at_ms(D_WEEKLY_MS).is_some());
+        assert!(fmt_zone_caption(SNAPSHOT_MS, zone).starts_with("local UTC"));
+    } else {
+        assert_eq!(zone.offset_at_ms(D_WEEKLY_MS), None);
+        assert_eq!(
+            fmt_zone_caption(SNAPSHOT_MS, zone),
+            haider_tui::usage_time::HOST_PER_INSTANT_UNSUPPORTED
+        );
+        assert_eq!(
+            fmt_reset_instant(D_WEEKLY_MS, zone, 2026),
+            "Fri 25 Sep · 16:59 UTC"
+        );
+    }
 }

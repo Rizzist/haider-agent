@@ -9,42 +9,42 @@
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
 04|  September 2026 · UTC reset calendar · provider timestamps only                                                                                                |
    ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×16; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×48; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×96
-05|  [04] today ·    selected account's resets · others dim · ↑↓ ←→ step the list                                                                                  |
-   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×15; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×61; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×82
-06|  selected a google-antigravity — 5h unknown · weekly unknown                                                                                                   |
+05|  as of Fri 04 Sep · 12:00 UTC · every countdown below counts from this snapshot · f refreshes                                                                  |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
+06|  [04] snapshot day ·    selected account's resets · others dim · ↑↓ ←→ step the list                                                                           |
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×22; Rgb(253, 253, 253)/Rgb(47, 110, 63)/BOLD×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×61; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×75
+07|  selected a google-antigravity — 5h unknown · weekly unknown                                                                                                   |
    ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×61; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×99
-07|                                                                                                                                                                |
+08|                                                                                                                                                                |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-08|  Sun                   Mon                   Tue                   Wed                   Thu                   Fri                   Sat                       |
+09|  Sun                   Mon                   Tue                   Wed                   Thu                   Fri                   Sat                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×154; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×4
-09|   30                    31                    01                    02                    03                   [04]                   05                       |
+10|   30                    31                    01                    02                    03                   [04]                   05                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×84; Rgb(125, 90, 5)/Rgb(241, 238, 231)/BOLD×22; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×26
-10|   06                    07                    08                    09                    10                    11                    12                       |
+11|   06                    07                    08                    09                    10                    11                    12                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-11|   13                    14                    15                    16                    17                    18                    19                       |
+12|   13                    14                    15                    16                    17                    18                    19                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-12|   20                    21                    22                    23                    24                    25                    26                       |
+13|   20                    21                    22                    23                    24                    25                    26                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-13|   27                    28                    29                    30                    01                    02                    03                       |
+14|   27                    28                    29                    30                    01                    02                    03                       |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×90; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×4; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×22
-14|                                                                                                                                                                |
+15|                                                                                                                                                                |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
-15|  RESET MARKERS — exact meter fields · unknown is never inferred                                                                                                |
+16|  RESET MARKERS — exact meter fields · unknown is never inferred                                                                                                |
    ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×15; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×49; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×96
-16|  > a  google-antigravity · google-antigravity · p****@e******.com · plan unknown                                                                               |
+17|  > a  google-antigravity · google-antigravity · p****@e******.com · plan unknown                                                                               |
    ~ Rgb(125, 90, 5)/Rgb(232, 232, 232)/BOLD×81; Rgb(54, 54, 54)/Rgb(232, 232, 232)/NONE×79
-17|      5h reset unknown · weekly reset unknown · meter unavailable · acp agent publishes no quota                                                                |
+18|      5h reset unknown · weekly reset unknown · meter unavailable · acp agent publishes no quota                                                                |
    ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×96; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×64
-18|      │ DETAIL google-antigravity — provider-reported extras                                                                                                    |
+19|      │ DETAIL google-antigravity — provider-reported extras                                                                                                    |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×6; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×46; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×100
-19|      │ previous resets  not reported by provider                                                                                                               |
+20|      │ previous resets  not reported by provider                                                                                                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
-20|      │ banked resets    not reported by provider                                                                                                               |
+21|      │ banked resets    not reported by provider                                                                                                               |
    ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×41; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×111
-21|      │ use banked reset no operation reported for this account                                                                                                 |
-   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×97
-22|                                                                                                                                                                |
-   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
+22|      │ use banked reset no operation reported for this account                                                                                                 |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×17; Rgb(110, 110, 110)/Rgb(253, 253, 253)/ITALIC×38; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×97
 23|                                                                                                                                                                |
    ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×160
 24|                                                                                                                                                                |

@@ -981,7 +981,7 @@ pub fn usage_plain(model: &crate::app::AppModel) -> String {
                     "  {}{}: {text}",
                     crate::usage_time::fmt_civil_date(&civil, year),
                     if day == zoned_day(snapshot, zone) {
-                        " (today)"
+                        " (snapshot day)"
                     } else {
                         ""
                     }

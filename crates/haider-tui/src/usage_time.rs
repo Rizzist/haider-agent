@@ -13,6 +13,13 @@
 //! - An unresolvable local zone is said out loud: the instant renders in UTC
 //!   only, never a silent UTC labelled "local".
 
+/// The caption when the host can only report its offset NOW (Windows):
+/// rendering future resets with today's offset would show a wrong local
+/// time — and highlight a wrong day — across a DST change, so the calendar
+/// stays in UTC and says why.
+pub const HOST_PER_INSTANT_UNSUPPORTED: &str =
+    "UTC (local time per reset is not supported on this platform)";
+
 /// Which frame `/usage` renders local times in.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum UsageTimeZone {
@@ -20,7 +27,9 @@ pub enum UsageTimeZone {
     /// (tests and headless paths never read the host zone by accident).
     #[default]
     UtcOnly,
-    /// The host OS zone, resolved for each instant (the live TUI).
+    /// The host OS zone, resolved for each instant (the live TUI). Where
+    /// the platform cannot resolve an arbitrary instant (Windows), this is
+    /// UTC-only with [`HOST_PER_INSTANT_UNSUPPORTED`] as the caption.
     Host,
     /// A fixed offset in seconds east of UTC.
     Fixed(i32),
@@ -237,6 +246,9 @@ pub fn fmt_zone_caption(snapshot_ms: u64, zone: UsageTimeZone) -> String {
     match (zone, zone.offset_at_ms(snapshot_ms)) {
         (_, Some(offset)) => format!("local {}", fmt_utc_offset(offset)),
         (UsageTimeZone::UtcOnly, None) => "UTC".to_owned(),
+        (UsageTimeZone::Host, None) if !haider_platform::LOCAL_OFFSET_PER_INSTANT => {
+            HOST_PER_INSTANT_UNSUPPORTED.to_owned()
+        }
         (_, None) => "UTC (local zone unavailable)".to_owned(),
     }
 }
