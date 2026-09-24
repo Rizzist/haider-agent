@@ -765,3 +765,133 @@ fn compact_history_record_round_trips_and_fails_closed_on_segment_drift() {
         "a compact record whose segment rows drifted must fail closed"
     );
 }
+
+fn history_view(texts: &[&str]) -> (ProviderViewLedgerV1, Vec<ProviderViewBlobV1>) {
+    let system = ProviderViewBlobV1::new(b"compact-system".to_vec());
+    let tools = ProviderViewBlobV1::new(b"compact-tools".to_vec());
+    let history = texts
+        .iter()
+        .map(|text| ProviderViewBlobV1::new(text.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    let mut ledger = provider_view("fixed", 16).0;
+    ledger.system_block = system.block.clone();
+    ledger.tool_schema_block = tools.block.clone();
+    ledger.history_blocks = history.iter().map(|blob| blob.block.clone()).collect();
+    let mut blobs = vec![system, tools];
+    blobs.extend(history);
+    (ledger, blobs)
+}
+
+fn stamped_attempt_view(envelope: &RawEnvelope) -> ProviderViewLedgerV1 {
+    let payload: EventPayload =
+        serde_json::from_value(serde_json::to_value(&envelope.payload).expect("payload JSON"))
+            .expect("typed payload");
+    let EventPayload::Item(ItemEvent::Completed { item, .. }) = payload else {
+        panic!("attempt completion expected");
+    };
+    ProviderViewAttemptV1::try_from_extension_item(&item)
+        .expect("attempt decodes")
+        .expect("provider-view attempt")
+        .view
+}
+
+/// Reproduces stage 4 defect 1: an older request survives while the newer
+/// requests that grew its trunk expired first (wall-clock step backwards,
+/// as written by a profile before the monotone expiry clamp). The next
+/// request used to reuse the grown trunk and was rebuilt as
+/// `[a, x2, y1, z]`, and its compacted journal facts became unreadable.
+///
+/// MUTATION CHECK: reuse the trunk whenever `common >= trunk_end` (ignoring
+/// the surviving leaf's cutoff). Expected runtime failure: StoreCorrupt from
+/// `verify_provider_view`; with the encode guard also removed, the reopened
+/// journal read fails as well.
+#[test]
+fn out_of_order_expiry_never_reuses_a_trunk_past_the_surviving_leaf() {
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("provider-view-out-of-order-expiry");
+    let (r1, r4_events) = {
+        let store = Store::open(root.path()).expect("store");
+        create_session(&store, &session_id);
+        let far = 4_000_000_000_000_u64;
+        let (ledger, blobs) = history_view(&["a", "x1", "y1"]);
+        let r1 = store
+            .persist_provider_view_until(&session_id, ledger, blobs, far)
+            .expect("persist r1");
+        let mut newer = Vec::new();
+        for texts in [&["a", "x2", "y2"], &["a", "x2", "y3"]] {
+            let (ledger, blobs) = history_view(texts);
+            newer.push(
+                store
+                    .persist_provider_view_until(&session_id, ledger, blobs, far)
+                    .expect("persist newer request")
+                    .storage
+                    .expect("storage cursor")
+                    .request_ordinal,
+            );
+        }
+        let connection = Connection::open(store.database_path()).expect("observer");
+        for ordinal in newer {
+            connection
+                .execute(
+                    "UPDATE provider_view_requests SET expires_at_ms = 100
+                     WHERE session_id = ?1 AND request_ordinal = ?2",
+                    params![
+                        session_id.as_str(),
+                        i64::try_from(ordinal).expect("ordinal fits i64")
+                    ],
+                )
+                .expect("model a pre-clamp out-of-order expiry");
+        }
+        assert_eq!(
+            store.sweep_expired_provider_views(500).expect("sweep"),
+            2,
+            "both newer requests expire before the older one"
+        );
+        store.verify_provider_view(&r1).expect("r1 still valid");
+        let r4_events = persist_history_attempt(&store, &session_id, &["a", "x1", "y1", "z"], 4);
+        let r4 = stamped_attempt_view(&r4_events[1]);
+        store
+            .verify_provider_view(&r4)
+            .expect("r4 rebuilds its own ledger, not the grown trunk");
+        (r1, r4_events)
+    };
+    let store = Store::open(root.path()).expect("reopen");
+    store.verify_provider_view(&r1).expect("r1 after reopen");
+    assert_eq!(
+        store
+            .read(&session_id, r4_events[0].seq - 1, 2)
+            .expect("r4 attempt facts replay after reopen"),
+        r4_events
+    );
+    store
+        .verify_provider_view(&stamped_attempt_view(&r4_events[1]))
+        .expect("r4 after reopen");
+}
+
+/// MUTATION CHECK: drop the per-session expiry clamp in `persist_prepared`.
+/// Expected runtime failure: the later request keeps its earlier expiry and
+/// the sweep removes it before the older request.
+#[test]
+fn provider_view_expiry_never_precedes_an_earlier_request_in_its_session() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-monotone-expiry");
+    create_session(&store, &session_id);
+    let (ledger, blobs) = history_view(&["a", "b"]);
+    let first = store
+        .persist_provider_view_until(&session_id, ledger, blobs, 1_000)
+        .expect("persist first");
+    let (ledger, blobs) = history_view(&["a", "b", "c"]);
+    let second = store
+        .persist_provider_view_until(&session_id, ledger, blobs, 100)
+        .expect("persist after a clock step backwards");
+    assert_eq!(
+        second.storage.as_ref().expect("storage").expires_at_ms,
+        1_000,
+        "a later request inherits its predecessor's expiry"
+    );
+    assert_eq!(store.sweep_expired_provider_views(500).expect("sweep"), 0);
+    store.verify_provider_view(&first).expect("first live");
+    store.verify_provider_view(&second).expect("second live");
+    assert_eq!(store.sweep_expired_provider_views(1_000).expect("sweep"), 2);
+}

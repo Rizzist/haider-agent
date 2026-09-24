@@ -350,3 +350,81 @@ fn hook_engine_facts_do_not_reenter_the_dispatch_outbox() {
             .is_empty()
     );
 }
+
+fn create_acknowledged_session(store: &Store, profile: &std::path::Path, session_id: &SessionId) {
+    let created = store
+        .create_session(&SessionCreateCommand {
+            command_id: format!("create-{session_id}"),
+            request_digest: format!("create-{session_id}-digest"),
+            request_json: r#"{"session":"hook-outbox-fifo"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: std::fs::canonicalize(profile)
+                .expect("canonical")
+                .to_str()
+                .expect("UTF-8")
+                .to_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "hook-outbox-v1".into(),
+            event_id: EventId::new(format!("{session_id}-created")),
+            device_id: DeviceId::new("hook-outbox-device"),
+        })
+        .expect("create");
+    let SessionCreateOutcome::Committed { envelope, .. } = created else {
+        panic!("fresh create must commit");
+    };
+    store
+        .complete_hook_dispatch(session_id, envelope.seq)
+        .expect("ack create");
+}
+
+/// Hook dispatch pages follow global commit order across sessions, so a busy
+/// session whose id sorts first cannot starve a quieter one under `limit`.
+///
+/// MUTATION CHECK: order pending rows by `(session_id, seq)` (the v33 outbox
+/// primary key). Expected runtime failure: the first page holds only the busy
+/// session's facts and the quiet session's older fact is not dispatched.
+#[test]
+fn hook_dispatch_pages_are_fifo_across_sessions() {
+    let profile = tempfile::tempdir().expect("profile");
+    let store = Store::open(profile.path()).expect("store");
+    let busy = SessionId::new("aaa-busy-session");
+    let quiet = SessionId::new("zzz-quiet-session");
+    create_acknowledged_session(&store, profile.path(), &busy);
+    create_acknowledged_session(&store, profile.path(), &quiet);
+    let generation = store.worker_generation();
+    let fact = |session_id: &SessionId, event_id: String| {
+        [event(
+            session_id,
+            &event_id,
+            serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("payload"),
+            generation,
+        )]
+    };
+    let mut committed = Vec::new();
+    let mut first = fact(&busy, "busy-0".into());
+    store.append(&mut first).expect("busy fact");
+    committed.extend(first);
+    let mut quiet_fact = fact(&quiet, "quiet-0".into());
+    store.append(&mut quiet_fact).expect("quiet fact");
+    committed.extend(quiet_fact);
+    for index in 1..6 {
+        let mut busy_fact = fact(&busy, format!("busy-{index}"));
+        store.append(&mut busy_fact).expect("busy fact");
+        committed.extend(busy_fact);
+    }
+
+    let page = store.pending_hook_dispatches(3).expect("first page");
+    assert_eq!(page, committed[..3], "the quiet fact keeps its FIFO slot");
+    assert_eq!(page[1].session_id, quiet);
+    assert_eq!(
+        store.pending_hook_dispatches(16).expect("all pending"),
+        committed,
+        "pages are global commit order and per-session sequence order"
+    );
+}

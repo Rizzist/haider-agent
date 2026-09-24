@@ -8,8 +8,28 @@ index expiry so restart, replay, and older event reads do not depend on the
 expiring cache. Existing v24–v31 request rows and journal envelopes remain
 readable without rewriting them.
 
+A request reuses its predecessor's trunk only while the predecessor's leaf
+still ends at the trunk's current length. Otherwise (newer requests grew the
+trunk and then expired first) it branches at the shorter of the common prefix
+and that leaf's cutoff. Expiry is also clamped so that a request never expires
+before the latest earlier request of its session, which keeps expiry order
+equal to request order across wall-clock steps. A journal attempt fact is
+stored as a compact segment cursor only when the segment rows rebuild its
+exact ledger at append time; otherwise it keeps the self-contained form.
+
+Expiry and CAS reclamation run in bounded steps: at most 128 expired requests
+and 256 queued hashes per step. A persist runs at most one step when the
+hourly or every-64-persists watermark is due, and later persists continue an
+unfinished backlog. Store open and the explicit sweep run steps until done.
+A hash is reclaimed only if no provider-view block row references it and no
+surviving request of the sessions owning its history rows reaches it. That
+coverage is computed once per step, per touched session, so a step does not
+scan every live request's history.
+
 Schema v33 rebuilds the event-authority shadow from `events` and copies pending
 hook outbox rows into tables whose primary keys are their only row trees.
+Pending hook work is still dispatched in global journal commit order (the
+`events` rowid), so one busy session cannot starve another.
 Both steps run in the migration transaction. Its insert trigger tests the
 ordered shadow before insertion and updates `sessions` only when an old
 sequence or event ID is reused. Updates and deletes still advance mutation
@@ -30,7 +50,13 @@ journal spilled to an unlinked `etilqs_*` temporary file whose pages still
 reached the disk (72–320 KiB on otherwise 4–8 KiB turns). Statement journals
 only serve statement and savepoint rollback; crash recovery uses the WAL, so
 durability is unchanged. Android's bundled SQLite already keeps all temporary
-storage in memory.
+storage in memory. Profile-sized work switches to a file-backed temp store
+and restores the in-memory setting afterwards: migrations, open-time backfills
+and sweeps, and whole-session deletes. Memory temp storage has no size bound,
+so those operations would otherwise hold a profile-sized statement journal or
+sort in RAM. Android builds compile SQLite with `SQLITE_TEMP_STORE=3`, which
+ignores the pragma, so there the earlier always-in-memory behaviour is
+unchanged.
 
 Older binaries reject a v32 or v33 profile as a newer schema. To downgrade,
 stop the daemon and restore a **pre-upgrade backup of the entire profile**

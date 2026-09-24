@@ -74,8 +74,9 @@ struct HistoryPrefix {
 /// Returns the segment cursor that may replace this envelope's history
 /// ledger, or `None` when the fact must stay self-contained. Compaction
 /// requires a clean attempt decode, a live request cursor recorded earlier in
-/// the same append transaction, and an exact count and digest match, so that
-/// [`hydrate_history`] reproduces the original ledger bit for bit.
+/// the same append transaction, an exact count and digest match, and segment
+/// rows that currently rebuild the ledger, so that [`hydrate_history`]
+/// reproduces the original ledger bit for bit.
 fn history_prefix(
     connection: &Connection,
     envelope: &RawEnvelope,
@@ -130,6 +131,14 @@ fn history_prefix(
     let digest = history_digest(&attempt.view.history_blocks);
     if digest != stored_digest {
         return Ok(None);
+    }
+    // The cursor digest is computed from the ledger, not from the segment
+    // rows that `decode` will read. Compact only if those rows rebuild this
+    // exact ledger now; otherwise keep the self-contained form, so an index
+    // defect can never make a journal fact permanently unreadable.
+    match history_segment_prefix(connection, &storage.session_id, segment_id, count) {
+        Ok(blocks) if blocks == attempt.view.history_blocks => {}
+        Ok(_) | Err(_) => return Ok(None),
     }
     Ok(Some(HistoryPrefix {
         session_id: storage.session_id.clone(),
