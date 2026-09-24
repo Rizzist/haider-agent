@@ -977,6 +977,7 @@ async fn supervise_background_with_exit_observation(
                 mutation_digest,
                 workspace_revision: None,
                 subject_digest: None,
+                redacted_content: false,
             });
     BackgroundExitStatus {
         exit_code: exit_status

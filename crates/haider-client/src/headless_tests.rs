@@ -6,7 +6,8 @@ use super::{
     HeadlessEventOutput, HeadlessFailureCode, HeadlessInterrupt, HeadlessOutcome, HeadlessReducer,
     HeadlessRunError, HeadlessRunEventStorage, HeadlessRunFailure, HeadlessSessionConfig,
     HeadlessTerminalKind, headless_submit_body, load_attachment, load_pdf_attachment,
-    normalize_session_config_features, terminal_kind, try_take_pending_interrupt,
+    normalize_session_config_features, public_headless_envelope, terminal_kind,
+    try_take_pending_interrupt,
 };
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
@@ -62,6 +63,107 @@ fn spool_test_envelope(seq: u64, payload: serde_json::Value) -> RawEnvelope {
         "payload": payload,
     }))
     .expect("raw spool envelope")
+}
+
+/// Round-4 oracles: run output must not carry exact digests, byte counts, or
+/// keyed freshness of redacted content; the journal event keeps them and
+/// unredacted provenance is unchanged.
+#[test]
+fn headless_projection_withholds_redacted_integrity_and_keeps_public_provenance() {
+    let digest = "blake3:synthetic-content-digest";
+    let checkpoint = serde_json::json!({
+        "type": "checkpoint_recorded", "kind": "move", "checkpoint_id": "checkpoint:raw",
+        "post_digest": digest, "redacted_content": true, "paths": [{"path": "victim.txt",
+            "pre_digest": digest, "post_digest": digest, "pre_artifact": digest,
+            "truncated_reason": "pre-image is 24 bytes"}]
+    });
+    let original = spool_test_envelope(1, checkpoint.clone());
+    let public = public_headless_envelope(original.clone())
+        .payload
+        .to_string();
+    assert!(original.payload.to_string().contains(digest));
+    assert!(
+        !public.contains(digest) && !public.contains("24") && !public.contains("checkpoint:raw")
+    );
+    assert!(public.contains("\"checkpoint_recorded\"") && public.contains("victim.txt"));
+    let mut unredacted = checkpoint;
+    unredacted["redacted_content"] = serde_json::Value::Bool(false);
+    let kept = spool_test_envelope(2, unredacted);
+    assert_eq!(
+        public_headless_envelope(kept.clone()).payload.to_string(),
+        kept.payload.to_string()
+    );
+
+    let effect = spool_test_envelope(
+        3,
+        serde_json::json!({
+            "type": "effect", "phase": "outcome", "effect": "effect:synthetic",
+            "freshness": {"path": "victim.txt", "digest": digest},
+            "workspace_mutation": {"effect_id": "effect:synthetic", "mutation_digest": digest,
+                "subject_digest": "blake3:subject", "redacted_content": true},
+            "outcome": {"outcome": "ok"}
+        }),
+    );
+    let public = public_headless_envelope(effect).payload.to_string();
+    assert!(
+        !public.contains(digest) && !public.contains("blake3:subject"),
+        "{public}"
+    );
+    let keyed = spool_test_envelope(
+        4,
+        serde_json::json!({
+            "type": "effect", "phase": "outcome", "effect": "effect:read",
+            "freshness": {"path": "victim.txt", "digest": "blake3k:profile:abcd"},
+            "outcome": {"outcome": "ok"}
+        }),
+    );
+    assert!(
+        !public_headless_envelope(keyed)
+            .payload
+            .to_string()
+            .contains("blake3k")
+    );
+    let public_read = spool_test_envelope(
+        5,
+        serde_json::json!({
+            "type": "effect", "phase": "outcome", "effect": "effect:public",
+            "freshness": {"path": "public.txt", "digest": digest},
+            "outcome": {"outcome": "ok"}
+        }),
+    );
+    assert!(
+        public_headless_envelope(public_read)
+            .payload
+            .to_string()
+            .contains(digest)
+    );
+
+    let preview = r#"{"redacted_content":true,"result":"copied","workspace_revision":"r"}"#;
+    let tool = spool_test_envelope(
+        6,
+        serde_json::json!({
+            "type": "tool_result", "call_id": "copy", "effects": [{"bytes": 24}],
+            "result": {"preview": preview, "effects": [{"bytes": 24}]}
+        }),
+    );
+    let safe = public_headless_envelope(tool).payload.to_string();
+    assert!(!safe.contains("\"bytes\""), "{safe}");
+    assert!(safe.contains("copied"));
+
+    let review = spool_test_envelope(
+        7,
+        serde_json::json!({
+            "type": "menu_opened", "kind": {"kind": "permission",
+                "file_review": {"old_digest": digest, "new_digest": digest}}
+        }),
+    );
+    assert!(review.payload.to_string().contains(digest));
+    assert!(
+        !public_headless_envelope(review)
+            .payload
+            .to_string()
+            .contains(digest)
+    );
 }
 
 #[test]

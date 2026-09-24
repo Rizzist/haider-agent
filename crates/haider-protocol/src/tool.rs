@@ -322,7 +322,10 @@ pub enum ToolResultData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsSearchMatch {
     pub path: String,
+    /// One-based physical line. Zero withholds the coordinate after a masked
+    /// secret spanning lines, whose hidden line count it would reveal.
     pub line: usize,
+    /// One-based column in the redacted line, never in the source line.
     pub column: usize,
     pub text: String,
     pub context_before: Vec<String>,

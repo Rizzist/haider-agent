@@ -90,6 +90,36 @@ pub fn workspace_receipt_path_sensitive(path: &Path) -> bool {
             .is_some_and(|text| redact_output_text(text) != text)
 }
 
+/// Marker that replaces a path the agent must not learn verbatim.
+pub(crate) const SENSITIVE_PATH_MARKER: &str = "[REDACTED:sensitive_path]";
+
+/// Whether a path returned to an agent must be replaced by the marker. The
+/// receipt detector also catches credential assignments embedded in
+/// otherwise ordinary names (`password=<value>.txt`).
+pub(crate) fn model_path_masked(path: &Path) -> bool {
+    workspace_receipt_path_sensitive(path) || is_token_config_path(path)
+}
+
+/// One presentation rule for every path listing, summary, and error returned
+/// to an agent.
+pub(crate) fn model_visible_path(path: &Path) -> String {
+    if model_path_masked(path) {
+        SENSITIVE_PATH_MARKER.to_owned()
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// Whether the output redactor would change any part of `bytes`. Mutation
+/// producers use this to keep exact integrity facts (content digests, byte
+/// counts) in the owner-local journal instead of agent-visible results.
+pub fn content_redaction_affected(bytes: &[u8]) -> bool {
+    let mut detector = crate::OutputRedactor::default();
+    let _ = detector.push_bytes(bytes);
+    let _ = detector.finish_bytes();
+    detector.redactions_applied()
+}
+
 /// The quote window shares the process-output ceiling. Once exhausted without
 /// a closing quote, fail closed for the rest of this input/stream; do not scan
 /// for a later delimiter or retain the discarded bytes.
@@ -102,6 +132,13 @@ pub(crate) struct RedactionState {
 }
 
 impl RedactionState {
+    /// A secret (open quote or PEM block) continues past the last line fed
+    /// in. The redactor keeps its physical line breaks, so later line
+    /// coordinates would count the hidden value's lines.
+    pub(crate) fn spans_lines(&self) -> bool {
+        self.private_key || self.quoted.active()
+    }
+
     pub(crate) fn discard_oversized_line(&mut self) {
         if self.quoted.active() {
             self.quoted.exhausted = true;

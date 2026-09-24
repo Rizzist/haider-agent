@@ -6706,6 +6706,81 @@ async fn durable_queue_consumed(
     }
 }
 
+/// Agent-visible mutation receipt. A redacted mutation withholds its exact
+/// digests (they would let the agent test guesses of hidden content offline);
+/// the owner-local journal keeps them and `workspace_mutation` still resolves
+/// the durable evidence through `graph_evidence`.
+fn mutation_result_preview(
+    result: String,
+    mutation: WorkspaceMutation,
+    reference: WorkspaceMutationRef,
+) -> String {
+    if mutation.redacted_content {
+        serde_json::json!({
+            "result": result,
+            "redacted_content": true,
+            "workspace_revision": mutation.workspace_revision,
+            "workspace_mutation": reference,
+        })
+    } else {
+        serde_json::json!({
+            "result": result,
+            "mutation_digest": mutation.mutation_digest,
+            "workspace_revision": mutation.workspace_revision,
+            "subject_digest": mutation.subject_digest,
+            "workspace_mutation": reference,
+        })
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod mutation_preview_tests {
+    use super::*;
+
+    fn mutation(redacted_content: bool) -> WorkspaceMutation {
+        WorkspaceMutation {
+            effect_id: EffectId::new("effect-synthetic"),
+            mutation_digest: "blake3:synthetic-raw-content".into(),
+            workspace_revision: Some(haider_protocol::ids::WorkspaceRevision::new(
+                "workspace-revision:7",
+            )),
+            subject_digest: Some("blake3:synthetic-subject".into()),
+            redacted_content,
+        }
+    }
+
+    fn reference() -> WorkspaceMutationRef {
+        WorkspaceMutationRef {
+            run_id: RunId::new("run-synthetic"),
+            effect_id: EffectId::new("effect-synthetic"),
+        }
+    }
+
+    /// Round-4 oracle: a copy of a masked file published a raw-content
+    /// mutation digest (and a subject digest derived from it) to the model.
+    #[test]
+    fn redacted_mutation_preview_withholds_exact_digests() {
+        let preview = mutation_result_preview("copied a to b".into(), mutation(true), reference());
+        assert!(!preview.contains("synthetic-raw-content"), "{preview}");
+        assert!(!preview.contains("synthetic-subject"), "{preview}");
+        let value: serde_json::Value = serde_json::from_str(&preview).expect("json preview");
+        assert_eq!(value["redacted_content"], true);
+        assert_eq!(value["workspace_revision"], "workspace-revision:7");
+        assert_eq!(value["workspace_mutation"]["effect_id"], "effect-synthetic");
+    }
+
+    #[test]
+    fn public_mutation_preview_keeps_provenance() {
+        let preview = mutation_result_preview("copied a to b".into(), mutation(false), reference());
+        let value: serde_json::Value = serde_json::from_str(&preview).expect("json preview");
+        assert_eq!(value["mutation_digest"], "blake3:synthetic-raw-content");
+        assert_eq!(value["subject_digest"], "blake3:synthetic-subject");
+        assert!(value.get("redacted_content").is_none());
+    }
+}
+
 async fn durable_workspace_mutation(
     store: &HubStoreHandle,
     run_id: &RunId,
@@ -23745,19 +23820,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             ));
                         }
                     };
-                    let subject_digest = mutation.subject_digest.clone();
-                    let workspace_revision = mutation.workspace_revision.clone();
-                    result.preview = serde_json::json!({
-                        "result": result.preview,
-                        "mutation_digest": mutation.mutation_digest,
-                        "workspace_revision": workspace_revision,
-                        "subject_digest": subject_digest,
-                        "workspace_mutation": WorkspaceMutationRef {
+                    result.preview = mutation_result_preview(
+                        result.preview,
+                        mutation,
+                        WorkspaceMutationRef {
                             run_id: run_id.clone(),
                             effect_id: record.effect.clone(),
                         },
-                    })
-                    .to_string();
+                    );
                     Ok(result)
                 }
                 Err(error) => Err(error),

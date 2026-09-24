@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 /// Durable per-session identity of the bytes last observed or written for one
 /// workspace-relative file. A redacted read uses a keyed digest so the
-/// journal cannot serve as an offline guessing oracle.
+/// journal cannot serve as an offline guessing oracle; public projections
+/// (headless run output) omit redacted freshness claims entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFreshness {
     pub path: String,
@@ -29,6 +30,11 @@ pub struct WorkspaceMutation {
     pub workspace_revision: Option<WorkspaceRevision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_digest: Option<String>,
+    /// The mutated path or content would be redacted in an agent view. Its
+    /// exact digests remain owner-local: agent-visible results and public
+    /// projections withhold `mutation_digest`/`subject_digest`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted_content: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

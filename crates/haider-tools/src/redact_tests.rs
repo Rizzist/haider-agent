@@ -30,6 +30,18 @@ fn sensitive_paths_cover_key_and_state_families() {
     ));
 }
 
+#[test]
+fn model_path_helper_masks_assignment_bearing_names() {
+    assert_eq!(
+        super::model_visible_path(std::path::Path::new("password=amber-moonset.txt")),
+        "[REDACTED:sensitive_path]"
+    );
+    assert_eq!(
+        super::model_visible_path(std::path::Path::new("nested/public.txt")),
+        "nested/public.txt"
+    );
+}
+
 /// MUTATION CHECK: remove any known-shape branch or the generic entropy pass.
 /// Expected failure: a literal credential survives in the preview.
 #[test]

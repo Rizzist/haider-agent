@@ -172,15 +172,32 @@ bytes before the preview's reduction and `sha256` hashes those bytes. For an
 output with any redaction, both fields instead describe the complete redacted
 rendering before paging or head/tail reduction. This includes content-addressed
 artifact references and process transcript digests published with the result.
-Redacted file freshness uses a profile-derived, process-secret keyed digest;
-after daemon restart a new read is needed before writing that file.
+Redacted file freshness uses a profile-derived, process-secret keyed digest
+in the owner-local journal; after daemon restart a new read is needed before
+writing that file. Headless run output never carries a redacted freshness
+claim (keyed or not). A file mutation (`fs_write`, `fs_edit`, `fs_path`) whose
+path or content would be redacted is marked `redacted_content: true` on its
+`workspace_mutation` and `checkpoint_recorded` facts. For such a mutation the
+agent-visible result omits `mutation_digest` and `subject_digest` (it keeps
+`workspace_revision` and the `workspace_mutation` reference, which
+`graph_evidence` resolves), and headless run output replaces its mutation
+digest, checkpoint id and checkpoint digests with `withheld:` placeholders,
+drops per-path pre-image references and truncation reasons, and omits the
+tool result's file `effects` (exact byte counts). The exact facts remain in
+`haider events`. Headless `menu_opened` omits `file_review`; its raw diff
+digests belong to the interactive Ask surface only. `haider export --masked`
+drops integrity digests from transcript previews.
 Turn workspace tree receipts and process workspace mutation receipts report
 generic incomplete coverage when a path or file content would be redacted.
 They do not journal raw filenames, content digests, or byte counts for those
 entries. A client may see `workspace tree receipt unavailable: redacted
 material` or `reason=redacted_material` instead of an exact tree receipt.
 For `fs_search` with redaction, `bytes_scanned` describes processed safe text;
-unredacted searches retain their previous source-byte measure.
+unredacted searches retain their previous source-byte measure. Search matching
+and columns use the redacted line. After a secret that spans lines (an open
+quote or PEM block), the rest of that file reports line `0` (structured) and
+`?` (preview) instead of a physical line number. Paths whose names would be
+redacted appear as `[REDACTED:sensitive_path]` in search, glob and listings.
 The historical field name remains for older decoders; clients must not use it
 as an exact size or digest of a secret-bearing original. Old clients that use
 these fields for raw capture integrity checks must treat a redacted result as

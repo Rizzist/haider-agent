@@ -157,6 +157,7 @@ async fn freeze_checkpoint_marks_absent_and_over_limit_preimages_explicitly() {
                 },
             ],
             post_digest: "blake3:aggregate".into(),
+            redacted_content: false,
         },
     )
     .await
@@ -305,4 +306,68 @@ fn restore_preflights_every_path_before_changing_any_file() {
     assert!(matches!(error, CheckpointRestoreError::Conflict(_)));
     assert_eq!(fs::read(&first).expect("read first"), b"current-first");
     assert_eq!(fs::read(&second).expect("read second"), b"foreign-second");
+}
+
+/// Round-4 oracle: the no-CAS fallback reason must not repeat the raw
+/// pre-image length, and the capture's redaction class reaches the record so
+/// public projections can withhold its exact digests.
+#[test]
+fn fallback_checkpoint_reason_omits_raw_preimage_length_and_keeps_redaction_class() {
+    let secret = b"password=violet-sunrise\n".to_vec();
+    let paths = vec![CheckpointCapturePath {
+        path: "victim.txt".into(),
+        pre_digest: Some(format!("blake3:{}", blake3::hash(&secret).to_hex())),
+        pre_bytes: Some(secret.clone()),
+        post_digest: None,
+        truncated_reason: None,
+    }];
+    assert!(capture_paths_redacted(&paths));
+    let capture = CheckpointCapture {
+        kind: CheckpointKind::Write,
+        redacted_content: capture_paths_redacted(&paths),
+        paths,
+        post_digest: "blake3:synthetic-post-digest".into(),
+    };
+    let record =
+        crate::checkpoint::checkpoint_without_cas(freeze_input(), capture, "storage unavailable");
+    assert!(record.redacted_content);
+    let path = &record.paths[0];
+    // The owner-local journal keeps exact integrity data.
+    assert_eq!(
+        path.pre_digest.as_deref(),
+        Some(format!("blake3:{}", blake3::hash(&secret).to_hex()).as_str())
+    );
+    assert!(path.pre_artifact.is_none());
+    let reason = path.truncated_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("storage unavailable"));
+    assert!(!reason.contains(&secret.len().to_string()), "{reason}");
+}
+
+#[test]
+fn capture_classifier_covers_names_content_and_unclassified_preimages() {
+    let path = |name: &str, pre_bytes: Option<&[u8]>, pre_digest: bool| CheckpointCapturePath {
+        path: name.into(),
+        pre_bytes: pre_bytes.map(<[u8]>::to_vec),
+        pre_digest: pre_digest.then(|| "blake3:synthetic".to_owned()),
+        post_digest: None,
+        truncated_reason: None,
+    };
+    assert!(!capture_paths_redacted(&[path(
+        "public.txt",
+        Some(b"alpha public\n"),
+        true
+    )]));
+    assert!(!capture_paths_redacted(&[path("created.txt", None, false)]));
+    assert!(capture_paths_redacted(&[path(
+        "notes.txt",
+        Some(b"password=violet-sunrise\n"),
+        true
+    )]));
+    assert!(capture_paths_redacted(&[path(
+        "password=amber-moonset.txt",
+        None,
+        false
+    )]));
+    // Hashed but not retained (oversized): never classified, so fail closed.
+    assert!(capture_paths_redacted(&[path("large.bin", None, true)]));
 }

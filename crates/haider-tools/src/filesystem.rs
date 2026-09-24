@@ -648,7 +648,7 @@ impl EffectOperation for FsRead {
     }
 
     fn summary(&self) -> String {
-        format!("read {}", self.path.display())
+        format!("read {}", crate::redact::model_visible_path(&self.path))
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -779,7 +779,11 @@ impl EffectOperation for FsSearch {
     }
 
     fn summary(&self) -> String {
-        format!("search {} for {:?}", self.root.display(), self.query)
+        format!(
+            "search {} for {:?}",
+            crate::redact::model_visible_path(&self.root),
+            self.query
+        )
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -847,7 +851,11 @@ impl EffectOperation for FsGlob {
     }
 
     fn summary(&self) -> String {
-        format!("glob {} for {:?}", self.root.display(), self.pattern)
+        format!(
+            "glob {} for {:?}",
+            crate::redact::model_visible_path(&self.root),
+            self.pattern
+        )
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -931,7 +939,7 @@ impl EffectOperation for FsEdit {
     }
 
     fn summary(&self) -> String {
-        format!("edit {}", self.path.display())
+        format!("edit {}", crate::redact::model_visible_path(&self.path))
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -1008,7 +1016,7 @@ impl EffectOperation for FsWrite {
     }
 
     fn summary(&self) -> String {
-        format!("write {}", self.path.display())
+        format!("write {}", crate::redact::model_visible_path(&self.path))
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -1237,10 +1245,10 @@ impl EffectOperation for FsPath {
             Some(destination) => format!(
                 "{} {} to {}",
                 self.operation_name(),
-                self.source.display(),
-                destination.display()
+                crate::redact::model_visible_path(&self.source),
+                crate::redact::model_visible_path(destination)
             ),
-            None => format!("delete {}", self.source.display()),
+            None => format!("delete {}", crate::redact::model_visible_path(&self.source)),
         }
     }
 
@@ -2535,7 +2543,13 @@ fn list_directory_fd(directory: OwnedFd, display_path: &Path) -> ToolResult<Dire
 fn directory_listing(entries: Vec<(String, bool)>, entries_seen: usize) -> DirectoryListing {
     let raw = entries
         .iter()
-        .map(|(name, _)| name.clone())
+        .map(|(name, _)| {
+            if crate::redact::model_path_masked(Path::new(name.trim_end_matches('/'))) {
+                crate::redact::SENSITIVE_PATH_MARKER.to_owned()
+            } else {
+                name.clone()
+            }
+        })
         .collect::<Vec<_>>();
     let collapsed_entries = directory_preview(&entries).1;
     DirectoryListing {
@@ -2570,8 +2584,8 @@ fn directory_preview(entries: &[(String, bool)]) -> (String, usize) {
     let mut collapsed = 0usize;
     for (name, directory) in entries {
         let path = Path::new(name.trim_end_matches('/'));
-        if crate::redact::is_sensitive_path(path) || crate::redact::is_token_config_path(path) {
-            preview.push("[REDACTED:sensitive_path]".to_owned());
+        if crate::redact::model_path_masked(path) {
+            preview.push(crate::redact::SENSITIVE_PATH_MARKER.to_owned());
             collapsed = collapsed.saturating_add(1);
             continue;
         }
@@ -3509,6 +3523,9 @@ fn collect_streamed_file_matches(
     let mut buffer = Vec::new();
     let mut line_number = 0usize;
     let mut redaction = crate::redact::RedactionState::default();
+    // Once a multi-line secret has been hidden, later physical line numbers
+    // would count its lines; withhold them for the rest of this file.
+    let mut line_coordinates_withheld = false;
     loop {
         if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
             matches.truncate(ToolTruncationReason::TimeBudget);
@@ -3551,8 +3568,6 @@ fn collect_streamed_file_matches(
         // them from search's single-line presentation and match coordinates.
         let redacted = crate::redact::redact_line_with_state(full_line, &mut redaction);
         matches.observe_safe_line(redacted.text.len(), redacted.replacements > 0);
-        let line = full_line.strip_suffix('\n').unwrap_or(full_line);
-        let line = line.strip_suffix('\r').unwrap_or(line);
         let safe_line = redacted.text.strip_suffix('\n').unwrap_or(&redacted.text);
         let safe_line = safe_line.strip_suffix('\r').unwrap_or(safe_line);
         let structured_line = utf8_prefix(safe_line, SEARCH_STRUCTURED_LINE_BYTES).to_owned();
@@ -3572,7 +3587,7 @@ fn collect_streamed_file_matches(
             .saturating_sub(matches.match_count)
             .saturating_add(1);
         let columns = compiled.columns(
-            line,
+            safe_line,
             operation,
             remaining_matches,
             line_number,
@@ -3583,19 +3598,26 @@ fn collect_streamed_file_matches(
             break;
         }
         if !columns.is_empty() {
-            let display = portable_relative_path(display_path)?;
-            let raw_legacy = format!("{display}:{line_number}:{line}");
-            let preview_legacy = format!("{display}:{line_number}:{safe_line}");
-            let spool_line = if redacted.replacements > 0 {
-                &preview_legacy
+            let display = model_visible_search_path(display_path)?;
+            // Zero (structured) and `?` (preview) withhold the coordinate.
+            let public_line = if line_coordinates_withheld {
+                0
             } else {
-                &raw_legacy
+                line_number
             };
+            let line_label = if line_coordinates_withheld {
+                "?".to_owned()
+            } else {
+                line_number.to_string()
+            };
+            // Match text, columns, and the spool all use the redacted line.
+            let preview_legacy = format!("{display}:{line_label}:{safe_line}");
+            let spool_line = &preview_legacy;
             let structured = columns
                 .into_iter()
                 .map(|column| FsSearchMatch {
                     path: display.clone(),
-                    line: line_number,
+                    line: public_line,
                     column,
                     text: structured_line.clone(),
                     context_before: before.iter().cloned().collect(),
@@ -3610,6 +3632,7 @@ fn collect_streamed_file_matches(
                 }));
             }
         }
+        line_coordinates_withheld |= redaction.spans_lines();
         before.push_back(structured_line);
         while before.len() > operation.context.before {
             before.pop_front();
@@ -3823,7 +3846,7 @@ fn glob_files_at(
             let display_path = workspace_root.join(workspace_path);
             let file = open_search_file(&workspace_dir, workspace_path, &display_path)?;
             drop(file);
-            paths.push(portable_relative_path(workspace_path)?);
+            paths.push(model_visible_search_path(workspace_path)?);
             Ok(ControlFlow::Continue(()))
         },
     )?;
@@ -4337,6 +4360,16 @@ struct AppliedMutation {
 }
 
 impl AppliedMutation {
+    /// Classify the mutation before any result is published. A redacted
+    /// class keeps exact digests and byte counts owner-local; agent-visible
+    /// results and public projections withhold them.
+    fn classify_redaction(mut self, post_content: Option<&[u8]>) -> Self {
+        self.checkpoint.redacted_content |=
+            crate::checkpoint::capture_paths_redacted(&self.checkpoint.paths)
+                || post_content.is_some_and(crate::redact::content_redaction_affected);
+        self
+    }
+
     /// The receipt and change ledger already own the ordered relative and
     /// absolute paths. Attach metadata before either is moved into its durable
     /// finalizer; never reread a mutable path to infer the completed effect.
@@ -4406,7 +4439,7 @@ impl MutationWorkerOutcome {
                 checkpoint,
             } => (
                 Ok(result),
-                Some(workspace_mutation(effect, post_digest)),
+                Some(workspace_mutation(effect, post_digest, &checkpoint)),
                 Some(checkpoint),
             ),
             Self::ApplyFailed(error) => (Err(error), None, None),
@@ -4417,7 +4450,7 @@ impl MutationWorkerOutcome {
                 checkpoint,
             } => (
                 Err(error),
-                Some(workspace_mutation(effect, post_digest)),
+                Some(workspace_mutation(effect, post_digest, &checkpoint)),
                 Some(checkpoint),
             ),
         }
@@ -4439,7 +4472,7 @@ impl MutationWorkerOutcome {
                 post_digest,
                 checkpoint,
             } => {
-                let mutation = workspace_mutation(effect, post_digest.clone());
+                let mutation = workspace_mutation(effect, post_digest.clone(), &checkpoint);
                 (
                     Ok(result),
                     Some(FileFreshness {
@@ -4457,7 +4490,7 @@ impl MutationWorkerOutcome {
                 post_digest,
                 checkpoint,
             } => {
-                let mutation = workspace_mutation(effect, post_digest.clone());
+                let mutation = workspace_mutation(effect, post_digest.clone(), &checkpoint);
                 (
                     Err(error),
                     Some(FileFreshness {
@@ -4475,12 +4508,14 @@ impl MutationWorkerOutcome {
 fn workspace_mutation(
     effect_id: haider_protocol::ids::EffectId,
     mutation_digest: String,
+    checkpoint: &CheckpointCapture,
 ) -> WorkspaceMutation {
     WorkspaceMutation {
         effect_id,
         mutation_digest,
         workspace_revision: None,
         subject_digest: None,
+        redacted_content: checkpoint.redacted_content,
     }
 }
 
@@ -5113,8 +5148,10 @@ fn apply_windows_write(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -5219,8 +5256,10 @@ fn apply_windows_edit(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -5842,6 +5881,8 @@ fn apply_windows_path(
         post_digest: None,
         ..source_preimage.clone()
     }];
+    // Copy hashes copied bytes into `structural`; classify them in the same pass.
+    let mut copied_redacted = false;
     let mut structural = Vec::new();
     structural.extend_from_slice(operation.operation_name().as_bytes());
     structural.push(0);
@@ -5867,7 +5908,10 @@ fn apply_windows_path(
             }
             remove_windows_entry_from_handle(&source, &operation.source, source_entry)?;
             (
-                mutation_result(format!("deleted {}", operation.source.display())),
+                mutation_result(format!(
+                    "deleted {}",
+                    crate::redact::model_visible_path(&operation.source)
+                )),
                 vec![operation.source.clone()],
             )
         }
@@ -5987,8 +6031,8 @@ fn apply_windows_path(
                     (
                         mutation_result(format!(
                             "moved {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![operation.source.clone(), destination.clone()],
                     )
@@ -5996,14 +6040,20 @@ fn apply_windows_path(
                 FsPathOperation::Copy => {
                     let staging = create_windows_path_staging(&destination_parent, destination)?;
                     let staged_entry = staging.path.join("entry");
-                    let staged_entry_guard = match copy_windows_entry_from_handle(
+                    let mut copy_evidence = CopyEvidence {
+                        structural: &mut structural,
+                        redacted: false,
+                    };
+                    let copied = copy_windows_entry_from_handle(
                         &source,
                         &staged_entry,
                         &operation.source,
                         destination,
-                        &mut structural,
+                        &mut copy_evidence,
                         source_entry,
-                    ) {
+                    );
+                    copied_redacted = copy_evidence.redacted;
+                    let staged_entry_guard = match copied {
                         Ok(entry) => entry,
                         Err(error) => {
                             cleanup_windows_path_staging(staging, destination);
@@ -6022,8 +6072,8 @@ fn apply_windows_path(
                     (
                         mutation_result(format!(
                             "copied {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![destination.clone()],
                     )
@@ -6045,8 +6095,10 @@ fn apply_windows_path(
             kind: checkpoint_kind,
             paths: checkpoint_paths,
             post_digest,
+            redacted_content: copied_redacted,
         },
     }
+    .classify_redaction(None)
     .with_file_effects(effect_bytes, move_destination_existed))
 }
 
@@ -6214,7 +6266,7 @@ fn copy_windows_entry(
     destination: &Path,
     source_display: &Path,
     destination_display: &Path,
-    structural: &mut Vec<u8>,
+    evidence: &mut CopyEvidence<'_>,
 ) -> ToolResult<WindowsPathEntry> {
     let source_entry = open_windows_path_entry(source, source_display, false)?;
     copy_windows_entry_from_handle(
@@ -6222,7 +6274,7 @@ fn copy_windows_entry(
         destination,
         source_display,
         destination_display,
-        structural,
+        evidence,
         source_entry,
     )
 }
@@ -6235,10 +6287,12 @@ fn copy_windows_entry_from_handle(
     destination: &Path,
     source_display: &Path,
     destination_display: &Path,
-    structural: &mut Vec<u8>,
+    evidence: &mut CopyEvidence<'_>,
     mut source_entry: WindowsPathEntry,
 ) -> ToolResult<WindowsPathEntry> {
     let source_identity = source_entry.identity;
+    evidence.redacted |=
+        copied_name_masked(source_display) || copied_name_masked(destination_display);
     if source_identity.directory {
         fs::create_dir(destination).map_err(|error| {
             ToolError::io(
@@ -6253,8 +6307,10 @@ fn copy_windows_entry_from_handle(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ToolError::io("list copy source", source_display, error))?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
-        structural.extend_from_slice(b"\0directory\0");
-        structural.extend_from_slice(destination.as_os_str().as_encoded_bytes());
+        evidence.structural.extend_from_slice(b"\0directory\0");
+        evidence
+            .structural
+            .extend_from_slice(destination.as_os_str().as_encoded_bytes());
         for entry in entries {
             let name = entry.file_name();
             let _ = copy_windows_entry(
@@ -6262,7 +6318,7 @@ fn copy_windows_entry_from_handle(
                 &destination.join(&name),
                 &source_display.join(&name),
                 &destination_display.join(&name),
-                structural,
+                evidence,
             )?;
         }
         destination_guard
@@ -6338,10 +6394,13 @@ fn copy_windows_entry_from_handle(
                     error,
                 )
             })?;
-        structural.extend_from_slice(b"\0file\0");
-        structural.extend_from_slice(destination.as_os_str().as_encoded_bytes());
-        structural.push(0);
-        structural.extend_from_slice(&snapshot.bytes);
+        evidence.structural.extend_from_slice(b"\0file\0");
+        evidence
+            .structural
+            .extend_from_slice(destination.as_os_str().as_encoded_bytes());
+        evidence.structural.push(0);
+        evidence.structural.extend_from_slice(&snapshot.bytes);
+        evidence.redacted |= crate::redact::content_redaction_affected(&snapshot.bytes);
         let destination_guard =
             windows_path_entry_from_file(destination_file, destination_display)?;
         let final_identity = haider_platform::windows_file_identity(&source_entry.handle)
@@ -6722,8 +6781,10 @@ fn apply_write_at(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -6937,8 +6998,10 @@ fn apply_edit_at_with_commit_hooks(
                 truncated_reason: None,
             }],
             post_digest,
+            redacted_content: false,
         },
     }
+    .classify_redaction(Some(bytes))
     .with_file_effects(bytes.len() as u64, false))
 }
 
@@ -7080,6 +7143,8 @@ fn apply_path_at_with_commit_hook(
         ..source_preimage.clone()
     }];
 
+    // Copy hashes copied bytes into `structural`; classify them in the same pass.
+    let mut copied_redacted = false;
     let mut structural = Vec::new();
     structural.extend_from_slice(operation.operation_name().as_bytes());
     structural.push(0);
@@ -7103,7 +7168,10 @@ fn apply_path_at_with_commit_hook(
             )?;
             remove_entry_at(&commit_source_parent, &source_leaf, &operation.source)?;
             (
-                mutation_result(format!("deleted {}", operation.source.display())),
+                mutation_result(format!(
+                    "deleted {}",
+                    crate::redact::model_visible_path(&operation.source)
+                )),
                 vec![operation.source.clone()],
             )
         }
@@ -7253,8 +7321,8 @@ fn apply_path_at_with_commit_hook(
                     (
                         mutation_result(format!(
                             "moved {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![operation.source.clone(), destination.clone()],
                     )
@@ -7288,15 +7356,21 @@ fn apply_path_at_with_commit_hook(
                     let (staging_name, staging_directory) =
                         create_path_staging_directory(&copy_destination_parent, destination)?;
                     let staging_leaf = OsStr::new("entry");
-                    if let Err(error) = copy_entry_at(
+                    let mut copy_evidence = CopyEvidence {
+                        structural: &mut structural,
+                        redacted: false,
+                    };
+                    let copied = copy_entry_at(
                         &copy_source_parent,
                         &source_leaf,
                         &staging_directory,
                         staging_leaf,
                         &operation.source,
                         destination,
-                        &mut structural,
-                    ) {
+                        &mut copy_evidence,
+                    );
+                    copied_redacted = copy_evidence.redacted;
+                    if let Err(error) = copied {
                         remove_path_staging(&copy_destination_parent, &staging_name, destination);
                         return Err(error);
                     }
@@ -7372,8 +7446,8 @@ fn apply_path_at_with_commit_hook(
                     (
                         mutation_result(format!(
                             "copied {} to {}",
-                            operation.source.display(),
-                            destination.display()
+                            crate::redact::model_visible_path(&operation.source),
+                            crate::redact::model_visible_path(destination)
                         )),
                         vec![destination.clone()],
                     )
@@ -7396,8 +7470,10 @@ fn apply_path_at_with_commit_hook(
             kind: checkpoint_kind,
             paths: checkpoint_paths,
             post_digest,
+            redacted_content: copied_redacted,
         },
     }
+    .classify_redaction(None)
     .with_file_effects(effect_bytes, move_destination_existed))
 }
 
@@ -7605,10 +7681,11 @@ fn copy_entry_at(
     destination_leaf: &OsStr,
     source_path: &Path,
     destination_path: &Path,
-    structural: &mut Vec<u8>,
+    evidence: &mut CopyEvidence<'_>,
 ) -> ToolResult<()> {
     require_public_android_path(source_path)?;
     require_public_android_path(destination_path)?;
+    evidence.redacted |= copied_name_masked(source_path) || copied_name_masked(destination_path);
     let metadata = rustix::fs::statat(source_parent, source_leaf, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| anchored_io_error("inspect copy source", source_path, error))?;
     match FileType::from_raw_mode(metadata.st_mode) {
@@ -7642,10 +7719,13 @@ fn copy_entry_at(
                     rustix::fs::unlinkat(destination_parent, destination_leaf, AtFlags::empty());
                 return Err(error);
             }
-            structural.extend_from_slice(b"\0file\0");
-            structural.extend_from_slice(destination_leaf.as_encoded_bytes());
-            structural.push(0);
-            structural.extend_from_slice(&bytes);
+            evidence.structural.extend_from_slice(b"\0file\0");
+            evidence
+                .structural
+                .extend_from_slice(destination_leaf.as_encoded_bytes());
+            evidence.structural.push(0);
+            evidence.structural.extend_from_slice(&bytes);
+            evidence.redacted |= crate::redact::content_redaction_affected(&bytes);
             Ok(())
         }
         FileType::Directory => {
@@ -7680,8 +7760,10 @@ fn copy_entry_at(
                 }
             }
             names.sort();
-            structural.extend_from_slice(b"\0directory\0");
-            structural.extend_from_slice(destination_leaf.as_encoded_bytes());
+            evidence.structural.extend_from_slice(b"\0directory\0");
+            evidence
+                .structural
+                .extend_from_slice(destination_leaf.as_encoded_bytes());
             for name in names {
                 copy_entry_at(
                     &source_directory,
@@ -7690,7 +7772,7 @@ fn copy_entry_at(
                     &name,
                     &source_path.join(&name),
                     &destination_path.join(&name),
-                    structural,
+                    evidence,
                 )?;
             }
             rustix::fs::fsync(&destination_directory).map_err(|error| {
@@ -8638,6 +8720,32 @@ fn path_argument(path: &Path) -> ToolResult<&str> {
 
 fn relative_path_argument(path: &Path) -> ToolResult<&str> {
     path_argument(path)
+}
+
+/// Search and glob report portable workspace-relative paths; one masking rule
+/// covers every listing so an assignment-bearing name never reaches the agent.
+fn model_visible_search_path(path: &Path) -> ToolResult<String> {
+    let portable = portable_relative_path(path)?;
+    Ok(if crate::redact::model_path_masked(Path::new(&portable)) {
+        crate::redact::SENSITIVE_PATH_MARKER.to_owned()
+    } else {
+        portable
+    })
+}
+
+/// Structural copy evidence and its agent-visible redaction class, gathered
+/// in the same pass over the copied bytes and names.
+struct CopyEvidence<'a> {
+    structural: &'a mut Vec<u8>,
+    redacted: bool,
+}
+
+/// Copy display paths may be absolute; classify only the copied entry's own
+/// name. Workspace-relative mutation paths are classified by the checkpoint.
+fn copied_name_masked(display_path: &Path) -> bool {
+    display_path
+        .file_name()
+        .is_some_and(|name| crate::redact::model_path_masked(Path::new(name)))
 }
 
 /// Single digest seam for authored content and structural mutation evidence.

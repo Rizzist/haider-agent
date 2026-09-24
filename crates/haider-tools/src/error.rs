@@ -193,34 +193,38 @@ impl std::fmt::Display for ToolError {
                 write!(
                     formatter,
                     "path {} escapes workspace root {}",
-                    requested_path.display(),
-                    workspace_root.display()
+                    crate::redact::model_visible_path(requested_path),
+                    crate::redact::model_visible_path(workspace_root)
                 )?;
                 if let Some(resolved_path) = resolved_path {
-                    write!(formatter, " (resolved to {})", resolved_path.display())?;
+                    write!(
+                        formatter,
+                        " (resolved to {})",
+                        crate::redact::model_visible_path(resolved_path)
+                    )?;
                 }
                 Ok(())
             }
             Self::PathChanged { path, message } => write!(
                 formatter,
                 "authorized path {} changed before access: {message}",
-                path.display()
+                crate::redact::model_visible_path(path)
             ),
             Self::UnreadFile { path } => write!(
                 formatter,
                 "refusing to mutate unread file {}; read it before editing",
-                path.display()
+                crate::redact::model_visible_path(path)
             ),
             Self::StaleRead { path, .. } => write!(
                 formatter,
                 "refusing to mutate stale file {}; re-read before editing",
-                path.display()
+                crate::redact::model_visible_path(path)
             ),
             Self::EditAnchor(conflict) => {
                 write!(
                     formatter,
                     "edit anchor for {} matched {} locations; ",
-                    conflict.path.display(),
+                    crate::redact::model_visible_path(&conflict.path),
                     conflict.matches
                 )?;
                 if conflict.replace_all {
@@ -250,7 +254,11 @@ impl std::fmt::Display for ToolError {
                 operation,
                 path,
                 message,
-            } => write!(formatter, "{operation} {}: {message}", path.display()),
+            } => write!(
+                formatter,
+                "{operation} {}: {message}",
+                crate::redact::model_visible_path(path)
+            ),
             Self::Journal { message } => write!(formatter, "effect journal failed: {message}"),
             Self::Cas { message } => write!(formatter, "artifact storage failed: {message}"),
             Self::Ledger { message } => write!(formatter, "change ledger failed: {message}"),

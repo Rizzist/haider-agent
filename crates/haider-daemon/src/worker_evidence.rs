@@ -225,6 +225,7 @@ mod tests {
                 mutation_digest: "blake3:content".into(),
                 workspace_revision: None,
                 subject_digest: Some("blake3:subject".into()),
+                redacted_content: false,
             }),
         });
         store
