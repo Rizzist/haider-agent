@@ -2410,6 +2410,10 @@ pub struct SessionObserveDigest {
     /// Latest orchestration terminal from this selected run only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<haider_protocol::orchestration::OrchestrationRunDigestV1>,
+    /// Request-count policy of the selected run, when it explicitly opted in.
+    /// Older daemons and unbounded runs omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     /// `None` names the implicit main branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_branch_id: Option<BranchId>,

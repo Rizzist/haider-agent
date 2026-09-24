@@ -8472,6 +8472,23 @@ async fn refresh_context_economy_from_journal(
 /// collapses them into one observation; an autonomous plan recognizes that
 /// settlement before returning its fixed accepted result. Missing the answer
 /// is the failure mode this ordering exists to prevent.
+fn request_budget_with_test_override(
+    pinned: Option<haider_protocol::request_budget::RequestBudgetV1>,
+    override_limit: Option<usize>,
+) -> Option<haider_protocol::request_budget::RequestBudgetV1> {
+    override_limit
+        .map(|limit| haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: pinned
+                .map_or(
+                    haider_protocol::request_budget::OPT_IN_DEFAULT_TRANCHE,
+                    |pin| pin.tranche,
+                )
+                .min(limit),
+            hard_cap: limit,
+        })
+        .or(pinned)
+}
+
 async fn start_turn(
     dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,
@@ -9375,14 +9392,14 @@ async fn start_turn(
             .validate()
             .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
     }
-    // The test-factory override replaces any pin with a cap-only opt-in.
-    let request_budget = dependencies
-        .provider_factory
-        .max_provider_requests_per_turn_override()
-        .map(|limit| {
-            haider_protocol::request_budget::RequestBudgetV1::from_opt_in(None, Some(limit))
-        })
-        .or(pinned_request_budget);
+    // The test-factory override changes the ceiling, preserving a pinned
+    // tranche when possible (the seam's pre-973 behavior).
+    let request_budget = request_budget_with_test_override(
+        pinned_request_budget,
+        dependencies
+            .provider_factory
+            .max_provider_requests_per_turn_override(),
+    );
     if let Some(budget) = request_budget {
         config.provider_request_budget = Some(budget);
         // Hard-cap workspace receipts exist only for capped headless runs.

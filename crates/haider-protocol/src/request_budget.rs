@@ -36,6 +36,10 @@ impl Default for RequestBudgetV1 {
 }
 
 impl RequestBudgetV1 {
+    #[must_use]
+    pub fn status_label(self) -> String {
+        format!("request cap {} (tranche {})", self.hard_cap, self.tranche)
+    }
     /// Completes an explicit opt-in that named only one bound: a missing hard
     /// cap is [`OPT_IN_DEFAULT_HARD_CAP`]; a missing tranche is
     /// [`OPT_IN_DEFAULT_TRANCHE`] clamped to the hard cap, so an implicit

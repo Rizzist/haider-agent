@@ -330,6 +330,10 @@ facts replay unchanged and do not discard prior text or tool results.
 Interactive TUI and plain transcript rendering suppress progress statuses;
 bound checkpoints remain useful, and machine JSON/JSONL retains all facts for
 an explicitly budgeted run.
+Once a capped run emits its first request status, the TUI status strip and
+`haider session <id>` show `request cap N (tranche T)` once; session JSON
+exposes the selected run's optional `request_budget` object. Unbounded runs
+omit both displays and the JSON field.
 
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
 request policy. With only `--max-requests N`, the implicit tranche is

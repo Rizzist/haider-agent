@@ -14764,6 +14764,18 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             detail: None,
         });
     }
+    if let Some(budget) = model.projection.request_budget() {
+        let label = format!("  {}", budget.status_label());
+        if badge_cells + label.chars().count() <= width as usize {
+            badge_cells += label.chars().count();
+            segments.push(StatusSegment {
+                text: label,
+                tone: StatusSegmentTone::Dim,
+                state: None,
+                detail: None,
+            });
+        }
+    }
     let meter_shown = badge_cells + 2 + meter.chars().count() <= width as usize;
     if meter_shown {
         segments.push(StatusSegment {

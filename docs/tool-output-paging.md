@@ -64,9 +64,11 @@ A reused call id re-points its alias at the most recent capture; effect
 handles stay unique. Cursors count bytes in the stable secret-redacted UTF-8
 capture. Invalid UTF-8 boundaries are rejected. Handles are scoped to the
 session, with durable lookup through the recorded process signal or the fetch
-tool result after restart. A process terminated by an output or time bound can
-have uncaptured output; the execution result and its paging hint disclose that
-limit separately.
+tool result after restart. The daemon keeps at most 256 references per session
+in memory; older handles are resolved from that journal and their CAS content,
+even when one turn produces more than 256 captures. A process terminated by an
+output or time bound can have uncaptured output; the execution result and its
+paging hint disclose that limit separately.
 `exhausted` means the retained capture has been read. Cursor pages from
 `task_output` reach the model intact even when the source stream was truncated;
 the cursor never advances past content removed by a second preview reducer.

@@ -3,6 +3,40 @@
 use super::*;
 use haider_protocol::envelope::write_envelope_messagepack;
 
+#[test]
+fn test_override_keeps_a_pinned_tranche() {
+    use haider_protocol::request_budget::RequestBudgetV1;
+    let pinned = RequestBudgetV1 {
+        tranche: 40,
+        hard_cap: 96,
+    };
+    assert_eq!(
+        request_budget_with_test_override(Some(pinned), Some(80)),
+        Some(RequestBudgetV1 {
+            tranche: 40,
+            hard_cap: 80
+        })
+    );
+    assert_eq!(
+        request_budget_with_test_override(Some(pinned), Some(20)),
+        Some(RequestBudgetV1 {
+            tranche: 20,
+            hard_cap: 20
+        })
+    );
+    assert_eq!(
+        request_budget_with_test_override(Some(pinned), None),
+        Some(pinned)
+    );
+    assert_eq!(
+        request_budget_with_test_override(None, Some(5)),
+        Some(RequestBudgetV1 {
+            tranche: 5,
+            hard_cap: 5
+        })
+    );
+}
+
 #[derive(Clone)]
 struct CountingTurnSetupStore {
     inner: haider_core::SqliteStoreHandle,

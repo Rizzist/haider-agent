@@ -32,6 +32,10 @@ exit 78, and durable continuation coordinates. The 32 / 64 values remain only
 as convenience counterparts when a caller explicitly supplies one CLI request
 flag. TUI and plain transcript renderers suppress progress statuses while raw
 event and JSONL consumers retain them for explicitly budgeted runs.
+`session.observe` now exposes an optional `request_budget` object for the
+selected run once its first status is journaled. The TUI status strip and
+`haider session <id>` use it for a single cap label; older readers ignore the
+additive field and unbounded runs omit it.
 
 This changes no event shape, pricing, cost accounting, time budget,
 cancellation, workflow recurrence guard, or schema version.
