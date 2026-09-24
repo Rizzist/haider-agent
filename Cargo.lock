@@ -1917,6 +1917,7 @@ name = "haider-platform"
 version = "0.0.972"
 dependencies = [
  "blake3",
+ "chrono",
  "getrandom 0.3.4",
  "jni 0.21.1",
  "libc",

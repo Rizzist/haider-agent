@@ -1184,24 +1184,28 @@ fn the_disabled_explanation_meets_contrast_in_every_theme() {
     }
 }
 
-/// The host zone is per-instant where the platform supports it; elsewhere
-/// the calendar stays UTC and says why instead of guessing across DST.
+/// The host zone resolves per instant on every supported platform (Unix via
+/// `localtime_r`, Windows via chrono's per-year DST rules): the caption
+/// names a local offset and a reset renders in local time with UTC beside
+/// it. Only an unresolvable instant falls back to the UTC caption.
 #[test]
-fn host_zone_is_per_instant_or_honestly_utc() {
+fn host_zone_resolves_per_instant() {
     let zone = UsageTimeZone::Host;
-    if haider_platform::LOCAL_OFFSET_PER_INSTANT {
-        // Unix: whatever the runner's zone, an offset resolves per instant.
-        assert!(zone.offset_at_ms(D_WEEKLY_MS).is_some());
-        assert!(fmt_zone_caption(SNAPSHOT_MS, zone).starts_with("local UTC"));
-    } else {
-        assert_eq!(zone.offset_at_ms(D_WEEKLY_MS), None);
-        assert_eq!(
-            fmt_zone_caption(SNAPSHOT_MS, zone),
-            haider_tui::usage_time::HOST_PER_INSTANT_UNSUPPORTED
-        );
-        assert_eq!(
-            fmt_reset_instant(D_WEEKLY_MS, zone, 2026),
-            "Fri 25 Sep · 16:59 UTC"
-        );
+    let offset = zone
+        .offset_at_ms(D_WEEKLY_MS)
+        .expect("host offset resolves");
+    assert!(offset.abs() <= 14 * 3600);
+    assert!(fmt_zone_caption(SNAPSHOT_MS, zone).starts_with("local UTC"));
+    let text = fmt_reset_instant(D_WEEKLY_MS, zone, 2026);
+    assert!(
+        text.contains(" local"),
+        "a resolvable host zone renders local time: {text}"
+    );
+    fn unresolvable(_: i64) -> Option<i32> {
+        None
     }
+    assert_eq!(
+        fmt_zone_caption(SNAPSHOT_MS, UsageTimeZone::Rule(unresolvable)),
+        "UTC (local zone unavailable)"
+    );
 }

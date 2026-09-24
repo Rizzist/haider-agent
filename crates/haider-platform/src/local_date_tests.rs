@@ -61,19 +61,23 @@ fn live_samples_agree_with_pure_math() {
     assert!(local.offset_seconds.abs() <= 26 * 3600);
 }
 
-#[cfg(unix)]
-#[test]
-fn per_instant_offsets_are_supported_on_unix() {
-    const { assert!(super::LOCAL_OFFSET_PER_INSTANT) };
-}
-
-/// Windows never answers with the current offset for another instant.
+/// Windows (compile-only on the macOS dev host; executed only on native
+/// Windows): the per-instant offset resolves for instants on both sides of
+/// a northern and a southern DST season, and each answer is a plausible
+/// zone offset (within ±14h, whole quarter hours). The runner's zone may
+/// have no DST, so equal offsets are allowed.
 #[cfg(windows)]
 #[test]
-fn windows_refuses_a_per_instant_offset_instead_of_guessing() {
-    const { assert!(!super::LOCAL_OFFSET_PER_INSTANT) };
-    assert_eq!(
-        super::local_utc_offset_seconds(1_793_534_400),
-        Err(super::CivilDateError::PerInstantOffsetUnsupported)
-    );
+fn windows_resolves_plausible_per_instant_offsets() {
+    for instant in [
+        1_768_435_200, // 2026-01-15T00:00Z
+        1_784_073_600, // 2026-07-15T00:00Z
+        1_793_512_740, // 2026-11-01T05:59Z (US fall-back minus 1 min)
+        1_793_512_800, // 2026-11-01T06:00Z (US fall-back)
+        1_775_354_400, // 2026-04-05T02:00Z (AU fall-back)
+    ] {
+        let offset = super::local_utc_offset_seconds(instant).unwrap();
+        assert!(offset.abs() <= 14 * 3600, "{instant}: {offset}");
+        assert_eq!(offset % 900, 0, "{instant}: {offset}");
+    }
 }

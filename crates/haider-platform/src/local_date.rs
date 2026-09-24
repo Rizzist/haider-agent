@@ -37,10 +37,6 @@ pub enum CivilDateError {
     ClockBeforeEpoch,
     /// The OS local offset could not be resolved.
     OffsetUnavailable,
-    /// This platform cannot resolve the offset AT an arbitrary instant
-    /// (only the offset in effect now), so a per-instant answer would be a
-    /// guess across daylight-saving changes.
-    PerInstantOffsetUnsupported,
 }
 
 impl std::fmt::Display for CivilDateError {
@@ -48,9 +44,6 @@ impl std::fmt::Display for CivilDateError {
         let text = match self {
             Self::ClockBeforeEpoch => "system clock is before the Unix epoch",
             Self::OffsetUnavailable => "local UTC offset is unavailable",
-            Self::PerInstantOffsetUnsupported => {
-                "local UTC offset at an arbitrary instant is unsupported on this platform"
-            }
         };
         f.write_str(text)
     }
@@ -72,27 +65,32 @@ pub fn sample_utc_civil_date() -> Result<CivilDateSample, CivilDateError> {
     Ok(sample_with_offset(utc_ms, 0))
 }
 
-/// Whether [`local_utc_offset_seconds`] can answer for an arbitrary
-/// instant on this platform.
-pub const LOCAL_OFFSET_PER_INSTANT: bool = cfg!(unix);
-
 /// The OS local offset (seconds east of UTC) in effect AT `unix_seconds`.
 ///
-/// On Unix this is the zone rule for that instant (`localtime_r`), so a
-/// daylight-saving transition between now and the instant is honoured.
-/// Windows' offset source here is the CURRENT wall-clock difference, which
-/// would be wrong for an instant across a DST change, so it answers
-/// [`CivilDateError::PerInstantOffsetUnsupported`] instead of guessing.
-/// An unresolvable offset is always an error, never a silent UTC.
+/// The zone's rule for THAT instant is used, so a daylight-saving
+/// transition between now and the instant is honoured:
+/// - Unix: `localtime_r` for the instant;
+/// - Windows: `chrono::Local`, which resolves the zone's DST rules for the
+///   instant's year through kernel32 (not the current wall-clock offset
+///   that [`sample_local_civil_date`] uses for "now").
+///
+/// An unresolvable (none/ambiguous) result is
+/// [`CivilDateError::OffsetUnavailable`], never a silent UTC.
 pub fn local_utc_offset_seconds(unix_seconds: u64) -> Result<i32, CivilDateError> {
     #[cfg(unix)]
     {
         local_offset_seconds(unix_seconds)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = unix_seconds;
-        Err(CivilDateError::PerInstantOffsetUnsupported)
+        use chrono::TimeZone as _;
+        let seconds = i64::try_from(unix_seconds).map_err(|_| CivilDateError::OffsetUnavailable)?;
+        match chrono::Local.timestamp_opt(seconds, 0) {
+            chrono::LocalResult::Single(at) => Ok(at.offset().local_minus_utc()),
+            chrono::LocalResult::Ambiguous(..) | chrono::LocalResult::None => {
+                Err(CivilDateError::OffsetUnavailable)
+            }
+        }
     }
 }
 

@@ -24,6 +24,10 @@ rustix = { workspace = true, features = ["net", "system", "pipe", "time"] }
 nix = { version = "0.31.3", features = ["event"] }
 
 [target.'cfg(windows)'.dependencies]
+# 973: per-instant local UTC offsets (`local_utc_offset_seconds`). On Windows
+# chrono's `clock` resolves the zone's DST rules for the given instant via
+# kernel32 (windows-link); the FFI lives inside chrono.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 windows = { version = "0.54.0", features = [
     "Win32_Networking_NetworkListManager",
     "Win32_System_Com",
