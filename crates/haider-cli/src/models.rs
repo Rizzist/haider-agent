@@ -378,13 +378,7 @@ fn provider_view(
 ) -> ProviderView {
     let mut provider = provider;
     provider.inventory = provider.inventory.at_time(now_ms);
-    if !provider.has_static_models()
-        && matches!(
-            provider.inventory,
-            haider_rpc::ModelInventoryWire::NeverFetched
-                | haider_rpc::ModelInventoryWire::Unavailable { .. }
-        )
-    {
+    if !provider.has_known_models() {
         provider.models.clear();
         provider.model_details.clear();
         provider.default_model = None;
@@ -526,12 +520,12 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
             let context = model
                 .context_window
                 .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
-            let source = match model.source {
-                Some(haider_rpc::ModelDetailSourceWire::Static) => "  source=static",
-                Some(haider_rpc::ModelDetailSourceWire::Remote) => "  source=remote",
-                Some(haider_rpc::ModelDetailSourceWire::Configured) => "  source=configured",
-                Some(haider_rpc::ModelDetailSourceWire::Unknown) | None => "",
-            };
+            let source = model
+                .source
+                .filter(|source| *source != haider_rpc::ModelDetailSourceWire::Unknown)
+                .map_or_else(String::new, |source| {
+                    format!("  source={}", source.as_str())
+                });
             text.push_str(&format!(
                 "  {}  context_window={}{}\n",
                 model.model, context, source

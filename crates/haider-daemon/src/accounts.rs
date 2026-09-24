@@ -1083,7 +1083,7 @@ pub(crate) fn provider_credential_ready_for_summary<'a>(
     accounts: &'a AccountStore<Box<dyn StoreLike>>,
 ) -> impl Fn(&str) -> bool + 'a {
     move |provider| {
-        let subscription = !haider_provider::subscription_static_models(provider).is_empty();
+        let subscription = haider_provider::has_subscription_static_catalog(provider);
         accounts.list().iter().any(|descriptor| {
             descriptor.provider == provider
                 && (!subscription
@@ -3200,8 +3200,8 @@ async fn finish_provider_models_refresh(
             // A subscription may authorize inference while refusing model
             // enumeration. The fallback remains selectable and the failed
             // fetch is retained in inventory as informational provenance.
-            if reason.contains("(403)")
-                && !haider_provider::subscription_static_models(&provider).is_empty()
+            if haider_provider::model_list_forbidden(&reason)
+                && haider_provider::has_subscription_static_catalog(&provider)
                 && let Some(summary) =
                     providers.summary(&provider, &provider_credential_ready_for_summary(accounts))
                 && let Ok(revision) = store.management_revision().await

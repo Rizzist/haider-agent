@@ -463,12 +463,7 @@ impl ModelSelectionAuthority {
                 summary.catalog,
                 haider_rpc::ProviderCatalogKindWire::Public
                     | haider_rpc::ProviderCatalogKindWire::Authenticated
-            ) && !summary.has_static_models()
-                && matches!(
-                    summary.inventory,
-                    haider_rpc::ModelInventoryWire::NeverFetched
-                        | haider_rpc::ModelInventoryWire::Unavailable { .. }
-                )
+            ) && !summary.has_known_models()
         }) {
             return Err(SelectionRefusal::ProviderUnavailable {
                 provider: provider.to_owned(),

@@ -5709,13 +5709,10 @@ fn render_model_picker(
             ),
         ];
         if let Some(source) = row.source {
-            let label = match source {
-                haider_rpc::ModelDetailSourceWire::Static => "static",
-                haider_rpc::ModelDetailSourceWire::Remote => "remote",
-                haider_rpc::ModelDetailSourceWire::Configured => "configured",
-                haider_rpc::ModelDetailSourceWire::Unknown => "unknown",
-            };
-            spans.push(Span::styled(format!("  {label}"), theme.dim_style()));
+            spans.push(Span::styled(
+                format!("  {}", source.as_str()),
+                theme.dim_style(),
+            ));
         }
         if row.is_current {
             let current = if is_top_api_group(row) && row.providers.len() > 1 {

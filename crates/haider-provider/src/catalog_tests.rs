@@ -12,57 +12,6 @@ use crate::catalog::{
     discover_models_with_resolver,
 };
 
-#[test]
-fn subscription_fallbacks_have_distinct_ids_and_limit_metadata() {
-    for provider in [
-        "anthropic-oauth",
-        "openai-oauth",
-        "kimi-oauth",
-        "grok-oauth",
-        "haider-code",
-    ] {
-        let rows = crate::subscription_static_models(provider);
-        assert!(!rows.is_empty(), "{provider}");
-        let mut ids = std::collections::HashSet::new();
-        for row in rows {
-            assert!(ids.insert(row.slug.clone()), "duplicate {}", row.slug);
-            let limit = crate::static_model_limits(provider, &row.slug);
-            assert!(limit.max_output_tokens > 0);
-            assert!(
-                limit.context_window.is_some(),
-                "missing context for {}",
-                row.slug
-            );
-            assert_eq!(row.context_window, limit.context_window);
-        }
-    }
-    assert!(crate::subscription_static_models("custom").is_empty());
-    for (provider, model, context, output) in [
-        (
-            "anthropic-oauth",
-            "claude-fable-5-1",
-            Some(1_000_000),
-            128_000,
-        ),
-        (
-            "anthropic-oauth",
-            "claude-haiku-4-5-20251001",
-            Some(200_000),
-            64_000,
-        ),
-        ("openai-oauth", "gpt-5.6-sol", Some(1_050_000), 128_000),
-        ("openai-oauth", "gpt-6-sol", Some(1_050_000), 128_000),
-        ("kimi-oauth", "kimi-for-coding", Some(1_048_576), 32_768),
-        ("grok-oauth", "grok-4.6", Some(500_000), 32_768),
-    ] {
-        let limits = crate::static_model_limits(provider, model);
-        assert_eq!(
-            (limits.context_window, limits.max_output_tokens),
-            (context, output)
-        );
-    }
-}
-
 struct OneAddressResolver(SocketAddr);
 
 #[async_trait::async_trait]

@@ -15,8 +15,8 @@
 //!   with the OAuth bearer and the same beta headers W5b.2 already proves
 //!   work for inference.
 //!
-//! Discovery never synthesizes a successful response. The registry merges
-//! remote rows with the separately identified static subscription catalog.
+//! Discovery never synthesizes a successful response. The maintained rows
+//! live in `subscription_catalog`; the daemon registry merges the two.
 //!
 //! Requests use fixed origins and the same W5a discipline as the token
 //! endpoints: resolve-validate-pin through [`FixedOriginGuard`], proxies
@@ -117,6 +117,13 @@ pub enum CatalogError {
     Empty,
 }
 
+/// Whether a [`CatalogError::Unavailable`] reason records a 403 answer to a
+/// fixed-origin model-list request.
+#[must_use]
+pub fn model_list_forbidden(reason: &str) -> bool {
+    reason.contains("(403)")
+}
+
 impl std::fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -157,71 +164,14 @@ pub enum CatalogSource {
 }
 
 /// Release-owned catalog taxonomy. Offline IDs are authoritative. The
-/// subscription fallback is separate so discovery remains enabled.
+/// subscription fallback lives in `subscription_catalog` so discovery stays
+/// enabled for those providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCatalogDefinition {
     Offline { models: &'static [&'static str] },
     Public { source: CatalogSource },
     Authenticated { source: CatalogSource },
     Adapter,
-}
-
-/// Maintained subscription fallback IDs. Keep these conservative: remote
-/// discovery adds new rows and overrides metadata for matching IDs. Limits
-/// come from `model_limits`, which is also the turn-output limit authority.
-#[must_use]
-pub fn subscription_static_models(provider: &str) -> Vec<DiscoveredModel> {
-    let ids: &[&str] = match provider {
-        crate::ANTHROPIC_OAUTH_PROVIDER_NAME => &[
-            "claude-fable-5-1",
-            "claude-opus-5-5",
-            "claude-sonnet-5",
-            "claude-haiku-4-5-20251001",
-            "claude-opus-5",
-            "claude-fable-5",
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-        ],
-        crate::OPENAI_OAUTH_PROVIDER_NAME => &[
-            "gpt-6-astra",
-            "gpt-6-sol",
-            "gpt-6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.6",
-            "gpt-5.5",
-            "gpt-5.3-codex",
-        ],
-        crate::KIMI_OAUTH_PROVIDER_NAME => &[
-            "kimi-for-coding",
-            "k3",
-            "k3-256k",
-            "kimi-for-coding-highspeed",
-        ],
-        crate::GROK_OAUTH_PROVIDER_NAME => &["grok-4.6", "grok-4.5", "grok-4.3"],
-        crate::HAIDER_CODE_PROVIDER_NAME => &["deepseek-v4-flash"],
-        _ => &[],
-    };
-    ids.iter()
-        .enumerate()
-        .map(|(priority, id)| {
-            let limits = crate::static_model_limits(provider, id);
-            DiscoveredModel {
-                slug: (*id).to_owned(),
-                display_name: (*id).to_owned(),
-                context_window: limits.context_window,
-                description: None,
-                default_effort: None,
-                supported_efforts: Vec::new(),
-                visible: true,
-                priority: Some(priority as i64),
-                extensions: None,
-            }
-        })
-        .collect()
 }
 
 /// Public catalog coverage list used by the credential-free nightly probe.

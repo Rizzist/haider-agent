@@ -1099,15 +1099,18 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             && let Some(profile) = self.get(provider)
             && offline_inventory(profile)
         {
-            return profile.configured_models.clone();
+            return configured_rows(profile)
+                .into_iter()
+                .map(|row| row.model.slug)
+                .collect();
         }
         discovered
     }
 
     fn discovered_details(&self, provider: &str) -> Vec<DiscoveredModel> {
-        catalog_rows(provider, self.model_source.models(provider).as_deref())
+        merged_catalog_rows(provider, self.model_source.models(provider).as_deref())
             .into_iter()
-            .map(|(model, _)| model)
+            .map(|row| row.model)
             .collect()
     }
 
@@ -1117,88 +1120,101 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         has_credential: &dyn Fn(&str) -> bool,
     ) -> ProviderSummaryWire {
         let inventory = self.model_source.inventory(&profile.provider_id);
-        let remote = inventory.models();
-        let discovered = catalog_rows(&profile.provider_id, remote.as_deref());
+        let never_fetched = matches!(inventory, ProviderInventory::NeverFetched);
         // Offline catalogs are authoritative without a network request.
         // An empty remote result never falls back to configured rows.
-        let offline_catalog =
-            matches!(inventory, ProviderInventory::NeverFetched) && offline_inventory(profile);
-        let model_details = if offline_catalog {
-            profile
-                .configured_models
-                .iter()
-                .map(|slug| {
-                    model_detail_wire(
-                        &profile.provider_id,
-                        offline_model(&profile.provider_id, slug),
-                        haider_rpc::ModelDetailSourceWire::Configured,
-                    )
-                })
-                .collect()
+        let offline_catalog = never_fetched && offline_inventory(profile);
+        let rows = if offline_catalog {
+            configured_rows(profile)
         } else {
-            discovered
-                .into_iter()
-                .map(|(model, source)| model_detail_wire(&profile.provider_id, model, source))
-                .collect()
+            merged_catalog_rows(&profile.provider_id, inventory.models().as_deref())
+        };
+        let model_details = rows
+            .into_iter()
+            .map(|row| model_detail_wire(&profile.provider_id, row.model, row.source))
+            .collect();
+        let inventory_wire = if offline_catalog
+            || (never_fetched
+                && haider_provider::has_subscription_static_catalog(&profile.provider_id))
+        {
+            haider_rpc::ModelInventoryWire::Static
+        } else {
+            inventory.provenance()
         };
         provider_summary(
             profile,
             model_details,
             offline_catalog,
             has_credential(&profile.provider_id),
-            if offline_catalog
-                || (remote.is_none()
-                    && !haider_provider::subscription_static_models(&profile.provider_id)
-                        .is_empty()
-                    && matches!(inventory, ProviderInventory::NeverFetched))
-            {
-                haider_rpc::ModelInventoryWire::Static
-            } else {
-                inventory.provenance()
-            },
+            inventory_wire,
         )
     }
 }
 
+/// One pickable model and where it came from.
+struct CatalogRow {
+    model: DiscoveredModel,
+    source: haider_rpc::ModelDetailSourceWire,
+}
+
+/// The final gate every static, remote and configured row passes before it
+/// is projected into a summary or accepted for selection.
+fn servable_row(_provider: &str, model: &DiscoveredModel) -> bool {
+    model.visible
+}
+
 /// Static rows survive a failed or empty remote list. Remote entries replace
 /// matching static metadata, including hidden entries, then add new IDs.
-fn catalog_rows(
-    provider: &str,
-    remote: Option<&[DiscoveredModel]>,
-) -> Vec<(DiscoveredModel, haider_rpc::ModelDetailSourceWire)> {
+fn merged_catalog_rows(provider: &str, remote: Option<&[DiscoveredModel]>) -> Vec<CatalogRow> {
     use haider_rpc::ModelDetailSourceWire;
     let mut rows = haider_provider::subscription_static_models(provider)
         .into_iter()
-        .map(|model| (model, ModelDetailSourceWire::Static))
+        .map(|model| CatalogRow {
+            model,
+            source: ModelDetailSourceWire::Static,
+        })
         .collect::<Vec<_>>();
-    if let Some(remote) = remote {
-        for model in remote {
-            if let Some((fallback, source)) = rows
-                .iter_mut()
-                .find(|(fallback, _)| fallback.slug == model.slug)
-            {
-                let mut merged = model.clone();
-                merged.context_window = merged.context_window.or(fallback.context_window);
-                merged.priority = merged.priority.or(fallback.priority);
-                *fallback = merged;
-                *source = ModelDetailSourceWire::Remote;
-            } else {
-                rows.push((model.clone(), ModelDetailSourceWire::Remote));
-            }
+    for model in remote.unwrap_or_default() {
+        if let Some(row) = rows.iter_mut().find(|row| row.model.slug == model.slug) {
+            let mut merged = model.clone();
+            merged.context_window = merged.context_window.or(row.model.context_window);
+            merged.priority = merged.priority.or(row.model.priority);
+            row.model = merged;
+            row.source = ModelDetailSourceWire::Remote;
+        } else {
+            rows.push(CatalogRow {
+                model: model.clone(),
+                source: ModelDetailSourceWire::Remote,
+            });
         }
     }
-    rows.retain(|(model, _)| model.visible);
-    rows.sort_by(|(left, _), (right, _)| {
-        left.priority
+    rows.retain(|row| servable_row(provider, &row.model));
+    rows.sort_by(|left, right| {
+        left.model
+            .priority
             .unwrap_or(i64::MAX)
-            .cmp(&right.priority.unwrap_or(i64::MAX))
-            .then_with(|| left.display_name.cmp(&right.display_name))
+            .cmp(&right.model.priority.unwrap_or(i64::MAX))
+            .then_with(|| left.model.display_name.cmp(&right.model.display_name))
     });
     rows
 }
 
+/// An offline or configured profile's own rows, in profile order.
+fn configured_rows(profile: &ProviderProfileV1) -> Vec<CatalogRow> {
+    profile
+        .configured_models
+        .iter()
+        .map(|slug| offline_model(&profile.provider_id, slug))
+        .filter(|model| servable_row(&profile.provider_id, model))
+        .map(|model| CatalogRow {
+            model,
+            source: haider_rpc::ModelDetailSourceWire::Configured,
+        })
+        .collect()
+}
+
 /// Offline catalogs and configured Azure deployments use their profile rows;
-/// subscription fallbacks are merged separately by `catalog_rows`.
+/// subscription fallbacks are merged separately by `merged_catalog_rows`.
 fn offline_inventory(profile: &ProviderProfileV1) -> bool {
     matches!(
         haider_provider::provider_catalog_definition(&profile.provider_id),
@@ -1366,13 +1382,12 @@ fn provider_summary(
     // endpoint answers — there is no discovery for these surfaces — so it
     // lights Available only once a credential exists AND the profile has an
     // endpoint to serve from (vertex seeds without one until its card runs).
+    // Subscription static rows are seeded the same way, whatever the state
+    // of their remote list.
     let static_subscription =
-        !haider_provider::subscription_static_models(&profile.provider_id).is_empty();
-    let offline_ready = if offline_catalog || static_subscription {
-        credentialed && profile.base_url.is_some()
-    } else {
-        true
-    };
+        haider_provider::has_subscription_static_catalog(&profile.provider_id);
+    let seeded = offline_catalog || static_subscription;
+    let seeded_ready = !seeded || (credentialed && profile.base_url.is_some());
     let inventory_is_current = matches!(
         &inventory,
         haider_rpc::ModelInventoryWire::Static
@@ -1382,7 +1397,7 @@ fn provider_summary(
     let available = profile.enabled
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && !discovered_models.is_empty()
-        && offline_ready
+        && seeded_ready
         && (inventory_is_current || static_subscription);
     let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
         && matches!(
@@ -1421,9 +1436,9 @@ fn provider_summary(
             "provider is disabled".to_owned()
         } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
             "provider API family is unavailable".to_owned()
-        } else if (offline_catalog || static_subscription) && profile.base_url.is_none() {
+        } else if seeded && profile.base_url.is_none() {
             "provider endpoint is not configured".to_owned()
-        } else if (offline_catalog || static_subscription) && !credentialed {
+        } else if seeded && !credentialed {
             "provider has no credential".to_owned()
         } else if let haider_rpc::ModelInventoryWire::Stale { reason, .. }
         | haider_rpc::ModelInventoryWire::Unavailable { reason } = &inventory

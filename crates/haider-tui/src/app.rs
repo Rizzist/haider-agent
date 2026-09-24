@@ -1160,13 +1160,7 @@ fn normalize_provider_inventory(
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         });
     summary.inventory = summary.inventory.at_time(now);
-    if !summary.has_static_models()
-        && matches!(
-            summary.inventory,
-            haider_rpc::ModelInventoryWire::NeverFetched
-                | haider_rpc::ModelInventoryWire::Unavailable { .. }
-        )
-    {
+    if !summary.has_known_models() {
         summary.models.clear();
         summary.model_details.clear();
         summary.default_model = None;
@@ -5056,6 +5050,8 @@ pub struct ModelPickerRow {
     /// `oauth` / `api` — what a turn on this row meters.
     pub auth: &'static str,
     pub context_window: Option<u64>,
+    /// Daemon-declared row origin; `None` for placeholders, mixed groups and
+    /// older daemons.
     pub source: Option<haider_rpc::ModelDetailSourceWire>,
     /// Age in milliseconds of the provider inventory used for this row.
     pub inventory_age_ms: Option<u64>,

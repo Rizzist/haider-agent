@@ -1,9 +1,12 @@
 # Subscription model fallback catalog
 
 Subscription accounts can run inference even when their credential receives
-`403` from `/models`. `haider-provider::subscription_static_models` supplies
-maintained IDs in that case. The daemon merges these with remote discovery;
-remote metadata wins for the same ID, including a remote hidden flag.
+`403` from `/models`. The maintained IDs live in
+`crates/haider-provider/src/subscription_catalog.rs`
+(`subscription_static_models`). The daemon merges these with remote
+discovery in `provider_registry::merged_catalog_rows`; remote metadata wins
+for the same ID, including a remote hidden flag. Every static, remote and
+configured row then passes the single `servable_row` gate before projection.
 `ModelDetailWire.source` identifies each pickable row as `static`, `remote`,
 or `configured`. A failed model-list fetch remains in the provider inventory
 as information and does not change account health.

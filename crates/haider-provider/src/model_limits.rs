@@ -1,10 +1,17 @@
-//! Pinned token limits used when provider catalogs are unavailable or omit
-//! limits. Catalog declarations always win at daemon projection time.
+//! Pinned per-model token limits: the single static source for context
+//! windows and output ceilings used when a provider catalog is unavailable or
+//! omits them. Catalog declarations always win at daemon projection time.
+//!
+//! Provenance: rows serving the subscription catalog cite the provider
+//! references recorded, with their check date, in
+//! `docs/subscription-model-catalog.md`. Values marked "local" are
+//! conservative ceilings chosen here because the provider publishes no
+//! maximum; they never claim an API limit. Rows for other families have no
+//! recorded source yet.
 
-/// Conservative provider fallback for a model family whose exact row is not
-/// yet in the pinned table. Every fallback is deliberately above the legacy
-/// 4,096-token ceiling while remaining inside the family's established API
-/// maximum.
+/// Local output ceiling for a model whose provider publishes no maximum, or
+/// whose family is not in the table yet. It is deliberately above the legacy
+/// 4,096-token ceiling while remaining inside the family's API maximum.
 pub const UNKNOWN_OUTPUT_LIMIT: u64 = 32_768;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,16 +29,19 @@ pub fn static_model_limits(provider: &str, model: &str) -> StaticModelLimits {
         "gemini" | "google-antigravity" => gemini_limits(&model),
         "deepseek" => deepseek_limits(&model),
         "kimi-oauth" => kimi_limits(&model),
+        // Context: xAI model table, via the adapter's seed windows.
+        // Output: local.
         "xai" | "grok-oauth" => StaticModelLimits {
             context_window: crate::XAI_SEED_MODEL_CONTEXT_WINDOWS
                 .iter()
                 .find_map(|(id, window)| (*id == model).then_some(*window)),
-            max_output_tokens: 32_768,
+            max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
         },
+        // Context: the public Haider Code catalog declares 128K for its
+        // flash row. Output: local.
         "haider-code" => StaticModelLimits {
-            // The public Haider Code catalog declares 128K for its flash row.
             context_window: (model == "deepseek-v4-flash").then_some(128_000),
-            max_output_tokens: 32_768,
+            max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
         },
         _ => StaticModelLimits {
             context_window: None,
@@ -40,6 +50,7 @@ pub fn static_model_limits(provider: &str, model: &str) -> StaticModelLimits {
     }
 }
 
+/// Context: Kimi Code model table. Output: local.
 fn kimi_limits(model: &str) -> StaticModelLimits {
     let context_window = match model {
         // K3's 1M window depends on membership; advertise the safe common
@@ -50,12 +61,15 @@ fn kimi_limits(model: &str) -> StaticModelLimits {
     };
     StaticModelLimits {
         context_window,
-        max_output_tokens: 32_768,
+        max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
     }
 }
 
+/// Claude model table, matched by family so dated and platform (Bedrock,
+/// Vertex) spellings share a row. Unmatched families get a conservative
+/// window rather than a newer family's.
 fn anthropic_limits(model: &str) -> StaticModelLimits {
-    let current_long = [
+    const MILLION_CONTEXT_FAMILIES: [&str; 7] = [
         "fable-5",
         "opus-5",
         "sonnet-5",
@@ -63,18 +77,15 @@ fn anthropic_limits(model: &str) -> StaticModelLimits {
         "opus-4-7",
         "opus-4-6",
         "sonnet-4-6",
-    ]
-    .iter()
-    .any(|needle| model.contains(needle));
-    if current_long {
+    ];
+    const TWO_HUNDRED_K_FAMILIES: [&str; 3] = ["opus-4-5", "sonnet-4-5", "haiku-4-5"];
+    let in_family = |families: &[&str]| families.iter().any(|family| model.contains(family));
+    if in_family(&MILLION_CONTEXT_FAMILIES) {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 128_000,
         }
-    } else if model.contains("opus-4-5")
-        || model.contains("sonnet-4-5")
-        || model.contains("haiku-4-5")
-    {
+    } else if in_family(&TWO_HUNDRED_K_FAMILIES) {
         StaticModelLimits {
             context_window: Some(200_000),
             max_output_tokens: 64_000,
@@ -87,6 +98,8 @@ fn anthropic_limits(model: &str) -> StaticModelLimits {
     }
 }
 
+/// OpenAI model cards, matched by ID prefix. The GPT-6, GPT-5.6, GPT-5.5 and
+/// GPT-5.3 Codex rows serve the subscription catalog.
 fn openai_limits(model: &str) -> StaticModelLimits {
     if model.starts_with("gpt-6-") || model.starts_with("gpt-5.6") || model.starts_with("gpt-5.5") {
         StaticModelLimits {
@@ -121,7 +134,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
     } else {
         StaticModelLimits {
             context_window: None,
-            max_output_tokens: 32_768,
+            max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
         }
     }
 }
