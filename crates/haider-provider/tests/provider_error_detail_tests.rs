@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used)]
 
+use haider_provider::acp::client::AcpError;
+use haider_provider::acp::wire::JsonRpcError;
 use haider_provider::{
     ProviderErrorKind, replay_anthropic_http_error, replay_gemini_http_error,
     replay_openai_http_error, replay_openai_responses_sse,
@@ -14,6 +16,224 @@ fn classifiers() -> [Classifier; 3] {
         replay_gemini_http_error,
         replay_openai_http_error,
     ]
+}
+
+#[test]
+fn marked_account_names_and_tenant_hosts_do_not_publish() {
+    for (message, private) in [
+        (
+            "Your organization cedarbranch has no access.",
+            "cedarbranch",
+        ),
+        (
+            "Your organization 'cedarbranch labs' has no access.",
+            "cedarbranch",
+        ),
+        (
+            "Your organization “cedarbranch labs” has no access.",
+            "cedarbranch",
+        ),
+        (
+            "Your organization ©cedarbranch has no access.",
+            "cedarbranch",
+        ),
+        ("Your org Cedarbranch Labs has no access.", "Cedarbranch"),
+        ("Your organization Does Labs has no access.", "Does Labs"),
+        ("The workspace northquay lacks permission.", "northquay"),
+        ("The project beaconridge is disabled.", "beaconridge"),
+        ("Team silver meadow is disabled.", "silver meadow"),
+        ("TEAM: silver meadow is disabled.", "silver meadow"),
+        ("The team name silver meadow is disabled.", "silver meadow"),
+        ("tenant 'cedarbranch labs' is disabled.", "cedarbranch"),
+        ("account cedarbranch is disabled.", "cedarbranch"),
+        (
+            "Your organization cеdarbranch has no access.",
+            "cеdarbranch",
+        ),
+        (
+            "See https://cedarbranch.synthetic.example/private?x=1",
+            "cedarbranch",
+        ),
+    ] {
+        for classify in [replay_anthropic_http_error, replay_openai_http_error] {
+            let body = serde_json::json!({"error": {"message": message}}).to_string();
+            let detail = classify(403, None, body.as_bytes()).presentation.detail;
+            assert!(!detail.contains(private), "{message}: {detail}");
+        }
+    }
+}
+
+#[test]
+fn account_names_are_scrubbed_in_place_across_label_shapes() {
+    for (message, private) in [
+        ("Your organization is cedarbranch.", "cedarbranch"),
+        (
+            "Your account, cedarbranch labs, has no access.",
+            "cedarbranch",
+        ),
+        ("ORGANIZATION cedarbranch has no access.", "cedarbranch"),
+        (
+            "Your organization \u{201c}cedarbranch labs has no access.",
+            "cedarbranch",
+        ),
+        (
+            "Your organization `cedarbranch` has no access.",
+            "cedarbranch",
+        ),
+        ("The project (beaconridge) is disabled.", "beaconridge"),
+        ("Organisation northquay lacks permission.", "northquay"),
+        ("Customer cedarbranch was suspended.", "cedarbranch"),
+        ("The user cedarbranch cannot use this model.", "cedarbranch"),
+        ("Denied: tenant - cedarbranch - is disabled.", "cedarbranch"),
+        ("The team Is Cedarbranch is disabled.", "Cedarbranch"),
+    ] {
+        for classify in classifiers() {
+            let body = serde_json::json!({"error": {"message": message}}).to_string();
+            let detail = classify(403, None, body.as_bytes()).presentation.detail;
+            assert!(!detail.contains(private), "{message}: {detail}");
+        }
+    }
+    for (message, expected) in [
+        (
+            "Your organization cedarbranch has no access to this model.",
+            "Your organization [REDACTED] has no access to this model.",
+        ),
+        (
+            "Your organization 'cedarbranch labs' has no access.",
+            "Your organization [REDACTED] has no access.",
+        ),
+        (
+            "Rate limit reached for gpt-4o in organization cedarbranch on tokens per min.",
+            "Rate limit reached for gpt-4o in organization [REDACTED] on tokens per min.",
+        ),
+        (
+            "Your organization is cedarbranch.",
+            "Your organization is [REDACTED].",
+        ),
+        (
+            "The workspace northquay lacks permission.",
+            "The workspace [REDACTED] lacks permission.",
+        ),
+    ] {
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        assert_eq!(
+            replay_openai_http_error(403, None, body.as_bytes())
+                .presentation
+                .detail,
+            expected
+        );
+    }
+}
+
+#[test]
+fn ordinary_account_prose_is_not_mistaken_for_a_name() {
+    for message in [
+        "Your organization does not have access to this model.",
+        "Your organization is not allowed to use this model.",
+        "Your account is not active, please check your billing details.",
+        "Your organization has been disabled.",
+        "This organization is currently suspended.",
+        "You must be a member of an organization to use the API.",
+        "Please contact your organization administrator.",
+        "Check billing or switch account.",
+        "The first message must use the user role.",
+        "Roles must alternate between \"user\" and \"assistant\".",
+        "Your project quota was exceeded.",
+        "The account associated with this API key has been deactivated.",
+    ] {
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        for classify in [replay_anthropic_http_error, replay_openai_http_error] {
+            assert_eq!(
+                classify(403, None, body.as_bytes()).presentation.detail,
+                message
+            );
+        }
+    }
+}
+
+#[test]
+fn grammatical_account_prose_and_public_documentation_hosts_remain_useful() {
+    for predicate in [
+        "does",
+        "doesn't",
+        "is",
+        "isn't",
+        "has",
+        "hasn't",
+        "have",
+        "lacks",
+        "cannot",
+        "can't",
+        "may",
+        "must",
+        "should",
+        "was",
+        "will",
+        "not",
+        "currently",
+    ] {
+        let message = format!("Your organization {predicate} access to this model.");
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        assert_eq!(
+            replay_openai_http_error(403, None, body.as_bytes())
+                .presentation
+                .detail,
+            message
+        );
+    }
+    for host in [
+        "platform.openai.com",
+        "status.anthropic.com",
+        "ai.google.dev",
+    ] {
+        let message = format!("See https://{host}/private?token=fixture for help.");
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        let detail = replay_openai_http_error(403, None, body.as_bytes())
+            .presentation
+            .detail;
+        assert!(detail.contains(&format!("https://{host}")), "{detail}");
+        assert!(!detail.contains("fixture"), "{detail}");
+    }
+    for host in [
+        "cedarbranch.synthetic.example",
+        "tenant.status.openai.com",
+        "api.openai.com.synthetic.example",
+    ] {
+        let message = format!("See https://{host}/private?token=fixture for help.");
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        let detail = replay_openai_http_error(403, None, body.as_bytes())
+            .presentation
+            .detail;
+        assert!(detail.contains("[link removed]"), "{detail}");
+        assert!(!detail.contains(host), "{detail}");
+    }
+    let message = "See cedarbranch://api.openai.com/private for help.";
+    let body = serde_json::json!({"error": {"message": message}}).to_string();
+    let detail = replay_openai_http_error(403, None, body.as_bytes())
+        .presentation
+        .detail;
+    assert!(!detail.contains("cedarbranch"), "{detail}");
+}
+
+#[test]
+fn acp_conversion_never_retains_child_prose_in_the_message_or_journal() {
+    let private = "robin.verify2@synthetic.example";
+    let error = AcpError::Rpc(JsonRpcError {
+        code: -32000,
+        message: format!("Permission denied for {private}"),
+        data: None,
+    })
+    .into_provider_error(&format!("agent stderr: account {private}"));
+    assert!(!error.message.contains(private));
+    assert!(!error.presentation.detail.contains(private));
+    assert!(!error.public_message().contains(private));
+    let journal = serde_json::to_string(&error).expect("serialize ACP provider error");
+    assert!(!journal.contains(private));
+    let injected = haider_provider::ProviderError::new(
+        ProviderErrorKind::PermissionDenied,
+        format!("Permission denied for {private}"),
+    );
+    assert!(!injected.public_message().contains(private));
 }
 
 #[test]
@@ -455,7 +675,7 @@ fn redaction_pairs_never_expose_synthetic_account_values() {
         let url = serde_json::json!({"error": {"message": "See https://example.test/private?token=fixture973query for quota details."}}).to_string();
         assert_eq!(
             classify(400, None, url.as_bytes()).presentation.detail,
-            "See https://example.test for quota details."
+            "See [link removed] for quota details."
         );
     }
     let near_cut = format!("{} alice973@example.test", "safe ".repeat(101));
@@ -538,4 +758,43 @@ fn post_scrub_byte_limit_never_cuts_a_unicode_scalar_or_secret() {
         .detail;
     assert!(detail.ends_with(WITHHELD));
     assert!(!detail.contains('🦀'));
+}
+
+#[test]
+fn acp_auth_method_ids_keep_protocol_names_but_not_account_values() {
+    let error = AcpError::AuthMethodUnavailable {
+        advertised: vec![
+            "gemini-api-key".to_owned(),
+            "robin.verify2@synthetic.example".to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        ],
+    }
+    .into_provider_error("");
+    assert!(
+        error.message.contains("gemini-api-key"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("robin.verify2"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("0123456789abcdef"),
+        "{}",
+        error.message
+    );
+    assert!(!error.public_message().contains("robin.verify2"));
+}
+
+#[test]
+fn local_timeout_telemetry_survives_the_public_message_policy() {
+    let error = haider_provider::deadline_exhausted_error(
+        std::time::Duration::from_millis(2_000),
+        std::time::Duration::from_millis(1_500),
+    );
+    let message = error.public_message();
+    assert!(message.contains("reason=deadline_exhausted"), "{message}");
+    assert!(message.contains("opened_within_ms=1500"), "{message}");
 }

@@ -13334,7 +13334,11 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
     } else {
         ErrorCode::ProviderError
     };
-    let mut error = HaiderError::new(code, provider_error.to_string(), provider_error.retryable);
+    let mut error = HaiderError::new(
+        code,
+        provider_error.public_message(),
+        provider_error.retryable,
+    );
     error.details = Some(serde_json::json!({
         "provider_error_kind": format!("{:?}", provider_error.kind),
         "retry_after_ms": provider_error.retry_after_ms,
@@ -15822,6 +15826,27 @@ mod cu1_actor_tests {
         let presentation = error.presentation.expect("provider presentation");
         assert_eq!(presentation.opened_within_ms, Some(60_000));
         assert_eq!(presentation.budget_ms, Some(60_000));
+    }
+
+    #[test]
+    fn provider_message_is_scrubbed_before_run_failed_journaling() {
+        let private = "robin.verify2@synthetic.example";
+        let provider_error =
+            haider_provider::acp::client::AcpError::Rpc(haider_provider::acp::wire::JsonRpcError {
+                code: -32000,
+                message: format!("Permission denied for {private}"),
+                data: None,
+            })
+            .into_provider_error(&format!("agent stderr: account {private}"));
+        let error = provider_error_to_haider(provider_error);
+        let payload = EventPayload::RunFailed {
+            code: error.code,
+            message: sanitized_failure_message(&error.message),
+            retryable: error.retryable,
+            presentation: Some(presentation_for_haider_error(&error)),
+        };
+        let journal = serde_json::to_string(&payload).expect("serialize run failure");
+        assert!(!journal.contains(private), "{journal}");
     }
 
     #[tokio::test]

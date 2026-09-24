@@ -2004,9 +2004,7 @@ fn normalize_stop_reason(reason: &str) -> Result<FinishReason, ProviderError> {
             "Anthropic reported model_context_window_exceeded",
         )),
         "refusal" => Ok(FinishReason::Refusal),
-        _ => Err(malformed(format!(
-            "Anthropic returned unknown stop_reason `{reason}`"
-        ))),
+        _ => Err(malformed("Anthropic returned an unknown stop_reason")),
     }
 }
 

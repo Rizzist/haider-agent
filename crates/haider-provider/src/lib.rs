@@ -2805,6 +2805,28 @@ impl ProviderError {
         Self::new_with_presentation(kind, message, provider_error_presentation(kind))
     }
 
+    /// The only message form core may persist in `RunFailed`. Adapter
+    /// messages can interpolate provider- or child-controlled text (frame
+    /// fields, decoder errors, ACP RPC prose), so the message passes the same
+    /// `error_detail` policy as presentation prose even when the structured
+    /// presentation has already been sanitized. Local timeout errors
+    /// (`timeout_reason` set by `deadline_exhausted_error`, the idle deadline
+    /// and the response-open budget) are Haider-authored templates carrying
+    /// only numeric telemetry such as `reason=deadline_exhausted
+    /// opened_within_ms=…`, which the opaque-value scrubber would mangle, so
+    /// they are kept verbatim.
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        if self.timeout_reason.is_some() {
+            return self.to_string();
+        }
+        format!(
+            "{:?}: {}",
+            self.kind,
+            public_provider_message(self.kind, &self.message)
+        )
+    }
+
     fn new_with_presentation(
         kind: ProviderErrorKind,
         message: impl Into<String>,
@@ -3188,7 +3210,7 @@ pub(crate) fn reqwest_transport_error_with_route_gating(
     } else {
         ProviderError::new(
             ProviderErrorKind::Transport,
-            format!("{provider} HTTP transport failed: {error}"),
+            format!("{provider} HTTP transport failed"),
         )
     }
 }
@@ -3200,6 +3222,15 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+/// Scrubs a `ProviderError.message` candidate through the provider-detail
+/// policy. When safety cannot be established the provider-class default
+/// explanation replaces it, so raw text never survives as a fallback.
+pub(crate) fn public_provider_message(kind: ProviderErrorKind, raw: &str) -> String {
+    crate::error_detail::sanitize_provider_error_detail(raw)
+        .filter(|detail| detail != haider_protocol::error::PROVIDER_DETAIL_WITHHELD)
+        .unwrap_or_else(|| provider_error_presentation(kind).detail)
+}
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)

@@ -33,17 +33,187 @@ static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}").expect("static email regex")
 });
 static ACCOUNT_ID: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(^|[^A-Z0-9])(?:org|acct|account|user|proj|project|workspace|credit|session)[_-][A-Z0-9_-]+")
+    Regex::new(r"(?i)(^|[^A-Z0-9])(?:org|acct|account|user|proj|project|workspace|team|tenant|credit|session)[_-][A-Z0-9_-]+")
     .expect("static account id regex")
 });
 static LABELED_VALUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b(?:organization|org|account|user|project|workspace|customer|tenant|email|cookie|session|prompt|request[_ -]?(?:body|id)|response[_ -]?body|token|secret|api[_ -]?key|authorization|access[_ -]?token|refresh[_ -]?token)\b(?:[_ -]?(?:id|name|named))?\s*[:=]\s*[^,;.]+|\b(?:organization|org|account|user|project|workspace|customer|tenant)\s+(?:id|name|named)\s+[^,;.]+"#).expect("static labeled value regex")
+    Regex::new(r#"(?i)\b(?:organization|org|account|user|project|workspace|team|customer|tenant|email|cookie|session|prompt|request[_ -]?(?:body|id)|response[_ -]?body|token|secret|api[_ -]?key|authorization|access[_ -]?token|refresh[_ -]?token)\b(?:[_ -]?(?:id|name|named))?\s*[:=]\s*[^,;.]+|\b(?:organization|org|account|user|project|workspace|team|customer|tenant)\s+(?:id|name|named)\s+[^,;.]+"#).expect("static labeled value regex")
 });
-static NAMED_ACCOUNT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:organization|org|account|user|project|workspace|customer|tenant)\s+[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*)*").expect("static named account regex")
+static ACCOUNT_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    // Case-insensitive, Unicode word boundaries: `Organization`, `ORG` and
+    // `org` all open a name context; `organizations`, `org_…` and
+    // `account-level` do not (ids are handled by `ACCOUNT_ID`).
+    Regex::new(
+        r"(?i)\b(?:organization|organisation|org|account|user|project|workspace|team|customer|tenant)\b",
+    )
+    .expect("static account label regex")
 });
+/// Lower-case words that END an account label's name context instead of
+/// being part of a name. Without this list "Your organization does not have
+/// access to this model." would lose its useful predicate. Matching is exact
+/// and case-sensitive: a title-cased or upper-cased stopword ("Does Labs")
+/// may itself be a name and is scrubbed, because over-scrubbing an ambiguous
+/// token is preferred to leaking it. Groups: auxiliaries/predicates,
+/// adverbs, prepositions/conjunctions/determiners, and structural nouns or
+/// participles that describe the account rather than name it.
+const ACCOUNT_CONTEXT_END: &[&str] = &[
+    // Auxiliaries and predicates.
+    "does",
+    "doesn't",
+    "do",
+    "don't",
+    "did",
+    "didn't",
+    "is",
+    "isn't",
+    "are",
+    "aren't",
+    "was",
+    "wasn't",
+    "were",
+    "weren't",
+    "has",
+    "hasn't",
+    "have",
+    "haven't",
+    "had",
+    "hadn't",
+    "lacks",
+    "lack",
+    "cannot",
+    "can't",
+    "can",
+    "could",
+    "couldn't",
+    "may",
+    "might",
+    "must",
+    "should",
+    "shouldn't",
+    "will",
+    "won't",
+    "would",
+    "wouldn't",
+    "needs",
+    "need",
+    "requires",
+    "reached",
+    "exceeded",
+    "exceeds",
+    // Adverbs.
+    "not",
+    "no",
+    "currently",
+    "already",
+    "still",
+    "now",
+    "only",
+    "also",
+    // Prepositions, conjunctions, determiners.
+    "to",
+    "for",
+    "from",
+    "with",
+    "without",
+    "in",
+    "on",
+    "at",
+    "by",
+    "of",
+    "via",
+    "as",
+    "and",
+    "or",
+    "but",
+    "that",
+    "which",
+    "who",
+    "if",
+    "because",
+    "so",
+    "than",
+    "until",
+    "the",
+    "a",
+    "an",
+    "this",
+    "your",
+    "its",
+    "please",
+    // Structural nouns / participles about the account, not its name.
+    "access",
+    "role",
+    "field",
+    "message",
+    "messages",
+    "content",
+    "settings",
+    "balance",
+    "limit",
+    "limits",
+    "quota",
+    "billing",
+    "plan",
+    "tier",
+    "level",
+    "usage",
+    "credits",
+    "permissions",
+    "owner",
+    "admin",
+    "administrator",
+    "associated",
+    "linked",
+    "used",
+    "specified",
+    "provided",
+    "configured",
+];
+/// A copula directly after the label ("Your organization is …") may introduce
+/// a name ("is cedarbranch") as easily as a state. The word that follows must
+/// then be a context-ending word or one of these known states; anything else
+/// is scrubbed as a possible name.
+const ACCOUNT_COPULAS: &[&str] = &["is", "was", "are", "were"];
+const ACCOUNT_STATES: &[&str] = &[
+    "disabled",
+    "suspended",
+    "deactivated",
+    "inactive",
+    "active",
+    "restricted",
+    "blocked",
+    "limited",
+    "locked",
+    "archived",
+    "deleted",
+    "expired",
+    "unverified",
+    "verified",
+    "pending",
+    "required",
+    "invalid",
+    "unavailable",
+    "ineligible",
+    "eligible",
+    "allowed",
+    "permitted",
+    "missing",
+    "flagged",
+    "unable",
+    "over",
+    "out",
+    "past",
+    "below",
+    "above",
+    "being",
+    "using",
+    "too",
+    "rate",
+];
+/// Characters that end a name clause when they trail a token.
+const CLAUSE_DELIMITERS: &[char] = &[',', ';', '.', ':', '!', '?', ')'];
 static NAMED_LABEL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:organization|org|account|user|project|workspace|customer|tenant)\s+(?:id|name|named)\b").expect("static named label regex")
+    Regex::new(r"(?i)\b(?:organization|org|account|user|project|workspace|team|customer|tenant)\s+(?:id|name|named)\b").expect("static named label regex")
 });
 static OPAQUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:[A-F0-9]{16,}|[A-Z0-9+/=_-]{20,})\b").expect("static opaque value regex")
@@ -52,7 +222,7 @@ static CREDENTIAL_LABEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:authorization|proxy-authorization|bearer|x-api-key|x_api_key|api-key|api_key|apikey|access_token|access-token|refresh_token|refresh-token|cookie|set-cookie|echoed)\b\s*[:=]?").expect("static credential label regex")
 });
 static PRIVATE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:prompt|request[_ -]?(?:body|id)|response[_ -]?body|token|secret|session|account|org|organization|user|project|workspace|credit|email)(?:[_ -]?(?:id|name))?\s*[:=]").expect("static private label regex")
+    Regex::new(r"(?i)\b(?:prompt|request[_ -]?(?:body|id)|response[_ -]?body|token|secret|session|account|org|organization|user|project|workspace|team|tenant|credit|email)(?:[_ -]?(?:id|name))?\s*[:=]").expect("static private label regex")
 });
 static CREDENTIAL_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:sk-|sess-|AKIA|ghp_|xoxb-|eyJ)[A-Za-z0-9_-]{8,}")
@@ -113,6 +283,28 @@ const REQUEST_ID_ACCOUNT_MARKERS: &[&str] = &[
     "acct_", "account", "org_", "user_", "credit", "cookie", "session", "token", "prompt", "body",
     "email",
 ];
+
+/// Only public provider or documentation origins have a useful host to show.
+/// Exact matches prevent tenant subdomains (including `status.*` impostors)
+/// from becoming part of a durable error or masked export.
+const PUBLIC_PROVIDER_URL_HOSTS: &[&str] = &[
+    "api.openai.com",
+    "platform.openai.com",
+    "help.openai.com",
+    "status.openai.com",
+    "api.anthropic.com",
+    "console.anthropic.com",
+    "docs.anthropic.com",
+    "support.anthropic.com",
+    "status.anthropic.com",
+    "generativelanguage.googleapis.com",
+    "ai.google.dev",
+    "status.cloud.google.com",
+    "api.deepseek.com",
+    "platform.deepseek.com",
+    "status.deepseek.com",
+];
+const LINK_REMOVED: &str = "[link removed]";
 
 /// Locates the provider's own error prose in an HTTP error body (JSON
 /// envelope, or the raw UTF-8 body). Raw and untrusted: callers may classify
@@ -182,28 +374,28 @@ pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
     // restored after that pass; userinfo, path, query and fragment are gone.
     let (detail, urls, url_marker) = protect_url_hosts(&detail);
     let tail_label = [
-        CREDENTIAL_LABEL.find(&detail),
-        PRIVATE_LABEL.find(&detail),
-        NAMED_LABEL.find(&detail),
-        NAMED_ACCOUNT.find(&detail),
+        CREDENTIAL_LABEL.find(&detail).map(|found| found.start()),
+        PRIVATE_LABEL.find(&detail).map(|found| found.start()),
+        NAMED_LABEL.find(&detail).map(|found| found.start()),
     ]
     .into_iter()
     .flatten()
-    .min_by_key(regex::Match::start);
-    let detail = if let Some(label) = tail_label {
+    .min();
+    let detail = if let Some(start) = tail_label {
         if CREDENTIAL_PREFIX
             .find(&detail)
-            .is_some_and(|prefix| prefix.start() < label.start())
+            .is_some_and(|prefix| prefix.start() < start)
         {
             return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
         }
-        let start = open_quote_before(&detail, label.start()).unwrap_or(label.start());
+        let start = open_quote_before(&detail, start).unwrap_or(start);
         format!("{}{}", &detail[..start], REDACTED)
     } else if CREDENTIAL_PREFIX.is_match(&detail) {
         return Some(PROVIDER_DETAIL_WITHHELD.to_owned());
     } else {
         detail
     };
+    let detail = scrub_account_names(&detail);
     let redacted = haider_tools::redact_output_text(&detail);
     let mut prose = match redact_credentials(&redacted) {
         Some(prose) => prose,
@@ -223,7 +415,8 @@ pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
         })
         .into_owned();
     prose = LABELED_VALUE.replace_all(&prose, REDACTED).into_owned();
-    prose = NAMED_ACCOUNT.replace_all(&prose, REDACTED).into_owned();
+    // Restored URL hosts and redactor output are checked again.
+    prose = scrub_account_names(&prose);
     prose = OPAQUE.replace_all(&prose, REDACTED).into_owned();
     let prose = prose.trim();
     if prose.is_empty()
@@ -249,6 +442,90 @@ fn unsafe_unicode(ch: char) -> bool {
                 | '\u{2060}'..='\u{206f}'
                 | '\u{feff}'
         )
+}
+
+/// Replaces the name that follows an account label (organization, org,
+/// workspace, project, team, tenant, account, user, customer) with
+/// `[REDACTED]`, keeping the label and the rest of the sentence. A quoted
+/// name is removed through its closing quote (to the end if unclosed); an
+/// unquoted name runs until a clause delimiter or a context-ending word.
+fn scrub_account_names(detail: &str) -> String {
+    let mut output = String::with_capacity(detail.len());
+    let mut cursor = 0;
+    for label in ACCOUNT_LABEL.find_iter(detail) {
+        if label.start() < cursor {
+            continue;
+        }
+        if let Some(name) = account_name_span(detail, label.end()) {
+            output.push_str(&detail[cursor..name.start]);
+            output.push_str(REDACTED);
+            cursor = name.end;
+        }
+    }
+    output.push_str(&detail[cursor..]);
+    output
+}
+
+fn closing_quote(open: char) -> Option<char> {
+    match open {
+        '\'' | '"' | '`' => Some(open),
+        '\u{201c}' => Some('\u{201d}'),
+        '\u{2018}' => Some('\u{2019}'),
+        '\u{ab}' => Some('\u{bb}'),
+        _ => None,
+    }
+}
+
+fn account_name_span(detail: &str, label_end: usize) -> Option<std::ops::Range<usize>> {
+    let rest = &detail[label_end..];
+    // The label must be followed by whitespace, optionally after an
+    // appositive comma or dash ("organization, cedarbranch, has …").
+    let separator = rest.trim_start_matches([',', '-', '\u{2013}', '\u{2014}']);
+    let skipped = rest.len() - separator.len();
+    if skipped > 1 || !separator.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut position = label_end + skipped + (separator.len() - separator.trim_start().len());
+    let mut span: Option<std::ops::Range<usize>> = None;
+    let mut first = true;
+    let mut after_copula = false;
+    while position < detail.len() {
+        let rest = &detail[position..];
+        let open = rest.chars().next()?;
+        if let Some(close) = closing_quote(open) {
+            let body = position + open.len_utf8();
+            let end = detail[body..]
+                .find(close)
+                .map_or(detail.len(), |found| body + found + close.len_utf8());
+            let start = span.as_ref().map_or(position, |span| span.start);
+            return Some(start..end);
+        }
+        let token_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..token_len];
+        let word = token.trim_end_matches(CLAUSE_DELIMITERS);
+        if word.is_empty() {
+            break;
+        }
+        let copula = first && ACCOUNT_COPULAS.contains(&word);
+        let ends_context = !copula
+            && (ACCOUNT_CONTEXT_END.contains(&word)
+                || (after_copula && ACCOUNT_STATES.contains(&word)));
+        if ends_context {
+            break;
+        }
+        if !copula {
+            let end = position + word.len();
+            span = Some(span.map_or(position..end, |span| span.start..end));
+        }
+        if word.len() < token.len() {
+            break;
+        }
+        after_copula = copula;
+        first = false;
+        let next = &rest[token_len..];
+        position += token_len + (next.len() - next.trim_start().len());
+    }
+    span
 }
 
 /// If a sensitive label occurs inside an echoed quoted value, the text
@@ -297,11 +574,12 @@ fn url_host(captures: &Captures<'_>) -> String {
         .ok()
         .and_then(|parsed| {
             parsed.host_str().and_then(|host| {
-                (!ACCOUNT_ID.is_match(host) && !OPAQUE.is_match(host))
-                    .then(|| format!("{}://{host}{punctuation}", parsed.scheme()))
+                (matches!(parsed.scheme(), "http" | "https")
+                    && PUBLIC_PROVIDER_URL_HOSTS.contains(&host))
+                .then(|| format!("{}://{host}{punctuation}", parsed.scheme()))
             })
         })
-        .unwrap_or_else(|| REDACTED.to_owned())
+        .unwrap_or_else(|| format!("{LINK_REMOVED}{punctuation}"))
 }
 
 fn protect_url_hosts(detail: &str) -> (String, Vec<String>, String) {
@@ -333,6 +611,11 @@ fn scrub_body_fragment(detail: &str) -> Option<String> {
             return None;
         }
         output.push_str(&detail[cursor..start]);
+        if detail[start..].starts_with(LINK_REMOVED) {
+            output.push_str(LINK_REMOVED);
+            cursor = start + LINK_REMOVED.len();
+            continue;
+        }
         let mut stack = Vec::new();
         let mut quoted = false;
         let mut escaped = false;

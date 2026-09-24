@@ -982,11 +982,8 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             {
                 if let Some(presentation) = &failure.presentation {
                     eprintln!("haider: {} — {}", presentation.title, presentation.detail);
-                    if let Some(error_type) = &presentation.provider_error_type {
-                        eprintln!("haider: Provider error type: {error_type}");
-                    }
-                    if let Some(request_id) = &presentation.provider_request_id {
-                        eprintln!("haider: Request id: {request_id}");
+                    for line in provider_identity_lines(presentation) {
+                        eprintln!("haider: {line}");
                     }
                 } else {
                     eprintln!("haider: {}", failure.message);
@@ -1037,6 +1034,22 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             ExitCode::from(exit_code_for_error(&error))
         }
     }
+}
+
+fn provider_identity_lines(
+    presentation: &haider_protocol::error::ErrorPresentation,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(status) = presentation.provider_http_status {
+        lines.push(format!("HTTP {status}"));
+    }
+    if let Some(error_type) = &presentation.provider_error_type {
+        lines.push(format!("Provider error type: {error_type}"));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        lines.push(format!("Request id: {request_id}"));
+    }
+    lines
 }
 
 #[cfg(unix)]
@@ -2346,6 +2359,30 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_error_identity_includes_http_status() {
+        let presentation = haider_protocol::error::ErrorPresentation::new(
+            "provider-overloaded",
+            "Provider is overloaded",
+            "Overloaded",
+            haider_protocol::error::ErrorScope::Turn,
+            [haider_protocol::error::ErrorAction::Retry],
+        )
+        .with_http_status(503)
+        .with_provider_error_type(Some("overloaded_error"))
+        .with_request_id(Some("req_fixture503"));
+        assert_eq!(
+            provider_identity_lines(&presentation),
+            [
+                "HTTP 503",
+                "Provider error type: overloaded_error",
+                "Request id: req_fixture503",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        );
+    }
 
     #[test]
     fn request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits() {

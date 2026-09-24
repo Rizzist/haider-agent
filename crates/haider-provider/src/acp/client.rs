@@ -283,28 +283,67 @@ impl AcpError {
         }
     }
 
-    /// Converts to the crate's terminal error type, attaching the bounded
-    /// stderr tail as operator detail. The tail is already OAuth-redacted by
-    /// [`StderrRing`].
+    /// Converts to the crate's terminal error type. Both the RPC/display
+    /// text and the bounded stderr tail are child-controlled, so neither
+    /// reaches `ProviderError.message` or the presentation except through the
+    /// `error_detail` publication policy.
     pub fn into_provider_error(self, stderr_tail: &str) -> ProviderError {
         let kind = self.kind();
-        let message = self.to_string();
-        let error = ProviderError::new(kind, message.clone());
+        let raw = self.to_string();
+        let message = match &self {
+            // Auth-method ids are protocol identifiers the operator needs
+            // verbatim (`gemini-api-key` would otherwise trip the credential
+            // label scrubber). Only short identifier-shaped ids are shown.
+            Self::AuthMethodUnavailable { advertised } => {
+                let ids = advertised
+                    .iter()
+                    .map(|id| {
+                        if acp_identifier(id) {
+                            id.as_str()
+                        } else {
+                            "[REDACTED]"
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "the ACP agent does not advertise the oauth-personal auth method; it advertised: {}",
+                    if ids.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        ids.join(", ")
+                    }
+                )
+            }
+            _ => crate::public_provider_message(kind, &raw),
+        };
+        let error = ProviderError::new(kind, message);
         if stderr_tail.is_empty() {
-            error
-        } else {
-            // Line breaks are framing in the stderr ring. Join its lines
-            // before the single provider-detail boundary so ordinary agent
-            // diagnostics can survive while control bytes still fail closed.
-            let tail = stderr_tail
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" · ");
-            error.with_provider_detail(&format!("{message} Agent stderr tail: {tail}"))
+            return error;
         }
+        // Line breaks are framing in the stderr ring. Join its lines before
+        // the single provider-detail boundary so ordinary agent diagnostics
+        // can survive while control bytes still fail closed.
+        let tail = stderr_tail
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        error.with_provider_detail(&format!("{raw} Agent stderr tail: {tail}"))
     }
+}
+
+/// A published protocol identifier: at most 64 bytes of lower-case ASCII
+/// letters, digits, `-` or `_`, in short segments (each under 16 bytes), so
+/// it cannot carry an email, URL, or opaque token.
+fn acp_identifier(id: &str) -> bool {
+    id.len() <= 64
+        && id
+            .split(['-', '_'])
+            .all(|segment| (1..16).contains(&segment.len()))
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 // ---------------------------------------------------------------------------
