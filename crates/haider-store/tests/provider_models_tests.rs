@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used)]
 
-use haider_store::{CachedModels, Store};
+use haider_store::{CachedModels, Store, account_provider_model_cache_key};
 use rusqlite::Connection;
 
 /// The cache is durable, provider-scoped, and a refresh replaces every
@@ -78,6 +78,74 @@ fn provider_model_cache_is_durable_provider_scoped_and_replaced() {
             fetched_at_ms: 202,
         }),
         "replacing one provider must not alter another provider's provenance"
+    );
+}
+
+#[test]
+fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let a = account_provider_model_cache_key("openai-oauth", "account-a");
+    let b = account_provider_model_cache_key("openai-oauth", "account-b");
+    let other = account_provider_model_cache_key("anthropic-oauth", "account-a");
+    {
+        let store = Store::open(root.path()).expect("open store");
+        store
+            .put_provider_models(&a, "[\"a\"]", Some("etag-a"), 10)
+            .expect("put A");
+        store
+            .put_provider_models(&b, "[\"b\"]", Some("etag-b"), 20)
+            .expect("put B");
+        store
+            .put_provider_models(&other, "[\"other\"]", None, 30)
+            .expect("put other");
+    }
+    let store = Store::open(root.path()).expect("reopen store");
+    assert_eq!(
+        store.provider_models("openai-oauth").expect("legacy key"),
+        None
+    );
+    assert_eq!(
+        store
+            .provider_models(&a)
+            .expect("A read")
+            .expect("A cache exists")
+            .models_json,
+        "[\"a\"]"
+    );
+    assert_eq!(
+        store
+            .provider_models(&b)
+            .expect("B read")
+            .expect("B cache exists")
+            .models_json,
+        "[\"b\"]"
+    );
+    assert_eq!(
+        store
+            .provider_models(&other)
+            .expect("other read")
+            .expect("other cache exists")
+            .models_json,
+        "[\"other\"]"
+    );
+    store
+        .put_provider_models(&a, "[\"a-new\"]", None, 40)
+        .expect("replace A");
+    assert_eq!(
+        store
+            .provider_models(&a)
+            .expect("A replacement")
+            .expect("replacement A cache exists")
+            .models_json,
+        "[\"a-new\"]"
+    );
+    assert_eq!(
+        store
+            .provider_models(&b)
+            .expect("B preserved")
+            .expect("preserved B cache exists")
+            .models_json,
+        "[\"b\"]"
     );
 }
 

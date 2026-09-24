@@ -72,6 +72,7 @@ use haider_rpc::{
     ProviderAvailabilityWire, ProviderProbeFailureWire, ProviderRemoveRefusalReasonWire,
     ProviderSummaryWire, ProviderTrustWire, RequestId, ResponseBody, StagePurpose, WireFrame,
 };
+use haider_store::account_provider_model_cache_key;
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -1435,6 +1436,7 @@ pub(crate) enum AccountCommand {
     },
     ProviderModelsRefreshCompleted {
         provider: String,
+        cache_key: String,
         cached: Option<haider_core::CachedModels>,
         result: ProviderModelsRefreshResult,
         completed: ProviderModelsRefreshCompletion,
@@ -1814,7 +1816,6 @@ async fn run_account_actor(
                             {
                                 if refresh {
                                     refreshing_providers.remove(&provider);
-                                    pending_catalog_discoveries.remove(&provider);
                                     providers.models_unavailable(
                                         &provider,
                                         "provider model refresh worker failed".to_owned(),
@@ -2254,6 +2255,7 @@ async fn run_account_actor(
                     &snapshot,
                     management.as_ref(),
                     &providers,
+                    &mut pending_catalog_discoveries,
                     *job,
                 )
                 .await;
@@ -2266,6 +2268,7 @@ async fn run_account_actor(
                     &snapshot,
                     management.as_ref(),
                     &providers,
+                    &mut pending_catalog_discoveries,
                     &mut reserved_aliases,
                     &refresh_fences,
                     *job,
@@ -2373,11 +2376,32 @@ async fn run_account_actor(
             }
             AccountCommand::ProviderModelsRefreshCompleted {
                 provider,
+                cache_key,
                 cached,
                 result,
                 completed,
             } => {
                 refreshing_providers.remove(&provider);
+                if active_catalog_cache_key(&provider, &accounts, &providers).as_deref()
+                    != Some(cache_key.as_str())
+                {
+                    // A switch happened during the network flight. Its new
+                    // discovery remains queued; never publish the old rows.
+                    let completed = ProviderModelsRefreshCompletion::with_followers(
+                        completed,
+                        model_refresh_followers
+                            .remove(&provider)
+                            .unwrap_or_default(),
+                    );
+                    respond_model_refresh_error(
+                        &completed,
+                        ERROR_CODE_BUSY,
+                        "active credential changed during model refresh",
+                        true,
+                        None,
+                    );
+                    continue;
+                }
                 // A credential committed while this provider was refreshing
                 // shares that bounded flight instead of opening a follower.
                 pending_catalog_discoveries.remove(&provider);
@@ -2396,6 +2420,7 @@ async fn run_account_actor(
                         completed: &completed,
                     },
                     provider,
+                    cache_key,
                     cached,
                     result,
                 )
@@ -2519,6 +2544,8 @@ async fn run_account_actor(
                     vault.as_ref(),
                     &snapshot,
                     management.as_ref(),
+                    &providers,
+                    &mut pending_catalog_discoveries,
                     &provider,
                     failure,
                 )
@@ -2958,7 +2985,11 @@ async fn begin_provider_models_refresh(
     } else {
         None
     };
-    let cached = match store.provider_models(provider.clone()).await {
+    let cache_key = descriptor.as_ref().map_or_else(
+        || provider.clone(),
+        |descriptor| account_provider_model_cache_key(&provider, descriptor.alias.as_str()),
+    );
+    let cached = match store.provider_models(cache_key.clone()).await {
         Ok(cached) => cached,
         Err(error) => {
             providers.models_unavailable(&provider, error.message.clone());
@@ -2977,6 +3008,7 @@ async fn begin_provider_models_refresh(
     let commands = commands.clone();
     let model_discoverer = Arc::clone(model_discoverer);
     let task_provider = provider.clone();
+    let task_cache_key = cache_key;
     let task_completed = completed.clone();
     let refresh_task = refresh_tasks.spawn(async move {
         let result = match (broker, descriptor) {
@@ -3024,6 +3056,7 @@ async fn begin_provider_models_refresh(
         let _ = commands
             .send(AccountCommand::ProviderModelsRefreshCompleted {
                 provider: task_provider,
+                cache_key: task_cache_key,
                 cached,
                 result,
                 completed: task_completed,
@@ -3066,6 +3099,7 @@ struct ProviderModelsRefreshContext<'a> {
 async fn finish_provider_models_refresh(
     context: ProviderModelsRefreshContext<'_>,
     provider: String,
+    cache_key: String,
     cached: Option<haider_core::CachedModels>,
     result: ProviderModelsRefreshResult,
 ) {
@@ -3104,7 +3138,7 @@ async fn finish_provider_models_refresh(
             let fetched_at_ms = unix_ms_after(Duration::ZERO);
             let revision = match store
                 .put_provider_models_and_advance_management_revision(
-                    provider.clone(),
+                    cache_key.clone(),
                     models_json,
                     catalog.etag,
                     fetched_at_ms,
@@ -3159,8 +3193,8 @@ async fn finish_provider_models_refresh(
             let fetched_at_ms = unix_ms_after(Duration::ZERO);
             if let Err(error) = store
                 .put_provider_models(
-                    provider.clone(),
-                    cached.models_json,
+                    cache_key,
+                    cached.models_json.clone(),
                     cached.etag,
                     fetched_at_ms,
                 )
@@ -3175,7 +3209,20 @@ async fn finish_provider_models_refresh(
                 );
                 return;
             }
-            providers.touch_models(&provider, fetched_at_ms);
+            let models = match serde_json::from_str(&cached.models_json) {
+                Ok(models) => models,
+                Err(error) => {
+                    respond_model_refresh_error(
+                        completed,
+                        ERROR_CODE_PROVIDER_ERROR,
+                        &format!("cached model catalog is invalid: {error}"),
+                        false,
+                        None,
+                    );
+                    return;
+                }
+            };
+            providers.replace_discovered_models(provider.clone(), models, fetched_at_ms);
             let revision = match store.management_revision().await {
                 Ok(revision) => revision,
                 Err(error) => {
@@ -3375,6 +3422,23 @@ fn catalog_source(
     }
 }
 
+/// Authenticated inventories are durable only for the account that fetched
+/// them. Legacy provider-only rows are intentionally ignored on upgrade.
+fn active_catalog_cache_key(
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<String> {
+    let (_, auth) = catalog_source(provider, providers)?;
+    match auth {
+        ProviderAuthRequirementWire::OAuth | ProviderAuthRequirementWire::ApiKey => accounts
+            .active_for_provider(provider)
+            .map(|account| account_provider_model_cache_key(provider, account.alias.as_str())),
+        ProviderAuthRequirementWire::None => Some(provider.to_owned()),
+        _ => None,
+    }
+}
+
 fn enqueue_catalog_discovery(
     provider: &str,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
@@ -3476,12 +3540,15 @@ impl RotationCallback for AutomaticAlternate<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_account(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     provider: &str,
     failure: Option<(CredentialAlias, RotationTrigger)>,
 ) -> Result<ResolvedAccount, HaiderError> {
@@ -3562,9 +3629,18 @@ async fn resolve_account(
         (active.alias, trigger, selected)
     };
 
+    providers.clear_discovered_models(provider);
     accounts.select(&selected.alias)?;
+    enqueue_catalog_discovery(provider, providers, pending_catalog_discoveries);
     refresh_resolver_snapshot(snapshot, accounts);
-    publish_next_management_revision(store, snapshot, management, accounts).await?;
+    let revision = store.advance_management_revision().await?;
+    if let Some(management) = management {
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
+    }
     Ok(ResolvedAccount {
         rotation: Some(RotationEvent {
             provider: provider.to_owned(),
@@ -4393,6 +4469,7 @@ async fn handle_set_active(
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     job: SetActiveJob,
 ) {
     let alias = match normalize_account_alias(&job.alias) {
@@ -4525,9 +4602,20 @@ async fn handle_set_active(
         );
         return;
     }
+    let switching = accounts
+        .active_for_provider(&recovery.provider)
+        .is_none_or(|active| active.alias != alias);
+    if switching {
+        // Readers can observe the shared model source while selection saves
+        // the account file. Remove the old account's rows first.
+        providers.clear_discovered_models(&recovery.provider);
+    }
     if let Err(error) = accounts.select(&alias) {
         respond_management_error(&job.route, &error);
         return;
+    }
+    if switching {
+        enqueue_catalog_discovery(&recovery.provider, providers, pending_catalog_discoveries);
     }
     if let Err(error) = try_refresh_resolver_snapshot(snapshot, accounts) {
         respond_management_error(&job.route, &error);
@@ -4587,6 +4675,7 @@ async fn handle_remove_account(
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &mut HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
     job: RemoveAccountJob,
@@ -4736,9 +4825,16 @@ async fn handle_remove_account(
             );
             return;
         }
+        let removed_active = descriptor.active;
+        if removed_active {
+            providers.clear_discovered_models(&recovery.provider);
+        }
         if let Err(error) = accounts.remove(&alias) {
             respond_management_error(&job.route, &error);
             return;
+        }
+        if removed_active {
+            enqueue_catalog_discovery(&recovery.provider, providers, pending_catalog_discoveries);
         }
     }
     // Resolver publication deliberately precedes vault deletion. The public
@@ -5524,13 +5620,10 @@ async fn handle_provider_configure(
             }
         };
         let fetched_at_ms = unix_ms_after(Duration::ZERO);
+        let cache_key = active_catalog_cache_key(&profile.provider_id, accounts, providers)
+            .unwrap_or_else(|| profile.provider_id.clone());
         if let Err(error) = store
-            .put_provider_models(
-                profile.provider_id.clone(),
-                models_json,
-                catalog.etag,
-                fetched_at_ms,
-            )
+            .put_provider_models(cache_key, models_json, catalog.etag, fetched_at_ms)
             .await
         {
             respond_error(
@@ -11638,13 +11731,10 @@ async fn reconcile_provider_receipts(
                 )
             })?;
             let fetched_at_ms = unix_ms_after(Duration::ZERO);
+            let cache_key = active_catalog_cache_key(&profile.provider_id, accounts, providers)
+                .unwrap_or_else(|| profile.provider_id.clone());
             store
-                .put_provider_models(
-                    profile.provider_id.clone(),
-                    models_json,
-                    catalog.etag,
-                    fetched_at_ms,
-                )
+                .put_provider_models(cache_key, models_json, catalog.etag, fetched_at_ms)
                 .await?;
             providers.replace_discovered_models(
                 profile.provider_id.clone(),
@@ -12299,7 +12389,11 @@ impl AccountsRuntime {
                 .map(|summary| summary.provider)
                 .collect::<Vec<_>>();
             for provider in provider_ids {
-                if let Some(cached) = store.provider_models(provider.clone()).await? {
+                let Some(cache_key) = active_catalog_cache_key(&provider, &accounts, &providers)
+                else {
+                    continue;
+                };
+                if let Some(cached) = store.provider_models(cache_key).await? {
                     let models = serde_json::from_str(&cached.models_json).map_err(|error| {
                         HaiderError::new(
                             ErrorCode::StoreCorrupt,

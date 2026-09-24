@@ -194,6 +194,18 @@ fn subscription_picker_requires_provider_declared_lite_support() {
     let restored: Vec<DiscoveredModel> =
         serde_json::from_str(&serde_json::to_string(&models).expect("encode cache"))
             .expect("restore cache");
+    assert!(haider_provider::model_servable_by_endpoint(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        &restored[0]
+    ));
+    assert!(!haider_provider::model_servable_by_endpoint(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        &restored[1]
+    ));
+    assert!(!haider_provider::model_servable_by_endpoint(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        &restored[2]
+    ));
     assert_eq!(
         pickable(haider_provider::OPENAI_OAUTH_PROVIDER_NAME, &restored)
             .iter()

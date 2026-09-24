@@ -906,17 +906,21 @@ fn sensitive_credential_header(
     Ok(request.header(name, value))
 }
 
-/// Picker order: provider priority first, then display name. OpenAI OAuth
-/// only offers rows declared for the Lite transport that its adapter uses.
+/// Whether the provider's actual request transport can serve this row.
+/// Both remote and static catalog projections must apply this predicate at
+/// the final picker projection.
+#[must_use]
+pub fn model_servable_by_endpoint(provider: &str, model: &DiscoveredModel) -> bool {
+    model.visible
+        && (provider != crate::OPENAI_OAUTH_PROVIDER_NAME || model.use_responses_lite == Some(true))
+}
+
+/// Picker order: provider priority first, then display name.
 #[must_use]
 pub fn pickable(provider: &str, models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
     let mut visible: Vec<DiscoveredModel> = models
         .iter()
-        .filter(|model| {
-            model.visible
-                && (provider != crate::OPENAI_OAUTH_PROVIDER_NAME
-                    || model.use_responses_lite == Some(true))
-        })
+        .filter(|model| model_servable_by_endpoint(provider, model))
         .cloned()
         .collect();
     visible.sort_by(|left, right| {

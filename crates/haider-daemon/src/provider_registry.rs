@@ -17,7 +17,8 @@ use haider_provider::{
     KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME,
     OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
     OPENAI_SUBSCRIPTION_RESPONSES_URL, ProviderErrorKind, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS,
-    XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS, azure_openai_origin, pickable,
+    XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS, azure_openai_origin,
+    model_servable_by_endpoint, pickable,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -434,7 +435,6 @@ pub(crate) trait ProviderModelSourceLike: Send + Sync {
     }
     fn replace(&self, provider: String, inventory: ProviderInventory);
     fn unavailable(&self, provider: &str, reason: String);
-    fn touch(&self, provider: &str, fetched_at_ms: u64);
     fn remove(&self, provider: &str);
 }
 
@@ -508,26 +508,6 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
             ProviderInventory::Configured { .. } => ProviderInventory::Unavailable { reason },
         };
         inventories.insert(provider.to_owned(), inventory);
-    }
-
-    fn touch(&self, provider: &str, fetched_at_ms: u64) {
-        let mut inventories = self
-            .inventories
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(
-            ProviderInventory::Fetched { models, .. } | ProviderInventory::Stale { models, .. },
-        ) = inventories.get(provider)
-        {
-            let models = models.clone();
-            inventories.insert(
-                provider.to_owned(),
-                ProviderInventory::Fetched {
-                    models,
-                    fetched_at_ms,
-                },
-            );
-        }
     }
 
     fn remove(&self, provider: &str) {
@@ -686,12 +666,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         );
     }
 
-    pub(crate) fn models_unavailable(&self, provider: &str, reason: String) {
-        self.model_source.unavailable(provider, reason);
+    pub(crate) fn clear_discovered_models(&self, provider: &str) {
+        self.model_source.remove(provider);
     }
 
-    pub(crate) fn touch_models(&self, provider: &str, fetched_at_ms: u64) {
-        self.model_source.touch(provider, fetched_at_ms);
+    pub(crate) fn models_unavailable(&self, provider: &str, reason: String) {
+        self.model_source.unavailable(provider, reason);
     }
 
     pub(crate) fn configure(
@@ -1129,16 +1109,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             profile
                 .configured_models
                 .iter()
-                .map(|slug| {
-                    model_detail_wire(
-                        &profile.provider_id,
-                        offline_model(&profile.provider_id, slug),
-                    )
-                })
+                .map(|slug| offline_model(&profile.provider_id, slug))
+                .filter(|model| model_servable_by_endpoint(&profile.provider_id, model))
+                .map(|model| model_detail_wire(&profile.provider_id, model))
                 .collect()
         } else {
             discovered
                 .into_iter()
+                .filter(|model| model_servable_by_endpoint(&profile.provider_id, model))
                 .map(|model| model_detail_wire(&profile.provider_id, model))
                 .collect()
         };

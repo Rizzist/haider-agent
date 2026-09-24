@@ -1806,6 +1806,13 @@ pub struct CachedModels {
     pub fetched_at_ms: u64,
 }
 
+/// Namespaces an authenticated catalog by the selected credential alias.
+/// The separator cannot occur in a provider ID, and the length keeps aliases
+/// unambiguous even if they contain separators.
+pub fn account_provider_model_cache_key(provider: &str, alias: &str) -> String {
+    format!("account:{}:{provider}:{alias}", provider.len())
+}
+
 /// Atomic result of registering one typed Loom specialist. `install_job` is
 /// present only when this transaction created the job and therefore owns
 /// daemon-runner adoption. `install_job_id` also projects an already-existing

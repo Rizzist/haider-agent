@@ -61,7 +61,7 @@ pub use event_store::{
     TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
     TurnRetractCommand, TurnRetractOutcome, TypedAgentInstallCancelResult, TypedAgentInstallCas,
     TypedAgentInstallItemCas, TypedAgentInstallRetryResult, TypedAgentInstallSnapshot,
-    TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
+    TypedAgentInstallWatchPage, TypedAgentInstallWatchResult, account_provider_model_cache_key,
 };
 pub use event_store::{
     ForkCacheInheritanceCandidate, fork_provider_view_prefix_digest,

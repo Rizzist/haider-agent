@@ -450,6 +450,120 @@ pub(super) fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegis
     .expect("provider registry")
 }
 
+#[tokio::test]
+async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    let account = |name: &str, active: bool| CredentialDescriptor {
+        alias: CredentialAlias::new(name),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: name.to_owned(),
+        status: CredentialStatus::Ok,
+        active,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    accounts.add(account("account-a", true)).expect("add A");
+    accounts.add(account("account-b", false)).expect("add B");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let providers = test_provider_registry();
+    let row = |slug: &str| DiscoveredModel {
+        slug: slug.to_owned(),
+        display_name: slug.to_owned(),
+        context_window: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: Some(true),
+        extensions: None,
+    };
+    providers.replace_discovered_models(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        vec![row("a-only")],
+        1,
+    );
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+    let (sink, mut frames) = channel_sink();
+    for (command_id, alias, previous) in [
+        ("switch-to-b", "account-b", "a-only"),
+        ("switch-back-to-a", "account-a", "b-only"),
+    ] {
+        if alias == "account-a" {
+            providers.replace_discovered_models(
+                OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+                vec![row("b-only")],
+                2,
+            );
+        }
+        handle_set_active(
+            &store,
+            &mut accounts,
+            &snapshot,
+            None,
+            &providers,
+            &mut pending,
+            SetActiveJob {
+                command_id: command_id.to_owned(),
+                alias: alias.to_owned(),
+                route: LoginRoute {
+                    request_id: RequestId::new(command_id),
+                    sink: Arc::clone(&sink),
+                },
+            },
+        )
+        .await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), frames.recv())
+                .await
+                .expect("set-active deadline"),
+            Some(WireFrame::Response {
+                body: ResponseBody::AccountSetActive { .. },
+                ..
+            })
+        ));
+        let summary = providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("summary");
+        assert!(
+            summary.models.is_empty(),
+            "{previous} must disappear at the switch boundary"
+        );
+        assert!(matches!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::NeverFetched
+        ));
+        assert_eq!(
+            pending.next_ready(&HashSet::new()).as_deref(),
+            Some(OPENAI_OAUTH_PROVIDER_NAME)
+        );
+        assert_eq!(
+            active_catalog_cache_key(OPENAI_OAUTH_PROVIDER_NAME, &accounts, &providers),
+            Some(account_provider_model_cache_key(
+                OPENAI_OAUTH_PROVIDER_NAME,
+                alias
+            ))
+        );
+    }
+    providers.replace_discovered_models(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        vec![row("a-refetched")],
+        3,
+    );
+    assert_eq!(
+        providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("A summary after refetch")
+            .models,
+        vec!["a-refetched"]
+    );
+}
+
 fn identity_for(profile: &str, command: &str) -> LoginIdentity {
     LoginIdentity {
         provider: "anthropic".into(),
@@ -8217,6 +8331,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
     let alias = CredentialAlias::new("model-refresh-active");
+    let cache_key = account_provider_model_cache_key(OPENAI_OAUTH_PROVIDER_NAME, alias.as_str());
     let descriptor = CredentialDescriptor {
         alias: alias.clone(),
         provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
@@ -8368,7 +8483,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         "discovery receives the broker-extracted access token, never the encoded bundle"
     );
     let cached = store
-        .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+        .provider_models(cache_key.clone())
         .await
         .expect("cache read")
         .expect("cache row");
@@ -8418,7 +8533,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         }
     ));
     let touched = store
-        .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+        .provider_models(cache_key.clone())
         .await
         .expect("touched cache read")
         .expect("touched cache row");
@@ -8489,7 +8604,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     }
     assert_eq!(
         store
-            .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+            .provider_models(cache_key.clone())
             .await
             .expect("cache after unavailable")
             .expect("cache remains"),
@@ -15053,6 +15168,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
         .expect("completion");
     let AccountCommand::ProviderModelsRefreshCompleted {
         provider,
+        cache_key,
         cached,
         result,
         completed,
@@ -15069,6 +15185,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             completed: &completed,
         },
         provider,
+        cache_key,
         cached,
         result,
     )
