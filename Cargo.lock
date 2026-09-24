@@ -1954,6 +1954,7 @@ dependencies = [
  "haider-accounts",
  "haider-platform",
  "haider-protocol",
+ "haider-tools",
  "haider-webextract",
  "httpdate",
  "reqwest",

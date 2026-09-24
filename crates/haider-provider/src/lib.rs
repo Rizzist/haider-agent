@@ -2834,20 +2834,18 @@ impl ProviderError {
 
     #[must_use]
     pub fn with_http_metadata(mut self, status: u16, request_id: Option<&str>) -> Self {
-        let request_id = request_id.and_then(crate::error_detail::sanitize_provider_error_detail);
+        let request_id = request_id.and_then(crate::error_detail::safe_request_id);
         self.presentation = self
             .presentation
             .with_http_status(status)
-            .with_request_id(request_id.as_deref());
+            .with_request_id(request_id);
         self
     }
 
     #[must_use]
     pub(crate) fn with_provider_error_type(mut self, error_type: Option<&str>) -> Self {
-        let error_type = error_type.and_then(crate::error_detail::sanitize_provider_error_detail);
-        self.presentation = self
-            .presentation
-            .with_provider_error_type(error_type.as_deref());
+        let error_type = error_type.and_then(crate::error_detail::safe_error_type);
+        self.presentation = self.presentation.with_provider_error_type(error_type);
         self
     }
 
@@ -2876,15 +2874,17 @@ impl ProviderError {
     }
 
     /// Replaces only the operator-facing explanation while retaining the
-    /// typed recovery contract and provider metadata. The presentation
-    /// constructor supplies the durable public-text bound and control-byte
-    /// sanitization; adapters must redact credentials before calling this.
+    /// typed recovery contract and provider metadata. This is the final
+    /// provider-prose boundary, including adapters that supply stderr tails.
     #[must_use]
     pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
+        let Some(detail) = crate::error_detail::sanitize_provider_error_detail(detail) else {
+            return self;
+        };
         let mut presentation = ErrorPresentation::new(
             self.presentation.subcode.as_str(),
             &self.presentation.title,
-            detail,
+            &detail,
             self.presentation.scope,
             self.presentation.allowed_actions.clone(),
         );
@@ -4643,7 +4643,8 @@ mod e2_contract_tests {
                 .contains(&ErrorAction::Retry)
         );
         let rendered = serde_json::to_string(&error.presentation).expect("presentation JSON");
-        assert!(rendered.contains(DETAIL));
+        assert!(rendered.contains("message withheld: may contain account data"));
+        assert!(!rendered.contains(DETAIL));
         assert!(!rendered.contains(SECRET));
     }
 }

@@ -203,6 +203,55 @@ async fn real_turn_events_project_to_thinking_and_answer_deltas() {
     assert!(projection.terminal_result().is_ok());
 }
 
+#[tokio::test]
+async fn run_failure_bridge_uses_safe_presentation_instead_of_raw_message() {
+    use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
+
+    let (frames, _receiver) = mpsc::channel(8);
+    let responder = ChatResponder { id: 92, frames };
+    let mut projection = TurnProjection::default();
+    let run_id = RunId::new("mobile-projection-failure");
+    let presentation = ErrorPresentation::new(
+        "permission-denied",
+        "Provider denied the request",
+        "message withheld: may contain account data",
+        ErrorScope::Turn,
+        [ErrorAction::SwitchAccount],
+    )
+    .with_provider_error_type(Some("permission_error"))
+    .with_request_id(Some("req_fixture-403"))
+    .with_http_status(403);
+    projection
+        .apply(
+            raw_event(
+                1,
+                &run_id,
+                EventPayload::RunFailed {
+                    code: ErrorCode::ProviderError,
+                    message: "raw private body".into(),
+                    retryable: false,
+                    presentation: Some(presentation),
+                },
+            ),
+            &responder,
+        )
+        .await
+        .expect("project failure");
+    projection
+        .apply(
+            raw_event(2, &run_id, EventPayload::RunState(RunState::Errored)),
+            &responder,
+        )
+        .await
+        .expect("project terminal");
+    let error = projection.terminal_result().expect_err("run failed");
+    assert_eq!(error.code, "provider_error");
+    assert!(error.message.contains("permission_error"));
+    assert!(error.message.contains("HTTP 403"));
+    assert!(error.message.contains("req_fixture-403"));
+    assert!(!error.message.contains("raw private body"));
+}
+
 fn raw_event(seq: u64, run_id: &RunId, payload: EventPayload) -> RawEnvelope {
     EventEnvelope {
         schema_version: SCHEMA_VERSION,

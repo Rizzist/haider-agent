@@ -71,6 +71,17 @@ class ShellProjectionTest {
         assertNull(command.exitCode)
     }
 
+    @Test fun aProviderFailureKeepsSafeStructuredDiagnostics() {
+        val command = projected(item(), obj("type" to "run_state", "state" to "errored"),
+            obj("type" to "run_failed", "code" to "provider_error",
+                "message" to "raw private body",
+                "presentation" to obj("provider_error_type" to "permission_error",
+                    "provider_http_status" to 403,
+                    "provider_request_id" to "req_fixture-403"))).single()
+        assertEquals("provider_error · permission_error · HTTP 403 · Request ID: req_fixture-403", command.error)
+        assertFalse(command.error.orEmpty().contains("raw private body"))
+    }
+
     @Test fun cancellationAndOutputClippingAreExplicit() {
         val entries = listOf(envelope(1, item()), envelope(2, output(ByteArray(ShellProjection.MAX_OUTPUT_BYTES + 1))),
             envelope(3, obj("type" to "run_state", "state" to "cancelled"))).mapIndexed { i, e ->

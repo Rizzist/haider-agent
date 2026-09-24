@@ -1,4 +1,6 @@
-//! Public provider diagnostics, with credential-shaped tokens removed.
+//! Public provider diagnostics. Provider prose is untrusted account data.
+
+pub(crate) const WITHHELD_MESSAGE: &str = "message withheld: may contain account data";
 
 pub(crate) fn http_error_detail(body: &[u8]) -> Option<String> {
     match serde_json::from_slice::<serde_json::Value>(body) {
@@ -30,6 +32,133 @@ pub(crate) fn provider_error_message(value: &serde_json::Value) -> Option<&str> 
 }
 
 pub(crate) fn sanitize_provider_error_detail(detail: &str) -> Option<String> {
+    // Apply the same complete consumer used for tool output before deciding
+    // whether any provider prose is suitable for a durable public field.
+    let redacted = haider_tools::redact_output_text(detail);
+    let credential_redacted = redact_credentials(&redacted)?;
+    if detail.len() > 512
+        || redacted != detail
+        || credential_redacted != detail
+        || !plain_sentence(detail)
+    {
+        return Some(WITHHELD_MESSAGE.to_owned());
+    }
+    Some(detail.trim().to_owned())
+}
+
+/// Only short, ordinary sentences can be published. Any identifier, header,
+/// URL, JSON fragment, email, or ambiguous punctuation withholds the whole
+/// message so that partially scrubbed request bodies cannot leak a suffix.
+fn plain_sentence(detail: &str) -> bool {
+    let detail = detail.trim();
+    if detail.is_empty() || detail.len() > 256 || detail.contains(char::is_control) {
+        return false;
+    }
+    let lower = detail.to_ascii_lowercase();
+    if [
+        "cookie",
+        "set-cookie",
+        "account",
+        "organization",
+        "user",
+        "org",
+        "credit",
+        "email",
+        "session",
+        "tenant",
+        "customer",
+        "request body",
+        "prompt",
+        "body",
+        "identifier",
+        "account_id",
+        "org_id",
+        "user_id",
+        "credit_id",
+        "request_body",
+        "prompt=",
+        "http",
+        "www.",
+        "acct_",
+        "org_",
+        "user_",
+        "credit_",
+        "api_key",
+        "authorization",
+        "bearer",
+        "token",
+        "secret",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    if detail.split_whitespace().count() < 2 || !detail.chars().any(char::is_alphabetic) {
+        return false;
+    }
+    detail.split_whitespace().all(|word| {
+        let plain = word.trim_matches(|c: char| matches!(c, '.' | ',' | '!' | '?' | '-' | '\''));
+        !plain.is_empty() && plain.len() <= 32 && plain.chars().all(|c| c.is_ascii_alphabetic())
+    })
+}
+
+pub(crate) fn safe_error_type(value: &str) -> Option<&str> {
+    const TYPES: &[&str] = &[
+        "permission_error",
+        "permission_denied",
+        "insufficient_permissions",
+        "invalid_request_error",
+        "authentication_error",
+        "invalid_api_key",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "overloaded_error",
+        "api_error",
+        "server_error",
+        "timeout_error",
+        "timeout",
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "credit_balance_too_low",
+        "account_deleted",
+        "account_not_found",
+        "account_deactivated",
+        "account_revoked",
+        "account_deleted_error",
+        "account_not_found_error",
+        "account_deactivated_error",
+        "account_revoked_error",
+        "organization_deactivated",
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "model_context_window_exceeded",
+        "prompt_too_long",
+        "input_too_large",
+        "INVALID_ARGUMENT",
+    ];
+    TYPES.contains(&value).then_some(value)
+}
+
+pub(crate) fn safe_request_id(value: &str) -> Option<&str> {
+    if !(7..=128).contains(&value.len()) {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    ((value.starts_with("req_") || value.starts_with("req-"))
+        && ![
+            "acct_", "account", "org_", "user_", "credit", "cookie", "session", "token", "prompt",
+            "body", "email",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(value)
+}
+
+fn redact_credentials(detail: &str) -> Option<String> {
     let mut spans = credential_spans(detail).into_iter().peekable();
     let mut output = String::new();
     let mut offset = 0;

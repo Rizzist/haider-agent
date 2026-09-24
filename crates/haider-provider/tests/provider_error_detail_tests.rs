@@ -5,59 +5,41 @@ use haider_provider::{
     replay_openai_http_error,
 };
 
-type ErrorClassifier = fn(u16, Option<&str>, &[u8]) -> haider_provider::ProviderError;
-type DenialCase = (ErrorClassifier, &'static str, &'static str);
+type Classifier = fn(u16, Option<&str>, &[u8]) -> haider_provider::ProviderError;
+const WITHHELD: &str = "message withheld: may contain account data";
+
+fn classifiers() -> [Classifier; 3] {
+    [
+        replay_anthropic_http_error,
+        replay_gemini_http_error,
+        replay_openai_http_error,
+    ]
+}
 
 #[test]
-fn anthropic_and_openai_account_denials_keep_safe_diagnostics_in_journal_shape() {
-    let cases: [DenialCase; 4] = [
-        (
-            replay_anthropic_http_error,
-            "permission_error",
-            "Anthropic API key access denied",
-        ),
-        (
-            replay_openai_http_error,
-            "insufficient_permissions",
-            "OpenAI API key access denied",
-        ),
-        (
-            replay_openai_http_error,
-            "permission_denied",
-            "OpenAI OAuth grant denied",
-        ),
-        (
-            replay_anthropic_http_error,
-            "permission_error",
-            "Anthropic OAuth subscription denied",
-        ),
-    ];
-    for (classify, error_type, message) in cases {
-        let body = serde_json::json!({"type": "error", "error": {
-            "type": error_type,
-            "message": format!("{message}; Authorization: Bearer fixture-opaque-secret")
+fn plain_denial_keeps_diagnostic_value_and_structured_fields() {
+    for classify in [replay_anthropic_http_error, replay_openai_http_error] {
+        let body = serde_json::json!({"error": {
+            "type": "permission_error", "message": "You do not have permission to use this model."
         }})
         .to_string();
         let error =
             classify(403, None, body.as_bytes()).with_http_metadata(403, Some("req_fixture-403"));
         assert_eq!(error.kind, ProviderErrorKind::PermissionDenied);
-        assert!(error.presentation.detail.starts_with(message));
-        assert!(error.presentation.detail.contains("[REDACTED]"));
-        assert!(!error.presentation.detail.contains("fixture-opaque-secret"));
+        assert_eq!(
+            error.presentation.detail,
+            "You do not have permission to use this model."
+        );
+        assert_eq!(error.presentation.provider_http_status, Some(403));
         assert_eq!(
             error.presentation.provider_error_type.as_deref(),
-            Some(error_type)
+            Some("permission_error")
         );
         assert_eq!(
             error.presentation.provider_request_id.as_deref(),
             Some("req_fixture-403")
         );
         let journal = serde_json::to_vec(&error).expect("journal shape serializes");
-        assert!(
-            !journal
-                .windows(b"fixture-opaque-secret".len())
-                .any(|w| w == b"fixture-opaque-secret")
-        );
         let replayed: haider_provider::ProviderError =
             serde_json::from_slice(&journal).expect("journal shape replays");
         assert_eq!(replayed, error);
@@ -65,249 +47,148 @@ fn anthropic_and_openai_account_denials_keep_safe_diagnostics_in_journal_shape()
 }
 
 #[test]
-fn provider_error_type_and_request_id_are_redacted_and_bounded() {
-    let body = serde_json::json!({"error": {
-        "type": format!("permission_error Authorization: Bearer fixture-type-secret {}", "x".repeat(256)),
-        "message": "Access denied"
-    }})
-    .to_string();
-    let error = replay_openai_http_error(403, None, body.as_bytes()).with_http_metadata(
-        403,
-        Some("req-safe Authorization: Bearer fixture-id-secret"),
-    );
-    let presentation = error.presentation;
-    let error_type = presentation.provider_error_type.expect("provider type");
-    let request_id = presentation.provider_request_id.expect("request id");
-    assert!(error_type.len() <= 128);
-    assert!(request_id.len() <= 128);
-    for value in [&error_type, &request_id] {
-        assert!(value.contains("[REDACTED]"));
-        assert!(!value.contains("fixture-type-secret"));
-        assert!(!value.contains("fixture-id-secret"));
-    }
-}
-
-#[test]
-fn rejected_requests_keep_bounded_provider_diagnostics() {
-    for classify in [
-        replay_anthropic_http_error,
-        replay_openai_http_error,
-        replay_gemini_http_error,
-    ] {
-        let detail = "messages.2: tool_use ids were found without tool_result blocks immediately after: registration";
-        let body = serde_json::json!({"error": {
-            "type": "invalid_request_error", "status": "INVALID_ARGUMENT", "message": detail
-        }})
-        .to_string();
-        let error =
-            classify(400, None, body.as_bytes()).with_http_metadata(400, Some("req-fixture-400"));
-        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-        assert_eq!(error.presentation.detail, detail);
-        assert_eq!(error.presentation.provider_http_status, Some(400));
-        assert_eq!(
-            error.presentation.provider_request_id.as_deref(),
-            Some("req-fixture-400")
-        );
-        assert!(!error.retryable);
-
-        let without_type =
-            serde_json::json!({"error": {"message": detail}, "api_key": "fixture-extra-field"})
-                .to_string();
-        assert_eq!(
-            classify(400, None, without_type.as_bytes())
-                .presentation
-                .detail,
-            detail
-        );
-        let quoted_secret = serde_json::json!({"error": {"message": "Invalid field: \"api_key\":\"fixture-quoted-secret\""}}).to_string();
-        assert!(
-            !classify(400, None, quoted_secret.as_bytes())
-                .presentation
-                .detail
-                .contains("fixture-quoted-secret")
-        );
-        let raw = classify(400, None, b"Bad request: messages[2].content[0] is empty");
-        assert_eq!(
-            raw.presentation.detail,
-            "Bad request: messages[2].content[0] is empty"
-        );
-
-        let body = serde_json::json!({"error": {"type": "invalid_request_error", "message": "x".repeat(2048)}}).to_string();
-        assert!(
-            classify(400, None, body.as_bytes())
-                .presentation
-                .detail
-                .len()
-                <= 515
-        );
-    }
-}
-
-#[test]
-fn echoed_fixture_credentials_and_terminal_controls_are_not_public() {
-    for classify in [
-        replay_anthropic_http_error,
-        replay_gemini_http_error,
-        replay_openai_http_error,
-    ] {
-        let body = serde_json::json!({"error": {"type": "invalid_request_error", "message":
-            "Invalid shape. Authorization: Bearer fixture-opaque-value sk-fixture-secret-value\u{1b}[31m"
-        }}).to_string();
-        let detail = classify(400, None, body.as_bytes()).presentation.detail;
-        assert!(detail.starts_with("Invalid shape."));
-        assert!(!detail.contains("fixture-opaque-value"));
-        assert!(!detail.contains("sk-fixture-secret-value"));
-        assert!(!detail.contains('\u{1b}'));
-    }
-}
-
-#[test]
-fn inline_authorization_schemes_redact_the_following_credential() {
-    for classify in [
-        replay_anthropic_http_error,
-        replay_gemini_http_error,
-        replay_openai_http_error,
-    ] {
-        let body = serde_json::json!({"error": {"message":
-            "Invalid request; Authorization:Bearer fixture-opaque-secret"
-        }})
-        .to_string();
-        assert_eq!(
-            classify(400, None, body.as_bytes()).presentation.detail,
-            "Invalid request; [REDACTED] [REDACTED]"
-        );
-        for scheme in ["Bearer", "Basic", "Token", "bEaReR", "bAsIc", "tOkEn"] {
-            for header in [
-                format!("Authorization:{scheme}"),
-                format!("authorization={scheme}"),
-                format!("\"Authorization\":\"{scheme}"),
-                format!("'Authorization':'{scheme}"),
-                format!("Authorization:\"{scheme}\""),
-                format!("\"Authorization:{scheme}"),
-                format!("Authorization='{scheme}"),
-            ] {
-                for credential in [
-                    "fixture-opaque-secret",
-                    "\"fixture-opaque-secret\"",
-                    "'fixture-opaque-secret'",
-                ] {
-                    for whitespace in [" ", "  ", "\n\t", "\u{2003}"] {
-                        let message = format!(
-                            "Invalid request; {header}{whitespace}{credential} retained detail"
-                        );
-                        let body = serde_json::json!({"error": {
-                            "type": "invalid_request_error", "message": message
-                        }})
-                        .to_string();
-                        let detail = classify(400, None, body.as_bytes()).presentation.detail;
-                        let public_whitespace = whitespace.replace('\t', " ");
-                        // A malformed quoted scheme with no matching close
-                        // owns the remaining diagnostic, including this prose.
-                        let unterminated = ['"', '\''].into_iter().any(|quote| {
-                            header.ends_with(&format!("{quote}{scheme}"))
-                                && !credential.contains(quote)
-                        });
-                        let suffix = if unterminated {
-                            "[REDACTED] [REDACTED]"
-                        } else {
-                            "retained detail"
-                        };
-                        assert_eq!(
-                            detail,
-                            format!(
-                                "Invalid request; [REDACTED]{public_whitespace}[REDACTED] {suffix}"
-                            ),
-                            "input: {message}"
-                        );
-                    }
-                }
-            }
-            let message = format!("Authorization:  {scheme}\n\t'fixture-opaque-secret' retained");
-            let detail = classify(400, None, message.as_bytes()).presentation.detail;
-            assert_eq!(detail, "Authorization:  [REDACTED]\n [REDACTED] retained");
-        }
-    }
-}
-
-#[test]
-fn redacted_diagnostics_preserve_whitespace_control_sanitization_and_utf8_bound() {
-    for classify in [
-        replay_anthropic_http_error,
-        replay_gemini_http_error,
-        replay_openai_http_error,
-    ] {
-        let message = "messages.2:\n  invalid  tool pairing";
-        let body = serde_json::json!({"error": {"message": message}}).to_string();
-        assert_eq!(
-            classify(400, None, body.as_bytes()).presentation.detail,
-            message
-        );
-        let message = format!(
-            "Invalid request; Authorization:Bearer\n  \"fixture-opaque-secret\"\u{1b}[31m {}",
-            "界".repeat(300)
-        );
-        let body = serde_json::json!({"error": {"message": message}}).to_string();
-        let detail = classify(400, None, body.as_bytes()).presentation.detail;
-        let prefix = "Invalid request; [REDACTED]\n  [REDACTED] ";
-        assert_eq!(
-            detail,
-            format!("{prefix}{}", "界".repeat((512 - prefix.len()) / 3))
-        );
-        let body = serde_json::json!({"error": {
-            "message": "Invalid\u{1b}[31m request; Authorization:Token fixture-opaque-secret"
-        }})
-        .to_string();
-        let detail = classify(400, None, body.as_bytes()).presentation.detail;
-        assert!(!detail.contains('\u{1b}'));
-        assert!(!detail.contains("fixture-opaque-secret"));
-    }
-}
-
-#[test]
-fn quoted_value_paths_preserve_the_exact_utf8_bound() {
-    for classify in [
-        replay_anthropic_http_error,
-        replay_gemini_http_error,
-        replay_openai_http_error,
-    ] {
-        for (introducer, head, public_prefix) in [
-            ("X-Api-Key:", "boundhead", "[REDACTED] [REDACTED] "),
+fn provider_route_status_matrix_retains_safe_identity() {
+    let families: [(&str, Classifier); 4] = [
+        ("anthropic", replay_anthropic_http_error),
+        ("anthropic-oauth", replay_anthropic_http_error),
+        ("openai", replay_openai_http_error),
+        ("openai-oauth", replay_openai_http_error),
+    ];
+    for (family, classify) in families {
+        for (status, error_type, kind) in [
+            (403, "permission_error", ProviderErrorKind::PermissionDenied),
             (
-                "Authorization:Bearer ",
-                "boundhead",
-                "[REDACTED] [REDACTED] [REDACTED] ",
+                401,
+                "authentication_error",
+                ProviderErrorKind::Authentication,
             ),
-            ("apikey ", "boundhead", "apikey [REDACTED] [REDACTED] "),
-            ("Bearer ", "boundhead", "Bearer [REDACTED] [REDACTED] "),
-            ("echoed=", "sk-fixture-boundhead", "[REDACTED] [REDACTED] "),
+            (429, "rate_limit_error", ProviderErrorKind::RateLimited),
+            (500, "api_error", ProviderErrorKind::Transport),
         ] {
-            let message = format!(
-                "Invalid request; {introducer}\"{head}, boundtail\"; {}",
-                "界🦀".repeat(300)
+            let message = "The provider declined this operation.";
+            let body =
+                serde_json::json!({"type":"error","error":{"type":error_type,"message":message}})
+                    .to_string();
+            let id = format!("req_{family}_{status}");
+            let error =
+                classify(status, None, body.as_bytes()).with_http_metadata(status, Some(&id));
+            assert_eq!(error.kind, kind, "{family} {status}");
+            assert_eq!(error.presentation.detail, message, "{family} {status}");
+            assert_eq!(
+                error.presentation.provider_error_type.as_deref(),
+                Some(error_type)
             );
-            let structured = serde_json::json!({"error": {"message": message}}).to_string();
-            let expected = format!("Invalid request; {public_prefix}{}", "界🦀".repeat(300));
-            let mut end = 512;
-            while !expected.is_char_boundary(end) {
-                end -= 1;
-            }
-            for body in [structured.as_bytes(), message.as_bytes()] {
-                let detail = classify(400, None, body).presentation.detail;
-                assert_eq!(detail, expected[..end], "input: {message}");
-                assert!(!detail.contains(head));
-                assert!(!detail.contains("boundtail"));
+            assert_eq!(
+                error.presentation.provider_request_id.as_deref(),
+                Some(id.as_str())
+            );
+            assert_eq!(error.presentation.provider_http_status, Some(status));
+        }
+    }
+}
+
+#[test]
+fn arbitrary_provider_type_and_request_id_are_not_structured_diagnostics() {
+    for classify in [replay_anthropic_http_error, replay_openai_http_error] {
+        let body = serde_json::json!({"error": {
+            "type": "acct_973_private_account", "message": "Access denied."
+        }})
+        .to_string();
+        let error = classify(403, None, body.as_bytes())
+            .with_http_metadata(403, Some("req_fixture Cookie: session=private"));
+        assert!(error.presentation.provider_error_type.is_none());
+        assert!(error.presentation.provider_request_id.is_none());
+        assert_eq!(error.presentation.provider_http_status, Some(403));
+    }
+    let body = br#"{"error":{"type":"acct_private","code":"permission_denied","message":"Access denied."}}"#;
+    let error = replay_openai_http_error(403, None, body);
+    assert_eq!(
+        error.presentation.provider_error_type.as_deref(),
+        Some("permission_denied")
+    );
+}
+
+#[test]
+fn request_ids_require_the_exact_bounded_header_shape() {
+    let body = br#"{"error":{"type":"permission_error","message":"Access denied."}}"#;
+    for request_id in [
+        "req_fixture@example.test",
+        "req_fixture?account=private",
+        "req_fixture Cookie: private",
+        "req_acct_973_private_account",
+        "acct_973_private_account",
+        "req_",
+    ] {
+        let error =
+            replay_openai_http_error(403, None, body).with_http_metadata(403, Some(request_id));
+        assert!(
+            error.presentation.provider_request_id.is_none(),
+            "{request_id}"
+        );
+        assert_eq!(
+            error.presentation.provider_error_type.as_deref(),
+            Some("permission_error")
+        );
+    }
+    let long = format!("req_{}", "x".repeat(129));
+    assert!(
+        replay_openai_http_error(403, None, body)
+            .with_http_metadata(403, Some(&long))
+            .presentation
+            .provider_request_id
+            .is_none()
+    );
+}
+
+#[test]
+fn oversized_and_invalid_utf8_provider_bodies_never_publish_fragments() {
+    for classify in [replay_anthropic_http_error, replay_openai_http_error] {
+        let html = format!("<html><body>{}</body></html>", "x".repeat(16_000));
+        assert_eq!(
+            classify(403, None, html.as_bytes()).presentation.detail,
+            WITHHELD
+        );
+        let invalid = classify(403, None, b"\xff\xfeprivate");
+        assert!(!invalid.presentation.detail.contains("private"));
+    }
+}
+
+#[test]
+fn suspicious_message_shapes_are_withheld_across_adapters() {
+    let messages = [
+        "Access denied: alice973@example.test",
+        "Access denied: Cookie: session=fixture_973_cookie_secret",
+        "Access denied: Set-Cookie: session=fixture_973_cookie_secret",
+        "Access denied: acct_973_private_account",
+        "Access denied: org_973_private_org",
+        "Access denied: user_973_private_user",
+        "Access denied: credit_973_private_credit",
+        "Access denied: prompt=fixture_973_private_request_payload",
+        "Access denied: request_body={\"prompt\":\"private\"}",
+        "Access denied: https://example.test/path?token=private",
+        "Access denied: Authorization: Bearer fixture-opaque-secret",
+        "Access denied: sk-fixture-973-key",
+        "Access denied: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.fixture973signature",
+        "Invalid shape.\u{1b}[31m",
+        "messages.2: tool_use ids were found without tool_result blocks",
+    ];
+    for classify in classifiers() {
+        for message in messages {
+            let body = serde_json::json!({"error": {"message": message}}).to_string();
+            for input in [body.as_bytes(), message.as_bytes()] {
+                assert_eq!(
+                    classify(400, None, input).presentation.detail,
+                    WITHHELD,
+                    "{message}"
+                );
             }
         }
     }
 }
 
 #[test]
-fn credential_introductions_keep_unterminated_quote_ownership() {
-    for classify in [
-        replay_anthropic_http_error,
-        replay_gemini_http_error,
-        replay_openai_http_error,
-    ] {
+fn credential_boundary_matrix_remains_fail_closed() {
+    for classify in classifiers() {
         for introducer in [
             "proxy-authorization",
             "authorization",
@@ -317,39 +198,19 @@ fn credential_introductions_keep_unterminated_quote_ownership() {
             "api_key",
             "apikey",
             "access_token",
-            "access-token",
             "refresh_token",
-            "refresh-token",
             "Bearer",
             "Authorization:Bearer",
-            "Authorization:\"Bearer\" 'Basic'",
             "echoed=",
         ] {
             for separator in [" ", "\n\t", ":", ":\n", "=", " = ", " : = \n"] {
                 for quote in ['"', '\''] {
-                    let head = if introducer == "echoed=" {
-                        "sk-fixture-openhead"
-                    } else {
-                        "opaque-openhead"
-                    };
-                    // A mismatched quote, escaped matching quote, apparent
-                    // header and delimiters must all stay inside the value.
-                    let other_quote = if quote == '"' { '\'' } else { '"' };
                     let message = format!(
-                        "Invalid request; {introducer}{separator}{quote}{head}, {other_quote}opposite; \\{quote}escaped\n api_key=inner, opentail"
+                        "Invalid request; {introducer}{separator}{quote}opaque-openhead, \\{quote}escaped\n api_key=inner, opentail"
                     );
-                    let structured = serde_json::json!({"error": {"message": message}}).to_string();
-                    for body in [structured.as_bytes(), message.as_bytes()] {
-                        let detail = classify(400, None, body).presentation.detail;
-                        for secret in [head, "opposite", "escaped", "inner", "opentail"] {
-                            assert!(
-                                !detail.contains(secret),
-                                "input: {message:?}; output: {detail:?}"
-                            );
-                        }
-                        assert!(detail.starts_with("Invalid request;"));
-                        assert!(detail.ends_with("[REDACTED]"));
-                        assert!(detail.len() <= 512);
+                    let body = serde_json::json!({"error": {"message": message}}).to_string();
+                    for input in [body.as_bytes(), message.as_bytes()] {
+                        assert_eq!(classify(400, None, input).presentation.detail, WITHHELD);
                     }
                 }
             }
@@ -358,107 +219,29 @@ fn credential_introductions_keep_unterminated_quote_ownership() {
 }
 
 #[test]
-fn bearer_separators_share_closed_and_unquoted_value_boundaries() {
-    for classify in [
-        replay_anthropic_http_error,
-        replay_gemini_http_error,
-        replay_openai_http_error,
-    ] {
-        for introducer in [
-            "Bearer",
-            "bEaReR",
-            "Authorization:Bearer",
-            "Authorization:'Bearer'",
-        ] {
-            for separator in [" ", "\n\t", ":", ":\n", "=", " = ", " : = \n"] {
-                for value in [
-                    "\"separatorhead, separatortail\";",
-                    "'separatorhead, separatortail';",
-                    "\"Token\":\n'separatorhead, separatortail';",
-                    "Basic = \"separatorhead, separatortail\";",
-                    "separatorhead;",
-                ] {
-                    let message =
-                        format!("Invalid request; {introducer}{separator}{value} retained detail");
-                    let structured = serde_json::json!({"error": {"message": message}}).to_string();
-                    for body in [structured.as_bytes(), message.as_bytes()] {
-                        let detail = classify(400, None, body).presentation.detail;
-                        assert!(
-                            !detail.contains("separatorhead"),
-                            "input: {message:?}; output: {detail:?}"
-                        );
-                        assert!(
-                            !detail.contains("separatortail"),
-                            "input: {message:?}; output: {detail:?}"
-                        );
-                        assert!(detail.starts_with("Invalid request;"));
-                        assert!(
-                            detail.ends_with("retained detail"),
-                            "input: {message:?}; output: {detail:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn every_credential_in_compact_diagnostics_is_redacted() -> Result<(), serde_json::Error> {
+fn previous_credential_corpus_remains_private() -> Result<(), serde_json::Error> {
     #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Fixture {
         name: String,
         detail: String,
         secrets: Vec<String>,
         expected: Option<String>,
     }
-
     let fixtures: Vec<Fixture> =
         serde_json::from_str(include_str!("fixtures/provider_error_details.json"))?;
-    assert!(!fixtures.is_empty(), "the credential corpus must run");
-    for classify in [
-        replay_anthropic_http_error,
-        replay_gemini_http_error,
-        replay_openai_http_error,
-    ] {
+    assert!(!fixtures.is_empty());
+    for classify in classifiers() {
         for fixture in &fixtures {
-            assert!(!fixture.secrets.is_empty() || fixture.expected.is_some());
-            let message = &fixture.detail;
-            let body = serde_json::json!({"error": {
-                "type": "invalid_request_error", "message": message
-            }})
-            .to_string();
-            // The same sanitizer serves structured and plain HTTP error bodies.
-            for input in [body.as_bytes(), message.as_bytes()] {
-                let error = classify(400, None, input)
-                    .with_http_metadata(400, Some("req-multi-header-fixture"));
-                let detail = error.presentation.detail;
+            let body = serde_json::json!({"error": {"message": fixture.detail}}).to_string();
+            for input in [body.as_bytes(), fixture.detail.as_bytes()] {
+                let detail = classify(400, None, input).presentation.detail;
                 for secret in &fixture.secrets {
-                    assert!(
-                        !detail.contains(secret),
-                        "{}: credential survived in {detail:?}",
-                        fixture.name
-                    );
+                    assert!(!detail.contains(secret), "{} leaked {secret}", fixture.name);
                 }
-                if let Some(expected) = &fixture.expected {
-                    assert_eq!(&detail, expected, "{}", fixture.name);
-                }
-                if message.ends_with("retained detail") {
-                    assert!(
-                        detail.ends_with("retained detail"),
-                        "{}: {detail:?}",
-                        fixture.name
-                    );
+                if fixture.expected.is_some() {
+                    assert_eq!(detail, WITHHELD, "{}", fixture.name);
                 }
                 assert!(detail.len() <= 512);
-                assert!(!detail.chars().any(|c| c.is_control() && c != '\n'));
-                assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-                assert_eq!(error.presentation.provider_http_status, Some(400));
-                assert_eq!(
-                    error.presentation.provider_request_id.as_deref(),
-                    Some("req-multi-header-fixture")
-                );
             }
         }
     }

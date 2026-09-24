@@ -243,9 +243,7 @@ async fn hostile_probe_and_http_error_body_sources_are_bounded() {
     assert!(reset_after_status.retryable);
 }
 
-/// MUTATION CHECK: discard the extracted provider message, or restrict HTTP
-/// detail extraction to the typed OpenAI envelope. The exact parsed and raw
-/// explanations below disappear from the durable presentation.
+/// Safe prose survives; structured fragments and credentials are withheld.
 #[test]
 fn openai_http_errors_preserve_safe_provider_explanations() {
     let parsed = replay_openai_http_error(
@@ -256,7 +254,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
     assert_eq!(parsed.kind, ProviderErrorKind::InvalidRequest);
     assert_eq!(
         parsed.presentation.detail,
-        "Unsupported parameter: service_tier"
+        "message withheld: may contain account data"
     );
 
     let plain = replay_openai_http_error(
@@ -278,7 +276,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
     );
     assert_eq!(
         redacted.presentation.detail,
-        "Credential Bearer [REDACTED] was rejected"
+        "message withheld: may contain account data"
     );
     assert!(
         !redacted
@@ -287,8 +285,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
             .contains("sk-provider-secret-value")
     );
 
-    // MUTATION CHECK: clear `redact_next` after consuming `Bearer`. The
-    // opaque credential following `Authorization: Bearer` becomes durable.
+    // Opaque credentials remain absent from the public presentation.
     let redacted = replay_openai_http_error(
         400,
         None,
@@ -296,7 +293,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
     );
     assert_eq!(
         redacted.presentation.detail,
-        "Credential Authorization: [REDACTED] [REDACTED] was rejected"
+        "message withheld: may contain account data"
     );
     assert!(
         !redacted
@@ -316,12 +313,11 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
     assert!(!invalidated.retryable);
     assert_eq!(
         invalidated.presentation.detail,
-        "Your authentication token has been invalidated. Please sign in again."
+        "message withheld: may contain account data"
     );
 }
 
-/// MUTATION CHECK: return the kind-only stream error or require JSON data for
-/// `event:error`. The provider's explanation is lost in one of these cases.
+/// Stream errors retain safe prose and classify suspicious prose internally.
 #[test]
 fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
     let enveloped = replay_openai_responses_sse(
@@ -333,7 +329,10 @@ fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
         .expect("one stream item")
         .expect_err("response.failed is an error");
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-    assert_eq!(error.presentation.detail, "Unknown field: metadata");
+    assert_eq!(
+        error.presentation.detail,
+        "message withheld: may contain account data"
+    );
 
     let raw = replay_openai_responses_sse(
         b"event: error\ndata: The service is overloaded. Please try again later.\n\n",
@@ -375,7 +374,7 @@ fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
     assert!(!error.retryable);
     assert_eq!(
         error.presentation.detail,
-        "Your authentication token has been invalidated. Please sign in again."
+        "message withheld: may contain account data"
     );
 }
 

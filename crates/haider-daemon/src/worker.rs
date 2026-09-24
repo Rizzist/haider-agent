@@ -7356,6 +7356,7 @@ async fn perform_manual_compaction(
         lease.worker_generation(),
     );
     post_compaction_config.tools = post_compaction_tool_pack.current.as_ref().to_vec();
+    post_compaction_config.provider_lockdown = lockdown.is_some();
     if let Some(configured) = initial_tool_exposure_for_turn(
         dependencies.tool_factory.as_ref(),
         grant,
@@ -9346,6 +9347,7 @@ async fn start_turn(
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
     config.enforce_advertised_tool_ceiling = loom_provider_fenced || lockdown.is_some();
+    config.provider_lockdown = lockdown.is_some();
     config.branch_id = accepted.branch_id.clone();
     config.max_tokens = metadata.max_tokens;
     config.interaction_policy =

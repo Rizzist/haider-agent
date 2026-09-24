@@ -67,6 +67,9 @@ internal object RpcUiMapping {
                     val lines = listOfNotNull(
                         display.optionalString("title"),
                         display.optionalString("detail"),
+                        display.optionalString("provider_error_type")?.let { "Provider error: $it" },
+                        display.optionalNumber("provider_http_status")?.let { "HTTP $it" },
+                        display.optionalString("provider_request_id")?.let { "Request ID: $it" },
                         display.optionalString("code"),
                     ).map(String::trim).filter(String::isNotEmpty).distinct()
                     messages["failed:${entry.seq}"] = Message(entry.seq, Role.Agent, "",

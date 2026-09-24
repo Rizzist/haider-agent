@@ -987,11 +987,28 @@ impl TurnProjection {
             }
             EventPayload::RunFailed {
                 code,
-                message,
                 retryable,
+                presentation,
                 ..
             } => {
-                self.failure = Some(MobileChatError::new(code.as_str(), message, retryable));
+                let mut parts = vec![code.as_str().to_owned()];
+                if let Some(presentation) = presentation {
+                    if let Some(error_type) = presentation.provider_error_type {
+                        parts.push(error_type);
+                    }
+                    if let Some(status) = presentation.provider_http_status {
+                        parts.push(format!("HTTP {status}"));
+                    }
+                    if let Some(request_id) = presentation.provider_request_id {
+                        parts.push(format!("Request ID: {request_id}"));
+                    }
+                    parts.push(presentation.detail);
+                }
+                self.failure = Some(MobileChatError::new(
+                    code.as_str(),
+                    parts.join(" · "),
+                    retryable,
+                ));
             }
             EventPayload::RunState(state) => {
                 if let Some(status) = run_status(&state) {

@@ -857,6 +857,8 @@ pub struct HarnessConfig {
     /// workflows enable this bit so actor-owned tools cannot bypass a dynamic
     /// dispatcher grant merely by naming an unadvertised tool.
     pub enforce_advertised_tool_ceiling: bool,
+    /// Strip provider prose from durable failures for restricted providers.
+    pub provider_lockdown: bool,
     /// Local equivalents advertised after one exact provider-hosted-tool
     /// rejection. Empty means this provider has no safe fallback pack.
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
@@ -1055,6 +1057,7 @@ impl HarnessConfig {
             tool_exposure: None,
             tool_pack_digest: None,
             enforce_advertised_tool_ceiling: false,
+            provider_lockdown: false,
             provider_tool_fallback_tools: Vec::new(),
             shared_provider_tool_fallback_tools: None,
             provider_tool_fallback_digest: None,
@@ -5639,7 +5642,11 @@ impl HarnessActor {
                                 .await;
                         }
                         if message.as_ref().is_some_and(|partial| !partial.is_empty()) {
-                            let presentation = stream_interruption_presentation(&error);
+                            let mut presentation = stream_interruption_presentation(&error);
+                            if self.config.provider_lockdown {
+                                presentation.detail =
+                                    "message withheld: may contain account data".to_owned();
+                            }
                             let (source_item, partial) = match self
                                 .complete_incomplete_message(
                                     &run_id,
@@ -11082,6 +11089,10 @@ impl HarnessActor {
             }
         }
         specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
+        if self.config.provider_lockdown {
+            provider_error.presentation.detail =
+                "message withheld: may contain account data".to_owned();
+        }
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(
                 self.next_menu_id(),
@@ -11178,7 +11189,16 @@ impl HarnessActor {
 
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
-        let error = self.latched_terminal_failure().await.unwrap_or(error);
+        let mut error = self.latched_terminal_failure().await.unwrap_or(error);
+        if self.config.provider_lockdown
+            && let Some(presentation) = error.presentation.as_mut()
+            && matches!(
+                error.code,
+                ErrorCode::ProviderError | ErrorCode::ProviderTimeout | ErrorCode::IdleTimeout
+            )
+        {
+            presentation.detail = "message withheld: may contain account data".to_owned();
+        }
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
         }
