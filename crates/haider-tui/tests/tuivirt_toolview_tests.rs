@@ -758,3 +758,31 @@ fn tool_click_targets_sit_on_their_rows_below_the_origin_line() {
         assert_eq!(usize::from(rect.y), header, "header hit at {width} cols");
     }
 }
+
+/// The live proof's gesture: scrolled back into history under the origin
+/// line, a click on the write's `(⌃O to expand)` door opens its detail.
+#[test]
+fn the_door_opens_the_detail_when_scrolled_back_under_the_origin_line() {
+    let mut model = toolview_model();
+    model.launch_origin = Some((1, Some("/private/tmp/origin/ws".into())));
+    for n in 0..30 {
+        push_agent(
+            &mut model,
+            &format!("tail-{n}"),
+            &tuivirt_common::agent_row(n),
+        );
+    }
+    draw(&model, 118, 36);
+    model.scroll_back.set(model.scroll_max.get());
+    let frame = draw(&model, 118, 36);
+    let door = frame
+        .row_containing("(⌃O to expand)")
+        .unwrap_or_else(|| panic!("door on screen:\n{}", frame.rows.join("\n")));
+    let (rect, hit) = frame
+        .find_hit(|hit| matches!(hit, Hit::ToolDetail(_)))
+        .expect("door hit");
+    assert_eq!(usize::from(rect.y), door, "{}", frame.rows.join("\n"));
+    model.handle_hit(hit);
+    assert!(model.tool_detail.is_some());
+    assert!(draw(&model, 118, 36).contains("full detail"));
+}
