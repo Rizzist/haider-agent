@@ -615,7 +615,7 @@ fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
     // would be rejected by the very daemon it just resolved.
     model.identity.provider = profile.default_provider.clone();
     model.identity.model_short = profile.default_model.clone();
-    model.identity.context_window = profile.default_max_tokens;
+    model.identity.context_window = 0; // Unknown until a model detail arrives.
     if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
         model.sanctum_tier = SanctumTier::Translit;
     }

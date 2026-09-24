@@ -6,8 +6,9 @@
 //! Why: the meter divided real token counts by a hardcoded 200k seed, so
 //! every percentage shown for a subscription model was a fiction. The
 //! codex catalog declares real windows per model; a declared window always
-//! wins, and with none declared the seed stands — an honest fallback, not
-//! a fabrication.
+//! wins. With none declared a LIVE identity's window is UNKNOWN (`0`) —
+//! 973-context-meter: the live seed was the profile's 4,096-token OUTPUT
+//! budget, so every undeclared model read "100% of 4.1k".
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
@@ -119,14 +120,16 @@ fn adoption_takes_the_provider_declared_window() {
     );
 }
 
-/// MUTATION CHECK (W5g-1): make `refresh_context_window` substitute a
-/// constant (or zero) when the catalog declares no window. Expected
-/// runtime failure: the seed below is overwritten by an invented number.
+/// MUTATION CHECK (973-context-meter): let `refresh_context_window` keep
+/// the current figure when the catalog declares no window. Expected runtime
+/// failure: the live identity keeps the 4,096 output-budget seed (or a
+/// previous model's window) instead of reading unknown.
 #[test]
-fn an_undeclared_window_keeps_the_seed_honest() {
+fn an_undeclared_window_is_unknown_never_the_seed() {
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
-    let seed = model.identity.context_window;
+    // The live launcher's historical seed: the profile OUTPUT budget.
+    model.identity.context_window = 4_096;
 
     pass(
         &mut driver,
@@ -152,9 +155,12 @@ fn an_undeclared_window_keeps_the_seed_honest() {
 
     assert_eq!(model.identity.model_short, "claude-opus-5");
     assert_eq!(
-        model.identity.context_window, seed,
-        "no declaration → the current figure stands; never a guess"
+        model.identity.context_window, 0,
+        "no declaration → unknown; never the output budget, never a guess"
     );
+    let meter = model.context_meter();
+    assert_eq!(meter.window, None);
+    assert_eq!(meter.percent(), None);
 }
 
 /// MUTATION CHECK (W5g-1): remove the `refresh_context_window` call from
@@ -184,7 +190,10 @@ fn a_late_catalog_updates_even_a_pinned_identity() {
     run_slash(&mut model, "/model gpt-5.6-sol");
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
     assert!(model.identity_pinned, "/model is an explicit choice");
-    assert_eq!(model.identity.context_window, seed);
+    assert_eq!(
+        model.identity.context_window, 0,
+        "undeclared → unknown (the seed was {seed})"
+    );
 
     pass(
         &mut driver,

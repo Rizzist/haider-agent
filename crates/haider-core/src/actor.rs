@@ -722,7 +722,8 @@ pub const CONTEXT_STRUCTURAL_TIER_ONE_PERCENT: u64 = 60;
 /// to recover headroom first.
 pub const CONTEXT_STRUCTURAL_TIER_TWO_PERCENT: u64 = 75;
 /// Existing provider-summary boundary retained for compatibility.
-pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 = 85;
+pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 =
+    haider_protocol::context::CONTEXT_SUMMARY_TIER_PERCENT;
 pub const CONTEXT_STRUCTURAL_TIER_ONE_RETAINED_TOOL_PAIRS: usize = 24;
 pub const CONTEXT_STRUCTURAL_TIER_TWO_RETAINED_TOOL_PAIRS: usize = 12;
 
@@ -14294,24 +14295,10 @@ fn finalize_request_usage(
     Ok(())
 }
 
-/// Daemon/core context threshold policy. Wire clients consume the emitted
-/// threshold and must not recalculate it locally.
-#[must_use]
-pub fn context_soft_threshold_tokens(window: u64, reserved_output_tokens: u64) -> Option<u64> {
-    context_tier_threshold_tokens(window, reserved_output_tokens, CONTEXT_SUMMARY_TIER_PERCENT)
-}
-
-#[must_use]
-pub fn context_tier_threshold_tokens(
-    window: u64,
-    reserved_output_tokens: u64,
-    percent: u64,
-) -> Option<u64> {
-    let hard_fit = window.checked_sub(reserved_output_tokens)?;
-    let percentage = u64::try_from(u128::from(window).saturating_mul(u128::from(percent)) / 100)
-        .unwrap_or(u64::MAX);
-    Some(percentage.min(hard_fit))
-}
+/// Daemon/core context threshold policy: the one law lives in the protocol
+/// crate so a client can display the trigger for a newly selected model
+/// before that model's first daemon snapshot without a second copy of it.
+pub use haider_protocol::context::{context_soft_threshold_tokens, context_tier_threshold_tokens};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StructuralTrimOutcome {

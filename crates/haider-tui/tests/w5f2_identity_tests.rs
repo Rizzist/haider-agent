@@ -244,10 +244,13 @@ fn session_create_requests_an_output_budget_not_the_context_window() {
 
     // A tinier declared window still wins.
     assert_eq!(session_output_cap(4_096), 4_096);
+    // 973-context-meter: `0` is an UNKNOWN window, not a tiny one — the
+    // ceiling stands (the old `1` would have capped every reply at one
+    // token once an undeclared model's window became honestly unknown).
     assert_eq!(
         session_output_cap(0),
-        1,
-        "zero never reaches the daemon's reject"
+        SESSION_OUTPUT_CAP,
+        "an unknown window keeps the output ceiling"
     );
 }
 

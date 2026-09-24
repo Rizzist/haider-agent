@@ -1280,6 +1280,21 @@ impl ProvidersState {
             })
             .and_then(|detail| detail.context_window)
     }
+
+    /// Whether the catalog carries a detail row for `model` at all — then
+    /// its (possibly absent) window is the catalog's authoritative answer.
+    #[must_use]
+    pub fn model_listed(&self, provider: &str, model: &str) -> bool {
+        self.providers
+            .iter()
+            .filter(|summary| summary.provider == provider)
+            .any(|summary| {
+                summary
+                    .model_details
+                    .iter()
+                    .any(|detail| detail.name == model)
+            })
+    }
 }
 
 /// The composer queue panel (954): daemon-held mid-turn messages, listed
@@ -5245,6 +5260,13 @@ pub struct AppModel {
     /// ⌃G / `/tokens` context panel (sim tui.js:2946-2977) — session
     /// surfaces only; esc closes.
     pub token_panel: bool,
+    /// The (provider, model) pair the context meter last resolved against
+    /// (973-context-meter), maintained by [`Self::refresh_context_window`].
+    meter_identity: Option<(String, String)>,
+    /// The latest snapshot at the moment the identity pair last CHANGED:
+    /// while it is still the latest, it describes the previous model, so
+    /// its window may not stand in for the current model's.
+    meter_snapshot_before_switch: Option<haider_protocol::context::ContextFootprint>,
     /// `/tree` — selected row (sim treeSel).
     pub tree_sel: usize,
     /// `/tree` — the VIEWED branch (`None` = the root/main branch; sim
@@ -5890,6 +5912,8 @@ impl Default for AppModel {
         Self {
             screen: Screen::Boot,
             token_panel: false,
+            meter_identity: None,
+            meter_snapshot_before_switch: None,
             tree_sel: 0,
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
@@ -11705,19 +11729,64 @@ impl AppModel {
 
     /// Re-derives the identity's context window from the discovered catalog
     /// (W5g-1: real limits, never guessed). A provider-declared window
-    /// always wins; with none declared the current figure stands — seed
-    /// defaults remain honest fallbacks, not fabrications. Idempotent, so
-    /// catalog arrivals may call it even for a PINNED identity: the pin
-    /// protects the user's provider/model choice, not a stale number.
+    /// always wins. With none declared, a LIVE identity's window becomes
+    /// unknown (`0`): neither the previous model's window nor the profile's
+    /// output budget may stand in for it (973-context-meter — the owner's
+    /// "always 100%" was `used / 4,096`). Only the demo, which fabricates
+    /// locally, keeps its sim seed. Idempotent, so catalog arrivals may call
+    /// it even for a PINNED identity: the pin protects the user's
+    /// provider/model choice, not a stale number.
     pub fn refresh_context_window(&mut self) {
-        if let Some(window) = self
+        let pair = (
+            self.identity.provider.clone(),
+            self.identity.model_short.clone(),
+        );
+        if self.meter_identity.as_ref() != Some(&pair) {
+            if self.meter_identity.is_some() {
+                self.meter_snapshot_before_switch = self.projection.latest_footprint().cloned();
+            }
+            self.meter_identity = Some(pair);
+        }
+        let declared = self
             .providers
-            .declared_window(&self.identity.provider, &self.identity.model_short)
-            && self.identity.context_window != window
-        {
+            .declared_window(&self.identity.provider, &self.identity.model_short);
+        let window = match declared {
+            Some(window) => window,
+            None if self.mode.fabricates_locally() => return,
+            None => 0,
+        };
+        if self.identity.context_window != window {
             self.identity.context_window = window;
             self.dirty = true;
         }
+    }
+
+    /// The session context meter (973-context-meter): the latest durable
+    /// snapshot against the CURRENT model's window, through the one pure
+    /// resolution every surface renders.
+    #[must_use]
+    pub fn context_meter(&self) -> crate::context_meter::ContextMeter {
+        // A snapshot's window may stand in for an undeclared one only while
+        // the catalog has no row for the current model (not yet loaded, or
+        // a model outside it). When the catalog lists the model without a
+        // window, "unknown" is the answer — a snapshot window then belongs
+        // to a previously selected model.
+        // Nor may a snapshot taken before the last model switch: until the
+        // new model's first request it describes the previous model.
+        let snapshot_predates_model = self.meter_snapshot_before_switch.is_some()
+            && self.projection.latest_footprint() == self.meter_snapshot_before_switch.as_ref();
+        let snapshot_window_allowed = self.mode.fabricates_locally()
+            || !(snapshot_predates_model
+                || self
+                    .providers
+                    .model_listed(&self.identity.provider, &self.identity.model_short));
+        crate::context_meter::ContextMeter::resolve(
+            self.projection.latest_footprint(),
+            self.projection.context_tokens(),
+            self.identity.context_window,
+            snapshot_window_allowed,
+            crate::live::session_output_cap,
+        )
     }
 
     /// The auth flavor of the CURRENT identity pair — `oauth` or `api` —

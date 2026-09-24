@@ -2442,10 +2442,15 @@ fn ssh_profile_command(
 pub const SESSION_OUTPUT_CAP: u64 = 30_000;
 
 /// The output budget a new session may request: the ceiling, bounded by the
-/// (smaller) context window when one is declared.
+/// (smaller) context window when one is declared. `0` is an UNKNOWN window
+/// (973-context-meter) and leaves the ceiling in force.
 #[must_use]
 pub fn session_output_cap(context_window: u64) -> u64 {
-    SESSION_OUTPUT_CAP.min(context_window.max(1))
+    if context_window == 0 {
+        SESSION_OUTPUT_CAP
+    } else {
+        SESSION_OUTPUT_CAP.min(context_window)
+    }
 }
 
 impl LiveDriver {

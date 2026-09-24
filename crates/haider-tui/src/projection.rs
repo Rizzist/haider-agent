@@ -2193,7 +2193,7 @@ impl SessionProjection {
                 (window > 0).then(|| {
                     format!(
                         "· context at {}% — compacting · planned cache epoch transition; next turn history cold (summary retained · originals stay in /tree)",
-                        footprint.used_tokens.saturating_mul(100) / window
+                        crate::context_meter::percent_of(footprint.used_tokens, window)
                     )
                 })
             })
