@@ -19,8 +19,8 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 31;
-const LATEST_SCHEMA_VERSION: u32 = 31;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 32;
+const LATEST_SCHEMA_VERSION: u32 = 32;
 
 struct Migration {
     version: u32,
@@ -876,6 +876,43 @@ const MIGRATIONS: &[Migration] = &[
             DELETE FROM session_projection_checkpoints;
         ",
     },
+    Migration {
+        version: 32,
+        sql: "
+            -- Append-only trunks and immutable request leaves share a
+            -- provider-view prefix across requests. Old rows retain their v24
+            -- per-request history index and remain readable unchanged.
+            CREATE TABLE provider_view_history_segments (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                parent_segment_id INTEGER REFERENCES provider_view_history_segments(id),
+                parent_block_count INTEGER NOT NULL DEFAULT 0 CHECK (parent_block_count >= 0),
+                CHECK (parent_segment_id IS NOT NULL OR parent_block_count = 0),
+                CHECK (parent_segment_id IS NULL OR parent_segment_id < id)
+            );
+            CREATE TABLE provider_view_history_blocks (
+                segment_id INTEGER NOT NULL,
+                block_ordinal INTEGER NOT NULL CHECK (block_ordinal >= 0),
+                content_hash TEXT NOT NULL CHECK (length(content_hash) = 71),
+                byte_len INTEGER NOT NULL CHECK (byte_len >= 0),
+                PRIMARY KEY (segment_id, block_ordinal),
+                FOREIGN KEY (segment_id) REFERENCES provider_view_history_segments(id)
+            );
+            CREATE INDEX provider_view_history_blocks_hash
+                ON provider_view_history_blocks(content_hash);
+            CREATE TABLE provider_view_request_history (
+                session_id TEXT NOT NULL,
+                request_ordinal INTEGER NOT NULL,
+                segment_id INTEGER NOT NULL REFERENCES provider_view_history_segments(id),
+                block_count INTEGER NOT NULL CHECK (block_count >= 0),
+                history_digest TEXT NOT NULL CHECK (length(history_digest) = 64),
+                PRIMARY KEY (session_id, request_ordinal),
+                FOREIGN KEY (session_id, request_ordinal)
+                    REFERENCES provider_view_requests(session_id, request_ordinal)
+                    ON DELETE CASCADE
+            );
+        ",
+    },
 ];
 
 // The direct schema for an empty profile. The equivalence pin in
@@ -1201,6 +1238,39 @@ CREATE TABLE provider_view_blocks (
                     provider, model, cache_epoch, session_id,
                     request_ordinal, section, block_ordinal, content_hash
                 ),
+                FOREIGN KEY (session_id, request_ordinal)
+                    REFERENCES provider_view_requests(session_id, request_ordinal)
+                    ON DELETE CASCADE
+            );
+
+CREATE TABLE provider_view_history_segments (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                parent_segment_id INTEGER REFERENCES provider_view_history_segments(id),
+                parent_block_count INTEGER NOT NULL DEFAULT 0 CHECK (parent_block_count >= 0),
+                CHECK (parent_segment_id IS NOT NULL OR parent_block_count = 0),
+                CHECK (parent_segment_id IS NULL OR parent_segment_id < id)
+            );
+
+CREATE TABLE provider_view_history_blocks (
+                segment_id INTEGER NOT NULL,
+                block_ordinal INTEGER NOT NULL CHECK (block_ordinal >= 0),
+                content_hash TEXT NOT NULL CHECK (length(content_hash) = 71),
+                byte_len INTEGER NOT NULL CHECK (byte_len >= 0),
+                PRIMARY KEY (segment_id, block_ordinal),
+                FOREIGN KEY (segment_id) REFERENCES provider_view_history_segments(id)
+            );
+
+CREATE INDEX provider_view_history_blocks_hash
+                ON provider_view_history_blocks(content_hash);
+
+CREATE TABLE provider_view_request_history (
+                session_id TEXT NOT NULL,
+                request_ordinal INTEGER NOT NULL,
+                segment_id INTEGER NOT NULL REFERENCES provider_view_history_segments(id),
+                block_count INTEGER NOT NULL CHECK (block_count >= 0),
+                history_digest TEXT NOT NULL CHECK (length(history_digest) = 64),
+                PRIMARY KEY (session_id, request_ordinal),
                 FOREIGN KEY (session_id, request_ordinal)
                     REFERENCES provider_view_requests(session_id, request_ordinal)
                     ON DELETE CASCADE

@@ -140,6 +140,9 @@ mod event_store_append_tests;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound the reusable WAL allocation after a checkpoint/reset cycle.
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1_024 * 1_024;
+/// A fixed ~6 MiB frame budget bounds checkpoint work while avoiding the
+/// frequent whole-WAL flushes seen with SQLite's 1,000-page default.
+const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1_520;
 const REPLAY_PAGE_SIZE: usize = 1_024;
 /// Keep the complete current `prepare_cached` census without the previous 2x
 /// headroom. This cache is an optimization only; eviction reparses SQL and
@@ -25538,6 +25541,9 @@ fn open_connection_with(path: &Path, synchronous: StoreSynchronous) -> StoreResu
         .pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)
         .map_err(map_sqlite_error)?;
     connection
+        .pragma_update(None, "wal_autocheckpoint", WAL_AUTO_CHECKPOINT_PAGES)
+        .map_err(map_sqlite_error)?;
+    connection
         .pragma_update(None, "cache_size", SQLITE_PAGE_CACHE_KIB)
         .map_err(map_sqlite_error)?;
     connection
@@ -28520,7 +28526,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v31 and reopen.
+    /// v23's run-head backfill remains untouched through v32 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -28557,6 +28563,9 @@ mod run_head_projection_tests {
              DROP TABLE workflow_graph_instances;
              ALTER TABLE profile_meta DROP COLUMN boot_publication_pending;
              ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
+             DROP TABLE provider_view_request_history;
+             DROP TABLE provider_view_history_blocks;
+             DROP TABLE provider_view_history_segments;
              DROP TABLE provider_view_gc;
              DROP TABLE provider_view_blocks;
              DROP TABLE provider_view_requests;
@@ -28571,7 +28580,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 31);
+            assert_eq!(store.schema_version().expect("schema version"), 32);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))
@@ -29207,8 +29216,8 @@ mod store_synchronous_tests {
         );
         assert_eq!(
             queried_i64_pragma(&connection, "wal_autocheckpoint"),
-            1_000,
-            "the existing 1000-frame autocheckpoint must remain unchanged"
+            WAL_AUTO_CHECKPOINT_PAGES,
+            "every store connection must retain the bounded checkpoint interval"
         );
 
         connection

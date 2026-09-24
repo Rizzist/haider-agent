@@ -1228,12 +1228,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 31);
+        assert_eq!(must(store.schema_version()), 32);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 31);
+    assert_eq!(must(reopened.schema_version()), 32);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -1266,6 +1266,9 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
         "provider_view_session_cursors",
         "provider_view_requests",
         "provider_view_blocks",
+        "provider_view_request_history",
+        "provider_view_history_segments",
+        "provider_view_history_blocks",
         "provider_view_gc",
         "workflow_graph_instances",
         "workflow_node_states",
@@ -1314,13 +1317,16 @@ fn mutation_generation_migration_discards_unauthenticated_checkpoints() {
          DROP TABLE event_authority_keys;
          ALTER TABLE sessions DROP COLUMN journal_event_seq_high_water;
          ALTER TABLE sessions DROP COLUMN journal_mutation_generation;
+         DROP TABLE provider_view_request_history;
+         DROP TABLE provider_view_history_blocks;
+         DROP TABLE provider_view_history_segments;
          DELETE FROM schema_migrations WHERE version >= 30;
          PRAGMA user_version = 29;",
     ));
     drop(legacy);
 
     let migrated = must(Store::open(root.path()));
-    assert_eq!(must(migrated.schema_version()), 31);
+    assert_eq!(must(migrated.schema_version()), 32);
     let connection = must(Connection::open(migrated.database_path()));
     let migrated_generation: i64 = must(connection.query_row(
         "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
@@ -1360,7 +1366,7 @@ fn sqlite_master_schema(database_path: &std::path::Path) -> Vec<(String, String,
 
 /// OWNER UPGRADE LAW: 0.0.962 shipped schema v24. Migrating that exact table,
 /// index, and column shape must converge byte-for-byte in `sqlite_master` with
-/// a freshly migrated store; v25-v31 are additive and must not fork schemas.
+/// a freshly migrated store; v25-v32 are additive and must not fork schemas.
 ///
 /// MUTATION CHECK: omit a guarded v26 column addition or create a different
 /// definition on either migration route. Expected RUNTIME failure: the exact
@@ -1402,6 +1408,9 @@ fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
          DROP TABLE workflow_graph_instances;
          ALTER TABLE profile_meta DROP COLUMN boot_publication_pending;
          ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
+         DROP TABLE provider_view_request_history;
+         DROP TABLE provider_view_history_blocks;
+         DROP TABLE provider_view_history_segments;
          DELETE FROM schema_migrations WHERE version >= 25;
          PRAGMA user_version = 24;",
     ));
@@ -1412,7 +1421,7 @@ fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
     drop(legacy);
 
     let migrated = must(Store::open(legacy_root.path()));
-    assert_eq!(must(migrated.schema_version()), 31);
+    assert_eq!(must(migrated.schema_version()), 32);
     drop(migrated);
     assert_eq!(
         sqlite_master_schema(&legacy_path),
@@ -1466,7 +1475,7 @@ fn typed_agent_install_job_schema_is_durable_and_bounded() {
     drop(connection);
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 31);
+    assert_eq!(must(reopened.schema_version()), 32);
     let connection = must(Connection::open(reopened.database_path()));
     let retained: (String, u32, u32) = must(connection.query_row(
         "SELECT state, completed, total FROM loom_cli_install_jobs WHERE job_id = ?1",
