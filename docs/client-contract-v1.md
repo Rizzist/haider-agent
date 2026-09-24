@@ -3670,7 +3670,10 @@ logical provider requests as completion requires. `RunBudgetV1.request_budget`
 pins a headless run; `spawn_subagent.request_budget` pins each child in its
 durable manifest coordinates. A run pin takes precedence over the child pin,
 and omission at both levels remains unbounded. The convenience values used
-when only one CLI request flag is supplied remain tranche 32 / hard cap 64.
+when only `--max-requests N` is supplied use tranche `min(32, N)`; with only
+`--request-tranche N`, the hard cap is 64. API and manifest policies supply
+both `tranche` and `hard_cap` as a complete `RequestBudgetV1` object; omitting
+the object leaves the request count unbounded.
 Logical counts exclude transport retries, are independent of token/cost/time
 limits, and require no provider usage report.
 

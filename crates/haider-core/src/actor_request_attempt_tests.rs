@@ -511,9 +511,9 @@ fn reported_usage() -> Usage {
 
 /// MUTATION CHECK: move the provider-view marker back to a standalone append
 /// in the real request path. The production batch containing that marker is
-/// no longer the exact five-event pre-change journal sequence followed by the
-/// new progress marker. Budget visibility shares this boundary rather than
-/// introducing an additional request-side append.
+/// must remain the exact five-event journal sequence under the unbounded
+/// default. An explicit request policy adds the budget progress pair in the
+/// same append, as covered by the budget-specific tests below.
 #[tokio::test]
 async fn production_request_path_batches_provider_view_with_attempt_facts() {
     let session_id = SessionId::new("provider-view-production-batch");
@@ -555,15 +555,15 @@ async fn production_request_path_batches_provider_view_with_attempt_facts() {
         })
         .collect::<Vec<_>>();
     assert_eq!(request_batches.len(), 1);
-    assert_eq!(request_batches[0].len(), 7);
-    assert_request_boundary_golden(&request_batches[0][..5]);
-    let progress = RequestBudgetStatusV1::from_extension_item(completed_extension_item(
-        &request_batches[0][5..],
-        PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
-    ))
-    .expect("typed request budget shares the request boundary");
-    assert_eq!(progress.phase, RequestBudgetPhaseV1::Progress);
-    assert_eq!(progress.used, 1);
+    assert_eq!(request_batches[0].len(), 5);
+    assert_request_boundary_golden(&request_batches[0]);
+    assert!(!request_batches[0].iter().any(|payload| matches!(
+        payload,
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { kind, .. },
+            ..
+        }) if kind == PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
+    )));
     let provider_attempt = ProviderViewAttemptV1::try_from_extension_item(
         completed_extension_item(&request_batches[0], PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND),
     )

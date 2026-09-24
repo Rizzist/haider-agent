@@ -332,9 +332,12 @@ bound checkpoints remain useful, and machine JSON/JSONL retains all facts for
 an explicitly budgeted run.
 
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
-request policy. Supplying only one flag uses the explicit-policy convenience
-counterpart (tranche 32 or hard cap 64); supplying neither leaves the run
-unbounded. `haider run --resume RUN_ID --output jsonl` accepts a fresh
+request policy. With only `--max-requests N`, the implicit tranche is
+`min(32, N)`; for example, `--max-requests 5` permits exactly five requests
+without an earlier soft checkpoint. With only `--request-tranche N`, the
+implicit hard cap is 64 (so N must be at most 64). An explicit tranche must
+not exceed an explicit cap. Supplying neither flag leaves the run unbounded.
+`haider run --resume RUN_ID --output jsonl` accepts a fresh
 turn in the original headless root session, restoring tool history and the
 source policy unless explicitly overridden. Its stream correlates the new
 run and retains the ordinary contiguous cursor contract. The source run and

@@ -374,11 +374,17 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
 
     if request_tranche.is_some() || max_requests.is_some() {
         let defaults = haider_protocol::request_budget::RequestBudgetV1::default();
+        let hard_cap = usize::try_from(max_requests.unwrap_or(defaults.hard_cap as u64))
+            .map_err(|_| "--max-requests exceeds this platform's range")?;
         let request_budget = haider_protocol::request_budget::RequestBudgetV1 {
-            tranche: usize::try_from(request_tranche.unwrap_or(defaults.tranche as u64))
-                .map_err(|_| "--request-tranche exceeds this platform's range")?,
-            hard_cap: usize::try_from(max_requests.unwrap_or(defaults.hard_cap as u64))
-                .map_err(|_| "--max-requests exceeds this platform's range")?,
+            // An implicit soft checkpoint cannot exceed an explicit hard cap.
+            // Keep an explicitly supplied tranche strict so invalid pairs fail.
+            tranche: request_tranche
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| "--request-tranche exceeds this platform's range")?
+                .unwrap_or(defaults.tranche.min(hard_cap)),
+            hard_cap,
         };
         request_budget.validate()?;
         budget.request_budget = Some(request_budget);
@@ -1104,6 +1110,9 @@ Permission options:\n\
   --trust-hooks     Trust configured hooks for this run\n\
 \n\
 Use --session ID to submit an ordinary turn to an existing native session.\n\
+Request limits are opt-in: --max-requests N uses tranche min(32, N);\n\
+--request-tranche N alone uses hard cap 64. Neither flag leaves requests unbounded.\n\
+\n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
 --timeout <duration>, --start, --status, --stop, and --replay.";
 
@@ -2338,7 +2347,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_budget_is_opt_in_and_flags_preserve_explicit_counterpart_defaults() {
+    fn request_budget_is_opt_in_and_single_flags_choose_valid_counterparts() {
         let unbounded = parse_run_options_with_config(&["-p".into(), "long task".into()])
             .expect("unbounded default");
         assert_eq!(unbounded.options.budget.request_budget, None);
@@ -2355,6 +2364,20 @@ mod tests {
             Some(haider_protocol::request_budget::RequestBudgetV1 {
                 tranche: 32,
                 hard_cap: 96
+            })
+        );
+        let small_cap = parse_run_options_with_config(&[
+            "-p".into(),
+            "long task".into(),
+            "--max-requests".into(),
+            "5".into(),
+        ])
+        .expect("small hard cap without a tranche");
+        assert_eq!(
+            small_cap.options.budget.request_budget,
+            Some(haider_protocol::request_budget::RequestBudgetV1 {
+                tranche: 5,
+                hard_cap: 5
             })
         );
         let tranche = parse_run_options_with_config(&[

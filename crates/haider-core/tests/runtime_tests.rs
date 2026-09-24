@@ -618,31 +618,8 @@ async fn full_turn_commits_exact_projected_sequence() {
                 }
             }
         }),
-        // One visible budget item shares the request-attempt append. Keep
-        // both lifecycle halves in the exact projection rather than filtering
-        // the new telemetry out of this journal contract pin.
-        serde_json::json!({
-            "type":"item", "event":"started", "item_id":"<item>",
-            "item":{
-                "item":"extension", "kind":"provider_request_budget_v1",
-                "data":{
-                    "used":1, "budget":{"tranche":32,"hard_cap":64},
-                    "phase":"progress",
-                    "continuation":{"session_id":SESSION,"run_id":correlation_run_id.as_str()}
-                }
-            }
-        }),
-        serde_json::json!({
-            "type":"item", "event":"completed", "item_id":"<item>",
-            "item":{
-                "item":"extension", "kind":"provider_request_budget_v1",
-                "data":{
-                    "used":1, "budget":{"tranche":32,"hard_cap":64},
-                    "phase":"progress",
-                    "continuation":{"session_id":SESSION,"run_id":correlation_run_id.as_str()}
-                }
-            }
-        }),
+        // The unbounded default has no request-budget progress item. The
+        // exact journal pin retains the cache attempt and provider events.
         serde_json::json!({"type":"run_state","state":"streaming"}),
         serde_json::json!({
             "type":"item",
@@ -6387,10 +6364,10 @@ async fn actor_restarts_do_not_reuse_run_or_item_ids() {
             .iter()
             .any(|id| id.starts_with("run-session-test-24-"))
     );
-    // Each request has a cache diagnostic, request-budget status, assistant
-    // item and paired Finish marker. Eight unique IDs prove none are reused
-    // across restart, including the newly allocated terminal markers.
-    assert_eq!(item_ids.len(), 8);
+    // Each unbounded request has a cache diagnostic, assistant item and
+    // paired Finish marker. Six unique IDs prove none are reused across
+    // restart, including the terminal markers.
+    assert_eq!(item_ids.len(), 6);
     assert!(
         item_ids
             .iter()
@@ -6420,16 +6397,16 @@ async fn memory_store_allocates_and_reads_committed_sequences() {
         StoreHandle::latest_seq(store.as_ref(), &SessionId::new(SESSION))
             .await
             .expect("latest"),
-        // Budget status adds Started + Completed to the former 8 events;
-        // the paired provider Finish marker adds two more: 8 + 2 + 2.
-        12
+        // The unbounded default omits the budget status pair. The paired
+        // provider Finish marker adds two events to the original eight.
+        10
     );
     let tail = StoreHandle::read(store.as_ref(), &SessionId::new(SESSION), 3, 10)
         .await
         .expect("read");
     assert_eq!(
         tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        vec![4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![4, 5, 6, 7, 8, 9, 10]
     );
 }
 
@@ -6687,18 +6664,8 @@ async fn request_start_batches_thinking_with_cache_attempt_in_event_order() {
                 item: TurnItem::Extension { kind: completed, .. },
                 ..
             }),
-            EventPayload::Item(ItemEvent::Started {
-                item: TurnItem::Extension { kind: budget_started, .. },
-                ..
-            }),
-            EventPayload::Item(ItemEvent::Completed {
-                item: TurnItem::Extension { kind: budget_completed, .. },
-                ..
-            }),
         ] if started == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
             && completed == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
-            && budget_started == haider_protocol::request_budget::PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
-            && budget_completed == haider_protocol::request_budget::PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
     ));
 }
 

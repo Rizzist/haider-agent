@@ -51,11 +51,20 @@ fn legacy_run_budget_omits_request_policy_and_new_pin_roundtrips() {
             hard_cap: 80
         })
     );
+    for partial in [
+        serde_json::json!({"request_budget": {"hard_cap": 5}}),
+        serde_json::json!({"request_budget": {"tranche": 5}}),
+    ] {
+        assert!(
+            serde_json::from_value::<RunBudgetV1>(partial).is_err(),
+            "wire policies require both fields instead of CLI convenience defaults"
+        );
+    }
 }
 
 #[test]
 fn legacy_child_manifest_without_request_policy_is_unbounded() {
-    let manifest = AgentManifest {
+    let mut manifest = AgentManifest {
         agent: AgentId::new("unbounded-child"),
         role: AgentRole::Subagent,
         task: "long task".into(),
@@ -78,6 +87,13 @@ fn legacy_child_manifest_without_request_policy_is_unbounded() {
         manifest.request_budget().expect("legacy manifest"),
         None,
         "omitted child request policy is unbounded"
+    );
+    manifest.coordinates = Some(serde_json::json!({
+        "request_budget": {"hard_cap": 5}
+    }));
+    assert!(
+        manifest.request_budget().is_err(),
+        "a partial child policy must not acquire implicit defaults"
     );
 }
 
