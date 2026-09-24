@@ -379,8 +379,6 @@ fn wham_window_label(window: &WhamWindow, fallback: &str) -> String {
         Some(seconds) if seconds > 0 && seconds.is_multiple_of(60) => {
             format!("{}m", seconds / 60)
         }
-        _ if fallback == "primary" => "5h".to_owned(),
-        _ if fallback == "secondary" => "weekly".to_owned(),
         _ => fallback.to_owned(),
     }
 }

@@ -3675,6 +3675,76 @@ async fn usage_reset_rpc_returns_pending_and_parks_a_nonblocking_approval() {
     store.close().await.expect("store closes");
 }
 
+#[tokio::test]
+async fn usage_reset_direct_rpc_obeys_read_only_deny_before_opening_menu() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("usage-reset-read-only");
+    let mut create = create_command(&session, "usage-reset-read-only");
+    create.permission_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
+        read_only: true,
+        ..Default::default()
+    });
+    hub.create_internal_session(create)
+        .await
+        .expect("session created");
+    let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+    let snapshot = Arc::new(Mutex::new(vec![reset_test_descriptor(account.clone())]));
+    hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+        snapshot,
+        None,
+        Arc::new(crate::usage_report::ReqwestUsageMeterHttp::new()),
+    )))
+    .expect("usage service installs");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("deny-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attached");
+    connection
+        .request(
+            haider_rpc::RequestId::new("deny-reset"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("deny-command"),
+                session_id: session.clone(),
+                account,
+            },
+        )
+        .await
+        .expect("request answered");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::Error { code, .. },
+        } if request_id.as_str() == "deny-reset" && code == haider_rpc::ERROR_CODE_PERMISSION_DENIED
+    )));
+    assert_eq!(store.latest_seq(&session).await.expect("head"), head);
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 struct ResetTestTokens;
 
 fn reset_test_descriptor(
@@ -3723,6 +3793,7 @@ struct SlowResetHttp {
     release: tokio::sync::Notify,
     posts: AtomicUsize,
     request_ids: Mutex<Vec<String>>,
+    fail: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -3757,9 +3828,14 @@ impl crate::usage_report::UsageMeterHttp for SlowResetHttp {
         self.posts.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         self.release.notified().await;
+        let failed = self.fail.load(Ordering::SeqCst);
         Ok(crate::usage_report::UsageMeterHttpResponse {
-            status: 200,
-            body: br#"{"code":"reset","windows_reset":1}"#.to_vec(),
+            status: if failed { 500 } else { 200 },
+            body: if failed {
+                b"provider failure".to_vec()
+            } else {
+                br#"{"code":"reset","windows_reset":1}"#.to_vec()
+            },
             retry_after: None,
         })
     }
@@ -3919,7 +3995,7 @@ async fn usage_reset_answer_replies_while_post_waits_and_crash_never_retries() {
     // durable claim has already committed; no terminal outcome can be known.
     let task = hub
         .inner
-        .actor_tasks
+        .usage_reset_tasks
         .lock()
         .expect("tasks")
         .pop()
@@ -4031,6 +4107,318 @@ async fn usage_reset_answer_replies_while_post_waits_and_crash_never_retries() {
     );
     drop(replay_connection);
     restarted_hub.shutdown().await.expect("restarted hub stops");
+    reopened.close().await.expect("reopened store closes");
+}
+
+#[tokio::test]
+async fn usage_reset_finishes_durably_when_post_completes_during_graceful_drain() {
+    for failed in [false, true] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session = SessionId::new("graceful-usage-reset");
+        hub.create_internal_session(create_command(&session, "graceful-usage-reset"))
+            .await
+            .expect("session created");
+        let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+        let http = Arc::new(SlowResetHttp::default());
+        http.fail.store(failed, Ordering::SeqCst);
+        hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+            Arc::new(Mutex::new(vec![reset_test_descriptor(account.clone())])),
+            Some(Arc::new(ResetTestTokens)),
+            http.clone(),
+        )))
+        .expect("usage service installs");
+        let sink = Arc::new(CapturingFrameSink::default());
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([
+                    haider_rpc::Capability::Control,
+                    haider_rpc::Capability::View,
+                ]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("connection opens");
+        let head = store.latest_seq(&session).await.expect("head");
+        connection
+            .request(
+                haider_rpc::RequestId::new("grace-attach"),
+                haider_rpc::RequestBody::SessionAttach {
+                    session_id: session.clone(),
+                    after_seq: head,
+                    mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
+                },
+            )
+            .await
+            .expect("attached");
+        connection
+            .request(
+                haider_rpc::RequestId::new("grace-open"),
+                haider_rpc::RequestBody::UsageResetApply {
+                    command_id: haider_rpc::CommandId::new("grace-command"),
+                    session_id: session.clone(),
+                    account,
+                },
+            )
+            .await
+            .expect("approval opened");
+        let (menu_id, request_seq, generation) = sink
+            .0
+            .lock()
+            .expect("frames")
+            .iter()
+            .find_map(|frame| match frame {
+                WireFrame::Response {
+                    request_id,
+                    body:
+                        haider_rpc::ResponseBody::UsageResetApply {
+                            menu_id,
+                            request_seq,
+                            worker_generation,
+                            ..
+                        },
+                } if request_id.as_str() == "grace-open" => {
+                    Some((menu_id.clone(), *request_seq, *worker_generation))
+                }
+                _ => None,
+            })
+            .expect("pending response");
+        connection
+            .menu_answer(
+                Some(haider_rpc::RequestId::new("grace-approve")),
+                haider_rpc::CommandId::new("grace-answer"),
+                session.clone(),
+                menu_id,
+                request_seq,
+                generation,
+                "approve".into(),
+                0,
+                None,
+            )
+            .await
+            .expect("approved");
+        tokio::time::timeout(Duration::from_secs(3), http.started.notified())
+            .await
+            .expect("fake POST started");
+        drop(connection);
+        let closing_hub = hub.clone();
+        let shutdown = tokio::spawn(async move { closing_hub.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !hub.inner.draining.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain began");
+        http.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown finished")
+            .expect("shutdown joined")
+            .expect("hub shut down");
+        store.close().await.expect("store closes");
+        let reopened = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+        let events = reopened.read(&session, 0, 128).await.expect("journal");
+        assert!(events.iter().any(|event| matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Effect(EffectPhase::Outcome { outcome, .. }))
+                if if failed {
+                    matches!(outcome, EffectOutcome::Failed { .. })
+                } else {
+                    outcome == EffectOutcome::Ok
+                }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { ref kind, ref data },
+                ..
+            })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+                && data["status"] == (if failed { "failed" } else { "applied" })
+                && data["reason"] != "provider_outcome_unconfirmed"
+        )));
+        assert_eq!(http.posts.load(Ordering::SeqCst), 1);
+        reopened.close().await.expect("reopened store closes");
+    }
+}
+
+/// Raises the drain fence synchronously when the reset authorization batch
+/// (answer + `Authorized` + `Dispatched`) persists, i.e. after the durable
+/// dispatch claim and before the provider task can be registered.
+struct ResetDispatchFence {
+    hub: std::sync::OnceLock<SessionHub>,
+    fence_at: std::sync::atomic::AtomicU64,
+}
+
+impl SessionHubObserver for ResetDispatchFence {
+    fn observe(&self, observation: HubObservation) {
+        let HubObservation::Persisted { through_seq, .. } = observation else {
+            return;
+        };
+        let fence_at = self.fence_at.load(Ordering::SeqCst);
+        if fence_at == 0 || through_seq < fence_at {
+            return;
+        }
+        self.fence_at.store(0, Ordering::SeqCst);
+        if let Some(hub) = self.hub.get() {
+            hub.inner.draining.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// LAW: a durable `Dispatched` claim whose provider task lost the drain
+/// registration fence records the exact terminal fact (provider not called)
+/// instead of staying `provider_outcome_unconfirmed` forever.
+///
+/// MUTATION CHECK: return the drain error without recording the terminal
+/// result; the journal keeps `Dispatched` with no outcome and the assertions
+/// on the failed outcome/result fail.
+#[tokio::test]
+async fn usage_reset_claim_fenced_by_drain_records_provider_not_called() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let observer = Arc::new(ResetDispatchFence {
+        hub: std::sync::OnceLock::new(),
+        fence_at: std::sync::atomic::AtomicU64::new(0),
+    });
+    let hub =
+        SessionHub::with_observer(store.clone(), SessionHubConfig::default(), observer.clone())
+            .expect("hub");
+    let _ = observer.hub.set(hub.clone());
+    let session = SessionId::new("fenced-usage-reset");
+    hub.create_internal_session(create_command(&session, "fenced-usage-reset"))
+        .await
+        .expect("session created");
+    let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+    let http = Arc::new(SlowResetHttp::default());
+    hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+        Arc::new(Mutex::new(vec![reset_test_descriptor(account.clone())])),
+        Some(Arc::new(ResetTestTokens)),
+        http.clone(),
+    )))
+    .expect("usage service installs");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("fence-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attached");
+    connection
+        .request(
+            haider_rpc::RequestId::new("fence-open"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("fence-command"),
+                session_id: session.clone(),
+                account,
+            },
+        )
+        .await
+        .expect("approval opened");
+    let (menu_id, request_seq, generation) = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    haider_rpc::ResponseBody::UsageResetApply {
+                        menu_id,
+                        request_seq,
+                        worker_generation,
+                        ..
+                    },
+            } if request_id.as_str() == "fence-open" => {
+                Some((menu_id.clone(), *request_seq, *worker_generation))
+            }
+            _ => None,
+        })
+        .expect("pending response");
+    let answer_head = store.latest_seq(&session).await.expect("head");
+    // Answer at +1, authorization batch (`Authorized`, `Dispatched`) at +2..+3.
+    observer.fence_at.store(answer_head + 3, Ordering::SeqCst);
+    connection
+        .menu_answer(
+            Some(haider_rpc::RequestId::new("fence-approve")),
+            haider_rpc::CommandId::new("fence-answer"),
+            session.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            "approve".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("answer replied");
+    assert!(
+        hub.inner.draining.load(Ordering::Acquire),
+        "fence was raised after the dispatch claim persisted"
+    );
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::Error { code, .. },
+        } if request_id.as_str() == "fence-approve" && code == "usage_reset_dispatch_failed"
+    )));
+    assert!(
+        hub.inner
+            .usage_reset_tasks
+            .lock()
+            .expect("tasks")
+            .is_empty()
+    );
+    assert_eq!(http.posts.load(Ordering::SeqCst), 0);
+    drop(connection);
+    hub.inner.draining.store(false, Ordering::Release);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+
+    let reopened = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+    let events = reopened.read(&session, 0, 128).await.expect("journal");
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { ref error },
+            ..
+        })) if error == crate::usage_reset::DRAIN_FENCED_REASON
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { ref kind, ref data },
+            ..
+        })) if kind == haider_protocol::usage::USAGE_RESET_APPLY_RESULT_EXTENSION
+            && data["status"] == "failed"
+            && data["reason"] == crate::usage_reset::DRAIN_FENCED_REASON
+    )));
+    assert_eq!(http.posts.load(Ordering::SeqCst), 0);
     reopened.close().await.expect("reopened store closes");
 }
 

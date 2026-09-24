@@ -972,6 +972,9 @@ struct HubInner {
     idle_release_tasks: Mutex<HashMap<SessionId, IdleReleaseTask>>,
     close_admission_stopped: AtomicBool,
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Already-dispatched provider resets finish before their owning actors
+    /// receive Stop. Admission closes under this registry's lock at drain.
+    usage_reset_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Wakes the daemon-wide shell fan-out actor before shutdown joins the
     /// hub-owned task set. The registry sender itself lives in `HubInner`, so
     /// dropping the hub cannot close that actor's broadcast receiver first.
@@ -2497,6 +2500,7 @@ impl SessionHub {
             idle_release_tasks: Mutex::new(HashMap::new()),
             close_admission_stopped: AtomicBool::new(false),
             actor_tasks: Mutex::new(Vec::new()),
+            usage_reset_tasks: Mutex::new(Vec::new()),
             shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
@@ -4795,6 +4799,42 @@ impl SessionHub {
             .actor_for(first.session_id.clone())
             .await
             .map_err(hub_error_as_store)?;
+        self.append_with_actor(actor, envelopes).await
+    }
+
+    /// Only a supervised reset task may use this drain exception. It was
+    /// registered before the drain fence and may finish through its existing
+    /// actor; no new actor or external work is admitted.
+    async fn append_usage_reset_terminal(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        let Some(first) = envelopes.first() else {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "cannot append an empty envelope batch",
+                false,
+            ));
+        };
+        let actor = self
+            .existing_actor(&first.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        self.append_with_actor(actor, envelopes).await
+    }
+
+    async fn append_with_actor(
+        &self,
+        actor: SessionActorHandle,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        let first = envelopes.first().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "cannot append an empty envelope batch",
+                false,
+            )
+        })?;
         let (completed, result) = oneshot::channel();
         actor
             .commands
@@ -7770,14 +7810,19 @@ impl SessionHub {
         // journal; anything unsettled is reaped by next-start adoption.
         self.shutdown_background_tasks().await;
         self.begin_draining();
+        // Claim the accepted reset tasks while registration is fenced. These
+        // tasks can still append through their existing session actors.
+        let usage_reset_tasks = std::mem::take(&mut *lock(&self.inner.usage_reset_tasks)?);
+        let mut usage_reset_tasks =
+            OwnedTasks::new(usage_reset_tasks, Arc::clone(&self.inner.force_stop));
         if let Ok(peer) = self.peer_service() {
             peer.shutdown().await;
         }
-        // Install the abort-on-drop guards (each raises the forced-stop
-        // fence before aborting — see OwnedTasks) plus the standalone fence
-        // backstop, all before the first await. If the global drain deadline
-        // cancels this future, no hub task is detached and no actor starts
-        // another store command.
+        let _ = usage_reset_tasks.join_all().await;
+        // Install guards for the remaining tasks (the reset guard was live
+        // throughout its join). If the global drain deadline cancels this
+        // future, no hub task is detached and no actor starts another store
+        // command.
         let replay_tasks = std::mem::take(&mut *lock(&self.inner.replay_tasks)?)
             .into_values()
             .map(|replay| replay.task)
@@ -7816,11 +7861,11 @@ impl SessionHub {
             armed: true,
         };
         self.inner.observer.observe(HubObservation::ShutdownGuarded);
-        // GRACE ORDER (P1-3): actors first, gracefully. `Stop` queues behind
-        // whatever already reached each actor, so an append or CAS inside its
-        // store await commits AND publishes to receivers that are still
-        // registered — never to orphaned senders. New commands were already
-        // rejected at every hub seam by the draining flag.
+        // GRACE ORDER (P1-3): the accepted reset effects have finished, then
+        // actors stop gracefully. `Stop` queues behind whatever already
+        // reached each actor, so an append or CAS inside its store await
+        // commits AND publishes to still-registered receivers. New commands
+        // were already rejected at every ordinary hub admission seam.
         for actor in actors {
             let _ = actor.commands.send(ActorCommand::Stop).await;
         }

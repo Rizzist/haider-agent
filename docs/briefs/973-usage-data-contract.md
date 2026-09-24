@@ -4,6 +4,8 @@
 
 Only provider-published fields are meters. Missing windows, balances, counts,
 and timestamps remain absent; cadence is never used to manufacture a reset.
+An OpenAI window without an exact duration keeps its provider name
+(`primary` or `secondary`); it is never relabeled five-hour or weekly.
 
 | Provider | Meter/reset facts | Banked reset operation |
 | --- | --- | --- |
@@ -33,6 +35,8 @@ even when no provider session is attached. Its weekly window uses
 `utilization` as the used fraction (`1 - percent_remaining / 100`) and carries
 the provider's exact `resets_at_ms`; the remaining fraction is the complement
 of that same published percentage.
+The active-account refresh timer continues without an attached provider
+session, so the held meter is refreshed at the provider cadence.
 
 ## Human-only deferred approval
 
@@ -42,6 +46,8 @@ cannot approve it. A request opens `MenuKind::DeferredApproval` with only
 approve-once and deny choices. The menu is session-scoped and
 `blocking: false`; the initiating RPC/tool immediately returns
 `approval_pending` and the run continues.
+Both entry points apply the same session policy denial before opening a menu;
+read-only and hard-denied sessions receive a typed refusal.
 
 The committed `menu_answer` is the human authorization fact. On approval the
 daemon calls the provider with the same opaque approval id as OpenAI's
@@ -56,8 +62,13 @@ provider response can leave the spending outcome unknown.
 The only consume caller is the hub-owned completion task launched by a committed
 human `menu_answer` in `session_hub/usage_reset_rpc.rs`. The RPC persists
 `Dispatched` before handing off the single POST and replies without waiting
-for the provider or steer delivery. A hub shutdown joins the task; forced
-shutdown can leave its outcome unconfirmed. Agent polling in
+for the provider or steer delivery. Graceful shutdown joins accepted reset
+tasks while their session actors remain open, allowing a completed POST's
+terminal result to commit during drain. If drain wins the task-registration
+fence after `Dispatched` commits, the provider was never called and the claim
+records a terminal `failed` result with reason
+`daemon_draining_provider_not_called`. Forced shutdown can leave its outcome
+unconfirmed. Agent polling in
 `worker_usage_reset.rs::usage_reset_status` reads the
 result and never calls the provider. Shared identifiers, the approval menu
 and the poll-status derivation live in `usage_reset.rs`. If the daemon stops after dispatch but

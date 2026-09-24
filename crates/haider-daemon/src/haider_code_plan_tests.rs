@@ -650,7 +650,11 @@ async fn active_account_is_captured_without_a_provider_session() {
     let accounts = Arc::new(FakeAccounts::new(1, descriptor("first")));
     let credentials = Arc::new(FakeCredentials::new(&[("first", b"hk-first")]));
     let interest = Arc::new(FakeInterest::new(Vec::new()));
-    let http = Arc::new(FakeHttp::new([fetched_snapshot(Some(15))]));
+    let http = Arc::new(FakeHttp::new([
+        fetched_snapshot(Some(15)),
+        fetched_snapshot(Some(15)),
+        fetched_snapshot(Some(15)),
+    ]));
     let (stop, task) = start_fake_poller(
         accounts,
         credentials,
@@ -660,6 +664,11 @@ async fn active_account_is_captured_without_a_provider_session() {
     .await;
 
     wait_for(|| http.call_count() == 1 && interest.captures().len() == 1).await;
+    assert!(interest.publications().is_empty());
+    tokio::time::advance(Duration::from_secs(15)).await;
+    wait_for(|| http.call_count() == 2 && interest.captures().len() == 2).await;
+    tokio::time::advance(Duration::from_secs(15)).await;
+    wait_for(|| http.call_count() == 3 && interest.captures().len() == 3).await;
     assert!(interest.publications().is_empty());
 
     stop.send_replace(true);

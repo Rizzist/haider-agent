@@ -41,8 +41,8 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 /// LAW (openai_wham_fixture_yields_primary_secondary_and_named_extra_windows):
-/// the codex meter parse maps `rate_limit.primary_window`/`secondary_window`
-/// to human `5h`/`weekly` windows (percent → 0–1 fraction, `reset_at`
+/// the codex meter parse maps exact window duration fields to human `5h`/`weekly`
+/// windows (percent → 0–1 fraction, `reset_at`
 /// seconds → ms), surfaces each `additional_rate_limits[]` entry under its
 /// `limit_name` label, and reports the subscription `plan_type` — while
 /// tolerating unknown siblings such as `code_review_rate_limit`.
@@ -78,10 +78,11 @@ fn openai_wham_fixture_yields_primary_secondary_and_named_extra_windows() {
 
 /// LAW: OpenAI plans may publish either subscription window independently.
 /// Relative resets are anchored to the fetch instant, and an absent/null
-/// primary window never suppresses a valid weekly window.
+/// primary window never suppresses a valid secondary window. A relative
+/// reset is exact even when the duration is unknown.
 ///
 /// MUTATION CHECK: require `primary_window` before examining secondary; the
-/// secondary-only case changes from one weekly window to an error.
+/// secondary-only case changes from one window to an error.
 #[test]
 fn openai_optional_window_matrix_keeps_every_window_that_exists() {
     const FETCHED_AT_MS: u64 = 1_800_000_000_000;
@@ -93,7 +94,7 @@ fn openai_optional_window_matrix_keeps_every_window_that_exists() {
         )
         .expect("secondary-only fixture parses");
     assert_eq!(secondary.windows.len(), 1);
-    assert_eq!(secondary.windows[0].window, "weekly");
+    assert_eq!(secondary.windows[0].window, "secondary");
     assert!((secondary.windows[0].utilization - 0.08).abs() < 1e-9);
     assert_eq!(
         secondary.windows[0].resets_at_ms,
@@ -141,6 +142,28 @@ fn openai_live_redacted_shape_keeps_exact_weekly_window_and_reset_counts() {
     assert_eq!(credits.available_count, 1);
     assert_eq!(credits.applicable_available_count, Some(0));
     assert!(credits.apply_supported);
+}
+
+#[test]
+fn openai_missing_duration_keeps_provider_window_name() {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&fixture("openai_wham_usage_live_redacted.json"))
+            .expect("fixture JSON");
+    let primary = &mut body["rate_limit"]["primary_window"];
+    primary
+        .as_object_mut()
+        .expect("primary window")
+        .remove("limit_window_seconds");
+    primary
+        .as_object_mut()
+        .expect("primary window")
+        .remove("window_duration_mins");
+    let reading = UsageMeterEndpoint::OpenAiOauth
+        .parse(200, &serde_json::to_vec(&body).expect("JSON"))
+        .expect("duration-unknown meter parses");
+    assert_eq!(reading.windows.len(), 1);
+    assert_eq!(reading.windows[0].window, "primary");
+    assert_eq!(reading.windows[0].resets_at_ms, Some(1_790_662_309_000));
 }
 
 #[test]

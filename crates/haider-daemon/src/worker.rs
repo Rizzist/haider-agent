@@ -16755,47 +16755,12 @@ async fn create_broker_tool_dispatcher(
     broker
         .restore_freshness(durable_freshness.into_values())
         .map_err(tool_error)?;
-    let mut policy = PermissionPolicy::default();
-    for (class, default) in effective_permission_defaults(&context.metadata) {
-        match default {
-            ToolPermissionDefault::Allow => policy.allow(class),
-            ToolPermissionDefault::Ask => policy.ask(class),
-            ToolPermissionDefault::Deny => policy.deny(
-                class.clone(),
-                context
-                    .metadata
-                    .permission_overrides
-                    .filter(|overrides| overrides.read_only)
-                    .and_then(|_| read_only_denial_reason(&class))
-                    .unwrap_or("denied by explicit permission policy rule"),
-            ),
-            ToolPermissionDefault::NotApplicable => {}
-        }
-    }
+    let mut policy = initial_permission_policy(&context.metadata, context.lockdown.is_some());
     for grant in durable_grants
         .into_iter()
         .filter(|grant| crate::android_policy::effect_allowed(&grant.class))
     {
         policy.allow_session_grant(grant).map_err(tool_error)?;
-    }
-    if haider_core::InteractionResolutionPolicy::new(context.metadata.interaction_mode)
-        .resolve(haider_core::InteractionGate::EffectBrokerAsk)
-        == haider_core::InteractionResolution::AutoApprove
-    {
-        policy.auto_allow_asks();
-    }
-    if crate::android_policy::enabled() {
-        for class in crate::android_policy::HARD_DENIED_EFFECTS.iter().cloned() {
-            policy.hard_deny(class, "android-standalone platform ceiling");
-        }
-    }
-    if context.lockdown.is_some() {
-        for class in LOCKDOWN_HARD_DENIED_EFFECTS.iter().cloned() {
-            policy.hard_deny(
-                class,
-                "provider capability ceiling: lockdown cannot be lifted by user approval",
-            );
-        }
     }
     let output = HubCommandOutputContext {
         store: context.store.clone(),
@@ -17028,6 +16993,50 @@ pub(crate) fn effective_permission_defaults(
         }
     }
     defaults
+}
+
+/// Session baseline shared by agent tools and direct control RPCs. Durable
+/// grants may add ordinary allows to a worker, but never lift these denies.
+pub(crate) fn initial_permission_policy(
+    metadata: &SessionMetadataV1,
+    lockdown: bool,
+) -> PermissionPolicy {
+    let mut policy = PermissionPolicy::default();
+    for (class, default) in effective_permission_defaults(metadata) {
+        match default {
+            ToolPermissionDefault::Allow => policy.allow(class),
+            ToolPermissionDefault::Ask => policy.ask(class),
+            ToolPermissionDefault::Deny => policy.deny(
+                class.clone(),
+                metadata
+                    .permission_overrides
+                    .filter(|overrides| overrides.read_only)
+                    .and_then(|_| read_only_denial_reason(&class))
+                    .unwrap_or("denied by explicit permission policy rule"),
+            ),
+            ToolPermissionDefault::NotApplicable => {}
+        }
+    }
+    if haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode)
+        .resolve(haider_core::InteractionGate::EffectBrokerAsk)
+        == haider_core::InteractionResolution::AutoApprove
+    {
+        policy.auto_allow_asks();
+    }
+    if crate::android_policy::enabled() {
+        for class in crate::android_policy::HARD_DENIED_EFFECTS.iter().cloned() {
+            policy.hard_deny(class, "android-standalone platform ceiling");
+        }
+    }
+    if lockdown {
+        for class in LOCKDOWN_HARD_DENIED_EFFECTS.iter().cloned() {
+            policy.hard_deny(
+                class,
+                "provider capability ceiling: lockdown cannot be lifted by user approval",
+            );
+        }
+    }
+    policy
 }
 
 struct BrokerToolDispatcher {

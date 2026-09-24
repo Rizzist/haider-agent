@@ -27,14 +27,16 @@ impl BrokerToolDispatcher {
                     false,
                 )
             })?;
-        if self
-            .metadata
-            .permission_overrides
-            .is_some_and(|overrides| overrides.read_only)
-        {
-            return Ok(self
-                .permission_denial_result(READ_ONLY_USAGE_RESET_DENIAL.into())
-                .await);
+        let policy_intent = usage_reset::intent(
+            request.approval_id.as_deref().unwrap_or_default(),
+            &request.account,
+        );
+        let policy_denial = {
+            let policy = self.policy.lock().await;
+            usage_reset::policy_denial_reason(&policy, &policy_intent)
+        };
+        if let Some(reason) = policy_denial {
+            return Ok(self.permission_denial_result(reason).await);
         }
         let service = self
             .output
@@ -80,9 +82,6 @@ impl BrokerToolDispatcher {
         }
         let menu = usage_reset::approval_menu(&approval_id, &request.account);
         let intent = usage_reset::intent(&approval_id, &request.account);
-        if let Some(reason) = self.policy.lock().await.denial_reason(&intent) {
-            return Ok(self.permission_denial_result(reason).await);
-        }
         let effect = intent.effect.clone();
         append_payloads(
             &self.output.store,

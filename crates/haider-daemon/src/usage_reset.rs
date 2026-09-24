@@ -20,9 +20,22 @@ use haider_protocol::effect::{EffectClass, EffectIntent};
 use haider_protocol::ids::{CredentialAlias, EffectId, EventId, MenuId};
 use haider_protocol::menu::{DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::usage::{UsageResetApplyResultV1, UsageResetApplyStatusV1};
+use haider_tools::PermissionPolicy;
 
 pub(crate) const APPROVE_OPTION_KEY: &str = "approve";
 pub(crate) const DENY_OPTION_KEY: &str = "deny";
+/// Terminal reason when graceful drain fenced a claimed reset before its
+/// provider task was admitted; no provider request was sent.
+pub(crate) const DRAIN_FENCED_REASON: &str = "daemon_draining_provider_not_called";
+
+/// Both reset entry points check the same policy decision before parking an
+/// approval. Ordinary Allow still proceeds to a human decision.
+pub(crate) fn policy_denial_reason(
+    policy: &PermissionPolicy,
+    intent: &EffectIntent,
+) -> Option<String> {
+    policy.denial_reason(intent)
+}
 
 /// Stable approval id over length-prefixed request coordinates, so distinct
 /// coordinate tuples can never collide by concatenation. The id doubles as

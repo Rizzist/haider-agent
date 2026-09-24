@@ -562,9 +562,8 @@ pub(crate) async fn run_plan_poller(
             }
         }
 
-        let wait_deadline = (!recipients.is_empty()).then_some(deadline).flatten();
         if !wait_until_due_or_changed(
-            wait_deadline,
+            deadline,
             &mut stop,
             &mut account_changes,
             &mut interest_changes,

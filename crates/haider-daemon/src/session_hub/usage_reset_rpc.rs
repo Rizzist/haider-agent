@@ -48,6 +48,35 @@ impl HubConnection {
         session_id: SessionId,
         account: CredentialAlias,
     ) -> Result<(), SessionHubError> {
+        let approval_id = usage_reset::approval_id(&[session_id.as_str(), command_id.as_str()]);
+        let Some(metadata) = self.hub.session_metadata(&session_id).await? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        };
+        let lockdown = self
+            .hub
+            .bound_session_lockdown(&session_id)?
+            .map_or_else(
+                || self.hub.provider_lockdown_policy_detail(&metadata.provider),
+                |(_, policy)| Ok(policy),
+            )?
+            .is_lockdown();
+        let policy = crate::worker::initial_permission_policy(&metadata, lockdown);
+        let intent = usage_reset::intent(&approval_id, &account);
+        if let Some(reason) = usage_reset::policy_denial_reason(&policy, &intent) {
+            return self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_PERMISSION_DENIED,
+                &reason,
+                false,
+                None,
+            );
+        }
         let Some(service) = self.hub.usage_report_service()? else {
             return self.respond_error(
                 request_id,
@@ -66,8 +95,6 @@ impl HubConnection {
                 None,
             );
         }
-        let approval_id = usage_reset::approval_id(&[session_id.as_str(), command_id.as_str()]);
-
         if let Some(parked) = self.parked_usage_reset(&session_id, &approval_id).await? {
             if parked.account != account {
                 return self.respond_error(
@@ -111,7 +138,6 @@ impl HubConnection {
         };
         let menu = usage_reset::approval_menu(&approval_id, &account);
         let menu_id = menu.id.clone();
-        let intent = usage_reset::intent(&approval_id, &account);
         let effect = intent.effect.clone();
         let scope = ResetEventScope {
             session_id: &session_id,
@@ -309,27 +335,45 @@ impl HubConnection {
                 .usage_reset_envelopes(&scope, approval_id, "authorization", authorization)?;
         self.hub.append(&mut authorization).await?;
 
-        let hub = self.hub.clone();
-        let answered = answered.clone();
-        let account = account.clone();
-        let approval_id = approval_id.to_owned();
-        // The hub joins these tasks during graceful shutdown and aborts them
-        // on forced shutdown. An aborted POST remains unconfirmed in the
-        // journal and is deliberately never retried by a poll or restart.
-        let mut tasks = lock(&self.hub.inner.actor_tasks)?;
-        if self.hub.inner.draining.load(Ordering::Acquire) {
+        // The hub joins these tasks during graceful shutdown (before closing
+        // session actors) and aborts them on forced shutdown. An aborted POST
+        // remains unconfirmed in the journal and is deliberately never retried
+        // by a poll or restart.
+        let fenced = {
+            let mut tasks = lock(&self.hub.inner.usage_reset_tasks)?;
+            let fenced = self.hub.inner.draining.load(Ordering::Acquire);
+            if !fenced {
+                let hub = self.hub.clone();
+                let answered = answered.clone();
+                let account = account.clone();
+                let approval_id = approval_id.to_owned();
+                tasks.push(tokio::spawn(async move {
+                    if let Err(error) = hub
+                        .complete_usage_reset_approval(&answered, &account, &approval_id, approved)
+                        .await
+                    {
+                        tracing::error!(%approval_id, ?error, "usage reset completion failed");
+                    }
+                }));
+            }
+            fenced
+        };
+        if fenced {
+            // Drain won the registration fence after `Dispatched` committed,
+            // so the provider was provably never called. Record that exact
+            // terminal fact instead of leaving the claim unconfirmed.
+            let result = if approved {
+                usage_reset::failed(approval_id, account, usage_reset::DRAIN_FENCED_REASON)
+            } else {
+                usage_reset::result(approval_id, account, UsageResetApplyStatusV1::Denied)
+            };
+            self.hub
+                .record_usage_reset_terminal(answered, approval_id, approved, &result, false)
+                .await?;
             return Err(SessionHubError::Task(
                 "usage reset dispatch interrupted by daemon drain".into(),
             ));
         }
-        tasks.push(tokio::spawn(async move {
-            if let Err(error) = hub
-                .complete_usage_reset_approval(&answered, &account, &approval_id, approved)
-                .await
-            {
-                tracing::error!(%approval_id, ?error, "usage reset completion failed");
-            }
-        }));
         Ok(())
     }
 }
@@ -342,8 +386,6 @@ impl SessionHub {
         approval_id: &str,
         approved: bool,
     ) -> Result<(), SessionHubError> {
-        let effect = usage_reset::effect_id(approval_id);
-        let scope = ResetEventScope::after(answered);
         let result = if approved {
             self.apply_approved_usage_reset(account, approval_id)
                 .await?
@@ -353,8 +395,31 @@ impl SessionHub {
         let delivered_to_active_run = self
             .notify_usage_reset_result(&answered.session_id, approval_id, &result)
             .await?;
+        self.record_usage_reset_terminal(
+            answered,
+            approval_id,
+            approved,
+            &result,
+            delivered_to_active_run,
+        )
+        .await
+    }
 
-        let data = serde_json::to_value(&result).map_err(|error| {
+    /// Appends the effect outcome (for an approved claim) and the typed result
+    /// item. Uses the drain-exempt path: only a claim registered before the
+    /// drain fence, or one the fence provably stopped before dispatch, reaches
+    /// this through an already-open session actor.
+    async fn record_usage_reset_terminal(
+        &self,
+        answered: &RawEnvelope,
+        approval_id: &str,
+        approved: bool,
+        result: &UsageResetApplyResultV1,
+        delivered_to_active_run: bool,
+    ) -> Result<(), SessionHubError> {
+        let effect = usage_reset::effect_id(approval_id);
+        let scope = ResetEventScope::after(answered);
+        let data = serde_json::to_value(result).map_err(|error| {
             SessionHubError::Task(format!("cannot encode usage reset result: {error}"))
         })?;
         let mut terminal = Vec::new();
@@ -399,7 +464,7 @@ impl SessionHub {
         ));
         let mut terminal =
             self.usage_reset_envelopes(&scope, approval_id, "result event", terminal)?;
-        self.append(&mut terminal).await?;
+        self.append_usage_reset_terminal(&mut terminal).await?;
         Ok(())
     }
 
