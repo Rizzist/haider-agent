@@ -17085,6 +17085,9 @@ enum OrchestrationChildDispatch {
 enum OrchestrationChildInterruption {
     Cancelled,
     Deadline,
+    /// The explicit opt-in `no_progress_ms` window passed without any
+    /// observable journal progress.
+    NoProgress,
 }
 
 struct OrchestrationTerminalReason {
@@ -19142,24 +19145,31 @@ impl BrokerToolDispatcher {
         );
         let call_id = format!("orch:{}:{}:{attempt}", state.admitted.script_id, node.slot);
         let started_at_ms = unix_time_ms();
+        // Owner rule (2026-09-23): no default wall that stops productive
+        // automated work. Only EXPLICIT script/child walls and the parent's
+        // explicit run budget bound the operation; absent all three the
+        // persisted deadline is `ORCHESTRATION_NO_DEADLINE_MS`. The explicit
+        // `no_progress_ms` window is enforced on observed journal progress
+        // in `dispatch_orchestration_child`, never as a fixed wall.
         let script_deadline_ms = state
             .admitted
-            .admitted_at_ms
-            .saturating_add(state.admitted.limits.script_wall_ms.unwrap_or(120_000));
-        let child_limit_ms = state
+            .limits
+            .script_wall_ms
+            .map(|wall| state.admitted.admitted_at_ms.saturating_add(wall));
+        let child_deadline_ms = state
             .admitted
             .limits
             .child_wall_ms
-            .unwrap_or(30_000)
-            .min(state.admitted.limits.no_progress_ms.unwrap_or(30_000));
-        let ask_limit_ms = node
+            .map(|wall| started_at_ms.saturating_add(wall));
+        // The ask's `wait_ms` bounds only the wait for the permission answer,
+        // not the child's execution after it is permitted.
+        let ask_wait_ms = node
             .ports
             .iter()
             .find(|port| port.role == OrchPortRoleV1::Control && port.port == "permit")
             .and_then(|port| state.admitted.nodes.get(port.source_slot as usize))
             .and_then(|ask| ask.config.0.get("wait_ms"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(120_000);
+            .and_then(serde_json::Value::as_u64);
         let run_deadline_ms = self.run_deadline.map(|deadline| {
             started_at_ms.saturating_add(
                 u64::try_from(
@@ -19170,10 +19180,11 @@ impl BrokerToolDispatcher {
                 .unwrap_or(u64::MAX),
             )
         });
-        let operation_deadline_ms = started_at_ms
-            .saturating_add(child_limit_ms.min(ask_limit_ms))
-            .min(script_deadline_ms)
-            .min(run_deadline_ms.unwrap_or(u64::MAX));
+        let operation_deadline_ms = [child_deadline_ms, script_deadline_ms, run_deadline_ms]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS);
         let clock = state.call_clocks.entry(node.slot).or_insert_with(|| {
             crate::orchestration::CallClockV1 {
                 started_at_ms,
@@ -19184,6 +19195,8 @@ impl BrokerToolDispatcher {
         let operation_started_at_ms = clock.started_at_ms;
         let deadline_ms = clock.deadline_ms;
         clock.retry_not_before_ms = None;
+        let approval_deadline_ms =
+            ask_wait_ms.map(|wait| operation_started_at_ms.saturating_add(wait));
         let mut activation_parents = vec![
             state.admitted.source_ref.artifact.clone(),
             state.admitted.definition_refs[node.slot as usize]
@@ -19211,7 +19224,8 @@ impl BrokerToolDispatcher {
                 "activated_at_ms": started_at_ms,
                 "operation_started_at_ms": operation_started_at_ms,
                 "deadline_ms": deadline_ms,
-                "script_deadline_ms": script_deadline_ms,
+                "script_deadline_ms": script_deadline_ms
+                    .unwrap_or(crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS),
             }),
             activation_parents,
         )
@@ -19228,6 +19242,7 @@ impl BrokerToolDispatcher {
             deadline_ms,
             started: true,
             approval_waiting: false,
+            approval_deadline_ms,
         };
         state.pending_calls.insert(node.slot, pending.clone());
         let start = EventPayload::Item(ItemEvent::Started {
@@ -19289,6 +19304,7 @@ impl BrokerToolDispatcher {
         run_id: &RunId,
         pending: &crate::orchestration::PendingCallV1,
         interaction_observation_invalidated: bool,
+        no_progress_ms: Option<u64>,
         cancel: &CancelToken,
     ) -> Result<OrchestrationChildDispatch, HaiderError> {
         if let Some(result) =
@@ -19298,8 +19314,15 @@ impl BrokerToolDispatcher {
                 ToolDispatchResult::Completed(result),
             ));
         }
-        let remaining_ms = pending.deadline_ms.saturating_sub(unix_time_ms());
-        if remaining_ms == 0 {
+        let now_ms = unix_time_ms();
+        let approval_expired = pending.approval_waiting
+            && pending
+                .approval_deadline_ms
+                .is_some_and(|deadline| now_ms >= deadline);
+        let remaining_ms = (pending.deadline_ms
+            != crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS)
+            .then(|| pending.deadline_ms.saturating_sub(now_ms));
+        if approval_expired || remaining_ms == Some(0) {
             return Ok(OrchestrationChildDispatch::Interrupted {
                 kind: OrchestrationChildInterruption::Deadline,
                 settled: None,
@@ -19318,8 +19341,17 @@ impl BrokerToolDispatcher {
             &child_cancel,
         );
         tokio::pin!(child);
-        let deadline = tokio::time::sleep(Duration::from_millis(remaining_ms));
+        let deadline = async move {
+            match remaining_ms {
+                Some(remaining_ms) => {
+                    tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(deadline);
+        let stalled = self.orchestration_no_progress(no_progress_ms);
+        tokio::pin!(stalled);
         tokio::select! {
             biased;
             result = &mut child => Ok(OrchestrationChildDispatch::Settled(result?)),
@@ -19352,6 +19384,51 @@ impl BrokerToolDispatcher {
                         outcome_unknown: true,
                     }),
                 }
+            }
+            _ = &mut stalled => {
+                child_cancel.cancel();
+                match child.await {
+                    Ok(settled) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::NoProgress,
+                        outcome_unknown: orchestration_dispatch_outcome_unknown(&settled),
+                        settled: Some(settled),
+                    }),
+                    Err(_) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::NoProgress,
+                        settled: None,
+                        outcome_unknown: true,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolves only when an EXPLICIT `no_progress_ms` window passes with no
+    /// observable progress: the session journal head (child tool output,
+    /// delegated-child chip updates, results) must advance at least once per
+    /// window. A child that keeps producing work is never stopped by it.
+    /// Absent the opt-in window this never resolves.
+    async fn orchestration_no_progress(&self, no_progress_ms: Option<u64>) {
+        let Some(window_ms) = no_progress_ms.filter(|window| *window > 0) else {
+            return std::future::pending().await;
+        };
+        let window = Duration::from_millis(window_ms);
+        let poll = (window / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let session_id = self.output.store.session_id().clone();
+        let head = |store: HubStoreHandle, session_id: SessionId| async move {
+            StoreHandle::latest_seq(&store, &session_id).await.ok()
+        };
+        let mut observed = head(self.output.store.clone(), session_id.clone()).await;
+        let mut last_progress = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(poll).await;
+            let current = head(self.output.store.clone(), session_id.clone()).await;
+            // An unreadable head is not evidence of a stall.
+            if current.is_none() || current != observed {
+                observed = current;
+                last_progress = tokio::time::Instant::now();
+            } else if last_progress.elapsed() >= window {
+                return;
             }
         }
     }
@@ -19399,6 +19476,11 @@ impl BrokerToolDispatcher {
                     status: ScriptTerminalStatusV1::Cancelled,
                     code: "cancelled",
                     reason: "orchestration was cancelled while a child call was active",
+                },
+                OrchestrationChildInterruption::NoProgress => OrchestrationTerminalReason {
+                    status: ScriptTerminalStatusV1::TimedOut,
+                    code: "child_no_progress",
+                    reason: "a child call made no observable progress within the explicit no_progress_ms window",
                 },
                 OrchestrationChildInterruption::Deadline => OrchestrationTerminalReason {
                     status: ScriptTerminalStatusV1::TimedOut,
@@ -19528,6 +19610,7 @@ impl BrokerToolDispatcher {
             usize::from(group.max_concurrency)
         };
         let interaction_observation_invalidated = state.interaction_observation_invalidated;
+        let no_progress_ms = state.admitted.limits.no_progress_ms;
         for wave in pending.chunks(width) {
             let outcomes = join_all(wave.iter().map(|(_, call)| async move {
                 let result = self
@@ -19535,6 +19618,7 @@ impl BrokerToolDispatcher {
                         run_id,
                         call,
                         interaction_observation_invalidated,
+                        no_progress_ms,
                         cancel,
                     )
                     .await;
@@ -19941,9 +20025,9 @@ impl BrokerToolDispatcher {
                     .finish_orchestration(run_id, Some(&mut state), terminal)
                     .await;
             }
-            if unix_time_ms().saturating_sub(state.admitted.admitted_at_ms)
-                >= state.admitted.limits.script_wall_ms.unwrap_or(120_000)
-            {
+            if state.admitted.limits.script_wall_ms.is_some_and(|wall| {
+                unix_time_ms().saturating_sub(state.admitted.admitted_at_ms) >= wall
+            }) {
                 let terminal = orchestration_terminal(
                     &state,
                     ScriptTerminalStatusV1::TimedOut,
@@ -20072,6 +20156,7 @@ impl BrokerToolDispatcher {
                         run_id,
                         &pending,
                         state.interaction_observation_invalidated,
+                        state.admitted.limits.no_progress_ms,
                         cancel,
                     )
                     .await?
@@ -21684,7 +21769,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     && error.message == crate::delegation::RECURSION_LIMIT_MESSAGE
                 {
                     self.clear_cached_call(run_id, item_id, call_id);
-                    return Ok(ToolDispatchResult::Completed(recursion_limit_result()));
+                    return Ok(ToolDispatchResult::Completed(recursion_limit_result(
+                        &error,
+                    )));
                 }
                 self.clear_cached_call(run_id, item_id, call_id);
                 return Err(error);
@@ -22585,9 +22672,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             tokio::pin!(wait);
                             let mut close = shell.close_receiver();
                             let mut close_open = true;
+                            let mut dispatch_cancel_pending = true;
                             let waited = loop {
                                 tokio::select! {
                                     result = &mut wait => break result,
+                                    // The dispatch token (turn cancel, or an
+                                    // orchestration deadline / no-progress
+                                    // stop) terminates the foreground process
+                                    // instead of waiting for it to exit.
+                                    () = cancel.cancelled(), if dispatch_cancel_pending => {
+                                        dispatch_cancel_pending = false;
+                                        process_cancel.cancel();
+                                    }
                                     changed = close.changed(), if close_open => {
                                         if changed.is_err() {
                                             close_open = false;
@@ -24585,14 +24681,22 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
     }
 }
 
-fn recursion_limit_result() -> BoundedResult {
+/// Only reachable when the operator opted into `HAIDER_SUBAGENT_MAX_DEPTH`;
+/// subagent depth is unbounded by default.
+fn recursion_limit_result(error: &HaiderError) -> BoundedResult {
+    let limit = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("limit"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     BoundedResult {
         preview: serde_json::json!({
             "status": "rejected",
             "error": {
                 "kind": "recursion_depth_limit",
                 "message": crate::delegation::RECURSION_LIMIT_MESSAGE,
-                "limit": crate::delegation::RECURSION_DEPTH_LIMIT,
+                "limit": limit,
             }
         })
         .to_string(),

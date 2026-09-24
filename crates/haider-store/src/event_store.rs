@@ -49,7 +49,7 @@ use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
     ChildTemplatePromoted, ComputerObservationKind, EvidenceAuthority, EvidenceRecorded,
     EvidenceSlotSpec, EvidenceVerdict, GRAPH_INSPECT_MAX_RUNS,
-    GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_CONDITIONAL_HOPS, GRAPH_MAX_TODO_CHILDREN,
+    GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_TODO_CHILDREN,
     GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS, GRAPH_TELEMETRY_MAX_RUN_ROWS,
     GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
     GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
@@ -7545,16 +7545,15 @@ impl Store {
                             false,
                         )
                     })?;
+                // Only the pinned template's per-node `max_attempts` bounds
+                // the loop (unbounded by default; an explicit template value
+                // is an opt-in). A stuck loop is stopped above by the
+                // repeated-red-fingerprint NoProgress guard.
                 let source_attempts_exhausted =
                     node_status.attempts_opened >= node_spec.max_attempts;
                 let target_attempts_exhausted = declared_target.is_some()
                     && target_status.attempts_opened >= target_spec.max_attempts;
-                let conditional_hops_exhausted = declared_target.is_some()
-                    && status.attempt.saturating_sub(1) >= GRAPH_MAX_CONDITIONAL_HOPS;
-                if source_attempts_exhausted
-                    || target_attempts_exhausted
-                    || conditional_hops_exhausted
-                {
+                if source_attempts_exhausted || target_attempts_exhausted {
                     payloads.push(EventPayload::GraphBlocked(GraphBlocked {
                         graph_id: graph_id.clone(),
                         node: current_node.clone(),

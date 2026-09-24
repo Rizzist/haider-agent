@@ -189,7 +189,7 @@ pub fn plain_status(status: &GraphStatus) -> String {
         let marker = attempt_marker(node);
         let evidence = node_evidence_fragment(node);
         lines.push(format!(
-            "  {glyph}{marker} {} · {} · attempt {}/8{evidence}",
+            "  {glyph}{marker} {} · {} · attempt {}{evidence}",
             node.node.label(),
             gate_label(node),
             node.current_attempt.unwrap_or(0),

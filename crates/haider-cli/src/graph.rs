@@ -100,12 +100,8 @@ pub(crate) async fn graph_command(rest: &[String]) -> ExitCode {
                         .as_ref()
                         .map_or("-", GraphNodeName::label);
                     println!(
-                        "{} {} node={} attempt={}/{}",
-                        status.graph_id,
-                        lifecycle,
-                        node,
-                        status.attempt,
-                        haider_protocol::graph::GRAPH_MAX_ATTEMPTS
+                        "{} {} node={} attempt={}",
+                        status.graph_id, lifecycle, node, status.attempt,
                     );
                     Ok(())
                 }

@@ -2114,12 +2114,68 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
     );
 }
 
+/// OWNER RULE (no default caps): the built-in ship-loop repair loop keeps
+/// iterating while each red is new information, far past the former 8-attempt
+/// default, and then completes its VERIFY gate productively.
+/// MUTATION CHECK: restore a default attempt ceiling below 12. Expected
+/// failure: the graph blocks RoundsExhausted instead of reaching SHIP.
 #[test]
-fn eighth_unsatisfied_epoch_blocks_rounds_exhausted_without_back_edge_facts() {
+fn default_repair_loop_runs_past_eight_epochs_and_completes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "attempt-unbounded");
+    pin(&store, &session_id, "attempt-unbounded");
+    let mut serial = 1;
+    for epoch in 1..=12 {
+        advance_to_verify(&store, &session_id, serial);
+        serial += 1;
+        exhaust_verify_epoch(&store, &session_id, &mut serial, epoch);
+        let status = store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph");
+        assert_eq!(status.phase, GraphPhase::Active, "epoch {epoch}");
+    }
+    advance_to_verify(&store, &session_id, serial);
+    serial += 1;
+    for slot in ["tests", "lint", "typecheck"] {
+        record_verify_slot(
+            &store,
+            &session_id,
+            serial,
+            slot,
+            EvidenceVerdict::Green,
+            &format!("{slot} passed on epoch 13"),
+        );
+        serial += 1;
+    }
+    let status = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(status.phase, GraphPhase::Active);
+    assert_eq!(status.attempt, 13);
+    assert_eq!(status.blocked_reason, None);
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::ship_node()),
+        "the productive loop converged past the former 8-attempt default"
+    );
+}
+
+/// An EXPLICIT per-node `max_attempts` stays an honoured opt-in bound.
+/// MUTATION CHECK: ignore the pinned template's max_attempts. Expected
+/// failure: the graph stays active after the eighth unsatisfied epoch.
+#[test]
+fn explicit_eight_attempt_bound_blocks_rounds_exhausted_without_back_edge_facts() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let session_id = create_session(&store, "attempt-cap");
-    pin(&store, &session_id, "attempt-cap");
+    let mut nodes = haider_protocol::graph::ship_loop_nodes();
+    for node in &mut nodes {
+        node.max_attempts = 8;
+    }
+    pin_runtime_graph(&store, &session_id, "attempt-cap", "BUILD", nodes);
     let mut serial = 1;
     for epoch in 1..=8 {
         advance_to_verify(&store, &session_id, serial);
@@ -3801,7 +3857,12 @@ fn back_edge_preserves_unrelated_ready_sibling_evidence_and_epoch() {
 }
 
 #[test]
-fn twenty_four_conditional_hops_is_a_hard_runtime_bound() {
+/// OWNER RULE (no default caps): the former global 24-conditional-hop bound
+/// is gone; conditional loops continue past it and stop only at the pinned
+/// template's explicit per-node `max_attempts` (8 here).
+/// MUTATION CHECK: restore the 24-hop runtime bound. Expected failure: FOUR's
+/// fourth red blocks at attempt 25 instead of reopening at 26.
+fn conditional_hops_continue_past_twenty_four_until_the_explicit_node_bound() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let session_id = create_session(&store, "conditional-hop-bound");
@@ -3865,19 +3926,36 @@ fn twenty_four_conditional_hops_is_a_hard_runtime_bound() {
     );
     assert_eq!(at_bound.phase, GraphPhase::Active);
 
+    for round in 3..7 {
+        record(
+            &store,
+            &session_id,
+            serial,
+            fourth.clone(),
+            EvidenceVerdict::Red,
+            &format!("FOUR distinct failure past the old hop bound {round}"),
+        );
+        serial += 1;
+        let status = store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph");
+        assert_eq!(status.phase, GraphPhase::Active, "round {round}");
+        assert_eq!(status.attempt, 26 + (round - 3));
+    }
     record(
         &store,
         &session_id,
         serial,
         fourth,
         EvidenceVerdict::Red,
-        "FOUR hop 25 is refused",
+        "FOUR exhausts its explicit eight attempts",
     );
     let blocked = store
         .graph_status(&session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(blocked.attempt, 25);
+    assert_eq!(blocked.attempt, 29);
     assert_eq!(blocked.phase, GraphPhase::Blocked);
     assert_eq!(
         blocked.blocked_reason,
@@ -6013,7 +6091,9 @@ fn m2e_cached_template_is_revalidated_and_poison_is_typed() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let mut malformed = implement_verify_child_template();
-    malformed.nodes[0].max_attempts = haider_protocol::graph::GRAPH_MAX_ATTEMPTS + 1;
+    // Zero attempts is the remaining invalid bound (explicit bounds have no
+    // ceiling).
+    malformed.nodes[0].max_attempts = 0;
     let key = ChildTemplateCacheKey {
         task_shape: "mutation_verify".into(),
         effective_grant_digest: "grant-poison".into(),

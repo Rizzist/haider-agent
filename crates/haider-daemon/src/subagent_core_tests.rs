@@ -5232,12 +5232,13 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: reset depth to one for recursive children, remove the cap,
-/// or return a dispatcher error at the cap. Expected runtime failure: the
-/// ancestry chain/depths differ, a fourth delegation appears, or the root
-/// turn does not reach Done after receiving the typed cap result.
+/// MUTATION CHECK: reset depth to one for recursive children, ignore the
+/// explicit opt-in cap, or return a dispatcher error at the cap. Expected
+/// runtime failure: the ancestry chain/depths differ, a fourth delegation
+/// appears, or the root turn does not reach Done after receiving the typed
+/// cap result. Depth is unbounded by default; this pins the OPT-IN cap.
 #[tokio::test]
-async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error() {
+async fn opt_in_depth_cap_three_rejects_depth_four_as_a_typed_continuable_error() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -5319,7 +5320,7 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
                 provider: provider.clone(),
             }),
             tool_factory: delegation_tool_factory(),
-            delegation: None,
+            delegation: Some(DelegationHandle::with_max_depth(hub.clone(), Some(3))),
             web_search: None,
         },
         false,
@@ -5388,6 +5389,7 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
                     Block::ToolResult { call_id, preview, .. }
                         if call_id == "depth-4-rejected"
                             && preview.contains("recursion_depth_limit")
+                            && preview.contains("\"limit\":3")
                 )
             })
         })
@@ -5396,6 +5398,132 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+/// OWNER RULE (no default caps for automated agents): with no opt-in cap,
+/// a five-deep delegation chain establishes every level, each child reports
+/// to its parent, and the root turn completes productively.
+/// MUTATION CHECK: restore any default depth ceiling below five. Expected
+/// failure: a level is missing and the root never merges the chain.
+#[tokio::test]
+async fn default_subagent_depth_is_unbounded_five_deep_chain_completes() {
+    const DEPTH: u32 = 5;
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut steps = Vec::new();
+    for level in 1..=DEPTH {
+        steps.push(FakeStep::EmitToolCall {
+            call_id: format!("depth-{level}"),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({
+                "task": format!("depth-{level}"),
+                "prompt": format!("work at depth {level}")
+            }),
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    steps.push(FakeStep::EmitText {
+        text: format!("depth {DEPTH} leaf report"),
+    });
+    steps.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    for level in (1..=DEPTH).rev() {
+        steps.push(FakeStep::ExpectToolResult {
+            call_id: format!("depth-{level}"),
+        });
+        steps.push(FakeStep::EmitText {
+            text: format!("merged depth {level}"),
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        });
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: delegation_tool_factory(),
+            delegation: Some(DelegationHandle::with_max_depth(hub.clone(), None)),
+            web_search: None,
+        },
+        false,
+    );
+    let manager_handle = manager.handle();
+    hub.install_worker_manager(manager_handle.clone())
+        .expect("install manager");
+    let parent_session = SessionId::new("depth-unbounded-root");
+    let parent_run = RunId::new("depth-unbounded-root-run");
+    let accepted = accept_parent(&hub, &parent_session, &parent_run, "depth-unbounded").await;
+    manager_handle.submit(accepted).await.expect("submit root");
+    wait_for_state(&store, &parent_session, |state| *state == RunState::Done).await;
+
+    let (mut session, mut run) = (parent_session.clone(), parent_run.clone());
+    let mut parent_agent = None;
+    for level in 1..=DEPTH {
+        let row = hub
+            .delegations_for_parent_run(session.clone(), run.clone())
+            .await
+            .expect("level rows")
+            .pop()
+            .unwrap_or_else(|| panic!("depth {level} delegation must exist"));
+        assert_eq!(row.depth, level);
+        assert_eq!(row.root_session_id, parent_session);
+        assert_eq!(row.parent_agent_id, parent_agent);
+        assert!(
+            row.report.is_some(),
+            "depth {level} must report to its parent"
+        );
+        parent_agent = Some(row.agent_id.clone());
+        session = row.child_session_id;
+        run = row.child_run_id;
+    }
+    assert!(
+        hub.delegations_for_parent_run(session, run)
+            .await
+            .expect("leaf children")
+            .is_empty()
+    );
+    let requests = provider.requests();
+    for level in 1..=DEPTH {
+        let call = format!("depth-{level}");
+        assert!(
+            requests.iter().any(|request| {
+                request.messages.iter().any(|message| {
+                    message.blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            Block::ToolResult { call_id, preview, .. }
+                                if *call_id == call && !preview.contains("recursion_depth_limit")
+                        )
+                    })
+                })
+            }),
+            "depth {level} must return a child report, not a depth rejection"
+        );
+    }
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[test]
+fn subagent_max_depth_env_is_an_explicit_opt_in() {
+    use crate::delegation::configured_max_depth;
+    assert_eq!(configured_max_depth(None), None);
+    assert_eq!(configured_max_depth(Some("")), None);
+    assert_eq!(configured_max_depth(Some("0")), None);
+    assert_eq!(configured_max_depth(Some("not-a-number")), None);
+    assert_eq!(configured_max_depth(Some(" 7 ")), Some(7));
+    assert_eq!(configured_max_depth(Some("64")), Some(64));
 }
 
 /// HARD-CAP E2 LAW: after 512 durable live children across unrelated trees,

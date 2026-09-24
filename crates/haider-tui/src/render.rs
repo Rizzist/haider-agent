@@ -9869,7 +9869,7 @@ fn render_graph(
             theme.faint_style(),
         ));
         spans.push(Span::styled(
-            format!(" · attempt {}/8", node.current_attempt.unwrap_or(0)),
+            format!(" · attempt {}", node.current_attempt.unwrap_or(0)),
             theme.dim_style(),
         ));
         // D2: a Loom node names its specialist and task, in the type accent.

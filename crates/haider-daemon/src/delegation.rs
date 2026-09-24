@@ -75,7 +75,13 @@ const CHILD_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(241);
 pub(crate) const DELEGATED_MENU_ORIGIN: &str = "delegated-child";
 pub(crate) const DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND: &str =
     "delegation_terminal_mirror_handoff_v1";
-pub(crate) const RECURSION_DEPTH_LIMIT: u32 = 3;
+/// Explicit opt-in nesting cap for delegated children. Unset (the default)
+/// means subagent depth is unbounded: long-horizon agents may delegate as deep
+/// as their work needs, and the device-wide live-child admission limit
+/// (`SUBAGENT_LIVE_LIMIT`, a retryable backpressure rejection) is the resource
+/// bound. A positive integer caps depth; the call past it receives the typed,
+/// continuable `recursion_depth_limit` tool result.
+pub(crate) const SUBAGENT_MAX_DEPTH_ENV: &str = "HAIDER_SUBAGENT_MAX_DEPTH";
 pub(crate) const RECURSION_LIMIT_MESSAGE: &str = "recursion depth limit";
 const STALL_NUDGE_TEXT: &str = "report your status or conclude";
 const STALL_REPORT_SUMMARY: &str =
@@ -94,8 +100,28 @@ pub(crate) struct DelegationHandle {
     stall_supervision: bool,
     stall_cancel_on_grace: bool,
     settlement_tail_timeout: Duration,
+    /// Opt-in nesting cap (`None` = unbounded; see `SUBAGENT_MAX_DEPTH_ENV`).
+    max_depth: Option<u32>,
     #[cfg(all(test, unix))]
     stall_deadline_clock: Option<Arc<StallDeadlineTestClock>>,
+}
+
+/// Parses the opt-in `HAIDER_SUBAGENT_MAX_DEPTH` value. Absent, empty, `0`
+/// or non-numeric values leave depth unbounded (invalid values are logged so
+/// a mistyped cap is visible rather than silently enforced as something else).
+pub(crate) fn configured_max_depth(value: Option<&str>) -> Option<u32> {
+    let raw = value.map(str::trim).filter(|raw| !raw.is_empty())?;
+    match raw.parse::<u32>() {
+        Ok(0) => None,
+        Ok(limit) => Some(limit),
+        Err(_) => {
+            tracing::warn!(
+                value = raw,
+                "{SUBAGENT_MAX_DEPTH_ENV} is not a positive integer; subagent depth stays unbounded"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -315,9 +341,18 @@ impl DelegationHandle {
             stall_supervision: true,
             stall_cancel_on_grace: false,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            max_depth: configured_max_depth(std::env::var(SUBAGENT_MAX_DEPTH_ENV).ok().as_deref()),
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
         }
+    }
+
+    /// Test/embedder constructor with an explicit opt-in nesting cap.
+    #[cfg(test)]
+    pub(crate) fn with_max_depth(hub: SessionHub, max_depth: Option<u32>) -> Self {
+        let mut handle = Self::new(hub);
+        handle.max_depth = max_depth;
+        handle
     }
 
     #[cfg(all(test, unix))]
@@ -331,6 +366,7 @@ impl DelegationHandle {
             stall_supervision: true,
             stall_cancel_on_grace: true,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            max_depth: None,
             stall_deadline_clock: None,
         }
     }
@@ -357,6 +393,7 @@ impl DelegationHandle {
             stall_supervision: true,
             stall_cancel_on_grace: true,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            max_depth: None,
             stall_deadline_clock: Some(stall_deadline_clock),
         }
     }
@@ -375,6 +412,7 @@ impl DelegationHandle {
             stall_supervision: false,
             stall_cancel_on_grace: false,
             settlement_tail_timeout,
+            max_depth: None,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
         }
@@ -396,6 +434,7 @@ impl DelegationHandle {
             stall_supervision: true,
             stall_cancel_on_grace: true,
             settlement_tail_timeout,
+            max_depth: None,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
         }
@@ -2615,12 +2654,13 @@ impl DelegationHandle {
         }
         crate::worker::validate_grant(&parent.manifest.grant)?;
         let depth = parent.depth.saturating_add(1);
-        if depth > RECURSION_DEPTH_LIMIT {
-            return Err(HaiderError::new(
-                ErrorCode::InvalidArgument,
-                RECURSION_LIMIT_MESSAGE,
-                false,
-            ));
+        if let Some(limit) = self.max_depth
+            && depth > limit
+        {
+            let mut error =
+                HaiderError::new(ErrorCode::InvalidArgument, RECURSION_LIMIT_MESSAGE, false);
+            error.details = Some(serde_json::json!({ "limit": limit, "depth": depth }));
+            return Err(error);
         }
         Ok(SpawnAncestry {
             root_session_id: parent.root_session_id,

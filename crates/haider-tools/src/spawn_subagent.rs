@@ -9,7 +9,8 @@ use haider_protocol::spawn_subagent::{
     MAX_PROMPT_BYTES, MAX_SELECTOR_BYTES, MAX_TASK_BYTES, MAX_WAIT_MS, SpawnSubagentArguments,
 };
 
-/// Validated arguments for the depth-capped local-subagent tool.
+/// Validated arguments for the local-subagent tool (depth is unbounded unless
+/// the operator opts into `HAIDER_SUBAGENT_MAX_DEPTH`).
 ///
 /// `model`/`provider` are the ADDITIVE model selector (F1). Sessions are
 /// provider-agnostic: absent, the child inherits the parent's CURRENT model

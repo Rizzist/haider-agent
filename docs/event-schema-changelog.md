@@ -21,6 +21,40 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — autonomy limits become explicit opt-ins
+
+Owner rule (2026-09-23): no DEFAULT cap stops productive automated work;
+limits exist only as explicit opt-ins, alongside cancellation and real
+no-progress detection. No field or kind is added or removed; `schema_version`
+remains 1 and the RPC method pin is unchanged.
+
+- `tool_script` `limits` (`OrchestrationLimitsV1`): `child_attempts`,
+  `script_wall_ms`, `child_wall_ms` and `no_progress_ms` are absent by default
+  (previously 64 / 120 000 / 30 000 / 30 000) and omitted from admitted
+  records when absent. Explicit values keep their meaning and have no ceiling
+  beyond "positive" (previously 256 / 300 000 / 120 000 / 60 000).
+  `no_progress_ms` now stops a child only when the window passes without the
+  session journal advancing (output, child updates, results); it is no longer
+  folded into the child wall. An ask's `wait_ms` bounds only the permission
+  answer window, not the permitted child's execution. New terminal
+  `reason_code` value `child_no_progress` (status `timed_out`). Activation
+  evidence records `deadline_ms`/`script_deadline_ms` =
+  18446744073709551615 (`u64::MAX`) when no explicit wall applies.
+- Graph templates: built-in and compiled Loom node `max_attempts` default to
+  4294967295 (`u32::MAX`, effectively unbounded; previously 8, Loom 4/3) and
+  validators accept any positive explicit value (previously at most 8). The
+  global 24-conditional-hop runtime bound is removed; only a pinned template's
+  explicit per-node `max_attempts` yields `rounds_exhausted`. The
+  repeated-red-fingerprint `no_progress` block is unchanged. Workflow
+  activation ASTs default `max_back_edge_activations` to 4294967295 and accept
+  any positive explicit value (previously at most 24). Legacy pinned values
+  (for example `max_attempts: 8`) are honoured as explicit bounds.
+- `GraphBrief` prompt text and CLI/TUI graph views print `attempt N` without
+  the former fixed `/8` denominator.
+- Subagent depth is unbounded by default. The `recursion_depth_limit` tool
+  rejection appears only when the operator sets `HAIDER_SUBAGENT_MAX_DEPTH`
+  to a positive integer; its `limit` field reports that configured value.
+
 ### v0.0.972 — finalized tool arguments carrier
 
 New additive extension kind `tool_arguments_finalized_v1` uses the existing

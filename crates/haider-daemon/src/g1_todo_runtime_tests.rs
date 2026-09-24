@@ -474,7 +474,7 @@ async fn active_graph_brief_reaches_the_provider_but_not_durable_history() {
         matches!(
             message.blocks.as_slice(),
             [Block::Text { text }]
-                if text.starts_with("GraphBrief: BUILD attempt 1/8;")
+                if text.starts_with("GraphBrief: BUILD attempt 1;")
         )
     }));
     let events = world
@@ -585,10 +585,9 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
             round + 1
         );
         assert!(
-            graph_briefs[0].1.starts_with(&format!(
-                "GraphBrief: {} attempt 1/8;",
-                expected_nodes[round]
-            )),
+            graph_briefs[0]
+                .1
+                .starts_with(&format!("GraphBrief: {} attempt 1;", expected_nodes[round])),
             "request round {} reflects the graph transition at its logical request boundary",
             round + 1,
         );
