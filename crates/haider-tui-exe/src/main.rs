@@ -698,7 +698,15 @@ fn apply_interactive_workspace(
         .to_owned();
     model.cwd = workspace_text;
     model.pending_workspace_allocation = allocation;
-    model.session_dir = abbreviate_path(&workspace, environment.home.as_deref());
+    // The SAME producer the live driver uses for renewed allocations
+    // (sanitised, home-relative, `/`-normalised, identical fallback), so the
+    // first and every later preview spell a path identically everywhere.
+    let display = haider_tui::live::workspace_display_path(&model.cwd);
+    model.pending_workspace_display = model
+        .pending_workspace_allocation
+        .as_ref()
+        .map(|_| display.clone());
+    model.session_dir = display;
 
     Ok(())
 }
@@ -742,14 +750,6 @@ fn apply_launch_origin(model: &mut AppModel) {
     }
 }
 
-fn abbreviate_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
-    match home.and_then(|home| path.strip_prefix(home).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
-}
-
 /// Abbreviate the process cwd into the launcher/session dirs.
 fn apply_cwd(model: &mut AppModel) {
     let Ok(cwd) = std::env::current_dir() else {
@@ -761,7 +761,7 @@ fn apply_cwd(model: &mut AppModel) {
         .flatten()
     {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
         None => cwd.display().to_string(),
     };
     model.launcher_dir = abbreviated.clone();

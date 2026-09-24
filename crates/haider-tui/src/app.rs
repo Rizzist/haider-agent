@@ -5311,6 +5311,9 @@ pub struct AppModel {
     /// Creation-only dated allocation. The leaf named by `cwd` remains
     /// absent until the daemon brokers the first workspace-writing effect.
     pub pending_workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+    /// Display-only path for the next dated allocation. The launcher uses
+    /// this instead of implying its shell cwd is the new session workspace.
+    pub pending_workspace_display: Option<String>,
     /// Sanitised process launch directory used for TUI-origin registration.
     /// Android and non-local surfaces leave this absent.
     pub launch_origin_path: Option<haider_protocol::session::LaunchOriginPathV1>,
@@ -5319,6 +5322,10 @@ pub struct AppModel {
     /// Canonical workspace of the attached session, learned from
     /// `SessionSummary` or the create response.
     pub session_workspace_cwd: Option<String>,
+    /// The attached session's dated leaf is resolved but not on disk yet
+    /// (it materialises on the first write). Set by the live driver's
+    /// presence probe; the session header and origin line speak it.
+    pub session_workspace_uncreated: bool,
     /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
     /// each time, exactly as the sim's `nid()` does (review r2 P1-1 — fixed
     /// ids let a stale answer apply its consequences to a later card).
@@ -5936,9 +5943,11 @@ impl Default for AppModel {
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             cwd: "/".to_owned(),
             pending_workspace_allocation: None,
+            pending_workspace_display: None,
             launch_origin_path: None,
             session_dir: "~/dev/enterprise-suite".to_owned(),
             session_workspace_cwd: None,
+            session_workspace_uncreated: false,
             card_seq: 0,
             vfs: vfs_seed(),
             launcher_shellout: None,
@@ -18306,6 +18315,8 @@ impl AppModel {
         self.session_title = None;
         self.session_name = None;
         self.session_workspace_cwd = None;
+        // Re-judged by the live presence probe for the new surface.
+        self.session_workspace_uncreated = false;
         self.launch_origin = None;
         self.lockdown_provider = None;
         self.lockdown_boundary_known = false;
@@ -18524,6 +18535,8 @@ impl AppModel {
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
         self.session_workspace_cwd = slot.workspace_cwd.take();
+        // Re-judged by the live presence probe for the new surface.
+        self.session_workspace_uncreated = false;
         self.launch_origin = slot.launch_origin.take();
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
