@@ -1675,7 +1675,9 @@ pub fn has_stale_computer_screenshots(messages: &[Message]) -> bool {
 /// The latest computer observation is the only full screenshot useful for
 /// subsequent coordinate decisions. Older captures remain durable and
 /// retrievable through their artifact refs, but do not grow every later
-/// provider request.
+/// provider request. On prefix-binding Anthropic models this rewrite also
+/// invalidates later signed thinking; see
+/// [`request_rewrites_earlier_tool_result_images`].
 fn elide_stale_computer_screenshots(messages: &mut [Message]) {
     let computer_calls = computer_call_ids(messages);
     let mut retained_latest = false;
@@ -1733,6 +1735,39 @@ pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
             }
         }
     }
+}
+
+/// Whether this provider-bound clone carries a request-time image elision
+/// that rewrote an EARLIER tool result: stale computer screenshots or the
+/// oldest-first turn image budget. Both are recomputed from durable history
+/// on every request and only grow as newer images arrive, so once true for a
+/// conversation it stays true on every later request, including after a
+/// daemon restart or resume. Capability degradation is excluded: it applies
+/// identically from a result's first request and never changes a prefix.
+///
+/// A tool result whose own text happens to contain an identical marker line
+/// only makes this report `true`; callers must use it solely to opt into a
+/// strictly more tolerant provider policy.
+pub(crate) fn request_rewrites_earlier_tool_result_images(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolResult { preview, .. } => Some(preview),
+            _ => None,
+        })
+        .flat_map(|preview| preview.lines())
+        .filter(|line| line.starts_with("{\"haider_elision_v1\""))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|marker| {
+            marker
+                .pointer("/haider_elision_v1/scope")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|scope| {
+                    scope == ImageElisionScope::ComputerScreenshotHistory.as_str()
+                        || scope == ImageElisionScope::TurnBudget.as_str()
+                })
+        })
 }
 
 /// Why a provider-bound clone lost tool-result images. The scope string is

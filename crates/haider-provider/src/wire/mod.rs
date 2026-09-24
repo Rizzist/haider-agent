@@ -273,7 +273,8 @@ fn request_json_inner(
     }
     // G3 effort rides `output_config.effort` VERBATIM when set (GA, no beta
     // header). NEVER `thinking.budget_tokens` — that shape 400s on 4.7+ and
-    // every 5-family model — and no `thinking` field is emitted otherwise.
+    // every 5-family model. The Anthropic adapter adds adaptive thinking
+    // separately when its signed-prefix drop policy applies.
     if let Some(effort) = effort {
         object.insert(
             "output_config".into(),

@@ -86,6 +86,9 @@ pub const ANTHROPIC_FAST_BETA_VALUE: &str = "fast-mode-2026-02-01";
 /// `anthropic-beta` header with OAuth subscription identity and fast mode.
 pub const ANTHROPIC_COMPUTER_BETA_20251124: &str = "computer-use-2025-11-24";
 pub const ANTHROPIC_COMPUTER_BETA_20250124: &str = "computer-use-2025-01-24";
+/// Required alongside `thinking.block_binding` (Anthropic "Preserved
+/// thinking" controls); without it that body field is a 400.
+const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
@@ -153,6 +156,43 @@ fn anthropic_computer_beta_from_payload(payload: &serde_json::Value) -> Option<&
                 _ => None,
             },
         )
+}
+
+/// Models on which Anthropic binds replayed signed thinking to the exact
+/// preceding prefix (system, tools, earlier messages). Fable 5.1 and Opus 5.5
+/// are documented as enforcing. Mythos 5.1 is included defensively: Anthropic
+/// documents that models without the check accept `block_binding` and report
+/// only model-check drops, so the opt-in cannot cause a rejection there.
+fn prefix_binding_model(model: &str) -> bool {
+    matches!(
+        crate::effort::base_model(model),
+        "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1"
+    )
+}
+
+/// Whether this request must carry Anthropic's documented
+/// `prefix_mismatch_behavior: "drop_block"` policy.
+///
+/// Haider's request-time image elision (stale computer screenshots, the
+/// oldest-first turn image budget) rewrites an EARLIER tool result, which
+/// invalidates every later signed thinking block on prefix-binding models;
+/// accounts created on/after 2026-08-31 otherwise receive a 400. Anthropic's
+/// computer-use guidance: "If you must prune, keep
+/// `prefix_mismatch_behavior: \"drop_block\"` set from then on". The
+/// condition is derived only from the model and the request's own history,
+/// and that elision is monotonic, so it holds on every later request and is
+/// reconstructed identically after resume/restart. Ordinary append-only
+/// conversations keep their exact prior wire and the API's default check.
+pub(crate) fn thinking_binding_drop_required(request: &TurnRequest) -> bool {
+    prefix_binding_model(&request.model)
+        && crate::request_rewrites_earlier_tool_result_images(&request.messages)
+}
+
+fn payload_uses_thinking_binding_drop(payload: &serde_json::Value) -> bool {
+    payload
+        .pointer("/thinking/block_binding/prefix_mismatch_behavior")
+        .and_then(serde_json::Value::as_str)
+        == Some("drop_block")
 }
 
 fn build_anthropic_client(
@@ -693,6 +733,31 @@ impl AnthropicProvider {
                 cache_ttl,
             );
         }
+        // Request-time image elision rewrote an earlier tool result: ask the
+        // API to drop the signed thinking bound to the old prefix instead of
+        // rejecting the request (see `thinking_binding_drop_required`).
+        // `adaptive` is these models' only thinking mode and equals omission.
+        if thinking_binding_drop_required(request) {
+            let object = payload.as_object_mut().ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "Anthropic request payload was not a JSON object",
+                )
+            })?;
+            let thinking = object
+                .entry("thinking")
+                .or_insert_with(|| serde_json::json!({"type": "adaptive"}));
+            let Some(thinking) = thinking.as_object_mut() else {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "Anthropic thinking configuration was not a JSON object",
+                ));
+            };
+            thinking.insert(
+                "block_binding".into(),
+                serde_json::json!({"prefix_mismatch_behavior": "drop_block"}),
+            );
+        }
         // G4b Vertex wire deltas (LV1): the model is URL-addressed, so the
         // body DROPS `model` and carries `anthropic_version` in its place.
         if self.endpoint_shape == AnthropicEndpointShape::Vertex {
@@ -977,6 +1042,8 @@ impl AnthropicProvider {
             request = request.header("anthropic-version", ANTHROPIC_VERSION);
         }
         let computer_beta = anthropic_computer_beta_from_payload(payload);
+        let thinking_binding_beta =
+            payload_uses_thinking_binding_drop(payload).then_some(ANTHROPIC_THINKING_BINDING_BETA);
         request = match self.auth_mode {
             AnthropicAuthMode::ApiKey => {
                 let request = request.header("x-api-key", self.api_key_header()?);
@@ -985,13 +1052,20 @@ impl AnthropicProvider {
                     betas.push(ANTHROPIC_FAST_BETA_VALUE);
                 }
                 betas.extend(computer_beta);
+                betas.extend(thinking_binding_beta);
                 if betas.is_empty() {
                     request
                 } else {
                     request.header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
                 }
             }
-            AnthropicAuthMode::None => request,
+            AnthropicAuthMode::None => {
+                if let Some(beta) = thinking_binding_beta {
+                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, beta)
+                } else {
+                    request
+                }
+            }
             AnthropicAuthMode::OAuthBearer => {
                 // Optional feature betas APPEND after the OAuth identity in
                 // ONE comma-joined header — the subscription token must
@@ -1009,6 +1083,7 @@ impl AnthropicProvider {
                     betas.push(ANTHROPIC_FAST_BETA_VALUE);
                 }
                 betas.extend(computer_beta);
+                betas.extend(thinking_binding_beta);
                 request
                     .header(AUTHORIZATION, self.authorization_header()?)
                     .header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
@@ -1019,8 +1094,12 @@ impl AnthropicProvider {
             // Fast remains Claude-API-only and the factory never sets it here.
             AnthropicAuthMode::CloudBearer => {
                 let request = request.header(AUTHORIZATION, self.authorization_header()?);
-                if let Some(computer_beta) = computer_beta {
-                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, computer_beta)
+                let betas = computer_beta
+                    .into_iter()
+                    .chain(thinking_binding_beta)
+                    .collect::<Vec<_>>();
+                if !betas.is_empty() {
+                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
                 } else {
                     request
                 }

@@ -25,6 +25,12 @@ mod wayland;
 #[path = "computer/windows.rs"]
 mod windows;
 
+// Pure geometry for the Windows backend; compiled everywhere so its tests run
+// in macOS/Linux CI (only the Windows backend uses it at runtime).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[path = "computer/windows_geometry.rs"]
+mod windows_geometry;
+
 #[path = "computer/region.rs"]
 mod region;
 pub use region::{ComputerScreenshotCrop, ComputerScreenshotRegion, crop_screenshot_png};

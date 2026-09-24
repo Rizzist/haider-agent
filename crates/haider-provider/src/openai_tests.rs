@@ -20,6 +20,42 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TryRecvError;
 
 #[test]
+fn openai_computer_screenshot_history_still_elides_older_images() {
+    let screenshot = |id: &str| {
+        [
+            Message::assistant(vec![Block::ToolCall {
+                call_id: id.into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            }]),
+            Message::tool_result_with_images(
+                id,
+                "screenshot",
+                false,
+                vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{id}")),
+                    media_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 8,
+                }],
+            ),
+        ]
+    };
+    let mut messages = screenshot("a")
+        .into_iter()
+        .chain(screenshot("b"))
+        .collect::<Vec<_>>();
+    crate::apply_tool_result_image_budget(&mut messages);
+    assert!(
+        matches!(&messages[1].blocks[0], Block::ToolResult { images, .. } if images.is_empty())
+    );
+    assert!(
+        matches!(&messages[3].blocks[0], Block::ToolResult { images, .. } if images.len() == 1)
+    );
+}
+
+#[test]
 fn shared_provider_builder_pins_idle_h2_and_tcp_keep_alive() {
     assert_eq!(
         crate::PROVIDER_KEEP_ALIVE,
