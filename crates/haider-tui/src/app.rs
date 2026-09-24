@@ -11890,19 +11890,16 @@ impl AppModel {
         };
         // Adopt only once the provider's MODEL truth is here: a
         // half-adopted identity (right provider, demo-seed model) would
-        // send a foreign slug to the subscription API and 400. The next
-        // snapshot completes the picture; nothing is lost by waiting.
+        // send a foreign slug to the subscription API and 400. Static
+        // catalog rows are model truth even when remote discovery fails.
         let model_known = self
             .providers
             .providers
             .iter()
             .find(|summary| summary.provider == provider)
             .is_some_and(|summary| {
-                !matches!(
-                    summary.inventory,
-                    haider_rpc::ModelInventoryWire::NeverFetched
-                        | haider_rpc::ModelInventoryWire::Unavailable { .. }
-                ) && (summary.default_model.is_some() || !summary.models.is_empty())
+                summary.has_known_models()
+                    && (summary.default_model.is_some() || !summary.models.is_empty())
             });
         if !model_known {
             return;
@@ -20144,7 +20141,7 @@ impl AppModel {
                     _ => "api",
                 }
             };
-            if summary.models.is_empty() {
+            if !summary.has_known_models() || summary.models.is_empty() {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
                     providers: vec![summary.provider.clone()],

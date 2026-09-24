@@ -618,7 +618,7 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 400000,
           "default_effort": null,
           "model": "gpt-5.3-codex",
           "source": "static",

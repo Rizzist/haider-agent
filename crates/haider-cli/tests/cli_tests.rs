@@ -714,7 +714,8 @@ fn wait_for_provider_snapshot(
 /// End-to-end credential/catalog law through the real CLI, daemon actor,
 /// durable vault/store, production compatible adapter, and recording HTTP
 /// endpoint. MUTATION CHECK: restoring synchronous configure/login discovery
-/// blocks the held 404 add; dropping the post-commit edge leaves NeverFetched;
+/// blocks the held 404 add; dropping the post-commit edge leaves a custom
+/// provider NeverFetched;
 /// dropping per-provider dedupe opens a second held `/models` request.
 #[cfg(unix)]
 #[test]
@@ -743,7 +744,13 @@ fn credential_add_enqueues_one_nonblocking_catalog_flight_on_the_running_daemon(
         .iter()
         .find(|row| row["provider"] == "haider-code")
         .expect("Haider Code provider row");
-    assert_eq!(haider_code["inventory"]["state"], "never_fetched");
+    assert_eq!(haider_code["inventory"]["state"], "static");
+    assert!(
+        haider_code["model_details"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["source"] == "static")),
+        "the initial subscription catalog is published: {haider_code}"
+    );
     let daemon = wait_for_daemon_pid(&owner.profile);
     let proxy = CredentialCatalogProxy::start();
 
