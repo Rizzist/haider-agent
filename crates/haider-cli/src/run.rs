@@ -373,19 +373,16 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     }
 
     if request_tranche.is_some() || max_requests.is_some() {
-        let defaults = haider_protocol::request_budget::RequestBudgetV1::default();
-        let hard_cap = usize::try_from(max_requests.unwrap_or(defaults.hard_cap as u64))
+        let hard_cap = max_requests
+            .map(usize::try_from)
+            .transpose()
             .map_err(|_| "--max-requests exceeds this platform's range")?;
-        let request_budget = haider_protocol::request_budget::RequestBudgetV1 {
-            // An implicit soft checkpoint cannot exceed an explicit hard cap.
-            // Keep an explicitly supplied tranche strict so invalid pairs fail.
-            tranche: request_tranche
-                .map(usize::try_from)
-                .transpose()
-                .map_err(|_| "--request-tranche exceeds this platform's range")?
-                .unwrap_or(defaults.tranche.min(hard_cap)),
-            hard_cap,
-        };
+        let tranche = request_tranche
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "--request-tranche exceeds this platform's range")?;
+        let request_budget =
+            haider_protocol::request_budget::RequestBudgetV1::from_opt_in(tranche, hard_cap);
         request_budget.validate()?;
         budget.request_budget = Some(request_budget);
     }

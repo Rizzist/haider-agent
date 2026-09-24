@@ -1504,6 +1504,17 @@ fn no_idle_isolated_process_deadline() -> std::time::Duration {
     no_idle_parent_release_deadline().saturating_add(std::time::Duration::from_secs(4))
 }
 
+/// Whether any completed item is a typed `provider_request_budget_v1` status.
+fn has_request_budget_item(events: &[EventPayload]) -> bool {
+    events.iter().any(|payload| {
+        matches!(
+            payload,
+            EventPayload::Item(ItemEvent::Completed { item, .. })
+                if RequestBudgetStatusV1::from_extension_item(item).is_some()
+        )
+    })
+}
+
 fn continuation_seen(events: &[EventPayload], marker: &str) -> bool {
     events.iter().any(|payload| {
         matches!(
@@ -1880,13 +1891,7 @@ async fn assert_headless_workflow_chain_completes(test_id: &str, node_names: &[&
     .await;
     let events = events_until_terminal(&mut client, &run_id).await;
     assert!(
-        !events.iter().any(|payload| {
-            matches!(
-                payload,
-                EventPayload::Item(ItemEvent::Completed { item, .. })
-                    if RequestBudgetStatusV1::from_extension_item(item).is_some()
-            )
-        }),
+        !has_request_budget_item(&events),
         "a workflow without an explicit request policy stays unbounded"
     );
     let requests = fake.requests();
@@ -2028,13 +2033,7 @@ async fn interactive_turn_without_request_policy_completes_beyond_old_hard_cap()
         "completed after sixty-six provider requests"
     ));
     assert!(
-        !events.iter().any(|payload| {
-            matches!(
-                payload,
-                EventPayload::Item(ItemEvent::Completed { item, .. })
-                    if RequestBudgetStatusV1::from_extension_item(item).is_some()
-            )
-        }),
+        !has_request_budget_item(&events),
         "an omitted request policy must not synthesize request-budget items"
     );
 

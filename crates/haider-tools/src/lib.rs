@@ -51,8 +51,9 @@ pub const TOOL_RESULT_INLINE_MAX_BYTES: usize = 8 * 1024;
 /// symmetric head/tail view to the model.
 pub const WEB_FETCH_MODEL_PREVIEW_MAX_BYTES: usize = 16 * 1024;
 
-/// A 1 MiB orchestration capture fits in 16 reads, half of the core's default
-/// 32-request soft tranche (and a quarter of its 64-request hard ceiling).
+/// A 1 MiB orchestration capture fits in 16 reads: provider requests are
+/// unbounded by default, and this stays within half of the explicit opt-in
+/// 32-request soft tranche (a quarter of its 64-request hard cap).
 /// Share this allowance across file pages, shell previews and capture pages.
 pub const ORCHESTRATION_PREVIEW_MAX_BYTES: usize = 1024 * 1024 / 16;
 pub const FILE_PREVIEW_MAX_LINES: usize = 2_000;

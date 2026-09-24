@@ -150,8 +150,9 @@ impl TaskRegistry {
         let mut sessions = self.lock();
         let session = sessions.entry(session_id.clone()).or_default();
         session.captures.retain(|(existing, _)| existing != &handle);
-        // Two complete 64-request turns even with an alias entry per capture;
-        // only references are retained.
+        // Sized for two complete turns at the explicit opt-in 64-request cap,
+        // even with an alias entry per capture; only references are retained.
+        // Default turns are request-unbounded, so older handles can be evicted.
         if session.captures.len() >= 256 {
             session.captures.pop_front();
         }

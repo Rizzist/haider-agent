@@ -24,6 +24,24 @@ fn explicit_request_budget_defaults_allow_two_tranches_and_validate_order() {
         .validate()
         .is_ok()
     );
+    // Single-bound opt-ins: an implicit tranche never exceeds the cap; an
+    // explicit tranche is kept verbatim so an invalid pair still fails.
+    for (tranche, hard_cap, expected) in [
+        (None, None, (32, 64)),
+        (None, Some(5), (5, 5)),
+        (None, Some(96), (32, 96)),
+        (Some(40), None, (40, 64)),
+        (Some(8), Some(10), (8, 10)),
+    ] {
+        let budget = RequestBudgetV1::from_opt_in(tranche, hard_cap);
+        assert_eq!((budget.tranche, budget.hard_cap), expected);
+        assert!(budget.validate().is_ok());
+    }
+    assert!(
+        RequestBudgetV1::from_opt_in(Some(65), None)
+            .validate()
+            .is_err()
+    );
 }
 
 #[test]

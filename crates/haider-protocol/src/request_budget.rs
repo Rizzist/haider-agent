@@ -12,21 +12,46 @@ pub struct RequestBudgetV1 {
     pub hard_cap: usize,
 }
 
+/// Soft tranche used when an explicit opt-in names only the hard cap (and
+/// never above that cap). Provenance: the 970 turn-budget lane chose 32 so
+/// two tranches covered the reported 53-round solved benchmark; since 973
+/// it applies only to callers that opt into request-count limits.
+pub const OPT_IN_DEFAULT_TRANCHE: usize = 32;
+
+/// Hard cap used when an explicit opt-in names only the tranche. Provenance:
+/// the retired 970 default (two 32-request tranches); since 973 omission of
+/// a request policy is unbounded and this value applies only to opt-ins.
+pub const OPT_IN_DEFAULT_HARD_CAP: usize = 64;
+
 /// Convenience values for callers that explicitly opt into request-count
 /// limits. Runtime omission is represented by `Option<RequestBudgetV1>::None`
 /// and is unbounded.
 impl Default for RequestBudgetV1 {
     fn default() -> Self {
         Self {
-            tranche: 32,
-            // Historical explicit-policy counterpart when a caller supplies
-            // only `--request-tranche` and leaves the cap flag absent.
-            hard_cap: 64,
+            tranche: OPT_IN_DEFAULT_TRANCHE,
+            hard_cap: OPT_IN_DEFAULT_HARD_CAP,
         }
     }
 }
 
 impl RequestBudgetV1 {
+    /// Completes an explicit opt-in that named only one bound: a missing hard
+    /// cap is [`OPT_IN_DEFAULT_HARD_CAP`]; a missing tranche is
+    /// [`OPT_IN_DEFAULT_TRANCHE`] clamped to the hard cap, so an implicit
+    /// soft checkpoint never exceeds an explicit cap. A supplied tranche is
+    /// kept as given so an invalid explicit pair still fails [`Self::validate`].
+    /// Wire policies (`RunBudgetV1`, child manifests) require both fields and
+    /// never use this completion.
+    #[must_use]
+    pub fn from_opt_in(tranche: Option<usize>, hard_cap: Option<usize>) -> Self {
+        let hard_cap = hard_cap.unwrap_or(OPT_IN_DEFAULT_HARD_CAP);
+        Self {
+            tranche: tranche.unwrap_or(OPT_IN_DEFAULT_TRANCHE.min(hard_cap)),
+            hard_cap,
+        }
+    }
+
     pub fn validate(self) -> Result<(), String> {
         if self.tranche == 0 || self.hard_cap == 0 || self.tranche > self.hard_cap {
             Err("request budget requires 0 < tranche <= hard_cap".into())
@@ -65,6 +90,14 @@ pub struct RequestBudgetStatusV1 {
 }
 
 impl RequestBudgetStatusV1 {
+    /// The transcript line for this status, if any. Per-request `Progress`
+    /// facts stay durable metadata and are not rendered as transcript rows;
+    /// only actionable soft/hard checkpoints are shown.
+    #[must_use]
+    pub fn transcript_summary(&self) -> Option<String> {
+        (self.phase != RequestBudgetPhaseV1::Progress).then(|| self.summary())
+    }
+
     #[must_use]
     pub fn summary(&self) -> String {
         let phase = match self.phase {

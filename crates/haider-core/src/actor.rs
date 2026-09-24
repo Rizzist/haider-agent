@@ -4614,16 +4614,20 @@ impl HarnessActor {
                         cache: request_attempt_data,
                         response_epoch: replay.response_epoch,
                         workspace_receipt: pending_workspace_receipt.take(),
-                        request_budget: self.config.provider_request_budget.and_then(|budget| {
-                            (provider_attempt == 1).then(|| {
+                        // Progress is recorded once per logical request
+                        // (first attempt) and only under an explicit policy.
+                        request_budget: self
+                            .config
+                            .provider_request_budget
+                            .filter(|_| provider_attempt == 1)
+                            .map(|budget| {
                                 self.request_budget_status(
                                     &run_id,
                                     provider_request_count,
                                     budget,
                                     RequestBudgetPhaseV1::Progress,
                                 )
-                            })
-                        }),
+                            }),
                     },
                     &mut thinking_pending,
                 )

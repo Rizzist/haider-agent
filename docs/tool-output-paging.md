@@ -37,9 +37,10 @@ classifier and read path.
 
 Foreground process previews allow 64 KiB, with explicit head/tail byte
 accounting when reduction is necessary. The 1 MiB default execution capture
-can therefore be retrieved in 16 pages, using at most half the default
-32-request soft tranche. Neither the 64-request turn ceiling nor the process
-execution limit is increased.
+can therefore be retrieved in 16 pages. Provider requests per turn are
+unbounded by default; under an explicit request policy this is at most half
+the opt-in 32-request soft tranche. The process execution limit is not
+increased.
 
 A completely displayed, successfully completed process result carries no
 paging pointer: the inline output already is the whole secret-redacted capture,

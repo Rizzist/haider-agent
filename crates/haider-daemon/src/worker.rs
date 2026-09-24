@@ -316,7 +316,7 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Integration-test seam for proving an explicit actor request-loop cap
     /// through the real daemon. Production factories return `None`, leaving
-    /// provider-request count unbounded.
+    /// any run or child pin in force (no pin means unbounded).
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
@@ -9366,29 +9366,26 @@ async fn start_turn(
         .transpose()
         .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?
         .flatten();
-    if let Some(budget) = headless
+    let pinned_request_budget = headless
         .as_ref()
         .and_then(|context| context.spec.budget.request_budget)
-        .or(child_request_budget)
-    {
+        .or(child_request_budget);
+    if let Some(budget) = pinned_request_budget {
         budget
             .validate()
             .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
-        config.provider_request_budget = Some(budget);
-        config.ceiling_workspace = headless
-            .as_ref()
-            .map(|_| std::path::PathBuf::from(&metadata.cwd));
     }
-    if let Some(limit) = dependencies
+    // The test-factory override replaces any pin with a cap-only opt-in.
+    let request_budget = dependencies
         .provider_factory
         .max_provider_requests_per_turn_override()
-    {
-        config.provider_request_budget = Some(haider_protocol::request_budget::RequestBudgetV1 {
-            tranche: haider_protocol::request_budget::RequestBudgetV1::default()
-                .tranche
-                .min(limit),
-            hard_cap: limit,
-        });
+        .map(|limit| {
+            haider_protocol::request_budget::RequestBudgetV1::from_opt_in(None, Some(limit))
+        })
+        .or(pinned_request_budget);
+    if let Some(budget) = request_budget {
+        config.provider_request_budget = Some(budget);
+        // Hard-cap workspace receipts exist only for capped headless runs.
         config.ceiling_workspace = headless
             .as_ref()
             .map(|_| std::path::PathBuf::from(&metadata.cwd));
