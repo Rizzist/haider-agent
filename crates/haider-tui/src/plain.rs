@@ -694,6 +694,11 @@ fn render_item(out: &mut String, block: &ItemBlock) {
                     out.push_str(&summary);
                     out.push('\n');
                 }
+            } else if let Some(note) =
+                haider_protocol::loop_guard::LoopSuspectedV1::from_extension_item(&block.item)
+            {
+                out.push_str(&note.summary());
+                out.push('\n');
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 out.push_str(&label);
                 out.push('\n');

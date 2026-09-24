@@ -34,6 +34,7 @@ pub mod interaction;
 pub mod item;
 pub mod lockdown;
 pub mod loom;
+pub mod loop_guard;
 pub mod menu;
 pub mod mobile;
 pub mod orchestration;

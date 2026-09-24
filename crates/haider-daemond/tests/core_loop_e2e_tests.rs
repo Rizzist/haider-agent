@@ -1955,8 +1955,15 @@ async fn interactive_turn_without_request_policy_completes_beyond_old_hard_cap()
     let root = test_root("interactive-unbounded-request-count-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
-    fs::write(workspace.join("continuity.txt"), "retained fixture history")
+    // Distinct productive reads: identical repeated calls would (correctly)
+    // meet the repeated-tool-call loop guard instead of an unbounded count.
+    for ordinal in 1..=TOOL_REQUESTS {
+        fs::write(
+            workspace.join(format!("part-{ordinal}.txt")),
+            format!("retained fixture history part {ordinal}"),
+        )
         .expect("workspace input");
+    }
 
     let mut script = Vec::new();
     for ordinal in 1..=TOOL_REQUESTS {
@@ -1968,7 +1975,7 @@ async fn interactive_turn_without_request_policy_completes_beyond_old_hard_cap()
         script.push(FakeStep::EmitToolCall {
             call_id: format!("unbounded-{ordinal}"),
             name: "fs_read".into(),
-            args: serde_json::json!({"path": "continuity.txt"}),
+            args: serde_json::json!({"path": format!("part-{ordinal}.txt")}),
         });
         script.push(FakeStep::Finish {
             reason: FinishReason::ToolUse,

@@ -32,6 +32,7 @@ use haider_protocol::ids::{
     RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, ToolArgumentsFinalizedV1, ToolStatus, TurnItem};
+use haider_protocol::loop_guard::{LOOP_SUSPECTED_EXTENSION_KIND, LoopSuspectedV1};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::{RunState, WaitReason};
@@ -1192,6 +1193,141 @@ async fn repeated_identical_provider_tool_results_do_not_reset_the_streak() {
         ErrorCode::LoopLimit
     );
     assert_eq!(provider.requests().len(), 10);
+}
+
+fn identical_inspect_calls(count: usize) -> Vec<FakeStep> {
+    let mut script = Vec::new();
+    for ordinal in 1..=count {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("same-{}", ordinal - 1),
+            });
+        }
+        script.extend([
+            FakeStep::EmitToolCall {
+                call_id: format!("same-{ordinal}"),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+        ]);
+    }
+    script
+}
+
+/// Ordinary `tool_use` loop of identical calls and results: the typed
+/// `loop_suspected_v1` steer is journaled and sent to the model after the
+/// 30th repeat (before request 32); 30 more repeats end in `loop_limit`
+/// before request 62.
+#[tokio::test]
+async fn identical_tool_use_loop_is_steered_then_stopped_with_loop_limit() {
+    let (outcome, events, requests, calls) =
+        toolrepair_run(config(), identical_inspect_calls(61)).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("loop error");
+    assert_eq!(error.code, ErrorCode::LoopLimit);
+    let details = error.details.expect("loop details");
+    assert_eq!(details["loop"], "repeated_tool_calls");
+    assert_eq!(details["repeated_calls"], 60);
+    assert_eq!(details["suspect_after"], 30);
+    assert_eq!(details["stop_after_suspected"], 30);
+    assert_eq!(requests.len(), 61);
+    assert_eq!(calls, 61);
+
+    let notes: Vec<LoopSuspectedV1> = events
+        .iter()
+        .filter_map(|envelope| match typed(envelope) {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                LoopSuspectedV1::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "exactly one steer per streak");
+    assert_eq!(notes[0].repeated_calls, 30);
+    assert_eq!(notes[0].stop_after, 30);
+    assert_eq!(notes[0].tool.as_deref(), Some("inspect"));
+    let has_note =
+        |request: &TurnRequest| format!("{:?}", request.messages).contains("[loop_suspected_v1]");
+    assert!(!requests[..31].iter().any(has_note));
+    assert!(requests[31..].iter().all(has_note));
+    assert!(events.iter().any(|envelope| matches!(
+        typed(envelope),
+        EventPayload::RunFailed {
+            code: ErrorCode::LoopLimit,
+            ..
+        }
+    )));
+}
+
+/// Explicit opt-out: an embedder that disables the repeated-call guard keeps
+/// the unbounded behavior for identical calls.
+#[tokio::test]
+async fn disabled_tool_loop_guard_allows_identical_calls() {
+    let mut script = identical_inspect_calls(70);
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "same-70".into(),
+        },
+        FakeStep::EmitText {
+            text: "done after seventy identical reads".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let mut cfg = config();
+    cfg.tool_loop_guard = None;
+    let (outcome, events, requests, calls) = toolrepair_run(cfg, script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 71);
+    assert_eq!(calls, 70);
+    assert!(
+        !events
+            .iter()
+            .any(|envelope| completed_extension(envelope, LOOP_SUSPECTED_EXTENSION_KIND))
+    );
+}
+
+/// Distinct productive calls never accumulate toward the repeated-call guard.
+#[tokio::test]
+async fn distinct_tool_calls_run_past_the_repeat_thresholds() {
+    let mut script = Vec::new();
+    for ordinal in 1..=70 {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("distinct-{}", ordinal - 1),
+            });
+        }
+        script.extend([
+            FakeStep::EmitToolCall {
+                call_id: format!("distinct-{ordinal}"),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": format!("part-{ordinal}.txt")}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+        ]);
+    }
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "distinct-70".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (outcome, events, requests, _) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 71);
+    assert!(
+        !events
+            .iter()
+            .any(|envelope| completed_extension(envelope, LOOP_SUSPECTED_EXTENSION_KIND))
+    );
 }
 
 #[derive(Debug, Default)]

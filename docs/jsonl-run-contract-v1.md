@@ -335,21 +335,83 @@ Once a capped run emits its first request status, the TUI status strip and
 exposes the selected run's optional `request_budget` object. Unbounded runs
 omit both displays and the JSON field.
 
-The independent provider continuation guard counts consecutive `max_tokens`
-or `pause_turn` finishes without progress. Progress is new, nonblank assistant
-text; a completed local tool call with a distinct tool name, arguments, and
-model-visible result; or a distinct completed provider-side tool result with
-its name, arguments, preview, and status. Repeated content or identical calls
-and results, even with fresh call IDs, do not reset the streak. Usage updates,
-transport attempts, opaque replay state, and the automatic `max_tokens` nudge
-also do not reset it. Fingerprints normalize assistant Unicode and whitespace,
-collapse whitespace inside JSON argument strings, and ignore timestamps,
-generated IDs, and long encoded tokens in tool-result previews. A changed
-count or ordinary result text remains progress. The default permits eight
-no-progress continuations; the ninth ends in `loop_limit` (CLI exit 70).
-Productive turns may pass that many total continuations. This loop guard is
-separate from an explicit request budget and its `request_budget_exceeded` exit
-78.
+### Loop guards (`loop_limit`, v0.0.973)
+
+Two turn-local loop guards stop genuinely stuck loops. Neither counts
+productive work, and neither is a request-count cap. Both share one progress
+fingerprint set per turn. Progress means one of:
+
+- new nonblank assistant text;
+- a completed local tool call with a new (tool name, canonical arguments,
+  normalized model-visible result, truncation, images);
+- a completed provider-side tool result with a new (tool name, canonical
+  arguments, normalized preview, error status).
+
+Fresh call IDs, request ordinals, usage updates, transport attempts, opaque
+replay state, and the automatic `max_tokens` nudge are never progress.
+
+The fingerprints are for comparison only. The journal and the model always
+receive the original data. They use structural rules, not per-format noise
+patterns:
+
+- **All content:** Unicode NFKC, a Latin fold of look-alike Cyrillic/Greek
+  letters, and collapsed whitespace.
+- **Tool results and assistant text:** every digit run is masked, so latency,
+  clock times, HTTP dates, epochs, counters, and numeric nonces never look new.
+  Digits directly after a letter or `_` are kept (`chunk5`, `mod12`, `v0`),
+  because they name something. Letters are never masked, so a new git SHA, UUID
+  or encoded token is progress.
+- **Tool results only:** the result is compared as an unordered multiset. Each
+  line's `,`/`;`/`:`-separated items are sorted, then the lines are sorted. A
+  reordered list is therefore a repeat, while an added or removed line is
+  progress.
+- **Assistant text:** case is folded.
+- **Assistant text and argument strings:** a run of one repeated punctuation
+  character is capped at three.
+- **Arguments:** canonical JSON with ordered keys and exact numbers. Digits in
+  argument strings are not masked, so a call with different arguments, such as
+  another file, is a new call.
+
+The two guards:
+
+1. **Continuation guard.** It counts consecutive `max_tokens`/`pause_turn`
+   finishes whose response added no progress. The default allows eight; the
+   ninth ends the turn with `run_failed { code: loop_limit }` (CLI exit 70). The
+   error details carry `continuation_count` and `continuation_limit`.
+2. **Repeated-tool-call guard** (any finish reason, including ordinary
+   `tool_use` rounds). It counts consecutive tool calls whose fingerprint was
+   already seen in the turn.
+   - After 30 such calls, before the next provider request, it commits one
+     non-terminal `loop_suspected_v1` extension item. The item carries
+     `run_id`, `repeated_calls`, `stop_after`, an optional `tool`, and
+     `label`. It is visible in JSON/JSONL and as a transcript line in the TUI
+     and plain renderers. The same typed note is added to the model's input
+     and replays on recovery.
+   - If 30 more repeated calls follow with no new fingerprint and no new
+     assistant text, the turn ends with `loop_limit` (exit 70). The details
+     carry `loop: "repeated_tool_calls"`, `repeated_calls`, `suspect_after`
+     and `stop_after_suspected`.
+   - Any progress resets the count and re-arms the steer.
+   - A pure loop of identical calls is steered before request 32 (after the
+     30th repeat) and stops before request 62 (after the 60th repeat).
+   - The steer always precedes the stop, even when a parallel batch of
+     repeats crosses both thresholds at once.
+
+Accepted residuals:
+
+- Noise that changes letters, such as alphanumeric nonces, etags or
+  hex-with-letters IDs, still counts as progress. Such loops are bounded only
+  when the model's calls themselves repeat.
+- An identical call whose result changes only in unattached digits counts as
+  no progress. Examples are a bare counter (`Completed files: N`) or `stage N
+  done`, which cannot be told apart from a clock. Such a loop stops after
+  eight no-progress continuations, or after 60 repeated tool calls.
+- An in-memory streak restarts after daemon recovery.
+
+The repeated-call guard is on by default. Embedders may disable it or change
+its thresholds through `HarnessConfig::tool_loop_guard`. There is no CLI flag.
+Neither guard is related to an explicit request budget or its
+`request_budget_exceeded` exit 78.
 
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
 request policy. With only `--max-requests N`, the implicit tranche is

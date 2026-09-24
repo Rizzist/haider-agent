@@ -102,3 +102,47 @@ fn budget_status_hides_per_request_progress_and_renders_only_actionable_bounds()
         }
     }
 }
+
+#[test]
+fn loop_suspected_steer_renders_as_a_visible_transcript_line() {
+    let note = haider_protocol::loop_guard::LoopSuspectedV1 {
+        run_id: RunId::new("loop-run"),
+        repeated_calls: 30,
+        stop_after: 30,
+        tool: Some("fs_read".into()),
+    };
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+    model
+        .projection
+        .apply(&EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("loop-suspected"),
+            item: note.to_extension_item().expect("steer item"),
+        }));
+    let plain = render_plain(&model.projection, 0, None);
+    assert!(
+        plain.contains(&format!("{}\n", note.summary())),
+        "plain: {plain}"
+    );
+    let mut terminal = Terminal::new(TestBackend::new(180, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            render(&model, frame);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("loop suspected — 30 consecutive tool calls"),
+        "styled: {rendered}"
+    );
+}

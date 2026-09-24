@@ -17,7 +17,6 @@ haider-store = { path = "../haider-store" }
 haider-tools = { path = "../haider-tools" }
 serde.workspace = true
 serde_json.workspace = true
-regex.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 unicode-normalization.workspace = true

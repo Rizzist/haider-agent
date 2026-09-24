@@ -1817,7 +1817,6 @@ dependencies = [
  "haider-provider",
  "haider-store",
  "haider-tools",
- "regex",
  "serde",
  "serde_json",
  "tempfile",

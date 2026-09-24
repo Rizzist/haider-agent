@@ -16051,6 +16051,14 @@ fn item_lines<'a>(
                 if let Some(summary) = budget.transcript_summary() {
                     lines.push(Line::styled(format!("  {summary}"), theme.gold_style()));
                 }
+            } else if let Some(note) =
+                haider_protocol::loop_guard::LoopSuspectedV1::from_extension_item(&block.item)
+            {
+                // A non-terminal steer: gold like a budget checkpoint.
+                lines.push(Line::styled(
+                    format!("  {}", note.summary()),
+                    theme.gold_style(),
+                ));
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 let suffix = label.strip_prefix("🖼 image").unwrap_or(&label);
                 lines.push(Line::from(vec![

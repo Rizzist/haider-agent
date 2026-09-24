@@ -40,6 +40,14 @@ additive field and unbounded runs omit it.
 This changes no event shape, pricing, cost accounting, time budget,
 cancellation, workflow recurrence guard, or schema version.
 
+New additive extension kind `loop_suspected_v1` (`run_id`, `repeated_calls`,
+`stop_after`, optional `tool`, `label`): a non-terminal steer committed once
+per repeated-tool-call streak after 30 consecutive calls repeat an earlier call
+and normalized result of the same turn. It is model-visible and rendered as a
+transcript line. If the streak continues for 30 more calls without new progress,
+the turn ends with the existing `loop_limit` error code (CLI exit 70).
+Older readers treat the kind as an unknown extension.
+
 ### v0.0.972 — finalized tool arguments carrier
 
 New additive extension kind `tool_arguments_finalized_v1` uses the existing

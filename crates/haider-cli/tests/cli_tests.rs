@@ -5570,7 +5570,7 @@ fn default_request_budget_allows_more_than_sixty_four_provider_requests() {
         }
         script.push(serde_json::json!({
             "step": "emit_tool_call", "call_id": format!("unbounded-{ordinal}"),
-            "name": "fs_read", "args": {"path": "continuity.txt"}
+            "name": "fs_read", "args": {"path": format!("part-{ordinal}.txt")}
         }));
         script.push(serde_json::json!({"step": "finish", "reason": "tool_use"}));
     }
@@ -5583,15 +5583,19 @@ fn default_request_budget_allows_more_than_sixty_four_provider_requests() {
     script.push(serde_json::json!({"step": "finish", "reason": "end_turn"}));
     let script = serde_json::to_string(&script).expect("fake unbounded script");
     let mut command = haider();
-    std::fs::write(
-        command
-            .profile
-            .parent()
-            .expect("profile parent")
-            .join("workspace/continuity.txt"),
-        "retained fixture history",
-    )
-    .expect("workspace input");
+    // Distinct productive reads: identical repeated calls would (correctly)
+    // meet the repeated-tool-call loop guard instead of an unbounded count.
+    for ordinal in 1..=TOOL_REQUESTS {
+        std::fs::write(
+            command
+                .profile
+                .parent()
+                .expect("profile parent")
+                .join(format!("workspace/part-{ordinal}.txt")),
+            format!("retained fixture history part {ordinal}"),
+        )
+        .expect("workspace input");
+    }
     command.env("HAIDER_TEST_FAKE_PROVIDER", script).args([
         "run",
         "--provider",

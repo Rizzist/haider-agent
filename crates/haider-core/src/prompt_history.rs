@@ -4892,6 +4892,15 @@ fn render_journal_with_facts(
                         messages.push(Message::user_text(status.model_note()));
                     }
                 }
+                TurnItem::Extension { ref kind, .. }
+                    if kind == haider_protocol::loop_guard::LOOP_SUSPECTED_EXTENSION_KIND =>
+                {
+                    if let Some(note) =
+                        haider_protocol::loop_guard::LoopSuspectedV1::from_extension_item(&item)
+                    {
+                        messages.push(Message::user_text(note.model_note()));
+                    }
+                }
                 TurnItem::Extension { kind, data } if kind == PROVIDER_OPAQUE_EXTENSION_KIND => {
                     if let Some(block) = provider_opaque_extension(data) {
                         messages.push(Message::assistant(vec![block]));
