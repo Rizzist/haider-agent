@@ -22,6 +22,11 @@ pub const TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
 /// Maximum width or height retained for a tool-produced image. Larger source
 /// screenshots are downscaled before they enter the CAS.
 pub const TOOL_RESULT_IMAGE_MAX_DIMENSION: u32 = 2_048;
+/// Compatibility envelope for screenshots returned by the computer tool.
+/// Anthropic's computer-use guidance requires both the long-edge and pixel
+/// limits; the stricter pixel limit is what bounds a 16:9 desktop capture.
+pub const COMPUTER_SCREENSHOT_MAX_DIMENSION: u32 = 1_568;
+pub const COMPUTER_SCREENSHOT_MAX_PIXELS: u64 = 1_150_000;
 /// Maximum tool-result images admitted to one provider request.
 pub const TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN: usize = 5;
 /// Maximum encoded tool-result image bytes admitted to one provider request.

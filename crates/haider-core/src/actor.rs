@@ -4208,7 +4208,8 @@ impl HarnessActor {
                 });
             let request_images_will_mutate = !self.config.tool_result_images_supported
                 || request_image_count > TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
-                || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN;
+                || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN
+                || stale_computer_screenshot_projection(&request_messages);
             let mut request_only_tool_results =
                 if request_images_will_mutate {
                     request_messages
@@ -4233,6 +4234,13 @@ impl HarnessActor {
                 } else {
                     Vec::new()
                 };
+            // Image budgeting is request-local: durable history and its CAS
+            // refs are restored as soon as the stream opens. When the newest
+            // computer screenshot causes an older one to become an elision
+            // marker, declare that exact projection as a provider-view epoch
+            // instead of presenting the rewrite as append-only history.
+            let request_image_projection_epoch =
+                request_images_will_mutate.then(|| digest_json(&request_only_tool_results));
             let snapshot_insert_at = current_turn_start.min(request_messages.len());
             let mut request_stable_history_end = stable_history_end.min(request_messages.len());
             let mut request_cacheable_history_end =
@@ -4280,6 +4288,15 @@ impl HarnessActor {
                             .await;
                     }
                 };
+            let request_view_snapshot = match (
+                volatile_context_epoch.as_deref(),
+                request_image_projection_epoch.as_deref(),
+            ) {
+                (None, None) => None,
+                (Some(volatile), None) => Some(volatile.to_owned()),
+                (None, Some(images)) => Some(images.to_owned()),
+                (Some(volatile), Some(images)) => Some(digest_json(&(volatile, images))),
+            };
             // Cache metadata must exist before provider preparation, so this
             // is the last provider-neutral request-send boundary available to
             // the TTL selector. Sample every request at this same boundary;
@@ -4304,7 +4321,7 @@ impl HarnessActor {
                 },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
-                volatile_context_epoch.as_deref(),
+                request_view_snapshot.as_deref(),
             );
             // Built-in adapters render directly from the daemon's Arc-backed
             // definitions. Standalone/injected providers retain the owned Vec
@@ -4453,7 +4470,7 @@ impl HarnessActor {
                 },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
-                volatile_context_epoch.as_deref(),
+                request_view_snapshot.as_deref(),
             );
             provider_request.cache_metadata = Some(cache_metadata.clone());
             if let Some(provider_view) = prepared
@@ -15404,6 +15421,33 @@ fn tool_image_corrupt(message: impl Into<String>) -> HaiderError {
     HaiderError::new(ErrorCode::StoreCorrupt, message, false)
 }
 
+fn stale_computer_screenshot_projection(messages: &[Message]) -> bool {
+    let computer_calls = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolCall { call_id, name, .. } if name == "computer" => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| {
+            matches!(
+                block,
+                Block::ToolResult {
+                    call_id,
+                    images,
+                    ..
+                } if !images.is_empty() && computer_calls.contains(call_id.as_str())
+            )
+        })
+        .take(2)
+        .count()
+        > 1
+}
+
 /// E2 normalization point: every tool result passes through the actor before
 /// it is journaled, so legacy dispatchers cannot accidentally omit the typed
 /// presentation on a non-success result.
@@ -15547,6 +15591,44 @@ mod cu1_actor_tests {
         );
         config.tool_result_images_supported = images_supported;
         config
+    }
+
+    fn computer_screenshot(call_id: &str) -> [Message; 2] {
+        [
+            Message::assistant(vec![Block::ToolCall {
+                call_id: call_id.into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            }]),
+            Message::tool_result_with_images(
+                call_id,
+                "screenshot",
+                false,
+                vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{call_id}")),
+                    media_type: "image/png".into(),
+                    width: 1_429,
+                    height: 804,
+                    byte_len: 1_000_000,
+                }],
+            ),
+        ]
+    }
+
+    #[test]
+    fn second_computer_screenshot_declares_request_only_history_rewrite() {
+        let first = computer_screenshot("screenshot-1");
+        assert!(!stale_computer_screenshot_projection(&first));
+
+        let mut repeated = first.to_vec();
+        repeated.extend(computer_screenshot("screenshot-2"));
+        assert!(stale_computer_screenshot_projection(&repeated));
+
+        repeated.push(Message::tool_result("ordinary-tool", "done", false));
+        assert!(
+            stale_computer_screenshot_projection(&repeated),
+            "an unrelated result must not hide the request-local rewrite"
+        );
     }
 
     #[test]

@@ -18161,6 +18161,15 @@ impl BrokerToolDispatcher {
         })?
         .map_err(ToolError::Computer)?;
         cancel.check().map_err(ToolError::Computer)?;
+        let redacted = tokio::task::spawn_blocking(move || {
+            haider_tools::bound_computer_screenshot_png(&redacted)
+        })
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: format!("screenshot resize worker failed: {error}"),
+        })?
+        .map_err(ToolError::Computer)?;
+        cancel.check().map_err(ToolError::Computer)?;
         let mut cas = self.cas.lock().await;
         cas.put_image(redacted, "image/png")
             .await

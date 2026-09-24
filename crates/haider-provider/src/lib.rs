@@ -1559,6 +1559,7 @@ impl Message {
 /// names the first omitted artifact and reports any additional count without
 /// allowing an untrusted result vector to grow prompt text without bound.
 pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
+    elide_stale_computer_screenshots(messages);
     let mut retained_count = messages
         .iter()
         .flat_map(|message| &message.blocks)
@@ -1630,6 +1631,57 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
     }
 }
 
+/// The latest computer observation is the only full screenshot useful for
+/// subsequent coordinate decisions. Older captures remain durable and
+/// retrievable through their artifact refs, but do not grow every later
+/// provider request.
+fn elide_stale_computer_screenshots(messages: &mut [Message]) {
+    let computer_calls = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolCall { call_id, name, .. } if name == "computer" => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut retained_latest = false;
+    for message in messages.iter_mut().rev() {
+        for block in message.blocks.iter_mut().rev() {
+            let Block::ToolResult {
+                call_id,
+                preview,
+                images,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if !computer_calls.contains(call_id) || images.is_empty() {
+                continue;
+            }
+            if !retained_latest {
+                retained_latest = true;
+                continue;
+            }
+            let removed = std::mem::take(images);
+            let omitted_count = removed.len();
+            let omitted_bytes = removed
+                .iter()
+                .map(|image| image.byte_len)
+                .fold(0_u64, u64::saturating_add);
+            let first_omitted = removed
+                .first()
+                .map(|image| bounded_context_field(image.artifact.as_str(), 96));
+            preview.push_str(&tool_image_elision_marker(
+                "computer_screenshot_history",
+                omitted_count,
+                omitted_bytes,
+                first_omitted.as_deref(),
+            ));
+        }
+    }
+}
+
 /// Explicit capability degradation for a provider/model that cannot accept
 /// images. Callers apply this only to a provider-bound clone after budgeting;
 /// durable image refs remain unchanged.
@@ -1673,10 +1725,12 @@ fn tool_image_elision_marker(
     omitted_bytes: u64,
     first_omitted: Option<&str>,
 ) -> String {
-    let reason = if scope == "tool_result_image_budget" {
-        "oldest first"
-    } else {
-        "unsupported image capability"
+    let reason = match scope {
+        "tool_result_image_budget" => "oldest first",
+        "computer_screenshot_history" => {
+            "newest computer screenshot retained; full image retrievable from CAS"
+        }
+        _ => "unsupported image capability",
     };
     format!(
         "\n{}\n",

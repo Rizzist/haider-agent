@@ -1951,6 +1951,8 @@ dependencies = [
  "async-trait",
  "base64",
  "blake3",
+ "bytes",
+ "futures-util",
  "haider-accounts",
  "haider-platform",
  "haider-protocol",

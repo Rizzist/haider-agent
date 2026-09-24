@@ -77,8 +77,9 @@ pub use computer::{
     ComputerInspectionBounds, ComputerOperation, ComputerOutput, ComputerPermissionPoll,
     ComputerResult, ComputerScreenshotCrop, ComputerScreenshotRegion,
     PassthroughScreenshotRedaction, ScreenshotRedactionPolicy, ScreenshotRedactionRegion,
-    UnavailableComputerBackend, computer_manifest, configured_screenshot_redaction_policy,
-    crop_screenshot_png, open_system_permission_settings, platform_computer_backend,
+    UnavailableComputerBackend, bound_computer_screenshot_png, computer_manifest,
+    configured_screenshot_redaction_policy, crop_screenshot_png, open_system_permission_settings,
+    platform_computer_backend,
 };
 pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};
 pub use filesystem::{

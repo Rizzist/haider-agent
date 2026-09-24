@@ -1,17 +1,24 @@
 //! Anthropic Messages API adapter.
 
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::Stream;
 use haider_accounts::SecretHandle;
 use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{CapabilityDoc, FeatureResolve};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RETRY_AFTER,
+};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// Anthropic documents this as a limit on the complete JSON request, not the
 /// decoded PDF. Check the final payload because base64 expansion and prompt
@@ -90,12 +97,94 @@ const STREAM_CAPACITY: usize = 32;
 const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
     retry_policy: AnthropicRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
-    response_open_timeout: Duration::from_secs(30),
+    response_open_timeout: Duration::from_secs(60),
     chunk_idle_timeout: Duration::from_secs(90),
     semantic_progress_timeout: Duration::from_secs(5 * 60),
 };
 
 static ANTHROPIC_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+const REQUEST_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone)]
+struct RequestUploadBoundary {
+    complete: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    idle_deadline: Option<crate::ProviderIdleDeadline>,
+}
+
+impl RequestUploadBoundary {
+    fn new() -> Self {
+        let idle_deadline = crate::ProviderIdleDeadline::current();
+        if let Some(idle_deadline) = &idle_deadline {
+            idle_deadline.pause_for_upload();
+        }
+        Self {
+            complete: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+            idle_deadline,
+        }
+    }
+
+    fn complete(&self) {
+        if self.complete.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(idle_deadline) = &self.idle_deadline {
+            idle_deadline.resume_after_upload();
+        }
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        while !self.complete.load(Ordering::Acquire) {
+            let notified = self.notify.notified();
+            if self.complete.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct RequestUploadBody {
+    bytes: Bytes,
+    offset: usize,
+    boundary: RequestUploadBoundary,
+}
+
+impl RequestUploadBody {
+    fn new(bytes: Vec<u8>, boundary: RequestUploadBoundary) -> Self {
+        Self {
+            bytes: Bytes::from(bytes),
+            offset: 0,
+            boundary,
+        }
+    }
+}
+
+impl Stream for RequestUploadBody {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.offset == self.bytes.len() {
+            self.boundary.complete();
+            return Poll::Ready(None);
+        }
+        let end = self
+            .offset
+            .saturating_add(REQUEST_UPLOAD_CHUNK_BYTES)
+            .min(self.bytes.len());
+        let chunk = self.bytes.slice(self.offset..end);
+        self.offset = end;
+        Poll::Ready(Some(Ok(chunk)))
+    }
+}
+
+impl Drop for RequestUploadBody {
+    fn drop(&mut self) {
+        self.boundary.complete();
+    }
+}
 
 /// Anthropic's model-keyed native computer tool dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -904,6 +993,7 @@ impl AnthropicProvider {
         .await
     }
 
+    #[cfg(test)]
     async fn request_body_prepared(
         &self,
         prepared: crate::PreparedWire,
@@ -911,6 +1001,32 @@ impl AnthropicProvider {
         let request = self.request_builder(&prepared.payload).await?;
         let body = crate::serialize_prepared_json_body(prepared)?;
         request.body(body).build().map_err(transport_error)
+    }
+
+    async fn request_body_prepared_for_send(
+        &self,
+        prepared: crate::PreparedWire,
+    ) -> Result<(reqwest::Request, RequestUploadBoundary), ProviderError> {
+        let boundary = RequestUploadBoundary::new();
+        let result = async {
+            let request = self.request_builder(&prepared.payload).await?;
+            let body = crate::serialize_prepared_json_body(prepared)?;
+            let body_len = body.len();
+            let upload = RequestUploadBody::new(body, boundary.clone());
+            request
+                .header(CONTENT_LENGTH, body_len)
+                .body(reqwest::Body::wrap_stream(upload))
+                .build()
+                .map_err(transport_error)
+        }
+        .await;
+        match result {
+            Ok(request) => Ok((request, boundary)),
+            Err(error) => {
+                boundary.complete();
+                Err(error)
+            }
+        }
     }
 
     async fn request_builder(
@@ -1013,17 +1129,27 @@ impl AnthropicProvider {
                 reply_bindings: crate::PreparedReplyBindings::default(),
             },
         };
-        let request = self.request_body_prepared(prepared).await?;
+        let (request, upload) = self.request_body_prepared_for_send(prepared).await?;
         let route_gating = self.route_gating();
-        let opening = self.client.execute(request);
-        crate::route_gated_timeout(
-            self.transport_config.response_open_timeout,
-            opening,
-            route_gating,
-        )
-        .await
-        .map_err(|_| response_open_timeout_error(self.transport_config.response_open_timeout))?
-        .map_err(|error| transport_error_for_route(error, route_gating))
+        let mut opening = Box::pin(self.client.execute(request));
+        let opened_during_upload = tokio::select! {
+            response = &mut opening => Some(response),
+            () = upload.wait() => None,
+        };
+        let response = match opened_during_upload {
+            Some(response) => response,
+            None => crate::route_gated_timeout(
+                self.transport_config.response_open_timeout,
+                opening,
+                route_gating,
+            )
+            .await
+            .map_err(|_| {
+                response_open_timeout_error(self.transport_config.response_open_timeout)
+            })?,
+        };
+        upload.complete();
+        response.map_err(|error| transport_error_for_route(error, route_gating))
     }
 
     fn route_gating(&self) -> crate::RouteGating {
@@ -1731,13 +1857,16 @@ fn stream_idle_error(timeout: Duration) -> ProviderError {
 }
 
 fn response_open_timeout_error(timeout: Duration) -> ProviderError {
+    let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     ProviderError::new(
         ProviderErrorKind::Transport,
         format!(
-            "Anthropic response did not open within {} seconds",
-            timeout.as_secs()
+            "Anthropic response did not open within the configured response-open budget after request upload completed; opened_within_ms={budget_ms} budget_ms={budget_ms}"
         ),
     )
+    .with_presentation(crate::provider_timeout_presentation())
+    .with_timeout_budget(budget_ms, budget_ms)
+    .with_timeout_reason(crate::ProviderTimeoutReason::ResponseOpen)
 }
 
 fn anthropic_connect_timeout_error(timeout: Duration) -> ProviderError {

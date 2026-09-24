@@ -20,8 +20,9 @@ use crate::anthropic::{
     ANTHROPIC_COMPUTER_BETA_20250124, ANTHROPIC_COMPUTER_BETA_20251124, ANTHROPIC_FAST_BETA_VALUE,
     ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE,
     ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicComputerToolVersion, AnthropicProvider,
-    SseChunkSource, anthropic_computer_tool_version, read_error_body_bounded,
-    replay_anthropic_native_computer_sse, replay_anthropic_sse, stream_sse_source,
+    AnthropicRetryPolicy, AnthropicTransportConfig, SseChunkSource,
+    anthropic_computer_tool_version, read_error_body_bounded, replay_anthropic_native_computer_sse,
+    replay_anthropic_sse, stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
 use crate::{
@@ -1167,8 +1168,8 @@ fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_act
     let screenshot = ImageBlockRef {
         artifact: ArtifactRef::new("blake3:anthropic-native-screen"),
         media_type: "image/png".into(),
-        width: 1_600,
-        height: 900,
+        width: 1_429,
+        height: 804,
         byte_len: 12,
     };
     let request = TurnRequest {
@@ -1180,7 +1181,7 @@ fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_act
             }]),
             Message::tool_result_with_images(
                 "toolu_screen",
-                "screenshot captured (1600x900)",
+                "screenshot captured (1429x804)",
                 false,
                 vec![screenshot.clone()],
             ),
@@ -1209,8 +1210,8 @@ fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_act
         serde_json::json!({
             "type": "computer_20251124",
             "name": "computer",
-            "display_width_px": 1600,
-            "display_height_px": 900,
+            "display_width_px": 1429,
+            "display_height_px": 804,
             "display_number": 1,
         })
     );
@@ -2174,6 +2175,98 @@ async fn completed_anthropic_5xx_with_reset_body_keeps_http_status_not_network_c
         error.presentation.provider_request_id.as_deref(),
         Some("req-503")
     );
+}
+
+/// A provider that withholds request-body reads for longer than both local
+/// response clocks reproduces the screenshot failure without external auth.
+/// Upload is transport work, not provider silence: both clocks begin only
+/// after the streamed body reaches EOF, and the next SSE response succeeds.
+#[tokio::test]
+async fn slow_request_upload_is_excluded_from_response_open_and_logical_idle() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind slow provider");
+    let address = listener.local_addr().expect("slow provider address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept slow request");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1_024];
+        let (header_end, content_length) = loop {
+            let read = socket.read(&mut chunk).await.expect("read request header");
+            assert_ne!(read, 0, "request closed before headers");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header_end = header_start + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("content length");
+            break (header_end, content_length);
+        };
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        while request.len().saturating_sub(header_end) < content_length {
+            let read = socket.read(&mut chunk).await.expect("read slow body");
+            assert_ne!(read, 0, "request closed during body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+
+        let sse = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"upload complete\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            sse.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response head");
+        socket.write_all(sse).await.expect("write SSE");
+        content_length
+    });
+
+    let provider = AnthropicProvider::new_custom_no_auth(
+        secret_credential("anthropic-slow-upload", b"unused-fixture-secret"),
+        "claude-local",
+        &format!("http://{address}"),
+    )
+    .expect("slow provider")
+    .with_transport_config(AnthropicTransportConfig {
+        retry_policy: AnthropicRetryPolicy::Never,
+        connect_timeout: Duration::from_secs(1),
+        response_open_timeout: Duration::from_millis(100),
+        chunk_idle_timeout: Duration::from_millis(200),
+        semantic_progress_timeout: Duration::from_secs(1),
+    })
+    .expect("short fixture clocks");
+    let mut request = one_line_turn("claude-local");
+    request.messages = vec![Message::user_text("x".repeat(8 * 1024 * 1024))];
+    let prepared = provider.prepare_turn_owned(&mut request);
+    let idle = crate::ProviderIdleDeadline::default();
+    idle.begin_attempt(provider.idle_timeout());
+    let opening = idle.scope(provider.stream_prepared_turn(request, prepared));
+    let mut stream = tokio::select! {
+        error = idle.wait() => panic!("upload consumed logical idle budget: {error}"),
+        opened = opening => opened.expect("response opens after slow upload"),
+    };
+    let mut saw_finish = false;
+    while let Some(item) = stream.recv().await {
+        if matches!(item.expect("valid SSE"), StreamEvent::Finish { .. }) {
+            saw_finish = true;
+        }
+    }
+    assert!(saw_finish);
+    assert!(server.await.expect("slow server task") > 8 * 1024 * 1024);
 }
 
 #[test]

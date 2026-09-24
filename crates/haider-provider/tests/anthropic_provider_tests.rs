@@ -109,6 +109,7 @@ fn constructor_transport_config_disables_retries_and_bounds_connects_and_chunk_i
 
     assert_eq!(config.retry_policy, AnthropicRetryPolicy::Never);
     assert_eq!(config.connect_timeout, Duration::from_secs(10));
+    assert_eq!(config.response_open_timeout, Duration::from_secs(60));
     assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
 }
 
