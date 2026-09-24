@@ -3134,6 +3134,7 @@ enum ParkedChildMode {
     Complete,
     StallAfterApproval,
     ParentWaitTimeout,
+    ParentWaitTimeoutHang,
 }
 
 #[cfg(unix)]
@@ -3222,23 +3223,30 @@ async fn start_parked_child_with_wait_budgets(
             },
             FakeStep::Hang,
         ]),
-        ParkedChildMode::ParentWaitTimeout => {
+        ParkedChildMode::ParentWaitTimeout | ParkedChildMode::ParentWaitTimeoutHang => {
             // The child is still parked. The next provider request belongs to
             // the parent and must consume the bounded spawn observation.
-            script.extend([
-                FakeStep::ExpectToolResult {
-                    call_id: format!("{label}-spawn"),
-                },
-                FakeStep::EmitText {
-                    text: "parent received a live child handle".into(),
-                },
-                FakeStep::Finish {
-                    reason: FinishReason::EndTurn,
-                },
-            ]);
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("{label}-spawn"),
+            });
+            if matches!(mode, ParkedChildMode::ParentWaitTimeoutHang) {
+                script.push(FakeStep::Hang);
+            } else {
+                script.extend([
+                    FakeStep::EmitText {
+                        text: "parent received a live child handle".into(),
+                    },
+                    FakeStep::Finish {
+                        reason: FinishReason::EndTurn,
+                    },
+                ]);
+            }
         }
     }
-    if !matches!(mode, ParkedChildMode::ParentWaitTimeout) {
+    if !matches!(
+        mode,
+        ParkedChildMode::ParentWaitTimeout | ParkedChildMode::ParentWaitTimeoutHang
+    ) {
         script.extend([
             FakeStep::ExpectToolResult {
                 call_id: format!("{label}-spawn"),
@@ -3514,6 +3522,38 @@ impl UdsControlClient {
                     attachment_id: observed,
                     ..
                 } if observed == attachment_id => return replayed,
+                _ => {}
+            }
+        }
+    }
+
+    async fn cancel_turn(
+        &mut self,
+        session_id: SessionId,
+        run_id: RunId,
+        worker_generation: u64,
+    ) -> haider_rpc::CancelStatus {
+        let request_id = RequestId::new("detached-parent-cancel");
+        self.send(WireFrame::Request {
+            request_id: request_id.clone(),
+            body: RequestBody::TurnCancel {
+                command_id: CommandId::new("detached-parent-cancel-command"),
+                session_id,
+                worker_generation,
+                run_id,
+            },
+        })
+        .await;
+        loop {
+            match self.next().await {
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::TurnCancel { status, .. },
+                } if observed == request_id => return status,
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::Error { code, message, .. },
+                } if observed == request_id => panic!("parent cancel failed: {code}: {message}"),
                 _ => {}
             }
         }
@@ -4263,7 +4303,90 @@ async fn unanswered_delegated_question_returns_child_still_running() {
             .iter()
             .any(|payload| matches!(payload, EventPayload::RunFailed { .. }))
     );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let child_payloads = typed_payloads(
+        &harness
+            .store
+            .read(&harness.child.child_session_id, 0, 1024)
+            .await
+            .expect("detached child journal"),
+    );
+    assert!(
+        !child_payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
+    );
 
+    // Completing the parent did not cancel its detached child. An explicit
+    // user cancel of that completed run must still reach the descendant.
+    let mut control = UdsControlClient::connect(harness.hub.clone()).await;
+    control.attach_control(harness.parent_session.clone()).await;
+    let status = control
+        .cancel_turn(
+            harness.parent_session.clone(),
+            harness.child.parent_run_id.clone(),
+            harness.hub.worker_generation(),
+        )
+        .await;
+    assert_eq!(status, haider_rpc::CancelStatus::AlreadyTerminal);
+    wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
+        *state == RunState::Cancelled
+    })
+    .await;
+    control.close().await;
+
+    harness.manager.shutdown().await.expect("manager shutdown");
+    harness.hub.shutdown().await.expect("hub shutdown");
+    harness.store.close().await.expect("store close");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn cancelling_parent_after_wait_ms_detach_cancels_child() {
+    let harness = start_parked_child_with_wait_budgets(
+        "detached-cancel",
+        ParkedChildMode::ParentWaitTimeoutHang,
+        Duration::from_secs(1),
+        Duration::from_millis(2_250),
+        Duration::from_millis(250),
+        Some(2_250),
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let payloads = typed_payloads(
+                &harness
+                    .store
+                    .read(&harness.parent_session, 0, 1024)
+                    .await
+                    .expect("parent journal"),
+            );
+            if payloads.iter().any(|payload| matches!(payload,
+                EventPayload::ToolResult { result, .. }
+                    if matches!(&result.data, Some(haider_protocol::tool::ToolResultData::ChildStillRunning { .. }))
+            )) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached handle returned to parent");
+    let mut control = UdsControlClient::connect(harness.hub.clone()).await;
+    control.attach_control(harness.parent_session.clone()).await;
+    let status = control
+        .cancel_turn(
+            harness.parent_session.clone(),
+            harness.child.parent_run_id.clone(),
+            harness.hub.worker_generation(),
+        )
+        .await;
+    assert_eq!(status, haider_rpc::CancelStatus::Accepted);
+    wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
+        *state == RunState::Cancelled
+    })
+    .await;
+    control.close().await;
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
     harness.store.close().await.expect("store close");
@@ -4439,6 +4562,111 @@ async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() 
         )
     }));
 
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn default_stall_nudge_is_once_and_never_cancels_child() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "nudge-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"stall","prompt":"stay active"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Hang,
+    ]));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory { provider }),
+            tool_factory: delegation_tool_factory(),
+            delegation: Some(DelegationHandle::with_nudge_deadline(
+                hub.clone(),
+                Duration::from_millis(35),
+            )),
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let parent = SessionId::new("nudge-only-parent");
+    let run = RunId::new("nudge-only-run");
+    manager
+        .handle()
+        .submit(accept_parent(&hub, &parent, &run, "nudge-only").await)
+        .await
+        .expect("submit parent");
+    let child = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(child) = hub
+                .delegations_for_parent_run(parent.clone(), run.clone())
+                .await
+                .expect("delegations")
+                .pop()
+            {
+                let payloads = typed_payloads(
+                    &store
+                        .read(&child.child_session_id, 0, 1024)
+                        .await
+                        .expect("child journal"),
+                );
+                if payloads.iter().any(|payload| matches!(payload,
+                    EventPayload::UserMessage { text, .. } if text == "report your status or conclude"
+                )) {
+                    break child;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("production nudge");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let payloads = typed_payloads(
+        &store
+            .read(&child.child_session_id, 0, 1024)
+            .await
+            .expect("child journal"),
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(payload,
+                EventPayload::UserMessage { text, .. } if text == "report your status or conclude"
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
+    );
+    let request_json =
+        serde_json::json!({"session_id":parent,"run_id":run,"reason":"test-cleanup"}).to_string();
+    hub.cancel_internal_turn(TurnCancelCommand {
+        command_id: "nudge-only-cleanup".into(),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        session_id: parent,
+        worker_generation: hub.worker_generation(),
+        run_id: run,
+        cancelling_event_id: EventId::new("nudge-only-cancelling"),
+        device_id: DeviceId::new("nudge-only-device"),
+    })
+    .await
+    .expect("cancel parent");
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");

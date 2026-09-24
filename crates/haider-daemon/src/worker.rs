@@ -23816,20 +23816,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
         Ok(())
     }
 
-    async fn cancel_outstanding_deferred(&self) -> Result<(), HaiderError> {
-        let tickets = self
-            .deferred
-            .lock()
+    async fn cancel_outstanding_deferred(&self, run_id: &RunId) -> Result<(), HaiderError> {
+        // The live map only tracks blocking collectors. The journal owns the
+        // full turn's children, including background and wait_ms detachments.
+        self.delegation
+            .cancel_parent_run_descendants(&self.session_id, run_id, self.run_deadline)
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for ticket in tickets {
-            self.delegation
-                .cancel_ticket(&ticket, self.run_deadline)
-                .await?;
-        }
-        Ok(())
     }
 
     async fn cancel(&self) -> Result<(), HaiderError> {

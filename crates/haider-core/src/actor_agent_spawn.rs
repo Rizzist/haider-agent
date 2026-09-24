@@ -76,7 +76,7 @@ impl HarnessActor {
                         let _ = dispatcher.collect_deferred(ticket, &cleanup).await;
                     }
                 }
-                let _ = dispatcher.cancel_outstanding_deferred().await;
+                let _ = dispatcher.cancel_outstanding_deferred(run_id).await;
             }
         }
         match result {

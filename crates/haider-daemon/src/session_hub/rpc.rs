@@ -15822,6 +15822,13 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
+        // A child detached by wait_ms is no longer in the parent's active
+        // collector. Sweep durable descendants on every explicit user cancel,
+        // even if the parent worker has not reached its cancellation cleanup.
+        crate::delegation::DelegationHandle::new(self.hub.clone())
+            .cancel_parent_run_descendants(&cancelled.session_id, &cancelled.run_id, None)
+            .await
+            .map_err(SessionHubError::Store)?;
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::TurnCancel {
@@ -16042,6 +16049,13 @@ impl HubConnection {
             );
         };
         if found.state.is_terminal() {
+            // A completed parent can still own detached children. An explicit
+            // stop closes that subtree even though the parent run itself is
+            // already terminal.
+            crate::delegation::DelegationHandle::new(self.hub.clone())
+                .cancel_parent_run_descendants(&found.session_id, &run_id, None)
+                .await
+                .map_err(SessionHubError::Store)?;
             return self.send(WireFrame::Response {
                 request_id,
                 body: ResponseBody::HeadlessRunStop {
@@ -16092,6 +16106,10 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
+        crate::delegation::DelegationHandle::new(self.hub.clone())
+            .cancel_parent_run_descendants(&cancelled.session_id, &cancelled.run_id, None)
+            .await
+            .map_err(SessionHubError::Store)?;
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::HeadlessRunStop {

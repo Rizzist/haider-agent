@@ -993,6 +993,7 @@ fn agent_wait_failed_child_returns_durable_red_report_and_exit_one() {
     assert_eq!(waited["error"]["code"], "child_failed");
     assert_eq!(waited["result"]["state"], "errored");
     assert_eq!(waited["result"]["report"]["verified"], "red");
+    assert_eq!(waited["result"]["report_source"], "child_result");
     assert!(
         waited["result"]["child_result_seq"]
             .as_u64()

@@ -1523,6 +1523,9 @@ pub struct DeferredTicket {
 pub struct DeferredToolResult {
     pub report: ChildReport,
     pub chip: ChipState,
+    /// Structured observation status supplied by the dispatcher, independent
+    /// of the human-readable report summary.
+    pub data: Option<haider_protocol::tool::ToolResultData>,
     pub truncated: bool,
     pub truncation: Option<haider_protocol::tool::ToolTruncation>,
 }
@@ -1530,9 +1533,21 @@ pub struct DeferredToolResult {
 impl DeferredToolResult {
     /// A bounded observation ended before the child did. Terminal reports
     /// carry `Done` or `Error`; only a still-live child is reported `Waiting`,
-    /// and its summary is the typed `child_still_running` handle.
-    pub fn child_still_running(&self) -> bool {
-        self.chip == ChipState::Waiting
+    /// and its data contains the typed `child_still_running` handle.
+    pub fn child_still_running(&self) -> Result<bool, HaiderError> {
+        let waiting = self.chip == ChipState::Waiting;
+        let typed = matches!(
+            &self.data,
+            Some(haider_protocol::tool::ToolResultData::ChildStillRunning { .. })
+        );
+        if waiting != typed {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "deferred child observation and typed result disagree",
+                false,
+            ));
+        }
+        Ok(waiting)
     }
 }
 
@@ -2120,7 +2135,7 @@ pub trait ToolDispatcher: Send + Sync {
     /// Cancels every child still owned by this turn. The actor invokes this
     /// only on a real turn cancellation, never when a durable child-wait
     /// checkpoint is quietly parked for restart.
-    async fn cancel_outstanding_deferred(&self) -> Result<(), HaiderError> {
+    async fn cancel_outstanding_deferred(&self, _run_id: &RunId) -> Result<(), HaiderError> {
         Ok(())
     }
 
@@ -10482,13 +10497,16 @@ impl HarnessActor {
                                 workspace_revision: None,
                             },
                             chip: ChipState::Error,
+                            data: None,
                             truncated: false,
                             truncation: None,
                         },
                     };
                 }
             };
-            let child_still_running = completion.child_still_running();
+            let child_still_running = completion
+                .child_still_running()
+                .map_err(DriveError::Store)?;
             let mut result = BoundedResult {
                 // The opaque id is operational routing, not display identity:
                 // a later `message_subagent` call must be able to name the
@@ -10504,9 +10522,7 @@ impl HarnessActor {
                 truncated: completion.truncated,
                 truncation: None,
                 effects: Vec::new(),
-                data: child_still_running
-                    .then(|| serde_json::from_str(&completion.report.summary).ok())
-                    .flatten(),
+                data: completion.data.clone(),
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -11053,7 +11069,7 @@ impl HarnessActor {
     ) -> TurnOutcome {
         let mut cleanup_error = None;
         if let Some(dispatcher) = self.dispatcher.as_ref() {
-            if let Err(error) = dispatcher.cancel_outstanding_deferred().await {
+            if let Err(error) = dispatcher.cancel_outstanding_deferred(run_id).await {
                 cleanup_error = Some(error);
             }
             // P1-1: a cancel/close failure cannot turn a committed user

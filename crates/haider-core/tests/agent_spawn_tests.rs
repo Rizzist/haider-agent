@@ -74,6 +74,7 @@ impl ToolDispatcher for ChildDispatcher {
             } else {
                 ChipState::Done
             },
+            data: None,
             truncated: false,
             truncation: None,
         })

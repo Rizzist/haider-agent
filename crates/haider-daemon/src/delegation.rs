@@ -50,6 +50,7 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::spawn_subagent::agent_wait_command;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use haider_protocol::task::TaskEventPayload;
+use haider_protocol::tool::ToolResultData;
 use haider_tools::{MessageSubagent, SpawnSubagent};
 #[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
@@ -63,12 +64,13 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CHILD_NUDGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
 const CHILD_SETTLEMENT_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
 // Registry #94 arithmetic: 120s pre-nudge stall attribution + 120s
 // post-nudge grace + 1s cancellation/reap tail = 241s. Ordinary production
 // collection has no default child deadline; this bound applies only to
-// cancellation settlement and explicitly stall-supervised test handles.
+// cancellation settlement and explicitly stall-cancelling test handles.
 const CHILD_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(241);
 pub(crate) const DELEGATED_MENU_ORIGIN: &str = "delegated-child";
 pub(crate) const DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND: &str =
@@ -90,6 +92,7 @@ pub(crate) struct DelegationHandle {
     stall_deadline: Duration,
     run_wait_timeout: Duration,
     stall_supervision: bool,
+    stall_cancel_on_grace: bool,
     settlement_tail_timeout: Duration,
     #[cfg(all(test, unix))]
     stall_deadline_clock: Option<Arc<StallDeadlineTestClock>>,
@@ -309,7 +312,8 @@ impl DelegationHandle {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
-            stall_supervision: false,
+            stall_supervision: true,
+            stall_cancel_on_grace: false,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
@@ -325,9 +329,17 @@ impl DelegationHandle {
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             stall_supervision: true,
+            stall_cancel_on_grace: true,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
             stall_deadline_clock: None,
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_nudge_deadline(hub: SessionHub, stall_deadline: Duration) -> Self {
+        let mut handle = Self::new(hub);
+        handle.stall_deadline = stall_deadline;
+        handle
     }
 
     #[cfg(all(test, unix))]
@@ -343,6 +355,7 @@ impl DelegationHandle {
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             stall_supervision: true,
+            stall_cancel_on_grace: true,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
             stall_deadline_clock: Some(stall_deadline_clock),
         }
@@ -360,6 +373,7 @@ impl DelegationHandle {
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             stall_supervision: false,
+            stall_cancel_on_grace: false,
             settlement_tail_timeout,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
@@ -380,6 +394,7 @@ impl DelegationHandle {
             stall_deadline,
             run_wait_timeout,
             stall_supervision: true,
+            stall_cancel_on_grace: true,
             settlement_tail_timeout,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
@@ -1159,7 +1174,57 @@ impl DelegationHandle {
             .await?;
         self.hub
             .submit_internal_turn(established.accepted.clone())
-            .await
+            .await?;
+        // A collector can end at wait_ms or never exist for a background
+        // child. Keep the non-terminating nudge alive for that child run.
+        if self.stall_supervision && !self.stall_cancel_on_grace {
+            let coordinator = self.clone();
+            let agent = established.ticket.manifest.agent.clone();
+            tokio::spawn(async move {
+                coordinator.watch_stall_nudge(agent).await;
+            });
+        }
+        Ok(())
+    }
+
+    async fn watch_stall_nudge(&self, agent: AgentId) {
+        loop {
+            let progress = async {
+                let Some(record) = self.hub.delegation(agent.clone()).await? else {
+                    return Ok::<_, HaiderError>(None);
+                };
+                let progress = self.delegation_progress(&record).await?;
+                Ok(Some((record, progress)))
+            }
+            .await;
+            match progress {
+                Ok(Some((record, progress))) => {
+                    if progress.state.as_ref().is_some_and(RunState::is_terminal)
+                        || progress.nudge.is_some()
+                    {
+                        return;
+                    }
+                    let active = progress.state.as_ref().is_some_and(|state| {
+                        state != &RunState::Queued && state != &RunState::Cancelling
+                    });
+                    if active
+                        && !progress.human_required
+                        && self.stall_deadline_elapsed(progress.latest_at_ms)
+                    {
+                        if let Err(error) = self.nudge(&record).await {
+                            tracing::warn!(%agent, %error, "child stall nudge failed");
+                        }
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(%agent, %error, "child stall nudge watcher stopped");
+                    return;
+                }
+            }
+            tokio::time::sleep(CHILD_NUDGE_POLL_INTERVAL).await;
+        }
     }
 
     pub(crate) async fn record_launch_failure(
@@ -1223,7 +1288,7 @@ impl DelegationHandle {
             (Some(run), Some(wait)) => Some(run.min(wait)),
             (run, wait) => run.or(wait),
         };
-        let budget = if observation_deadline.is_some() || self.stall_supervision {
+        let budget = if observation_deadline.is_some() || self.stall_cancel_on_grace {
             Some(
                 self.child_wait_budget(&initial, observation_deadline)
                     .await?,
@@ -1272,6 +1337,7 @@ impl DelegationHandle {
                             completion: DeferredToolResult {
                                 report,
                                 chip,
+                                data: None,
                                 truncated: truncation.is_some(),
                                 truncation,
                             },
@@ -1297,13 +1363,14 @@ impl DelegationHandle {
                             completion: DeferredToolResult {
                                 report,
                                 chip: completion.chip,
+                                data: completion.data,
                                 truncated: completion.truncated,
                                 truncation: completion.truncation,
                             },
                         });
                     }
                 }
-                if self.stall_supervision {
+                if self.stall_cancel_on_grace {
                     let progress = self.delegation_progress(&record).await?;
                     if !progress.human_required {
                         match progress.nudge {
@@ -1311,9 +1378,10 @@ impl DelegationHandle {
                                 self.nudge(&record).await?;
                             }
                             Some((_, nudge_at_ms))
-                                if self.stall_deadline_elapsed(
-                                    progress.latest_at_ms.max(nudge_at_ms),
-                                ) =>
+                                if self.stall_cancel_on_grace
+                                    && self.stall_deadline_elapsed(
+                                        progress.latest_at_ms.max(nudge_at_ms),
+                                    ) =>
                             {
                                 self.cancel_subtree(&record, CancelCause::Stall).await?;
                             }
@@ -1400,11 +1468,7 @@ impl DelegationHandle {
                         )
                     })?;
                 let progress = self.session_progress(&record).await?;
-                Ok(child_still_running_result(
-                    &record,
-                    &progress,
-                    timeout.limit(),
-                ))
+                child_still_running_result(&record, &progress, timeout.limit())
             }
         }
     }
@@ -1731,6 +1795,41 @@ impl DelegationHandle {
                 }
             }
         });
+        Ok(())
+    }
+
+    /// Cancel every child established in this run, including handles no
+    /// longer present in a blocking collector's in-memory map.
+    pub(crate) async fn cancel_parent_run_descendants(
+        &self,
+        parent_session_id: &SessionId,
+        parent_run_id: &RunId,
+        run_deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), HaiderError> {
+        let mut pending = self
+            .hub
+            .delegations_for_parent_run(parent_session_id.clone(), parent_run_id.clone())
+            .await?;
+        while let Some(record) = pending.pop() {
+            if record.report.is_none() {
+                self.cancel_ticket(
+                    &DeferredTicket {
+                        id: record.agent_id.as_str().to_owned(),
+                        manifest: record.manifest,
+                    },
+                    run_deadline,
+                )
+                .await?;
+            } else {
+                // A terminal direct child may have left its own descendants
+                // detached. Continue through that child to reach them.
+                pending.extend(
+                    self.hub
+                        .delegations_for_parent_run(record.child_session_id, record.child_run_id)
+                        .await?,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2436,7 +2535,7 @@ impl DelegationHandle {
                     failure
                         .unwrap_or_else(|| "subagent failed without public failure detail".into()),
                 ),
-                ReportVerification::Red,
+                ReportVerification::from_terminal_run_state(&state),
                 ChipState::Error,
             ),
             RunState::Cancelled => (
@@ -2445,7 +2544,7 @@ impl DelegationHandle {
                 } else {
                     "subagent was cancelled before completing its report".into()
                 }),
-                ReportVerification::Red,
+                ReportVerification::from_terminal_run_state(&state),
                 ChipState::Error,
             ),
             _ => unreachable!("terminal state match is exhaustive"),
@@ -2478,6 +2577,7 @@ impl DelegationHandle {
                 workspace_revision: workflow_graph.and(latest_revision),
             },
             chip,
+            data: None,
             truncated,
             truncation,
         }))
@@ -2584,6 +2684,7 @@ impl DelegationHandle {
     ) -> Result<DelegationProgress, HaiderError> {
         let direct = self.session_progress(record).await?;
         let mut progress = DelegationProgress {
+            state: direct.state.clone(),
             latest_at_ms: direct.latest_at_ms,
             nudge: direct.nudge,
             human_required: matches!(
@@ -3268,6 +3369,7 @@ struct SessionProgress {
 }
 
 struct DelegationProgress {
+    state: Option<RunState>,
     latest_at_ms: u64,
     nudge: Option<(u64, u64)>,
     human_required: bool,
@@ -3380,8 +3482,16 @@ fn child_still_running_result(
     record: &DelegationRecord,
     progress: &SessionProgress,
     wait_limit: Duration,
-) -> DeferredToolResult {
-    DeferredToolResult {
+) -> Result<DeferredToolResult, HaiderError> {
+    let collect = agent_wait_command(&record.parent_session_id, &record.agent_id);
+    let wait_limit_ms = duration_millis(wait_limit);
+    let progress_data = progress
+        .state
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(internal_serialization)?;
+    Ok(DeferredToolResult {
         report: ChildReport {
             agent: record.agent_id.clone(),
             summary: serde_json::json!({
@@ -3393,17 +3503,27 @@ fn child_still_running_result(
                 "child_run_id": record.child_run_id,
                 "progress": progress.state,
                 "latest_progress_at_ms": progress.latest_at_ms,
-                "wait_limit_ms": duration_millis(wait_limit),
-                "collect": agent_wait_command(&record.parent_session_id, &record.agent_id),
+                "wait_limit_ms": wait_limit_ms,
+                "collect": collect.clone(),
             })
             .to_string(),
             verified: ReportVerification::Unverified,
             workspace_revision: None,
         },
         chip: ChipState::Waiting,
+        data: Some(ToolResultData::ChildStillRunning {
+            agent: record.agent_id.clone(),
+            parent_session_id: record.parent_session_id.clone(),
+            child_session_id: record.child_session_id.clone(),
+            child_run_id: record.child_run_id.clone(),
+            progress: progress_data,
+            latest_progress_at_ms: progress.latest_at_ms,
+            wait_limit_ms,
+            collect,
+        }),
         truncated: false,
         truncation: None,
-    }
+    })
 }
 
 fn instant_from_unix_deadline(deadline_at_ms: u64) -> tokio::time::Instant {

@@ -563,6 +563,7 @@ impl ToolDispatcher for RecoveredChildDispatcher {
                 workspace_revision: None,
             },
             chip: ChipState::Done,
+            data: None,
             truncated: false,
             truncation: None,
         })

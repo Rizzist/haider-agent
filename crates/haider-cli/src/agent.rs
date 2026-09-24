@@ -726,6 +726,7 @@ async fn wait(
     let mut child_session_id = None;
     let mut child_run_id = None;
     let mut original_run_id = None;
+    let mut background_handle = false;
     let mut target_frozen = false;
     let mut child_text = String::new();
     let mut terminal: Option<(RunState, u64)> = None;
@@ -746,6 +747,12 @@ async fn wait(
             };
             match payload {
                 EventPayload::AgentSpawned(manifest) if manifest.agent == agent_id => {
+                    background_handle = manifest
+                        .coordinates
+                        .as_ref()
+                        .and_then(|coordinates| coordinates.get("background"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
                     child_session_id = Some(child_session(&manifest)?);
                 }
                 EventPayload::Item(ItemEvent::Completed {
@@ -815,27 +822,14 @@ async fn wait(
         }
         target_frozen = true;
         let original = child_run_id == original_run_id;
-        let journal_report = || {
-            terminal.as_ref().map(|_| {
-                (
-                    ChildReport {
-                        agent: agent_id.clone(),
-                        summary: child_text.clone(),
-                        verified: ReportVerification::Unverified,
-                        workspace_revision: None,
-                    },
-                    None,
-                )
-            })
-        };
-        let selected_report = if original {
-            report
-                .as_ref()
-                .map(|(report, seq)| (report.clone(), Some(*seq)))
-                .or_else(journal_report)
-        } else {
-            journal_report()
-        };
+        let selected_report = select_wait_report(
+            &agent_id,
+            terminal.as_ref().map(|(state, _)| state),
+            &child_text,
+            report.as_ref(),
+            original,
+            background_handle,
+        );
         if let (Some((state, terminal_seq)), Some((report, child_result_seq))) =
             (&terminal, selected_report)
         {
@@ -869,6 +863,36 @@ async fn wait(
         pause(deadline,json!({"session_id":session_id,"agent_id":agent_id,"child_session_id":child_session_id,"child_run_id":child_run_id})).await?;
     }
 }
+
+/// A blocking spawn's original result belongs to the parent's durable
+/// ChildResult. Background children and later child turns have no such item.
+fn select_wait_report(
+    agent: &AgentId,
+    terminal: Option<&RunState>,
+    child_text: &str,
+    parent_report: Option<&(ChildReport, u64)>,
+    original: bool,
+    background_handle: bool,
+) -> Option<(ChildReport, Option<u64>)> {
+    if original && !background_handle {
+        return parent_report.map(|(report, seq)| (report.clone(), Some(*seq)));
+    }
+    terminal.map(|state| {
+        (
+            ChildReport {
+                agent: agent.clone(),
+                summary: child_text.to_owned(),
+                verified: ReportVerification::from_terminal_run_state(state),
+                workspace_revision: None,
+            },
+            None,
+        )
+    })
+}
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod tests;
 
 fn write_json(document: &Value) -> io::Result<()> {
     let mut output = io::stdout().lock();

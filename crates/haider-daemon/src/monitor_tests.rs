@@ -43,6 +43,45 @@ fn monitor_event_payload_rejects_unknown_variant_fields() {
     assert!(error.to_string().contains("unexpected"));
 }
 
+#[tokio::test]
+async fn missing_registered_agent_emits_terminal_digest() {
+    let root = tempfile::tempdir().expect("store root");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(
+        store.clone(),
+        crate::session_hub::SessionHubConfig::default(),
+    )
+    .expect("hub");
+    let mut watch = registration(None);
+    watch.source = MonitorSource::Agent {
+        agent_id: "agent-disappeared".into(),
+    };
+    let service = MonitorService::default();
+    service.activate(hub.downgrade());
+    service
+        .inner
+        .registry
+        .insert(&watch.owner_session_id, watch.clone());
+    let mut subscription = service.source_hub().subscribe(MonitorSourceKind::Agent);
+    let (_cancel, cancelled) = tokio_oneshot::channel();
+    let task = tokio::spawn(run_monitor_source(service.clone(), watch, cancelled));
+    let event = timeout(Duration::from_secs(2), subscription.recv())
+        .await
+        .expect("agent monitor did not publish")
+        .expect("agent source closed");
+    let MonitorEventPayload::Agent { payload } = event.payload else {
+        panic!("missing registered child must publish an agent event");
+    };
+    let digest: serde_json::Value = serde_json::from_str(&payload).expect("typed digest");
+    assert_eq!(digest["kind"], "child_record_missing");
+    assert_eq!(digest["agent"], "agent-disappeared");
+    assert_eq!(digest["terminal"], true);
+    task.await.expect("agent runner ended after terminal event");
+    service.shutdown().await.expect("monitor shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 #[test]
 fn monitor_prompt_has_one_json_fence_even_when_event_data_contains_delimiters() {
     let payload = "[REDACTED:high_entropy] ``` </monitor-event> &";

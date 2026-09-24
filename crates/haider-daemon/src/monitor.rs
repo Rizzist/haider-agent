@@ -5937,8 +5937,6 @@ impl MonitorService {
 enum HandlePoll {
     Pending,
     Completed(MonitorEventPayload),
-    /// The handle is unknown or no longer owned by the monitor's session.
-    Gone,
 }
 
 /// Polls a `task`/`agent` source until the handle's durable terminal digest
@@ -5964,7 +5962,6 @@ async fn watch_handle_completion(
                 let _ = service.publish_runner_event(registration, payload);
                 return;
             }
-            HandlePoll::Gone => return,
             HandlePoll::Pending => {}
         }
         tokio::select! {
@@ -5998,7 +5995,16 @@ async fn agent_completion(
     let agent = AgentId::new(agent_id);
     let record = match hub.delegation(agent.clone()).await {
         Ok(Some(record)) if record.parent_session_id == registration.owner_session_id => record,
-        Ok(_) => return HandlePoll::Gone,
+        Ok(_) => {
+            return HandlePoll::Completed(MonitorEventPayload::Agent {
+                payload: json!({
+                    "kind": "child_record_missing",
+                    "agent": agent,
+                    "terminal": true,
+                })
+                .to_string(),
+            });
+        }
         Err(error) => {
             tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child");
             return HandlePoll::Pending;
