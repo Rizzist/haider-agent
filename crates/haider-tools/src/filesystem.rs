@@ -1067,7 +1067,7 @@ pub(crate) fn build_permission_file_review(
                     })
                     .collect(),
             };
-            let (new, _) = apply_edit_changes(&operation, old.clone())?;
+            let (new, _, _) = apply_edit_changes(&operation, old.clone())?;
             Ok(crate::file_review::build_file_review(
                 effect.clone(),
                 path_argument(&path)?.to_owned(),
@@ -1104,7 +1104,34 @@ pub(crate) fn build_permission_file_review(
     }
 }
 
-fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(String, usize)> {
+/// Apply an edit call to `text` in memory, exactly as `fs_edit` applies it
+/// to a file: the edited text, the replacement count, and every
+/// replacement's authoritative span (973-tui-toolview). Public so the span
+/// laws can be tested against the real application path.
+pub fn apply_fs_edit_text(
+    operation: &FsEdit,
+    text: String,
+) -> ToolResult<(String, usize, Vec<haider_protocol::tool::EditSpanV1>)> {
+    apply_edit_changes(operation, text)
+}
+
+/// Apply an edit call, returning the edited text, the replacement count and
+/// the span of every replacement measured while applying it.
+fn apply_edit_changes(
+    operation: &FsEdit,
+    edited: String,
+) -> ToolResult<(String, usize, Vec<haider_protocol::tool::EditSpanV1>)> {
+    let mut spans = crate::edit_spans::SpanTracker::new(&edited);
+    let (edited, replacements) = apply_edit_changes_with(operation, edited, &mut spans)?;
+    let spans = spans.finish(&edited);
+    Ok((edited, replacements, spans))
+}
+
+fn apply_edit_changes_with(
+    operation: &FsEdit,
+    mut edited: String,
+    spans: &mut crate::edit_spans::SpanTracker,
+) -> ToolResult<(String, usize)> {
     if operation.edits.is_empty() {
         return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
     }
@@ -1114,7 +1141,7 @@ fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(Str
         ));
     }
     let mut replacements = 0usize;
-    for edit in &operation.edits {
+    for (index, edit) in operation.edits.iter().enumerate() {
         let matches = edited.match_indices(&edit.old).count();
         if (!edit.replace_all && matches != 1) || (edit.replace_all && matches == 0) {
             return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
@@ -1132,11 +1159,27 @@ fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(Str
                     .flatten(),
             }));
         }
-        edited = if edit.replace_all {
-            edited.replace(&edit.old, &edit.new)
+        // The same text `str::replace`/`replacen` produce — left-to-right,
+        // non-overlapping matches, the replacement never re-scanned — applied
+        // one occurrence at a time so each replacement's span is measured
+        // exactly where it lands.
+        let positions: Vec<usize> = if edit.replace_all {
+            edited.match_indices(&edit.old).map(|(at, _)| at).collect()
         } else {
-            edited.replacen(&edit.old, &edit.new, 1)
+            edited.find(&edit.old).into_iter().collect()
         };
+        let delta = edit.new.len() as isize - edit.old.len() as isize;
+        for (occurrence, at) in positions.into_iter().enumerate() {
+            let at = at.saturating_add_signed(delta * occurrence as isize);
+            spans.replace(
+                &mut edited,
+                at,
+                &edit.old,
+                &edit.new,
+                u32::try_from(index).unwrap_or(u32::MAX),
+                u32::try_from(occurrence).unwrap_or(u32::MAX),
+            );
+        }
         replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
     }
     Ok((edited, replacements))
@@ -4331,9 +4374,20 @@ impl AppliedMutation {
                     path: captured.path.clone(),
                     absolute_path: absolute.to_string_lossy().into_owned(),
                     bytes,
+                    edit_spans: Vec::new(),
                 }
             })
             .collect();
+        self
+    }
+
+    /// Attach the spans an edit measured while applying (973-tui-toolview)
+    /// to its one file effect. Called only by the edit paths, after
+    /// [`Self::with_file_effects`].
+    fn with_edit_spans(mut self, spans: Vec<haider_protocol::tool::EditSpanV1>) -> Self {
+        if let Some(effect) = self.result.effects.first_mut() {
+            effect.edit_spans = spans;
+        }
         self
     }
 }
@@ -5113,7 +5167,7 @@ fn apply_windows_edit(
     let edited = String::from_utf8(source.bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
     })?;
-    let (edited, replacements) = apply_edit_changes(operation, edited)?;
+    let (edited, replacements, edit_spans) = apply_edit_changes(operation, edited)?;
     let bytes = edited.as_bytes();
     let permissions = source_file
         .metadata()
@@ -5185,7 +5239,8 @@ fn apply_windows_edit(
             post_digest,
         },
     }
-    .with_file_effects(bytes.len() as u64, false))
+    .with_file_effects(bytes.len() as u64, false)
+    .with_edit_spans(edit_spans))
 }
 
 #[cfg(windows)]
@@ -6814,7 +6869,7 @@ fn apply_edit_at_with_commit_hooks(
     let edited = String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
     })?;
-    let (edited, replacements) = apply_edit_changes(operation, edited)?;
+    let (edited, replacements, edit_spans) = apply_edit_changes(operation, edited)?;
     let bytes = edited.as_bytes();
     let post_digest = mutation_digest(bytes);
     let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
@@ -6903,7 +6958,8 @@ fn apply_edit_at_with_commit_hooks(
             post_digest,
         },
     }
-    .with_file_effects(bytes.len() as u64, false))
+    .with_file_effects(bytes.len() as u64, false)
+    .with_edit_spans(edit_spans))
 }
 
 #[cfg(unix)]

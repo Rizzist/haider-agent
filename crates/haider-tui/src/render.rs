@@ -55,11 +55,6 @@ pub(crate) struct LayoutCtx<'a> {
     pub runs: &'a [crate::toolfold::FoldRun],
     /// Where tool-row paths shorten from (workspace, then `~`).
     pub paths: &'a crate::toolview::PathContext,
-    /// Resolved file lines of settled edits, keyed by item id — what
-    /// numbers an edit's diff rows.
-    pub anchors: &'a BTreeMap<String, Vec<Option<usize>>>,
-    /// `AppModel::edit_anchor_revision` — a layout-cache coordinate.
-    pub anchor_revision: u64,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -95,8 +90,6 @@ pub(crate) struct TranscriptLayoutCache {
     /// The path context tool headers were shortened under: a workspace
     /// learned after a row was measured re-shortens every row.
     paths_fingerprint: u64,
-    /// The edit-anchor revision diff rows were numbered under.
-    anchor_revision: u64,
     revision: u64,
     entry_mutation_revision: u64,
     source_ptr: usize,
@@ -179,8 +172,7 @@ impl TranscriptLayoutCache {
             || self.width != width
             || self.theme != Some(theme_key)
             || self.fold_revision != ctx.fold.revision()
-            || self.paths_fingerprint != ctx.paths.fingerprint()
-            || self.anchor_revision != ctx.anchor_revision;
+            || self.paths_fingerprint != ctx.paths.fingerprint();
         let source = projection.entries();
         let projection_changed = self.revision != projection.render_revision()
             || self.source_ptr != source.as_ptr() as usize
@@ -226,7 +218,6 @@ impl TranscriptLayoutCache {
         self.theme = Some(theme_key);
         self.fold_revision = ctx.fold.revision();
         self.paths_fingerprint = ctx.paths.fingerprint();
-        self.anchor_revision = ctx.anchor_revision;
         self.revision = projection.render_revision();
         self.entry_mutation_revision = projection.entry_mutation_revision();
         self.source_ptr = source.as_ptr() as usize;
@@ -6417,8 +6408,6 @@ fn render_session(
         now_ms: model.clock_ms,
         runs: transcript_runs.as_ref(),
         paths: &tool_paths,
-        anchors: &model.edit_anchors,
-        anchor_revision: model.edit_anchor_revision,
     };
     transcript_cache.reconcile(&model.projection, layout_ctx);
     // The origin is context chrome, not conversation content. On the short
@@ -11082,8 +11071,6 @@ fn render_subagent(
         now_ms: model.clock_ms,
         runs: transcript_runs.as_ref(),
         paths: &tool_paths,
-        anchors: &model.edit_anchors,
-        anchor_revision: model.edit_anchor_revision,
     };
     transcript_cache.reconcile(&chip.transcript, layout_ctx);
     let mut tail: Vec<Line<'static>> = Vec::new();
@@ -15704,10 +15691,7 @@ fn multi_line_command(command: &str) -> Option<String> {
     (command.trim().lines().count() > 1).then(|| command.to_owned())
 }
 
-pub(crate) fn tool_extras(
-    block: &ItemBlock,
-    anchors: &BTreeMap<String, Vec<Option<usize>>>,
-) -> ToolRowExtras {
+pub(crate) fn tool_extras(block: &ItemBlock) -> ToolRowExtras {
     match &block.item {
         TurnItem::ToolCall {
             name, args, status, ..
@@ -15717,13 +15701,8 @@ pub(crate) fn tool_extras(
                 kind: Some(kind),
                 settle: settle_of(*status),
                 exit_code: None,
-                diff: crate::toolview::tool_diff(
-                    name,
-                    args,
-                    anchors
-                        .get(block.item_id.as_str())
-                        .map_or(&[], Vec::as_slice),
-                ),
+                // Numbered only from the edit tool's own spans.
+                diff: crate::toolview::tool_diff(name, args, block.edit_spans()),
                 inline_args: if kind == crate::toolview::ToolKind::Shell {
                     crate::toolview::shell_command(args)
                         .as_deref()
@@ -15820,7 +15799,7 @@ fn tool_disclosure_lines<'a>(
         if focused { theme.sel_bg } else { theme.bg },
     );
     lines.push(hover_band(summary, focused, ctx.width, theme));
-    let extras = tool_extras(block, ctx.anchors);
+    let extras = tool_extras(block);
     let compact = block.compact_output();
     let output = &compact.text;
     let shows_subline = ctx.fold.verbosity().shows_subline();
@@ -15947,12 +15926,8 @@ fn tool_disclosure_lines<'a>(
 /// — the clamp the scroll gestures need, taken from the same function that
 /// renders them so the two can never disagree.
 #[must_use]
-pub fn expanded_display_rows(
-    block: &ItemBlock,
-    width: u16,
-    anchors: &BTreeMap<String, Vec<Option<usize>>>,
-) -> usize {
-    expanded_rows(block, &tool_extras(block, anchors), width as usize).len()
+pub fn expanded_display_rows(block: &ItemBlock, width: u16) -> usize {
+    expanded_rows(block, &tool_extras(block), width as usize).len()
 }
 
 /// The header facts for one tool-ish item (`ToolCall` or
@@ -16051,14 +16026,13 @@ fn tool_row_facts<'b>(block: &'b ItemBlock, ctx: LayoutCtx<'_>) -> crate::toolfo
 /// notes, and the unshortened reason.
 fn tool_detail_body(
     block: &ItemBlock,
-    ctx: LayoutCtx<'_>,
     cells: usize,
 ) -> (
     Option<Vec<crate::toolfold::Segment>>,
     Vec<crate::toolview::DisplayRow>,
 ) {
     use crate::toolview as tv;
-    let extras = tool_extras(block, ctx.anchors);
+    let extras = tool_extras(block);
     let output = block.detail_output();
     let result = tv::result_segments(
         &tv::ResultFacts {
@@ -16175,8 +16149,6 @@ fn render_tool_detail(
         now_ms: model.clock_ms,
         runs: &[],
         paths: &paths,
-        anchors: &model.edit_anchors,
-        anchor_revision: model.edit_anchor_revision,
     };
     let mut facts = tool_row_facts(block, ctx);
     // The header carries its outcome in full here; the `⎿` line follows.
@@ -16199,7 +16171,6 @@ fn render_tool_detail(
         mutation: model
             .viewed_tool_projection()
             .map_or(0, SessionProjection::entry_mutation_revision),
-        anchors: model.edit_anchor_revision,
     };
     let cached = view
         .layout
@@ -16208,7 +16179,7 @@ fn render_tool_detail(
         .filter(|layout| layout.key == key)
         .map(|layout| (layout.result.clone(), std::rc::Rc::clone(&layout.rows)));
     let (result, rows) = cached.unwrap_or_else(|| {
-        let (result, rows) = tool_detail_body(block, ctx, cells);
+        let (result, rows) = tool_detail_body(block, cells);
         let rows = std::rc::Rc::new(rows);
         *view.layout.borrow_mut() = Some(crate::app::DetailLayout {
             key,

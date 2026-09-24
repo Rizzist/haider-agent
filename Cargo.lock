@@ -2055,6 +2055,7 @@ dependencies = [
  "haider-provider",
  "haider-rpc",
  "haider-stt",
+ "haider-tools",
  "image",
  "ratatui",
  "ratatui-image",

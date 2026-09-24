@@ -24766,6 +24766,7 @@ fn lockdown_write_result(
                 .replace('\\', "/"),
             absolute_path: path.to_string_lossy().into_owned(),
             bytes: bytes as u64,
+            edit_spans: Vec::new(),
         }],
         data: None,
         artifact: None,

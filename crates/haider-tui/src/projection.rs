@@ -196,7 +196,7 @@ impl ItemBlock {
         if let Some(payload) = result_payload
             && (self.output_tail.is_empty() || self.output_truncated)
         {
-            let (text, limit_reached) = self.readable_payload(payload);
+            let (text, limit_reached) = readable_payload(payload);
             return OutputView {
                 text,
                 tail_cut: false,
@@ -222,7 +222,7 @@ impl ItemBlock {
         if self.output_tail.is_empty()
             && let Some(result) = &self.tool_result
         {
-            let (text, limit_reached) = self.readable_payload(result.payload_text());
+            let (text, limit_reached) = readable_payload(result.payload_text());
             return OutputView {
                 text,
                 tail_cut: false,
@@ -258,26 +258,21 @@ impl ItemBlock {
         })
     }
 
-    /// [`readable_payload`] only for tools whose result IS an envelope
-    /// (verify 3): execution (`{"output": …}`) and workspace writes/edits
-    /// (`{"result": "edited …", "mutation_digest": …}`). Any other tool's
-    /// JSON that merely has an `output`/`result` key (a fetched API
-    /// response, a file read) is content, and is shown exactly as sent.
-    fn readable_payload<'a>(&self, payload: &'a str) -> (std::borrow::Cow<'a, str>, bool) {
-        use crate::toolview::ToolKind;
-        let execution = match &self.item {
-            TurnItem::ToolCall { name, .. } => matches!(
-                crate::toolview::tool_kind(name),
-                ToolKind::Shell | ToolKind::Write | ToolKind::Edit
-            ),
-            TurnItem::CommandExecution { .. } => true,
-            _ => false,
-        };
-        if execution {
-            readable_payload(payload)
-        } else {
-            (std::borrow::Cow::Borrowed(payload), false)
-        }
+    /// The spans the edit tool measured while applying this call
+    /// (973-tui-toolview repair 4) — the ONLY source an edit's diff rows are
+    /// numbered from. Empty for other tools and for journals written before
+    /// the tools recorded them.
+    #[must_use]
+    pub fn edit_spans(&self) -> &[haider_protocol::tool::EditSpanV1] {
+        self.tool_result
+            .as_ref()
+            .and_then(|result| {
+                result
+                    .effects
+                    .iter()
+                    .find(|effect| !effect.edit_spans.is_empty())
+            })
+            .map_or(&[], |effect| effect.edit_spans.as_slice())
     }
 
     /// The typed search match count, when the joined result carries one.
@@ -308,16 +303,53 @@ pub struct OutputView<'a> {
 /// Payloads larger than this are shown raw rather than parsed.
 const READABLE_PAYLOAD_MAX: usize = 4 * 1024 * 1024;
 
-/// A tool result's human-readable text. Execution tools answer with a JSON
-/// ENVELOPE (`{"output": "…", "exit_code": 0, "artifact": "blake3:…", …}`);
-/// the reader wants the output it carries, with its real newlines — not one
-/// escaped line of digests. `output` (or a plain `result` sentence) is
-/// extracted when present; anything else is shown exactly as sent. The
-/// second value is the envelope's own `limit_reached` flag.
+/// Keys of the daemon's EXECUTION envelope (`process_exec`, `ssh_shell`,
+/// `test_run`, `!` commands): the output it carries plus provenance.
+const EXECUTION_ENVELOPE_KEYS: &[&str] = &[
+    "status",
+    "effect_id",
+    "exit_code",
+    "signal",
+    "output_bytes",
+    "command_arg_digest",
+    "transcript_digest",
+    "workspace_revision",
+    "subject_digest",
+    "process_signal",
+    "output",
+    "output_adapter",
+    "test_summary",
+    "artifact",
+    "capture",
+    "limit_reached",
+    "limits",
+    "escalation_note",
+    "context_savings_detail",
+];
+
+/// Keys of the daemon's WORKSPACE-MUTATION envelope (`fs_write`, `fs_edit`,
+/// `fs_path` and their aliases): the tool's sentence plus provenance.
+const MUTATION_ENVELOPE_KEYS: &[&str] = &[
+    "result",
+    "mutation_digest",
+    "workspace_revision",
+    "subject_digest",
+    "workspace_mutation",
+];
+
+/// A tool result's human-readable text (973-tui-toolview).
+///
+/// The daemon wraps execution and workspace-mutation results in JSON
+/// ENVELOPES (`{"output": "…", "command_arg_digest": …}` /
+/// `{"result": "edited …", "mutation_digest": …}`). A payload is unwrapped
+/// by its SHAPE — every key belongs to one envelope's schema and that
+/// envelope's identifying keys are present — never by the tool's name, so
+/// `fs_path` and `test_run` render their text too, while a file or API
+/// response that merely has an `output` key is content and is shown
+/// exactly as sent. The second value is the envelope's `limit_reached`.
 fn readable_payload(payload: &str) -> (std::borrow::Cow<'_, str>, bool) {
     let raw = (std::borrow::Cow::Borrowed(payload), false);
-    let trimmed = payload.trim_start();
-    if !trimmed.starts_with('{') || payload.len() > READABLE_PAYLOAD_MAX {
+    if !payload.trim_start().starts_with('{') || payload.len() > READABLE_PAYLOAD_MAX {
         return raw;
     }
     let Ok(serde_json::Value::Object(envelope)) =
@@ -325,15 +357,35 @@ fn readable_payload(payload: &str) -> (std::borrow::Cow<'_, str>, bool) {
     else {
         return raw;
     };
+    let shaped = |schema: &[&str], text_key: &str, identifying: &[&str]| {
+        envelope.keys().all(|key| schema.contains(&key.as_str()))
+            && identifying.iter().all(|key| envelope.contains_key(*key))
+            && envelope
+                .get(text_key)
+                .is_some_and(serde_json::Value::is_string)
+    };
+    let text_key = if shaped(
+        EXECUTION_ENVELOPE_KEYS,
+        "output",
+        &["effect_id", "command_arg_digest", "transcript_digest"],
+    ) {
+        "output"
+    } else if shaped(
+        MUTATION_ENVELOPE_KEYS,
+        "result",
+        &["mutation_digest", "workspace_mutation"],
+    ) {
+        "result"
+    } else {
+        return raw;
+    };
     let limit_reached = envelope
         .get("limit_reached")
         .is_some_and(|value| !value.is_null() && value != &serde_json::Value::Bool(false));
-    for key in ["output", "result"] {
-        if let Some(text) = envelope.get(key).and_then(serde_json::Value::as_str) {
-            return (std::borrow::Cow::Owned(text.to_owned()), limit_reached);
-        }
+    match envelope.get(text_key).and_then(serde_json::Value::as_str) {
+        Some(text) => (std::borrow::Cow::Owned(text.to_owned()), limit_reached),
+        None => raw,
     }
-    raw
 }
 
 /// A tool result's declared bound, as the transcript may show it.

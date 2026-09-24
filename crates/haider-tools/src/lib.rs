@@ -11,6 +11,7 @@ mod checkpoint;
 #[path = "checkpoint_tests.rs"]
 mod checkpoint_tests;
 mod computer;
+pub mod edit_spans;
 mod error;
 mod file_preview;
 mod file_review;
@@ -81,6 +82,7 @@ pub use computer::{
     crop_screenshot_png, open_system_permission_settings, platform_computer_backend,
 };
 pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};
+pub use filesystem::apply_fs_edit_text;
 pub use filesystem::{
     CasSink, FsCaseMode, FsEdit, FsEditChange, FsFileGlob, FsGlob, FsPath, FsPathOperation, FsRead,
     FsSearch, FsSearchContext, FsSearchMode, FsWrite, GLOB_ENTRY_LIMIT, GLOB_MAX_FILES_SCANNED,

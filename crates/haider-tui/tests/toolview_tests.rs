@@ -3,6 +3,7 @@
 //! result line, fold phrases, display rows and the diff/text contrast floor.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use haider_protocol::tool::EditSpanV1;
 use haider_tui::toolfold::{Segment, Tone, segments_text};
 use haider_tui::toolview::{
     self as tv, DetailFacts, DiffKind, PathContext, ResultFacts, RowRole, Settle, ToolKind,
@@ -251,12 +252,23 @@ fn an_edit_diffs_its_replacement_line_by_line() {
     assert_eq!(diff.gutter(), 0);
 }
 
+fn span(edit_index: u32, old: Option<u32>, new: Option<u32>) -> EditSpanV1 {
+    EditSpanV1 {
+        edit_index,
+        occurrence: 0,
+        old_start_line: old,
+        old_line_count: 0,
+        new_start_line: new,
+        new_line_count: 0,
+    }
+}
+
 #[test]
-fn a_resolved_anchor_numbers_the_edit_in_file_lines() {
+fn an_edit_is_numbered_from_the_tools_spans() {
     let diff = tv::tool_diff(
         "edit",
         &json!({"file_path": "a.rs", "old_string": "a\nb", "new_string": "a\nB"}),
-        &[Some(118)],
+        &[span(0, Some(118), Some(118))],
     )
     .unwrap();
     let numbered: Vec<(DiffKind, Option<usize>)> = diff
@@ -275,12 +287,38 @@ fn a_resolved_anchor_numbers_the_edit_in_file_lines() {
     assert_eq!(diff.gutter(), 3);
 }
 
+/// Removed rows count in the PRE-edit file, added rows in the POST-edit
+/// file: verify 3's boundary case, `c` line 3 before and line 2 after.
+#[test]
+fn removed_and_added_rows_number_from_their_own_sides() {
+    let diff = tv::tool_diff(
+        "fs_edit",
+        &json!({"path": "b.txt", "edits": [{"old": "a\n", "new": "a"}, {"old": "c", "new": "C"}]}),
+        &[span(0, Some(1), Some(1)), span(1, Some(3), Some(2))],
+    )
+    .unwrap();
+    let rows: Vec<(DiffKind, Option<usize>, &str)> = diff
+        .lines
+        .iter()
+        .map(|line| (line.kind, line.number, line.text.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (DiffKind::Context, Some(1), "a"),
+            (DiffKind::Gap, None, ""),
+            (DiffKind::Removed, Some(3), "c"),
+            (DiffKind::Added, Some(2), "C"),
+        ]
+    );
+}
+
 #[test]
 fn several_edits_are_separated_by_a_gap_and_counted_together() {
     let diff = tv::tool_diff(
         "fs_edit",
         &json!({"path": "a", "edits": [{"old": "x", "new": "y"}, {"old": "p", "new": "q\nr"}]}),
-        &[Some(3), None],
+        &[span(0, Some(3), Some(3))],
     )
     .unwrap();
     assert_eq!((diff.added, diff.removed), (3, 2));
@@ -295,7 +333,33 @@ fn several_edits_are_separated_by_a_gap_and_counted_together() {
     assert_eq!(
         diff.lines.last().unwrap().number,
         None,
-        "edit 2 was unresolved"
+        "edit 2 has no span, so no number"
+    );
+}
+
+/// No spans (an older journal, another tool), a replace_all with several
+/// occurrences, or an unproven side: no number is shown.
+#[test]
+fn without_a_proven_span_nothing_is_numbered() {
+    let args = json!({"path": "a", "edits": [{"old": "x", "new": "y", "replace_all": true}]});
+    let none = tv::tool_diff("fs_edit", &args, &[]).unwrap();
+    assert!(none.lines.iter().all(|line| line.number.is_none()));
+    let mut second = span(0, Some(5), Some(5));
+    second.occurrence = 1;
+    let many = tv::tool_diff("fs_edit", &args, &[span(0, Some(1), Some(1)), second]).unwrap();
+    assert!(
+        many.lines.iter().all(|line| line.number.is_none()),
+        "several occurrences have no single location"
+    );
+    let one_sided = tv::tool_diff("fs_edit", &args, &[span(0, None, Some(7))]).unwrap();
+    let rows: Vec<(DiffKind, Option<usize>)> = one_sided
+        .lines
+        .iter()
+        .map(|line| (line.kind, line.number))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(DiffKind::Removed, None), (DiffKind::Added, Some(7))]
     );
 }
 
@@ -303,80 +367,24 @@ fn several_edits_are_separated_by_a_gap_and_counted_together() {
 fn a_huge_replacement_falls_back_without_losing_a_line() {
     let old: String = (0..1_200).map(|n| format!("old {n}\n")).collect();
     let new: String = (0..1_200).map(|n| format!("new {n}\n")).collect();
-    let lines = tv::line_diff(&old, &new, None);
+    let lines = tv::line_diff(&old, &new, None, None);
     assert_eq!(lines.len(), 2_400, "complete, never truncated");
     assert_eq!(lines[0].kind, DiffKind::Removed);
     assert_eq!(lines[2_399].kind, DiffKind::Added);
 }
 
 #[test]
-fn a_location_is_only_ever_a_unique_occurrence() {
-    assert_eq!(tv::unique_line_of("a\nb\nc", "b"), Some(2));
-    assert_eq!(tv::unique_line_of("a\nb", "a"), Some(1));
-    assert_eq!(
-        tv::unique_line_of("a\nb\nc\nb", "b"),
-        None,
-        "two occurrences are ambiguous — never the first one"
-    );
-    assert_eq!(tv::unique_line_of("a\nb", "zz"), None);
-    assert_eq!(
-        tv::unique_line_of("a", ""),
-        None,
-        "an empty replacement has no place"
-    );
-}
-
-fn pair(old: &str, new: &str) -> tv::EditPair {
-    tv::EditPair {
-        old: old.to_owned(),
-        new: new.to_owned(),
-        replace_all: false,
-    }
-}
-
-/// Astra review (973): line 1 already reads `READY`; the edit turned line 4
-/// (`old line`) into `READY`. The first occurrence is line 1 — the WRONG
-/// line — so the edit must stay unnumbered.
-#[test]
-fn an_edit_whose_text_already_existed_elsewhere_is_not_numbered() {
-    let after = "READY\nx\ny\nREADY\nend\n";
-    assert_eq!(
-        tv::resolve_edit_anchors(&[pair("old line", "READY")], after),
-        vec![None]
-    );
-    // The same edit into a file where its text is unique IS numbered.
-    let unique = "START\nx\ny\nREADY\nend\n";
-    assert_eq!(
-        tv::resolve_edit_anchors(&[pair("old line", "READY")], unique),
-        vec![Some(4)]
-    );
-}
-
-#[test]
-fn line_shifting_multi_edits_and_replace_all_are_not_numbered() {
-    let after = "a\nNEW1\nextra\nb\nNEW2\n";
-    // Edit 1 adds a line, so edit 2's PRE-edit line differs from its
-    // post-edit line: nothing in the call may be numbered.
-    assert_eq!(
-        tv::resolve_edit_anchors(&[pair("old1", "NEW1\nextra"), pair("old2", "NEW2")], after),
-        vec![None, None]
-    );
-    // Line-count-preserving edits keep both numberings equal.
-    let same = "a\nNEW1\nb\nNEW2\n";
-    assert_eq!(
-        tv::resolve_edit_anchors(&[pair("old1", "NEW1"), pair("old2", "NEW2")], same),
-        vec![Some(2), Some(4)]
-    );
-    let mut all = pair("x", "Y");
-    all.replace_all = true;
-    assert_eq!(tv::resolve_edit_anchors(&[all], "Y\n"), vec![None]);
-    // The flag is read from both edit schemas.
+fn edit_pairs_read_both_edit_schemas() {
     let fs_edit = tv::edit_pairs(
-        &json!({"path": "a", "edits": [{"old": "x", "new": "y", "replace_all": true}]}),
+        &json!({"path": "a", "edits": [{"old": "x", "new": "y"}, {"old": "p", "new": "q"}]}),
     );
-    assert!(fs_edit[0].replace_all);
+    assert_eq!(fs_edit.len(), 2);
+    assert_eq!(
+        (fs_edit[1].old.as_str(), fs_edit[1].new.as_str()),
+        ("p", "q")
+    );
     let edit = tv::edit_pairs(&json!({"file_path": "a", "old_string": "x", "new_string": "y"}));
-    assert!(!edit[0].replace_all);
+    assert_eq!((edit[0].old.as_str(), edit[0].new.as_str()), ("x", "y"));
 }
 
 #[test]
@@ -858,198 +866,4 @@ fn every_tool_row_text_ink_clears_4_5_on_its_ground_in_every_theme() {
         assert_ne!(theme.diff_removed_ground(), theme.bg);
         assert_ne!(theme.diff_added_ground(), theme.diff_removed_ground());
     }
-}
-
-// ---- 973 repair 3: line numbers only when PROVABLY right ----------------
-
-/// Apply an edit call the way the filesystem tool does: each replacement
-/// on the current text, first occurrence.
-fn apply_edits(before: &str, pairs: &[tv::EditPair]) -> String {
-    let mut text = before.to_owned();
-    for pair in pairs {
-        text = text.replacen(&pair.old, &pair.new, 1);
-    }
-    text
-}
-
-/// The file line of `needle` in `text` (test oracle, first occurrence).
-fn line_in(text: &str, needle: &str) -> usize {
-    let at = text.find(needle).expect("needle present");
-    text[..at].matches('\n').count() + 1
-}
-
-/// Every number the resolver hands out must be the replacement's REAL line
-/// in the pre-edit file (removed rows) and the post-edit file (added rows).
-fn assert_numbers_are_true(before: &str, pairs: &[tv::EditPair]) -> Vec<Option<usize>> {
-    let after = apply_edits(before, pairs);
-    let anchors = tv::resolve_edit_anchors(pairs, &after);
-    // The TRUE lines, simulated: where each replacement's old text was
-    // found (in the text as it stood when that replacement ran) and where
-    // its new text ended up.
-    let mut text = before.to_owned();
-    let mut found = Vec::new();
-    let mut shifted = false;
-    for pair in pairs {
-        found.push(line_in(&text, &pair.old));
-        shifted |= pair.old.matches('\n').count() != pair.new.matches('\n').count();
-        text = text.replacen(&pair.old, &pair.new, 1);
-    }
-    for ((pair, anchor), old_line) in pairs.iter().zip(&anchors).zip(&found) {
-        if let Some(line) = anchor {
-            assert_eq!(
-                *line,
-                line_in(&after, &pair.new),
-                "post-edit line of {pair:?}"
-            );
-            assert_eq!(line, old_line, "pre-edit line of {pair:?}");
-            if pairs.len() > 1 {
-                // With several edits, the intermediate text's lines are the
-                // ORIGINAL file's lines only because nothing shifted.
-                assert!(!shifted, "a shifting call was numbered: {pairs:?}");
-            }
-        }
-    }
-    anchors
-}
-
-/// Verify 3's exact case: deleting the boundary newline joins `a` and `b`,
-/// so `c` moves from line 3 to line 2 while `lines()` counts one line on
-/// each side of the first replacement. Nothing may be numbered.
-#[test]
-fn a_deleted_line_boundary_unnumbers_the_call() {
-    let before = "a\nb\nc\n";
-    let pairs = [pair("a\n", "a"), pair("c", "C")];
-    assert_eq!(apply_edits(before, &pairs), "ab\nC\n");
-    assert_eq!(assert_numbers_are_true(before, &pairs), vec![None, None]);
-    // …and the mirror case, verify 3's second repro: an ADDED boundary.
-    let before = "a\nb\n";
-    let pairs = [pair("a", "a\n"), pair("b", "B")];
-    assert_eq!(apply_edits(before, &pairs), "a\n\nB\n");
-    assert_eq!(assert_numbers_are_true(before, &pairs), vec![None, None]);
-}
-
-#[test]
-fn crlf_boundaries_count_as_shifts_and_crlf_preserving_edits_are_numbered() {
-    let before = "a\r\nb\r\nc\r\n";
-    let joined = [pair("a\r\n", "a"), pair("c", "C")];
-    assert_eq!(assert_numbers_are_true(before, &joined), vec![None, None]);
-    let kept = [pair("a\r\n", "A\r\n"), pair("c", "C")];
-    assert_eq!(
-        assert_numbers_are_true(before, &kept),
-        vec![Some(1), Some(3)]
-    );
-}
-
-#[test]
-fn a_trailing_newline_change_at_eof_counts_as_a_shift() {
-    // EOF without a newline: adding one is a newline-count change.
-    let before = "x\ny\nlast";
-    let added = [pair("x", "X"), pair("last", "last\n")];
-    assert_eq!(assert_numbers_are_true(before, &added), vec![None, None]);
-    // A single edit at EOF needs no guard and is numbered truly.
-    assert_eq!(
-        assert_numbers_are_true(before, &[pair("last", "LAST")]),
-        vec![Some(3)]
-    );
-    // Removing the final newline in a multi-edit call is also a shift.
-    let before = "x\ny\n";
-    let removed = [pair("x", "X"), pair("y\n", "y")];
-    assert_eq!(assert_numbers_are_true(before, &removed), vec![None, None]);
-}
-
-#[test]
-fn insertions_shift_every_later_replacement() {
-    let before = "a\nb\nc\nd\n";
-    let inserted = [pair("b\n", "b\nNEW\n"), pair("d", "D")];
-    assert_eq!(assert_numbers_are_true(before, &inserted), vec![None, None]);
-    // Alone, an insertion is numbered at the line it starts on.
-    assert_eq!(
-        assert_numbers_are_true(before, &[pair("b\n", "b\nNEW\n")]),
-        vec![Some(2)]
-    );
-    let diff = tv::tool_diff(
-        "edit",
-        &json!({"file_path": "a", "old_string": "b\n", "new_string": "b\nNEW\n"}),
-        &[Some(2)],
-    )
-    .unwrap();
-    let numbered: Vec<(DiffKind, Option<usize>, &str)> = diff
-        .lines
-        .iter()
-        .map(|line| (line.kind, line.number, line.text.as_str()))
-        .collect();
-    assert_eq!(
-        numbered,
-        vec![
-            (DiffKind::Context, Some(2), "b"),
-            (DiffKind::Added, Some(3), "NEW"),
-        ],
-        "the inserted line is the file's line 3"
-    );
-}
-
-#[test]
-fn replacements_that_touch_each_others_text_are_not_numbered() {
-    // Edit 2 consumes edit 1's text and re-creates it elsewhere: its one
-    // occurrence is edit 2's, not edit 1's.
-    let before = "p\nq\nr\n";
-    let pairs = [pair("p", "Z"), pair("r", "Z-r")];
-    assert_eq!(assert_numbers_are_true(before, &pairs), vec![None, None]);
-    // Independent, newline-preserving replacements ARE numbered.
-    let pairs = [pair("p", "P"), pair("r", "R")];
-    assert_eq!(
-        assert_numbers_are_true(before, &pairs),
-        vec![Some(1), Some(3)]
-    );
-}
-
-/// Exhaustive sweep: over many small files and edit pairs, the resolver
-/// never hands out a number that is not the true pre- AND post-edit line.
-#[test]
-fn no_resolved_number_is_ever_wrong_over_a_sweep() {
-    let files = [
-        "a\nb\nc\n",
-        "a\nb\nc",
-        "a\r\nb\r\nc\r\n",
-        "\na\n\nb\n",
-        "ab\ncd\nef\n",
-    ];
-    let edits = [
-        ("a", "A"),
-        ("a\n", "a"),
-        ("a", "a\n"),
-        ("b\n", ""),
-        ("b", "b\nX"),
-        ("c", "C"),
-        ("\n", ""),
-        ("cd", "c\nd"),
-        ("ef", "EF"),
-        ("b", "BB"),
-    ];
-    let mut numbered = 0usize;
-    for file in files {
-        for first in edits {
-            for second in edits {
-                let pairs = [pair(first.0, first.1), pair(second.0, second.1)];
-                // Only calls the tool would accept: each old text matches.
-                let mut text = file.to_owned();
-                let mut valid = true;
-                for p in &pairs {
-                    if !text.contains(&p.old) {
-                        valid = false;
-                        break;
-                    }
-                    text = text.replacen(&p.old, &p.new, 1);
-                }
-                if !valid {
-                    continue;
-                }
-                numbered += assert_numbers_are_true(file, &pairs)
-                    .iter()
-                    .flatten()
-                    .count();
-            }
-        }
-    }
-    assert!(numbered > 0, "the sweep exercises numbered cases too");
 }

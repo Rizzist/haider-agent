@@ -84,26 +84,6 @@ pub const TOOL_TIMING_MAX: usize = 1024;
 /// than one turn's worth of items.
 pub const TOOL_TIMING_SCAN: usize = 64;
 
-/// Largest file `AppModel::note_edit_anchors` reads to number an edit.
-pub const EDIT_ANCHOR_MAX_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Read the file an edit call named — relative paths against the session
-/// workspace — when it exists locally, is a regular file, is valid UTF-8
-/// and is no larger than [`EDIT_ANCHOR_MAX_BYTES`].
-fn read_edited_file(workspace: Option<&str>, path: &str) -> Option<String> {
-    let path = std::path::Path::new(path);
-    let full = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::path::Path::new(workspace?).join(path)
-    };
-    let metadata = std::fs::metadata(&full).ok()?;
-    if !metadata.is_file() || metadata.len() > EDIT_ANCHOR_MAX_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(full).ok()
-}
-
 /// The demo VFS seed (sim tui.js:418-426).
 #[must_use]
 pub fn vfs_seed() -> BTreeMap<String, Vec<String>> {
@@ -4224,7 +4204,6 @@ pub struct DetailLayoutKey {
     pub source: usize,
     pub revision: u64,
     pub mutation: u64,
-    pub anchors: u64,
 }
 
 /// A cached full-detail body.
@@ -5505,14 +5484,6 @@ pub struct AppModel {
     /// newest calls, and a row whose start was never observed drops its
     /// duration segment rather than printing a fabricated `0s`.
     pub tool_timings: std::collections::BTreeMap<String, crate::toolfold::ToolTiming>,
-    /// File line of each replacement a settled edit made, per item id
-    /// (973-tui-toolview) — what numbers an edit's diff rows. Resolved ONCE,
-    /// only for calls this client watched run (a replayed row's file may
-    /// have moved on since), and `None` wherever the text could not be
-    /// found: an unresolved edit shows no numbers rather than invented ones.
-    pub edit_anchors: std::collections::BTreeMap<String, Vec<Option<usize>>>,
-    /// Bumped whenever `edit_anchors` changes — a layout-cache coordinate.
-    pub edit_anchor_revision: u64,
     /// Monotone counter of persisted verbosity commits — the settings
     /// store's write trigger (the `theme_commits` idiom: a commit
     /// re-affirming the current value must still reach disk).
@@ -6057,8 +6028,6 @@ impl Default for AppModel {
             toolfold: crate::toolfold::ToolFold::default(),
             default_tool_verbosity: crate::toolfold::Verbosity::default(),
             tool_timings: std::collections::BTreeMap::new(),
-            edit_anchors: std::collections::BTreeMap::new(),
-            edit_anchor_revision: 0,
             verbosity_commits: 0,
             auto_resuming: false,
             aura: AuraModel::seed(),
@@ -16575,91 +16544,6 @@ impl AppModel {
         }
     }
 
-    /// Resolve the file line each settled edit's replacement landed on
-    /// (973-tui-toolview). Walks the same bounded transcript tail as
-    /// [`Self::note_tool_timings`], considers only successful edit calls
-    /// whose START this client observed, records each row once its file
-    /// is readable (bounded to [`EDIT_ANCHOR_MAX_BYTES`]), and records
-    /// `None` for any replacement it cannot place with CERTAINTY
-    /// ([`crate::toolview::resolve_edit_anchors`]: ambiguous or absent text,
-    /// `replace_all`, line-shifting multi-edits) and for every replacement
-    /// of an edit a later call may already have overtaken. A file it cannot
-    /// read (a remote daemon's path) is retried while the row is in the
-    /// scanned tail and otherwise never numbered.
-    pub fn note_edit_anchors(&mut self) {
-        let workspace = self.tool_path_context().workspace;
-        let entries = self.projection.entries();
-        let scan_from = entries.len().saturating_sub(TOOL_TIMING_SCAN);
-        let mut resolved: Vec<(String, Vec<Option<usize>>)> = Vec::new();
-        for (offset, entry) in entries[scan_from..].iter().enumerate() {
-            let crate::projection::TranscriptEntry::Item(block) = entry else {
-                continue;
-            };
-            let haider_protocol::item::TurnItem::ToolCall {
-                name, args, status, ..
-            } = &block.item
-            else {
-                continue;
-            };
-            let id = block.item_id.as_str();
-            if *status != haider_protocol::item::ToolStatus::Completed
-                || crate::toolview::tool_kind(name) != crate::toolview::ToolKind::Edit
-                || self.edit_anchors.contains_key(id)
-                || !self.tool_timings.contains_key(id)
-            {
-                continue;
-            }
-            let pairs = crate::toolview::edit_pairs(args);
-            // A later tool call or command may already have changed the
-            // file again (another edit, a write, a shell `sed`): the file on
-            // disk no longer shows where THIS edit landed. Record the row as
-            // resolved-without-numbers rather than read a moved target.
-            let later_mutation = entries[scan_from + offset + 1..].iter().any(|later| {
-                matches!(
-                    later,
-                    crate::projection::TranscriptEntry::Item(crate::projection::ItemBlock {
-                        item: haider_protocol::item::TurnItem::ToolCall { .. }
-                            | haider_protocol::item::TurnItem::CommandExecution { .. },
-                        ..
-                    })
-                )
-            });
-            if later_mutation {
-                resolved.push((id.to_owned(), vec![None; pairs.len()]));
-                continue;
-            }
-            let content = args
-                .get("path")
-                .or_else(|| args.get("file_path"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|path| read_edited_file(workspace.as_deref(), path));
-            // An unreadable file records NOTHING, so a later beat retries:
-            // a live session learns its canonical (dated) workspace after
-            // the create response, and the first beats may still be looking
-            // under the process cwd. The bounded tail scan ends the retries
-            // once the row scrolls out of it.
-            let Some(content) = content else {
-                continue;
-            };
-            resolved.push((
-                id.to_owned(),
-                crate::toolview::resolve_edit_anchors(&pairs, &content),
-            ));
-        }
-        if resolved.is_empty() {
-            return;
-        }
-        self.edit_anchors.extend(resolved);
-        while self.edit_anchors.len() > TOOL_TIMING_MAX {
-            let Some(oldest) = self.edit_anchors.keys().next().cloned() else {
-                break;
-            };
-            self.edit_anchors.remove(&oldest);
-        }
-        self.edit_anchor_revision = self.edit_anchor_revision.wrapping_add(1);
-        self.dirty = true;
-    }
-
     /// The projection currently on screen. A missing child has no rows;
     /// it must never fall back to navigating the hidden main transcript.
     pub(crate) fn viewed_tool_projection(&self) -> Option<&SessionProjection> {
@@ -16896,11 +16780,7 @@ impl AppModel {
             crate::projection::TranscriptEntry::Item(block)
                 if block.item_id.as_str() == item_id =>
             {
-                Some(crate::render::expanded_display_rows(
-                    block,
-                    width,
-                    &self.edit_anchors,
-                ))
+                Some(crate::render::expanded_display_rows(block, width))
             }
             _ => None,
         }) else {
@@ -18607,8 +18487,6 @@ impl AppModel {
         // session restores its own mode and disclosure record.
         self.toolfold.clear_session();
         self.tool_timings.clear();
-        self.edit_anchors.clear();
-        self.edit_anchor_revision = self.edit_anchor_revision.wrapping_add(1);
         self.tasks_line_expanded = false;
         self.tasks_line_page = 0;
         *self.pending_tool_reveal.borrow_mut() = None;

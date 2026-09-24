@@ -24,6 +24,7 @@
 //! windowed. The full-detail view reads the same inputs unbounded.
 
 use crate::toolfold::{Segment, Tone, first_meaningful_line, meaning_segments};
+use haider_protocol::tool::EditSpanV1;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -390,8 +391,6 @@ impl ToolDiff {
 pub struct EditPair {
     pub old: String,
     pub new: String,
-    /// Every occurrence was replaced — the edit has no single location.
-    pub replace_all: bool,
 }
 
 /// Every replacement an edit call carries: `edits[].{old,new}` (`fs_edit`),
@@ -404,10 +403,6 @@ pub fn edit_pairs(args: &serde_json::Value) -> Vec<EditPair> {
         Some(EditPair {
             old: old.to_owned(),
             new: new.to_owned(),
-            replace_all: value
-                .get("replace_all")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
         })
     };
     if let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) {
@@ -422,15 +417,19 @@ pub fn edit_pairs(args: &serde_json::Value) -> Vec<EditPair> {
         .collect()
 }
 
-/// The diff a write/edit call carries. `anchors[i]` is the resolved FILE
-/// line of edit `i`'s replacement text, when the caller could resolve it;
-/// without one, that edit's rows carry no numbers rather than invented ones.
+/// The diff a write/edit call carries.
+///
+/// An edit's rows are numbered ONLY from `spans` — the authoritative
+/// coordinates the edit tool measured while applying each replacement
+/// ([`EditSpanV1`]). A replacement with exactly one span is numbered from
+/// it (removed rows in the pre-edit file, added rows in the post-edit file,
+/// each side only when the tool proved it); a `replace_all` with several
+/// occurrences, or a result without spans (an older journal, another tool),
+/// shows no numbers. Nothing is inferred from text (973 repair 4).
+///
+/// A whole-file write numbers its rows from 1: they ARE the file's lines.
 #[must_use]
-pub fn tool_diff(
-    name: &str,
-    args: &serde_json::Value,
-    anchors: &[Option<usize>],
-) -> Option<ToolDiff> {
+pub fn tool_diff(name: &str, args: &serde_json::Value, spans: &[EditSpanV1]) -> Option<ToolDiff> {
     match tool_kind(name) {
         ToolKind::Write => {
             let content = args.get("content").and_then(serde_json::Value::as_str)?;
@@ -464,8 +463,8 @@ pub fn tool_diff(
                         text: String::new(),
                     });
                 }
-                let start = anchors.get(index).copied().flatten();
-                for line in line_diff(&pair.old, &pair.new, start) {
+                let (old_start, new_start) = span_starts(spans, index);
+                for line in line_diff(&pair.old, &pair.new, old_start, new_start) {
                     match line.kind {
                         DiffKind::Added => diff.added += 1,
                         DiffKind::Removed => diff.removed += 1,
@@ -480,25 +479,51 @@ pub fn tool_diff(
     }
 }
 
+/// The pre-/post-edit start lines of edit `index`, when the tool measured
+/// exactly one replacement for it.
+fn span_starts(spans: &[EditSpanV1], index: usize) -> (Option<usize>, Option<usize>) {
+    let mut own = spans
+        .iter()
+        .filter(|span| usize::try_from(span.edit_index).is_ok_and(|i| i == index));
+    match (own.next(), own.next()) {
+        (Some(span), None) => (
+            span.old_start_line
+                .and_then(|line| usize::try_from(line).ok()),
+            span.new_start_line
+                .and_then(|line| usize::try_from(line).ok()),
+        ),
+        _ => (None, None),
+    }
+}
+
 /// A line-level diff of one replacement (longest common subsequence).
-/// `start` is the file line of the replacement's first line: removed rows
-/// number from it in the OLD file, added and context rows in the NEW one.
+/// Removed rows number from `old_start` (the replaced text's first line in
+/// the PRE-edit file), added rows from `new_start` (the inserted text's
+/// first line in the POST-edit file); a context row is in both and takes
+/// its post-edit number, else its pre-edit one. A missing start leaves
+/// that side unnumbered.
 #[must_use]
-pub fn line_diff(old: &str, new: &str, start: Option<usize>) -> Vec<DiffLine> {
+pub fn line_diff(
+    old: &str,
+    new: &str,
+    old_start: Option<usize>,
+    new_start: Option<usize>,
+) -> Vec<DiffLine> {
     let old: Vec<&str> = old.lines().collect();
     let new: Vec<&str> = new.lines().collect();
-    let number = |offset: usize| start.map(|start| start + offset);
+    let old_number = |offset: usize| old_start.map(|start| start + offset);
+    let new_number = |offset: usize| new_start.map(|start| start + offset);
     let mut out = Vec::with_capacity(old.len() + new.len());
     let cells = (old.len() + 1).saturating_mul(new.len() + 1);
     if cells > LCS_MAX_CELLS {
         out.extend(old.iter().enumerate().map(|(i, text)| DiffLine {
             kind: DiffKind::Removed,
-            number: number(i),
+            number: old_number(i),
             text: (*text).to_owned(),
         }));
         out.extend(new.iter().enumerate().map(|(j, text)| DiffLine {
             kind: DiffKind::Added,
-            number: number(j),
+            number: new_number(j),
             text: (*text).to_owned(),
         }));
         return out;
@@ -520,7 +545,7 @@ pub fn line_diff(old: &str, new: &str, start: Option<usize>) -> Vec<DiffLine> {
         if i < old.len() && j < new.len() && old[i] == new[j] {
             out.push(DiffLine {
                 kind: DiffKind::Context,
-                number: number(j),
+                number: new_number(j).or_else(|| old_number(i)),
                 text: new[j].to_owned(),
             });
             i += 1;
@@ -532,89 +557,20 @@ pub fn line_diff(old: &str, new: &str, start: Option<usize>) -> Vec<DiffLine> {
             // old-then-new, the way every reader expects.
             out.push(DiffLine {
                 kind: DiffKind::Removed,
-                number: number(i),
+                number: old_number(i),
                 text: old[i].to_owned(),
             });
             i += 1;
         } else {
             out.push(DiffLine {
                 kind: DiffKind::Added,
-                number: number(j),
+                number: new_number(j),
                 text: new[j].to_owned(),
             });
             j += 1;
         }
     }
     out
-}
-
-/// The 1-based line where `needle` starts inside `haystack` — ONLY when it
-/// occurs there exactly once. Zero or several occurrences are ambiguous and
-/// answer `None`: a location is never guessed.
-#[must_use]
-pub fn unique_line_of(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    let mut hits = haystack.match_indices(needle);
-    let (at, _) = hits.next()?;
-    if hits.next().is_some() {
-        return None;
-    }
-    Some(haystack[..at].matches('\n').count() + 1)
-}
-
-/// Resolve the file line each replacement of one edit call landed on, from
-/// the edited file as read right after the call settled (973-tui-toolview
-/// repair: the tools carry no edit coordinates, so this is the only source,
-/// and it answers `None` wherever it cannot PROVE the number).
-///
-/// * A `replace_all` edit has no single location → `None`.
-/// * A replacement whose text occurs zero or several times in the file is
-///   ambiguous (`READY` already on line 1 when line 4 became `READY`) →
-///   `None`.
-/// * A call with several edits is numbered only when EVERY replacement
-///   keeps its newline count (`'\n'` bytes — so a joined or split line
-///   boundary, a trailing-newline change, a CRLF line added or removed, or
-///   an insertion all count as a shift). Removed rows are numbered in the
-///   PRE-edit file, so any shift above a later replacement would make its
-///   numbers wrong: `"a\n" → "a"` then `c → C` moves `c` from line 3 to 2
-///   while `lines()` still counts one line on each side (verify 3).
-/// * A call with several edits is also refused when one replacement's text
-///   occurs inside another's old or new text, or its old text inside
-///   another's new text: one edit may have consumed, re-created or created
-///   the other's text, so an occurrence may not be where THIS edit acted.
-///
-/// A single edit needs neither guard: its old text started on the same line
-/// its new text starts on, and nothing else in the call moved either.
-#[must_use]
-pub fn resolve_edit_anchors(pairs: &[EditPair], content: &str) -> Vec<Option<usize>> {
-    let newlines = |text: &str| text.bytes().filter(|byte| *byte == b'\n').count();
-    let several = pairs.len() > 1;
-    let shifts = several
-        && pairs
-            .iter()
-            .any(|pair| newlines(&pair.old) != newlines(&pair.new));
-    let entangled = several
-        && pairs.iter().enumerate().any(|(index, pair)| {
-            !pair.new.is_empty()
-                && pairs.iter().enumerate().any(|(other_index, other)| {
-                    other_index != index
-                        && (other.old.contains(&pair.new)
-                            || other.new.contains(&pair.new)
-                            || (!pair.old.is_empty() && other.new.contains(&pair.old)))
-                })
-        });
-    pairs
-        .iter()
-        .map(|pair| {
-            if shifts || entangled || pair.replace_all {
-                None
-            } else {
-                unique_line_of(content, &pair.new)
-            }
-        })
-        .collect()
 }
 
 // ------------------------------------------------------- result summary ---

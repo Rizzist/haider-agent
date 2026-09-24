@@ -21,7 +21,7 @@ use haider_protocol::request_budget::{
     PROVIDER_REQUEST_BUDGET_EXTENSION_KIND, RequestBudgetContinuationV1, RequestBudgetPhaseV1,
     RequestBudgetStatusV1, RequestBudgetV1,
 };
-use haider_protocol::tool::{BoundedResult, ToolResultStatus};
+use haider_protocol::tool::{BoundedResult, EditSpanV1, ToolResultStatus};
 use haider_tui::app::{AppEvent, AppModel, Hit};
 use haider_tui::theme::ThemeKey;
 use haider_tui::toolfold::ToolTiming;
@@ -101,6 +101,60 @@ fn push_tool(
             result: outcome.1,
         },
     );
+}
+
+/// A successful EDIT result carrying the spans the tool measured.
+fn ok_edit(preview: &str, spans: Vec<EditSpanV1>) -> (ToolStatus, BoundedResult) {
+    let (status, mut result) = ok(preview);
+    result.effects.push(haider_protocol::tool::ToolFileEffect {
+        kind: haider_protocol::tool::ToolFileEffectKind::Edit,
+        name: "f".to_owned(),
+        path: "f".to_owned(),
+        absolute_path: "/work/f".to_owned(),
+        bytes: 1,
+        edit_spans: spans,
+    });
+    (status, result)
+}
+
+fn span(edit_index: u32, old: Option<u32>, new: Option<u32>) -> EditSpanV1 {
+    EditSpanV1 {
+        edit_index,
+        occurrence: 0,
+        old_start_line: old,
+        old_line_count: 1,
+        new_start_line: new,
+        new_line_count: 1,
+    }
+}
+
+/// The daemon's execution envelope, with its real identifying keys.
+fn exec_envelope(output: &str, limit: serde_json::Value) -> String {
+    serde_json::json!({
+        "status": "completed",
+        "effect_id": "effect-1",
+        "exit_code": 0,
+        "output_bytes": output.len(),
+        "command_arg_digest": "blake3:0123456789abcdef0123456789abcdef",
+        "transcript_digest": "blake3:fedcba9876543210fedcba9876543210",
+        "artifact": "blake3:0123456789abcdef0123456789abcdef",
+        "capture": "capture:effect-1",
+        "limit_reached": limit,
+        "output": output,
+    })
+    .to_string()
+}
+
+/// The daemon's workspace-mutation envelope.
+fn mutation_envelope(sentence: &str) -> String {
+    serde_json::json!({
+        "result": sentence,
+        "mutation_digest": "blake3:feedface",
+        "workspace_revision": "workspace-revision:9",
+        "subject_digest": "blake3:beef",
+        "workspace_mutation": {"run_id": "run-1", "effect_id": "effect-9"},
+    })
+    .to_string()
 }
 
 fn ok(preview: &str) -> (ToolStatus, BoundedResult) {
@@ -231,12 +285,11 @@ fn push_owner_tools(model: &mut AppModel) {
             }],
         }),
         "",
-        ok("edited state/970-STATUS.md (1 replacement)"),
+        ok_edit(
+            "edited state/970-STATUS.md (1 replacement)",
+            vec![span(0, Some(41), Some(41))],
+        ),
     );
-    model
-        .edit_anchors
-        .insert("edit-status".to_owned(), vec![Some(41)]);
-    model.edit_anchor_revision += 1;
     apply(model, budget_progress());
     for (n, file) in ["src/app.rs", "src/render.rs", "src/toolfold.rs"]
         .iter()
@@ -640,97 +693,44 @@ fn a_failed_calls_detail_carries_its_unshortened_reason() {
 // ---- 4. edit anchors -----------------------------------------------------
 
 #[test]
-fn a_watched_edit_is_numbered_from_its_file_and_a_replayed_one_is_not() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("notes.md");
-    std::fs::write(&file, "one\ntwo\nthree\nFOUR\nfive\n").unwrap();
+fn an_edit_is_numbered_from_its_results_spans_and_never_without_them() {
+    let args = serde_json::json!({"path": "notes.md", "edits": [{"old": "four", "new": "FOUR"}]});
     let mut model = session_model();
-    model.cwd = dir.path().display().to_string();
-    model.clock_ms = 1_700_000_000_000;
-    let args = serde_json::json!({
-        "path": "notes.md",
-        "edits": [{"old": "four", "new": "FOUR"}],
-    });
-    apply(
+    push_tool(
         &mut model,
-        EventPayload::Item(ItemEvent::Started {
-            item_id: ItemId::new("e1"),
-            item: tool("e1", "fs_edit", args.clone(), ToolStatus::InProgress),
-        }),
+        "e1",
+        "fs_edit",
+        args.clone(),
+        "",
+        ok_edit(
+            "edited notes.md (1 replacement)",
+            vec![span(0, Some(4), Some(4))],
+        ),
     );
-    model.note_tool_timings();
-    apply(
-        &mut model,
-        EventPayload::Item(ItemEvent::Completed {
-            item_id: ItemId::new("e1"),
-            item: tool("e1", "fs_edit", args.clone(), ToolStatus::Completed),
-        }),
-    );
-    model.clock_ms += 20;
-    model.note_tool_timings();
-    let revision = model.edit_anchor_revision;
-    model.note_edit_anchors();
-    assert_eq!(model.edit_anchors.get("e1"), Some(&vec![Some(4)]));
-    assert_ne!(model.edit_anchor_revision, revision);
     let frame = draw(&model, 118, 36);
-    assert!(frame.contains("4 - four"), "{}", frame.rows.join("\n"));
-    assert!(frame.contains("4 + FOUR"));
-
-    // A row met already settled (a replay) is never located: the file may
-    // have moved on since, so it carries no numbers at all.
-    apply(
-        &mut model,
-        EventPayload::Item(ItemEvent::Completed {
-            item_id: ItemId::new("e2"),
-            item: tool("e2", "fs_edit", args, ToolStatus::Completed),
-        }),
+    assert!(
+        frame.contains("4 - four") && frame.contains("4 + FOUR"),
+        "{}",
+        frame.rows.join("\n")
     );
-    model.note_tool_timings();
-    model.note_edit_anchors();
-    assert!(!model.edit_anchors.contains_key("e2"));
-    // A file the client cannot read yet (a workspace still being learned,
-    // a remote daemon) records nothing, so a later beat can still place it.
-    apply(
-        &mut model,
-        EventPayload::Item(ItemEvent::Started {
-            item_id: ItemId::new("e3"),
-            item: tool(
-                "e3",
-                "fs_edit",
-                serde_json::json!({"path": "later.md", "edits": [{"old": "a", "new": "b"}]}),
-                ToolStatus::InProgress,
-            ),
-        }),
+    // A journal written before the tool measured spans shows NO numbers —
+    // nothing is inferred from the file.
+    let mut older = session_model();
+    push_tool(
+        &mut older,
+        "e2",
+        "fs_edit",
+        args,
+        "",
+        ok("edited notes.md (1 replacement)"),
     );
-    model.note_tool_timings();
-    apply(
-        &mut model,
-        EventPayload::Item(ItemEvent::Completed {
-            item_id: ItemId::new("e3"),
-            item: tool(
-                "e3",
-                "fs_edit",
-                serde_json::json!({"path": "later.md", "edits": [{"old": "a", "new": "b"}]}),
-                ToolStatus::Completed,
-            ),
-        }),
+    let frame = draw(&older, 118, 36);
+    let text = frame.rows.join("\n");
+    assert!(
+        frame.contains("      - four") && frame.contains("      + FOUR"),
+        "{text}"
     );
-    model.note_tool_timings();
-    model.note_edit_anchors();
-    assert!(!model.edit_anchors.contains_key("e3"), "not readable yet");
-    std::fs::write(
-        dir.path().join("later.md"),
-        "x
-b
-",
-    )
-    .unwrap();
-    model.note_edit_anchors();
-    assert_eq!(model.edit_anchors.get("e3"), Some(&vec![Some(2)]));
-    // Resolving is once per row: a later beat does not re-read.
-    let revision = model.edit_anchor_revision;
-    model.note_edit_anchors();
-    assert_eq!(model.edit_anchor_revision, revision);
+    assert!(!text.contains("4 - four"), "{text}");
 }
 
 // ---- 5. click geometry under the "Opened from" origin line -------------
@@ -946,10 +946,6 @@ fn every_tone_model() -> AppModel {
             ),
         }),
     );
-    model
-        .edit_anchors
-        .insert("edit-status".to_owned(), vec![Some(41)]);
-    model.edit_anchor_revision += 1;
     model
 }
 
@@ -1250,46 +1246,28 @@ fn every_row_type_clicks_into_the_detail_view_and_esc_returns() {
     assert!(model.tool_detail.is_none(), "q closes it too");
 }
 
-/// Astra item 2: an edit a LATER call may have overtaken is never
-/// numbered from the moved file.
+/// Repair 4: an edit's numbers come from the tool's own measurement, so a
+/// later call that changes the file again cannot move them.
 #[test]
-fn an_edit_overtaken_by_a_later_call_is_not_numbered() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("f.md"), "a\nb\nNEW\nc\n").unwrap();
+fn an_edits_numbers_survive_later_calls_because_they_are_measured() {
     let mut model = session_model();
-    model.cwd = dir.path().display().to_string();
-    model.clock_ms = 1_700_000_000_000;
-    let args = serde_json::json!({"path": "f.md", "edits": [{"old": "old", "new": "NEW"}]});
-    apply(
+    push_tool(
         &mut model,
-        EventPayload::Item(ItemEvent::Started {
-            item_id: ItemId::new("e1"),
-            item: tool("e1", "fs_edit", args.clone(), ToolStatus::InProgress),
-        }),
+        "e1",
+        "fs_edit",
+        serde_json::json!({"path": "f.md", "edits": [{"old": "old", "new": "NEW"}]}),
+        "",
+        ok_edit(
+            "edited f.md (1 replacement)",
+            vec![span(0, Some(3), Some(3))],
+        ),
     );
-    model.note_tool_timings();
-    apply(
-        &mut model,
-        EventPayload::Item(ItemEvent::Completed {
-            item_id: ItemId::new("e1"),
-            item: tool("e1", "fs_edit", args, ToolStatus::Completed),
-        }),
-    );
-    // Before the next beat, a later command already ran.
     push_command(&mut model, "later", "sed -i '' 1d f.md", "", 0);
-    model.clock_ms += 20;
-    model.note_tool_timings();
-    model.note_edit_anchors();
-    assert_eq!(model.edit_anchors.get("e1"), Some(&vec![None]));
     let frame = draw(&model, 118, 36);
     assert!(
-        frame.contains("- old") && frame.contains("+ NEW"),
+        frame.contains("3 - old") && frame.contains("3 + NEW"),
         "{}",
         frame.rows.join("\n")
-    );
-    assert!(
-        !frame.contains("3 + NEW"),
-        "never numbered from the moved file"
     );
 }
 
@@ -1399,14 +1377,7 @@ fn an_execution_envelope_shows_its_output_not_its_json() {
         "FIRST_ENVELOPE_LINE\n{}LAST_ENVELOPE_LINE\n",
         "n\n".repeat(40)
     );
-    let envelope = serde_json::json!({
-        "artifact": "blake3:0123456789abcdef0123456789abcdef",
-        "exit_code": 0,
-        "limit_reached": null,
-        "output": output,
-        "status": "completed",
-    })
-    .to_string();
+    let envelope = exec_envelope(&output, serde_json::Value::Null);
     push_tool(
         &mut model,
         "env",
@@ -1430,8 +1401,7 @@ fn an_execution_envelope_shows_its_output_not_its_json() {
     assert!(!text.contains("output limit"), "{text}");
     // An envelope whose tool hit its limit says so.
     let mut limited = session_model();
-    let envelope =
-        serde_json::json!({"limit_reached": "max_output_bytes", "output": "partial\n"}).to_string();
+    let envelope = exec_envelope("partial\n", serde_json::json!("max_output_bytes"));
     push_tool(
         &mut limited,
         "lim",
@@ -1471,11 +1441,7 @@ fn an_execution_envelope_shows_its_output_not_its_json() {
     // A workspace write/edit result IS an envelope: its sentence is shown,
     // not its digests (live finding, repair 3).
     let mut edit = session_model();
-    let body = serde_json::json!({
-        "mutation_digest": "blake3:feedface",
-        "result": "edited notes.md (2 replacements)",
-    })
-    .to_string();
+    let body = mutation_envelope("edited notes.md (2 replacements)");
     push_tool(
         &mut edit,
         "edit",
@@ -1492,49 +1458,90 @@ fn an_execution_envelope_shows_its_output_not_its_json() {
         view.rows.join("\n")
     );
     assert!(!view.contains("blake3:feedface"));
-}
-
-/// Verify 3's live repro, end to end through the real anchor path: a
-/// boundary-newline deletion followed by `c → C` is shown UNNUMBERED.
-#[test]
-fn the_boundary_newline_edit_is_shown_unnumbered() {
-    let dir = tempfile::tempdir().unwrap();
-    // The file as the edit left it: `a\nb\nc\n` → `ab\nC\n`.
-    std::fs::write(dir.path().join("boundary.txt"), "ab\nC\n").unwrap();
-    let mut model = session_model();
-    model.cwd = dir.path().display().to_string();
-    model.clock_ms = 1_700_000_000_000;
-    let args = serde_json::json!({
-        "path": "boundary.txt",
-        "edits": [{"old": "a\n", "new": "a"}, {"old": "c", "new": "C"}],
-    });
-    apply(
-        &mut model,
-        EventPayload::Item(ItemEvent::Started {
-            item_id: ItemId::new("eb"),
-            item: tool("eb", "fs_edit", args.clone(), ToolStatus::InProgress),
-        }),
+    // Verify 4: unwrapping is by the envelope's SHAPE, not the tool's name —
+    // `fs_path` (mutation envelope) and `test_run` (execution envelope with
+    // its test summary) render their text with no digests or capture ids.
+    let mut path = session_model();
+    push_tool(
+        &mut path,
+        "mv",
+        "fs_path",
+        serde_json::json!({"operation": "move", "source": "a.md", "destination": "b.md"}),
+        "",
+        ok(&mutation_envelope("moved a.md to b.md")),
     );
-    model.note_tool_timings();
-    apply(
-        &mut model,
-        EventPayload::Item(ItemEvent::Completed {
-            item_id: ItemId::new("eb"),
-            item: tool("eb", "fs_edit", args, ToolStatus::Completed),
-        }),
-    );
-    model.clock_ms += 20;
-    model.note_tool_timings();
-    model.note_edit_anchors();
-    assert_eq!(model.edit_anchors.get("eb"), Some(&vec![None, None]));
-    let frame = draw(&model, 118, 36);
-    let text = frame.rows.join("\n");
+    assert!(path.open_tool_detail("mv"));
+    let view = draw(&path, 118, 36);
+    let text = view.rows.join("\n");
+    assert!(text.contains("moved a.md to b.md"), "{text}");
     assert!(
-        frame.contains("      - c") && frame.contains("      + C"),
+        !text.contains("blake3:") && !text.contains("effect-9"),
         "{text}"
     );
-    assert!(
-        !text.contains("2 - c") && !text.contains("3 - c"),
-        "never numbered: {text}"
+    let mut tests = session_model();
+    let mut envelope: serde_json::Value = serde_json::from_str(&exec_envelope(
+        "test result: ok. 3 passed\n",
+        serde_json::Value::Null,
+    ))
+    .unwrap();
+    envelope["test_summary"] =
+        serde_json::json!({"format": "cargo", "counts": {"passed": 3}, "failing_tests": []});
+    push_tool(
+        &mut tests,
+        "tr",
+        "test_run",
+        serde_json::json!({"command": "cargo test"}),
+        "",
+        ok(&envelope.to_string()),
     );
+    let collapsed = draw(&tests, 118, 36);
+    assert!(
+        collapsed.contains("test result: ok. 3 passed"),
+        "{}",
+        collapsed.rows.join("\n")
+    );
+    assert!(tests.open_tool_detail("tr"));
+    let text = draw(&tests, 118, 36).rows.join("\n");
+    assert!(
+        !text.contains("blake3:") && !text.contains("capture:"),
+        "{text}"
+    );
+    // …and a READ of a file that happens to hold envelope-like keys is
+    // content: shown exactly (verify 4's data.json).
+    let mut read = session_model();
+    let file = r#"{"output":"INNER_OUTPUT","other":"KEEP_ME","mutation_digest":"FILEDATA"}"#;
+    push_tool(
+        &mut read,
+        "rd",
+        "fs_read",
+        serde_json::json!({"path": "data.json"}),
+        "",
+        ok(file),
+    );
+    assert!(read.open_tool_detail("rd"));
+    assert!(draw(&read, 118, 36).contains(file));
+}
+
+/// Verify 3's boundary case with the tool's measured spans: `c` was line 3
+/// before the edit and `C` is line 2 after it — both shown TRUE.
+#[test]
+fn the_boundary_newline_edit_shows_its_measured_numbers() {
+    let mut model = session_model();
+    push_tool(
+        &mut model,
+        "eb",
+        "fs_edit",
+        serde_json::json!({
+            "path": "boundary.txt",
+            "edits": [{"old": "a\n", "new": "a"}, {"old": "c", "new": "C"}],
+        }),
+        "",
+        ok_edit(
+            "edited boundary.txt (2 replacements)",
+            vec![span(0, Some(1), Some(1)), span(1, Some(3), Some(2))],
+        ),
+    );
+    let frame = draw(&model, 118, 36);
+    let text = frame.rows.join("\n");
+    assert!(frame.contains("3 - c") && frame.contains("2 + C"), "{text}");
 }

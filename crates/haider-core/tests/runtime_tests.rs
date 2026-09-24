@@ -7824,6 +7824,7 @@ async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_r
             path: "before.txt".into(),
             absolute_path: "/workspace/before.txt".into(),
             bytes: 14,
+            edit_spans: Vec::new(),
         },
         ToolFileEffect {
             kind: ToolFileEffectKind::Create,
@@ -7831,6 +7832,7 @@ async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_r
             path: "after.txt".into(),
             absolute_path: "/workspace/after.txt".into(),
             bytes: 14,
+            edit_spans: Vec::new(),
         },
     ];
     let dispatcher = Arc::new(AppliedFailureDispatcher {
