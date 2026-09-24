@@ -5,12 +5,17 @@
 //!
 //! * An explicit account alias (a session/run pinned with `--account`) is
 //!   honoured exactly — it is the only attempt, healthy or not.
-//! * Otherwise the attempts are: the active default when it is healthy, else
-//!   the first healthy account of the provider; then every other healthy
-//!   account in store order. A dead default is used only when no healthy
+//! * Otherwise the attempts are: the active default when it is usable, else
+//!   the first usable account of the provider; then every other usable
+//!   account in store order. A dead default is used only when no usable
 //!   account exists, solely to surface an actionable error.
-//! * "Healthy" here means [`CredentialStatus::Ok`] with the catalog's
-//!   required auth method.
+//! * "Usable" here means [`CredentialStatus::Ok`] or rate-limited
+//!   [`CredentialStatus::Limited`] with the catalog's required auth method
+//!   (OAuth catalogs need an OAuth account, API-key catalogs an API key).
+//!   Quota does not control model-list access; expired, revoked and
+//!   needs-attention (e.g. forbidden) accounts are skipped. The same
+//!   predicate decides whether an explicit account's failure leaves another
+//!   usable account for the provider.
 //!
 //! Only the catalog credential falls back. The provider default and any
 //! session's pinned account are never changed by this module.
@@ -23,14 +28,17 @@
 use super::*;
 
 /// Whether `descriptor` may serve a fallback catalog refresh for `provider`.
-fn is_healthy_catalog_account(
+fn is_usable_catalog_account(
     descriptor: &CredentialDescriptor,
     provider: &str,
     expected_auth: AuthMethod,
 ) -> bool {
     descriptor.provider == provider
         && descriptor.auth_method == expected_auth
-        && descriptor.status == CredentialStatus::Ok
+        && matches!(
+            descriptor.status,
+            CredentialStatus::Ok | CredentialStatus::Limited { .. }
+        )
 }
 
 /// The primary account for a refresh (see the module rule), validated
@@ -52,10 +60,10 @@ fn model_refresh_descriptor<'a>(
     } else {
         accounts
             .active_for_provider(provider)
-            .filter(|descriptor| is_healthy_catalog_account(descriptor, provider, expected_auth))
+            .filter(|descriptor| is_usable_catalog_account(descriptor, provider, expected_auth))
             .or_else(|| {
                 accounts.list().iter().find(|descriptor| {
-                    is_healthy_catalog_account(descriptor, provider, expected_auth)
+                    is_usable_catalog_account(descriptor, provider, expected_auth)
                 })
             })
             .or_else(|| accounts.active_for_provider(provider))
@@ -118,7 +126,7 @@ pub(super) fn model_refresh_candidates(
                 .iter()
                 .filter(|candidate| {
                     candidate.alias != primary.alias
-                        && is_healthy_catalog_account(candidate, provider, expected_auth)
+                        && is_usable_catalog_account(candidate, provider, expected_auth)
                 })
                 .cloned(),
         );
@@ -133,11 +141,18 @@ pub(super) fn provider_has_other_usable_account(
     accounts: &AccountStore<Box<dyn StoreLike>>,
     provider: &str,
     selected: &CredentialAlias,
+    requirement: &ProviderAuthRequirementWire,
 ) -> bool {
+    let expected_auth = match requirement {
+        ProviderAuthRequirementWire::OAuth => AuthMethod::OAuth,
+        ProviderAuthRequirementWire::ApiKey => AuthMethod::ApiKey,
+        // A catalog without a credential requirement has no account-specific
+        // failure to isolate.
+        _ => return false,
+    };
     accounts.list().iter().any(|descriptor| {
-        descriptor.provider == provider
-            && descriptor.alias != *selected
-            && descriptor.status == CredentialStatus::Ok
+        descriptor.alias != *selected
+            && is_usable_catalog_account(descriptor, provider, expected_auth)
     })
 }
 

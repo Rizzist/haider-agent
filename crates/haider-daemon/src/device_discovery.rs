@@ -188,6 +188,8 @@ struct CodexClaims {
     #[serde(default)]
     exp: Option<u64>,
     #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
     email: Option<String>,
     #[serde(default)]
     chatgpt_account_id: Option<String>,
@@ -399,6 +401,7 @@ fn linked_codex_material(
         .and_then(|token| decode_jwt::<CodexClaims>(&token.0))
         .unwrap_or_default();
     let email = id.email.and_then(nonempty);
+    let user = id.sub.and_then(nonempty);
     let account_id = id
         .chatgpt_account_id
         .and_then(nonempty)
@@ -425,7 +428,9 @@ fn linked_codex_material(
     let identity = AccountIdentity {
         email,
         display_name: None,
-        account_id: account_id.clone(),
+        account_id: user.map(|user| {
+            haider_provider::openai_user_account_coordinate(&user, account_id.as_deref())
+        }),
         plan,
         issuer: Some("https://auth.openai.com".to_owned()),
         captured_at,
@@ -435,7 +440,10 @@ fn linked_codex_material(
     let expires_at_ms = expires_at_ms.ok_or(LinkedSourceReadFailure::MissingFields)?;
     let observed_at_ms = now_ms().ok_or(LinkedSourceReadFailure::Invalid)?;
     let generation = last_refreshed_at_ms.unwrap_or(1).max(1);
-    let subject = account_id.as_deref().unwrap_or(display_identity.as_str());
+    let subject = identity
+        .account_id
+        .as_deref()
+        .unwrap_or(display_identity.as_str());
     let bundle = OAuthTokenBundleV1::new(
         haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         "https://auth.openai.com".to_owned(),
@@ -888,6 +896,7 @@ fn discover_codex() -> Option<DeviceCandidate> {
         .and_then(|token| decode_jwt::<CodexClaims>(&token.0))
         .unwrap_or_default();
     let email = legacy_identity.email.and_then(nonempty);
+    let user = legacy_identity.sub.and_then(nonempty);
     let account_id = legacy_identity
         .chatgpt_account_id
         .and_then(nonempty)
@@ -917,10 +926,14 @@ fn discover_codex() -> Option<DeviceCandidate> {
                 .flatten()
         })
         .or_else(|| {
-            (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
+            (email.is_some() || account_id.is_some() || user.is_some()).then(|| AccountIdentity {
                 email,
                 display_name: None,
-                account_id,
+                // The fallback has no stable coordinate without a user sub:
+                // a workspace id alone is shared by multiple members.
+                account_id: user.map(|user| {
+                    haider_provider::openai_user_account_coordinate(&user, account_id.as_deref())
+                }),
                 plan: None,
                 issuer: Some("https://auth.openai.com".to_owned()),
                 captured_at,

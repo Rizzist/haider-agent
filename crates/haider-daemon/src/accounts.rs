@@ -124,6 +124,8 @@ const STATUS_DEVICE_DISCOVERY_TTL: Duration = Duration::from_secs(30);
 const SOURCE_EVENT_COALESCE: Duration = Duration::from_millis(100);
 const SOURCE_RECONCILE_BASE: Duration = Duration::from_secs(15);
 const SOURCE_RECONCILE_JITTER_MAX_MS: u64 = 5_000;
+const OAUTH_STAGE_MARKER: &[u8] = b"HAIDER_OAUTH_STAGE\x01";
+const OAUTH_STAGE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn source_reconcile_period(profile_id: &str) -> Duration {
     let digest = blake3::hash(profile_id.as_bytes());
@@ -1760,7 +1762,23 @@ async fn run_account_actor(
         .then(|| CredentialSourceWatcher::new(&source_registry, source_event_tx.clone()));
     let _source_event_tx = source_event_tx;
     let mut draining = false;
-    if backfill_oauth_identities(&mut accounts, vault.as_ref()).await {
+    sweep_abandoned_oauth_stages(vault.as_ref(), &accounts);
+    let mut identities_changed = backfill_oauth_identities(&mut accounts, vault.as_ref()).await;
+    identities_changed |= upgrade_legacy_openai_identities(
+        &mut accounts,
+        vault.as_ref(),
+        &refresh_fences,
+        IdentityUpgradeScope::Startup,
+    );
+    identities_changed |= upgrade_legacy_anthropic_identities(
+        &mut accounts,
+        vault.as_ref(),
+        &refresh_fences,
+        &ProductionLegacyAnthropicProfile,
+        IdentityUpgradeScope::Startup,
+    )
+    .await;
+    if identities_changed {
         refresh_resolver_snapshot(&snapshot, &accounts);
         let _ = publish_next_management_revision(&store, &snapshot, management.as_ref(), &accounts)
             .await;
@@ -1916,6 +1934,7 @@ async fn run_account_actor(
                     &source_snapshot,
                     &profile_id,
                     &reserved_aliases,
+                    &refresh_fences,
                     *job,
                 )
                 .await;
@@ -2256,6 +2275,8 @@ async fn run_account_actor(
                     &store,
                     &mut accounts,
                     vault.as_ref(),
+                    &refresh_fences,
+                    &ProductionLegacyAnthropicProfile,
                     &snapshot,
                     management.as_ref(),
                     *job,
@@ -2647,6 +2668,247 @@ async fn backfill_oauth_identities(
     changed
 }
 
+/// A pre-973 Claude row carries a synthetic token hash rather than an account
+/// coordinate. Probe only that row's own unexpired access token and retain all
+/// rows and vault slots; duplicate hints provide the explicit merge path.
+#[async_trait::async_trait]
+trait LegacyAnthropicProfileSource: Send + Sync {
+    async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity>;
+}
+
+struct ProductionLegacyAnthropicProfile;
+
+#[async_trait::async_trait]
+impl LegacyAnthropicProfileSource for ProductionLegacyAnthropicProfile {
+    async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+        crate::oauth::legacy_anthropic_profile_identity(access_token).await
+    }
+}
+
+/// When a legacy identity upgrade runs. An upgrade rewrites the vaulted
+/// bundle with a higher generation and advances the refresh fence. While the
+/// daemon runs, a row whose refresh is in flight is durably `Expired`
+/// (`begin_oauth_refresh`); upgrading it then would make that refresh's
+/// commit stale and strand a rotated token, so live upgrades skip `Expired`
+/// rows. At actor startup no refresh can be in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityUpgradeScope {
+    Startup,
+    Live,
+}
+
+fn identity_upgrade_permitted(row: &CredentialDescriptor, scope: IdentityUpgradeScope) -> bool {
+    match row.status {
+        CredentialStatus::Revoked => false,
+        CredentialStatus::Expired => scope == IdentityUpgradeScope::Startup,
+        CredentialStatus::Ok
+        | CredentialStatus::Limited { .. }
+        | CredentialStatus::NeedsAttention { .. } => true,
+    }
+}
+
+/// Wall-clock budget for each legacy Claude profile probe. A pass probes its
+/// rows concurrently, so a slow or offline profile endpoint delays the
+/// account actor by at most this much; unfinished rows retry next time.
+const LEGACY_PROFILE_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+async fn upgrade_legacy_anthropic_identities(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    refresh_fences: &RefreshFenceRegistry,
+    profile: &dyn LegacyAnthropicProfileSource,
+    scope: IdentityUpgradeScope,
+) -> bool {
+    let probes = accounts
+        .list()
+        .iter()
+        .filter(|row| is_legacy_anthropic_row(row, scope))
+        .filter_map(|row| {
+            legacy_anthropic_access_token(vault, &row.alias).map(|token| (row.alias.clone(), token))
+        })
+        .collect::<Vec<_>>();
+    if probes.is_empty() {
+        return false;
+    }
+    // Concurrent probes, each bounded: a pass takes at most one budget and
+    // keeps every probe that finished in time.
+    let identities =
+        futures_util::future::join_all(probes.iter().map(|(alias, token)| async move {
+            let identity =
+                tokio::time::timeout(LEGACY_PROFILE_PROBE_BUDGET, profile.identity(token))
+                    .await
+                    .ok()
+                    .flatten();
+            (alias.clone(), identity)
+        }))
+        .await;
+    let mut changed = false;
+    for (alias, identity) in identities {
+        if let Some(identity) = identity {
+            changed |= apply_legacy_anthropic_identity(
+                accounts,
+                vault,
+                refresh_fences,
+                &alias,
+                identity,
+                scope,
+            );
+        }
+    }
+    changed
+}
+
+fn is_legacy_anthropic_row(row: &CredentialDescriptor, scope: IdentityUpgradeScope) -> bool {
+    row.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
+        && row.auth_method == AuthMethod::OAuth
+        && identity_upgrade_permitted(row, scope)
+        && row
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref())
+            .is_some_and(|id| id.starts_with("anthropic:"))
+}
+
+/// The row's own still-valid access token, the only credential its profile
+/// probe may use.
+fn legacy_anthropic_access_token(
+    vault: &dyn Vault,
+    alias: &CredentialAlias,
+) -> Option<Zeroizing<Vec<u8>>> {
+    let secret = vault.resolve(alias).ok()?;
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret()).ok()?;
+    (bundle.expires_at_unix_ms > unix_ms_after(Duration::ZERO))
+        .then(|| Zeroizing::new(bundle.access_token().to_vec()))
+}
+
+async fn upgrade_legacy_anthropic_alias(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    refresh_fences: &RefreshFenceRegistry,
+    profile: &dyn LegacyAnthropicProfileSource,
+    alias: &CredentialAlias,
+    scope: IdentityUpgradeScope,
+) -> bool {
+    if !accounts
+        .get(alias)
+        .is_some_and(|row| is_legacy_anthropic_row(row, scope))
+    {
+        return false;
+    }
+    let Some(token) = legacy_anthropic_access_token(vault, alias) else {
+        return false;
+    };
+    let Ok(Some(identity)) =
+        tokio::time::timeout(LEGACY_PROFILE_PROBE_BUDGET, profile.identity(&token)).await
+    else {
+        return false;
+    };
+    apply_legacy_anthropic_identity(accounts, vault, refresh_fences, alias, identity, scope)
+}
+
+/// Record a verified profile identity in the row's vaulted bundle (so a later
+/// refresh keeps it) and in its descriptor. Credentials are never removed;
+/// duplicates this reveals are flagged for explicit removal.
+fn apply_legacy_anthropic_identity(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    refresh_fences: &RefreshFenceRegistry,
+    alias: &CredentialAlias,
+    identity: AccountIdentity,
+    scope: IdentityUpgradeScope,
+) -> bool {
+    if !accounts
+        .get(alias)
+        .is_some_and(|row| is_legacy_anthropic_row(row, scope))
+    {
+        return false;
+    }
+    let Ok(secret) = vault.resolve(alias) else {
+        return false;
+    };
+    let Ok(mut bundle) = haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret()) else {
+        return false;
+    };
+    let Some(generation) = bundle.generation.checked_add(1) else {
+        return false;
+    };
+    bundle.account_identity = Some(identity.clone());
+    bundle.generation = generation;
+    let Ok(encoded) = bundle.encode() else {
+        return false;
+    };
+    if vault.put(alias, &encoded).is_err() {
+        return false;
+    }
+    refresh_fences.invalidate(alias);
+    accounts.set_identity(alias, Some(identity)).is_ok()
+}
+
+fn upgrade_legacy_openai_identities(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    refresh_fences: &RefreshFenceRegistry,
+    scope: IdentityUpgradeScope,
+) -> bool {
+    let aliases = accounts
+        .list()
+        .iter()
+        .filter(|row| {
+            row.provider == OPENAI_OAUTH_PROVIDER_NAME
+                && row.auth_method == AuthMethod::OAuth
+                && identity_upgrade_permitted(row, scope)
+                && !row
+                    .account_identity
+                    .as_ref()
+                    .and_then(|identity| identity.account_id.as_deref())
+                    .is_some_and(|id| id.starts_with("user:"))
+        })
+        .map(|row| row.alias.clone())
+        .collect::<Vec<_>>();
+    let Some(source) = haider_provider::oauth_identity_source(OPENAI_OAUTH_PROVIDER_NAME) else {
+        return false;
+    };
+    let mut changed = false;
+    for alias in aliases {
+        let Ok(secret) = vault.resolve(&alias) else {
+            continue;
+        };
+        let Ok(mut bundle) = haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret())
+        else {
+            continue;
+        };
+        let Ok(Some(identity)) = source.identity_from_tokens(&haider_provider::OAuthTokens {
+            access_token: bundle.access_token(),
+            refresh_token: bundle.refresh_token(),
+            id_token: bundle.id_token(),
+            captured_at: unix_ms_after(Duration::ZERO),
+        }) else {
+            continue;
+        };
+        if !identity
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("user:"))
+        {
+            continue;
+        }
+        bundle.account_identity = Some(identity.clone());
+        let Some(generation) = bundle.generation.checked_add(1) else {
+            continue;
+        };
+        bundle.generation = generation;
+        if let Ok(encoded) = bundle.encode()
+            && vault.put(&alias, &encoded).is_ok()
+        {
+            refresh_fences.invalidate(&alias);
+            if accounts.set_identity(&alias, Some(identity)).is_ok() {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 fn adoption_notice(
     candidate: &haider_rpc::DeviceCredentialCandidateWire,
     accounts: &[CredentialDescriptor],
@@ -2663,7 +2925,16 @@ fn adoption_notice(
                 .account_identity
                 .as_ref()
                 .zip(identity)
-                .is_some_and(|(existing, candidate)| account_identities_match(candidate, existing))
+                .is_some_and(|(existing, identity)| {
+                    if candidate.provider == OPENAI_OAUTH_PROVIDER_NAME {
+                        descriptor
+                            .principal()
+                            .zip(AccountPrincipal::new(&candidate.provider, Some(identity)))
+                            .is_some_and(|(left, right)| left.same_account(right))
+                    } else {
+                        account_identities_match(identity, existing)
+                    }
+                })
     });
     (!already_present).then(|| haider_rpc::AccountAdoptionAvailable {
         source: candidate.source.clone(),
@@ -2672,18 +2943,15 @@ fn adoption_notice(
 }
 
 fn account_identities_match(candidate: &AccountIdentity, existing: &AccountIdentity) -> bool {
-    if candidate
+    if let Some((candidate, existing)) = candidate
         .account_id
         .as_deref()
         .zip(existing.account_id.as_deref())
-        .is_some_and(|(candidate, existing)| candidate == existing)
-        || candidate
-            .email
-            .as_deref()
-            .zip(existing.email.as_deref())
-            .is_some_and(|(candidate, existing)| candidate.eq_ignore_ascii_case(existing))
     {
-        return true;
+        return candidate == existing;
+    }
+    if let Some((candidate, existing)) = candidate.email.as_deref().zip(existing.email.as_deref()) {
+        return AccountIdentity::emails_match(candidate, existing);
     }
     // Claude Code currently exposes only a provider-normalized subscription
     // identity. Match that complete available tuple, but never let it
@@ -3103,7 +3371,14 @@ async fn finish_provider_models_refresh(
     let preserve_global_inventory = explicit_account
         && result.is_account_specific_failure()
         && account_alias.is_some_and(|selected| {
-            provider_has_other_usable_account(accounts, &provider, selected)
+            providers.get(&provider).is_some_and(|profile| {
+                provider_has_other_usable_account(
+                    accounts,
+                    &provider,
+                    selected,
+                    &profile.auth_requirement,
+                )
+            })
         });
     if let Some(reason) = failure_reason.filter(|_| !preserve_global_inventory) {
         providers.models_unavailable(&provider, reason);
@@ -4051,15 +4326,30 @@ async fn handle_set_label(
 /// Rebuilds public identity from the credential already inside Haider's
 /// vault. OAuth providers all pass through the provider-owned abstraction;
 /// no token bytes enter the response, receipt, or diagnostic path.
+#[allow(clippy::too_many_arguments)]
 async fn handle_refresh_identity(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
+    refresh_fences: &RefreshFenceRegistry,
+    anthropic_profile: &dyn LegacyAnthropicProfileSource,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
     job: RefreshIdentityJob,
 ) {
     let alias = CredentialAlias::new(job.alias.trim());
+    // The focused path reaches legacy rows beyond those present at startup.
+    // Persist the profile-derived coordinate in the vault before rebuilding
+    // the public descriptor, so a later refresh cannot restore the hash id.
+    upgrade_legacy_anthropic_alias(
+        accounts,
+        vault,
+        refresh_fences,
+        anthropic_profile,
+        &alias,
+        IdentityUpgradeScope::Live,
+    )
+    .await;
     let Some(current) = accounts
         .list()
         .iter()
@@ -6582,6 +6872,7 @@ async fn handle_oauth_add(
     source_snapshot: &AccountSourcesSnapshot,
     _profile_id: &str,
     reserved_aliases: &HashSet<String>,
+    refresh_fences: &RefreshFenceRegistry,
     job: OAuthAddJob,
 ) {
     let OAuthAddJob {
@@ -6695,7 +6986,7 @@ async fn handle_oauth_add(
         .await;
         return;
     }
-    let (bundle, resumed_from_staging) = if resume {
+    let (mut bundle, resumed_from_staging) = if resume {
         let stored = match resolve_optional_vault_secret(Arc::clone(&vault), &staging_alias).await {
             Ok(Some(stored)) => Some((stored, true)),
             Ok(None) => {
@@ -6731,7 +7022,12 @@ async fn handle_oauth_add(
             );
             return;
         };
-        let bundle = match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+        let encoded = if from_staging {
+            oauth_stage_payload(stored.expose_secret())
+        } else {
+            stored.expose_secret()
+        };
+        let bundle = match haider_accounts::OAuthTokenBundleV1::decode(encoded) {
             Ok(bundle) => bundle,
             Err(_) => {
                 respond_error(
@@ -6764,6 +7060,30 @@ async fn handle_oauth_add(
             false,
         );
         return;
+    }
+    if identity.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
+        && upgrade_legacy_anthropic_identities(
+            accounts,
+            vault.as_ref(),
+            refresh_fences,
+            &ProductionLegacyAnthropicProfile,
+            IdentityUpgradeScope::Live,
+        )
+        .await
+    {
+        refresh_resolver_snapshot(snapshot, accounts);
+        let _ = publish_next_management_revision(store, snapshot, management, accounts).await;
+    }
+    if identity.provider == OPENAI_OAUTH_PROVIDER_NAME
+        && upgrade_legacy_openai_identities(
+            accounts,
+            vault.as_ref(),
+            refresh_fences,
+            IdentityUpgradeScope::Live,
+        )
+    {
+        refresh_resolver_snapshot(snapshot, accounts);
+        let _ = publish_next_management_revision(store, snapshot, management, accounts).await;
     }
     let alias = oauth_alias_for_identity(accounts, &identity.provider, &requested_alias, &bundle);
     if reserved_aliases.contains(alias.as_str()) {
@@ -6800,6 +7120,29 @@ async fn handle_oauth_add(
             return;
         }
     };
+    if accounts.get(&alias).is_some()
+        && let Some(previous) = prior_secret.as_ref()
+    {
+        let previous = match haider_accounts::OAuthTokenBundleV1::decode(previous.expose_secret()) {
+            Ok(previous) => previous,
+            Err(error) => {
+                respond_management_error(&route, &error);
+                return;
+            }
+        };
+        bundle.generation = match previous.generation.checked_add(1) {
+            Some(next) => bundle.generation.max(next),
+            None => {
+                respond_error(
+                    &route,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    "OAuth token generation is exhausted",
+                    false,
+                );
+                return;
+            }
+        };
+    }
     if let Err(error) = persist_oauth_bundle(
         accounts,
         Arc::clone(&vault),
@@ -6819,6 +7162,9 @@ async fn handle_oauth_add(
         );
         return;
     }
+    // The actor serializes refresh commits. Advance the fence before it can
+    // process a stale refresh response from the old token lineage.
+    refresh_fences.invalidate(&alias);
     if let Err(error) =
         promote_linked_alias_to_haider_oauth(source_registry, source_snapshot, accounts, &alias)
     {
@@ -7382,6 +7728,19 @@ async fn handle_oauth_import_heal(
                 }
             }
         };
+    // The source now holds a provably different account (another member of
+    // the same workspace signed in to that CLI). Healing would hand this
+    // alias the other account's token; refresh with its own lineage instead.
+    if descriptor
+        .principal()
+        .zip(AccountPrincipal::new(
+            &descriptor.provider,
+            imported.bundle.account_identity.as_ref(),
+        ))
+        .is_some_and(|(current, incoming)| current.provably_different_account(incoming))
+    {
+        return Ok(OAuthImportHealResult::RefreshFallback { source });
+    }
     let live_owner = imported.claude_native_owner;
     if same_oauth_import(&current, &imported.bundle)
         && !matches!(descriptor.status, CredentialStatus::NeedsAttention { .. })
@@ -7545,7 +7904,7 @@ async fn handle_oauth_import(
             return;
         }
     };
-    let alias = match select_oauth_import_alias(
+    let mut alias = match select_oauth_import_alias(
         store,
         accounts,
         &job.command_id,
@@ -7565,16 +7924,16 @@ async fn handle_oauth_import(
         source: spec.source.to_owned(),
         alias: alias.as_str().to_owned(),
         provider: spec.provider.to_owned(),
-        candidate: receipt_candidate,
+        candidate: receipt_candidate.clone(),
     };
-    let request_json = match identity.canonical_json() {
+    let mut request_json = match identity.canonical_json() {
         Ok(json) => json,
         Err(error) => {
             respond_management_error(&job.route, &error);
             return;
         }
     };
-    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    let mut request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
     match store
         .management_receipt_preflight::<AccountAddReceiptResponse>(
             job.command_id.clone(),
@@ -7603,155 +7962,38 @@ async fn handle_oauth_import(
             return;
         }
     }
-    let resume = match store
-        .account_add_claim_receipt(job.command_id.clone(), request_digest, request_json)
-        .await
+    if let Err(error) = oauth_import_alias_available(store, reserved_aliases, &alias).await {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    // A pre-repair OpenAI row keyed on the shared workspace alone is not
+    // provably another member; recover its user subject first (offline, from
+    // its own vaulted ID token) so the retarget below can tell members apart.
+    if spec.provider == OPENAI_OAUTH_PROVIDER_NAME
+        && upgrade_legacy_openai_identities(
+            accounts,
+            vault.as_ref(),
+            refresh_fences,
+            IdentityUpgradeScope::Live,
+        )
     {
-        Ok(AccountAddClaim::Fresh) => false,
-        Ok(AccountAddClaim::ResumePending) => true,
-        Ok(AccountAddClaim::Committed(response)) => {
-            let revision = match store.account_add_receipts().await.ok().and_then(|rows| {
-                rows.into_iter()
-                    .find(|row| row.command_id == job.command_id)
-                    .and_then(|row| row.final_revision)
-            }) {
-                Some(revision) => revision,
-                None => {
-                    respond_management_error(
-                        &job.route,
-                        &HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            "committed OAuth import receipt has no revision",
-                            false,
-                        ),
-                    );
-                    return;
-                }
-            };
-            enqueue_catalog_discovery(
-                &response.descriptor.provider,
-                providers,
-                pending_catalog_discoveries,
-            );
-            respond(
-                &job.route,
-                oauth_import_response(response_kind, response.descriptor, revision),
-            );
-            return;
-        }
+        refresh_resolver_snapshot(snapshot, accounts);
+        let _ = publish_next_management_revision(store, snapshot, management, accounts).await;
+    }
+    let OAuthImportTarget {
+        mut replacing,
+        mut prior_secret,
+        mut prior_bundle,
+        generation,
+    } = match prepare_oauth_import_target(accounts, &vault, spec.provider, &alias).await {
+        Ok(target) => target,
         Err(error) => {
             respond_management_error(&job.route, &error);
             return;
         }
-    };
-    if reserved_aliases.contains(alias.as_str()) {
-        respond_management_error(
-            &job.route,
-            &HaiderError::new(
-                ErrorCode::Busy,
-                "account alias is reserved by pending removal cleanup",
-                true,
-            ),
-        );
-        return;
-    }
-    match alias_has_pending_login_reservation(store, &alias).await {
-        Ok(false) => {}
-        Ok(true) => {
-            respond_management_error(
-                &job.route,
-                &HaiderError::new(
-                    ErrorCode::Busy,
-                    "account alias is reserved by a pending login",
-                    true,
-                ),
-            );
-            return;
-        }
-        Err(error) => {
-            respond_management_error(&job.route, &error);
-            return;
-        }
-    }
-    let replacing = accounts.get(&alias).cloned();
-    if replacing.as_ref().is_some_and(|descriptor| {
-        descriptor.provider != spec.provider || descriptor.auth_method != AuthMethod::OAuth
-    }) {
-        respond_management_error(
-            &job.route,
-            &HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "credential alias `{alias}` is not a replaceable `{}` OAuth account",
-                    spec.provider
-                ),
-                false,
-            ),
-        );
-        return;
-    }
-    let prior_secret = if replacing.is_some() {
-        let vault_for_read = Arc::clone(&vault);
-        let alias_for_read = alias.clone();
-        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
-            Ok(Ok(stored)) => Some(stored),
-            // The descriptor row exists but its secret is GONE (a
-            // Keychain→file-vault upgrade, W5f-4; or a torn write). Re-import
-            // is exactly the recovery: proceed as if fresh — no prior bundle
-            // to increment a generation from, and the new secret restores the
-            // account. Any OTHER vault fault is real and still fails.
-            Ok(Err(error)) if error.code == ErrorCode::CredentialMissing => None,
-            Ok(Err(error)) => {
-                respond_management_error(&job.route, &error);
-                return;
-            }
-            Err(_) => {
-                respond_management_error(
-                    &job.route,
-                    &HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true),
-                );
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let prior_bundle = match prior_secret.as_ref() {
-        Some(stored) => match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
-            Ok(bundle) if bundle.provider_id == spec.provider => Some(bundle),
-            _ => {
-                respond_management_error(
-                    &job.route,
-                    &HaiderError::new(
-                        ErrorCode::Unauthorized,
-                        "stored OAuth token bundle is invalid; remove the account and import again",
-                        false,
-                    ),
-                );
-                return;
-            }
-        },
-        None => None,
-    };
-    let generation = match prior_bundle.as_ref() {
-        Some(bundle) => match bundle.generation.checked_add(1) {
-            Some(generation) => generation,
-            None => {
-                respond_management_error(
-                    &job.route,
-                    &HaiderError::new(
-                        ErrorCode::ProviderError,
-                        "OAuth token generation is exhausted",
-                        false,
-                    ),
-                );
-                return;
-            }
-        },
-        None => 1,
     };
     let source = spec.source.to_owned();
-    let imported = match preloaded_material {
+    let mut imported = match preloaded_material {
         Some(imported) if imported.bundle.generation == generation => imported,
         Some(_) => {
             respond_management_error(
@@ -7817,6 +8059,89 @@ async fn handle_oauth_import(
         );
         return;
     }
+    // Retarget before the receipt claim, so the committed receipt names the
+    // alias actually written: import provenance (heal, refresh ownership)
+    // follows that alias.
+    if let Some(target) = oauth_import_retarget(
+        accounts,
+        spec.provider,
+        &alias,
+        replacing.as_ref(),
+        &imported.bundle,
+    ) {
+        if let Err(error) = oauth_import_alias_available(store, reserved_aliases, &target).await {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        let retargeted =
+            match prepare_oauth_import_target(accounts, &vault, spec.provider, &target).await {
+                Ok(retargeted) => retargeted,
+                Err(error) => {
+                    respond_management_error(&job.route, &error);
+                    return;
+                }
+            };
+        let identity = OAuthImportIdentity {
+            source: spec.source.to_owned(),
+            alias: target.as_str().to_owned(),
+            provider: spec.provider.to_owned(),
+            candidate: receipt_candidate,
+        };
+        request_json = match identity.canonical_json() {
+            Ok(json) => json,
+            Err(error) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
+        };
+        request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        imported.bundle.generation = retargeted.generation;
+        replacing = retargeted.replacing;
+        prior_secret = retargeted.prior_secret;
+        prior_bundle = retargeted.prior_bundle;
+        alias = target;
+    }
+    let resume = match store
+        .account_add_claim_receipt(job.command_id.clone(), request_digest, request_json)
+        .await
+    {
+        Ok(AccountAddClaim::Fresh) => false,
+        Ok(AccountAddClaim::ResumePending) => true,
+        Ok(AccountAddClaim::Committed(response)) => {
+            let revision = match store.account_add_receipts().await.ok().and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| row.command_id == job.command_id)
+                    .and_then(|row| row.final_revision)
+            }) {
+                Some(revision) => revision,
+                None => {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "committed OAuth import receipt has no revision",
+                            false,
+                        ),
+                    );
+                    return;
+                }
+            };
+            enqueue_catalog_discovery(
+                &response.descriptor.provider,
+                providers,
+                pending_catalog_discoveries,
+            );
+            respond(
+                &job.route,
+                oauth_import_response(response_kind, response.descriptor, revision),
+            );
+            return;
+        }
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
     if resume
         && let Some(prior) = prior_bundle.as_ref()
         && same_oauth_import(prior, &imported.bundle)
@@ -7887,6 +8212,157 @@ async fn handle_oauth_import(
     .await;
 }
 
+/// An import may not write an alias that pending removal cleanup or a
+/// durable in-flight login has reserved.
+async fn oauth_import_alias_available(
+    store: &SqliteStoreHandle,
+    reserved_aliases: &HashSet<String>,
+    alias: &CredentialAlias,
+) -> Result<(), HaiderError> {
+    if reserved_aliases.contains(alias.as_str()) {
+        return Err(HaiderError::new(
+            ErrorCode::Busy,
+            "account alias is reserved by pending removal cleanup",
+            true,
+        ));
+    }
+    if alias_has_pending_login_reservation(store, alias).await? {
+        return Err(HaiderError::new(
+            ErrorCode::Busy,
+            "account alias is reserved by a pending login",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+/// The alias an import will write and what it replaces there.
+struct OAuthImportTarget {
+    replacing: Option<CredentialDescriptor>,
+    prior_secret: Option<SecretHandle>,
+    prior_bundle: Option<haider_accounts::OAuthTokenBundleV1>,
+    generation: u64,
+}
+
+async fn prepare_oauth_import_target(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    vault: &Arc<dyn Vault>,
+    provider: &str,
+    alias: &CredentialAlias,
+) -> Result<OAuthImportTarget, HaiderError> {
+    let replacing = accounts.get(alias).cloned();
+    if replacing.as_ref().is_some_and(|descriptor| {
+        descriptor.provider != provider || descriptor.auth_method != AuthMethod::OAuth
+    }) {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!("credential alias `{alias}` is not a replaceable `{provider}` OAuth account"),
+            false,
+        ));
+    }
+    let prior_secret = if replacing.is_some() {
+        let vault_for_read = Arc::clone(vault);
+        let alias_for_read = alias.clone();
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(stored)) => Some(stored),
+            // The descriptor row exists but its secret is GONE (a
+            // Keychain→file-vault upgrade, W5f-4; or a torn write). Re-import
+            // is exactly the recovery: proceed as if fresh — no prior bundle
+            // to increment a generation from, and the new secret restores the
+            // account. Any OTHER vault fault is real and still fails.
+            Ok(Err(error)) if error.code == ErrorCode::CredentialMissing => None,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth vault worker failed",
+                    true,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let prior_bundle = match prior_secret.as_ref() {
+        Some(stored) => match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+            Ok(bundle) if bundle.provider_id == provider => Some(bundle),
+            _ => {
+                return Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "stored OAuth token bundle is invalid; remove the account and import again",
+                    false,
+                ));
+            }
+        },
+        None => None,
+    };
+    let generation = match prior_bundle.as_ref() {
+        Some(bundle) => bundle.generation.checked_add(1).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::ProviderError,
+                "OAuth token generation is exhausted",
+                false,
+            )
+        })?,
+        None => 1,
+    };
+    Ok(OAuthImportTarget {
+        replacing,
+        prior_secret,
+        prior_bundle,
+        generation,
+    })
+}
+
+/// An import is source-bound: it normally rewrites the alias of that source's
+/// previous import. When the source now holds a *provably different* account
+/// (e.g. another member of the same ChatGPT workspace signed in to the Codex
+/// CLI), that alias must not be overwritten. The import goes to the row that
+/// already holds the incoming account, or to a fresh alias. Returns `None`
+/// when the selected alias is the right target.
+fn oauth_import_retarget(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+    alias: &CredentialAlias,
+    replacing: Option<&CredentialDescriptor>,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+) -> Option<CredentialAlias> {
+    let incoming = AccountPrincipal::new(provider, bundle.account_identity.as_ref())?;
+    let current = replacing?.principal()?;
+    if !current.provably_different_account(incoming) {
+        return None;
+    }
+    let matched = oauth_alias_for_identity(accounts, provider, alias, bundle);
+    if matched != *alias {
+        return Some(matched);
+    }
+    next_free_account_alias(accounts, alias.as_str()).ok()
+}
+
+/// `base`, else the first free `base-N` (N ≥ 2).
+fn next_free_account_alias(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    base: &str,
+) -> Result<CredentialAlias, HaiderError> {
+    let mut candidate = base.to_owned();
+    let mut suffix = 1_u32;
+    while accounts
+        .list()
+        .iter()
+        .any(|descriptor| descriptor.alias.as_str() == candidate)
+    {
+        suffix = suffix.checked_add(1).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "OAuth import alias suffix space is exhausted",
+                false,
+            )
+        })?;
+        candidate = format!("{base}-{suffix}");
+    }
+    Ok(CredentialAlias::new(candidate))
+}
+
 fn confirmed_source_matches(expected: Option<[u8; 32]>, actual: [u8; 32]) -> bool {
     expected.is_none_or(|expected| expected == actual)
 }
@@ -7948,23 +8424,7 @@ async fn select_oauth_import_alias(
         // below and force a suffixed import instead.
         return Ok(default);
     }
-    let mut candidate = default_alias.to_owned();
-    let mut suffix = 1_u32;
-    while accounts
-        .list()
-        .iter()
-        .any(|descriptor| descriptor.alias.as_str() == candidate)
-    {
-        suffix = suffix.checked_add(1).ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                "OAuth import alias suffix space is exhausted",
-                false,
-            )
-        })?;
-        candidate = format!("{default_alias}-{suffix}");
-    }
-    Ok(CredentialAlias::new(candidate))
+    next_free_account_alias(accounts, default_alias)
 }
 
 fn latest_oauth_receipt_identities(
@@ -8054,7 +8514,7 @@ fn oauth_alias_for_identity(
     let Some(principal) = AccountPrincipal::new(provider, bundle.account_identity.as_ref()) else {
         return requested_alias.clone();
     };
-    accounts
+    let matches = accounts
         .list()
         .iter()
         .filter(|descriptor| descriptor.auth_method == AuthMethod::OAuth)
@@ -8063,16 +8523,109 @@ fn oauth_alias_for_identity(
                 .principal()
                 .is_some_and(|prior| prior.same_account(principal))
         })
-        .min_by_key(|descriptor| descriptor.alias != *requested_alias)
-        .map_or_else(
-            || requested_alias.clone(),
-            |descriptor| descriptor.alias.clone(),
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return requested_alias.clone();
+    }
+    let exact = matches
+        .iter()
+        .copied()
+        .filter(|row| {
+            row.account_identity
+                .as_ref()
+                .and_then(|identity| identity.account_id.as_deref())
+                .zip(
+                    bundle
+                        .account_identity
+                        .as_ref()
+                        .and_then(|identity| identity.account_id.as_deref()),
+                )
+                .is_some_and(|(left, right)| left == right)
+        })
+        .min_by_key(|row| row.alias != *requested_alias);
+    // Multiple exact-id rows are existing duplicates, not a reason to add a
+    // third credential. Keep all other rows for explicit operator removal.
+    if let Some(exact) = exact {
+        return exact.alias.clone();
+    }
+    if matches.len() != 1 {
+        return requested_alias.clone();
+    }
+    let matched = matches[0];
+    // An email-only legacy row is a bridge only while its email names a
+    // single stable account. Otherwise the bridge could bind either account
+    // and is left for explicit resolution.
+    if let Some(email) = matched
+        .account_identity
+        .as_ref()
+        .filter(|identity| identity.account_id.is_none())
+        .and_then(|identity| identity.email.as_deref())
+        && AccountIdentity::email_names_several_accounts(
+            email,
+            accounts
+                .list()
+                .iter()
+                .filter(|row| row.provider == provider)
+                .filter_map(|row| row.account_identity.as_ref())
+                .chain(bundle.account_identity.as_ref()),
         )
+    {
+        return requested_alias.clone();
+    }
+    matched.alias.clone()
 }
 
 fn oauth_staging_alias(command_id: &str) -> CredentialAlias {
     let digest = blake3::hash(command_id.as_bytes()).to_hex().to_string();
     CredentialAlias::new(format!("__oauth_stage_{}", &digest[..24]))
+}
+
+fn oauth_stage_payload(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_prefix(OAUTH_STAGE_MARKER)
+        .and_then(|tail| tail.get(8..))
+        .unwrap_or(bytes)
+}
+
+fn sweep_abandoned_oauth_stages(vault: &dyn Vault, accounts: &AccountStore<Box<dyn StoreLike>>) {
+    let Ok(aliases) = vault.list() else { return };
+    let now = unix_ms_after(Duration::ZERO);
+    for alias in aliases {
+        let name = alias.as_str();
+        let Some(suffix) = name.strip_prefix("__oauth_stage_") else {
+            continue;
+        };
+        if suffix.len() != 24
+            || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || accounts.get(&alias).is_some()
+        {
+            continue;
+        }
+        let Ok(stored) = vault.resolve(&alias) else {
+            continue;
+        };
+        if haider_accounts::OAuthTokenBundleV1::decode(oauth_stage_payload(stored.expose_secret()))
+            .is_err()
+        {
+            // An internal-looking alias alone does not authorize deleting an
+            // unrelated vault value.
+            continue;
+        }
+        let created = stored
+            .expose_secret()
+            .strip_prefix(OAUTH_STAGE_MARKER)
+            .and_then(|tail| tail.get(..8))
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes);
+        // Pre-timestamp stages cannot be dated and belong to a prior daemon
+        // process. A pending receipt can ask the user to restage safely.
+        if created.is_none_or(|created| {
+            created > now.saturating_add(5 * 60 * 1000)
+                || now.saturating_sub(created) >= OAUTH_STAGE_MAX_AGE.as_millis() as u64
+        }) {
+            let _ = vault.delete(&alias);
+        }
+    }
 }
 
 fn promote_linked_alias_to_haider_oauth(
@@ -8125,8 +8678,14 @@ async fn put_oauth_staging(
     bundle: &haider_accounts::OAuthTokenBundleV1,
 ) -> Result<(), HaiderError> {
     let encoded = bundle.encode()?;
+    let mut stage = Zeroizing::new(Vec::with_capacity(
+        OAUTH_STAGE_MARKER.len() + 8 + encoded.len(),
+    ));
+    stage.extend_from_slice(OAUTH_STAGE_MARKER);
+    stage.extend_from_slice(&unix_ms_after(Duration::ZERO).to_le_bytes());
+    stage.extend_from_slice(&encoded);
     let alias = alias.clone();
-    tokio::task::spawn_blocking(move || vault.put(&alias, &encoded))
+    tokio::task::spawn_blocking(move || vault.put(&alias, &stage))
         .await
         .map_err(|_| {
             HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)

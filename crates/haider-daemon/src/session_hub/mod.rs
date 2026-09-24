@@ -914,6 +914,7 @@ struct LockdownTurnBinding {
 
 struct HubInner {
     provider_rebind_revision: Arc<AtomicU64>,
+    unavailable_catalog_backoff: Mutex<HashMap<String, rpc::UnavailableProbeBackoff>>,
     store: SqliteStoreHandle,
     append_committer: AppendCommitter,
     append_commit_task: Mutex<Option<JoinHandle<()>>>,
@@ -2473,6 +2474,7 @@ impl SessionHub {
         });
         let inner = Arc::new(HubInner {
             provider_rebind_revision: Arc::new(AtomicU64::new(0)),
+            unavailable_catalog_backoff: Mutex::new(HashMap::new()),
             store,
             append_committer,
             append_commit_task: Mutex::new(Some(append_commit_task)),

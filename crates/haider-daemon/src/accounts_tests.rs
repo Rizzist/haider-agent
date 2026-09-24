@@ -192,6 +192,8 @@ async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key(
         &store,
         &mut accounts,
         &vault,
+        &RefreshFenceRegistry::default(),
+        &ProductionLegacyAnthropicProfile,
         &snapshot,
         Some(&management),
         RefreshIdentityJob {
@@ -281,7 +283,10 @@ async fn startup_backfill_decodes_only_the_vaulted_id_token_without_network() {
         identity.email.as_deref(),
         Some("fake-person@example.invalid")
     );
-    assert_eq!(identity.account_id.as_deref(), Some("fake-account-id-1"));
+    assert_eq!(
+        identity.account_id, None,
+        "workspace-only JWT has no user dedupe key"
+    );
     assert!(!identity.verified);
 }
 
@@ -584,6 +589,688 @@ fn oauth_provider_without_stable_identity_keeps_requested_alias() {
         current.same_stable_principal(&legacy),
         "email bridges a legacy row that predates stable account-ID capture"
     );
+}
+
+#[test]
+fn email_only_bridge_does_not_merge_distinct_workspace_accounts() {
+    let mut accounts = memory_accounts();
+    for (alias, id, active) in [
+        ("legacy-email", None, true),
+        ("known-workspace", Some("user=a;workspace=one"), false),
+    ] {
+        let identity = stable_test_identity("owner@example.test", id);
+        accounts
+            .add(CredentialDescriptor {
+                alias: CredentialAlias::new(alias),
+                provider: "fake-oauth".to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::OAuth,
+                identity: identity.summary(),
+                status: CredentialStatus::Ok,
+                active,
+                label: None,
+                account_identity: Some(identity),
+                created_at_ms: None,
+            })
+            .expect("seed account");
+    }
+    let incoming = oauth_bundle().with_account_identity(stable_test_identity(
+        "owner@example.test",
+        Some("user=a;workspace=two"),
+    ));
+    let requested = CredentialAlias::new("new-workspace");
+    assert_eq!(
+        oauth_alias_for_identity(&accounts, "fake-oauth", &requested, &incoming),
+        requested
+    );
+}
+
+#[test]
+fn openai_same_workspace_relogin_matches_user_only() {
+    let mut accounts = memory_accounts();
+    let existing = CredentialAlias::new("openai-user-a");
+    let a = haider_provider::openai_user_account_coordinate("user-a", Some("team"));
+    let b = haider_provider::openai_user_account_coordinate("user-b", Some("team"));
+    accounts
+        .add(CredentialDescriptor {
+            alias: existing.clone(),
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "user-a@example.test".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: Some(stable_test_identity("user-a@example.test", Some(&a))),
+            created_at_ms: None,
+        })
+        .expect("seed first workspace member");
+    let requested = CredentialAlias::new("openai-new-login");
+    let same =
+        oauth_bundle().with_account_identity(stable_test_identity("user-a@example.test", Some(&a)));
+    assert_eq!(
+        oauth_alias_for_identity(&accounts, OPENAI_OAUTH_PROVIDER_NAME, &requested, &same),
+        existing
+    );
+    let other =
+        oauth_bundle().with_account_identity(stable_test_identity("user-b@example.test", Some(&b)));
+    assert_eq!(
+        oauth_alias_for_identity(&accounts, OPENAI_OAUTH_PROVIDER_NAME, &requested, &other),
+        requested
+    );
+}
+
+#[tokio::test]
+async fn openai_team_members_keep_separate_vault_rows_and_relogin_selects_existing_user() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, _management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    for (user, requested, expected) in [
+        ("user-a", "openai-member-a", "openai-member-a"),
+        ("user-b", "openai-member-b", "openai-member-b"),
+        ("user-b", "openai-member-b-again", "openai-member-b"),
+    ] {
+        let coordinate = haider_provider::openai_user_account_coordinate(user, Some("shared-team"));
+        let email = format!("{user}@example.test");
+        let bundle = openai_import_test_bundle(b"synthetic-access", b"synthetic-refresh", 1)
+            .with_account_identity(stable_test_identity(&email, Some(&coordinate)));
+        commands
+            .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+                command_id: format!("login-{requested}"),
+                provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+                display_alias: requested.to_owned(),
+                claim: Some(OAuthReadyClaim::for_account_test(
+                    OPENAI_OAUTH_PROVIDER_NAME,
+                    requested,
+                    bundle,
+                )),
+                route: LoginRoute {
+                    request_id: RequestId::new(format!("request-{requested}")),
+                    sink: Arc::clone(&sink),
+                },
+            })))
+            .await
+            .expect("send synthetic login");
+        let response = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("login deadline")
+            .expect("login response");
+        assert!(
+            matches!(response, WireFrame::Response { body: ResponseBody::AccountAdd { descriptor }, .. } if descriptor.alias.as_str() == expected && descriptor.active)
+        );
+    }
+    {
+        let rows = snapshot.lock().expect("account snapshot");
+        assert_eq!(rows.len(), 2, "same-user re-login must update in place");
+        assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+        assert!(
+            rows.iter()
+                .any(|row| row.alias.as_str() == "openai-member-b" && row.active)
+        );
+    }
+    assert!(
+        vault
+            .resolve(&CredentialAlias::new("openai-member-a"))
+            .is_ok()
+    );
+    assert!(
+        vault
+            .resolve(&CredentialAlias::new("openai-member-b"))
+            .is_ok()
+    );
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+#[test]
+fn upgraded_legacy_anthropic_row_is_reused_without_deleting_duplicates() {
+    let mut accounts = memory_accounts();
+    let old = CredentialAlias::new("anthropic-oauth-2");
+    let duplicate = CredentialAlias::new("anthropic-oauth-3");
+    let stable = "account=person-uuid;organization=team-uuid";
+    for (alias, id, active) in [
+        (old.clone(), "anthropic:old-hash", true),
+        (duplicate.clone(), stable, false),
+    ] {
+        let identity = stable_test_identity("owner@example.test", Some(id));
+        accounts
+            .add(CredentialDescriptor {
+                alias,
+                provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::OAuth,
+                identity: identity.summary(),
+                status: CredentialStatus::Ok,
+                active,
+                label: None,
+                account_identity: Some(identity),
+                created_at_ms: None,
+            })
+            .expect("seed legacy row");
+    }
+    accounts
+        .set_identity(
+            &old,
+            Some(stable_test_identity("owner@example.test", Some(stable))),
+        )
+        .expect("profile upgrade");
+    let incoming = oauth_bundle()
+        .with_account_identity(stable_test_identity("owner@example.test", Some(stable)));
+    let requested = CredentialAlias::new("anthropic-oauth-4");
+    assert_eq!(
+        oauth_alias_for_identity(
+            &accounts,
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            &requested,
+            &incoming
+        ),
+        old
+    );
+    assert_eq!(
+        accounts.list().len(),
+        2,
+        "both existing credentials remain for explicit removal"
+    );
+}
+
+#[tokio::test]
+async fn legacy_anthropic_profiles_upgrade_each_own_vault_bundle() {
+    struct FakeProfile;
+    #[async_trait::async_trait]
+    impl LegacyAnthropicProfileSource for FakeProfile {
+        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+            access_token.starts_with(b"synthetic-legacy-").then(|| {
+                stable_test_identity(
+                    "owner@example.test",
+                    Some("account=owner;organization=team"),
+                )
+            })
+        }
+    }
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    for (alias, token, active) in [
+        ("anthropic-oauth-2", b"synthetic-legacy-a".as_slice(), true),
+        ("anthropic-oauth-3", b"synthetic-legacy-b".as_slice(), false),
+        ("anthropic-oauth-4", b"synthetic-legacy-c".as_slice(), false),
+        ("anthropic-oauth-5", b"synthetic-legacy-d".as_slice(), false),
+        ("anthropic-oauth-6", b"synthetic-legacy-e".as_slice(), false),
+    ] {
+        let alias = CredentialAlias::new(alias);
+        let identity = stable_test_identity("owner@example.test", Some("anthropic:old-hash"));
+        // `-6` models a row whose refresh is in flight (durably Expired).
+        let status = if alias.as_str() == "anthropic-oauth-6" {
+            CredentialStatus::Expired
+        } else {
+            CredentialStatus::Ok
+        };
+        accounts
+            .add(CredentialDescriptor {
+                alias: alias.clone(),
+                provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::OAuth,
+                identity: identity.summary(),
+                status,
+                active,
+                label: None,
+                account_identity: Some(identity),
+                created_at_ms: None,
+            })
+            .expect("seed legacy account");
+        let bundle = haider_accounts::OAuthTokenBundleV1::new(
+            ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+            "https://claude.ai".to_owned(),
+            "test-audience".to_owned(),
+            None,
+            "Bearer".to_owned(),
+            Zeroizing::new(token.to_vec()),
+            None,
+            u64::MAX,
+            None,
+            vec!["user:inference".to_owned()],
+            haider_accounts::OAuthIdentityV1 {
+                subject_hash: "legacy-subject".to_owned(),
+                display_identity: "Claude".to_owned(),
+            },
+            1,
+        )
+        .expect("synthetic bundle");
+        vault
+            .put(&alias, &bundle.encode().expect("encode bundle"))
+            .expect("seed secret");
+    }
+    let fences = RefreshFenceRegistry::default();
+    let in_flight = CredentialAlias::new("anthropic-oauth-6");
+    assert!(
+        upgrade_legacy_anthropic_identities(
+            &mut accounts,
+            &vault,
+            &fences,
+            &FakeProfile,
+            IdentityUpgradeScope::Live,
+        )
+        .await
+    );
+    // A live upgrade must not bump the generation under an in-flight refresh:
+    // that refresh's rotated token would be rejected as stale and lost.
+    let untouched = haider_accounts::OAuthTokenBundleV1::decode(
+        vault
+            .resolve(&in_flight)
+            .expect("in-flight bundle")
+            .expose_secret(),
+    )
+    .expect("decode in-flight bundle");
+    assert_eq!(untouched.generation, 1);
+    assert_eq!(fences.current(&in_flight), 0);
+    assert_eq!(
+        accounts
+            .get(&in_flight)
+            .and_then(|row| row.account_identity.as_ref())
+            .and_then(|identity| identity.account_id.as_deref()),
+        Some("anthropic:old-hash")
+    );
+    // At actor startup no refresh can be in flight, so the row upgrades.
+    assert!(
+        upgrade_legacy_anthropic_identities(
+            &mut accounts,
+            &vault,
+            &fences,
+            &FakeProfile,
+            IdentityUpgradeScope::Startup,
+        )
+        .await
+    );
+    assert_eq!(
+        accounts.list().len(),
+        5,
+        "migration never deletes credentials"
+    );
+    for row in accounts.list() {
+        assert_eq!(
+            row.account_identity
+                .as_ref()
+                .and_then(|identity| identity.account_id.as_deref()),
+            Some("account=owner;organization=team")
+        );
+        let stored = vault.resolve(&row.alias).expect("upgraded vault bundle");
+        let stored = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+            .expect("decode bundle");
+        assert_eq!(stored.generation, 2);
+        assert_eq!(fences.current(&row.alias), 1);
+        assert_eq!(
+            stored
+                .account_identity
+                .as_ref()
+                .and_then(|identity| identity.email.as_deref()),
+            Some("owner@example.test")
+        );
+    }
+    let incoming = oauth_bundle().with_account_identity(stable_test_identity(
+        "owner@example.test",
+        Some("account=owner;organization=team"),
+    ));
+    assert_eq!(
+        oauth_alias_for_identity(
+            &accounts,
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            &CredentialAlias::new("anthropic-oauth-7"),
+            &incoming
+        ),
+        CredentialAlias::new("anthropic-oauth-2"),
+        "a fresh login reuses the first upgraded row instead of adding another"
+    );
+}
+
+/// MUTATION CHECK: probe legacy rows sequentially without the per-probe
+/// budget. Expected runtime failure: the hanging profile endpoint never
+/// returns, so the pass (and actor startup) stalls past the deadline.
+#[tokio::test(start_paused = true)]
+async fn legacy_profile_probes_run_concurrently_within_one_budget() {
+    struct HangingProfile;
+    #[async_trait::async_trait]
+    impl LegacyAnthropicProfileSource for HangingProfile {
+        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+            if access_token == b"synthetic-legacy-hang" {
+                std::future::pending::<()>().await;
+            }
+            Some(stable_test_identity(
+                "owner@example.test",
+                Some("account=owner;organization=team"),
+            ))
+        }
+    }
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    for (alias, token) in [
+        ("anthropic-hang", b"synthetic-legacy-hang".as_slice()),
+        ("anthropic-ok", b"synthetic-legacy-ok".as_slice()),
+    ] {
+        let alias = CredentialAlias::new(alias);
+        let identity = stable_test_identity("owner@example.test", Some("anthropic:old-hash"));
+        accounts
+            .add(CredentialDescriptor {
+                alias: alias.clone(),
+                provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::OAuth,
+                identity: identity.summary(),
+                status: CredentialStatus::Ok,
+                active: false,
+                label: None,
+                account_identity: Some(identity),
+                created_at_ms: None,
+            })
+            .expect("seed legacy account");
+        let bundle = haider_accounts::OAuthTokenBundleV1::new(
+            ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+            "https://claude.ai".to_owned(),
+            "test-audience".to_owned(),
+            None,
+            "Bearer".to_owned(),
+            Zeroizing::new(token.to_vec()),
+            None,
+            u64::MAX,
+            None,
+            vec!["user:inference".to_owned()],
+            haider_accounts::OAuthIdentityV1 {
+                subject_hash: "legacy-subject".to_owned(),
+                display_identity: "Claude".to_owned(),
+            },
+            1,
+        )
+        .expect("synthetic bundle");
+        vault
+            .put(&alias, &bundle.encode().expect("encode bundle"))
+            .expect("seed secret");
+    }
+    let fences = RefreshFenceRegistry::default();
+    let started = tokio::time::Instant::now();
+    let changed = tokio::time::timeout(
+        LEGACY_PROFILE_PROBE_BUDGET * 2,
+        upgrade_legacy_anthropic_identities(
+            &mut accounts,
+            &vault,
+            &fences,
+            &HangingProfile,
+            IdentityUpgradeScope::Startup,
+        ),
+    )
+    .await
+    .expect("a pass is bounded by one probe budget");
+    assert!(changed);
+    assert!(started.elapsed() <= LEGACY_PROFILE_PROBE_BUDGET + Duration::from_millis(100));
+    let id = |alias: &str| {
+        accounts
+            .get(&CredentialAlias::new(alias))
+            .and_then(|row| row.account_identity.as_ref())
+            .and_then(|identity| identity.account_id.clone())
+    };
+    assert_eq!(
+        id("anthropic-ok").as_deref(),
+        Some("account=owner;organization=team")
+    );
+    assert_eq!(
+        id("anthropic-hang").as_deref(),
+        Some("anthropic:old-hash"),
+        "an unanswered probe leaves the row for a later pass"
+    );
+}
+
+#[test]
+fn legacy_openai_workspace_row_upgrades_from_its_own_id_token() {
+    let id_token = |sub: &str| {
+        let claims = format!(
+            r#"{{"sub":"{sub}","email":"{sub}@example.test","https://api.openai.com/auth":{{"chatgpt_account_id":"shared-team"}}}}"#
+        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+        Zeroizing::new(format!("e30.{payload}.signature").into_bytes())
+    };
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    for (alias, sub, status) in [
+        ("openai-legacy-a", "user-a", CredentialStatus::Ok),
+        ("openai-legacy-b", "user-b", CredentialStatus::Expired),
+    ] {
+        let alias = CredentialAlias::new(alias);
+        // Pre-repair rows stored the shared workspace id alone.
+        let legacy = stable_test_identity(&format!("{sub}@example.test"), Some("shared-team"));
+        accounts
+            .add(CredentialDescriptor {
+                alias: alias.clone(),
+                provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::OAuth,
+                identity: legacy.summary(),
+                status,
+                active: false,
+                label: None,
+                account_identity: Some(legacy),
+                created_at_ms: None,
+            })
+            .expect("seed legacy OpenAI row");
+        let bundle = openai_import_test_bundle(b"synthetic-access", b"synthetic-refresh", 1)
+            .with_id_token(id_token(sub));
+        vault
+            .put(&alias, &bundle.encode().expect("encode bundle"))
+            .expect("seed secret");
+    }
+    let fences = RefreshFenceRegistry::default();
+    let coordinate = |accounts: &AccountStore<Box<dyn StoreLike>>, alias: &str| {
+        accounts
+            .get(&CredentialAlias::new(alias))
+            .and_then(|row| row.account_identity.as_ref())
+            .and_then(|identity| identity.account_id.clone())
+    };
+    assert!(upgrade_legacy_openai_identities(
+        &mut accounts,
+        &vault,
+        &fences,
+        IdentityUpgradeScope::Live,
+    ));
+    let user_a = haider_provider::openai_user_account_coordinate("user-a", Some("shared-team"));
+    assert_eq!(
+        coordinate(&accounts, "openai-legacy-a"),
+        Some(user_a.clone())
+    );
+    assert_eq!(
+        coordinate(&accounts, "openai-legacy-b").as_deref(),
+        Some("shared-team"),
+        "a live upgrade skips a row whose refresh may be in flight"
+    );
+    assert_eq!(fences.current(&CredentialAlias::new("openai-legacy-b")), 0);
+    assert!(upgrade_legacy_openai_identities(
+        &mut accounts,
+        &vault,
+        &fences,
+        IdentityUpgradeScope::Startup,
+    ));
+    let user_b = haider_provider::openai_user_account_coordinate("user-b", Some("shared-team"));
+    assert_eq!(
+        coordinate(&accounts, "openai-legacy-b"),
+        Some(user_b.clone())
+    );
+    // The two members of one workspace stay distinct, and each login
+    // selects its own upgraded row.
+    for (sub, coordinate, expected) in [
+        ("user-a", user_a, "openai-legacy-a"),
+        ("user-b", user_b, "openai-legacy-b"),
+    ] {
+        let incoming =
+            openai_import_test_bundle(b"fresh", b"fresh-refresh", 1).with_account_identity(
+                stable_test_identity(&format!("{sub}@example.test"), Some(&coordinate)),
+            );
+        assert_eq!(
+            oauth_alias_for_identity(
+                &accounts,
+                OPENAI_OAUTH_PROVIDER_NAME,
+                &CredentialAlias::new("openai-oauth-new"),
+                &incoming,
+            ),
+            CredentialAlias::new(expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_anthropic_identity_refresh_persists_upgrade_across_repeats() {
+    struct FakeProfile;
+    #[async_trait::async_trait]
+    impl LegacyAnthropicProfileSource for FakeProfile {
+        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+            (access_token == b"synthetic-refresh-access").then(|| {
+                stable_test_identity(
+                    "owner@example.test",
+                    Some("account=owner;organization=team"),
+                )
+            })
+        }
+    }
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("anthropic-legacy-refresh");
+    let legacy = stable_test_identity("owner@example.test", Some("anthropic:old-hash"));
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: legacy.summary(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: Some(legacy),
+            created_at_ms: None,
+        })
+        .expect("seed legacy row");
+    let bundle = haider_accounts::OAuthTokenBundleV1::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+        "https://claude.ai".to_owned(),
+        "test-audience".to_owned(),
+        None,
+        "Bearer".to_owned(),
+        Zeroizing::new(b"synthetic-refresh-access".to_vec()),
+        None,
+        u64::MAX,
+        None,
+        vec!["user:inference".to_owned()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "legacy-subject".to_owned(),
+            display_identity: "Claude".to_owned(),
+        },
+        1,
+    )
+    .expect("synthetic bundle");
+    let vault = MemoryVault::new();
+    vault
+        .put(&alias, &bundle.encode().expect("encode bundle"))
+        .expect("seed secret");
+    let fences = RefreshFenceRegistry::default();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), Vec::new());
+    for revision in 1..=2 {
+        let (sink, mut frames) = channel_sink();
+        handle_refresh_identity(
+            &store,
+            &mut accounts,
+            &vault,
+            &fences,
+            &FakeProfile,
+            &snapshot,
+            Some(&management),
+            RefreshIdentityJob {
+                alias: alias.as_str().to_owned(),
+                route: LoginRoute {
+                    request_id: RequestId::new(format!("refresh-anthropic-{revision}")),
+                    sink,
+                },
+            },
+        )
+        .await;
+        let WireFrame::Response {
+            body: ResponseBody::AccountRefresh { descriptor, .. },
+            ..
+        } = frames.try_recv().expect("refresh response")
+        else {
+            panic!("expected account refresh response");
+        };
+        assert_eq!(
+            descriptor
+                .account_identity
+                .as_ref()
+                .and_then(|identity| identity.account_id.as_deref()),
+            Some("account=owner;organization=team")
+        );
+    }
+    let stored = vault.resolve(&alias).expect("upgraded bundle");
+    let stored =
+        haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode bundle");
+    assert_eq!(stored.generation, 2, "repeat must not re-upgrade");
+    assert_eq!(fences.current(&alias), 1);
+    assert_eq!(
+        stored
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref()),
+        Some("account=owner;organization=team")
+    );
+    store.close().await.expect("close store");
+}
+
+#[tokio::test]
+async fn abandoned_oauth_stage_sweep_preserves_recent_stage_and_other_secrets() {
+    let vault = Arc::new(MemoryVault::new());
+    let accounts = memory_accounts();
+    let old = oauth_staging_alias("old-stage");
+    let recent = oauth_staging_alias("recent-stage");
+    let ordinary = CredentialAlias::new("ordinary-account");
+    let ordinary_stage_named = oauth_staging_alias("ordinary-stage-named");
+    let undated = oauth_staging_alias("old-format-stage");
+    put_oauth_staging(vault.clone(), &old, &oauth_bundle())
+        .await
+        .expect("stage old");
+    put_oauth_staging(vault.clone(), &recent, &oauth_bundle())
+        .await
+        .expect("stage recent");
+    vault
+        .put(&ordinary, b"synthetic-other-secret")
+        .expect("put ordinary");
+    vault
+        .put(&ordinary_stage_named, b"synthetic-not-an-oauth-bundle")
+        .expect("put unrelated stage-named value");
+    vault
+        .put(
+            &undated,
+            &oauth_bundle().encode().expect("old format stage"),
+        )
+        .expect("put undated stage");
+    let stored = vault.resolve(&old).expect("old stage");
+    let mut aged = Zeroizing::new(stored.expose_secret().to_vec());
+    let timestamp = OAUTH_STAGE_MARKER.len();
+    aged[timestamp..timestamp + 8].copy_from_slice(&0_u64.to_le_bytes());
+    vault.put(&old, &aged).expect("age stage");
+    sweep_abandoned_oauth_stages(vault.as_ref(), &accounts);
+    assert!(vault.resolve(&old).is_err());
+    assert!(vault.resolve(&undated).is_err());
+    let recent_secret = vault.resolve(&recent).expect("fresh stage retained");
+    assert!(
+        haider_accounts::OAuthTokenBundleV1::decode(oauth_stage_payload(
+            recent_secret.expose_secret()
+        ))
+        .is_ok()
+    );
+    assert!(vault.resolve(&ordinary).is_ok());
+    assert!(vault.resolve(&ordinary_stage_named).is_ok());
 }
 
 // MUTATION CHECK (W5a/B6a provider dispatch): remove either native API-key
@@ -5752,6 +6439,110 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
     actor.shutdown().await;
 }
 
+/// A same-principal interactive add replaces an existing alias while an old
+/// broker refresh still holds generation 1 and fence epoch 0.
+#[tokio::test]
+async fn oauth_relogin_advances_generation_and_fences_late_refresh() {
+    let alias = CredentialAlias::new("existing-oauth");
+    let identity = stable_test_identity("same@example.test", Some("user=same;workspace=team"));
+    let old = oauth_bundle().with_account_identity(identity.clone());
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: "fake-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: old.identity.display_identity.clone(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: Some(identity.clone()),
+        created_at_ms: None,
+    };
+    let mut accounts = memory_accounts();
+    accounts.add(descriptor.clone()).expect("seed descriptor");
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alias, &old.encode().expect("old bundle"))
+        .expect("seed vault");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let fences = RefreshFenceRegistry::default();
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot,
+        management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
+        profile_id: "relogin-race".into(),
+        default_model: "unused".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: fences.clone(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    let mut fresh = oauth_bundle().with_account_identity(identity);
+    fresh.generation = 1;
+    commands
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "same-principal-relogin".into(),
+            provider: "fake-oauth".into(),
+            display_alias: "new-requested-alias".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                "fake-oauth",
+                "new-requested-alias",
+                fresh,
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("relogin-race-request"),
+                sink,
+            },
+        })))
+        .await
+        .expect("send re-login");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv()).await.expect("response deadline").expect("response"),
+        WireFrame::Response { body: ResponseBody::AccountAdd { descriptor }, .. } if descriptor.alias == alias
+    ));
+    let committed = haider_accounts::OAuthTokenBundleV1::decode(
+        vault.resolve(&alias).expect("fresh secret").expose_secret(),
+    )
+    .expect("fresh bundle");
+    assert_eq!(committed.generation, 2);
+    assert_eq!(fences.current(&alias), 1);
+    let mut late = oauth_bundle();
+    late.generation = 2;
+    let (completed, result) = tokio::sync::oneshot::channel();
+    commands
+        .send(AccountCommand::ApplyOAuthRefresh {
+            descriptor,
+            expected: OAuthRefreshFence {
+                fence_epoch: 0,
+                generation: 1,
+                issuer: old.issuer.clone(),
+                audience: old.audience.clone(),
+                resource: old.resource.clone(),
+                subject_hash: old.identity.subject_hash.clone(),
+            },
+            encoded_bundle: late.encode().expect("late bundle"),
+            completed,
+        })
+        .await
+        .expect("send stale refresh");
+    assert!(matches!(
+        result.await.expect("refresh response"),
+        Err(RefreshApplyError::Stale)
+    ));
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
 /// An omitted API alias is command-derived before secret validation and is
 /// retained in the durable semantic identity for replay.
 ///
@@ -7972,6 +8763,80 @@ fn model_refresh_skips_dead_default_and_honours_explicit_alias() {
     );
 }
 
+#[test]
+fn rate_limited_default_serves_catalog_and_alternate_requires_matching_auth() {
+    let mut accounts = memory_accounts();
+    for (alias, status, active, auth_method) in [
+        (
+            "limited-default",
+            CredentialStatus::Limited { until_ms: u64::MAX },
+            true,
+            AuthMethod::OAuth,
+        ),
+        (
+            "wrong-auth",
+            CredentialStatus::Ok,
+            false,
+            AuthMethod::ApiKey,
+        ),
+        ("live-oauth", CredentialStatus::Ok, false, AuthMethod::OAuth),
+    ] {
+        accounts
+            .add(CredentialDescriptor {
+                alias: CredentialAlias::new(alias),
+                provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+                base_url: None,
+                auth_method,
+                identity: alias.to_owned(),
+                status,
+                active,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            })
+            .expect("seed account");
+    }
+    let candidates = model_refresh_candidates(
+        &accounts,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        AuthMethod::OAuth,
+        None,
+    )
+    .expect("candidates");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|row| row.alias.as_str())
+            .collect::<Vec<_>>(),
+        ["limited-default", "live-oauth"]
+    );
+    let live = CredentialAlias::new("live-oauth");
+    assert!(provider_has_other_usable_account(
+        &accounts,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        &live,
+        &ProviderAuthRequirementWire::OAuth
+    ));
+    accounts
+        .set_status(&live, CredentialStatus::Expired)
+        .expect("expire alternate");
+    assert!(!provider_has_other_usable_account(
+        &accounts,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        &CredentialAlias::new("limited-default"),
+        &ProviderAuthRequirementWire::OAuth
+    ));
+    assert!(
+        !provider_has_other_usable_account(
+            &accounts,
+            OPENAI_OAUTH_PROVIDER_NAME,
+            &CredentialAlias::new("limited-default"),
+            &ProviderAuthRequirementWire::None
+        ),
+        "a credential-free catalog has no account-specific failure to isolate"
+    );
+}
+
 /// MUTATION CHECK (W5g-5b): drop the custom-profile arm from
 /// `catalog_source`. Expected runtime failure: the first refresh answers
 /// unavailable instead of publishing `custom-key-model` in its summary.
@@ -9539,6 +10404,66 @@ async fn marked_expired_import_commits_a_fresher_source_and_resolves_it() {
     store.close().await.expect("close");
 }
 
+/// MUTATION CHECK: remove the provably-different-account guard from
+/// `handle_oauth_import_heal`. Expected runtime failure: resolving member A's
+/// expired import returns member B's access token (or commits B elsewhere).
+#[tokio::test(flavor = "current_thread")]
+async fn import_heal_never_hands_an_alias_another_members_token() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(
+        &source_path,
+        codex_member_fixture("member-a", "synthetic-access-a"),
+    )
+    .expect("write Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::import_heal_never_hands_an_alias_another_members_token",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+    let source_path = std::path::PathBuf::from(
+        std::env::var_os("HAIDER_CODEX_AUTH_PATH").expect("isolated Codex path"),
+    );
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, broker, snapshot, refresh_fences) = start_oauth_import_heal_test_actor(
+        &store,
+        Arc::clone(&vault),
+        import_refresh_catalog("http://127.0.0.1:1/token"),
+    );
+    let descriptor = import_codex_for_heal(&actor).await;
+    mark_import_expired(&actor, vault.as_ref(), &refresh_fences, &descriptor).await;
+    std::fs::write(
+        &source_path,
+        codex_member_fixture("member-b", "synthetic-access-b"),
+    )
+    .expect("switch Codex login to member B");
+
+    let resolved = broker.resolve(&descriptor).await;
+    assert!(
+        !matches!(&resolved, Ok(access) if access.expose_secret() == b"synthetic-access-b"),
+        "member A's alias must never resolve member B's token"
+    );
+    // A failed own-lineage refresh may leave A expired or tombstoned, but
+    // never holding B's token.
+    if let Ok(stored) = vault.resolve(&descriptor.alias)
+        && let Ok(stored) = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+    {
+        assert_ne!(stored.access_token(), b"synthetic-access-b");
+    }
+    assert_eq!(
+        snapshot.lock().expect("snapshot").len(),
+        1,
+        "a background heal never creates another member's account"
+    );
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK: drop the own-refresh fallback after a same-token source
 /// read, fail to carry the import-source fingerprint through rotation, or
 /// treat the unchanged auth.json predecessor as fresher on the next due
@@ -10371,6 +11296,103 @@ async fn malformed_and_missing_imports_name_paths_and_commit_nothing() {
     assert!(vault.list().expect("vault list").is_empty());
     assert_eq!(management.read().expect("management").revision, 0);
 
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+fn codex_member_fixture(member: &str, access: &str) -> Vec<u8> {
+    let claims = format!(
+        r#"{{"sub":"{member}","email":"{member}@example.test","https://api.openai.com/auth":{{"chatgpt_account_id":"shared-team","chatgpt_plan_type":"team"}}}}"#
+    );
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    serde_json::json!({
+        "tokens": {
+            "id_token": format!("e30.{payload}.signature"),
+            "access_token": access,
+            "refresh_token": format!("{access}-refresh"),
+            "account_id": "shared-team",
+        }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// MUTATION CHECK: make `oauth_import_retarget` return `None`. Expected
+/// runtime failure: member B's import overwrites member A's `openai-oauth`
+/// credential (one row, A's vault bytes replaced) instead of adding a row.
+#[tokio::test(flavor = "current_thread")]
+async fn codex_import_of_another_workspace_member_never_overwrites_the_first() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(
+        &source_path,
+        codex_member_fixture("member-a", "synthetic-access-a"),
+    )
+    .expect("write Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::codex_import_of_another_workspace_member_never_overwrites_the_first",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+    let source_path = std::path::PathBuf::from(
+        std::env::var_os("HAIDER_CODEX_AUTH_PATH").expect("isolated Codex path"),
+    );
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, _management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let access = |alias: &str| {
+        let stored = vault
+            .resolve(&CredentialAlias::new(alias))
+            .expect("vaulted import");
+        haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+            .expect("decode import")
+            .access_token()
+            .to_vec()
+    };
+    for (step, member, expected_alias, expected_rows) in [
+        (1, "member-a", "openai-oauth", 1),
+        (2, "member-b", "openai-oauth-2", 2),
+        (3, "member-b", "openai-oauth-2", 2),
+        (4, "member-a", "openai-oauth", 2),
+    ] {
+        std::fs::write(
+            &source_path,
+            codex_member_fixture(member, &format!("synthetic-access-{member}-{step}")),
+        )
+        .expect("rewrite Codex fixture");
+        let (sink, mut frames) = channel_sink();
+        send_oauth_import(&actor.commands(), sink, &format!("import-{step}"), "codex").await;
+        match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("import deadline")
+            .expect("import response")
+        {
+            WireFrame::Response {
+                body: ResponseBody::AccountOAuthImport { descriptor, .. },
+                ..
+            } => assert_eq!(descriptor.alias.as_str(), expected_alias, "step {step}"),
+            other => panic!("unexpected import response at step {step}: {other:?}"),
+        }
+        assert_eq!(
+            snapshot.lock().expect("snapshot").len(),
+            expected_rows,
+            "step {step}"
+        );
+        assert_eq!(
+            access(expected_alias),
+            format!("synthetic-access-{member}-{step}").into_bytes()
+        );
+    }
+    // Each member's credential stayed in its own row throughout.
+    assert_eq!(access("openai-oauth"), b"synthetic-access-member-a-4");
+    assert_eq!(access("openai-oauth-2"), b"synthetic-access-member-b-3");
     actor.shutdown().await;
     store.close().await.expect("close");
 }

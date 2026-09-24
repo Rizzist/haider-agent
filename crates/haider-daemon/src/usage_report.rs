@@ -619,16 +619,15 @@ impl UsageReportService {
         } else {
             OpenAiTokenIdentity::default()
         };
-        // OpenAI's WHAM meter is account-scoped. This value is the
-        // `chatgpt_account_id` captured from the OAuth ID token by
-        // `OpenAiOAuthIdentitySource`; an OpenAI organization id is never a
-        // substitute. Refuse early instead of sending an ambiguous request
-        // that fails later as a bare 401/403.
+        // OpenAI's WHAM meter requires the raw workspace id. The descriptor
+        // now stores a user+workspace dedupe coordinate, so extract only the
+        // workspace component for this request header.
         let chatgpt_account_id = if endpoint == UsageMeterEndpoint::OpenAiOauth {
             match descriptor
                 .account_identity
                 .as_ref()
                 .and_then(|identity| identity.account_id.as_deref())
+                .and_then(haider_provider::openai_workspace_from_account_coordinate)
                 .filter(|account_id| !account_id.is_empty())
             {
                 Some(account_id) => Some(account_id),

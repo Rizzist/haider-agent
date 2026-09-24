@@ -82,6 +82,46 @@ fn account_list_projection_is_additive_and_preserves_legacy_absence() {
     assert_eq!(projected.created, Some(964));
 }
 
+#[test]
+fn ambiguous_email_bridge_has_review_hint_without_false_removal_advice() {
+    let view = |alias: &str, account_id: Option<&str>| AccountView {
+        alias: alias.to_owned(),
+        provider: "anthropic-oauth".to_owned(),
+        auth_kind: "oauth",
+        identity: Some(haider_protocol::credential::AccountIdentity {
+            email: Some("OWNER@example.test".to_owned()),
+            display_name: None,
+            account_id: account_id.map(str::to_owned),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+        created: None,
+    };
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            view("legacy", None),
+            view("member-a", Some("account=a;organization=team")),
+            view("member-b", Some("account=b;organization=team")),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains("email matches multiple account IDs"));
+    assert!(!text.contains("remove this duplicate"));
+
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            view("legacy", None),
+            view("member-a", Some("account=a;organization=team")),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains("remove this duplicate"));
+}
+
 fn codex_candidate() -> haider_rpc::DeviceCredentialCandidateWire {
     haider_rpc::DeviceCredentialCandidateWire {
         candidate: format!("dc1_{}", "0".repeat(64)),

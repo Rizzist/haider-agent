@@ -3,6 +3,8 @@
 
 use crate::ids::CredentialAlias;
 use serde::{Deserialize, Serialize};
+use unicode_casefold::UnicodeCaseFold as _;
+use unicode_normalization::UnicodeNormalization as _;
 
 /// Informational, secret-free account facts captured at credential intake.
 ///
@@ -29,7 +31,7 @@ impl AccountIdentity {
     /// Returns whether two records identify the same stable provider account.
     ///
     /// A provider account ID is authoritative when both records carry one.
-    /// Otherwise a case-insensitive email match supports migration from older
+    /// Otherwise a Unicode-folded, NFKC email match supports migration from older
     /// rows that predate a provider's stable-ID capture. Display labels,
     /// subscription plans, and credential bytes are never identity keys.
     #[must_use]
@@ -40,8 +42,54 @@ impl AccountIdentity {
                 .email
                 .as_deref()
                 .zip(other.email.as_deref())
-                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right)),
+                .is_some_and(|(left, right)| Self::emails_match(left, right)),
         }
+    }
+
+    /// Compare public email claims after Unicode compatibility normalization
+    /// and full default case folding. An email remains only a migration hint.
+    #[must_use]
+    pub fn emails_match(left: &str, right: &str) -> bool {
+        let normalize = |email: &str| email.nfkc().case_fold().nfkc().collect::<String>();
+        normalize(left) == normalize(right)
+    }
+
+    /// Whether `email` names more than one stable account id among
+    /// `identities`. An email-only (legacy) record sharing such an email
+    /// cannot be bridged to any one of those accounts automatically; it needs
+    /// explicit operator review. Callers pass one provider's identities.
+    #[must_use]
+    pub fn email_names_several_accounts<'a>(
+        email: &str,
+        identities: impl IntoIterator<Item = &'a AccountIdentity>,
+    ) -> bool {
+        let mut first: Option<&str> = None;
+        for identity in identities {
+            let (Some(other_email), Some(account_id)) =
+                (identity.email.as_deref(), identity.account_id.as_deref())
+            else {
+                continue;
+            };
+            if !Self::emails_match(email, other_email) {
+                continue;
+            }
+            match first {
+                None => first = Some(account_id),
+                Some(seen) if seen != account_id => return true,
+                Some(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Whether this is an email-only record whose email matches `email`.
+    #[must_use]
+    pub fn is_email_only_match(&self, email: &str) -> bool {
+        self.account_id.is_none()
+            && self
+                .email
+                .as_deref()
+                .is_some_and(|own| Self::emails_match(own, email))
     }
 
     /// Normalizes one untrusted informational claim before it can reach a
@@ -71,6 +119,91 @@ impl AccountIdentity {
             .as_deref()
             .and_then(Self::sanitized_field)
             .map_or(principal.clone(), |plan| format!("{principal} · {plan}"))
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{AccountIdentity, AccountPrincipal};
+
+    #[test]
+    fn email_fallback_uses_nfkc_and_full_unicode_case_folding() {
+        assert!(AccountIdentity::emails_match(
+            "STRASSE@EXAMPLE.TEST",
+            "Straße@example.test"
+        ));
+        assert!(AccountIdentity::emails_match(
+            "ＫＥＹ@example.test",
+            "key@example.test"
+        ));
+    }
+
+    #[test]
+    fn openai_workspace_id_without_user_sub_never_deduplicates() {
+        let mut a = AccountIdentity {
+            email: Some("one@example.test".into()),
+            display_name: None,
+            account_id: Some("shared-workspace".into()),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        };
+        let mut b = a.clone();
+        b.email = Some("two@example.test".into());
+        assert!(matches!(
+            (
+                AccountPrincipal::new("openai-oauth", Some(&a)),
+                AccountPrincipal::new("openai-oauth", Some(&b)),
+            ),
+            (Some(left), Some(right)) if !left.same_account(right)
+        ));
+        a.account_id = Some("user:3:one;workspace:16:shared-workspace".into());
+        b.account_id = Some("user:3:two;workspace:16:shared-workspace".into());
+        assert!(matches!(
+            (
+                AccountPrincipal::new("openai-oauth", Some(&a)),
+                AccountPrincipal::new("openai-oauth", Some(&b)),
+            ),
+            (Some(left), Some(right)) if !left.same_account(right)
+        ));
+    }
+
+    #[test]
+    fn only_stable_user_coordinates_are_provably_different() {
+        let identity = |account_id: Option<&str>| AccountIdentity {
+            email: Some("member@example.test".into()),
+            display_name: None,
+            account_id: account_id.map(str::to_owned),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        };
+        let workspace_only = identity(Some("shared-workspace"));
+        let user_a = identity(Some("user:1:a;workspace:16:shared-workspace"));
+        let user_b = identity(Some("user:1:b;workspace:16:shared-workspace"));
+        let no_id = identity(None);
+        let openai = |identity| AccountPrincipal::new("openai-oauth", Some(identity));
+        let different = |left, right| {
+            openai(left)
+                .zip(openai(right))
+                .is_some_and(|(left, right)| left.provably_different_account(right))
+        };
+        assert!(different(&user_a, &user_b));
+        assert!(!different(&user_a, &user_a));
+        // A legacy workspace-only row might be either member.
+        assert!(!different(&user_a, &workspace_only));
+        assert!(!different(&user_a, &no_id));
+        let anthropic = |identity| AccountPrincipal::new("anthropic-oauth", Some(identity));
+        let (member_a, member_b) = (
+            identity(Some("account=a;organization=o")),
+            identity(Some("account=b;organization=o")),
+        );
+        let (Some(left), Some(right)) = (anthropic(&member_a), anthropic(&member_b)) else {
+            unreachable!("identities are present");
+        };
+        assert!(left.provably_different_account(right));
     }
 }
 
@@ -135,13 +268,50 @@ impl<'a> AccountPrincipal<'a> {
         identity.map(|identity| Self { provider, identity })
     }
 
-    /// Same provider and same stable account
-    /// (see [`AccountIdentity::same_stable_principal`]).
+    /// The provider-scoped stable account coordinate, if this record has
+    /// one that names a single user. OpenAI's `chatgpt_account_id` names a
+    /// workspace shared by Team/Business members, so only a `user:` coordinate
+    /// (ID-token subject plus workspace) qualifies there. Older OpenAI rows
+    /// that stored the workspace alone have no stable coordinate until their
+    /// user subject is recovered.
+    #[must_use]
+    pub fn stable_account_id(self) -> Option<&'a str> {
+        let id = self.identity.account_id.as_deref()?;
+        (self.provider != OPENAI_OAUTH_PROVIDER || id.starts_with("user:")).then_some(id)
+    }
+
+    /// Same provider and same stable account. OpenAI requires a user-level
+    /// coordinate on both sides and never falls back to email; other
+    /// providers use [`AccountIdentity::same_stable_principal`].
     #[must_use]
     pub fn same_account(self, other: AccountPrincipal<'_>) -> bool {
-        self.provider == other.provider && self.identity.same_stable_principal(other.identity)
+        if self.provider != other.provider {
+            return false;
+        }
+        if self.provider == OPENAI_OAUTH_PROVIDER {
+            return self
+                .stable_account_id()
+                .zip(other.stable_account_id())
+                .is_some_and(|(left, right)| left == right);
+        }
+        self.identity.same_stable_principal(other.identity)
+    }
+
+    /// Both records carry stable coordinates and they name different
+    /// accounts. Unlike `!same_account`, a record without a stable
+    /// coordinate is never *provably* another account.
+    #[must_use]
+    pub fn provably_different_account(self, other: AccountPrincipal<'_>) -> bool {
+        self.provider != other.provider
+            || self
+                .stable_account_id()
+                .zip(other.stable_account_id())
+                .is_some_and(|(left, right)| left != right)
     }
 }
+
+/// Provider id whose OAuth account id is a shared workspace, not a user.
+const OPENAI_OAUTH_PROVIDER: &str = "openai-oauth";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

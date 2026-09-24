@@ -53,6 +53,112 @@ use zeroize::Zeroizing;
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 
+pub(super) struct UnavailableProbeBackoff {
+    account_alias: Option<String>,
+    account_fingerprint: String,
+    next_probe: std::time::Instant,
+    next_delay: Duration,
+}
+
+impl UnavailableProbeBackoff {
+    fn permit(&mut self, account_alias: Option<&str>, account_fingerprint: &str) -> bool {
+        let now = std::time::Instant::now();
+        if self.account_alias.as_deref() != account_alias
+            || self.account_fingerprint != account_fingerprint
+        {
+            self.account_alias = account_alias.map(str::to_owned);
+            self.account_fingerprint = account_fingerprint.to_owned();
+            self.next_probe = now + Duration::from_secs(30);
+            self.next_delay = Duration::from_secs(60);
+            return true;
+        }
+        if now < self.next_probe {
+            return false;
+        }
+        self.next_probe = now + self.next_delay;
+        self.next_delay = (self.next_delay * 2).min(Duration::from_secs(600));
+        true
+    }
+
+    fn new(account_alias: Option<&str>, account_fingerprint: &str) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            account_alias: account_alias.map(str::to_owned),
+            account_fingerprint: account_fingerprint.to_owned(),
+            next_probe: now + Duration::from_secs(30),
+            next_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+fn retain_backoff_until_catalog_recovers(
+    probes: &mut std::collections::HashMap<String, UnavailableProbeBackoff>,
+    provider: &str,
+    inventory: &haider_rpc::ModelInventoryWire,
+) {
+    if matches!(
+        inventory,
+        haider_rpc::ModelInventoryWire::Fetched { .. }
+            | haider_rpc::ModelInventoryWire::Stale { .. }
+            | haider_rpc::ModelInventoryWire::Static
+            | haider_rpc::ModelInventoryWire::Configured
+    ) {
+        probes.remove(provider);
+    }
+}
+
+#[cfg(test)]
+mod unavailable_probe_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_probe_is_bounded_and_resets_on_account_change() {
+        let mut state = UnavailableProbeBackoff::new(Some("first"), "snapshot-1");
+        assert!(!state.permit(Some("first"), "snapshot-1"));
+        state.next_probe = std::time::Instant::now() - Duration::from_secs(1);
+        assert!(state.permit(Some("first"), "snapshot-1"));
+        assert_eq!(state.next_delay, Duration::from_secs(120));
+        assert!(!state.permit(Some("first"), "snapshot-1"));
+        assert!(state.permit(Some("second"), "snapshot-1"));
+        assert_eq!(state.next_delay, Duration::from_secs(60));
+        assert!(state.permit(Some("second"), "snapshot-2"));
+    }
+
+    #[test]
+    fn successful_call_with_unavailable_result_keeps_probe_backoff() {
+        let mut probes = std::collections::HashMap::new();
+        probes.insert(
+            "openai-oauth".to_owned(),
+            UnavailableProbeBackoff::new(Some("member"), "snapshot"),
+        );
+        retain_backoff_until_catalog_recovers(
+            &mut probes,
+            "openai-oauth",
+            &haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "synthetic outage".to_owned(),
+            },
+        );
+        assert!(probes.contains_key("openai-oauth"));
+        assert!(
+            probes
+                .get_mut("openai-oauth")
+                .is_some_and(|state| !state.permit(Some("member"), "snapshot"))
+        );
+        retain_backoff_until_catalog_recovers(
+            &mut probes,
+            "openai-oauth",
+            &haider_rpc::ModelInventoryWire::NeverFetched,
+        );
+        assert!(probes.contains_key("openai-oauth"));
+        retain_backoff_until_catalog_recovers(
+            &mut probes,
+            "openai-oauth",
+            &haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 },
+        );
+        assert!(!probes.contains_key("openai-oauth"));
+    }
+}
+
 pub(super) fn status_caching(
     idle_ttl_ms: Option<u64>,
     active_provider: Option<&str>,
@@ -10473,6 +10579,46 @@ impl HubConnection {
                     data: None,
                 })
             })?;
+        let unavailable = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| {
+                matches!(
+                    summary.inventory,
+                    haider_rpc::ModelInventoryWire::Unavailable { .. }
+                )
+            });
+        if unavailable {
+            let descriptors = facade
+                .snapshot
+                .lock()
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| row.provider == provider)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let fingerprint = blake3::hash(&serde_json::to_vec(&descriptors).unwrap_or_default())
+                .to_hex()
+                .to_string();
+            if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
+                let allowed = match probes.entry(provider.to_owned()) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().permit(account_alias, &fingerprint)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(UnavailableProbeBackoff::new(account_alias, &fingerprint));
+                        true
+                    }
+                };
+                if !allowed {
+                    return Ok(());
+                }
+            }
+        } else if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
+            probes.remove(provider);
+        }
         let refreshed = match facade
             .refresh_provider_models(
                 provider.to_owned(),
@@ -10503,6 +10649,9 @@ impl HubConnection {
             }
             Err(error) => return Err(InventoryRefreshError::Provider(error)),
         };
+        if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
+            retain_backoff_until_catalog_recovers(&mut probes, provider, &refreshed.inventory);
+        }
         if let Some(summary) = summaries
             .iter_mut()
             .find(|summary| summary.provider == provider)

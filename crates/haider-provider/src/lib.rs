@@ -687,7 +687,8 @@ pub use cachemaxxing::{
 pub use oauth_identity::{
     ANTHROPIC_OAUTH_PROFILE_URL, AnthropicOAuthIdentitySource, GrokOAuthIdentitySource,
     IdentityEndpoint, IdentityError, KimiOAuthIdentitySource, OAuthIdentitySource, OAuthTokens,
-    OpenAiOAuthIdentitySource, oauth_identity_source,
+    OpenAiOAuthIdentitySource, oauth_identity_source, openai_user_account_coordinate,
+    openai_workspace_from_account_coordinate,
 };
 
 const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;

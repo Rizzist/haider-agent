@@ -12627,24 +12627,57 @@ impl AppModel {
                 crate::format::mask_identity(&descriptor.identity)
             );
             if let Some(principal) = descriptor.principal() {
-                let duplicates = self
-                    .accounts
-                    .rows
-                    .iter()
-                    .filter(|row| {
-                        row.alias != descriptor.alias.as_str()
-                            && row
-                                .principal()
-                                .is_some_and(|prior| prior.same_account(principal))
-                    })
-                    .map(|row| row.alias.as_str())
-                    .collect::<Vec<_>>();
+                // An email-only row whose email names several stable accounts
+                // is flagged for review, never offered as a removable duplicate.
+                let ambiguous_email = descriptor.account_identity.as_ref().is_some_and(
+                    |identity| {
+                        let Some(email) = identity.email.as_deref() else {
+                            return false;
+                        };
+                        let provider_identities = || {
+                            self.accounts
+                                .rows
+                                .iter()
+                                .filter(|row| row.provider == descriptor.provider)
+                                .filter_map(|row| row.account_identity.as_ref())
+                        };
+                        haider_protocol::credential::AccountIdentity::email_names_several_accounts(
+                            email,
+                            provider_identities().chain(std::iter::once(identity)),
+                        ) && provider_identities().any(|prior| prior.is_email_only_match(email))
+                    },
+                );
+                let duplicates =
+                    self.accounts
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.alias != descriptor.alias.as_str()
+                                && row
+                                    .principal()
+                                    .is_some_and(|prior| prior.same_account(principal))
+                                && (!ambiguous_email
+                                    || row
+                                        .account_identity
+                                        .as_ref()
+                                        .and_then(|prior| prior.account_id.as_deref())
+                                        .zip(
+                                            descriptor.account_identity.as_ref().and_then(
+                                                |identity| identity.account_id.as_deref(),
+                                            ),
+                                        )
+                                        .is_some_and(|(prior, current)| prior == current))
+                        })
+                        .map(|row| row.alias.as_str())
+                        .collect::<Vec<_>>();
                 if !duplicates.is_empty() {
                     message.push_str(&format!(
                         " · matching aliases retained: {} · remove explicitly with `haider account remove {} --confirm`",
                         duplicates.join(", "),
                         duplicates[0]
                     ));
+                } else if ambiguous_email {
+                    message.push_str(" · email matches distinct account IDs; review aliases before removing a duplicate");
                 }
             } else {
                 message.push_str(

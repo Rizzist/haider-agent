@@ -1900,8 +1900,8 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
         Some("fake-person@example.invalid")
     );
     assert_eq!(
-        account_identity.account_id.as_deref(),
-        Some("fake-account-id-1")
+        account_identity.account_id, None,
+        "workspace-only JWT has no user dedupe key"
     );
     assert!(!account_identity.verified);
     assert!(bundle.id_token().is_some(), "ID token remains vault-only");
@@ -2355,6 +2355,28 @@ async fn anthropic_native_login_gets_verified_profile_identity() {
     let refreshed = refresh_bundle_from_response(&registration, body.as_bytes(), &first)
         .expect("refresh bundle");
     assert_eq!(refreshed.account_identity, first.account_identity);
+}
+
+#[tokio::test]
+async fn legacy_anthropic_token_can_upgrade_from_its_own_profile() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_identity_endpoint(format!("http://{}/profile", server.address))
+        .expect("test profile endpoint");
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let identity = legacy_anthropic_profile_identity_with_registration(
+        ACCESS_SENTINEL.as_bytes(),
+        &registration,
+    )
+    .await
+    .expect("verified legacy profile");
+    assert_eq!(
+        identity.account_id.as_deref(),
+        Some("account=account-uuid-973;organization=organization-uuid-973")
+    );
+    assert_eq!(identity.email.as_deref(), Some("owner@example.test"));
+    assert!(identity.verified);
 }
 
 /// MUTATION CHECK: force either body builder to ignore the registration's

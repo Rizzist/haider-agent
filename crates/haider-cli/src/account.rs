@@ -1462,7 +1462,31 @@ fn write_json(document: &impl Serialize) -> ExitCode {
     }
 }
 
-fn write_human(document: &AccountsDocument) -> ExitCode {
+fn ambiguous_email_bridge<'a>(
+    document: &'a AccountsDocument,
+    account: &AccountView,
+) -> Option<&'a AccountView> {
+    use haider_protocol::credential::AccountIdentity;
+    let email = account.identity.as_ref()?.email.as_deref()?;
+    let provider_identities = || {
+        document
+            .accounts
+            .iter()
+            .filter(|candidate| candidate.provider == account.provider)
+            .filter_map(|candidate| Some((candidate, candidate.identity.as_ref()?)))
+    };
+    if !AccountIdentity::email_names_several_accounts(
+        email,
+        provider_identities().map(|(_, identity)| identity),
+    ) {
+        return None;
+    }
+    provider_identities()
+        .find(|(_, identity)| identity.is_email_only_match(email))
+        .map(|(candidate, _)| candidate)
+}
+
+fn render_human(document: &AccountsDocument) -> String {
     let mut text = String::new();
     for (index, account) in document.accounts.iter().enumerate() {
         text.push_str(&format!(
@@ -1478,19 +1502,41 @@ fn write_human(document: &AccountsDocument) -> ExitCode {
                 |created| created.to_string(),
             )
         ));
-        if let Some(principal) = account.principal()
-            && let Some(canonical) = document.accounts[..index].iter().find(|prior| {
-                prior
-                    .principal()
-                    .is_some_and(|prior| prior.same_account(principal))
-            })
-        {
+        let Some(principal) = account.principal() else {
+            continue;
+        };
+        let ambiguous_bridge = ambiguous_email_bridge(document, account);
+        let canonical = document.accounts[..index].iter().find(|prior| {
+            prior
+                .principal()
+                .is_some_and(|prior| prior.same_account(principal))
+                && (ambiguous_bridge.is_none()
+                    || prior
+                        .identity
+                        .as_ref()
+                        .and_then(|identity| identity.account_id.as_deref())
+                        .zip(
+                            account
+                                .identity
+                                .as_ref()
+                                .and_then(|identity| identity.account_id.as_deref()),
+                        )
+                        .is_some_and(|(left, right)| left == right))
+        });
+        if let Some(canonical) = canonical {
             text.push_str(&format!(
                 "  matching identity already kept as `{}`; remove this duplicate explicitly with `haider account remove {} --confirm`\n",
                 canonical.alias, account.alias
             ));
+        } else if ambiguous_bridge.is_some_and(|bridge| bridge.alias == account.alias) {
+            text.push_str("  email matches multiple account IDs; review these accounts and remove duplicates explicitly\n");
         }
     }
+    text
+}
+
+fn write_human(document: &AccountsDocument) -> ExitCode {
+    let text = render_human(document);
     let stdout = io::stdout();
     let mut output = stdout.lock();
     if let Err(error) = output

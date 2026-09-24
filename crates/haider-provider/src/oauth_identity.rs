@@ -155,11 +155,16 @@ impl OAuthIdentitySource for OpenAiOAuthIdentitySource {
             chatgpt_plan_type,
             chatgpt_account_id,
         } = claims.openai_auth.unwrap_or_default();
+        let workspace =
+            nonempty(chatgpt_account_id).or_else(|| nonempty(claims.chatgpt_account_id));
+        let user = nonempty(claims.sub);
         Ok(Some(AccountIdentity {
             email: nonempty(claims.email),
             display_name: nonempty(claims.name),
-            account_id: nonempty(chatgpt_account_id)
-                .or_else(|| nonempty(claims.chatgpt_account_id)),
+            // chatgpt_account_id names a workspace shared by Team/Business
+            // members. Never use it without the ID-token's user subject.
+            account_id: user
+                .map(|user| openai_user_account_coordinate(&user, workspace.as_deref())),
             plan: nonempty(chatgpt_plan_type).or_else(|| nonempty(claims.plan)),
             issuer: nonempty(claims.iss).or_else(|| Some("https://auth.openai.com".to_owned())),
             captured_at: tokens.captured_at,
@@ -266,6 +271,32 @@ fn anthropic_stable_account_coordinate(account_id: &str, organization_id: &str) 
     format!("account={account_id};organization={organization_id}")
 }
 
+/// Length-prefixes both components so distinct claims cannot serialize to
+/// the same provider-scoped dedupe coordinate.
+pub fn openai_user_account_coordinate(user: &str, workspace: Option<&str>) -> String {
+    let workspace = workspace.unwrap_or("");
+    format!(
+        "user:{}:{user};workspace:{}:{workspace}",
+        user.len(),
+        workspace.len()
+    )
+}
+
+/// Extract the workspace for APIs that still require its raw identifier.
+/// Old descriptors containing only a workspace id remain readable there,
+/// even though they are no longer accepted as a user dedupe key.
+pub fn openai_workspace_from_account_coordinate(coordinate: &str) -> Option<&str> {
+    let Some(rest) = coordinate.strip_prefix("user:") else {
+        return (!coordinate.is_empty()).then_some(coordinate);
+    };
+    let (length, rest) = rest.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    let suffix = rest.get(length..)?.strip_prefix(";workspace:")?;
+    let (workspace_length, workspace) = suffix.split_once(':')?;
+    let workspace_length = workspace_length.parse::<usize>().ok()?;
+    (workspace_length == workspace.len() && !workspace.is_empty()).then_some(workspace)
+}
+
 impl OAuthIdentitySource for KimiOAuthIdentitySource {
     fn identity_from_tokens(
         &self,
@@ -335,7 +366,7 @@ mod tests {
     #[test]
     fn openai_nested_claims_are_informational_and_unverified() {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            br#"{"email":"owner@example.test","https://api.openai.com/auth":{"chatgpt_plan_type":"pro","chatgpt_account_id":"acct-1"}}"#,
+            br#"{"sub":"user-1","email":"owner@example.test","https://api.openai.com/auth":{"chatgpt_plan_type":"pro","chatgpt_account_id":"acct-1"}}"#,
         );
         let token = format!("e30.{payload}.signature");
         let tokens = OAuthTokens {
@@ -350,8 +381,86 @@ mod tests {
             .expect("identity present");
         assert_eq!(identity.email.as_deref(), Some("owner@example.test"));
         assert_eq!(identity.plan.as_deref(), Some("pro"));
-        assert_eq!(identity.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(
+            identity.account_id.as_deref(),
+            Some("user:6:user-1;workspace:6:acct-1")
+        );
         assert!(!identity.verified);
+    }
+
+    #[test]
+    fn openai_workspace_members_have_distinct_principals() {
+        let identity = |sub: &str| {
+            let claims = format!(
+                r#"{{"sub":"{sub}","email":"{sub}@example.test","https://api.openai.com/auth":{{"chatgpt_account_id":"shared-workspace"}}}}"#
+            );
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            let token = format!("e30.{payload}.signature");
+            OpenAiOAuthIdentitySource
+                .identity_from_tokens(&OAuthTokens {
+                    access_token: b"synthetic",
+                    refresh_token: None,
+                    id_token: Some(token.as_bytes()),
+                    captured_at: 1,
+                })
+                .expect("claims decode")
+                .expect("identity")
+        };
+        let a = identity("user-a");
+        let b = identity("user-b");
+        assert_ne!(a.account_id, b.account_id);
+        assert!(!a.same_stable_principal(&b));
+    }
+
+    #[test]
+    fn openai_sub_without_workspace_is_still_a_user_coordinate() {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"only-user"}"#);
+        let token = format!("e30.{payload}.signature");
+        let identity = OpenAiOAuthIdentitySource
+            .identity_from_tokens(&OAuthTokens {
+                access_token: b"synthetic",
+                refresh_token: None,
+                id_token: Some(token.as_bytes()),
+                captured_at: 1,
+            })
+            .expect("claims decode")
+            .expect("identity");
+        assert_eq!(
+            identity.account_id.as_deref(),
+            Some("user:9:only-user;workspace:0:")
+        );
+    }
+
+    #[test]
+    fn openai_workspace_header_uses_raw_workspace_not_user_coordinate() {
+        let coordinate = openai_user_account_coordinate("member", Some("workspace"));
+        assert_eq!(
+            openai_workspace_from_account_coordinate(&coordinate),
+            Some("workspace")
+        );
+        assert_eq!(
+            openai_workspace_from_account_coordinate("old-workspace"),
+            Some("old-workspace")
+        );
+        assert_eq!(
+            openai_workspace_from_account_coordinate(&openai_user_account_coordinate(
+                "member", None
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_coordinate_distinguishes_workspaces_and_delimiters() {
+        assert_ne!(
+            openai_user_account_coordinate("same-user", Some("personal")),
+            openai_user_account_coordinate("same-user", Some("team")),
+        );
+        assert_ne!(
+            openai_user_account_coordinate("a;workspace:b", None),
+            openai_user_account_coordinate("a", Some("b")),
+        );
     }
 
     #[test]

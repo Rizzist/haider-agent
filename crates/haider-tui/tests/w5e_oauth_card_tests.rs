@@ -5,7 +5,7 @@
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, OAuthAddPhase};
+use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, Hit, OAuthAddPhase};
 use haider_tui::mock::seed_account_rows;
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -25,6 +25,52 @@ fn accounts_model() -> AppModel {
     model.requests.clear();
     model.accounts.apply_snapshot(seed_account_rows(), None);
     model
+}
+
+#[test]
+fn oauth_receipt_flags_ambiguous_email_without_wrong_removal_hint() {
+    let descriptor = |alias: &str, account_id: Option<&str>| CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: "anthropic-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "owner@example.test".into(),
+        status: CredentialStatus::Ok,
+        active: false,
+        label: None,
+        account_identity: Some(haider_protocol::credential::AccountIdentity {
+            email: Some("owner@example.test".into()),
+            display_name: None,
+            account_id: account_id.map(str::to_owned),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    let mut model = accounts_model();
+    model.accounts.apply_snapshot(
+        vec![
+            AccountRow::from_descriptor(&descriptor("legacy", None)),
+            AccountRow::from_descriptor(&descriptor(
+                "member-a",
+                Some("account=a;organization=team"),
+            )),
+        ],
+        None,
+    );
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::AnthropicOAuth,
+    ));
+    let attempt = model.oauth_add.as_ref().expect("card").attempt;
+    model.oauth_add_completed(
+        attempt,
+        &descriptor("member-b", Some("account=b;organization=team")),
+    );
+    let message = model.accounts.message.as_deref().expect("receipt");
+    assert!(message.contains("email matches distinct account IDs"));
+    assert!(!message.contains("haider account remove legacy"));
 }
 
 fn draw(model: &AppModel, width: u16, height: u16) -> String {

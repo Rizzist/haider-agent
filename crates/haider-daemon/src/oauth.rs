@@ -2216,18 +2216,25 @@ fn codex_import_bundle(
         .unwrap_or_else(|| "imported".to_owned());
     let subject = identity_claims
         .sub
+        .clone()
         .and_then(nonempty)
         .or_else(|| account_id.clone())
         .unwrap_or_else(|| "imported".to_owned());
+    let user_account_id = identity_claims
+        .sub
+        .and_then(nonempty)
+        .map(|user| haider_provider::openai_user_account_coordinate(&user, account_id.as_deref()));
     let account_identity = account_identity.or_else(|| {
-        (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
-            email,
-            display_name: None,
-            account_id,
-            plan: None,
-            issuer: Some(registration.issuer.clone()),
-            captured_at,
-            verified: false,
+        (email.is_some() || account_id.is_some() || user_account_id.is_some()).then(|| {
+            AccountIdentity {
+                email,
+                display_name: None,
+                account_id: user_account_id,
+                plan: None,
+                issuer: Some(registration.issuer.clone()),
+                captured_at,
+                verified: false,
+            }
         })
     });
     let id_token = auth.tokens.id_token.map(|token| token.0);
@@ -4775,6 +4782,33 @@ async fn account_identity_from_endpoint(
         },
         account_identity,
     )))
+}
+
+/// Best-effort migration for an older Claude OAuth row whose descriptor only
+/// holds a synthetic `anthropic:<hash>` identity. The caller supplies that
+/// row's own still-valid access token; no other account's credential is used.
+pub(crate) async fn legacy_anthropic_profile_identity(
+    access_token: &[u8],
+) -> Option<AccountIdentity> {
+    let registration = OAuthProviderCatalog::default()
+        .registration(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)?;
+    legacy_anthropic_profile_identity_with_registration(access_token, &registration).await
+}
+
+async fn legacy_anthropic_profile_identity_with_registration(
+    access_token: &[u8],
+    registration: &OAuthProviderRegistration,
+) -> Option<AccountIdentity> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    account_identity_from_endpoint(&client, registration, access_token, now_ms()?)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, identity)| identity)
 }
 
 async fn token_bundle_from_response(
