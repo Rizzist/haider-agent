@@ -853,7 +853,7 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     drop(raw);
 
     let store = Store::open(root.path()).expect("migrate legacy database");
-    assert_eq!(store.schema_version().expect("schema version"), 32);
+    assert_eq!(store.schema_version().expect("schema version"), 33);
     let legacy = store
         .loom_workflow("legacy-retained")
         .expect("read migrated current")

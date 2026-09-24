@@ -140,9 +140,10 @@ mod event_store_append_tests;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound the reusable WAL allocation after a checkpoint/reset cycle.
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1_024 * 1_024;
-/// A fixed ~6 MiB frame budget bounds checkpoint work while avoiding the
-/// frequent whole-WAL flushes seen with SQLite's 1,000-page default.
-const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1_520;
+/// The original 1,000-page budget bounds each automatic WAL checkpoint to
+/// roughly 4 MiB plus the committing transaction. The compact journal keeps
+/// ordinary turns below this budget for multiple turns.
+const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1_000;
 const REPLAY_PAGE_SIZE: usize = 1_024;
 /// Keep the complete current `prepare_cached` census without the previous 2x
 /// headroom. This cache is an optimization only; eviction reparses SQL and
@@ -28526,7 +28527,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v32 and reopen.
+    /// v23's run-head backfill remains untouched through v33 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -28580,7 +28581,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 32);
+            assert_eq!(store.schema_version().expect("schema version"), 33);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

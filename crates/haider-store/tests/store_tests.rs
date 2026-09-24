@@ -368,6 +368,31 @@ fn journal_mutation_generation_covers_authoritative_rewrites_and_deletes_only() 
 }
 
 #[test]
+fn ordinary_journal_append_skips_session_authority_row_updates() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("append-authority-write-probe");
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute_batch(
+        "CREATE TABLE session_update_probe(n INTEGER);
+         CREATE TRIGGER probe_sessions_update AFTER UPDATE ON sessions
+         BEGIN INSERT INTO session_update_probe(n) VALUES (1); END;",
+    ));
+    let mut facts = [envelope(
+        &session,
+        "append-authority-write-probe-event",
+        json!({"type": "generation_fixture"}),
+    )];
+    must(store.append(&mut facts));
+    let updates: i64 = must(connection.query_row(
+        "SELECT COUNT(*) FROM session_update_probe",
+        [],
+        |row| row.get(0),
+    ));
+    assert_eq!(updates, 0, "a normal append does not rewrite sessions");
+}
+
+#[test]
 fn trigger_matrix_vacuum_and_backup_restore_preserve_authority() {
     let root = test_root();
     let session = SessionId::new("verifier-trigger-matrix");
@@ -1228,12 +1253,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 32);
+        assert_eq!(must(store.schema_version()), 33);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 32);
+    assert_eq!(must(reopened.schema_version()), 33);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -1284,6 +1309,67 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
 }
 
 #[test]
+fn populated_v32_upgrade_preserves_journal_and_pending_hook_outbox() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("v32-populated-upgrade");
+    let mut facts = [envelope(
+        &session,
+        "v32-retained-event",
+        json!({"type": "user_message", "text": "retained"}),
+    )];
+    must(store.append(&mut facts));
+    let database = store.database_path().to_path_buf();
+    drop(store);
+
+    let old = must(Connection::open(&database));
+    must(old.execute_batch(
+        "DROP TABLE event_authority_keys;
+         CREATE TABLE event_authority_keys (
+             session_id TEXT NOT NULL, seq INTEGER NOT NULL CHECK (seq > 0),
+             event_id TEXT NOT NULL, PRIMARY KEY (session_id, seq), UNIQUE (event_id)
+         );
+         INSERT INTO event_authority_keys SELECT session_id, seq, event_id FROM events;
+         CREATE TEMP TABLE old_hook_rows AS SELECT * FROM hook_dispatch_outbox;
+         DROP TABLE hook_dispatch_outbox;
+         CREATE TABLE hook_dispatch_outbox (
+             session_id TEXT NOT NULL, seq INTEGER NOT NULL CHECK (seq > 0),
+             run_id TEXT, workspace_unavailable INTEGER NOT NULL DEFAULT 0
+                 CHECK (workspace_unavailable IN (0, 1)),
+             PRIMARY KEY (session_id, seq),
+             FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
+         );
+         INSERT INTO hook_dispatch_outbox SELECT * FROM old_hook_rows;
+         DROP TABLE old_hook_rows;
+         DELETE FROM schema_migrations WHERE version = 33;
+         PRAGMA user_version = 32;",
+    ));
+    drop(old);
+
+    let upgraded = must(Store::open(root.path()));
+    assert_eq!(must(upgraded.schema_version()), 33);
+    assert_eq!(must(upgraded.read(&session, 0, 10)), facts);
+    let connection = must(Connection::open(&database));
+    let pending: i64 = must(connection.query_row(
+        "SELECT COUNT(*) FROM hook_dispatch_outbox WHERE session_id = ?1",
+        [session.as_str()],
+        |row| row.get(0),
+    ));
+    assert_eq!(pending, 1, "unacknowledged hooks survive the table rewrite");
+    for table in ["event_authority_keys", "hook_dispatch_outbox"] {
+        let sql: String = must(connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        ));
+        assert!(
+            sql.ends_with("WITHOUT ROWID"),
+            "{table} keeps one primary tree"
+        );
+    }
+}
+
+#[test]
 fn mutation_generation_migration_discards_unauthenticated_checkpoints() {
     let root = test_root();
     let session = SessionId::new("generation-migration-checkpoint");
@@ -1326,7 +1412,7 @@ fn mutation_generation_migration_discards_unauthenticated_checkpoints() {
     drop(legacy);
 
     let migrated = must(Store::open(root.path()));
-    assert_eq!(must(migrated.schema_version()), 32);
+    assert_eq!(must(migrated.schema_version()), 33);
     let connection = must(Connection::open(migrated.database_path()));
     let migrated_generation: i64 = must(connection.query_row(
         "SELECT journal_mutation_generation FROM sessions WHERE id = ?1",
@@ -1366,7 +1452,7 @@ fn sqlite_master_schema(database_path: &std::path::Path) -> Vec<(String, String,
 
 /// OWNER UPGRADE LAW: 0.0.962 shipped schema v24. Migrating that exact table,
 /// index, and column shape must converge byte-for-byte in `sqlite_master` with
-/// a freshly migrated store; v25-v32 are additive and must not fork schemas.
+/// a freshly migrated store; v25-v33 converge without forking schemas.
 ///
 /// MUTATION CHECK: omit a guarded v26 column addition or create a different
 /// definition on either migration route. Expected RUNTIME failure: the exact
@@ -1421,7 +1507,7 @@ fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
     drop(legacy);
 
     let migrated = must(Store::open(legacy_root.path()));
-    assert_eq!(must(migrated.schema_version()), 32);
+    assert_eq!(must(migrated.schema_version()), 33);
     drop(migrated);
     assert_eq!(
         sqlite_master_schema(&legacy_path),
@@ -1475,7 +1561,7 @@ fn typed_agent_install_job_schema_is_durable_and_bounded() {
     drop(connection);
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 32);
+    assert_eq!(must(reopened.schema_version()), 33);
     let connection = must(Connection::open(reopened.database_path()));
     let retained: (String, u32, u32) = must(connection.query_row(
         "SELECT state, completed, total FROM loom_cli_install_jobs WHERE job_id = ?1",

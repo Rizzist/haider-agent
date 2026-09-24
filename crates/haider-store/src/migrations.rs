@@ -19,8 +19,8 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 32;
-const LATEST_SCHEMA_VERSION: u32 = 32;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 33;
+const LATEST_SCHEMA_VERSION: u32 = 33;
 
 struct Migration {
     version: u32,
@@ -913,6 +913,71 @@ const MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 33,
+        sql: "
+            -- The authority shadow is reconstructible from the journal. Its
+            -- primary key is the table B-tree, avoiding one page update per
+            -- event. Rebuild under the migration transaction.
+            DROP TABLE event_authority_keys;
+            CREATE TABLE event_authority_keys (
+                session_id TEXT NOT NULL,
+                seq        INTEGER NOT NULL CHECK (seq > 0),
+                event_id   TEXT NOT NULL,
+                PRIMARY KEY (session_id, seq),
+                UNIQUE (event_id)
+            ) WITHOUT ROWID;
+            INSERT INTO event_authority_keys(session_id, seq, event_id)
+            SELECT session_id, seq, event_id FROM events;
+
+            -- The transient hook queue also needs only its primary-key tree.
+            CREATE TEMP TABLE hook_outbox_rows_v33 AS
+            SELECT session_id, seq, run_id, workspace_unavailable
+            FROM hook_dispatch_outbox;
+            DROP TABLE hook_dispatch_outbox;
+            CREATE TABLE hook_dispatch_outbox (
+                session_id TEXT NOT NULL,
+                seq        INTEGER NOT NULL CHECK (seq > 0),
+                run_id     TEXT,
+                workspace_unavailable INTEGER NOT NULL DEFAULT 0
+                    CHECK (workspace_unavailable IN (0, 1)),
+                PRIMARY KEY (session_id, seq),
+                FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
+            ) WITHOUT ROWID;
+            INSERT INTO hook_dispatch_outbox(
+                session_id, seq, run_id, workspace_unavailable
+            ) SELECT session_id, seq, run_id, workspace_unavailable
+              FROM hook_outbox_rows_v33;
+            DROP TABLE hook_outbox_rows_v33;
+
+            DROP TRIGGER events_authority_inserted;
+            CREATE TRIGGER events_authority_inserted
+            AFTER INSERT ON events
+            BEGIN
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = NEW.session_id
+                   AND (NEW.seq <= journal_event_seq_high_water
+                        OR EXISTS (
+                            SELECT 1 FROM event_authority_keys
+                             WHERE session_id = NEW.session_id AND seq >= NEW.seq
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM event_authority_keys
+                             WHERE event_id = NEW.event_id
+                        ));
+                UPDATE sessions
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = (
+                     SELECT session_id FROM event_authority_keys
+                      WHERE event_id = NEW.event_id
+                 )
+                   AND id <> NEW.session_id;
+                INSERT OR REPLACE INTO event_authority_keys(session_id, seq, event_id)
+                VALUES (NEW.session_id, NEW.seq, NEW.event_id);
+            END;
+        ",
+    },
 ];
 
 // The direct schema for an empty profile. The equivalence pin in
@@ -1019,7 +1084,7 @@ CREATE TABLE event_authority_keys (
                 event_id   TEXT NOT NULL,
                 PRIMARY KEY (session_id, seq),
                 UNIQUE (event_id)
-            );
+            ) WITHOUT ROWID;
 
 CREATE TABLE events (
                 session_id      TEXT NOT NULL,
@@ -1053,7 +1118,7 @@ CREATE TABLE hook_dispatch_outbox (
                     CHECK (workspace_unavailable IN (0, 1)),
                 PRIMARY KEY (session_id, seq),
                 FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
-            );
+            ) WITHOUT ROWID;
 
 CREATE TABLE workspace_unavailable_runs (
                 session_id TEXT NOT NULL,
@@ -1446,18 +1511,17 @@ CREATE TRIGGER events_authority_inserted
             AFTER INSERT ON events
             BEGIN
                 UPDATE sessions
-                   SET journal_mutation_generation = journal_mutation_generation +
-                       CASE WHEN NEW.seq <= journal_event_seq_high_water
-                                  OR EXISTS (
-                                      SELECT 1 FROM event_authority_keys
-                                       WHERE event_id = NEW.event_id
-                                  )
-                            THEN 1 ELSE 0 END,
-                       journal_event_seq_high_water = MAX(
-                           journal_event_seq_high_water,
-                           NEW.seq
-                       )
-                 WHERE id = NEW.session_id;
+                   SET journal_mutation_generation = journal_mutation_generation + 1
+                 WHERE id = NEW.session_id
+                   AND (NEW.seq <= journal_event_seq_high_water
+                        OR EXISTS (
+                            SELECT 1 FROM event_authority_keys
+                             WHERE session_id = NEW.session_id AND seq >= NEW.seq
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM event_authority_keys
+                             WHERE event_id = NEW.event_id
+                        ));
                 UPDATE sessions
                    SET journal_mutation_generation = journal_mutation_generation + 1
                  WHERE id = (
@@ -1578,7 +1642,7 @@ pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> St
                  event_id   TEXT NOT NULL,
                  PRIMARY KEY (session_id, seq),
                  UNIQUE (event_id)
-             );
+             ) WITHOUT ROWID;
              DELETE FROM event_authority_keys;
              INSERT INTO event_authority_keys(session_id, seq, event_id)
              SELECT session_id, seq, event_id FROM events;
@@ -1587,18 +1651,17 @@ pub(crate) fn ensure_event_authority_triggers(connection: &mut Connection) -> St
              AFTER INSERT ON events
              BEGIN
                  UPDATE sessions
-                    SET journal_mutation_generation = journal_mutation_generation +
-                        CASE WHEN NEW.seq <= journal_event_seq_high_water
-                                   OR EXISTS (
-                                       SELECT 1 FROM event_authority_keys
-                                        WHERE event_id = NEW.event_id
-                                   )
-                             THEN 1 ELSE 0 END,
-                        journal_event_seq_high_water = MAX(
-                            journal_event_seq_high_water,
-                            NEW.seq
-                        )
-                  WHERE id = NEW.session_id;
+                    SET journal_mutation_generation = journal_mutation_generation + 1
+                  WHERE id = NEW.session_id
+                    AND (NEW.seq <= journal_event_seq_high_water
+                         OR EXISTS (
+                             SELECT 1 FROM event_authority_keys
+                              WHERE session_id = NEW.session_id AND seq >= NEW.seq
+                         )
+                         OR EXISTS (
+                             SELECT 1 FROM event_authority_keys
+                              WHERE event_id = NEW.event_id
+                         ));
                  UPDATE sessions
                     SET journal_mutation_generation = journal_mutation_generation + 1
                   WHERE id = (
@@ -1691,7 +1754,8 @@ fn event_authority_triggers_are_current(connection: &Connection) -> StoreResult<
                         AND (
                             (name = 'events_authority_inserted'
                              AND instr(sql, 'event_authority_keys') > 0
-                             AND instr(sql, 'journal_event_seq_high_water') > 0)
+                             AND instr(sql, 'journal_event_seq_high_water') > 0
+                             AND instr(sql, 'seq >= NEW.seq') > 0)
                             OR (name = 'events_authority_updated'
                                 AND instr(sql, 'payload_kind') > 0
                                 AND instr(sql, 'event_authority_keys') > 0
