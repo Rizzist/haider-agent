@@ -60,6 +60,11 @@ pub struct DiscoveredModel {
     /// The provider's declared context window in tokens; `None` when the
     /// provider does not declare one — never a guess.
     pub context_window: Option<u64>,
+    /// The provider's declared maximum response size in tokens. Catalogs
+    /// frequently omit this even when the inference endpoint enforces it;
+    /// daemon projection fills those gaps from pinned model-family limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     pub description: Option<String>,
     /// The provider's default reasoning effort, when it declares one.
     pub default_effort: Option<String>,
@@ -613,6 +618,10 @@ pub fn parse_catalog(
                     .get("inputTokenLimit")
                     .and_then(serde_json::Value::as_u64)
                     .filter(|window| *window > 0),
+                max_output_tokens: entry
+                    .get("outputTokenLimit")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|limit| *limit > 0),
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
@@ -656,7 +665,32 @@ pub fn parse_catalog(
             models.push(DiscoveredModel {
                 slug: slug.to_owned(),
                 display_name: slug.to_owned(),
-                context_window: None,
+                context_window: (!matches!(
+                    source,
+                    CatalogSource::OpenAiCompatible { .. }
+                        | CatalogSource::AnthropicCompatible { .. }
+                ))
+                .then(|| {
+                    entry
+                        .get("context_window")
+                        .or_else(|| entry.get("context_length"))
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|window| *window > 0)
+                })
+                .flatten(),
+                max_output_tokens: (!matches!(
+                    source,
+                    CatalogSource::OpenAiCompatible { .. }
+                        | CatalogSource::AnthropicCompatible { .. }
+                ))
+                .then(|| {
+                    entry
+                        .get("max_output_tokens")
+                        .or_else(|| entry.get("max_tokens"))
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|limit| *limit > 0)
+                })
+                .flatten(),
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
@@ -719,14 +753,23 @@ pub fn parse_catalog(
                 .get("context_window")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|window| *window > 0),
-            CatalogSource::AnthropicSubscription
-            | CatalogSource::GeminiApiKey
+            CatalogSource::AnthropicSubscription => entry
+                .get("max_input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|window| *window > 0),
+            CatalogSource::GeminiApiKey
             | CatalogSource::OpenAiCompatible { .. }
             | CatalogSource::AnthropicCompatible { .. }
             | CatalogSource::DeepSeekApi
             | CatalogSource::HaiderCodeApi
             | CatalogSource::XaiApi => None,
         };
+        let max_output_tokens = entry
+            .get("max_output_tokens")
+            .or_else(|| entry.get("max_tokens"))
+            .or_else(|| entry.get("outputTokenLimit"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|limit| *limit > 0);
         let kimi_extensions =
             matches!(source, CatalogSource::KimiOAuth).then(|| DiscoveredModelExtensions {
                 protocol: entry
@@ -786,6 +829,7 @@ pub fn parse_catalog(
             slug: slug.to_owned(),
             display_name,
             context_window,
+            max_output_tokens,
             description: entry
                 .get("description")
                 .and_then(serde_json::Value::as_str)

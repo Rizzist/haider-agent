@@ -13,10 +13,9 @@ use haider_protocol::tool::ImageBlockRef;
 use haider_provider::{
     Message, MessageRole, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_SUBSCRIPTION_BASE_URL,
     OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, PromptCacheMetadata, Provider,
-    ProviderError, ProviderErrorKind, ProviderStreamItem, ResolvedAttachment, ToolDefinition,
-    TurnRequest, degrade_tool_result_images_to_placeholders, replay_deepseek_chat_sse,
-    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
-    replay_openai_responses_sse,
+    ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
+    degrade_tool_result_images_to_placeholders, replay_deepseek_chat_sse, replay_openai_chat_sse,
+    replay_openai_http_error, replay_openai_models_response, replay_openai_responses_sse,
 };
 use serde::Deserialize;
 
@@ -317,12 +316,15 @@ fn lk9_chat_unknown_extra_fields_are_ignored() {
 }
 
 #[test]
-fn responses_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
+fn responses_max_tokens_surfaces_partial_tool_without_an_end() {
     let wire = br#"event: response.output_item.added
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_partial","call_id":"call_partial","name":"write_file","arguments":""}}
 
 event: response.function_call_arguments.delta
 data: {"type":"response.function_call_arguments.delta","item_id":"fc_partial","output_index":0,"delta":"{\"path\":"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_partial","output_index":0,"arguments":"{\"path\":"}
 
 event: response.incomplete
 data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0}}}}
@@ -331,7 +333,19 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
 
     let items = replay_openai_responses_sse(wire);
 
-    assert_no_tool_events(&items, "call_partial");
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallStart { call_id, .. }) if call_id == "call_partial"
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallArgsDelta { call_id, args_fragment })
+            if call_id == "call_partial" && args_fragment == "{\"path\":"
+    )));
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "call_partial"
+    )));
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {
@@ -355,7 +369,7 @@ fn context_exceeded_http_fixture_has_a_distinct_non_retryable_kind() {
 }
 
 #[test]
-fn chat_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
+fn chat_max_tokens_surfaces_partial_tool_without_an_end() {
     let wire = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_partial","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}
 
 data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
@@ -366,7 +380,19 @@ data: [DONE]
 
     let items = replay_openai_chat_sse(wire);
 
-    assert_no_tool_events(&items, "call_partial");
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallStart { call_id, .. }) if call_id == "call_partial"
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallArgsDelta { call_id, args_fragment })
+            if call_id == "call_partial" && args_fragment == "{\"path\":"
+    )));
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "call_partial"
+    )));
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {
@@ -986,24 +1012,6 @@ fn streamed_overloaded_error_is_retryable_overload() {
     assert_eq!(error.kind, ProviderErrorKind::Overloaded);
     assert!(error.retryable);
     assert!(!error.message.contains("private overload detail"));
-}
-
-fn assert_no_tool_events(items: &[ProviderStreamItem], call_id: &str) {
-    assert!(
-        !items.iter().any(|item| matches!(
-            item,
-            Ok(StreamEvent::ToolCallStart {
-                call_id: actual,
-                ..
-            } | StreamEvent::ToolCallArgsDelta {
-                call_id: actual,
-                ..
-            } | StreamEvent::ToolCallEnd {
-                call_id: actual,
-            }) if actual == call_id
-        )),
-        "partial tool call `{call_id}` crossed the adapter boundary"
-    );
 }
 
 #[test]

@@ -2950,6 +2950,22 @@ fn malformed_tool_steps(call_id: &str, arguments: &str) -> Vec<FakeStep> {
     ]
 }
 
+fn output_limited_tool_steps(call_id: &str, arguments: &str) -> Vec<FakeStep> {
+    vec![
+        FakeStep::EmitToolCallStart {
+            call_id: call_id.into(),
+            name: "inspect".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: call_id.into(),
+            fragment: arguments.into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+    ]
+}
+
 async fn toolrepair_run(
     cfg: HarnessConfig,
     script: Vec<FakeStep>,
@@ -3092,6 +3108,93 @@ async fn malformed_tool_json_is_durable_invalid_result_with_one_repair_continuat
             .iter()
             .any(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
     );
+}
+
+#[tokio::test]
+async fn output_limited_tool_is_not_executed_and_gets_one_split_retry() {
+    let partial = format!("{{\"payload\":\"{}", "x".repeat(20_000));
+    let mut script = output_limited_tool_steps("limited-1", &partial);
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "limited-1".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "valid-2".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"chunk": "small"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "valid-2".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(calls, 1, "only the complete retry may dispatch");
+    let result = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { call_id, result } if call_id == "limited-1" => Some(result),
+            _ => None,
+        })
+        .expect("durable output-limit result");
+    let data = serde_json::to_value(result.data.as_ref().expect("typed data"))
+        .expect("serialize output-limit data");
+    assert_eq!(data["kind"], "output_limit_truncation");
+    assert_eq!(data["repaired"], true);
+    assert_eq!(
+        result
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subcode
+            .as_str(),
+        "output-limit-tool-arguments"
+    );
+    assert!(result.preview.contains("not executed"));
+    assert!(result.preview.contains("splitting large content"));
+    assert!(!result.preview.contains("malformed"));
+    assert!(events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::ToolCall { call_id, args, status: ToolStatus::Failed, .. },
+            ..
+        }) if call_id == "limited-1" && args == serde_json::Value::String(partial.clone())
+    )));
+}
+
+#[tokio::test]
+async fn second_consecutive_output_limited_tool_terminates_honestly() {
+    let mut script = output_limited_tool_steps("limited-1", "{\"payload\":");
+    script.extend(output_limited_tool_steps("limited-2", "{\"payload\":"));
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(calls, 0);
+    let (message, presentation) = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::RunFailed {
+                message,
+                presentation,
+                ..
+            } => Some((message, presentation)),
+            _ => None,
+        })
+        .expect("typed terminal failure");
+    assert_eq!(
+        presentation.expect("presentation").subcode.as_str(),
+        "output-limit-tool-arguments"
+    );
+    assert!(!message.contains("malformed"));
 }
 
 #[tokio::test]

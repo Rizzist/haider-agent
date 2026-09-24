@@ -1280,6 +1280,23 @@ impl ProvidersState {
             })
             .and_then(|detail| detail.context_window)
     }
+
+    /// Maximum output budget for this exact provider/model row. New daemons
+    /// always project a declared or pinned fallback value; `None` preserves
+    /// compatibility with older daemons.
+    #[must_use]
+    pub fn declared_output_limit(&self, provider: &str, model: &str) -> Option<u64> {
+        self.providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .and_then(|summary| {
+                summary
+                    .model_details
+                    .iter()
+                    .find(|detail| detail.name == model)
+            })
+            .and_then(|detail| detail.max_output_tokens)
+    }
 }
 
 /// The composer queue panel (954): daemon-held mid-turn messages, listed

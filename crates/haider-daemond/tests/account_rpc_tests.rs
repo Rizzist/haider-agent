@@ -1017,6 +1017,7 @@ async fn session_create_accepts_gemini_when_account_active() {
             slug: "gemini-2.5-flash".into(),
             display_name: "Gemini 2.5 Flash".into(),
             context_window: Some(1_048_576),
+            max_output_tokens: Some(65_536),
             description: None,
             default_effort: None,
             supported_efforts: Vec::new(),

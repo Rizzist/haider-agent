@@ -82,6 +82,7 @@ pub(crate) struct RunOptions {
     pub provider: Option<ProviderSelection>,
     pub model: Option<String>,
     pub attachments: Vec<PathBuf>,
+    pub max_output_tokens: Option<u64>,
     pub budget: RunBudgetV1,
     pub resume_run_id: Option<RunId>,
     pub session_id: Option<SessionId>,
@@ -136,6 +137,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     let mut prompt_stdin = false;
     let mut action = RunAction::Execute;
     let mut budget = RunBudgetV1::default();
+    let mut max_output_tokens = None;
     let mut request_tranche = None;
     let mut max_requests = None;
     let mut resume_run_id = None;
@@ -219,14 +221,22 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 )?);
             }
             "--max-requests" => return Err("duplicate --max-requests flag".into()),
-            "--max-tokens" if budget.max_tokens.is_none() => {
+            "--max-tokens" if max_output_tokens.is_none() => {
                 index += 1;
-                budget.max_tokens = Some(parse_positive_u64(
+                max_output_tokens = Some(parse_positive_u64(
                     rest.get(index).map(String::as_str),
                     "--max-tokens",
                 )?);
             }
             "--max-tokens" => return Err("duplicate --max-tokens flag".into()),
+            "--max-total-tokens" if budget.max_tokens.is_none() => {
+                index += 1;
+                budget.max_tokens = Some(parse_positive_u64(
+                    rest.get(index).map(String::as_str),
+                    "--max-total-tokens",
+                )?);
+            }
+            "--max-total-tokens" => return Err("duplicate --max-total-tokens flag".into()),
             "--max-cost" if budget.max_cost_microusd.is_none() => {
                 index += 1;
                 budget.max_cost_microusd =
@@ -399,6 +409,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || allow_writes_seen
             || allow_exec_seen
             || auto_allow_seen
+            || max_output_tokens.is_some()
             || !budget.is_empty()
             || seed.is_some()
         {
@@ -423,6 +434,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || allow_exec_seen
             || auto_allow_seen
             || trust_hooks
+            || max_output_tokens.is_some()
         {
             return Err("--resume inherits the source session's model and permissions".into());
         }
@@ -462,6 +474,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || account.is_some()
             || ssh_scope.is_some()
             || !attachments.is_empty()
+            || max_output_tokens.is_some()
             || !budget.is_empty()
             || seed.is_some()
             || read_only
@@ -501,6 +514,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             provider,
             model,
             attachments,
+            max_output_tokens,
             budget,
             seed,
         },
@@ -860,7 +874,9 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         } else {
             request_model
         },
-        max_tokens: profile.default_max_tokens,
+        // Zero is the feature-gated daemon sentinel for deriving the exact
+        // model-row limit. Explicit --max-tokens remains an exact override.
+        max_tokens: options.max_output_tokens.unwrap_or(0),
         budget: options.budget.clone(),
         seed: options.seed,
         replay_of: None,
@@ -1105,7 +1121,8 @@ Permission options:\n\
 \n\
 Use --session ID to submit an ordinary turn to an existing native session.\n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
---timeout <duration>, --start, --status, --stop, and --replay.";
+--timeout <duration>, --start, --status, --stop, and --replay. --max-tokens N\n\
+sets the per-response output limit; --max-total-tokens N caps cumulative usage.";
 
 pub(crate) fn read_stdin_prompt_from(mut input: impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();
@@ -2412,7 +2429,7 @@ mod tests {
             vec![],
             vec!["--request-tranche", "40"],
             vec!["--max-requests", "80"],
-            vec!["--max-tokens", "1000"],
+            vec!["--max-total-tokens", "1000"],
             vec!["--max-cost", "0.50"],
             vec!["--max-time", "10s"],
         ] {

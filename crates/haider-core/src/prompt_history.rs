@@ -4861,7 +4861,7 @@ fn render_journal_with_facts(
                     // Match the live repair continuation's empty placeholder.
                     let args = if pending_tool_results
                         .get(&call_id)
-                        .is_some_and(crate::actor::invalid_tool_call_result)
+                        .is_some_and(crate::actor::repairable_tool_call_result)
                     {
                         serde_json::json!({})
                     } else {

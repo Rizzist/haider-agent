@@ -2422,8 +2422,10 @@ pub const SESSION_OUTPUT_CAP: u64 = 30_000;
 /// The output budget a new session may request: the ceiling, bounded by the
 /// (smaller) context window when one is declared.
 #[must_use]
-pub fn session_output_cap(context_window: u64) -> u64 {
-    SESSION_OUTPUT_CAP.min(context_window.max(1))
+pub fn session_output_cap(context_window: u64, model_output_limit: Option<u64>) -> u64 {
+    SESSION_OUTPUT_CAP
+        .min(context_window.max(1))
+        .min(model_output_limit.unwrap_or(SESSION_OUTPUT_CAP).max(1))
 }
 
 impl LiveDriver {
@@ -6606,7 +6608,13 @@ impl LiveDriver {
                         workspace_allocation,
                         provider: model.identity.provider.clone(),
                         model: model.identity.model_short.clone(),
-                        max_tokens: session_output_cap(model.identity.context_window),
+                        max_tokens: session_output_cap(
+                            model.identity.context_window,
+                            model.providers.declared_output_limit(
+                                &model.identity.provider,
+                                &model.identity.model_short,
+                            ),
+                        ),
                         first_text: text,
                     },
                 )]

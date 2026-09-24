@@ -235,12 +235,14 @@ fn message_delta_preserves_truncated_tool_arguments_for_actor_validation() {
         .collect();
     assert_eq!(args, fragments.concat());
     assert!(serde_json::from_str::<Value>(&args).is_err());
+    // Neither the stopped first call nor the open second call may acquire
+    // an executable End after the message terminates at max_tokens.
     assert_eq!(
         events
             .iter()
             .filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
             .count(),
-        2
+        0
     );
     assert_eq!(events.last(), Some(&finish(FinishReason::MaxTokens)));
 }

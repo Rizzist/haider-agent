@@ -1032,7 +1032,7 @@ fn provider_request_body_is_budget_independent_and_matches_the_golden_ledger() {
     let token_budget = proxy_run(
         &profile,
         &profile.workspace,
-        &["--max-tokens", "1000000"],
+        &["--max-total-tokens", "1000000"],
         prompt,
     );
     let time_budget = proxy_run(&profile, &profile.workspace, &["--max-time", "10m"], prompt);

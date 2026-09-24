@@ -92,6 +92,48 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     }
 }
 
+#[test]
+fn session_output_limit_validation_is_exact_and_typed() {
+    let selection = crate::model_select::ValidatedModelSelection {
+        provider: "anthropic-oauth".into(),
+        model: "claude-fable-5-1".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+        context_window: Some(1_000_000),
+        max_output_tokens: 128_000,
+    };
+
+    assert_eq!(
+        super::rpc::resolve_session_output_limit(0, &selection).expect("derived default"),
+        30_000
+    );
+    let smaller = crate::model_select::ValidatedModelSelection {
+        max_output_tokens: 8_192,
+        ..selection.clone()
+    };
+    assert_eq!(
+        super::rpc::resolve_session_output_limit(0, &smaller).expect("model-bounded default"),
+        8_192
+    );
+    assert_eq!(
+        super::rpc::resolve_session_output_limit(128_000, &selection)
+            .expect("exact explicit limit"),
+        128_000
+    );
+    let (message, data) = super::rpc::resolve_session_output_limit(128_001, &selection)
+        .expect_err("over-limit refusal");
+    assert!(message.contains("claude-fable-5-1"));
+    assert!(message.contains("128000"));
+    assert!(matches!(
+        data,
+        haider_rpc::ErrorData::ModelOutputLimit {
+            requested: 128_001,
+            max_output_tokens: 128_000,
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
+}
+
 /// The attachment replay preflight must keep immutable-blob validation out of
 /// an idempotent retry while still entering the fused acceptance transaction
 /// that repairs a legacy first-turn receipt with no title.

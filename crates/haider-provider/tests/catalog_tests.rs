@@ -152,6 +152,36 @@ fn anthropic_context_window_is_always_none() {
     assert_eq!(models[0].context_window, None);
 }
 
+#[test]
+fn provider_catalog_token_limits_are_preserved_when_declared() {
+    let anthropic = parse_catalog(
+        CatalogSource::AnthropicSubscription,
+        &serde_json::json!({
+            "data": [{
+                "id": "claude-fable-5-1",
+                "max_input_tokens": 1_000_000,
+                "max_tokens": 128_000
+            }]
+        }),
+    )
+    .expect("anthropic payload parses");
+    assert_eq!(anthropic[0].context_window, Some(1_000_000));
+    assert_eq!(anthropic[0].max_output_tokens, Some(128_000));
+
+    let gemini = parse_catalog(
+        CatalogSource::GeminiApiKey,
+        &serde_json::json!({
+            "models": [{
+                "name": "models/gemini-2.5-pro",
+                "inputTokenLimit": 1_048_576,
+                "outputTokenLimit": 65_536
+            }]
+        }),
+    )
+    .expect("Gemini payload parses");
+    assert_eq!(gemini[0].max_output_tokens, Some(65_536));
+}
+
 /// MUTATION CHECK: make `visible` unconditionally `true` (drop the
 /// `visibility == "list"` test). Expected runtime failure: the hidden model
 /// appears in `pickable` below.
@@ -249,6 +279,7 @@ fn openai_compatible_ids_are_models_without_invented_metadata() {
                 slug: "custom-model-a".to_owned(),
                 display_name: "custom-model-a".to_owned(),
                 context_window: None,
+                max_output_tokens: None,
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
@@ -260,6 +291,7 @@ fn openai_compatible_ids_are_models_without_invented_metadata() {
                 slug: "custom-model-b".to_owned(),
                 display_name: "custom-model-b".to_owned(),
                 context_window: None,
+                max_output_tokens: None,
                 description: None,
                 default_effort: None,
                 supported_efforts: Vec::new(),
@@ -527,6 +559,7 @@ fn legacy_catalog_rows_serialize_byte_identically() {
         slug: "legacy".into(),
         display_name: "Legacy".into(),
         context_window: None,
+        max_output_tokens: None,
         description: None,
         default_effort: None,
         supported_efforts: Vec::new(),
@@ -555,6 +588,7 @@ fn display_name_falls_back_to_the_slug() {
             slug: "bare-slug".into(),
             display_name: "bare-slug".into(),
             context_window: None,
+            max_output_tokens: None,
             description: None,
             default_effort: None,
             supported_efforts: Vec::new(),

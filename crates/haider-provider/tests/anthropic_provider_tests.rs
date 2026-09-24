@@ -487,6 +487,50 @@ fn context_exceeded_http_and_sse_fixtures_are_distinct_from_max_tokens() {
     }));
 }
 
+#[test]
+fn max_tokens_keeps_partial_tool_open_for_actor_classification() {
+    let wire = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_partial","type":"message","role":"assistant","content":[],"model":"claude-fable-5-1","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_partial","name":"fs_write","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"large.html\",\"content\":\""}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":4096}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+    let items = replay_anthropic_sse(wire);
+
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallStart { call_id, name })
+            if call_id == "toolu_partial" && name == "fs_write"
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallArgsDelta { call_id, .. }) if call_id == "toolu_partial"
+    )));
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "toolu_partial"
+    )));
+    assert!(matches!(
+        items.last(),
+        Some(Ok(StreamEvent::Finish {
+            reason: FinishReason::MaxTokens
+        }))
+    ));
+}
+
 #[tokio::test]
 async fn capability_table_is_model_specific_and_conservative_for_unknown_ids() {
     let cases = [

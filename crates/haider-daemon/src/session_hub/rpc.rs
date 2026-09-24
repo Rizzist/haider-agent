@@ -3624,6 +3624,32 @@ fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::S
     }
 }
 
+pub(super) fn resolve_session_output_limit(
+    requested: u64,
+    selection: &crate::model_select::ValidatedModelSelection,
+) -> Result<u64, (String, haider_rpc::ErrorData)> {
+    if requested == 0 {
+        return Ok(haider_provider::DEFAULT_OUTPUT_LIMIT.min(selection.max_output_tokens));
+    }
+    if requested > selection.max_output_tokens {
+        Err((
+            format!(
+                "max_tokens {requested} exceeds model `{}` · `{}` output limit {}",
+                selection.model, selection.provider, selection.max_output_tokens
+            ),
+            haider_rpc::ErrorData::ModelOutputLimit {
+                provider: selection.provider.clone(),
+                model: selection.model.clone(),
+                requested,
+                max_output_tokens: selection.max_output_tokens,
+                context_window: selection.context_window,
+            },
+        ))
+    } else {
+        Ok(requested)
+    }
+}
+
 impl HubConnection {
     /// Publishes the resident TUI's foreground session after applying the same
     /// exact worker-generation fence used by control mutations. This is an
@@ -16371,7 +16397,7 @@ impl HubConnection {
         cwd: String,
         mut provider: String,
         mut model: String,
-        max_tokens: u64,
+        mut max_tokens: u64,
         permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
@@ -16663,12 +16689,12 @@ impl HubConnection {
                 None,
             );
         }
-        const MAX_DAEMON_OUTPUT_RESERVE: u64 = 30_000;
-        if model.trim().is_empty() || max_tokens == 0 || max_tokens > MAX_DAEMON_OUTPUT_RESERVE {
+        const MAX_DAEMON_OUTPUT_RESERVE: u64 = haider_provider::MAX_OUTPUT_LIMIT;
+        if model.trim().is_empty() || max_tokens > MAX_DAEMON_OUTPUT_RESERVE {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "session model must be non-empty and max_tokens must be in 1..=30000",
+                "session model must be non-empty and max_tokens must be in 0..=384000 (0 derives the model default)",
                 false,
                 None,
             );
@@ -16698,6 +16724,18 @@ impl HubConnection {
         let validated = match authority.validate_selection_with_status(&provider, None, &model) {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+        };
+        max_tokens = match resolve_session_output_limit(max_tokens, &validated) {
+            Ok(max_tokens) => max_tokens,
+            Err((message, data)) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &message,
+                    false,
+                    Some(data),
+                );
+            }
         };
         if let Err(refusal) = authority.validate_effort(&provider, &model, effort.as_deref()) {
             return self.respond_tuning_refusal(request_id, &refusal);

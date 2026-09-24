@@ -39,6 +39,7 @@ fn discovered_with_context(
         slug: slug.to_owned(),
         display_name: format!("Fixture {slug}"),
         context_window,
+        max_output_tokens: None,
         description: Some("provider-owned fixture".to_owned()),
         default_effort: None,
         supported_efforts: Vec::new(),
@@ -1046,6 +1047,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
                 name: "frontier-a".to_owned(),
                 display_name: Some("Fixture frontier-a".to_owned()),
                 context_window: Some(100_000),
+                max_output_tokens: Some(32_768),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -1056,6 +1058,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
                 name: "frontier-b".to_owned(),
                 display_name: Some("Fixture frontier-b".to_owned()),
                 context_window: Some(200_000),
+                max_output_tokens: Some(32_768),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -1614,8 +1617,17 @@ fn bedrock_and_vertex_model_details_get_effort_ladders_but_no_speeds() {
             .find(|detail| detail.name == "anthropic.claude-haiku-4-5")
             .expect("seeded haiku detail")
             .context_window,
-        None,
-        "seeded rows never guess a context window"
+        Some(200_000),
+        "seeded rows use the pinned Claude-family context fallback"
+    );
+    assert_eq!(
+        bedrock
+            .model_details
+            .iter()
+            .find(|detail| detail.name == "anthropic.claude-haiku-4-5")
+            .expect("seeded haiku detail")
+            .max_output_tokens,
+        Some(64_000)
     );
 
     let vertex = seeded_registry("vertex")
@@ -1656,6 +1668,12 @@ fn bedrock_and_vertex_model_details_get_effort_ladders_but_no_speeds() {
         anthropic.model_details[0].supported_speeds,
         ["fast"],
         "the claude api keeps advertising fast"
+    );
+    assert_eq!(anthropic.model_details[0].context_window, Some(1_000_000));
+    assert_eq!(
+        anthropic.model_details[0].max_output_tokens,
+        Some(128_000),
+        "an incomplete subscription catalog receives the pinned row limit"
     );
 }
 

@@ -40,7 +40,10 @@ pub const PROFILE_CONFIG_FILE: &str = "config.json";
 /// W3c default provider for new sessions.
 pub const DEFAULT_PROVIDER: &str = "anthropic";
 /// W3c default max output tokens for new sessions.
-pub const DEFAULT_MAX_TOKENS: u64 = 4096;
+/// Default per-response budget for clients that cannot yet inspect the
+/// selected model row. Daemon-side model-limit validation remains the final
+/// authority and explicit client overrides still win.
+pub const DEFAULT_MAX_TOKENS: u64 = 30_000;
 /// Release-owned packaged default: a FULL Anthropic model ID (never a short
 /// product label). Verified by the ignored live smoke, which is evidence,
 /// never the merge gate.

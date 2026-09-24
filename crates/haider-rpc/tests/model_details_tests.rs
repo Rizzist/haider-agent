@@ -24,11 +24,11 @@ fn provider_summary_without_model_details_decodes_an_empty_vector() {
     assert!(summary.model_details.is_empty());
 }
 
-/// MUTATION CHECK: omit model details or their context windows during
+/// MUTATION CHECK: omit model details or their token limits during
 /// serialization. Expected runtime failure: the decoded summary differs from
 /// the provider-declared names and windows below.
 #[test]
-fn provider_summary_model_details_round_trip_names_and_windows() {
+fn provider_summary_model_details_round_trip_token_limits() {
     let summary = ProviderSummaryWire {
         provider: "openai".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
@@ -42,6 +42,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
                 name: "frontier-a".to_owned(),
                 display_name: Some("Frontier A".to_owned()),
                 context_window: Some(200_000),
+                max_output_tokens: Some(128_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -52,6 +53,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
                 name: "frontier-b".to_owned(),
                 display_name: None,
                 context_window: None,
+                max_output_tokens: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -88,6 +90,29 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
     assert_eq!(decoded.model_details[0].context_window, Some(200_000));
     assert_eq!(decoded.model_details[1].name, "frontier-b");
     assert_eq!(decoded.model_details[1].context_window, None);
+}
+
+#[test]
+fn model_output_limit_error_data_round_trips_additively() {
+    let data = haider_rpc::ErrorData::ModelOutputLimit {
+        provider: "anthropic-oauth".into(),
+        model: "claude-fable-5-1".into(),
+        requested: 200_000,
+        max_output_tokens: 128_000,
+        context_window: Some(1_000_000),
+    };
+    let json = serde_json::to_value(&data).expect("serialize typed limit error");
+    assert_eq!(json["kind"], "model_output_limit");
+    assert_eq!(json["max_output_tokens"], 128_000);
+    assert!(matches!(
+        serde_json::from_value(json).expect("decode typed limit error"),
+        haider_rpc::ErrorData::ModelOutputLimit {
+            requested: 200_000,
+            max_output_tokens: 128_000,
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
 }
 
 /// MUTATION CHECK: require the additive response-open budget, omit a present

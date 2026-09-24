@@ -1129,17 +1129,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             profile
                 .configured_models
                 .iter()
-                .map(|slug| {
-                    model_detail_wire(
-                        &profile.provider_id,
-                        offline_model(&profile.provider_id, slug),
-                    )
-                })
+                .map(|slug| model_detail_wire(profile, offline_model(&profile.provider_id, slug)))
                 .collect()
         } else {
             discovered
                 .into_iter()
-                .map(|model| model_detail_wire(&profile.provider_id, model))
+                .map(|model| model_detail_wire(profile, model))
                 .collect()
         };
         provider_summary(
@@ -1173,6 +1168,7 @@ fn offline_model(_provider: &str, slug: &str) -> DiscoveredModel {
         slug: slug.to_owned(),
         display_name: slug.to_owned(),
         context_window: None,
+        max_output_tokens: None,
         description: None,
         default_effort: None,
         supported_efforts: Vec::new(),
@@ -1187,7 +1183,9 @@ fn offline_model(_provider: &str, slug: &str) -> DiscoveredModel {
 /// gemini effort ladders come from the pinned static capability tables, and
 /// the anthropic fast gate rides `supported_speeds`. The daemon is the ONE
 /// source of this truth — clients hold no tables.
-fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire {
+fn model_detail_wire(profile: &ProviderProfileV1, model: DiscoveredModel) -> ModelDetailWire {
+    let provider = profile.provider_id.as_str();
+    let static_limits = haider_provider::static_model_limits(provider, &model.slug);
     let static_ladder: &[&str] = if model.supported_efforts.is_empty() {
         match provider {
             // G4b: bedrock/vertex serve the same Claude families — the
@@ -1234,10 +1232,10 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
     } else {
         Vec::new()
     };
-    ModelDetailWire {
-        name: model.slug.clone(),
-        display_name: Some(model.display_name),
-        context_window: model.context_window.or_else(|| {
+    let context_window = model
+        .context_window
+        .or(static_limits.context_window)
+        .or_else(|| {
             (provider == XAI_PROVIDER_NAME)
                 .then(|| {
                     XAI_SEED_MODEL_CONTEXT_WINDOWS
@@ -1245,7 +1243,19 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
                         .find_map(|(slug, window)| (*slug == model.slug).then_some(*window))
                 })
                 .flatten()
-        }),
+        });
+    let max_output_tokens = model
+        .max_output_tokens
+        .unwrap_or(static_limits.max_output_tokens);
+    let max_output_tokens = max_output_tokens.min(haider_provider::MAX_OUTPUT_LIMIT);
+    let max_output_tokens = context_window.map_or(max_output_tokens, |context_window| {
+        max_output_tokens.min(context_window)
+    });
+    ModelDetailWire {
+        name: model.slug.clone(),
+        display_name: Some(model.display_name),
+        context_window,
+        max_output_tokens: Some(max_output_tokens),
         supported_efforts,
         default_effort,
         supported_speeds,

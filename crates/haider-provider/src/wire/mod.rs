@@ -1112,6 +1112,10 @@ struct StreamState {
     native_computer: bool,
     started: bool,
     open_blocks: BTreeMap<usize, OpenBlock>,
+    /// Client tool blocks that received `content_block_stop` but whose message-level
+    /// finish reason is not known yet. A later `max_tokens` must be able to
+    /// discard their End marker before the actor can dispatch them.
+    closed_tool_blocks: BTreeMap<usize, OpenBlock>,
     seen_blocks: BTreeSet<usize>,
     implicitly_closed_blocks: BTreeSet<usize>,
     message_delta_seen: bool,
@@ -1126,6 +1130,7 @@ impl StreamState {
             native_computer,
             started: false,
             open_blocks: BTreeMap::new(),
+            closed_tool_blocks: BTreeMap::new(),
             seen_blocks: BTreeSet::new(),
             implicitly_closed_blocks: BTreeSet::new(),
             message_delta_seen: false,
@@ -1343,7 +1348,17 @@ impl StreamState {
                     return Ok(Vec::new());
                 }
                 self.require_before_message_delta("content_block_stop")?;
-                self.close_block(index)
+                if matches!(self.open_blocks.get(&index), Some(OpenBlock::Tool { .. })) {
+                    let block = self.open_blocks.remove(&index).ok_or_else(|| {
+                        malformed(format!(
+                            "Anthropic stopped unopened content block index {index}"
+                        ))
+                    })?;
+                    self.closed_tool_blocks.insert(index, block);
+                    Ok(Vec::new())
+                } else {
+                    self.close_block(index)
+                }
             }
             WireEvent::MessageDelta { delta, usage } => {
                 self.require_started("message_delta")?;
@@ -1360,12 +1375,26 @@ impl StreamState {
                     self.stop_reason = Some(normalized);
                 }
                 // A message-level delta ends the content phase even when the
-                // provider omits or delays a block stop. Finalize normally so
-                // tool ends, signed thinking, and citations are not lost.
+                // provider omits or delays a block stop. A max-token stop is
+                // different: an open tool is partial and must not gain a
+                // synthetic, executable ToolCallEnd.
                 let mut events = Vec::new();
                 while let Some((&index, _)) = self.open_blocks.first_key_value() {
-                    events.extend(self.close_block(index)?);
+                    let output_limited_tool = self.stop_reason == Some(FinishReason::MaxTokens)
+                        && matches!(self.open_blocks.get(&index), Some(OpenBlock::Tool { .. }));
+                    if output_limited_tool {
+                        self.open_blocks.remove(&index);
+                    } else {
+                        events.extend(self.close_block(index)?);
+                    }
                     self.implicitly_closed_blocks.insert(index);
+                }
+                let closed_tool_blocks = std::mem::take(&mut self.closed_tool_blocks);
+                if self.stop_reason != Some(FinishReason::MaxTokens) {
+                    for (index, block) in closed_tool_blocks {
+                        self.open_blocks.insert(index, block);
+                        events.extend(self.close_block(index)?);
+                    }
                 }
                 self.message_delta_seen = true;
                 let Some(usage) = usage else {
@@ -1396,7 +1425,7 @@ impl StreamState {
             }
             WireEvent::MessageStop => {
                 self.require_started("message_stop")?;
-                if !self.open_blocks.is_empty() {
+                if !self.open_blocks.is_empty() || !self.closed_tool_blocks.is_empty() {
                     return Err(malformed(
                         "Anthropic message_stop arrived while a content block was open",
                     ));

@@ -3305,7 +3305,7 @@ impl HarnessActor {
         // original spelling from the already-durable provider Start markers
         // only on resume; ordinary turns perform no extra journal reads.
         let mut recovered_names = HashMap::new();
-        let mut malformed_tool_pending_repair = false;
+        let mut tool_call_repair_pending = false;
         let recovery_calls: HashSet<&str> =
             checkpoint
                 .iter()
@@ -3323,7 +3323,7 @@ impl HarnessActor {
             || child_wait.is_some()
             || self.config.provider_requests_already_made > 0
         {
-            (recovered_names, malformed_tool_pending_repair) = match self
+            (recovered_names, tool_call_repair_pending) = match self
                 .recover_tool_repair_state(&run_id, &recovery_calls)
                 .await
             {
@@ -3824,8 +3824,10 @@ impl HarnessActor {
                     }
                     StreamEvent::ToolCallEnd { call_id } => {
                         if let Some(tool) = completed_tools.remove(call_id) {
-                            let invalid =
-                                tool.result.as_ref().is_some_and(invalid_tool_call_result);
+                            let invalid = tool
+                                .result
+                                .as_ref()
+                                .is_some_and(repairable_tool_call_result);
                             assistant_blocks.push(Block::ToolCall {
                                 call_id: tool.call_id.clone(),
                                 name: tool.name.clone(),
@@ -5968,7 +5970,7 @@ impl HarnessActor {
                                 // Persist the reset before dispatch, including deferred tools.
                                 // Their results may arrive after a later malformed frame, so
                                 // result-completion order cannot reconstruct frame validity.
-                                if malformed_tool_pending_repair {
+                                if tool_call_repair_pending {
                                     if let Err(error) = self
                                         .commit_hidden_extension_marker(
                                             &run_id,
@@ -5987,7 +5989,7 @@ impl HarnessActor {
                                             )
                                             .await;
                                     }
-                                    malformed_tool_pending_repair = false;
+                                    tool_call_repair_pending = false;
                                 }
                                 assistant_blocks.push(block);
                                 let is_script = tools.iter().any(|tool| {
@@ -6175,7 +6177,7 @@ impl HarnessActor {
                                         &mut tools,
                                         &call_id,
                                         &error,
-                                        !malformed_tool_pending_repair,
+                                        !tool_call_repair_pending,
                                     )
                                     .await
                                 {
@@ -6192,7 +6194,7 @@ impl HarnessActor {
                                             .await;
                                     }
                                 };
-                                if malformed_tool_pending_repair {
+                                if tool_call_repair_pending {
                                     return self
                                         .provider_failure_outcome_with_items(
                                             &run_id,
@@ -6203,7 +6205,7 @@ impl HarnessActor {
                                         )
                                         .await;
                                 }
-                                malformed_tool_pending_repair = true;
+                                tool_call_repair_pending = true;
                                 assistant_blocks.push(block);
                                 Ok(Some(result))
                             }
@@ -6581,6 +6583,59 @@ impl HarnessActor {
                                         error,
                                     )
                                     .await;
+                            }
+                        }
+                        if reason == FinishReason::MaxTokens {
+                            let completed_call_ids = assistant_blocks
+                                .iter()
+                                .filter_map(|block| match block {
+                                    Block::ToolCall { call_id, .. } => Some(call_id.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<HashSet<_>>();
+                            let partial_call_ids = tools
+                                .iter()
+                                .filter(|tool| !completed_call_ids.contains(tool.call_id.as_str()))
+                                .map(|tool| tool.call_id.clone())
+                                .collect::<Vec<_>>();
+                            if !partial_call_ids.is_empty() {
+                                let error = output_limit_tool_error();
+                                let repair = !tool_call_repair_pending;
+                                for call_id in partial_call_ids {
+                                    let (block, result) = match self
+                                        .close_output_limit_tool_failure(
+                                            &run_id, &mut tools, &call_id, repair,
+                                        )
+                                        .await
+                                    {
+                                        Ok(pair) => pair,
+                                        Err(close_error) => {
+                                            return self
+                                                .drive_error_outcome_with_items(
+                                                    &run_id,
+                                                    &mut message,
+                                                    &mut reasoning,
+                                                    &mut tools,
+                                                    close_error,
+                                                )
+                                                .await;
+                                        }
+                                    };
+                                    assistant_blocks.push(block);
+                                    tool_results.push(result);
+                                }
+                                if tool_call_repair_pending {
+                                    return self
+                                        .provider_failure_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                                tool_call_repair_pending = true;
                             }
                         }
                         if !buffered_script_calls.is_empty() {
@@ -8591,7 +8646,7 @@ impl HarnessActor {
                 };
                 match payload {
                     EventPayload::ToolResult { result, .. }
-                        if invalid_tool_call_result(&result) =>
+                        if repairable_tool_call_result(&result) =>
                     {
                         pending_repair = true
                     }
@@ -8856,6 +8911,69 @@ impl HarnessActor {
         let message = Message::tool_result(tool.call_id.clone(), result.preview, false);
         tools.remove(index);
         Ok((block, message))
+    }
+
+    /// Closes a call that never received ToolCallEnd because the provider hit
+    /// its response limit. Raw partial bytes remain durable for diagnosis,
+    /// while the call itself is never dispatched.
+    async fn close_output_limit_tool_failure(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        call_id: &str,
+        repaired: bool,
+    ) -> Result<(Block, Message), DriveError> {
+        let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
+            return Err(DriveError::Provider(provider_protocol_error(format!(
+                "provider truncated unknown tool call `{call_id}`",
+            ))));
+        };
+        let tool = &tools[index];
+        let message = "the provider stopped at its output limit before the tool arguments were complete; the truncated tool call was not executed";
+        let diagnostic = serde_json::json!({
+            "status": "failed",
+            "error": {
+                "kind": "output_limit_truncation",
+                "tool": tool.name,
+                "message": message,
+                "repair": "Retry by splitting large content across multiple smaller tool calls. A second consecutive truncated tool call terminates the run.",
+            },
+        });
+        let result = BoundedResult {
+            preview: diagnostic.to_string(),
+            truncated: false,
+            truncation: None,
+            effects: Vec::new(),
+            data: Some(
+                haider_protocol::tool::ToolResultData::OutputLimitTruncation {
+                    tool: tool.name.clone(),
+                    message: message.to_owned(),
+                    repaired: Some(repaired),
+                },
+            ),
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: ToolResultStatus::Failed,
+            reason: Some(message.to_owned()),
+            presentation: Some(tool_error_presentation(
+                "output-limit-tool-arguments",
+                "Tool call exceeded the output limit",
+                "The provider stopped before the tool arguments were complete. The truncated call was not executed.",
+            )),
+            orchestration: None,
+        };
+        let result = tool.correct_result(result);
+        self.commit_tool_result_and_completion(run_id, tool, &result)
+            .await?;
+        let block = Block::ToolCall {
+            call_id: tool.call_id.clone(),
+            name: tool.name.clone(),
+            args: serde_json::json!({}),
+        };
+        let result_message = Message::tool_result(tool.call_id.clone(), result.preview, false);
+        tools.remove(index);
+        Ok((block, result_message))
     }
 
     /// Closes the matching tool item for a provider `ToolCallEnd`.
@@ -12964,6 +13082,14 @@ pub(crate) fn invalid_tool_call_result(result: &BoundedResult) -> bool {
     )
 }
 
+pub(crate) fn repairable_tool_call_result(result: &BoundedResult) -> bool {
+    invalid_tool_call_result(result)
+        || matches!(
+            result.data,
+            Some(haider_protocol::tool::ToolResultData::OutputLimitTruncation { .. })
+        )
+}
+
 struct RequestInputResolutionContext {
     request: RequestInput,
     menu: Menu,
@@ -13026,6 +13152,20 @@ fn parse_tool_args(tool: &ToolAccumulator) -> Result<Arc<serde_json::Value>, Dri
             )),
         )),
     }
+}
+
+fn output_limit_tool_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::InvalidRequest,
+        "the provider repeatedly stopped at its output limit before completing tool arguments; no truncated tool call was executed",
+    )
+    .with_presentation(ErrorPresentation::new(
+        "output-limit-tool-arguments",
+        "Tool call exceeded the output limit",
+        "The provider repeatedly exhausted its response limit while a tool call was open. Split large content across smaller tool calls.",
+        ErrorScope::Tool,
+        [ErrorAction::Retry],
+    ))
 }
 
 /// Returns the value that crosses the dispatcher boundary. Ordinary tools

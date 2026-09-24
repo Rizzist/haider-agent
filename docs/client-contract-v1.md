@@ -330,6 +330,7 @@ is §4.1.
 | `session_provider_rebind_v1` | `session.provider.rebind` |
 | `session_account_select_v1` | exact `session.create.account_alias` pin |
 | `session_create_admission_v1` | daemon resolution of create provider/default model and initial tuning |
+| `model_output_limits_v1` | model-row output maxima and `session.create.max_tokens=0` derivation |
 | `session_model_select_v1` | `session.select_model` |
 | `session_rename_v1` | `session.rename`, `SessionSummary.title` |
 | `session_workspace_set_v1` | receipt-backed `session.workspace.set`; additive `workspace_unavailable` and `workspace_selected` raw facts |
@@ -1321,8 +1322,11 @@ explicit availability disambiguates it. Provider `endpoint`,
 `availability_reason`, and `default_model` are absent when undeclared/unknown;
 empty `models`, `model_details`, `auth_methods`, effort ladders, or speed lists
 mean the provider declares none in an available snapshot. `context_window`,
-`default_effort`, and `supports_thinking_type` absence means not declared;
-clients hold no replacement capability tables.
+`default_effort`, and `supports_thinking_type` absence means not declared.
+`max_output_tokens` is additive: current daemons project the provider catalog
+declaration or a pinned provider/model fallback, bounded by the known context
+window and adapter maximum; absence means an older daemon. Clients hold no
+replacement capability tables.
 
 `supports_vision` states whether the pair accepts image attachments. It is the
 daemon's projection of the adapter's own `capabilities().vision` — the fact the
@@ -1775,6 +1779,13 @@ and `crates/haider-store/src/event_store.rs:5876-5946`).
 |---|---|---|
 | Request | `session.create` | `command_id: CommandId`, `cwd: String`, `provider: String`, `model: String`, `max_tokens: u64`, `permission_overrides: Option<SessionPermissionOverridesV1>`, `cache_policy: Option<CachePolicySettingsV1>`, `interaction_mode: SessionInteractionModeV1` |
 | Success response | `SessionCreate` (`method: "session.create"`) | `session_id: SessionId`, `created_seq: u64`, `worker_generation: u64`, `metadata: SessionMetadataV1`; the metadata carries the same `interaction_mode: SessionInteractionModeV1` |
+
+When `model_output_limits_v1` is advertised, `max_tokens: 0` is a derivation
+sentinel: after provider/model resolution the daemon persists and returns the
+smaller of its 30,000-token default and the resolved model maximum. Positive
+values remain exact client overrides and values above the row limit receive a
+typed `model_output_limit` error. A client must negotiate the feature before
+sending zero.
 
 The exact enum strings are `"interactive"` and `"autonomous"`.
 `interactive` is the serde default and is omitted on the wire; that is a

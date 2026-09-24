@@ -55,6 +55,7 @@ fn provider_summary(
                 name: (*slug).to_owned(),
                 display_name: None,
                 context_window: None,
+                max_output_tokens: Some(30_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -243,9 +244,10 @@ fn session_create_requests_an_output_budget_not_the_context_window() {
     assert_eq!(created, SESSION_OUTPUT_CAP);
 
     // A tinier declared window still wins.
-    assert_eq!(session_output_cap(4_096), 4_096);
+    assert_eq!(session_output_cap(4_096, None), 4_096);
+    assert_eq!(session_output_cap(200_000, Some(8_192)), 8_192);
     assert_eq!(
-        session_output_cap(0),
+        session_output_cap(0, None),
         1,
         "zero never reaches the daemon's reject"
     );
