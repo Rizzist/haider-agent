@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use haider_protocol::spawn_subagent::{
-    MAX_PROMPT_BYTES, MAX_SELECTOR_BYTES, MAX_TASK_BYTES, SpawnSubagentArguments,
+    MAX_PROMPT_BYTES, MAX_SELECTOR_BYTES, MAX_TASK_BYTES, MAX_WAIT_MS, SpawnSubagentArguments,
 };
 
 /// Validated arguments for the depth-capped local-subagent tool.
@@ -140,7 +140,7 @@ pub fn spawn_subagent_manifest() -> ToolManifest {
                     "description": "Return a durable child handle immediately. Use haider agent wait/list/message/cancel with the returned parent session and child id."
                 },
                 "wait_ms": {
-                    "type": "integer", "minimum": 1, "maximum": 86400000,
+                    "type": "integer", "minimum": 1, "maximum": MAX_WAIT_MS,
                     "description": "Optional time to observe a blocking child. On expiry return child_still_running; the child continues."
                 },
                 "model": {

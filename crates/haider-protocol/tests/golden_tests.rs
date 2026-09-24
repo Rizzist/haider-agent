@@ -862,6 +862,28 @@ fn child_still_running_data_is_additive_and_keeps_legacy_results() {
 }
 
 #[test]
+fn delegated_child_handle_commands_are_pinned() {
+    use haider_protocol::spawn_subagent::{
+        MAX_WAIT_MS, agent_cancel_command, agent_list_command, agent_wait_command,
+    };
+    let parent = SessionId::new("parent-1");
+    let agent = AgentId::new("agent-1");
+    assert_eq!(
+        agent_wait_command(&parent, &agent),
+        "haider agent wait parent-1 agent-1 --json"
+    );
+    assert_eq!(
+        agent_list_command(&parent),
+        "haider agent list parent-1 --json"
+    );
+    assert_eq!(
+        agent_cancel_command(&parent, &agent),
+        "haider agent cancel parent-1 agent-1 --json"
+    );
+    assert_eq!(MAX_WAIT_MS, 24 * 60 * 60 * 1_000);
+}
+
+#[test]
 fn invalid_tool_call_repair_metadata_is_additive_and_round_trips() {
     for repaired in [false, true] {
         let data = ToolResultData::InvalidToolCall {

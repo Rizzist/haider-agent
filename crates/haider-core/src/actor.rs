@@ -101,6 +101,9 @@ use haider_protocol::request_budget::{
     PROVIDER_REQUEST_BUDGET_EXTENSION_KIND, RequestBudgetContinuationV1, RequestBudgetPhaseV1,
     RequestBudgetStatusV1, RequestBudgetV1,
 };
+use haider_protocol::spawn_subagent::{
+    agent_cancel_command, agent_list_command, agent_wait_command,
+};
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
     BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES,
@@ -1522,6 +1525,15 @@ pub struct DeferredToolResult {
     pub chip: ChipState,
     pub truncated: bool,
     pub truncation: Option<haider_protocol::tool::ToolTruncation>,
+}
+
+impl DeferredToolResult {
+    /// A bounded observation ended before the child did. Terminal reports
+    /// carry `Done` or `Error`; only a still-live child is reported `Waiting`,
+    /// and its summary is the typed `child_still_running` handle.
+    pub fn child_still_running(&self) -> bool {
+        self.chip == ChipState::Waiting
+    }
 }
 
 /// Port for general tool execution. `request_input` remains actor-owned
@@ -8996,13 +9008,6 @@ impl HarnessActor {
             let result = match outcome {
                 GeneralToolOutcome::Completed(result) => result,
                 GeneralToolOutcome::Deferred(ticket) => {
-                    let background = ticket
-                        .manifest
-                        .coordinates
-                        .as_ref()
-                        .and_then(|coordinates| coordinates.get("background"))
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
                     self.commit_payload(
                         run_id,
                         EventPayload::AgentSpawned(ticket.manifest.clone()),
@@ -9027,33 +9032,8 @@ impl HarnessActor {
                         },
                     )
                     .await?;
-                    if background {
-                        let agent = &ticket.manifest.agent;
-                        let coordinates = ticket.manifest.coordinates.as_ref();
-                        BoundedResult {
-                            preview: serde_json::json!({
-                                "status": "child_spawned",
-                                "agent": agent,
-                                "parent_session_id": self.config.session_id,
-                                "child_session_id": coordinates.and_then(|value| value.get("child_session_id")),
-                                "child_run_id": coordinates.and_then(|value| value.get("child_run_id")),
-                                "collect": format!("haider agent wait {} {} --json", self.config.session_id, agent),
-                                "list": format!("haider agent list {} --json", self.config.session_id),
-                                "cancel": format!("haider agent cancel {} {} --json", self.config.session_id, agent),
-                            })
-                            .to_string(),
-                            truncated: false,
-                            truncation: None,
-                            effects: Vec::new(),
-                            data: None,
-                            artifact: None,
-                            images: Vec::new(),
-                            cursor: None,
-                            status: ToolResultStatus::Completed,
-                            reason: None,
-                            presentation: None,
-                            orchestration: None,
-                        }
+                    if is_background_spawn(&ticket.manifest) {
+                        background_spawn_result(&self.config.session_id, &ticket.manifest)
                     } else {
                         deferred.push(DeferredAccumulator {
                             call_id: tools[index].call_id.clone(),
@@ -10508,7 +10488,7 @@ impl HarnessActor {
                     };
                 }
             };
-            let child_still_running = completion.chip == ChipState::Waiting;
+            let child_still_running = completion.child_still_running();
             let mut result = BoundedResult {
                 // The opaque id is operational routing, not display identity:
                 // a later `message_subagent` call must be able to name the
@@ -13342,6 +13322,49 @@ fn submit_busy_error(capacity: usize) -> HaiderError {
         "deferred_command_capacity": capacity,
     }));
     error
+}
+
+fn is_background_spawn(manifest: &AgentManifest) -> bool {
+    manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("background"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The immediate tool result for `spawn_subagent(background=true)`: the
+/// durable child handle and the CLI commands that operate on it.
+fn background_spawn_result(
+    parent_session_id: &SessionId,
+    manifest: &AgentManifest,
+) -> BoundedResult {
+    let agent = &manifest.agent;
+    let coordinates = manifest.coordinates.as_ref();
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "child_spawned",
+            "agent": agent,
+            "parent_session_id": parent_session_id,
+            "child_session_id": coordinates.and_then(|value| value.get("child_session_id")),
+            "child_run_id": coordinates.and_then(|value| value.get("child_run_id")),
+            "collect": agent_wait_command(parent_session_id, agent),
+            "list": agent_list_command(parent_session_id),
+            "cancel": agent_cancel_command(parent_session_id, agent),
+        })
+        .to_string(),
+        truncated: false,
+        truncation: None,
+        effects: Vec::new(),
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+        orchestration: None,
+    }
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {

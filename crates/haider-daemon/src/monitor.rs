@@ -67,6 +67,8 @@ const MONITOR_TRANSPORT_MIRROR_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_DELIVERY_RETRY_MIN: Duration = Duration::from_secs(1);
 const MONITOR_DELIVERY_RETRY_MAX: Duration = Duration::from_secs(30);
 const MONITOR_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// Task/agent completion digests are durable facts; this only bounds wake latency.
+const MONITOR_HANDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MONITOR_PROCESS_BATCH_WINDOW: Duration = Duration::from_millis(500);
 // Two 500 ms process batches: one may already be filling when the leader
 // exits, and one final batch may contain bytes that raced that observation.
@@ -1290,6 +1292,16 @@ impl MonitorService {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(session)
+    }
+
+    /// The activated session hub, if it is still alive.
+    fn session_hub(&self) -> Option<SessionHub> {
+        self.inner
+            .hub
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .and_then(|weak| weak.upgrade())
     }
 
     pub(crate) fn activate(&self, hub: WeakSessionHub) {
@@ -5921,6 +5933,100 @@ impl MonitorService {
     }
 }
 
+/// Outcome of one poll of a task or delegated-child handle.
+enum HandlePoll {
+    Pending,
+    Completed(MonitorEventPayload),
+    /// The handle is unknown or no longer owned by the monitor's session.
+    Gone,
+}
+
+/// Polls a `task`/`agent` source until the handle's durable terminal digest
+/// exists, publishes it once, and ends the runner.
+async fn watch_handle_completion(
+    service: &MonitorService,
+    registration: &MonitorRegistration,
+    cancelled: &mut oneshot::Receiver<()>,
+) {
+    loop {
+        let Some(hub) = service.session_hub() else {
+            return;
+        };
+        let poll = match &registration.source {
+            MonitorSource::Task { task_id } => task_completion(&hub, registration, task_id),
+            MonitorSource::Agent { agent_id } => {
+                agent_completion(&hub, registration, agent_id).await
+            }
+            _ => return,
+        };
+        match poll {
+            HandlePoll::Completed(payload) => {
+                let _ = service.publish_runner_event(registration, payload);
+                return;
+            }
+            HandlePoll::Gone => return,
+            HandlePoll::Pending => {}
+        }
+        tokio::select! {
+            () = tokio::time::sleep(MONITOR_HANDLE_POLL_INTERVAL) => {}
+            _ = &mut *cancelled => return,
+        }
+    }
+}
+
+fn task_completion(
+    hub: &SessionHub,
+    registration: &MonitorRegistration,
+    task_id: &str,
+) -> HandlePoll {
+    let Some(completed) = hub
+        .task_registry()
+        .monitor_completion(&registration.owner_session_id, &TaskId::new(task_id))
+    else {
+        return HandlePoll::Pending;
+    };
+    let payload = serde_json::to_string(&completed)
+        .unwrap_or_else(|_| "task completed without an encodable digest".into());
+    HandlePoll::Completed(MonitorEventPayload::Task { payload })
+}
+
+async fn agent_completion(
+    hub: &SessionHub,
+    registration: &MonitorRegistration,
+    agent_id: &str,
+) -> HandlePoll {
+    let agent = AgentId::new(agent_id);
+    let record = match hub.delegation(agent.clone()).await {
+        Ok(Some(record)) if record.parent_session_id == registration.owner_session_id => record,
+        Ok(_) => return HandlePoll::Gone,
+        Err(error) => {
+            tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child");
+            return HandlePoll::Pending;
+        }
+    };
+    match crate::delegation::DelegationHandle::new(hub.clone())
+        .derive_terminal_report(&record)
+        .await
+    {
+        Ok(Some(completion)) => {
+            let payload = json!({
+                "agent": agent,
+                "child_session_id": record.child_session_id,
+                "child_run_id": record.child_run_id,
+                "report": completion.report,
+                "chip": completion.chip,
+            })
+            .to_string();
+            HandlePoll::Completed(MonitorEventPayload::Agent { payload })
+        }
+        Ok(None) => HandlePoll::Pending,
+        Err(error) => {
+            tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child report");
+            HandlePoll::Pending
+        }
+    }
+}
+
 async fn run_monitor_source(
     service: MonitorService,
     registration: MonitorRegistration,
@@ -5931,85 +6037,8 @@ async fn run_monitor_source(
     }
     match &registration.source {
         MonitorSource::Sms => {}
-        MonitorSource::Task { task_id } => {
-            let task = TaskId::new(task_id);
-            loop {
-                let hub = service
-                    .inner
-                    .hub
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                let Some(hub) = hub.and_then(|weak| weak.upgrade()) else {
-                    return;
-                };
-                if let Some(completed) = hub
-                    .task_registry()
-                    .monitor_completion(&registration.owner_session_id, &task)
-                {
-                    let payload = serde_json::to_string(&completed)
-                        .unwrap_or_else(|_| "task completed without an encodable digest".into());
-                    let _ = service
-                        .publish_runner_event(&registration, MonitorEventPayload::Task { payload });
-                    return;
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(MONITOR_FILE_POLL_INTERVAL) => {}
-                    _ = &mut cancelled => return,
-                }
-            }
-        }
-        MonitorSource::Agent { agent_id } => {
-            let agent = AgentId::new(agent_id);
-            loop {
-                let hub = service
-                    .inner
-                    .hub
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                let Some(hub) = hub.and_then(|weak| weak.upgrade()) else {
-                    return;
-                };
-                match hub.delegation(agent.clone()).await {
-                    Ok(Some(record))
-                        if record.parent_session_id == registration.owner_session_id =>
-                    {
-                        match crate::delegation::DelegationHandle::new(hub.clone())
-                            .derive_terminal_report(&record)
-                            .await
-                        {
-                            Ok(Some(completion)) => {
-                                let payload = json!({
-                                    "agent": agent,
-                                    "child_session_id": record.child_session_id,
-                                    "child_run_id": record.child_run_id,
-                                    "report": completion.report,
-                                    "chip": completion.chip,
-                                })
-                                .to_string();
-                                let _ = service.publish_runner_event(
-                                    &registration,
-                                    MonitorEventPayload::Agent { payload },
-                                );
-                                return;
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child report")
-                            }
-                        }
-                    }
-                    Ok(_) => return,
-                    Err(error) => {
-                        tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child")
-                    }
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(MONITOR_FILE_POLL_INTERVAL) => {}
-                    _ = &mut cancelled => return,
-                }
-            }
+        MonitorSource::Task { .. } | MonitorSource::Agent { .. } => {
+            watch_handle_completion(&service, &registration, &mut cancelled).await;
         }
         MonitorSource::Timer { interval_ms } => {
             let interval = Duration::from_millis(*interval_ms);
@@ -7883,7 +7912,9 @@ fn next_fire_at_ms(registration: &MonitorRegistration) -> Option<u64> {
             ..
         } => Some(interval_ms.unwrap_or(5_000)),
         MonitorSource::Sms | MonitorSource::Process { .. } | MonitorSource::Cli { .. } => None,
-        MonitorSource::Task { .. } | MonitorSource::Agent { .. } => Some(1_000),
+        MonitorSource::Task { .. } | MonitorSource::Agent { .. } => {
+            u64::try_from(MONITOR_HANDLE_POLL_INTERVAL.as_millis()).ok()
+        }
     }?;
     Some(now_ms().saturating_add(delay))
 }

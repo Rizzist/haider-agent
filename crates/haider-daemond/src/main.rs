@@ -278,9 +278,45 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
     let script = script
         .into_string()
         .map_err(|_| format!("{FAKE_PROVIDER_ENV} is not valid UTF-8"))?;
-    let parsed: serde_json::Value = serde_json::from_str(&script)
-        .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not JSON: {error}"))?;
-    let (fake, by_model) = if let Some(models) = parsed.get("by_model") {
+    let fake = FakeFactory::from_script(&script)?;
+    eprintln!("haiderd: TEST MODE — every turn resolves to the injected fake provider");
+    // Every turn resolves to the fake regardless of what the session was
+    // created with, so the creatable set includes the release default too:
+    // otherwise a client using the profile's own provider is rejected at
+    // `session.create` for a provider the daemon was never going to call.
+    let mut providers = haider_provider::BUILTIN_PROVIDER_NAMES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    providers.insert("fake".to_owned());
+    Ok(DaemonDependencies {
+        provider_factory: ProviderFactoryConfig::Injected {
+            factory: Arc::new(fake),
+            providers,
+        },
+        ..DaemonDependencies::default()
+    })
+}
+
+/// The injected factory: one deterministic provider for every turn, or one
+/// per session model when the script is a `by_model` map.
+enum FakeFactory {
+    Single(Arc<FakeProvider>),
+    ByModel(HashMap<String, Arc<FakeProvider>>),
+}
+
+impl FakeFactory {
+    fn from_script(script: &str) -> Result<Self, String> {
+        let parsed: serde_json::Value = serde_json::from_str(script)
+            .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not JSON: {error}"))?;
+        let Some(models) = parsed.get("by_model") else {
+            let provider = FakeProvider::from_json(script)
+                .map_err(|error| {
+                    format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}")
+                })?
+                .without_request_recording();
+            return Ok(Self::Single(Arc::new(provider)));
+        };
         let models = models
             .as_object()
             .ok_or_else(|| format!("{FAKE_PROVIDER_ENV}.by_model must be an object"))?;
@@ -301,36 +337,8 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
                 .without_request_recording();
             routed.insert(model.clone(), Arc::new(provider));
         }
-        (None, Some(routed))
-    } else {
-        let provider = FakeProvider::from_json(&script)
-            .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}"))?
-            .without_request_recording();
-        (Some(Arc::new(provider)), None)
-    };
-    eprintln!("haiderd: TEST MODE — every turn resolves to the injected fake provider");
-    // Every turn resolves to the fake regardless of what the session was
-    // created with, so the creatable set includes the release default too:
-    // otherwise a client using the profile's own provider is rejected at
-    // `session.create` for a provider the daemon was never going to call.
-    let mut providers = haider_provider::BUILTIN_PROVIDER_NAMES
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<std::collections::BTreeSet<_>>();
-    providers.insert("fake".to_owned());
-    Ok(DaemonDependencies {
-        provider_factory: ProviderFactoryConfig::Injected {
-            factory: Arc::new(FakeFactory { fake, by_model }),
-            providers,
-        },
-        ..DaemonDependencies::default()
-    })
-}
-
-/// The injected factory: one deterministic provider for every turn.
-struct FakeFactory {
-    fake: Option<Arc<FakeProvider>>,
-    by_model: Option<HashMap<String, Arc<FakeProvider>>>,
+        Ok(Self::ByModel(routed))
+    }
 }
 
 #[async_trait::async_trait]
@@ -339,18 +347,12 @@ impl ProviderFactory for FakeFactory {
         &self,
         metadata: &SessionMetadataV1,
     ) -> Result<ResolvedTurnProvider, HaiderError> {
-        let fake = match &self.by_model {
-            Some(models) => models.get(&metadata.model).cloned().ok_or_else(|| {
+        let fake = match self {
+            Self::Single(fake) => Arc::clone(fake),
+            Self::ByModel(models) => models.get(&metadata.model).cloned().ok_or_else(|| {
                 HaiderError::new(
                     haider_protocol::error::ErrorCode::InvalidArgument,
                     format!("test fake script has no route for model {}", metadata.model),
-                    false,
-                )
-            })?,
-            None => self.fake.as_ref().cloned().ok_or_else(|| {
-                HaiderError::new(
-                    haider_protocol::error::ErrorCode::Internal,
-                    "test fake provider has no script",
                     false,
                 )
             })?,

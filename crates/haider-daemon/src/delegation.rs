@@ -47,6 +47,7 @@ use haider_protocol::loom::{LoomGate, LoomWorkflow, parse_pipe};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuScope};
 use haider_protocol::reply::ReplyText;
 use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::spawn_subagent::agent_wait_command;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use haider_protocol::task::TaskEventPayload;
 use haider_tools::{MessageSubagent, SpawnSubagent};
@@ -64,8 +65,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
 const CHILD_SETTLEMENT_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
-// Recovery/cancellation tail compatibility for explicitly supervised test
-// waits. Ordinary production collection has no default child deadline.
+// Registry #94 arithmetic: 120s pre-nudge stall attribution + 120s
+// post-nudge grace + 1s cancellation/reap tail = 241s. Ordinary production
+// collection has no default child deadline; this bound applies only to
+// cancellation settlement and explicitly stall-supervised test handles.
 const CHILD_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(241);
 pub(crate) const DELEGATED_MENU_ORIGIN: &str = "delegated-child";
 pub(crate) const DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND: &str =
@@ -1216,24 +1219,9 @@ impl DelegationHandle {
                     false,
                 )
             })?;
-        let wait_deadline = ticket
-            .manifest
-            .coordinates
-            .as_ref()
-            .and_then(|coordinates| {
-                Some((
-                    coordinates.get("wait_started_at_ms")?.as_u64()?,
-                    coordinates.get("wait_ms")?.as_u64()?,
-                ))
-            })
-            .map(|(started, duration)| {
-                instant_from_unix_deadline(started.saturating_add(duration))
-            });
-        let observation_deadline = match (run_deadline, wait_deadline) {
+        let observation_deadline = match (run_deadline, observation_wait_deadline(ticket)) {
             (Some(run), Some(wait)) => Some(run.min(wait)),
-            (Some(run), None) => Some(run),
-            (None, Some(wait)) => Some(wait),
-            (None, None) => None,
+            (run, wait) => run.or(wait),
         };
         let budget = if observation_deadline.is_some() || self.stall_supervision {
             Some(
@@ -1412,28 +1400,11 @@ impl DelegationHandle {
                         )
                     })?;
                 let progress = self.session_progress(&record).await?;
-                Ok(DeferredToolResult {
-                    report: ChildReport {
-                        agent: record.agent_id.clone(),
-                        summary: serde_json::json!({
-                            "kind": "child_still_running",
-                            "status": "child_still_running",
-                            "agent": record.agent_id,
-                            "parent_session_id": record.parent_session_id,
-                            "child_session_id": record.child_session_id,
-                            "child_run_id": record.child_run_id,
-                            "progress": progress.state,
-                            "latest_progress_at_ms": progress.latest_at_ms,
-                            "wait_limit_ms": duration_millis(timeout.limit()),
-                            "collect": format!("haider agent wait {} {} --json", record.parent_session_id, record.agent_id),
-                        }).to_string(),
-                        verified: ReportVerification::Unverified,
-                        workspace_revision: None,
-                    },
-                    chip: ChipState::Waiting,
-                    truncated: false,
-                    truncation: None,
-                })
+                Ok(child_still_running_result(
+                    &record,
+                    &progress,
+                    timeout.limit(),
+                ))
             }
         }
     }
@@ -3390,6 +3361,49 @@ pub(crate) fn anchored_child_wait_deadline(
     let fallback_deadline =
         now + Duration::from_millis(fallback_deadline_ms.saturating_sub(now_unix_ms));
     run_deadline.unwrap_or(fallback_deadline)
+}
+
+/// The absolute end of a blocking spawn's explicit `wait_ms` observation,
+/// anchored to when the spawn was established so recovery never extends it.
+fn observation_wait_deadline(ticket: &DeferredTicket) -> Option<tokio::time::Instant> {
+    let coordinates = ticket.manifest.coordinates.as_ref()?;
+    let started_at_ms = coordinates.get("wait_started_at_ms")?.as_u64()?;
+    let wait_ms = coordinates.get("wait_ms")?.as_u64()?;
+    Some(instant_from_unix_deadline(
+        started_at_ms.saturating_add(wait_ms),
+    ))
+}
+
+/// The typed `child_still_running` handle returned when an observation window
+/// ends before the child does. The child is left live and collectable.
+fn child_still_running_result(
+    record: &DelegationRecord,
+    progress: &SessionProgress,
+    wait_limit: Duration,
+) -> DeferredToolResult {
+    DeferredToolResult {
+        report: ChildReport {
+            agent: record.agent_id.clone(),
+            summary: serde_json::json!({
+                "kind": "child_still_running",
+                "status": "child_still_running",
+                "agent": record.agent_id,
+                "parent_session_id": record.parent_session_id,
+                "child_session_id": record.child_session_id,
+                "child_run_id": record.child_run_id,
+                "progress": progress.state,
+                "latest_progress_at_ms": progress.latest_at_ms,
+                "wait_limit_ms": duration_millis(wait_limit),
+                "collect": agent_wait_command(&record.parent_session_id, &record.agent_id),
+            })
+            .to_string(),
+            verified: ReportVerification::Unverified,
+            workspace_revision: None,
+        },
+        chip: ChipState::Waiting,
+        truncated: false,
+        truncation: None,
+    }
 }
 
 fn instant_from_unix_deadline(deadline_at_ms: u64) -> tokio::time::Instant {
