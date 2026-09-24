@@ -857,6 +857,7 @@ mod tests {
         assert!(matches!(output, Cow::Borrowed(bytes) if bytes == png));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn computer_screenshot_enforces_long_edge_and_pixel_envelope() {
         use haider_protocol::tool::{
@@ -884,6 +885,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn already_bounded_computer_screenshot_keeps_exact_png_bytes() {
         let source = png_fixture();

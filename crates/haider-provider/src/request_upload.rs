@@ -21,6 +21,14 @@ use tokio::sync::Notify;
 /// 64 KiB keeps a multi-megabyte body to a few dozen polls.
 const REQUEST_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Absolute request-upload budget. Allow a conservative 64 KiB/s, with a
+/// 30-second floor for connection setup and a five-minute ceiling so a peer
+/// that stops reading cannot hold the paused logical-idle clock forever.
+pub(crate) fn request_upload_budget(body_bytes: usize) -> std::time::Duration {
+    let seconds = body_bytes.div_ceil(64 * 1024).clamp(30, 5 * 60);
+    std::time::Duration::from_secs(u64::try_from(seconds).unwrap_or(5 * 60))
+}
+
 /// Shared completion flag for one request body. Creating it pauses the
 /// task's [`crate::ProviderIdleDeadline`] (if any); the first
 /// [`complete`](Self::complete) — body EOF, body drop, or an explicit call on

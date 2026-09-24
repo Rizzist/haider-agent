@@ -30,7 +30,7 @@ async fn terminal_idle_error_names_the_last_response_open_cause() {
     idle.begin_attempt(Some(Duration::from_secs(1)));
     idle.record_error(&ProviderError::new(
         ProviderErrorKind::Transport,
-        "Anthropic response did not open within 60 seconds",
+        "Anthropic response did not open within the configured response-open budget after request upload completed; budget_ms=60000",
     ));
     tokio::time::advance(Duration::from_secs(1)).await;
 

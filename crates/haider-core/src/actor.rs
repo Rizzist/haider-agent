@@ -4235,10 +4235,11 @@ impl HarnessActor {
                     Vec::new()
                 };
             // Image budgeting is request-local: durable history and its CAS
-            // refs are restored as soon as the stream opens. When the newest
-            // computer screenshot causes an older one to become an elision
-            // marker, declare that exact projection as a provider-view epoch
-            // instead of presenting the rewrite as append-only history.
+            // refs are restored as soon as the stream opens. Computer-history
+            // elision, count/byte budgeting, and unsupported-image fallback
+            // can each rewrite previously sent provider bytes. Declare every
+            // such projection as a provider-view epoch rather than treating
+            // the rewritten prefix as append-only cache history.
             let request_image_projection_epoch =
                 request_images_will_mutate.then(|| digest_json(&request_only_tool_results));
             let snapshot_insert_at = current_turn_start.min(request_messages.len());
@@ -13709,11 +13710,14 @@ fn provider_error_allows_retry(
     {
         return false;
     }
-    // A locally bounded response-open wait is still retryable by the caller,
-    // but an automatic replay would start the same parked request again.
-    // Preserve the typed Retry action while terminalizing this attempt under
-    // Haider's own control, independent of the configured timeout value.
-    if error.timeout_reason == Some(ProviderTimeoutReason::ResponseOpen) {
+    // A locally bounded request upload or response-open wait is still
+    // retryable by the caller, but an automatic replay would start the same
+    // parked request again. Preserve the typed Retry action while ending
+    // this attempt under Haider's own control.
+    if matches!(
+        error.timeout_reason,
+        Some(ProviderTimeoutReason::RequestUpload | ProviderTimeoutReason::ResponseOpen)
+    ) {
         return false;
     }
     let Some(deadline) = deadline else {

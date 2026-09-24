@@ -918,20 +918,22 @@ impl AnthropicProvider {
     async fn request_body_prepared_for_send(
         &self,
         prepared: crate::PreparedWire,
-    ) -> Result<(reqwest::Request, crate::RequestUploadBoundary), ProviderError> {
+    ) -> Result<(reqwest::Request, crate::RequestUploadBoundary, Duration), ProviderError> {
         let boundary = crate::RequestUploadBoundary::new();
         let result = async {
             let request = self.request_builder(&prepared.payload).await?;
             let body = crate::serialize_prepared_json_body(prepared)?;
+            let upload_budget = crate::request_upload::request_upload_budget(body.len());
             request
                 .header(CONTENT_LENGTH, body.len())
                 .body(boundary.body(body))
                 .build()
+                .map(|request| (request, upload_budget))
                 .map_err(transport_error)
         }
         .await;
         match result {
-            Ok(request) => Ok((request, boundary)),
+            Ok((request, upload_budget)) => Ok((request, boundary, upload_budget)),
             Err(error) => {
                 boundary.complete();
                 Err(error)
@@ -1039,7 +1041,8 @@ impl AnthropicProvider {
                 reply_bindings: crate::PreparedReplyBindings::default(),
             },
         };
-        let (request, upload) = self.request_body_prepared_for_send(prepared).await?;
+        let (request, upload, upload_budget) =
+            self.request_body_prepared_for_send(prepared).await?;
         let route_gating = self.route_gating();
         // The response-open budget covers only the wait after the body
         // producer reaches EOF; a response that opens mid-upload (e.g. an
@@ -1048,6 +1051,10 @@ impl AnthropicProvider {
         let opened_during_upload = tokio::select! {
             response = &mut opening => Some(response),
             () = upload.wait() => None,
+            () = tokio::time::sleep(upload_budget) => {
+                upload.complete();
+                return Err(request_upload_timeout_error(upload_budget));
+            },
         };
         let response = match opened_during_upload {
             Some(response) => response,
@@ -1058,6 +1065,7 @@ impl AnthropicProvider {
             )
             .await
             .map_err(|_| {
+                upload.complete();
                 response_open_timeout_error(self.transport_config.response_open_timeout)
             })?,
         };
@@ -1774,12 +1782,23 @@ fn response_open_timeout_error(timeout: Duration) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::Transport,
         format!(
-            "Anthropic response did not open within the configured response-open budget after request upload completed; opened_within_ms={budget_ms} budget_ms={budget_ms}"
+            "Anthropic response did not open within the configured response-open budget after request upload completed; budget_ms={budget_ms}"
         ),
     )
     .with_presentation(crate::provider_timeout_presentation())
     .with_timeout_budget(budget_ms, budget_ms)
     .with_timeout_reason(crate::ProviderTimeoutReason::ResponseOpen)
+}
+
+fn request_upload_timeout_error(timeout: Duration) -> ProviderError {
+    let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!("Anthropic request upload did not complete within its configured budget; budget_ms={budget_ms}"),
+    )
+    .with_presentation(crate::provider_timeout_presentation())
+    .with_timeout_budget(budget_ms, budget_ms)
+    .with_timeout_reason(crate::ProviderTimeoutReason::RequestUpload)
 }
 
 fn anthropic_connect_timeout_error(timeout: Duration) -> ProviderError {

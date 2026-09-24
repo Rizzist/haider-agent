@@ -2828,6 +2828,8 @@ pub enum ProviderTimeoutReason {
     /// No bytes or frames within the logical operation budget, across retries.
     IdleTimeout,
     DeadlineExhausted,
+    /// Request body did not finish uploading within its size-based budget.
+    RequestUpload,
     /// Request execution began, but response headers did not open within the
     /// provider's configured transport budget.
     ResponseOpen,

@@ -2269,6 +2269,85 @@ async fn slow_request_upload_is_excluded_from_response_open_and_logical_idle() {
     assert!(server.await.expect("slow server task") > 8 * 1024 * 1024);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn non_reading_peer_hits_typed_request_upload_deadline() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled provider");
+    let address = listener.local_addr().expect("stalled provider address");
+    let (headers_seen, headers_ready) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept request");
+        let mut headers = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = socket.read(&mut chunk).await.expect("read headers");
+            assert_ne!(read, 0, "request closed before headers");
+            headers.extend_from_slice(&chunk[..read]);
+        }
+        let headers = String::from_utf8_lossy(&headers);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .expect("content length");
+        assert!(content_length > 16 * 1024 * 1024);
+        headers_seen
+            .send(content_length)
+            .expect("signal received headers");
+        // Keep the connection open and stop consuming the large body.
+        future::pending::<()>().await;
+    });
+
+    let provider = AnthropicProvider::new_custom_no_auth(
+        secret_credential("anthropic-stalled-upload", b"unused-fixture-secret"),
+        "claude-local",
+        &format!("http://{address}"),
+    )
+    .expect("stalled provider")
+    .with_transport_config(AnthropicTransportConfig {
+        retry_policy: AnthropicRetryPolicy::Never,
+        connect_timeout: Duration::from_secs(1),
+        response_open_timeout: Duration::from_secs(1),
+        chunk_idle_timeout: Duration::from_secs(1),
+        semantic_progress_timeout: Duration::from_secs(1),
+    })
+    .expect("fixture clocks");
+    let mut request = one_line_turn("claude-local");
+    request.messages = vec![Message::user_text("x".repeat(16 * 1024 * 1024))];
+    let opening = tokio::spawn(async move { provider.stream_turn(request).await });
+    let content_length = headers_ready
+        .await
+        .expect("server received request headers");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(270)).await;
+    let error = tokio::time::timeout(Duration::from_secs(1), opening)
+        .await
+        .expect("upload must have a deadline")
+        .expect("provider task")
+        .expect_err("non-reading peer must time out");
+    assert_eq!(error.kind, ProviderErrorKind::Transport);
+    assert_eq!(
+        error.timeout_reason,
+        Some(crate::ProviderTimeoutReason::RequestUpload)
+    );
+    assert!(error.message.contains("request upload did not complete"));
+    assert_eq!(
+        error.budget_ms,
+        Some(
+            u64::try_from(crate::request_upload::request_upload_budget(content_length).as_millis())
+                .expect("small fixture budget")
+        )
+    );
+    server.abort();
+}
+
 #[test]
 fn native_computer_replay_never_silently_drops_region() {
     let input = serde_json::json!({"action": "screenshot", "region": {"x": 1, "y": 2, "width": 3, "height": 4, "reference_width": 100, "reference_height": 100}});
