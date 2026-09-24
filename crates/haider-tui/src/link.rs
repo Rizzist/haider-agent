@@ -1673,6 +1673,7 @@ pub fn request_body_for_features(
             model,
             provider: Some(provider),
             confirm_new_epoch,
+            max_tokens: None,
         },
         // G2: the /rename command's receipted title. Always `Some` — bare
         // clearing is deliberately not offered by this client.
@@ -2421,6 +2422,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             provider,
             model,
             worker_generation,
+            output_budget,
             ..
         } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ModelSelected {
@@ -2429,6 +2431,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 provider,
                 model,
                 worker_generation,
+                output_budget,
             }]
         }),
         // G2: the NORMALIZED committed title — the reply reports daemon

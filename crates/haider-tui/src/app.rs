@@ -20755,6 +20755,20 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// A user-set output budget did not fit the newly selected model: the
+    /// daemon clamped it. Keep the model flash and append the typed notice.
+    pub fn apply_output_budget_clamp(
+        &mut self,
+        clamp: &haider_protocol::output_budget::OutputBudgetClampV1,
+    ) {
+        let notice = clamp.notice();
+        self.flash = Some(match self.flash.take() {
+            Some(flash) => format!("{flash} · {notice}"),
+            None => format!("· {notice}"),
+        });
+        self.dirty = true;
+    }
+
     /// F2e: route a client-observed failure to `session`'s OWN view —
     /// the attached projection when it is live on screen, the parked
     /// slot's otherwise — so the error line is there when the user looks.

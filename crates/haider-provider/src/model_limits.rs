@@ -27,6 +27,9 @@ pub fn static_model_limits(provider: &str, model: &str) -> StaticModelLimits {
         "openai" | "openai-oauth" => openai_limits(&model),
         "gemini" | "google-antigravity" => gemini_limits(&model),
         "deepseek" => deepseek_limits(&model),
+        "kimi-oauth" => kimi_code_limits(&model),
+        "xai" | "grok-oauth" => xai_limits(&model),
+        "haider-code" => haider_code_limits(&model),
         // Local synthetic adapter, not a provider API claim: its fixture
         // accepts the shared default budget and keeps durable test goldens
         // representative of the ordinary 30,000-token path.
@@ -34,7 +37,7 @@ pub fn static_model_limits(provider: &str, model: &str) -> StaticModelLimits {
             context_window: None,
             max_output_tokens: haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT,
         },
-        // Kimi, xAI/Grok and Haider Code: no pinned context; output local.
+        // Custom profiles and unlisted adapters: unverified local fallback.
         _ => StaticModelLimits {
             context_window: None,
             max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
@@ -261,19 +264,113 @@ fn gemini_limits(model: &str) -> StaticModelLimits {
     }
 }
 
-/// V4 values: https://api-docs.deepseek.com/quick_start/pricing/
+/// Current DeepSeek IDs, checked 2026-09-24:
+/// https://api-docs.deepseek.com/quick_start/pricing ("CONTEXT LENGTH 1M",
+/// "MAX OUTPUT MAXIMUM: 384K") and
+/// https://api-docs.deepseek.com/api/create-chat-completion (`max_tokens`
+/// "must be between 1 and 384K (393216)"; model enum `deepseek-flash`,
+/// `deepseek-v4-pro`). `deepseek-flash` is DeepSeek-V4.1-Flash; the legacy
+/// `deepseek-v4-flash*` names are served by it. 384,000 stays below the
+/// documented 393,216 ceiling.
 fn deepseek_limits(model: &str) -> StaticModelLimits {
-    if model.split(['-', '_', '.']).any(|part| part == "v4") {
+    let current = model == "deepseek-flash"
+        || model.starts_with("deepseek-flash-")
+        || model.split(['-', '_', '.']).any(|part| part == "v4");
+    if current {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 384_000,
         }
     } else {
-        // Unverified older model: no context claim; the daemon can use a
-        // discovered provider limit without risking an oversized request.
+        // Unverified: `deepseek-chat`/`deepseek-reasoner` were retired
+        // 2026-07-24 and no longer have documented limits. No context claim;
+        // the daemon can use a discovered provider limit instead.
         StaticModelLimits {
             context_window: None,
-            max_output_tokens: 8_192,
+            max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
         }
+    }
+}
+
+/// Kimi Code subscription models (`https://api.kimi.com/coding/v1`), checked
+/// 2026-09-24 at https://www.kimi.com/code/docs/en/kimi-code/models.html:
+/// `k3` 1,048,576 on Pro plans and 262,144 otherwise (the plan-independent
+/// 262,144 is used), `k3-256k` 262,144, `kimi-for-coding` 1,048,576,
+/// `kimi-for-coding-highspeed` 262,144. Kimi publishes no separate output
+/// ceiling; its documented constraint is input + output <= context
+/// (https://platform.kimi.ai/docs/api/chat.md), so the shared default budget
+/// is the output maximum — well inside every documented window.
+fn kimi_code_limits(model: &str) -> StaticModelLimits {
+    let context_window = match model {
+        "kimi-for-coding" => Some(1_048_576),
+        "k3" | "k3-256k" | "kimi-for-coding-highspeed" | "kimi-k3" => Some(262_144),
+        "kimi-k2.7-code" | "kimi-k2.7-code-highspeed" | "kimi-k2.6" => Some(262_144),
+        _ => None,
+    };
+    StaticModelLimits {
+        context_window,
+        max_output_tokens: if context_window.is_some() {
+            crate::output_budget::DEFAULT_OUTPUT_LIMIT
+        } else {
+            UNKNOWN_OUTPUT_LIMIT
+        },
+    }
+}
+
+/// xAI Grok models, checked 2026-09-24 at https://docs.x.ai/docs/models
+/// (grok-4.7/4.6/4.5 500,000; grok-4.3 and grok-4.20 1,000,000;
+/// grok-build-0.1, alias grok-code-fast-1, 256,000; grok-build-latest is an
+/// alias of grok-4.5). Output: xAI documents `max_completion_tokens` /
+/// `max_output_tokens` "Defaults to 128,000 when unset"
+/// (https://docs.x.ai/developers/rest-api-reference/inference/chat-completions.md),
+/// so 128,000 is an accepted per-response budget. The Grok subscription proxy
+/// serves the same model IDs.
+fn xai_limits(model: &str) -> StaticModelLimits {
+    let context_window = if ["grok-4.7", "grok-4.6", "grok-4.5", "grok-build-latest"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+    {
+        Some(500_000)
+    } else if model.starts_with("grok-4.3") || model.starts_with("grok-4.20") {
+        Some(1_000_000)
+    } else if model.starts_with("grok-build-0.1") || model.starts_with("grok-code-fast") {
+        Some(256_000)
+    } else {
+        None
+    };
+    StaticModelLimits {
+        context_window,
+        max_output_tokens: if context_window.is_some() {
+            128_000
+        } else {
+            UNKNOWN_OUTPUT_LIMIT
+        },
+    }
+}
+
+/// Haider Code hosted models, from the public catalog
+/// https://haidercode.ai/v1/models (read 2026-09-24 without credentials; see
+/// also https://haidercode.ai/docs/go: "Context is the window the model
+/// publishes"). The catalog publishes `max_output_tokens: null` for every
+/// model, so the shared default budget is the output maximum for rows with a
+/// published window; rows with an unpublished window stay on the unverified
+/// fallback. The live catalog's declarations win at projection time.
+fn haider_code_limits(model: &str) -> StaticModelLimits {
+    let context_window = match model {
+        "deepseek-v4-flash" | "deepseek-v4-pro" => Some(128_000),
+        "glm-5.3-flash" | "glm-5.2" | "glm-5.3" => Some(200_000),
+        "qwen3.7-plus" | "kimi-k2.7-code" => Some(262_144),
+        "qwen3.8-27b" | "qwen3.8-2.4t-a95b" | "qwen3.8-max" | "kimi-k3" | "minimax-m3" => {
+            Some(1_000_000)
+        }
+        _ => None,
+    };
+    StaticModelLimits {
+        context_window,
+        max_output_tokens: if context_window.is_some() {
+            crate::output_budget::DEFAULT_OUTPUT_LIMIT
+        } else {
+            UNKNOWN_OUTPUT_LIMIT
+        },
     }
 }

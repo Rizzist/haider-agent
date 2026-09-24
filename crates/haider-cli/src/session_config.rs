@@ -33,11 +33,15 @@ pub(crate) struct ConfigOptions {
     /// the provider cache prefix, and the daemon refuses it without explicit
     /// consent. This flag IS that consent for headless callers.
     pub(crate) confirm_epoch: bool,
+    /// Per-response output budget: `Some(0)` (`--max-tokens auto`) returns to
+    /// the model-derived budget, `Some(n)` sets a user budget.
+    pub(crate) max_tokens: Option<u64>,
 }
 
 impl ConfigOptions {
     pub(crate) fn mutates(&self) -> bool {
         self.model.is_some()
+            || self.max_tokens.is_some()
             || self.effort.is_some()
             || self.fast.is_some()
             || self.account.is_some()
@@ -49,8 +53,11 @@ impl ConfigOptions {
             haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
         ]);
-        if self.model.is_some() {
+        if self.model.is_some() || self.max_tokens.is_some() {
             features.insert(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned());
+        }
+        if self.max_tokens.is_some() {
+            features.insert(haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1.to_owned());
         }
         if self.effort.is_some() {
             features.insert(haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned());
@@ -81,6 +88,8 @@ struct SessionConfigDocument {
     context_window: Option<u64>,
     workspace_cwd: String,
     max_tokens: u64,
+    /// `derived` (follows the selected model) or `user_set`.
+    max_tokens_source: &'static str,
     created_at_ms: u64,
     head_seq: u64,
     worker_generation: u64,
@@ -162,7 +171,7 @@ pub(crate) async fn session_config_command(session_id: &str, rest: &[String]) ->
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] [--agent-type <id|none>] [--confirm-epoch]"
+                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--max-tokens <n|auto>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] [--agent-type <id|none>] [--confirm-epoch]"
             );
             return ExitCode::SUCCESS;
         }
@@ -236,6 +245,23 @@ pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ConfigOptions>, St
                 options.model = Some(required_value(rest, index, "--model", "a model id")?);
             }
             "--model" => return Err("duplicate --model flag".into()),
+            "--max-tokens" if options.max_tokens.is_none() => {
+                index += 1;
+                let value = required_value(rest, index, "--max-tokens", "a token count or auto")?;
+                options.max_tokens = Some(if value == "auto" {
+                    0
+                } else {
+                    match value.parse::<u64>() {
+                        Ok(tokens) if tokens > 0 => tokens,
+                        _ => {
+                            return Err(
+                                "--max-tokens requires a positive token count or auto".into()
+                            );
+                        }
+                    }
+                });
+            }
+            "--max-tokens" => return Err("duplicate --max-tokens flag".into()),
             "--effort" if options.effort.is_none() => {
                 index += 1;
                 options.effort = Some(required_value(rest, index, "--effort", "a level")?);
@@ -305,6 +331,7 @@ async fn execute(
         let mutation = apply_mutations(
             client,
             &session_id,
+            digest.metadata.as_ref(),
             &providers,
             &options,
             &mut worker_generation,
@@ -330,6 +357,7 @@ async fn execute(
 async fn apply_mutations(
     client: &haider_client::RpcClient,
     session_id: &SessionId,
+    current: Option<&haider_protocol::session::SessionMetadataV1>,
     providers: &[ProviderSummaryWire],
     options: &ConfigOptions,
     worker_generation: &mut u64,
@@ -338,8 +366,15 @@ async fn apply_mutations(
     if options.account.is_some() {
         return Err(ConfigError::AccountSelectionUnsupported);
     }
-    if let Some(selector) = options.model.as_deref() {
-        let (provider, model) = resolve_model_selector(selector, providers)?;
+    if options.model.is_some() || options.max_tokens.is_some() {
+        // `--max-tokens` alone re-selects the current pair with a new budget.
+        let (provider, model) = match options.model.as_deref() {
+            Some(selector) => resolve_model_selector(selector, providers)?,
+            None => {
+                let current = current.ok_or(ConfigError::MissingMetadata)?;
+                (Some(current.provider.clone()), current.model.clone())
+            }
+        };
         let response = client
             .request(RequestBody::SessionSelectModel {
                 command_id: CommandId::new(command_id("session-config-model")),
@@ -348,9 +383,18 @@ async fn apply_mutations(
                 model,
                 provider,
                 confirm_new_epoch: options.confirm_epoch,
+                max_tokens: options.max_tokens,
             })
             .await
             .map_err(ConfigError::Client)?;
+        if let ResponseBody::SessionSelectModel {
+            output_budget: Some(budget),
+            ..
+        } = &response
+            && let Some(clamp) = budget.clamped
+        {
+            eprintln!("haider session config: {}", clamp.notice());
+        }
         *worker_generation = selected_generation(
             response,
             session_id,
@@ -648,6 +692,16 @@ fn document(
         context_window,
         workspace_cwd: metadata.cwd,
         max_tokens: metadata.max_tokens,
+        max_tokens_source:
+            match haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                metadata.max_tokens_source,
+                metadata.max_tokens,
+            ) {
+                haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived => "derived",
+                haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. } => {
+                    "user_set"
+                }
+            },
         created_at_ms: metadata.created_at_ms,
         head_seq: digest.head_seq,
         worker_generation: digest.worker_generation,

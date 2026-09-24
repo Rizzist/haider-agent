@@ -4043,6 +4043,15 @@ pub enum RequestBody {
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         confirm_new_epoch: bool,
+        /// `model_output_limits_v1`: explicit per-response output budget.
+        /// Absent keeps the session's budget policy (a derived budget
+        /// re-derives for the new model; a user-set one is clamped with a
+        /// notice). `0` returns the session to the derived budget; a positive
+        /// value becomes the user-set budget and is refused when it exceeds
+        /// the selected model's maximum. Select the current model to change
+        /// only the budget.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u64>,
     },
     /// Receipted live-session rename (G2). `title` is normalized by the
     /// daemon (trimmed, control characters stripped, ≤ 80 chars; empty
@@ -5244,6 +5253,11 @@ pub enum ResponseBody {
         model: String,
         selected_seq: u64,
         worker_generation: u64,
+        /// `model_output_limits_v1`: the per-response budget this selection
+        /// committed, its source, and a typed clamp notice when a user-set
+        /// budget exceeded the new model's maximum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     /// Durable coordinates of a committed rename (G2): the NORMALIZED title
     /// — never an echo of the request — plus the committed journal sequence

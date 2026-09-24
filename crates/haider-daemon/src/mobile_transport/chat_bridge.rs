@@ -225,6 +225,7 @@ impl DaemonMobileChatBridge {
                         model,
                         provider: Some(provider),
                         confirm_new_epoch,
+                        max_tokens: None,
                     })
                     .await?;
                 let worker_generation = match selected.body {

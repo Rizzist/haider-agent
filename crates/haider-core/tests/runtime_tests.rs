@@ -2004,6 +2004,91 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
     assert_ne!(last.used_tokens, 1_020);
 }
 
+/// 973 output cap: a provider that rejects `max_tokens` as too large and
+/// states its maximum gets exactly ONE retry at that maximum. A second
+/// rejection surfaces as the ordinary provider error — never a loop.
+/// MUTATION CHECK: drop the one-shot flag. Expected runtime failure: the
+/// repeated-rejection run makes three requests instead of two.
+#[tokio::test]
+async fn oversized_max_tokens_retries_once_at_the_provider_stated_maximum() {
+    let anthropic_rejection = "max_tokens: 30000 > 16000, which is the maximum allowed number \
+                               of output tokens for claude-test";
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: anthropic_rejection.into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut retry_config = config();
+    retry_config.max_tokens = 30_000;
+    let handle = HarnessActor::spawn(retry_config, provider.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("output-limit-retry"),
+            messages: vec![Message::user_text("write a large file")],
+        })
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_tokens, 30_000);
+    assert_eq!(
+        requests[1].max_tokens, 16_000,
+        "retry uses the stated maximum"
+    );
+
+    let repeated = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: "max_tokens is too large: 30000. This model supports at most 16384 \
+                      completion tokens, whereas you provided 30000."
+                .into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut repeated_config = config();
+    repeated_config.max_tokens = 30_000;
+    let handle = HarnessActor::spawn(
+        repeated_config,
+        repeated.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("output-limit-repeated"),
+            messages: vec![Message::user_text("write a large file")],
+        })
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(
+        outcome.state,
+        RunState::Errored,
+        "the second rejection surfaces"
+    );
+    let requests = repeated.requests();
+    assert_eq!(requests.len(), 2, "exactly one retry");
+    assert_eq!(requests[1].max_tokens, 16_384);
+}
+
 /// MUTATION CHECK: route ContextExceeded through generic retry or omit the
 /// one-shot guard. Expected runtime failure: no CompactionIntent is durable,
 /// the retry lacks the summary, or the double-overflow case makes >2 calls.

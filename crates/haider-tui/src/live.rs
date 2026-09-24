@@ -1849,6 +1849,8 @@ pub enum LiveReply {
         provider: String,
         model: String,
         worker_generation: u64,
+        /// Budget the selection committed; a clamp becomes a visible notice.
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     /// `session.rename` committed (G2): the NORMALIZED title — never an
     /// echo of the request.
@@ -4510,6 +4512,7 @@ impl LiveDriver {
                 provider,
                 model: model_name,
                 worker_generation,
+                output_budget,
             } => {
                 self.retire(&command_id);
                 if self
@@ -4521,6 +4524,9 @@ impl LiveDriver {
                 }
                 self.generations.insert(session, worker_generation);
                 model.apply_model_selected(&provider, &model_name);
+                if let Some(clamp) = output_budget.and_then(|budget| budget.clamped) {
+                    model.apply_output_budget_clamp(&clamp);
+                }
                 Vec::new()
             }
             LiveReply::Renamed {

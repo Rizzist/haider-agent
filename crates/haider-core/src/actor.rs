@@ -3724,6 +3724,10 @@ impl HarnessActor {
                 .await;
         }
         let mut forced_compaction_used = false;
+        // A provider may reject `max_tokens` as larger than the model allows
+        // and state its maximum. Retry ONCE per turn at that maximum; a
+        // second rejection surfaces normally, so this can never loop.
+        let mut output_limit_retry_used = false;
         // Once an ineffective compaction promotes this turn, later request
         // rounds may use the larger hard budget but must never compact again.
         let mut compaction_guard_consumed = false;
@@ -4950,6 +4954,33 @@ impl HarnessActor {
                         }
                         break stream;
                     }
+                    Err(error)
+                        if !output_limit_retry_used
+                            && haider_provider::provider_stated_output_limit(
+                                &error,
+                                self.config.max_tokens,
+                            )
+                            .is_some() =>
+                    {
+                        output_limit_retry_used = true;
+                        if let Some(stated) = haider_provider::provider_stated_output_limit(
+                            &error,
+                            self.config.max_tokens,
+                        ) {
+                            tracing::info!(
+                                requested = self.config.max_tokens,
+                                provider_maximum = stated,
+                                "provider rejected max_tokens as too large; retrying once at its stated maximum"
+                            );
+                            self.config.max_tokens = stated;
+                        }
+                        provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
+                    }
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
                         let compacted = if request_projection_compacted || compaction_guard_consumed
                         {
@@ -5412,6 +5443,54 @@ impl HarnessActor {
                             provider_content_seen = true;
                         }
                         event
+                    }
+                    Err(error)
+                        if !output_limit_retry_used
+                            && !provider_content_seen
+                            && haider_provider::provider_stated_output_limit(
+                                &error,
+                                self.config.max_tokens,
+                            )
+                            .is_some() =>
+                    {
+                        if let Err(error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            request_usage.is_some(),
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::from(error),
+                                )
+                                .await;
+                        }
+                        output_limit_retry_used = true;
+                        if let Some(stated) = haider_provider::provider_stated_output_limit(
+                            &error,
+                            self.config.max_tokens,
+                        ) {
+                            tracing::info!(
+                                requested = self.config.max_tokens,
+                                provider_maximum = stated,
+                                "provider rejected max_tokens as too large; retrying once at its stated maximum"
+                            );
+                            self.config.max_tokens = stated;
+                        }
+                        provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
                     }
                     Err(error)
                         if error.kind == ProviderErrorKind::ContextExceeded

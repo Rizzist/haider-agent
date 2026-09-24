@@ -23,6 +23,44 @@ details may be unavailable when a session is created; zero remains safe then.
 override. The separate `--max-total-tokens N` flag bounds cumulative run
 usage.
 
+## Model switches and explicit budgets
+
+Session metadata records whether the budget is `derived` or `user_set`
+(`max_tokens_source`). Metadata written before 973 has no source; a stored
+4,096, 8,192 or 30,000 (the pre-973 client defaults) is derived, any other
+value was an explicit override. `session.select_model` re-applies the source
+to the new model, so a switch never fails on the output budget:
+
+- derived: `min(30,000, new model maximum)`, silently;
+- user-set: `min(requested, new model maximum)`; a clamp returns a typed
+  `output_budget.clamped` notice (TUI flash, CLI stderr). The requested value
+  is kept, so switching back to a larger model restores it.
+
+`session.select_model.max_tokens` (and `haider session <id> config
+--max-tokens <n|auto>`) sets a user budget or returns to the derived one; an
+explicit value above the selected model's maximum is refused, like
+`session.create`. The automatic provider pair-switch path has no validated
+model row and keeps the stored budget; the provider retry below covers it.
+
+## Provider-stated maxima
+
+If a provider rejects a request because `max_tokens` exceeds the model's
+maximum and states that maximum (Anthropic `max_tokens: A > B, which is the
+maximum allowed number of output tokens`, OpenAI-compatible `supports at most
+B completion tokens`, DeepSeek `valid range of max_tokens is [1, B]`), the
+actor retries that request once at `B` and keeps `B` for the rest of the
+turn. A second rejection surfaces as the ordinary provider error; the retry
+never loops.
+
+## Sourced static rows
+
+`model_limits.rs` cites the official page for every non-fallback row.
+DeepSeek `deepseek-flash` (V4.1-Flash) and `deepseek-v4-pro`: 1M context,
+384,000 output. Kimi Code (`kimi-oauth`) and Haider Code publish context
+windows but no output ceiling, so documented rows use the shared 30,000
+default; xAI documents a 128,000 default output budget and per-model windows.
+Only IDs without any published limit stay on the unverified 8,192 fallback.
+
 ## Partial tool calls at the limit
 
 An Anthropic `max_tokens`, OpenAI `length`, or Responses `incomplete` terminal

@@ -351,6 +351,7 @@ struct SessionSelectModelInput {
     model: String,
     provider: Option<String>,
     confirm_new_epoch: bool,
+    max_tokens: Option<u64>,
 }
 
 enum SessionForkSelectorInput {
@@ -2292,6 +2293,7 @@ mod observe_cache_retention_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -2533,6 +2535,7 @@ mod observe_cache_retention_tests {
                 provider: "fake".into(),
                 model: "fake-model".into(),
                 max_tokens: 4096,
+                max_tokens_source: None,
                 permission_overrides: None,
                 effort: None,
                 fast: false,
@@ -3624,19 +3627,19 @@ fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::S
     }
 }
 
-/// Negotiates `session.create.max_tokens` against the validated model row:
-/// zero derives the default budget bounded by the row maximum, a positive
-/// value is an exact override, and an override above the row maximum is a
-/// typed refusal rather than a silent clamp.
+/// Negotiates an explicit `max_tokens` request (`session.create`, or
+/// `session.select_model` carrying `max_tokens`) against the validated model
+/// row: zero derives the default budget bounded by the row maximum, a positive
+/// value is an exact user-set override, and an override above the row maximum
+/// is a typed refusal rather than a silent clamp — the user asked for that
+/// exact value in this request.
 pub(super) fn resolve_session_output_limit(
     requested: u64,
     selection: &crate::model_select::ValidatedModelSelection,
-) -> Result<u64, (String, haider_rpc::ErrorData)> {
-    if requested == 0 {
-        return Ok(haider_provider::DEFAULT_OUTPUT_LIMIT.min(selection.max_output_tokens));
-    }
+) -> Result<haider_protocol::output_budget::SessionOutputBudgetV1, (String, haider_rpc::ErrorData)>
+{
     if requested > selection.max_output_tokens {
-        Err((
+        return Err((
             format!(
                 "max_tokens {requested} exceeds model `{}` · `{}` output limit {}",
                 selection.model, selection.provider, selection.max_output_tokens
@@ -3648,10 +3651,28 @@ pub(super) fn resolve_session_output_limit(
                 max_output_tokens: selection.max_output_tokens,
                 context_window: selection.context_window,
             },
-        ))
-    } else {
-        Ok(requested)
+        ));
     }
+    Ok(
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::from_request(requested)
+            .apply(selection.max_output_tokens),
+    )
+}
+
+/// Re-applies a session's STORED budget to a newly selected model. A derived
+/// budget re-derives `min(default, new max)` silently; a user-set budget keeps
+/// the user's request and is clamped to the new maximum with a typed notice.
+/// Legacy metadata without a recorded source is classified first. Model
+/// switches therefore never fail on the output budget.
+pub(super) fn reapply_session_output_budget(
+    current: &haider_protocol::session::SessionMetadataV1,
+    selection: &crate::model_select::ValidatedModelSelection,
+) -> haider_protocol::output_budget::SessionOutputBudgetV1 {
+    haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+        current.max_tokens_source,
+        current.max_tokens,
+    )
+    .apply(selection.max_output_tokens)
 }
 
 impl HubConnection {
@@ -5237,6 +5258,7 @@ impl HubConnection {
                 model,
                 provider,
                 confirm_new_epoch,
+                max_tokens,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -5268,6 +5290,7 @@ impl HubConnection {
                         model,
                         provider,
                         confirm_new_epoch,
+                        max_tokens,
                     },
                 )
                 .await
@@ -8314,6 +8337,7 @@ impl HubConnection {
                             model,
                             provider: None,
                             confirm_new_epoch,
+                            max_tokens: None,
                         },
                     )
                     .await?;
@@ -8355,6 +8379,7 @@ impl HubConnection {
                             model,
                             provider: Some(provider),
                             confirm_new_epoch,
+                            max_tokens: None,
                         },
                     )
                     .await?;
@@ -12020,6 +12045,7 @@ impl HubConnection {
             model,
             provider,
             confirm_new_epoch,
+            max_tokens,
         } = input;
         if command_id.as_str().trim().is_empty() || model.trim().is_empty() {
             return self.respond_error(
@@ -12030,14 +12056,18 @@ impl HubConnection {
                 None,
             );
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
+        let mut request_coordinates = serde_json::json!({
             "session_id": &session_id,
             "worker_generation": worker_generation,
             "model": &model,
             "provider": &provider,
             "confirm_new_epoch": confirm_new_epoch,
-        }))
-        .map_err(|error| {
+        });
+        // Present only when requested, so pre-973 receipt digests replay.
+        if let Some(max_tokens) = max_tokens {
+            request_coordinates["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        let request_json = serde_json::to_string(&request_coordinates).map_err(|error| {
             SessionHubError::Task(format!(
                 "cannot encode model-selection coordinates: {error}"
             ))
@@ -12112,15 +12142,25 @@ impl HubConnection {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
         };
-        if let Err((message, data)) = resolve_session_output_limit(current.max_tokens, &validated) {
-            return self.respond_error(
-                request_id,
-                ERROR_CODE_INVALID_ARGUMENT,
-                &message,
-                false,
-                Some(data),
-            );
-        }
+        // D1: a switch never fails on a budget the user did not ask for in
+        // this request. Stored budgets re-derive (derived) or clamp with a
+        // typed notice (user-set); only an explicit `max_tokens` above the
+        // selected model's maximum is refused, exactly like session.create.
+        let output_budget = match max_tokens {
+            Some(requested) => match resolve_session_output_limit(requested, &validated) {
+                Ok(output_budget) => output_budget,
+                Err((message, data)) => {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        &message,
+                        false,
+                        Some(data),
+                    );
+                }
+            },
+            None => reapply_session_output_budget(&current, &validated),
+        };
         if matches!(
             validated.inventory_status,
             haider_rpc::ModelInventoryStatusWire::Unlisted
@@ -12191,6 +12231,7 @@ impl HubConnection {
             provider: resolved_provider,
             model: resolved_model,
             expected_pair: None,
+            output_budget: Some(output_budget),
             event_id: EventId::new(random_id("model-selected")?),
             device_id: self.hub.inner.device_id.clone(),
         };
@@ -12250,6 +12291,7 @@ impl HubConnection {
                 model: selected.model,
                 selected_seq: selected.selected_seq,
                 worker_generation: selected.worker_generation,
+                output_budget: selected.output_budget,
             },
         })
     }
@@ -16410,7 +16452,7 @@ impl HubConnection {
         cwd: String,
         mut provider: String,
         mut model: String,
-        mut max_tokens: u64,
+        max_tokens: u64,
         permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
@@ -16741,8 +16783,8 @@ impl HubConnection {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
         };
-        max_tokens = match resolve_session_output_limit(max_tokens, &validated) {
-            Ok(max_tokens) => max_tokens,
+        let output_budget = match resolve_session_output_limit(max_tokens, &validated) {
+            Ok(output_budget) => output_budget,
             Err((message, data)) => {
                 return self.respond_error(
                     request_id,
@@ -16794,7 +16836,8 @@ impl HubConnection {
             cwd: workspace.canonical().to_owned(),
             provider,
             model,
-            max_tokens,
+            max_tokens: output_budget.max_tokens,
+            max_tokens_source: Some(output_budget.source),
             permission_overrides,
             effort,
             fast: fast.unwrap_or(false),

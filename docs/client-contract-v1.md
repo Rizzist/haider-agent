@@ -330,7 +330,7 @@ is §4.1.
 | `session_provider_rebind_v1` | `session.provider.rebind` |
 | `session_account_select_v1` | exact `session.create.account_alias` pin |
 | `session_create_admission_v1` | daemon resolution of create provider/default model and initial tuning |
-| `model_output_limits_v1` | model-row output maxima and `session.create.max_tokens=0` derivation |
+| `model_output_limits_v1` | model-row output maxima, `session.create.max_tokens=0` derivation, `session.select_model.max_tokens` and its `output_budget` response |
 | `session_model_select_v1` | `session.select_model` |
 | `session_rename_v1` | `session.rename`, `SessionSummary.title` |
 | `session_workspace_set_v1` | receipt-backed `session.workspace.set`; additive `workspace_unavailable` and `workspace_selected` raw facts |
@@ -1786,6 +1786,24 @@ smaller of its 30,000-token default and the resolved model maximum. Positive
 values remain exact client overrides and values above the row limit receive a
 typed `model_output_limit` error. A client must negotiate the feature before
 sending zero.
+
+The created metadata records `max_tokens_source`: `{"kind":"derived"}` for a
+zero request or `{"kind":"user_set","requested":N}` for a positive one
+(absent on metadata written before 973; readers treat the legacy client
+defaults 4,096, 8,192 and 30,000 as derived and any other value as user-set).
+Every `session.select_model` re-applies that source to the newly selected
+model: a derived budget becomes `min(30,000, new maximum)` silently; a
+user-set budget becomes `min(requested, new maximum)`, and when that clamps
+the response's `output_budget.clamped` carries `{requested,
+max_output_tokens}` for the client to show as a notice. A model switch never
+fails on the output budget. With `model_output_limits_v1`, a
+`session.select_model` request may carry `max_tokens`: `0` returns the
+session to the derived budget, a positive value becomes the user-set budget
+(refused with typed `model_output_limit` when it exceeds the selected model's
+maximum). Selecting the session's current model with `max_tokens` changes
+only the budget. The response's additive `output_budget` is
+`{max_tokens, source, clamped?}`. CLI: `haider session <id> config
+--max-tokens <n|auto>`.
 
 The exact enum strings are `"interactive"` and `"autonomous"`.
 `interactive` is the serde default and is omitted on the wire; that is a

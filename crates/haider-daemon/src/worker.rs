@@ -474,6 +474,10 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             // rev933b finding 7: the automatic switch observed this exact
             // pair; a concurrent explicit selection moves it and must win.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
+            // No validated model row exists on this path: keep the stored
+            // budget. An oversized budget on the fallback model is recovered
+            // by the provider's one-shot `max_tokens too large` retry.
+            output_budget: None,
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
@@ -13639,6 +13643,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -13754,6 +13759,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -13865,6 +13871,7 @@ mod manager_law_tests {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
