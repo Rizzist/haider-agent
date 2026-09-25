@@ -99,6 +99,19 @@ impl ProductionHaiderCodePlanHttp {
 #[async_trait::async_trait]
 impl HaiderCodePlanHttp for ProductionHaiderCodePlanHttp {
     async fn get_account(&self, credential: &SecretHandle) -> PlanFetchOutcome {
+        #[cfg(debug_assertions)]
+        let url = match crate::debug_fake_usage::route(
+            HAIDER_CODE_ACCOUNT_URL,
+            credential.expose_secret(),
+        ) {
+            crate::debug_fake_usage::Route::Live(url) => std::borrow::Cow::Borrowed(url),
+            crate::debug_fake_usage::Route::Fake(url) => std::borrow::Cow::Owned(url),
+            crate::debug_fake_usage::Route::Refused(_) => {
+                return PlanFetchOutcome::Transient(PlanTransientFailure::CredentialUnavailable);
+            }
+        };
+        #[cfg(not(debug_assertions))]
+        let url = std::borrow::Cow::Borrowed(HAIDER_CODE_ACCOUNT_URL);
         let Some(client) = self.transport.client() else {
             return PlanFetchOutcome::Transient(PlanTransientFailure::Network);
         };
@@ -116,7 +129,7 @@ impl HaiderCodePlanHttp for ProductionHaiderCodePlanHttp {
         header.set_sensitive(true);
 
         let response = match client
-            .get(HAIDER_CODE_ACCOUNT_URL)
+            .get(url.as_ref())
             .timeout(PLAN_REQUEST_TIMEOUT)
             .header(AUTHORIZATION, header)
             .send()

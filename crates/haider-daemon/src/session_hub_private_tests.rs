@@ -3745,6 +3745,103 @@ async fn usage_reset_direct_rpc_obeys_read_only_deny_before_opening_menu() {
     store.close().await.expect("store closes");
 }
 
+/// LAW: the direct RPC applies the lockdown capability ceiling (the same
+/// shared policy check as the agent tool) before any approval menu opens.
+///
+/// MUTATION CHECK: disable the RPC's `policy_denial_reason` check; the RPC
+/// then parks a `DeferredApproval` menu for a lockdown provider and the
+/// journal head advances.
+#[tokio::test]
+async fn usage_reset_direct_rpc_obeys_lockdown_before_opening_menu() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("usage-reset-lockdown");
+    hub.create_internal_session(create_command(&session, "usage-reset-lockdown"))
+        .await
+        .expect("session created");
+    let mut locked = provider_summary("fake");
+    locked.trust = haider_rpc::ProviderTrustWire::Lockdown;
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(1, Vec::new(), vec![locked]),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+        sources: Arc::new(Mutex::new(Vec::new())),
+        vault: None,
+    })
+    .expect("install lockdown provider trust");
+    assert!(
+        hub.provider_lockdown_policy_detail("fake")
+            .expect("provider policy")
+            .is_lockdown()
+    );
+    let account = haider_protocol::ids::CredentialAlias::new("reset-capable");
+    let snapshot = Arc::new(Mutex::new(vec![reset_test_descriptor(account.clone())]));
+    hub.install_usage_report(Arc::new(crate::usage_report::UsageReportService::new(
+        snapshot,
+        None,
+        Arc::new(crate::usage_report::ReqwestUsageMeterHttp::new()),
+    )))
+    .expect("usage service installs");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("lockdown-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attached");
+    connection
+        .request(
+            haider_rpc::RequestId::new("lockdown-reset"),
+            haider_rpc::RequestBody::UsageResetApply {
+                command_id: haider_rpc::CommandId::new("lockdown-command"),
+                session_id: session.clone(),
+                account,
+            },
+        )
+        .await
+        .expect("request answered");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::Error { code, message, .. },
+        } if request_id.as_str() == "lockdown-reset"
+            && code == haider_rpc::ERROR_CODE_PERMISSION_DENIED
+            && message.contains("lockdown cannot be lifted by user approval")
+    )));
+    assert_eq!(store.latest_seq(&session).await.expect("head"), head);
+    let events = store.read(&session, 0, 128).await.expect("journal");
+    assert!(!events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::MenuOpened(_))
+    )));
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 struct ResetTestTokens;
 
 fn reset_test_descriptor(

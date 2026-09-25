@@ -1036,6 +1036,9 @@ async fn run_inner(
     // and (when the vault runs) the SAME credential broker as provider
     // construction, so meter fetches ride the broker's refresh single-flight
     // instead of racing it.
+    // Debug/test builds only: resolve and announce the fake usage hook once.
+    #[cfg(debug_assertions)]
+    crate::debug_fake_usage::announce();
     hub.install_usage_report(std::sync::Arc::new(
         crate::usage_report::UsageReportService::new(
             std::sync::Arc::clone(&accounts_runtime.facade.snapshot),

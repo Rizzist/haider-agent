@@ -177,10 +177,17 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         extra_headers: &[(&'static str, &'static str)],
         chatgpt_account_id: Option<&str>,
     ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+        let url = routed_url(url, bearer)?;
         let Some(client) = self.transport.client() else {
             return Err(MeterUnavailable::new("transport_unavailable"));
         };
-        send_authorized(client.get(url), bearer, extra_headers, chatgpt_account_id).await
+        send_authorized(
+            client.get(url.as_ref()),
+            bearer,
+            extra_headers,
+            chatgpt_account_id,
+        )
+        .await
     }
 
     async fn post_json(
@@ -191,16 +198,38 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         chatgpt_account_id: Option<&str>,
         body: &serde_json::Value,
     ) -> Result<UsageMeterHttpResponse, MeterUnavailable> {
+        let url = routed_url(url, bearer)?;
         let Some(client) = self.transport.client() else {
             return Err(MeterUnavailable::new("transport_unavailable"));
         };
         send_authorized(
-            client.post(url).json(body),
+            client.post(url.as_ref()).json(body),
             bearer,
             extra_headers,
             chatgpt_account_id,
         )
         .await
+    }
+}
+
+/// The live URL, or under the debug-only fake usage hook the fake-server URL
+/// (a real credential is refused there and sent nowhere).
+fn routed_url<'a>(
+    url: &'a str,
+    bearer: &SecretHandle,
+) -> Result<std::borrow::Cow<'a, str>, MeterUnavailable> {
+    #[cfg(debug_assertions)]
+    {
+        match crate::debug_fake_usage::route(url, bearer.expose_secret()) {
+            crate::debug_fake_usage::Route::Live(url) => Ok(std::borrow::Cow::Borrowed(url)),
+            crate::debug_fake_usage::Route::Fake(url) => Ok(std::borrow::Cow::Owned(url)),
+            crate::debug_fake_usage::Route::Refused(reason) => Err(MeterUnavailable::new(reason)),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = bearer;
+        Ok(std::borrow::Cow::Borrowed(url))
     }
 }
 

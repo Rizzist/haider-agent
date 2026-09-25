@@ -408,8 +408,9 @@ fn wham_window(
     })
 }
 
-/// Parses `GET https://chatgpt.com/backend-api/wham/usage` bytes: primary
-/// (5 h) + secondary (weekly) windows, named per-model
+/// Parses `GET https://chatgpt.com/backend-api/wham/usage` bytes: the
+/// primary and secondary windows (labelled `5h`/`weekly`/`<n>m` only from an
+/// exact published duration, otherwise by their provider names), named per-model
 /// `additional_rate_limits`, and the subscription `plan_type`.
 pub fn parse_openai_wham_usage(body: &[u8]) -> Result<MeterReading, MeterUnavailable> {
     parse_openai_wham_usage_at(body, 0)
