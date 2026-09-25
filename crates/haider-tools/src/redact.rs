@@ -6,6 +6,7 @@
 
 use base64::Engine as _;
 use regex::Regex;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -27,18 +28,101 @@ pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
 }
 
 fn redact_lines(input: &str, policy: RedactionPolicy) -> RedactedText {
+    redact_lines_with_spans(input, policy, None)
+}
+
+fn redact_lines_with_spans(
+    input: &str,
+    policy: RedactionPolicy,
+    mut raw_spans: Option<&mut Vec<RawRedaction>>,
+) -> RedactedText {
     let mut state = RedactionState::default();
     let mut output = String::with_capacity(input.len());
     let mut replacements = 0usize;
+    let mut line_start = 0usize;
+    let mut line_spans = Vec::new();
     for line in input.split_inclusive('\n') {
-        let redacted = redact_line(line, &mut state, policy);
+        line_spans.clear();
+        let redacted = redact_line_spans(
+            line,
+            &mut state,
+            policy,
+            raw_spans.is_some().then_some(&mut line_spans),
+        );
+        if let Some(raw_spans) = raw_spans.as_deref_mut() {
+            raw_spans.extend(line_spans.iter().map(|span| RawRedaction {
+                raw: line_start + span.raw.start..line_start + span.raw.end,
+                marker: span.marker,
+            }));
+        }
         output.push_str(&redacted.text);
         replacements = replacements.saturating_add(redacted.replacements);
+        line_start += line.len();
     }
     RedactedText {
         text: output,
         replacements,
     }
+}
+
+/// Raw byte ranges of `input` that `fs_read` of `path` replaces with a
+/// marker: the explicit-path rendering, or the whole file for a path whose
+/// read is one `sensitive_file` marker. Ranges are ordered and disjoint; the
+/// bytes between them are exactly the visible text of the rendering.
+pub(crate) fn explicit_read_redacted_spans(path: &Path, input: &str) -> ExplicitReadSpans {
+    if is_sensitive_path(path)
+        || (is_token_config_path(path) && token_config_contains_secret(input.as_bytes()))
+    {
+        return ExplicitReadSpans {
+            spans: if input.is_empty() {
+                Vec::new()
+            } else {
+                vec![RawRedaction {
+                    raw: 0..input.len(),
+                    marker: "[REDACTED:sensitive_file]",
+                }]
+            },
+            whole_file: true,
+        };
+    }
+    let mut spans = Vec::new();
+    let _ = redact_lines_with_spans(input, RedactionPolicy::ExplicitPath, Some(&mut spans));
+    ExplicitReadSpans {
+        spans,
+        whole_file: false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExplicitReadSpans {
+    pub spans: Vec<RawRedaction>,
+    pub whole_file: bool,
+}
+
+/// One replaced span: the `raw` bytes of the input render as `marker`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawRedaction {
+    pub raw: Range<usize>,
+    /// Read only by the rendering-equivalence test, which proves the spans
+    /// reproduce `fs_read` byte for byte.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub marker: &'static str,
+}
+
+/// The rendering of `text` with every (ordered, disjoint) span replaced by
+/// its marker: for spans from [`explicit_read_redacted_spans`], exactly the
+/// text `fs_read` presents.
+#[cfg(test)]
+pub(crate) fn render_raw_redactions(text: &str, spans: &[RawRedaction]) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for span in spans {
+        output.push_str(&text[cursor..span.raw.start]);
+        output.push_str(span.marker);
+        cursor = span.raw.end;
+    }
+    output.push_str(&text[cursor..]);
+    output
 }
 
 /// Forced secret redaction for the provider-lockdown sandbox. The returned
@@ -202,14 +286,35 @@ pub(crate) fn redact_line_with_state(line: &str, state: &mut RedactionState) -> 
 }
 
 fn redact_line(line: &str, state: &mut RedactionState, policy: RedactionPolicy) -> RedactedText {
+    redact_line_spans(line, state, policy, None)
+}
+
+/// `redact_line`, optionally recording the raw byte range of every replaced
+/// span (relative to `line`).
+fn redact_line_spans(
+    line: &str,
+    state: &mut RedactionState,
+    policy: RedactionPolicy,
+    mut raw_spans: Option<&mut Vec<RawRedaction>>,
+) -> RedactedText {
     let begins = line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----");
     let ends = line.contains("-----END") && line.contains("PRIVATE KEY-----");
     let was_quoted = state.quoted.active();
     // Even a line replaced by a PEM marker must advance quote/escape state:
     // a same-line BEGIN/END pair cannot expose the password's next line.
-    let redacted = redact_with_state(line, policy, &mut state.quoted);
+    let redacted =
+        redact_with_state_spans(line, policy, &mut state.quoted, raw_spans.as_deref_mut());
     if state.private_key || (begins && !(was_quoted && state.quoted.active())) {
         state.private_key = !ends;
+        if let Some(raw_spans) = raw_spans {
+            // The whole line (a CR included) becomes one marker; only the LF
+            // survives.
+            raw_spans.clear();
+            raw_spans.push(RawRedaction {
+                raw: 0..line.strip_suffix('\n').unwrap_or(line).len(),
+                marker: SecretKind::PrivateKey.marker(),
+            });
+        }
         let mut text = SecretKind::PrivateKey.marker().to_owned();
         if line.ends_with('\n') {
             text.push('\n');
@@ -392,6 +497,15 @@ fn redact_with_state(
     policy: RedactionPolicy,
     quoted: &mut QuotedValue,
 ) -> RedactedText {
+    redact_with_state_spans(input, policy, quoted, None)
+}
+
+fn redact_with_state_spans(
+    input: &str,
+    policy: RedactionPolicy,
+    quoted: &mut QuotedValue,
+    mut raw_spans: Option<&mut Vec<RawRedaction>>,
+) -> RedactedText {
     let spans = redaction_spans(input, policy, quoted);
     if spans.is_empty() {
         return RedactedText {
@@ -408,6 +522,12 @@ fn redact_with_state(
         }
         output.push_str(&input[cursor..span.start]);
         output.push_str(span.kind.marker());
+        if let Some(raw_spans) = raw_spans.as_deref_mut() {
+            raw_spans.push(RawRedaction {
+                raw: span.start..span.end,
+                marker: span.kind.marker(),
+            });
+        }
         cursor = span.end;
         replacements = replacements.saturating_add(1);
     }

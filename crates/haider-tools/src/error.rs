@@ -6,6 +6,7 @@
 //! answers closed and retryable, [`ToolError::WorkspaceBoundary`] reports path
 //! escapes, [`ToolError::PathChanged`] refuses post-authorization namespace
 //! changes, [`ToolError::EditAnchor`] carries anchored replacement evidence,
+//! [`ToolError::AnchorInRedactedContent`] refuses anchors on redacted content,
 //! and [`ToolError::Ledger`] makes a post-apply evidence failure explicit.
 
 use haider_protocol::ids::MenuId;
@@ -71,6 +72,17 @@ pub enum ToolError {
         path: PathBuf,
         recorded_digest: String,
         current_digest: String,
+    },
+    /// An edit anchor in a file with redacted spans matched no visible text,
+    /// or matched visible text touching a redacted span (any anchor at all
+    /// when the whole file is redacted). One fixed shape and text for every
+    /// such refusal, whatever the anchor: it depends only on the redacted
+    /// rendering, never on redacted bytes, so an edit cannot test a guess
+    /// about a secret. (No nearest candidate: its choice would vary with the
+    /// guess.)
+    AnchorInRedactedContent {
+        path: PathBuf,
+        whole_file: bool,
     },
     EditAnchor(FsEditAnchorMismatch),
     Io {
@@ -249,6 +261,20 @@ impl std::fmt::Display for ToolError {
                     )?;
                 }
                 Ok(())
+            }
+            Self::AnchorInRedactedContent { path, whole_file } => {
+                let path = crate::redact::model_visible_path(path);
+                if *whole_file {
+                    write!(
+                        formatter,
+                        "every byte of {path} is redacted, so no edit anchor can match it; replace the file with fs_write and its complete new content"
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "edit anchor for {path} is not in visible text clear of redacted content; anchors match only visible text that does not touch a [REDACTED:...] marker, and an anchor with no visible match is treated as naming redacted content; anchor on visible text away from the marker or replace the file with fs_write"
+                    )
+                }
             }
             Self::Io {
                 operation,

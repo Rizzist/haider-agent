@@ -24471,6 +24471,9 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
         haider_tools::ToolError::UnreadFile { .. } => ("rejected", "unread_file"),
+        haider_tools::ToolError::AnchorInRedactedContent { .. } => {
+            ("rejected", "anchor_in_redacted_content")
+        }
         haider_tools::ToolError::EditAnchor(_) => ("conflict", "edit_anchor_count"),
         haider_tools::ToolError::InvalidArgument { .. } => ("rejected", "invalid_argument"),
         haider_tools::ToolError::InvalidMenuAnswer { .. } => ("rejected", "invalid_menu_answer"),

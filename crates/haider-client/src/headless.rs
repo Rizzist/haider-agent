@@ -1619,7 +1619,13 @@ fn public_headless_projection(envelope: &RawEnvelope) -> Option<RawEnvelope> {
             .get("result")
             .and_then(|result| result.get("preview"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(redacted_mutation_preview),
+            .is_some_and(|preview| {
+                redacted_mutation_preview(preview)
+                    || haider_rpc::haider_protocol::pipe::stale_read_preview_without_digests(
+                        preview,
+                    )
+                    .is_some()
+            }),
         "menu_opened" => payload
             .get("kind")
             .and_then(|kind| kind.get("file_review"))
@@ -1673,6 +1679,23 @@ fn public_headless_projection(envelope: &RawEnvelope) -> Option<RawEnvelope> {
             }
         }
         "tool_result" => {
+            let stale = fields
+                .get("result")
+                .and_then(|result| result.get("preview"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(haider_rpc::haider_protocol::pipe::stale_read_preview_without_digests);
+            if let Some(preview) = stale {
+                // Stale-read digests (keyed for redacted files) stay in the
+                // owner's journal, exactly as the provider projection drops
+                // them; the refusal kind and remedy remain.
+                if let Some(result) = fields
+                    .get_mut("result")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    result.insert("preview".into(), preview.into());
+                }
+                return Some(envelope);
+            }
             // File effects carry exact byte counts of the redacted content.
             fields.remove("effects");
             if let Some(result) = fields

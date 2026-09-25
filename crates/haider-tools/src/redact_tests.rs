@@ -878,3 +878,44 @@ fn unterminated_multiline_quotes_and_nested_contexts_fail_closed() {
         assert_eq!(redact_private_key_lines(input).text, expected);
     }
 }
+
+/// The edit engine matches anchors between the recorded raw spans; those
+/// spans must reproduce the `fs_read` rendering byte for byte, or an anchor
+/// could reach bytes the model never saw.
+#[test]
+fn explicit_read_spans_reproduce_the_read_rendering() {
+    let path = Path::new("fixture.conf");
+    for input in [
+        "plain text only\n",
+        "a=1\npassword=violet-sunrise\nb=2\npassword=violet-sunrise\n",
+        "token = sk-abcdefghijklmnopqrstuv tail\n",
+        "password=\"line-one\nline-two\" after\nPUBLIC\n",
+        "password=\"abc\\\nSYNTHETICTAIL987\" after\n",
+        "-----BEGIN\x20PRIVATE KEY-----\r\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\r\n-----END PRIVATE KEY-----\r\ntail\n",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789\nnext\n",
+        "url = https://user:hunter2-synthetic@example.test/path\n",
+        "key: \"-----BEGIN\x20PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----\"\nafter\n",
+        "no trailing newline password=violet-sunrise",
+        "éé password=ünïcode-välue-1234 ü\n",
+    ] {
+        let rendered = super::ExplicitReadPaths::new(path).redact(path, input).text;
+        let spans = super::explicit_read_redacted_spans(path, input);
+        assert!(!spans.whole_file);
+        assert!(
+            spans
+                .spans
+                .windows(2)
+                .all(|pair| pair[0].raw.end <= pair[1].raw.start),
+            "{input:?}"
+        );
+        assert_eq!(
+            super::render_raw_redactions(input, &spans.spans),
+            rendered,
+            "{input:?}"
+        );
+    }
+    let env = super::explicit_read_redacted_spans(Path::new(".env"), "A=1\n");
+    assert!(env.whole_file);
+    assert_eq!(env.spans.len(), 1);
+    assert_eq!(env.spans[0].raw, 0..4);
+}

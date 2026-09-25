@@ -817,19 +817,19 @@ async fn anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction() {
         (
             "config.txt",
             "token = sk-abcdefghijklmnopqrstuv\n".into(),
-            "REDACTED",
+            "not in visible text clear of redacted content",
             Some("sk-abcdefghijklmnopqrstuv"),
         ),
         (
             "multiline.txt",
             "password=\"abc\\\nSYNTHETICTAIL987\" after\n".into(),
-            "REDACTED:password",
+            "not in visible text clear of redacted content",
             Some("SYNTHETICTAIL987"),
         ),
         (
             ".env",
             "CUSTOM_SECRET=private-value\n".into(),
-            "sensitive path",
+            "every byte of [REDACTED:sensitive_path] is redacted",
             Some("private-value"),
         ),
         (
@@ -841,7 +841,7 @@ async fn anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction() {
         (
             "key.txt",
             "-----BEGIN\x20PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n".into(),
-            "REDACTED:private_key",
+            "not in visible text clear of redacted content",
             Some("private-material"),
         ),
     ] {
@@ -2200,6 +2200,172 @@ async fn redacted_search_uses_safe_coordinates_and_masks_assignment_filenames() 
         .expect("list directory");
     assert!(!directory.preview.contains("amber-moonset"));
     assert!(directory.preview.contains("[REDACTED:sensitive_path]"));
+}
+
+/// Round-5 oracle: fs_edit anchors were counted against raw bytes, so a
+/// correct guess of a redacted value (or of its prefix, or an identity edit)
+/// answered differently from a wrong one. Through the platform edit path
+/// (unix or `apply_windows_edit`), a correct and a wrong guess now produce the
+/// same verdict and message, and the file is untouched; visible edits apply.
+#[tokio::test]
+async fn edit_anchor_guesses_on_redacted_content_are_indistinguishable() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let root = fs::canonicalize(directory.path()).expect("canonical workspace");
+    let secret = "violet-sunrise";
+    let contents = format!("a=1\npassword={secret}\nb=2\npassword={secret}\n");
+    fs::write(root.join("twice.conf"), &contents).expect("seed secret");
+    let mut broker = broker_at(RecordingJournal::default(), &root);
+    broker
+        .fs_read(
+            &FsRead::new("twice.conf"),
+            &allow(EffectClass::FsRead),
+            &mut RecordingCas::default(),
+            ResultBounds::default(),
+        )
+        .await
+        .expect("complete read");
+    let policy = allow(EffectClass::FsWrite);
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("guess"));
+    let ledger = ChangeLedger::new();
+    for (right, wrong) in [
+        ("password=violet-sunrise", "password=amber-moonset1"),
+        ("password=violet-s", "password=amber-mo"),
+        ("violet-sunrise", "amber-moonset1"),
+        ("vio", "amb"),
+    ] {
+        for (identity, replace_all) in [(true, false), (false, false), (true, true)] {
+            let mut views = Vec::new();
+            for guess in [right, wrong] {
+                let new = if identity { guess } else { "password=changed" };
+                let error = broker
+                    .fs_edit(
+                        &FsEdit::new("twice.conf", guess, new).replace_all(replace_all),
+                        &policy,
+                        &attribution,
+                        &ledger,
+                    )
+                    .await
+                    .expect_err("guess refused");
+                views.push(format!("{:?} | {}", error.source_error(), error));
+            }
+            assert_eq!(views[0], views[1], "{right:?} vs {wrong:?}");
+            assert!(views[0].contains("AnchorInRedactedContent"), "{}", views[0]);
+            assert!(!views[0].contains("violet"), "{}", views[0]);
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("twice.conf")).expect("unchanged"),
+            contents
+        );
+    }
+    broker
+        .fs_edit(
+            &FsEdit::new("twice.conf", "a=1", "a=2"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("visible edit applies");
+    assert_eq!(
+        fs::read_to_string(root.join("twice.conf")).expect("edited"),
+        format!("a=2\npassword={secret}\nb=2\npassword={secret}\n")
+    );
+}
+
+/// Round-5 oracle: glob filters matched raw names that listings mask, so
+/// `password=a*` versus `password=b*` tested a masked filename prefix. A
+/// pattern now sees only the masked name: both guesses select nothing.
+#[tokio::test]
+async fn glob_filters_cannot_test_guesses_about_masked_names() {
+    use haider_protocol::tool::ToolResultData;
+    use haider_tools::{FsFileGlob, FsGlob};
+
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let root = directory.path();
+    fs::write(root.join("password=amber-moonset.txt"), "needle\n").expect("seed masked name");
+    fs::write(root.join("public.txt"), "needle\n").expect("seed public name");
+    let mut broker = broker_at(RecordingJournal::default(), root);
+    let mut cas = RecordingCas::default();
+    let policy = allow(EffectClass::FsRead);
+    let mut glob_views = Vec::new();
+    let mut search_views = Vec::new();
+    for guess in ["password=a*", "password=b*", "*amber*", "*zzzz*"] {
+        let glob = broker
+            .fs_glob(
+                &FsGlob::new(root, guess),
+                &policy,
+                &mut cas,
+                ResultBounds::default(),
+            )
+            .await
+            .expect("glob");
+        let hide = |text: String| text.replace(guess, "<guess>");
+        glob_views.push((
+            hide(glob.preview),
+            glob.truncated,
+            hide(format!("{:?}", glob.data)),
+        ));
+        for (include, exclude) in [
+            (vec![guess.to_owned()], Vec::new()),
+            (Vec::new(), vec![guess.to_owned()]),
+        ] {
+            let search = broker
+                .fs_search(
+                    &FsSearch::new(root, "needle")
+                        .with_file_glob(FsFileGlob::new(include.clone(), exclude.clone())),
+                    &policy,
+                    &mut cas,
+                    ResultBounds::default(),
+                )
+                .await
+                .expect("search");
+            let Some(ToolResultData::FsSearch { matches, .. }) = &search.data else {
+                panic!("structured search results");
+            };
+            search_views.push((
+                include.is_empty(),
+                matches.len(),
+                hide(search.preview.clone()),
+            ));
+        }
+        let legacy = broker
+            .fs_search(
+                &FsSearch::new(root, "needle").with_glob(guess),
+                &policy,
+                &mut cas,
+                ResultBounds::default(),
+            )
+            .await
+            .expect("legacy glob search");
+        search_views.push((false, usize::MAX, hide(legacy.preview)));
+    }
+    for views in glob_views.windows(2) {
+        assert_eq!(views[0], views[1]);
+    }
+    assert!(!glob_views[0].0.contains("amber"));
+    let per_guess = search_views.len() / 4;
+    for guess in 1..4 {
+        assert_eq!(
+            search_views[..per_guess],
+            search_views[guess * per_guess..(guess + 1) * per_guess]
+        );
+    }
+    // Excluding a guess never hides the masked file, including it never
+    // selects it: the marker is the only name a pattern can see.
+    assert_eq!(search_views[1].1, 2);
+    assert_eq!(search_views[0].1, 0);
+    // The masked marker itself is selectable, like any visible name.
+    let marker = broker
+        .fs_glob(
+            &FsGlob::new(root, "*"),
+            &policy,
+            &mut cas,
+            ResultBounds::default(),
+        )
+        .await
+        .expect("glob all");
+    assert!(marker.preview.contains("[REDACTED:sensitive_path]"));
+    assert!(marker.preview.contains("public.txt"));
 }
 
 #[tokio::test]

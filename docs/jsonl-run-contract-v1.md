@@ -197,7 +197,15 @@ unredacted searches retain their previous source-byte measure. Search matching
 and columns use the redacted line. After a secret that spans lines (an open
 quote or PEM block), the rest of that file reports line `0` (structured) and
 `?` (preview) instead of a physical line number. Paths whose names would be
-redacted appear as `[REDACTED:sensitive_path]` in search, glob and listings.
+redacted appear as `[REDACTED:sensitive_path]` in search, glob and listings;
+glob patterns (`fs_glob`, `fs_search` `glob` and `file_glob`) match that marker,
+not the hidden name. In a file with redacted spans, `fs_edit` anchors match
+only visible text: an anchor with no visible match, or whose match touches a
+redacted span, gets the typed `anchor_in_redacted_content` refusal (every
+anchor does, for a wholly redacted file), and match counts ignore redacted
+bytes, so no edit outcome depends on a guess about a secret. Stale-read
+refusals in headless output, transcripts and exports omit `current_digest` and
+`recorded_digest`, as the provider projection does.
 The historical field name remains for older decoders; clients must not use it
 as an exact size or digest of a secret-bearing original. Old clients that use
 these fields for raw capture integrity checks must treat a redacted result as

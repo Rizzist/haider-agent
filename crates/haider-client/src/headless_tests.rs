@@ -166,6 +166,60 @@ fn headless_projection_withholds_redacted_integrity_and_keeps_public_provenance(
     );
 }
 
+/// A stale-read refusal's digests (keyed for a redacted file) leave run
+/// output exactly as the provider projection drops them; kind and remedy
+/// stay, and the journal envelope keeps the digests.
+#[test]
+fn headless_projection_strips_stale_read_digests() {
+    let preview = serde_json::json!({
+        "status": "conflict",
+        "error": {"kind": "stale_read", "message": "refusing to mutate stale file victim.txt; re-read before editing",
+            "details": {"current_digest": "blake3k:profile:synthetic-current",
+                "recorded_digest": "blake3k:profile:synthetic-recorded",
+                "remedy": "re-read before editing"}}
+    })
+    .to_string();
+    let original = spool_test_envelope(
+        1,
+        serde_json::json!({
+            "type": "tool_result", "call_id": "edit",
+            "result": {"preview": preview, "status": "conflict"}
+        }),
+    );
+    assert!(original.payload.to_string().contains("synthetic-current"));
+    let public = public_headless_envelope(original).payload;
+    let text = public.to_string();
+    assert!(
+        !text.contains("synthetic-current") && !text.contains("synthetic-recorded"),
+        "{text}"
+    );
+    let shown: serde_json::Value = serde_json::from_str(
+        public["result"]["preview"]
+            .as_str()
+            .expect("preview stays a string"),
+    )
+    .expect("preview stays JSON");
+    assert_eq!(shown["error"]["kind"], "stale_read");
+    assert_eq!(
+        shown["error"]["details"]["remedy"],
+        "re-read before editing"
+    );
+    assert!(shown["error"]["details"].get("current_digest").is_none());
+
+    // Any other refusal is unchanged.
+    let other = spool_test_envelope(
+        2,
+        serde_json::json!({
+            "type": "tool_result", "call_id": "edit",
+            "result": {"preview": r#"{"status":"rejected","error":{"kind":"unread_file","message":"stale_read current_digest"}}"#}
+        }),
+    );
+    assert_eq!(
+        public_headless_envelope(other.clone()).payload.to_string(),
+        other.payload.to_string()
+    );
+}
+
 #[test]
 fn memory_and_forced_spool_ledgers_serialize_to_identical_bytes() {
     let run_id = RunId::new("spool-run");

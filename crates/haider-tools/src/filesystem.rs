@@ -1113,7 +1113,12 @@ pub(crate) fn build_permission_file_review(
     }
 }
 
-fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(String, usize)> {
+/// Applies anchored replacements. In a file with redacted spans (as `fs_read`
+/// renders it for the model) anchors match visible text only: every verdict,
+/// count and message is a function of the redacted rendering, so an edit —
+/// including an identity edit — cannot test a guess about redacted bytes.
+/// Shared by the unix and Windows edit paths and the Ask file-review recipe.
+fn apply_edit_changes(operation: &FsEdit, edited: String) -> ToolResult<(String, usize)> {
     if operation.edits.is_empty() {
         return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
     }
@@ -1122,6 +1127,15 @@ fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(Str
             "fs_edit old anchors cannot be empty",
         ));
     }
+    let redaction = crate::redact::explicit_read_redacted_spans(&operation.path, &edited);
+    if redaction.spans.is_empty() {
+        apply_plain_edit_changes(operation, edited)
+    } else {
+        apply_redacted_edit_changes(operation, edited, redaction)
+    }
+}
+
+fn apply_plain_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(String, usize)> {
     let mut replacements = 0usize;
     for edit in &operation.edits {
         let matches = edited.match_indices(&edit.old).count();
@@ -1151,6 +1165,105 @@ fn apply_edit_changes(operation: &FsEdit, mut edited: String) -> ToolResult<(Str
     Ok((edited, replacements))
 }
 
+/// Matches of `anchor` inside the visible stretches between redacted `spans`.
+/// Each stretch is searched on its own, so a match never crosses a span and
+/// counts and positions depend only on visible text.
+fn visible_anchor_matches(
+    text: &str,
+    anchor: &str,
+    spans: &[crate::redact::RawRedaction],
+) -> Vec<usize> {
+    let mut matches = Vec::new();
+    let mut cursor = 0usize;
+    let tail = text.len()..text.len();
+    for span in spans
+        .iter()
+        .map(|span| &span.raw)
+        .chain(std::iter::once(&tail))
+    {
+        if let Some(visible) = text.get(cursor..span.start) {
+            matches.extend(
+                visible
+                    .match_indices(anchor)
+                    .map(|(index, _)| cursor + index),
+            );
+        }
+        cursor = cursor.max(span.end);
+    }
+    matches
+}
+
+fn apply_redacted_edit_changes(
+    operation: &FsEdit,
+    mut text: String,
+    redaction: crate::redact::ExplicitReadSpans,
+) -> ToolResult<(String, usize)> {
+    if redaction.whole_file {
+        return Err(ToolError::AnchorInRedactedContent {
+            path: operation.path.clone(),
+            whole_file: true,
+        });
+    }
+    let mut spans = redaction.spans;
+    let mut replacements = 0usize;
+    for edit in &operation.edits {
+        let matches = visible_anchor_matches(&text, &edit.old, &spans);
+        // A visible match that ends where a span starts (or starts where one
+        // ends) touches redacted content: refuse it, like an anchor with no
+        // visible match at all (which may name redacted bytes). Both
+        // decisions read only visible text and span positions.
+        let touches = matches.iter().any(|&at| {
+            let end = at + edit.old.len();
+            spans
+                .iter()
+                .any(|span| span.raw.start == end || span.raw.end == at)
+        });
+        if matches.is_empty() || touches {
+            return Err(ToolError::AnchorInRedactedContent {
+                path: operation.path.clone(),
+                whole_file: false,
+            });
+        }
+        if !edit.replace_all && matches.len() != 1 {
+            return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
+                path: operation.path.clone(),
+                matches: matches.len(),
+                replace_all: false,
+                nearest_candidate: None,
+            }));
+        }
+        let mut next = String::with_capacity(
+            text.len()
+                .saturating_add(matches.len().saturating_mul(edit.new.len())),
+        );
+        let mut cursor = 0usize;
+        for &at in &matches {
+            next.push_str(&text[cursor..at]);
+            next.push_str(&edit.new);
+            cursor = at + edit.old.len();
+        }
+        next.push_str(&text[cursor..]);
+        // Matches never overlap a span; a later span moves by the length
+        // change of every replacement before it. Spans are not re-detected:
+        // the redacted bytes keep their original extent for later edits.
+        for span in &mut spans {
+            let before = matches
+                .iter()
+                .take_while(|at| **at < span.raw.start)
+                .count();
+            let shift = |offset: usize| {
+                offset
+                    .saturating_add(before.saturating_mul(edit.new.len()))
+                    .saturating_sub(before.saturating_mul(edit.old.len()))
+            };
+            span.raw = shift(span.raw.start)..shift(span.raw.end);
+        }
+        text = next;
+        replacements = replacements.saturating_add(matches.len());
+    }
+    Ok((text, replacements))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod edit_change_tests {
@@ -1175,6 +1288,207 @@ mod edit_change_tests {
                 message: "fs_edit old anchors cannot be empty".into(),
             }
         );
+    }
+
+    // Synthetic secrets only. `RIGHT` is the redacted value in every fixture;
+    // `WRONG` is a guess of the same shape.
+    const RIGHT: &str = "violet-sunrise";
+    const WRONG: &str = "amber-moonset1";
+
+    /// What the model sees for one edit: the typed verdict and its rendered
+    /// message (success text includes the replacement count).
+    fn model_view(path: &str, text: &str, edit: FsEditChange) -> String {
+        let operation = FsEdit::many(path, vec![edit]);
+        match apply_edit_changes(&operation, text.to_owned()) {
+            Ok((_, replacements)) => format!("ok ({replacements} replacements)"),
+            Err(error) => format!("{error:?} | {error}"),
+        }
+    }
+
+    fn change(old: &str, new: &str, replace_all: bool) -> FsEditChange {
+        FsEditChange {
+            old: old.into(),
+            new: new.into(),
+            replace_all,
+        }
+    }
+
+    /// Every guess shape, as a (right, wrong) pair of anchors and news.
+    fn guess_pairs() -> Vec<(FsEditChange, FsEditChange)> {
+        let mut pairs = Vec::new();
+        for replace_all in [false, true] {
+            for (right, wrong) in [
+                (format!("password={RIGHT}"), format!("password={WRONG}")),
+                (RIGHT.to_owned(), WRONG.to_owned()),
+                (
+                    format!("password={}", &RIGHT[..8]),
+                    format!("password={}", &WRONG[..8]),
+                ),
+                (RIGHT[..3].to_owned(), WRONG[..3].to_owned()),
+                (format!("password={RIGHT}\n"), format!("password={WRONG}\n")),
+                (format!("{RIGHT}\nb=2"), format!("{WRONG}\nb=2")),
+            ] {
+                // Identity edit (old == new) and a real replacement.
+                pairs.push((
+                    change(&right, &right, replace_all),
+                    change(&wrong, &wrong, replace_all),
+                ));
+                pairs.push((
+                    change(&right, "password=changed", replace_all),
+                    change(&wrong, "password=changed", replace_all),
+                ));
+            }
+        }
+        pairs
+    }
+
+    fn assert_guesses_indistinguishable(path: &str, text: &str) {
+        for (right, wrong) in guess_pairs() {
+            let right_view = model_view(path, text, right.clone());
+            let wrong_view = model_view(path, text, wrong.clone());
+            assert_eq!(
+                right_view, wrong_view,
+                "{path}: a correct guess {:?} must look exactly like a wrong one {:?}",
+                right.old, wrong.old
+            );
+            assert!(
+                right_view.contains("AnchorInRedactedContent"),
+                "{path}: {right_view}"
+            );
+            assert!(!right_view.contains(&RIGHT[..6]), "{right_view}");
+        }
+    }
+
+    #[test]
+    fn edit_guesses_on_a_repeated_secret_are_indistinguishable() {
+        let text = format!("a=1\npassword={RIGHT}\nb=2\npassword={RIGHT}\n");
+        assert_guesses_indistinguishable("settings.conf", &text);
+    }
+
+    #[test]
+    fn edit_guesses_on_a_unique_secret_are_indistinguishable() {
+        let text = format!("a=1\npassword={RIGHT}\nb=2\n");
+        assert_guesses_indistinguishable("settings.conf", &text);
+        // A PEM body line is one redacted span too.
+        let pem =
+            format!("-----BEGIN\x20PRIVATE KEY-----\n{RIGHT}\n-----END PRIVATE KEY-----\na=1\n");
+        for (right, wrong) in [(RIGHT, WRONG), (&RIGHT[..4], &WRONG[..4])] {
+            assert_eq!(
+                model_view("key.pem", &pem, change(right, right, false)),
+                model_view("key.pem", &pem, change(wrong, wrong, false))
+            );
+        }
+    }
+
+    #[test]
+    fn anchors_touching_a_redacted_span_get_one_typed_refusal() {
+        let text = format!("a=1\npassword={RIGHT}\nb=2\n");
+        for anchor in [
+            "password=",
+            "=",
+            "\nb=2",
+            "password=[REDACTED:password]",
+            "[REDACTED:password]",
+        ] {
+            let error =
+                apply_edit_changes(&FsEdit::new("settings.conf", anchor, anchor), text.clone())
+                    .expect_err("touching anchor refused");
+            assert!(
+                matches!(
+                    error,
+                    ToolError::AnchorInRedactedContent {
+                        whole_file: false,
+                        ..
+                    }
+                ),
+                "{anchor:?}: {error:?}"
+            );
+            assert!(!error.to_string().contains(RIGHT));
+        }
+    }
+
+    #[test]
+    fn edits_in_visible_text_still_apply_and_keep_the_secret() {
+        let text = format!("color=violet\npassword={RIGHT}\nb=2\npassword={RIGHT}\n");
+        // `violet` also occurs inside the redacted value; only the visible
+        // occurrence counts and changes.
+        let (edited, replacements) = apply_edit_changes(
+            &FsEdit::new("settings.conf", "violet", "blue").replace_all(true),
+            text.clone(),
+        )
+        .expect("visible replace_all");
+        assert_eq!(replacements, 1);
+        assert_eq!(
+            edited,
+            format!("color=blue\npassword={RIGHT}\nb=2\npassword={RIGHT}\n")
+        );
+        // Sequential edits shift the recorded spans with the visible text.
+        let (edited, replacements) = apply_edit_changes(
+            &FsEdit::many(
+                "settings.conf",
+                vec![
+                    change("color=violet", "color=a-much-longer-value", false),
+                    change("b=2", "b=3", false),
+                    change("b=3", "b", false),
+                ],
+            ),
+            text.clone(),
+        )
+        .expect("sequential visible edits");
+        assert_eq!(replacements, 3);
+        assert_eq!(
+            edited,
+            format!("color=a-much-longer-value\npassword={RIGHT}\nb\npassword={RIGHT}\n")
+        );
+        // An anchor that would reach a shifted span is still refused.
+        let error = apply_edit_changes(
+            &FsEdit::many(
+                "settings.conf",
+                vec![
+                    change("color=violet", "c", false),
+                    change("\nb=2", "x", false),
+                ],
+            ),
+            text,
+        )
+        .expect_err("shifted span still touches");
+        assert!(matches!(error, ToolError::AnchorInRedactedContent { .. }));
+    }
+
+    #[test]
+    fn visible_match_counts_ignore_redacted_occurrences() {
+        // `x` occurs twice in the visible text; the secret's own characters
+        // never add to the count or the replacement total.
+        let text = format!("x=1\nx=2\npassword={RIGHT}xx\n");
+        let error = apply_edit_changes(&FsEdit::new("a.conf", "x=", "y="), text)
+            .expect_err("ambiguous visible anchor");
+        let ToolError::EditAnchor(mismatch) = error else {
+            panic!("expected an ordinary count");
+        };
+        assert_eq!(mismatch.matches, 2);
+    }
+
+    #[test]
+    fn wholly_redacted_files_refuse_every_anchor_alike() {
+        let text = format!("A=1\nSECRET={RIGHT}\n");
+        let views = ["A=1", "SECRET", RIGHT, WRONG]
+            .map(|anchor| model_view(".env", &text, change(anchor, anchor, false)));
+        assert!(views.iter().all(|view| view == &views[0]), "{views:?}");
+        assert!(views[0].contains("whole_file: true"), "{}", views[0]);
+    }
+
+    #[test]
+    fn files_without_redactions_keep_raw_anchor_semantics() {
+        let text = "let marker = \"[REDACTED:secret]\";\nsame same\n".to_owned();
+        let (edited, _) = apply_edit_changes(
+            &FsEdit::new("src/redact.rs", "[REDACTED:secret]", "[REDACTED:kind]"),
+            text.clone(),
+        )
+        .expect("literal marker in a plain file");
+        assert!(edited.contains("[REDACTED:kind]"));
+        let error = apply_edit_changes(&FsEdit::new("src/redact.rs", "same", "x"), text)
+            .expect_err("ambiguous");
+        assert!(matches!(error, ToolError::EditAnchor(ref m) if m.matches == 2));
     }
 }
 
@@ -2679,7 +2993,7 @@ fn search_files_at(
                 else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                if path_filters.matches(&match_path) {
+                if path_filters.matches(&model_match_path(path, match_path)) {
                     ensure_search_collector(
                         &mut matches,
                         max_preview_bytes,
@@ -2706,7 +3020,7 @@ fn search_files_at(
                 let path_under_root =
                     path_under_search_root(workspace_root, relative, workspace_path)?;
                 let match_path = portable_relative_path(path_under_root)?;
-                if !path_filters.matches(&match_path) {
+                if !path_filters.matches(&model_match_path(workspace_path, match_path)) {
                     return Ok(ControlFlow::Continue(()));
                 }
                 if crate::redact::is_sensitive_path(workspace_path) {
@@ -3364,6 +3678,22 @@ fn portable_relative_path(path: &Path) -> ToolResult<String> {
     Ok(path_argument(path)?.replace('\\', "/"))
 }
 
+/// The path a glob filter tests: the same masking as every model-visible
+/// listing. A masked name matches only as the marker, so an include or
+/// exclude pattern can select only what the model can already see and never
+/// tests a guess about a masked name.
+fn model_match_path(workspace_path: &Path, candidate: String) -> String {
+    let workspace_masked = match portable_relative_path(workspace_path) {
+        Ok(portable) => crate::redact::model_path_masked(Path::new(&portable)),
+        Err(_) => true,
+    };
+    if workspace_masked || crate::redact::model_path_masked(Path::new(&candidate)) {
+        crate::redact::SENSITIVE_PATH_MARKER.to_owned()
+    } else {
+        candidate
+    }
+}
+
 fn portable_hidden_accounting_path(
     workspace_root: &Path,
     search_root: &Path,
@@ -3826,7 +4156,7 @@ fn glob_files_at(
                     else {
                         return Ok(ControlFlow::Continue(()));
                     };
-                    if pattern.is_match(&candidate) {
+                    if pattern.is_match(model_match_path(path, candidate)) {
                         skipped_sensitive = skipped_sensitive.saturating_add(1);
                     }
                     return Ok(ControlFlow::Continue(()));
@@ -3836,7 +4166,7 @@ fn glob_files_at(
             files_scanned = files_scanned.saturating_add(1);
             let path_under_root = path_under_search_root(workspace_root, relative, workspace_path)?;
             let candidate = portable_relative_path(path_under_root)?;
-            if !pattern.is_match(&candidate) {
+            if !pattern.is_match(model_match_path(workspace_path, candidate)) {
                 return Ok(ControlFlow::Continue(()));
             }
             if crate::redact::is_sensitive_path(workspace_path) {
