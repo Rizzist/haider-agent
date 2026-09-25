@@ -2221,6 +2221,27 @@ impl GeminiDecoder {
     fn dispatch(&mut self, frame: SseFrame) -> Result<Vec<StreamEvent>, ProviderError> {
         let mut value: serde_json::Value = serde_json::from_str(&frame.data)
             .map_err(|error| malformed(format!("Gemini SSE data is not valid JSON: {error}")))?;
+        // A mid-stream `{"error": {...}}` frame carries the same envelope as
+        // an HTTP error body: classify it through the one prose boundary
+        // (templates publish, unknown prose stays owner-local) instead of
+        // ignoring it and reporting a bare interrupted stream.
+        if let Some(code) = value
+            .get("error")
+            .filter(|error| error.is_object())
+            .map(|error| {
+                error
+                    .get("code")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|code| u16::try_from(code).ok())
+                    .filter(|code| (400..=599).contains(code))
+                    .unwrap_or(500)
+            })
+        {
+            let mut error = replay_gemini_http_error(code, None, frame.data.as_bytes());
+            // Not an HTTP response status: the frame arrived on a 200 stream.
+            error.presentation.provider_http_status = None;
+            return Err(error);
+        }
         if value
             .get("promptFeedback")
             .and_then(|feedback| feedback.get("blockReason"))

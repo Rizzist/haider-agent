@@ -7,8 +7,8 @@ use haider_provider::acp::client::{ACP_STDERR_TAIL_BYTES, AcpError, StderrRing};
 use haider_provider::acp::wire::JsonRpcError;
 use haider_provider::{
     ProviderError, ProviderErrorKind, ProviderSlotEvidence, deadline_exhausted_error,
-    replay_anthropic_http_error, replay_gemini_http_error, replay_openai_http_error,
-    replay_openai_responses_sse,
+    replay_anthropic_http_error, replay_gemini_http_error, replay_gemini_sse,
+    replay_openai_http_error, replay_openai_responses_sse,
 };
 use std::time::Duration;
 
@@ -241,6 +241,34 @@ fn near_miss_messages_do_not_match_a_template() {
             }
         }
     }
+}
+
+#[test]
+fn gemini_stream_error_frames_use_the_template_boundary() {
+    let frame = |message: &str| {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"error": {"code": 400, "message": message, "status": "INVALID_ARGUMENT"}})
+        )
+    };
+    let known = "User location is not supported for the API use.";
+    let error = replay_gemini_sse(frame(known).as_bytes())
+        .into_iter()
+        .find_map(Result::err)
+        .expect("error frame");
+    assert_eq!(error.presentation.detail, known);
+    assert_eq!(error.presentation.provider_http_status, None);
+    let unknown = replay_gemini_sse(frame("Denied for org quillgemini.").as_bytes())
+        .into_iter()
+        .find_map(Result::err)
+        .expect("error frame");
+    assert!(unknown.presentation.detail.ends_with(WITHHELD));
+    assert!(!shareable_text(&unknown).contains("quillgemini"));
+    assert!(
+        unknown
+            .provider_raw_detail
+            .is_some_and(|raw| raw.contains("quillgemini"))
+    );
 }
 
 // ---------------------------------------------------------------------------
