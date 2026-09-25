@@ -2048,6 +2048,187 @@ async fn interactive_turn_without_request_policy_completes_beyond_old_hard_cap()
     task.join().await.expect("daemon joins");
 }
 
+/// A `loop_suspected_v1` steer journaled by one daemon is replayed into the
+/// model's next request by the NEXT daemon (prompt-verbatim render through
+/// the durable history projection), not only within the live actor.
+///
+/// MUTATION CHECK: dropping the `LOOP_SUSPECTED_EXTENSION_KIND` arm from the
+/// prompt-history projection leaves the post-restart request without the
+/// note while the pre-restart request still has it.
+#[tokio::test]
+async fn loop_suspected_steer_is_replayed_into_the_next_request_after_restart() {
+    const CALLS: usize = 32;
+    let test_id = "loop-suspected-restart";
+    let root = test_root("loop-suspected-restart-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(workspace.join("same.txt"), "same stable contents").expect("workspace input");
+    let mut script = Vec::new();
+    for ordinal in 1..=CALLS {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("same-{}", ordinal - 1),
+            });
+        }
+        script.push(FakeStep::EmitToolCall {
+            call_id: format!("same-{ordinal}"),
+            name: "fs_read".into(),
+            args: serde_json::json!({"path": "same.txt"}),
+        });
+        script.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: format!("same-{CALLS}"),
+        },
+        FakeStep::EmitText {
+            text: "stopping the repeated reads".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "second turn answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (dependencies, fake) = fake_dependencies(script);
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let overrides = SessionPermissionOverridesV1 {
+        read_only: true,
+        allow_writes: false,
+        allow_exec: false,
+        allow_mobile: false,
+        auto_allow: false,
+    };
+
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "first-client",
+        ClientKind::Tui,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(
+        &mut first_client,
+        &config,
+        &workspace,
+        "fake",
+        "fake-v1",
+        Some(overrides),
+        None,
+    )
+    .await;
+    let first_run = submit_turn(
+        &mut first_client,
+        &config,
+        "loop-turn",
+        session_id.clone(),
+        generation,
+        "read the file",
+    )
+    .await;
+    let events = events_until_terminal(&mut first_client, &first_run).await;
+    assert!(continuation_seen(&events, "stopping the repeated reads"));
+    let requests = fake.requests();
+    // Call 1 is new, calls 2..=31 are 30 repeats: the steer precedes request 32.
+    assert_eq!(requests.len(), CALLS + 1);
+    assert!(
+        !requests[..31]
+            .iter()
+            .any(|request| request_contains(request, "[loop_suspected_v1]"))
+    );
+    assert!(request_contains(&requests[31], "[loop_suspected_v1]"));
+    drop(first_client);
+    first_task.shutdown_handle().request("restart");
+    first_task.join().await.expect("first daemon joins");
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "second-client",
+        ClientKind::Tui,
+    )
+    .await;
+    send_request(
+        &mut second_client,
+        &config,
+        "list-after-restart",
+        RequestBody::SessionList {
+            cursor: None,
+            limit: 10,
+            order: Default::default(),
+        },
+    )
+    .await;
+    let restarted_generation = match next_response(&mut second_client).await {
+        WireFrame::Response {
+            body: ResponseBody::SessionList { sessions, .. },
+            ..
+        } => {
+            sessions
+                .iter()
+                .find(|row| row.session_id == session_id)
+                .expect("the session survives the restart")
+                .worker_generation
+        }
+        other => panic!("expected session.list response, got {other:?}"),
+    };
+    let replay = attach_existing(
+        &mut second_client,
+        &config,
+        session_id.clone(),
+        "attach-after-restart",
+    )
+    .await;
+    assert!(
+        replay.iter().any(|envelope| envelope
+            .payload
+            .to_string()
+            .contains("\"loop_suspected_v1\"")),
+        "the durable journal holds the typed steer"
+    );
+    let second_run = submit_turn(
+        &mut second_client,
+        &config,
+        "submit-after-restart",
+        session_id,
+        restarted_generation,
+        "and again",
+    )
+    .await;
+    let events = events_until_terminal(&mut second_client, &second_run).await;
+    assert!(continuation_seen(&events, "second turn answer"));
+    let requests = fake.requests();
+    assert_eq!(requests.len(), CALLS + 2);
+    let after_restart = &requests[CALLS + 1];
+    assert!(request_contains(after_restart, "and again"));
+    assert!(
+        request_contains(after_restart, "[loop_suspected_v1]"),
+        "the restarted daemon replays the steer into the model's next request"
+    );
+    assert!(request_contains(
+        after_restart,
+        r#""guard":"repeated_tool_calls""#
+    ));
+    assert!(request_contains(after_restart, r#""repeated_calls":30"#));
+    drop(second_client);
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
 #[tokio::test]
 async fn headless_workflow_provider_request_cap_returns_resumable_budget_cause() {
     let test_id = "headless-workflow-loop-limit";

@@ -110,6 +110,7 @@ fn loop_suspected_steer_renders_as_a_visible_transcript_line() {
         repeated_calls: 30,
         stop_after: 30,
         tool: Some("fs_read".into()),
+        guard: haider_protocol::loop_guard::LoopGuardKindV1::RepeatedToolCalls,
     };
     let mut model = AppModel::new();
     for payload in demo_script() {

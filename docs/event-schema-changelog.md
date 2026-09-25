@@ -40,12 +40,24 @@ additive field and unbounded runs omit it.
 This changes no event shape, pricing, cost accounting, time budget,
 cancellation, workflow recurrence guard, or schema version.
 
-New additive extension kind `loop_suspected_v1` (`run_id`, `repeated_calls`,
-`stop_after`, optional `tool`, `label`): a non-terminal steer committed once
-per repeated-tool-call streak after 30 consecutive calls repeat an earlier call
-and normalized result of the same turn. It is model-visible and rendered as a
-transcript line. If the streak continues for 30 more calls without new progress,
-the turn ends with the existing `loop_limit` error code (CLI exit 70).
+New additive extension kind `loop_suspected_v1` (`run_id`, `guard`,
+`repeated_calls`, `stop_after`, optional `tool`, `label`): a non-terminal steer
+committed once per streak, after 30 consecutive calls repeat an earlier call and
+normalized result of the same turn (`guard: "repeated_tool_calls"`), or after
+100 consecutive calls repeat an earlier (tool, arguments) pair whatever the
+results (`guard: "repeated_actions"`). A missing `guard` means
+`repeated_tool_calls`. It is model-visible and rendered as a transcript line.
+If the streak continues for 30 (respectively 100) more calls without a new
+call, the turn ends with the existing `loop_limit` error code (CLI exit 70).
+Assistant text never resets these streaks.
+
+`ErrorPresentation` gains the additive optional field `loop_limit`, present only
+on `loop_limit` failures and tagged by `loop` (`no_progress_continuations`
+with `continuation_count`/`continuation_limit`; `repeated_tool_calls` or
+`repeated_actions` with `repeated_calls`/`suspect_after`/`stop_after_suspected`).
+It reaches the `run_failed` event payload and the `haider.run.v1`
+`error.presentation`. Readers drop an unknown `loop` value rather than
+rejecting the presentation. Serialized bytes of every other error are unchanged.
 Older readers treat the kind as an unknown extension.
 
 ### v0.0.972 — finalized tool arguments carrier

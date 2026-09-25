@@ -9,8 +9,9 @@
 //!   Digits glued to a preceding letter or `_` stay (they name something, such
 //!   as `chunk5`, `mod12`, `v0`), so a new chunk path is progress.
 //! - Letters are never masked: a new git SHA, UUID or base64 token is progress.
-//!   Accepted residual: noise that changes letters (nonces, etags) also counts
-//!   as progress; the repeated-call guard bounds loops whose calls repeat.
+//!   Accepted residual: noise that changes letters (nonces, etags) makes a
+//!   new result; the action-level guard (same tool and arguments, whatever
+//!   the result) bounds such loops.
 //! - Tool results compare an unordered multiset: each line's `,`/`;`/`:`-separated
 //!   items are sorted, then lines are sorted, so a reordered list is a repeat.
 //! - Assistant text also folds case; text and argument strings cap runs of one

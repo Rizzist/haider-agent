@@ -32,7 +32,9 @@ use haider_protocol::ids::{
     RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, ToolArgumentsFinalizedV1, ToolStatus, TurnItem};
-use haider_protocol::loop_guard::{LOOP_SUSPECTED_EXTENSION_KIND, LoopSuspectedV1};
+use haider_protocol::loop_guard::{
+    LOOP_SUSPECTED_EXTENSION_KIND, LoopGuardKindV1, LoopLimitV1, LoopSuspectedV1,
+};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::{RunState, WaitReason};
@@ -1253,13 +1255,147 @@ async fn identical_tool_use_loop_is_steered_then_stopped_with_loop_limit() {
         |request: &TurnRequest| format!("{:?}", request.messages).contains("[loop_suspected_v1]");
     assert!(!requests[..31].iter().any(has_note));
     assert!(requests[31..].iter().all(has_note));
+    let presentation = events
+        .iter()
+        .find_map(|envelope| match typed(envelope) {
+            EventPayload::RunFailed {
+                code: ErrorCode::LoopLimit,
+                presentation,
+                ..
+            } => presentation,
+            _ => None,
+        })
+        .expect("run_failed loop_limit with presentation");
+    assert_eq!(
+        presentation.loop_limit,
+        Some(LoopLimitV1::RepeatedToolCalls {
+            repeated_calls: 60,
+            suspect_after: 30,
+            stop_after_suspected: 30,
+        }),
+        "typed details reach run_failed"
+    );
+}
+
+/// Addendum 2: new narration each round does not reset the repeated-call
+/// streak, so an identical call with fresh text is still stopped at 60.
+#[tokio::test]
+async fn narration_between_identical_calls_does_not_unlock_the_loop() {
+    let mut script = Vec::new();
+    for ordinal in 1..=61usize {
+        if ordinal > 1 {
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("same-{}", ordinal - 1),
+            });
+        }
+        let words = [
+            "amber", "basil", "cedar", "delta", "ember", "fable", "garnet",
+        ];
+        script.extend([
+            FakeStep::EmitText {
+                text: format!(
+                    "Retrying with the {} {} idea.",
+                    words[ordinal % 7],
+                    words[(ordinal / 7) % 7]
+                ),
+            },
+            FakeStep::EmitToolCall {
+                call_id: format!("same-{ordinal}"),
+                name: "inspect".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+        ]);
+    }
+    let (outcome, _events, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("loop error");
+    assert_eq!(error.code, ErrorCode::LoopLimit);
+    assert_eq!(
+        error.details.expect("details")["loop"],
+        "repeated_tool_calls"
+    );
+    assert_eq!(requests.len(), 61);
+    assert_eq!(calls, 61);
+}
+
+/// Addendum 2 action-level guard: an identical call whose result changes
+/// only in letters every time is steered after 100 repeated (tool,
+/// arguments) calls (before request 102) and stopped after 200 (before
+/// request 202), with typed details on run_failed.
+#[tokio::test]
+async fn identical_call_with_letter_noise_results_is_bounded_by_the_action_guard() {
+    let (outcome, events, requests, calls) =
+        toolrepair_run_with(config(), identical_inspect_calls(201), true).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("loop error");
+    assert_eq!(error.code, ErrorCode::LoopLimit);
+    assert_eq!(
+        serde_json::from_value::<LoopLimitV1>(error.details.expect("details")).expect("typed"),
+        LoopLimitV1::RepeatedActions {
+            repeated_calls: 200,
+            suspect_after: 100,
+            stop_after_suspected: 100,
+        }
+    );
+    assert_eq!(requests.len(), 201);
+    assert_eq!(calls, 201);
+    let notes: Vec<LoopSuspectedV1> = events
+        .iter()
+        .filter_map(|envelope| match typed(envelope) {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                LoopSuspectedV1::from_extension_item(&item)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "only the action guard steers: {notes:?}");
+    assert_eq!(notes[0].guard, LoopGuardKindV1::RepeatedActions);
+    assert_eq!(notes[0].repeated_calls, 100);
+    assert_eq!(notes[0].stop_after, 100);
+    let has_note =
+        |request: &TurnRequest| format!("{:?}", request.messages).contains("[loop_suspected_v1]");
+    assert!(!requests[..101].iter().any(has_note));
+    assert!(requests[101..].iter().all(has_note));
     assert!(events.iter().any(|envelope| matches!(
         typed(envelope),
         EventPayload::RunFailed {
             code: ErrorCode::LoopLimit,
+            presentation: Some(presentation),
             ..
-        }
+        } if matches!(presentation.loop_limit, Some(LoopLimitV1::RepeatedActions { .. }))
     )));
+}
+
+/// A 150-poll of a changing resource with one identical call is steered once
+/// by the action guard and then completes: the steer is not a stop.
+#[tokio::test]
+async fn polling_a_changing_result_150_times_completes() {
+    let mut script = identical_inspect_calls(150);
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "same-150".into(),
+        },
+        FakeStep::EmitText {
+            text: "the job finished".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (outcome, events, requests, calls) = toolrepair_run_with(config(), script, true).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 151);
+    assert_eq!(calls, 150);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| completed_extension(envelope, LOOP_SUSPECTED_EXTENSION_KIND))
+            .count(),
+        1
+    );
 }
 
 /// Explicit opt-out: an embedder that disables the repeated-call guard keeps
@@ -2669,6 +2805,9 @@ impl ToolDispatcher for CompletingDispatcher {
 
 struct CountingCompletingDispatcher {
     calls: AtomicUsize,
+    /// Each result carries a new letters-only tag (an etag/request-ID-like
+    /// noise the result-level fingerprint cannot mask).
+    letter_noise: bool,
 }
 
 struct PreflightRejectingDispatcher {
@@ -2714,9 +2853,21 @@ impl ToolDispatcher for CountingCompletingDispatcher {
         _args: serde_json::Value,
         _cancel: &haider_core::CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let preview = if self.letter_noise {
+            let tag: String = (0..6)
+                .scan(call, |rest, _| {
+                    let letter = char::from(b'a' + u8::try_from(*rest % 26).unwrap_or(0));
+                    *rest /= 26;
+                    Some(letter)
+                })
+                .collect();
+            format!("status same; etag {tag}")
+        } else {
+            "done once".into()
+        };
         Ok(ToolDispatchResult::Completed(BoundedResult {
-            preview: "done once".into(),
+            preview,
             truncated: false,
             truncation: None,
             effects: Vec::new(),
@@ -3249,10 +3400,24 @@ async fn toolrepair_run(
     Vec<TurnRequest>,
     usize,
 ) {
+    toolrepair_run_with(cfg, script, false).await
+}
+
+async fn toolrepair_run_with(
+    cfg: HarnessConfig,
+    script: Vec<FakeStep>,
+    letter_noise: bool,
+) -> (
+    haider_core::TurnOutcome,
+    Vec<RawEnvelope>,
+    Vec<TurnRequest>,
+    usize,
+) {
     let provider = Arc::new(FakeProvider::new(script));
     let store = Arc::new(MemoryStore::new());
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         cfg,
@@ -4409,6 +4574,7 @@ async fn network_break_after_tool_effect_replays_without_redispatch() {
     );
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -4687,6 +4853,7 @@ async fn recovered_route_wait_restores_partial_tool_without_duplicate_dispatch()
     );
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -4780,6 +4947,7 @@ async fn recovered_route_wait_restores_completed_effect_without_redispatch() {
     );
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let store = Arc::new(MemoryStore::new());
     let (actor, handle) = HarnessActor::new_with_dispatcher(
@@ -7253,6 +7421,7 @@ async fn repair_reset_store_failure_closes_pending_tools_without_dispatch() {
     let provider = Arc::new(FakeProvider::new(script));
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         config(),

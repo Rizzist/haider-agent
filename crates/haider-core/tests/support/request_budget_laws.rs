@@ -188,6 +188,7 @@ async fn hard_request_bound_restores_partial_text_and_tool_history_after_actor_r
     let provider = Arc::new(FakeProvider::new(rounds(3)));
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         bounded,
@@ -808,6 +809,7 @@ async fn capped_actor_recovery_uses_original_durable_tree_receipt_and_prior_tool
     ]));
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (recovered_actor, recovered) = HarnessActor::new_with_dispatcher(
         bounded,
@@ -919,6 +921,7 @@ async fn capped_actor_counts_reused_provider_call_id_in_each_logical_request() {
     let store = Arc::new(MemoryStore::new());
     let dispatcher = Arc::new(CountingCompletingDispatcher {
         calls: AtomicUsize::new(0),
+        letter_noise: false,
     });
     let (actor, handle) = HarnessActor::new_with_dispatcher(
         bounded,

@@ -3690,12 +3690,16 @@ The transcript TUI and plain renderer suppress progress telemetry; bound
 checkpoints remain visible and raw JSON/JSONL retains all opted-in policy facts.
 
 Independently of any request policy, a `loop_suspected_v1` extension item
-(`run_id`, `repeated_calls`, `stop_after`, optional `tool`, `label`) is a
-non-terminal, model-visible steer. It is committed once per streak when 30
-consecutive tool calls repeat an earlier call and normalized result of the
-same turn. It is rendered as a transcript line. If the streak reaches 30 more
-repeats with no new call fingerprint and no new assistant text, the turn ends
-with `loop_limit` (CLI exit 70). See `docs/jsonl-run-contract-v1.md`, "Loop
+(`run_id`, `guard`, `repeated_calls`, `stop_after`, optional `tool`, `label`)
+is a non-terminal, model-visible steer. It is committed once per streak when
+30 consecutive tool calls repeat an earlier call and normalized result of the
+same turn (`guard: "repeated_tool_calls"`), or when 100 consecutive calls
+repeat an earlier (tool, arguments) pair with no new pair in between, whatever
+the results (`guard: "repeated_actions"`). Assistant text resets neither
+streak. It is rendered as a transcript line. After 30 (respectively 100) more
+repeats with no new call, the turn ends with `loop_limit` (CLI exit 70). The
+`run_failed` payload's `presentation.loop_limit` object carries the typed
+details (`loop` tag plus counts); see `docs/jsonl-run-contract-v1.md`, "Loop
 guards", for the fingerprint rules and accepted residuals.
 
 `haider run --resume RUN_ID` requires `request_budget_v1` and starts a new turn
