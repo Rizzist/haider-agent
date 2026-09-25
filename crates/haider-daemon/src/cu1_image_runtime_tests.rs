@@ -36,6 +36,37 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
 
+/// A genuine elision record, as the actor's projection of an image-bearing
+/// history (two computer screenshots) produces it.
+fn actor_elision_record() -> haider_provider::ToolResultImageProjection {
+    let shot = |call_id: &str| {
+        [
+            Message::assistant(vec![Block::ToolCall {
+                call_id: call_id.into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            }]),
+            Message::tool_result_with_images(
+                call_id,
+                "screenshot",
+                false,
+                vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{call_id}")),
+                    media_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 8,
+                }],
+            ),
+        ]
+    };
+    let mut history = shot("cu1-shot-1").to_vec();
+    history.extend(shot("cu1-shot-2"));
+    let record = haider_provider::apply_tool_result_image_budget(&mut history);
+    assert!(record.elided_all_images("cu1-shot-1"));
+    record
+}
+
 /// The compaction provider request uses the same atomic provider-index plus
 /// request-attempt publication as an ordinary turn. The store integration
 /// test forces commit and rollback of the four-envelope batch; this pin keeps
@@ -603,6 +634,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
     .await;
 
     let economy = haider_protocol::context::ContextEconomy::default();
+    let image_projection = actor_elision_record();
     let _result = compactor
         .compact(ContextCompactionRequest {
             run_id: &run_id,
@@ -610,6 +642,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
             covered_messages: covered_messages.clone(),
             retained_messages: Vec::new(),
             attachments: Vec::new(),
+            image_projection: image_projection.clone(),
             latest_compaction_summary_end: None,
             economy_before: &economy,
         })
@@ -618,6 +651,8 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
+    // The actor's typed elision record rides the exact-replay summary request.
+    assert_eq!(request.tool_result_image_projection, image_projection);
     let mut expected_messages = covered_messages.clone();
     expected_messages.push(Message::user_text(super::COMPACTION_SUMMARY_INSTRUCTION));
     // Mutation pin: eager image rewriting, dropping the direct attachment,
@@ -750,6 +785,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
     .await;
 
     let economy = haider_protocol::context::ContextEconomy::default();
+    let image_projection = actor_elision_record();
     let post_summary_result = compactor
         .compact(ContextCompactionRequest {
             run_id: &run_id,
@@ -757,6 +793,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
             covered_messages: covered_messages.clone(),
             retained_messages: Vec::new(),
             attachments: Vec::new(),
+            image_projection: image_projection.clone(),
             latest_compaction_summary_end: None,
             economy_before: &economy,
         })
@@ -776,6 +813,10 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
     assert_eq!(requests[0].system_prompt, lane_system_prompt);
     assert_eq!(requests[0].tools, lane_tools);
     assert!(requests[0].cache_metadata.is_some());
+    assert_eq!(requests[0].tool_result_image_projection, image_projection);
+    // The text-only fallback keeps the actor's record (merged with its own
+    // budget pass, which elides nothing for this single-image history).
+    assert_eq!(requests[1].tool_result_image_projection, image_projection);
 
     // Mutation pin: deleting this one-shot fallback turns a provider's
     // multimodal replay rejection into a failed compaction.

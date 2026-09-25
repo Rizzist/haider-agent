@@ -7629,6 +7629,10 @@ async fn perform_manual_compaction(
             covered_messages: messages,
             retained_messages,
             attachments: Vec::new(),
+            // Manual compaction compiles raw durable history and applies no
+            // request-time image projection, so nothing earlier was elided;
+            // the text-only fallback computes and records its own.
+            image_projection: ToolResultImageProjection::default(),
             latest_compaction_summary_end,
             economy_before: &metadata.context_economy,
         })
