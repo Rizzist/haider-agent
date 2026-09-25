@@ -360,7 +360,8 @@ async fn replay_rejects_conflicting_metadata_and_unsupported_vision_gets_a_place
         FeatureResolve::Unsupported,
     )
     .await
-    .expect("unsupported vision degrades after validating CAS truth");
+    .expect("unsupported vision degrades after validating CAS truth")
+    .0;
     assert!(resolved.is_empty());
     let Block::ToolResult {
         preview, images, ..
@@ -383,7 +384,8 @@ async fn replay_rejects_conflicting_metadata_and_unsupported_vision_gets_a_place
         FeatureResolve::Unsupported,
     )
     .await
-    .expect("the same honest artifact can appear in multiple results");
+    .expect("the same honest artifact can appear in multiple results")
+    .0;
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].artifact, artifact);
 }

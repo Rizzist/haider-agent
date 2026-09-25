@@ -248,7 +248,9 @@ same retained envelope:
 
 Failed terminals also carry `payload.error_code`. Provider timeout reasons
 remain in the durable provider failure presentation and use the provider's
-typed reason vocabulary (including `response_open` when supported). JSONL does
+typed reason vocabulary (including `response_open` when supported, and
+`request_upload` when a request body did not finish uploading within its
+size-based budget of 64 KiB/s, clamped to 30-300 s). JSONL does
 not create a parallel timeout-reason taxonomy: `provider_timeout` is a
 `provider_error` terminal, `budget_exhausted` is a `budget` terminal, and
 `timeout` means the caller's run deadline.

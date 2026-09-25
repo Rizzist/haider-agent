@@ -1,7 +1,8 @@
 //! Anthropic Messages API adapter.
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -163,7 +164,7 @@ fn anthropic_computer_beta_from_payload(payload: &serde_json::Value) -> Option<&
 /// are documented as enforcing. Mythos 5.1 is included defensively: Anthropic
 /// documents that models without the check accept `block_binding` and report
 /// only model-check drops, so the opt-in cannot cause a rejection there.
-fn prefix_binding_model(model: &str) -> bool {
+pub(crate) fn prefix_binding_model(model: &str) -> bool {
     matches!(
         crate::effort::base_model(model),
         "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1"
@@ -179,13 +180,63 @@ fn prefix_binding_model(model: &str) -> bool {
 /// accounts created on/after 2026-08-31 otherwise receive a 400. Anthropic's
 /// computer-use guidance: "If you must prune, keep
 /// `prefix_mismatch_behavior: \"drop_block\"` set from then on". The
-/// condition is derived only from the model and the request's own history,
-/// and that elision is monotonic, so it holds on every later request and is
-/// reconstructed identically after resume/restart. Ordinary append-only
-/// conversations keep their exact prior wire and the API's default check.
+/// condition is derived only from the model and the request's TYPED image
+/// projection record (never from tool-result text), and that elision is
+/// monotonic, so it holds on every later request and is reconstructed
+/// identically after resume/restart. Ordinary append-only conversations keep
+/// their exact prior wire and the API's default check.
 pub(crate) fn thinking_binding_drop_required(request: &TurnRequest) -> bool {
     prefix_binding_model(&request.model)
-        && crate::request_rewrites_earlier_tool_result_images(&request.messages)
+        && request
+            .tool_result_image_projection
+            .rewrites_earlier_tool_results()
+}
+
+/// Routes (auth mode, URL, model) whose endpoint rejected the thinking
+/// binding opt-in with a 400 naming `block_binding` or its beta. Process-wide
+/// so a rebuilt adapter for the same route never repeats the rejected
+/// request; see [`AnthropicProvider::send_request_with_binding_fallback`].
+fn thinking_binding_rejected_routes() -> &'static Mutex<HashSet<String>> {
+    static ROUTES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    ROUTES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether a 400 body rejects exactly Haider's prefix-binding opt-in (the
+/// `thinking.block_binding` field or the binding-controls beta), as an
+/// endpoint without thinking-binding controls answers. A prefix-mismatch
+/// rejection or any other invalid request never matches.
+pub(crate) fn anthropic_rejects_thinking_binding(body: &[u8]) -> bool {
+    let message = serde_json::from_slice::<ErrorEnvelope>(body).map_or_else(
+        |_| String::from_utf8_lossy(body).to_ascii_lowercase(),
+        |envelope| envelope.error.message.to_ascii_lowercase(),
+    );
+    [
+        "block_binding",
+        "prefix_mismatch_behavior",
+        ANTHROPIC_THINKING_BINDING_BETA,
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// Removes the binding opt-in from a rendered payload. The beta header is
+/// derived from the payload, so it disappears with it.
+fn strip_thinking_binding_drop(payload: &mut serde_json::Value) {
+    let Some(thinking) = payload
+        .get_mut("thinking")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    thinking.remove("block_binding");
+    // `adaptive` without further settings is exactly what these models do
+    // when `thinking` is omitted, which restores the pre-policy wire.
+    if thinking.len() == 1
+        && thinking.get("type").and_then(serde_json::Value::as_str) == Some("adaptive")
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.remove("thinking");
+    }
 }
 
 fn payload_uses_thinking_binding_drop(payload: &serde_json::Value) -> bool {
@@ -737,7 +788,8 @@ impl AnthropicProvider {
         // API to drop the signed thinking bound to the old prefix instead of
         // rejecting the request (see `thinking_binding_drop_required`).
         // `adaptive` is these models' only thinking mode and equals omission.
-        if thinking_binding_drop_required(request) {
+        // A route that already rejected the opt-in keeps the pre-policy wire.
+        if thinking_binding_drop_required(request) && !self.thinking_binding_rejected() {
             let object = payload.as_object_mut().ok_or_else(|| {
                 ProviderError::new(
                     ProviderErrorKind::Internal,
@@ -982,26 +1034,23 @@ impl AnthropicProvider {
 
     async fn request_body_prepared_for_send(
         &self,
-        prepared: crate::PreparedWire,
+        prepared: &crate::PreparedWire,
     ) -> Result<(reqwest::Request, crate::RequestUploadBoundary, Duration), ProviderError> {
+        // Endpoint validation and OAuth credential work inside the builder
+        // stay on the logical idle clock; only the upload itself pauses it.
+        let request = self.request_builder(&prepared.payload).await?;
+        let body = crate::serialize_prepared_json_body_ref(prepared)?;
+        let upload_budget = crate::request_upload::request_upload_budget(body.len());
         let boundary = crate::RequestUploadBoundary::new();
-        let result = async {
-            let request = self.request_builder(&prepared.payload).await?;
-            let body = crate::serialize_prepared_json_body(prepared)?;
-            let upload_budget = crate::request_upload::request_upload_budget(body.len());
-            request
-                .header(CONTENT_LENGTH, body.len())
-                .body(boundary.body(body))
-                .build()
-                .map(|request| (request, upload_budget))
-                .map_err(transport_error)
-        }
-        .await;
-        match result {
-            Ok((request, upload_budget)) => Ok((request, boundary, upload_budget)),
+        match request
+            .header(CONTENT_LENGTH, body.len())
+            .body(boundary.body(body))
+            .build()
+        {
+            Ok(request) => Ok((request, boundary, upload_budget)),
             Err(error) => {
                 boundary.complete();
-                Err(error)
+                Err(transport_error(error))
             }
         }
     }
@@ -1108,20 +1157,105 @@ impl AnthropicProvider {
         crate::apply_provider_request_headers(request)
     }
 
-    async fn send_request(
+    fn take_or_render_prepared(
         &self,
         request: &TurnRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
-        let prepared = match crate::take_prepared_wire_payload() {
+    ) -> Result<crate::PreparedWire, ProviderError> {
+        Ok(match crate::take_prepared_wire_payload() {
             Some(prepared) => prepared,
             None => crate::PreparedWire {
                 payload: self.request_payload(request)?,
                 history_boundary: None,
                 reply_bindings: crate::PreparedReplyBindings::default(),
             },
-        };
-        let (request, upload, upload_budget) =
-            self.request_body_prepared_for_send(prepared).await?;
+        })
+    }
+
+    fn thinking_binding_route(&self) -> String {
+        format!("{:?}|{}|{}", self.auth_mode, self.api_url, self.model)
+    }
+
+    fn thinking_binding_rejected(&self) -> bool {
+        thinking_binding_rejected_routes()
+            .lock()
+            .is_ok_and(|routes| routes.contains(&self.thinking_binding_route()))
+    }
+
+    async fn send_request(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let prepared = self.take_or_render_prepared(request)?;
+        let built = self.request_body_prepared_for_send(&prepared).await?;
+        drop(prepared);
+        self.execute_prepared_send(built).await
+    }
+
+    /// Sends one turn. When the payload carries the prefix-binding drop
+    /// policy and the endpoint answers 400 rejecting exactly that opt-in
+    /// (e.g. a gateway or route without thinking-binding controls), the route
+    /// is latched as unsupported for this process and the SAME prepared wire
+    /// is resent once without the policy, restoring the pre-policy request.
+    /// Later requests on the route render without it, so the fallback never
+    /// repeats or loops; any other status or 400 is returned unchanged.
+    async fn send_request_with_binding_fallback(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let mut prepared = self.take_or_render_prepared(request)?;
+        if self.thinking_binding_rejected() {
+            strip_thinking_binding_drop(&mut prepared.payload);
+        }
+        if !payload_uses_thinking_binding_drop(&prepared.payload) {
+            let built = self.request_body_prepared_for_send(&prepared).await?;
+            drop(prepared);
+            return self.execute_prepared_send(built).await;
+        }
+        let built = self.request_body_prepared_for_send(&prepared).await?;
+        let response = self.execute_prepared_send(built).await?;
+        if response.status().as_u16() != 400 {
+            return Ok(response);
+        }
+        let request_id = anthropic_request_id(&response);
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = read_error_body_bounded(response).await.map_err(|error| {
+            classify_http_body_read_error(400, retry_after.as_deref(), error)
+                .with_http_metadata(400, request_id.as_deref())
+        })?;
+        if !anthropic_rejects_thinking_binding(&body) {
+            return Err(
+                replay_anthropic_http_error(400, retry_after.as_deref(), &body)
+                    .with_http_metadata(400, request_id.as_deref()),
+            );
+        }
+        if let Ok(mut routes) = thinking_binding_rejected_routes().lock() {
+            routes.insert(self.thinking_binding_route());
+        }
+        tracing::warn!(
+            target: "haider.provider",
+            model = %self.model,
+            auth_mode = ?self.auth_mode,
+            request_id = request_id.as_deref().unwrap_or(""),
+            "Anthropic route rejected the thinking prefix-binding drop policy; resending once without it and disabling it for this route"
+        );
+        strip_thinking_binding_drop(&mut prepared.payload);
+        let built = self.request_body_prepared_for_send(&prepared).await?;
+        drop(prepared);
+        self.execute_prepared_send(built).await
+    }
+
+    async fn execute_prepared_send(
+        &self,
+        (request, upload, upload_budget): (
+            reqwest::Request,
+            crate::RequestUploadBoundary,
+            Duration,
+        ),
+    ) -> Result<reqwest::Response, ProviderError> {
         let route_gating = self.route_gating();
         // The response-open budget covers only the wait after the body
         // producer reaches EOF; a response that opens mid-upload (e.g. an
@@ -1169,16 +1303,11 @@ impl AnthropicProvider {
     ) -> Result<ProviderStream, ProviderError> {
         let native_computer = anthropic_computer_tool_version(&request.model).is_some()
             && request.tools.iter().any(|tool| tool.name == "computer");
-        let response = self.send_request(request).await?;
+        let response = self.send_request_with_binding_fallback(request).await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let request_id = response
-                .headers()
-                .get("request-id")
-                .or_else(|| response.headers().get("x-request-id"))
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
+            let request_id = anthropic_request_id(&response);
             let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
@@ -1210,6 +1339,15 @@ impl AnthropicProvider {
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
+}
+
+fn anthropic_request_id(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("request-id")
+        .or_else(|| response.headers().get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn anthropic_cache_control(ttl: AnthropicCacheTtl) -> serde_json::Value {
@@ -2179,6 +2317,7 @@ mod oauth_cache_tests {
                 stable_prefix_tokens: 4_096,
                 ..PromptCacheMetadata::default()
             }),
+            tool_result_image_projection: Default::default(),
         }
     }
 
@@ -2292,6 +2431,7 @@ mod cache_reuse_tests {
                 stable_prefix_tokens: 2048,
                 ..Default::default()
             }),
+            tool_result_image_projection: Default::default(),
         };
         for turn in 0..3 {
             request.messages[0] = Message::user_text(format!("accepted turn {turn}"));

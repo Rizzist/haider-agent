@@ -4199,6 +4199,13 @@ fn openai_stream_error_prose(detail: &str) -> ProviderError {
     }
 }
 
+/// Stand-in for a native computer screenshot that request-time elision
+/// removed because a newer screenshot superseded it. OpenAI's Responses
+/// contract requires a `computer_screenshot` on every replayed
+/// `computer_call_output`, but only the latest screen needs full fidelity; the
+/// real capture stays durable in CAS. A 16x16 mid-gray PNG (72 bytes).
+pub(crate) const OPENAI_ELIDED_COMPUTER_SCREENSHOT_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAAAAAA6mKC9AAAAD0lEQVR42mNoQAMMI1sAAAUMgAHjM1mKAAAAAElFTkSuQmCC";
+
 fn responses_request_json(
     request: &TurnRequest,
     codex_responses_lite: bool,
@@ -4412,28 +4419,39 @@ fn responses_request_json_neutral_with_boundary(
                                 )));
                             }
                         }
-                        let image = images.last().ok_or_else(|| {
-                            invalid_request(format!(
+                        let image_url = if let Some(image) = images.last() {
+                            if !crate::tool_image_media_type_supported(&image.media_type) {
+                                return Err(invalid_request(format!(
+                                    "tool image {} has unsupported media type",
+                                    image.artifact
+                                )));
+                            }
+                            let data = resolved_attachment(&attachments, image.artifact.as_str())?;
+                            format!("data:{};base64,{data}", image.media_type)
+                        } else if request
+                            .tool_result_image_projection
+                            .elided_all_images(call_id)
+                        {
+                            // Superseded by a newer screenshot and elided from
+                            // this request (typed projection record, never
+                            // inferred from text). The native contract still
+                            // requires an image on every replayed output.
+                            OPENAI_ELIDED_COMPUTER_SCREENSHOT_URL.to_owned()
+                        } else {
+                            return Err(invalid_request(format!(
                                 "OpenAI native computer call `{}` completed without its required updated screenshot",
                                 target.provider_call_id
-                            ))
-                        })?;
-                        if !crate::tool_image_media_type_supported(&image.media_type) {
-                            return Err(invalid_request(format!(
-                                "tool image {} has unsupported media type",
-                                image.artifact
                             )));
-                        }
-                        let data = resolved_attachment(&attachments, image.artifact.as_str())?;
+                        };
                         let screenshot = match target.kind {
                             OpenAiComputerToolKind::Ga => serde_json::json!({
                                 "type": "computer_screenshot",
-                                "image_url": format!("data:{};base64,{data}", image.media_type),
+                                "image_url": image_url,
                                 "detail": "original",
                             }),
                             OpenAiComputerToolKind::Preview => serde_json::json!({
                                 "type": "computer_screenshot",
-                                "image_url": format!("data:{};base64,{data}", image.media_type),
+                                "image_url": image_url,
                             }),
                             OpenAiComputerToolKind::Generic => {
                                 return Err(internal(

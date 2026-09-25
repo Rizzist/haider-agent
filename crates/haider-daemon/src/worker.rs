@@ -171,7 +171,9 @@ use haider_provider::{
     ProviderRequestOrdinal, ResolvedAttachment, apply_tool_result_image_budget,
     canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
 };
-use haider_provider::{Provider, ProviderError, ToolDefinition, TurnRequest};
+use haider_provider::{
+    Provider, ProviderError, ToolDefinition, ToolResultImageProjection, TurnRequest,
+};
 use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
@@ -1551,6 +1553,7 @@ impl ContextCompactor for DaemonContextCompactor {
             covered_messages,
             retained_messages,
             attachments,
+            image_projection,
             latest_compaction_summary_end,
             economy_before,
         } = request;
@@ -1570,21 +1573,26 @@ impl ContextCompactor for DaemonContextCompactor {
         // exceptional case. Its actor projection begins with the prior brief,
         // so rebuild the intent-named original journal fragments instead of
         // ever feeding a summary back into a summary.
-        let (covered_messages, source_attachments) = if latest_compaction_summary_end.is_some() {
-            let mut original_messages = PromptHistoryCompiler::compile_compaction_source(
-                &self.store,
-                self.store.session_id(),
-                self.branch_id.as_ref(),
-                self.agent_id.as_ref(),
-                run_id,
-                intent,
-            )
-            .await?;
-            prepare_compaction_messages(&self.store, &mut original_messages).await?;
-            (original_messages, Vec::new())
-        } else {
-            (covered_messages, attachments)
-        };
+        let (covered_messages, source_attachments, source_image_projection) =
+            if latest_compaction_summary_end.is_some() {
+                let mut original_messages = PromptHistoryCompiler::compile_compaction_source(
+                    &self.store,
+                    self.store.session_id(),
+                    self.branch_id.as_ref(),
+                    self.agent_id.as_ref(),
+                    run_id,
+                    intent,
+                )
+                .await?;
+                prepare_compaction_messages(&self.store, &mut original_messages).await?;
+                (
+                    original_messages,
+                    Vec::new(),
+                    ToolResultImageProjection::default(),
+                )
+            } else {
+                (covered_messages, attachments, image_projection)
+            };
         let recovered_economy = self.store.latest_context_economy().await?;
         let economy_before = recovered_economy
             .as_ref()
@@ -1650,6 +1658,7 @@ impl ContextCompactor for DaemonContextCompactor {
             // detouring through the uncached fallback.
             attachments: source_attachments.clone(),
             cache_metadata: Some(cache_metadata.clone()),
+            tool_result_image_projection: source_image_projection.clone(),
         };
         let projected_input_tokens = estimate_provider_request_input_tokens(
             &request.messages,
@@ -1867,8 +1876,12 @@ impl ContextCompactor for DaemonContextCompactor {
                     });
                 }
                 let artifact_store = self.store.clone();
-                prepare_tool_images_for_text_only_request(&artifact_store, &mut degraded_messages)
-                    .await?;
+                let mut fallback_image_projection = prepare_tool_images_for_text_only_request(
+                    &artifact_store,
+                    &mut degraded_messages,
+                )
+                .await?;
+                fallback_image_projection.merge(&source_image_projection);
                 if let Some(tail) = &self.post_compaction_volatile_tail {
                     degraded_messages.push(Message::user_text(tail.clone()));
                 }
@@ -1888,6 +1901,7 @@ impl ContextCompactor for DaemonContextCompactor {
                     tools: Vec::new(),
                     attachments: Vec::new(),
                     cache_metadata: None,
+                    tool_result_image_projection: fallback_image_projection,
                 };
                 let fallback_projected_input_tokens = estimate_provider_request_input_tokens(
                     &fallback.messages,
@@ -9111,7 +9125,7 @@ async fn start_turn(
         compile_micros = prompt_compile_started.elapsed().as_micros(),
         "prompt history compiled"
     );
-    let attachments = resolve_prompt_attachments(
+    let (attachments, prompt_image_projection) = resolve_prompt_attachments(
         lease,
         &mut messages,
         provider_capabilities.vision,
@@ -9513,6 +9527,7 @@ async fn start_turn(
     // decision into provider-specific behavior. G1: children do NOT retain
     // `todo_write` — the plan surface is root-only (L5).
     config.attachments = attachments;
+    config.prompt_image_projection = prompt_image_projection;
     let run_boundary_guard = Arc::new(DaemonGraphFinalizationGuard {
         store: lease.clone(),
         branch_id: accepted.branch_id.clone(),
@@ -11136,9 +11151,9 @@ async fn resolve_prompt_attachments(
     messages: &mut [Message],
     vision: FeatureResolve,
     pdf_documents: FeatureResolve,
-) -> Result<Vec<ResolvedAttachment>, HaiderError> {
+) -> Result<(Vec<ResolvedAttachment>, ToolResultImageProjection), HaiderError> {
     validate_durable_tool_images(store, messages).await?;
-    apply_tool_result_image_budget(messages);
+    let projection = apply_tool_result_image_budget(messages);
     let mut resolved = Vec::<ResolvedAttachment>::new();
     for message in &mut *messages {
         for block in &mut message.blocks {
@@ -11283,7 +11298,7 @@ async fn resolve_prompt_attachments(
     if vision == FeatureResolve::Unsupported {
         degrade_tool_result_images_to_placeholders(messages);
     }
-    Ok(resolved)
+    Ok((resolved, projection))
 }
 
 async fn validate_durable_tool_images<R>(store: &R, messages: &[Message]) -> Result<(), HaiderError>
@@ -11357,14 +11372,14 @@ where
 async fn prepare_tool_images_for_text_only_request<R>(
     store: &R,
     messages: &mut [Message],
-) -> Result<(), HaiderError>
+) -> Result<ToolResultImageProjection, HaiderError>
 where
     R: haider_core::ArtifactReader + ?Sized,
 {
     validate_durable_tool_images(store, messages).await?;
-    apply_tool_result_image_budget(messages);
+    let projection = apply_tool_result_image_budget(messages);
     degrade_tool_result_images_to_placeholders(messages);
-    Ok(())
+    Ok(projection)
 }
 
 async fn prepare_compaction_messages(

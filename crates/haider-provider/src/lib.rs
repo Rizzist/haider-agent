@@ -1191,7 +1191,9 @@ pub(crate) fn serialize_prepared_json_body(
     serialize_prepared_json_body_ref(&prepared)
 }
 
-fn serialize_prepared_json_body_ref(prepared: &PreparedWire) -> Result<Vec<u8>, ProviderError> {
+pub(crate) fn serialize_prepared_json_body_ref(
+    prepared: &PreparedWire,
+) -> Result<Vec<u8>, ProviderError> {
     let mut writer = CompactJsonVecWriter::new();
     write_json_value_with_replies(&mut writer, &prepared.payload, &prepared.reply_bindings)
         .map_err(|error| {
@@ -1560,8 +1562,13 @@ impl Message {
 /// Every affected tool result receives a bounded, honest text note. The note
 /// names the first omitted artifact and reports any additional count without
 /// allowing an untrusted result vector to grow prompt text without bound.
-pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
-    elide_stale_computer_screenshots(messages);
+///
+/// Returns the typed record of which tool results lost images. Callers carry
+/// it on [`TurnRequest::tool_result_image_projection`]; adapters never infer
+/// it from (untrusted) preview text.
+pub fn apply_tool_result_image_budget(messages: &mut [Message]) -> ToolResultImageProjection {
+    let mut projection = ToolResultImageProjection::default();
+    elide_stale_computer_screenshots(messages, &mut projection);
     let mut retained_count = messages
         .iter()
         .flat_map(|message| &message.blocks)
@@ -1586,7 +1593,10 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
     for message in messages {
         for block in &mut message.blocks {
             let Block::ToolResult {
-                preview, images, ..
+                call_id,
+                preview,
+                images,
+                ..
             } = block
             else {
                 continue;
@@ -1629,7 +1639,81 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
                 omitted_bytes,
                 Some(&first_omitted),
             ));
+            projection.record(call_id, images.is_empty());
         }
+    }
+    projection
+}
+
+/// Typed, request-local record of the tool results whose images
+/// [`apply_tool_result_image_budget`] removed: stale computer screenshots and
+/// the oldest-first turn budget. Capability degradation is not recorded: it
+/// applies identically from a result's first request and never rewrites an
+/// already-sent prefix.
+///
+/// Only the projection itself creates entries, so no tool output or page
+/// text can set it. It is recomputed from durable history on every request
+/// (the daemon's prompt compile and each actor request merge their records),
+/// and both elisions only grow as newer images arrive, so once non-empty for
+/// a conversation it stays non-empty, including after a restart or resume.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultImageProjection {
+    /// Tool results that lost at least one image, keyed by call id.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    elided: std::collections::BTreeMap<String, ToolResultImageElision>,
+}
+
+/// How much of one tool result's image list the projection removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultImageElision {
+    /// Some images remain; the oldest were dropped by the turn budget.
+    Partial,
+    /// Every image was removed from this result.
+    All,
+}
+
+impl ToolResultImageProjection {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.elided.is_empty()
+    }
+
+    /// Whether the projection rewrote an earlier tool result, invalidating
+    /// signed reasoning bound to the previously sent prefix.
+    #[must_use]
+    pub fn rewrites_earlier_tool_results(&self) -> bool {
+        !self.elided.is_empty()
+    }
+
+    /// Whether the projection removed every image of this tool result.
+    #[must_use]
+    pub fn elided_all_images(&self, call_id: &str) -> bool {
+        self.elided.get(call_id) == Some(&ToolResultImageElision::All)
+    }
+
+    /// Unions a record computed over an earlier projection of the same
+    /// history (e.g. the daemon's prompt compile) into this one.
+    pub fn merge(&mut self, other: &Self) {
+        for (call_id, elision) in &other.elided {
+            self.record(call_id, *elision == ToolResultImageElision::All);
+        }
+    }
+
+    fn record(&mut self, call_id: &str, all: bool) {
+        let elision = if all {
+            ToolResultImageElision::All
+        } else {
+            ToolResultImageElision::Partial
+        };
+        self.elided
+            .entry(call_id.to_owned())
+            .and_modify(|existing| {
+                if elision == ToolResultImageElision::All {
+                    *existing = elision;
+                }
+            })
+            .or_insert(elision);
     }
 }
 
@@ -1676,9 +1760,11 @@ pub fn has_stale_computer_screenshots(messages: &[Message]) -> bool {
 /// subsequent coordinate decisions. Older captures remain durable and
 /// retrievable through their artifact refs, but do not grow every later
 /// provider request. On prefix-binding Anthropic models this rewrite also
-/// invalidates later signed thinking; see
-/// [`request_rewrites_earlier_tool_result_images`].
-fn elide_stale_computer_screenshots(messages: &mut [Message]) {
+/// invalidates later signed thinking; see [`ToolResultImageProjection`].
+fn elide_stale_computer_screenshots(
+    messages: &mut [Message],
+    projection: &mut ToolResultImageProjection,
+) {
     let computer_calls = computer_call_ids(messages);
     let mut retained_latest = false;
     for message in messages.iter_mut().rev() {
@@ -1705,6 +1791,7 @@ fn elide_stale_computer_screenshots(messages: &mut [Message]) {
                 ImageElisionScope::ComputerScreenshotHistory,
                 &removed,
             );
+            projection.record(call_id, true);
         }
     }
 }
@@ -1735,39 +1822,6 @@ pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
             }
         }
     }
-}
-
-/// Whether this provider-bound clone carries a request-time image elision
-/// that rewrote an EARLIER tool result: stale computer screenshots or the
-/// oldest-first turn image budget. Both are recomputed from durable history
-/// on every request and only grow as newer images arrive, so once true for a
-/// conversation it stays true on every later request, including after a
-/// daemon restart or resume. Capability degradation is excluded: it applies
-/// identically from a result's first request and never changes a prefix.
-///
-/// A tool result whose own text happens to contain an identical marker line
-/// only makes this report `true`; callers must use it solely to opt into a
-/// strictly more tolerant provider policy.
-pub(crate) fn request_rewrites_earlier_tool_result_images(messages: &[Message]) -> bool {
-    messages
-        .iter()
-        .flat_map(|message| &message.blocks)
-        .filter_map(|block| match block {
-            Block::ToolResult { preview, .. } => Some(preview),
-            _ => None,
-        })
-        .flat_map(|preview| preview.lines())
-        .filter(|line| line.starts_with("{\"haider_elision_v1\""))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .any(|marker| {
-            marker
-                .pointer("/haider_elision_v1/scope")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|scope| {
-                    scope == ImageElisionScope::ComputerScreenshotHistory.as_str()
-                        || scope == ImageElisionScope::TurnBudget.as_str()
-                })
-        })
 }
 
 /// Why a provider-bound clone lost tool-result images. The scope string is
@@ -2027,6 +2081,11 @@ pub struct TurnRequest {
     /// Ephemeral cache-boundary metadata. Absent preserves the exact CM1 wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metadata: Option<PromptCacheMetadata>,
+    /// Typed record of request-time tool-result image elision in `messages`
+    /// (see [`apply_tool_result_image_budget`]). Empty preserves the exact
+    /// prior wire.
+    #[serde(default, skip_serializing_if = "ToolResultImageProjection::is_empty")]
+    pub tool_result_image_projection: ToolResultImageProjection,
 }
 
 pub(crate) struct StagedAttachmentMove {
