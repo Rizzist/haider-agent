@@ -10,9 +10,9 @@ use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
 
 /// Prefix of account-scoped keys. `v2` (lane 973-catalog-accuracy, repair 2)
 /// replaced the unreleased alias-only `account:<len>:<provider>:<alias>`
-/// form; those rows and pre-973 provider-only authenticated rows are left on
-/// disk unread.
-const ACCOUNT_SCOPED_PREFIX: &str = "account-v2:";
+/// form; those rows and pre-973 provider-only authenticated rows are unread
+/// and removed by the catalog prune on startup or account mutation.
+pub(crate) const ACCOUNT_SCOPED_PREFIX: &str = "account-v2:";
 
 /// A `provider_models` row key. Construct it only through [`Self::public`]
 /// or [`Self::for_account`] so every reader and writer derives it the same way.

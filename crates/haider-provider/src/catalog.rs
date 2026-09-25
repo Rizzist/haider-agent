@@ -1,8 +1,8 @@
 //! Model discovery from the PROVIDERS' OWN sources (W5e-2).
 //!
-//! The owner requirement is that model choice never comes from a hardcoded
-//! slug table: it comes from the same place the vendors' own CLIs get it,
-//! authorized with the subscription credentials the vault already holds.
+//! Remote discovery is preferred. Subscription credentials may be allowed to
+//! run turns while their `/models` request is forbidden, so a small maintained
+//! static catalog keeps those providers usable on a fresh profile.
 //!
 //! - **OpenAI subscription**: `GET {OPENAI_SUBSCRIPTION_BASE_URL}/models`,
 //!   the endpoint the installed codex CLI uses
@@ -15,10 +15,8 @@
 //!   with the OAuth bearer and the same beta headers W5b.2 already proves
 //!   work for inference.
 //!
-//! DISCOVERY IS NEVER SYNTHESIZED. When a provider will not serve a list,
-//! [`CatalogError::Unavailable`] is returned so the caller can fall back to
-//! its last-known cache or say "unavailable" — this module never invents a
-//! model that the provider did not name.
+//! Discovery never synthesizes a successful response. The maintained rows
+//! live in `subscription_catalog`; the daemon registry merges the two.
 //!
 //! Requests use fixed origins and the same W5a discipline as the token
 //! endpoints: resolve-validate-pin through [`FixedOriginGuard`], proxies
@@ -123,6 +121,13 @@ pub enum CatalogError {
     Empty,
 }
 
+/// Whether a [`CatalogError::Unavailable`] reason records a 403 answer to a
+/// fixed-origin model-list request.
+#[must_use]
+pub fn model_list_forbidden(reason: &str) -> bool {
+    reason.contains("(403)")
+}
+
 impl std::fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -162,8 +167,9 @@ pub enum CatalogSource {
     XaiApi,
 }
 
-/// Release-owned catalog taxonomy. Remote definitions cannot contain a
-/// fallback list. Offline model IDs are the catalog itself.
+/// Release-owned catalog taxonomy. Offline IDs are authoritative. The
+/// subscription fallback lives in `subscription_catalog` so discovery stays
+/// enabled for those providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCatalogDefinition {
     Offline { models: &'static [&'static str] },

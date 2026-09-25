@@ -49,6 +49,7 @@ fn windowed_summary(
         model_details: entries
             .iter()
             .map(|(slug, window)| haider_rpc::ModelDetailWire {
+                source: None,
                 name: (*slug).to_owned(),
                 display_name: None,
                 context_window: *window,

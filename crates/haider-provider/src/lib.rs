@@ -27,6 +27,7 @@ mod effort_tests;
 mod error_detail;
 mod gemini;
 mod idle;
+mod model_limits;
 pub use idle::{ProviderIdleDeadline, ProviderIdleTimeout};
 #[cfg(test)]
 mod gemini_tests;
@@ -40,6 +41,9 @@ mod pricing;
 pub mod prompt_cache_fake;
 #[cfg(test)]
 mod reply_binding_tests;
+mod subscription_catalog;
+#[cfg(test)]
+mod subscription_catalog_tests;
 mod usage;
 mod webfetch;
 #[cfg(test)]
@@ -1226,8 +1230,8 @@ pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
     PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition, catalog_request_url,
     compatible_model_id_is_display_safe, discover_models, discover_models_with_resolver,
-    model_servable_by_endpoint, openai_compatible_catalog_endpoint, parse_catalog, pickable,
-    provider_catalog_definition,
+    model_list_forbidden, model_servable_by_endpoint, openai_compatible_catalog_endpoint,
+    parse_catalog, pickable, provider_catalog_definition,
 };
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
@@ -1240,6 +1244,7 @@ pub use gemini::{
     GeminiTransportConfig, gemini_http_client_build_count, gemini_model_http_client_build_count,
     replay_gemini_http_error, replay_gemini_sse, replay_gemini_sse_for_request,
 };
+pub use model_limits::{StaticModelLimits, UNKNOWN_OUTPUT_LIMIT, static_model_limits};
 pub use openai::{
     CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, GROK_OAUTH_BASE_URL,
     GROK_OAUTH_PROVIDER_NAME, GROK_SHELL_CLIENT_IDENTIFIER, GROK_SHELL_CLIENT_MODE,
@@ -1268,6 +1273,9 @@ pub use pricing::{
     estimate_cache_input_costs_for, estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd,
     estimate_chunk_cost_usd_for, estimate_normalized_usage_cost_usd,
     estimate_normalized_usage_cost_usd_for, model_rate,
+};
+pub use subscription_catalog::{
+    has_subscription_static_catalog, subscription_static_model_ids, subscription_static_models,
 };
 pub use usage::{
     ANTHROPIC_OAUTH_USAGE_URL, ANTHROPIC_OAUTH_USAGE_USER_AGENT, KIMI_OAUTH_USAGE_URL,

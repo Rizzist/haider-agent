@@ -28,18 +28,153 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "authenticated",
-      "default_model": null,
+      "default_model": "claude-fable-5-1",
       "enabled": true,
       "endpoint": "https://api.anthropic.com",
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "static"
       },
       "inventory_age": "<volatile>",
-      "models": [],
+      "models": [
+        {
+          "context_window": 1000000,
+          "default_effort": null,
+          "model": "claude-fable-5-1",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": null,
+          "model": "claude-opus-5-5",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": "high",
+          "model": "claude-sonnet-5",
+          "source": "static",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 200000,
+          "default_effort": null,
+          "model": "claude-haiku-4-5-20251001",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": "high",
+          "model": "claude-opus-5",
+          "source": "static",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [
+            "fast"
+          ],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": "high",
+          "model": "claude-fable-5",
+          "source": "static",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": "high",
+          "model": "claude-opus-4-8",
+          "source": "static",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [
+            "fast"
+          ],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": "high",
+          "model": "claude-opus-4-7",
+          "source": "static",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": "high",
+          "model": "claude-opus-4-6",
+          "source": "static",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": "high",
+          "model": "claude-sonnet-4-6",
+          "source": "static",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
       "provider": "anthropic-oauth"
     },
     {
@@ -65,6 +200,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "anthropic.claude-fable-5",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -79,6 +215,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "anthropic.claude-opus-5",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -93,6 +230,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "anthropic.claude-opus-4-8",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -107,6 +245,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "anthropic.claude-opus-4-7",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -121,6 +260,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "anthropic.claude-sonnet-5",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -135,6 +275,7 @@
           "context_window": null,
           "default_effort": null,
           "model": "anthropic.claude-haiku-4-5",
+          "source": "configured",
           "supported_efforts": [],
           "supported_speeds": [],
           "supports_thinking_type": null
@@ -212,18 +353,46 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "authenticated",
-      "default_model": null,
+      "default_model": "grok-4.6",
       "enabled": true,
       "endpoint": "https://cli-chat-proxy.grok.com/v1",
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "static"
       },
       "inventory_age": "<volatile>",
-      "models": [],
+      "models": [
+        {
+          "context_window": 500000,
+          "default_effort": null,
+          "model": "grok-4.6",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 500000,
+          "default_effort": null,
+          "model": "grok-4.5",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": null,
+          "model": "grok-4.3",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
       "provider": "grok-oauth"
     },
     {
@@ -233,18 +402,28 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "public",
-      "default_model": null,
+      "default_model": "deepseek-v4-flash",
       "enabled": true,
       "endpoint": "https://haidercode.ai/v1",
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "static"
       },
       "inventory_age": "<volatile>",
-      "models": [],
+      "models": [
+        {
+          "context_window": 128000,
+          "default_effort": null,
+          "model": "deepseek-v4-flash",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
       "provider": "haider-code"
     },
     {
@@ -254,18 +433,55 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "authenticated",
-      "default_model": null,
+      "default_model": "kimi-for-coding",
       "enabled": true,
       "endpoint": "https://api.kimi.com/coding/v1",
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "static"
       },
       "inventory_age": "<volatile>",
-      "models": [],
+      "models": [
+        {
+          "context_window": 1048576,
+          "default_effort": null,
+          "model": "kimi-for-coding",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 262144,
+          "default_effort": null,
+          "model": "k3",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 262144,
+          "default_effort": null,
+          "model": "k3-256k",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 262144,
+          "default_effort": null,
+          "model": "kimi-for-coding-highspeed",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
       "provider": "kimi-oauth"
     },
     {
@@ -317,18 +533,73 @@
       ],
       "auth_state": "missing",
       "availability": "unavailable",
-      "availability_reason": "provider model inventory is unavailable",
+      "availability_reason": "provider has no credential",
       "catalog": "authenticated",
-      "default_model": null,
+      "default_model": "gpt-6-astra",
       "enabled": true,
       "endpoint": "https://chatgpt.com/backend-api/codex/responses",
       "fetched_at": "<volatile>",
       "has_credential": false,
       "inventory": {
-        "state": "never_fetched"
+        "state": "static"
       },
       "inventory_age": "<volatile>",
-      "models": [],
+      "models": [
+        {
+          "context_window": 1050000,
+          "default_effort": null,
+          "model": "gpt-6-astra",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1050000,
+          "default_effort": null,
+          "model": "gpt-6-sol",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1050000,
+          "default_effort": null,
+          "model": "gpt-6-luna",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1050000,
+          "default_effort": null,
+          "model": "gpt-5.6-sol",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1050000,
+          "default_effort": null,
+          "model": "gpt-5.6-terra",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1050000,
+          "default_effort": null,
+          "model": "gpt-5.6-luna",
+          "source": "static",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
       "provider": "openai-oauth"
     },
     {
@@ -354,6 +625,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "claude-fable-5",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -368,6 +640,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "claude-opus-5",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -382,6 +655,7 @@
           "context_window": null,
           "default_effort": "high",
           "model": "claude-sonnet-5",
+          "source": "configured",
           "supported_efforts": [
             "low",
             "medium",
@@ -396,6 +670,7 @@
           "context_window": null,
           "default_effort": null,
           "model": "claude-sonnet-4-5@20250929",
+          "source": "configured",
           "supported_efforts": [],
           "supported_speeds": [],
           "supports_thinking_type": null
@@ -404,6 +679,7 @@
           "context_window": null,
           "default_effort": null,
           "model": "claude-haiku-4-5@20251001",
+          "source": "configured",
           "supported_efforts": [],
           "supported_speeds": [],
           "supports_thinking_type": null

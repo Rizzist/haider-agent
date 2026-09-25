@@ -1994,6 +1994,20 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.provider_models(&provider))).await
     }
 
+    pub async fn prune_provider_model_caches(
+        &self,
+        keep_account_keys: Vec<String>,
+        authenticated_providers: Vec<String>,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.prune_provider_model_caches(&keep_account_keys, &authenticated_providers)
+            })
+        })
+        .await
+    }
+
     /// Replaces a provider's durable last-known model catalog.
     pub async fn put_provider_models(
         &self,

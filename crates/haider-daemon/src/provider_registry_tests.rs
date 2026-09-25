@@ -62,6 +62,145 @@ fn model_source(
     source
 }
 
+#[test]
+fn fresh_subscription_and_failed_catalog_keep_static_rows_selectable() {
+    let source = model_source([]);
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from(["anthropic-oauth".into()]),
+            "unused",
+        ),
+        source.clone(),
+    )
+    .expect("registry");
+    let fresh = registry
+        .summary("anthropic-oauth", &|_| true)
+        .expect("summary");
+    assert_eq!(fresh.inventory, haider_rpc::ModelInventoryWire::Static);
+    assert_eq!(
+        fresh.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert_eq!(fresh.default_model.as_deref(), Some("claude-fable-5-1"));
+    assert!(
+        fresh
+            .model_details
+            .iter()
+            .all(|row| row.source == Some(haider_rpc::ModelDetailSourceWire::Static))
+    );
+    assert!(
+        fresh
+            .model_details
+            .iter()
+            .find(|row| row.name == "claude-fable-5-1")
+            .and_then(|row| row.context_window)
+            .is_some()
+    );
+
+    source.unavailable(
+        "anthropic-oauth",
+        "provider does not serve a model list to this credential (403)".into(),
+    );
+    let fallback = registry
+        .summary("anthropic-oauth", &|_| true)
+        .expect("fallback");
+    assert!(matches!(
+        fallback.inventory,
+        haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ));
+    assert_eq!(
+        fallback.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert_eq!(fallback.models, fresh.models);
+    assert_eq!(
+        registry
+            .summary("anthropic-oauth", &|_| false)
+            .expect("no credential")
+            .availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable
+    );
+
+    source.replace(
+        "anthropic-oauth".into(),
+        ProviderInventory::Fetched {
+            models: vec![
+                discovered_with_context("claude-fable-5-1", true, None, Some(123_456)),
+                discovered("claude-new", true, None),
+            ],
+            fetched_at_ms: 1,
+        },
+    );
+    let merged = registry
+        .summary("anthropic-oauth", &|_| true)
+        .expect("merged");
+    let overridden = merged
+        .model_details
+        .iter()
+        .find(|row| row.name == "claude-fable-5-1")
+        .expect("overridden");
+    assert_eq!(overridden.context_window, Some(123_456));
+    assert_eq!(
+        overridden.source,
+        Some(haider_rpc::ModelDetailSourceWire::Remote)
+    );
+    assert!(
+        merged
+            .model_details
+            .iter()
+            .any(|row| row.name == "claude-new"
+                && row.source == Some(haider_rpc::ModelDetailSourceWire::Remote))
+    );
+    assert!(
+        merged
+            .model_details
+            .iter()
+            .any(|row| row.name == "claude-opus-5"
+                && row.source == Some(haider_rpc::ModelDetailSourceWire::Static))
+    );
+}
+
+#[test]
+fn each_subscription_builtin_has_selectable_rows_before_discovery() {
+    for provider in [
+        "anthropic-oauth",
+        "openai-oauth",
+        "kimi-oauth",
+        "grok-oauth",
+        "haider-code",
+    ] {
+        let registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            initial_provider_profiles(
+                &std::collections::BTreeSet::from([provider.into()]),
+                "unused",
+            ),
+            model_source([]),
+        )
+        .expect("registry");
+        let summary = registry.summary(provider, &|_| true).expect("summary");
+        assert_eq!(
+            summary.availability,
+            ProviderAvailabilityWire::Available,
+            "{provider}"
+        );
+        assert_eq!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::Static,
+            "{provider}"
+        );
+        assert!(!summary.models.is_empty(), "{provider}");
+        assert!(
+            summary
+                .model_details
+                .iter()
+                .all(|row| row.source == Some(haider_rpc::ModelDetailSourceWire::Static)),
+            "{provider}"
+        );
+    }
+}
+
 fn resilience_profiles() -> Vec<ProviderProfileV1> {
     initial_provider_profiles(
         &std::collections::BTreeSet::from([
@@ -1044,6 +1183,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
         summary.model_details,
         vec![
             ModelDetailWire {
+                source: Some(haider_rpc::ModelDetailSourceWire::Remote),
                 name: "frontier-a".to_owned(),
                 display_name: Some("Fixture frontier-a".to_owned()),
                 context_window: Some(100_000),
@@ -1054,6 +1194,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: Some(haider_rpc::ModelDetailSourceWire::Remote),
                 name: "frontier-b".to_owned(),
                 display_name: Some("Fixture frontier-b".to_owned()),
                 context_window: Some(200_000),
@@ -1087,14 +1228,10 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
     );
 }
 
-/// An installed adapter without cache provenance is not a model inventory.
-///
-/// MUTATION CHECK: delete the `!discovered_models.is_empty()` conjunct from
-/// `provider_summary`'s `available` expression. Expected runtime failure: the
-/// built-in row below reports `Available` despite having no cached models.
-/// Verified by revert on 2026-07-30.
+/// A static subscription catalog may be visible before login, but it cannot
+/// make the provider available without a healthy credential.
 #[test]
-fn builtin_without_cached_models_is_unknown_not_available_with_guesses() {
+fn builtin_static_models_stay_unavailable_without_credential() {
     let registry = ProviderRegistry::new(
         MemoryProviderStore::default(),
         initial_provider_profiles(
@@ -1110,12 +1247,12 @@ fn builtin_without_cached_models_is_unknown_not_available_with_guesses() {
         .into_iter()
         .next()
         .expect("summary");
-    assert!(summary.models.is_empty());
-    assert_eq!(summary.default_model, None);
+    assert!(summary.models.contains(&"gpt-6-sol".to_owned()));
+    assert_eq!(summary.inventory, haider_rpc::ModelInventoryWire::Static);
     assert_eq!(summary.availability, ProviderAvailabilityWire::Unavailable);
     assert_eq!(
         summary.availability_reason.as_deref(),
-        Some("provider model inventory is unavailable")
+        Some("provider has no credential")
     );
 }
 
@@ -1141,9 +1278,40 @@ fn openai_subscription_summary_excludes_incompatible_and_legacy_cached_rows() {
     let summary = registry
         .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
         .expect("OpenAI summary");
-    assert_eq!(summary.models, vec!["lite-ready"]);
-    assert_eq!(summary.model_details.len(), 1);
-    assert_eq!(summary.default_model, None);
+    assert!(summary.models.contains(&"lite-ready".to_owned()));
+    assert!(!summary.models.contains(&"standard-only".to_owned()));
+    assert!(!summary.models.contains(&"legacy-row".to_owned()));
+    assert!(!summary.models.contains(&"gpt-5.5".to_owned()));
+    assert_eq!(summary.model_details.len(), 7, "six static plus one remote");
+    assert_eq!(summary.default_model.as_deref(), Some("gpt-6-astra"));
+}
+
+#[test]
+fn openai_static_lite_capability_survives_undeclared_remote_metadata() {
+    let mut explicit_no = discovered("gpt-6-sol", true, Some(0));
+    explicit_no.use_responses_lite = Some(false);
+    let undeclared = discovered("gpt-6-luna", true, Some(1));
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([OPENAI_OAUTH_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        model_source([(OPENAI_OAUTH_PROVIDER_NAME, vec![explicit_no, undeclared])]),
+    )
+    .expect("registry");
+    let summary = registry
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("summary");
+    assert!(
+        !summary.models.contains(&"gpt-6-sol".to_owned()),
+        "explicit false wins"
+    );
+    assert!(
+        summary.models.contains(&"gpt-6-luna".to_owned()),
+        "static known capability fills missing flag"
+    );
+    assert!(!summary.models.contains(&"gpt-5.5".to_owned()));
 }
 
 /// MUTATION CHECK: register Kimi as a generic/custom provider, API-key
@@ -1170,7 +1338,7 @@ fn kimi_oauth_is_a_builtin_chat_completions_subscription_provider() {
     )
     .expect("Kimi provider registry");
     let summary = registry
-        .summaries(&|_| false)
+        .summaries(&|_| true)
         .into_iter()
         .next()
         .expect("Kimi summary");
@@ -1182,8 +1350,17 @@ fn kimi_oauth_is_a_builtin_chat_completions_subscription_provider() {
     assert_eq!(summary.endpoint.as_deref(), Some(KIMI_OAUTH_BASE_URL));
     assert_eq!(summary.auth_methods, vec![AuthMethod::OAuth]);
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
-    assert_eq!(summary.models, vec!["kimi-coding-a"]);
-    assert_eq!(summary.model_details[0].context_window, Some(262_144));
+    assert!(summary.models.contains(&"kimi-coding-a".to_owned()));
+    assert!(summary.models.contains(&"kimi-for-coding".to_owned()));
+    assert_eq!(
+        summary
+            .model_details
+            .iter()
+            .find(|row| row.name == "kimi-coding-a")
+            .expect("remote row")
+            .context_window,
+        Some(262_144)
+    );
 }
 
 /// WH1 — `deepseek` is release-owned Chat Completions at the fixed vendor
@@ -1239,8 +1416,8 @@ fn wh1_deepseek_registry_is_builtin_chat_completions_api_key() {
     );
 }
 
-/// Public catalogs never manufacture models on a fresh install. The auth
-/// requirement below belongs to inference, not catalog discovery.
+/// The public catalog has a conservative release snapshot for offline startup.
+/// Authentication still belongs to inference, not catalog discovery.
 #[test]
 fn haider_code_registry_is_builtin_chat_completions_api_key() {
     let registry = ProviderRegistry::new(
@@ -1270,19 +1447,15 @@ fn haider_code_registry_is_builtin_chat_completions_api_key() {
     );
     assert_eq!(summary.endpoint.as_deref(), Some(HAIDER_CODE_BASE_URL));
     assert_eq!(summary.auth_methods, vec![AuthMethod::ApiKey]);
-    assert!(summary.models.is_empty());
-    assert_eq!(
-        summary.inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
-    );
-    assert!(summary.inventory.needs_refresh());
-    assert!(summary.default_model.is_none());
+    assert!(summary.models.contains(&"deepseek-v4-flash".to_owned()));
+    assert_eq!(summary.inventory, haider_rpc::ModelInventoryWire::Static);
+    assert_eq!(summary.default_model.as_deref(), Some("deepseek-v4-flash"));
     assert!(
         registry
             .validate_default_model(HAIDER_CODE_PROVIDER_NAME, "Go")
             .is_err()
     );
-    assert_eq!(summary.availability, ProviderAvailabilityWire::Unavailable);
+    assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
     assert!(profile.default_model.is_none());
 }
 
@@ -1325,22 +1498,66 @@ fn xai_and_grok_oauth_registry_profiles_pin_lane_boundaries() {
     );
     assert_eq!(grok.endpoint.as_deref(), Some(GROK_OAUTH_BASE_URL));
     assert_eq!(grok.auth_methods, vec![AuthMethod::OAuth]);
-    // MUTATION CHECK (kimi law): seed an inventory here again. Expected
-    // RUNTIME failure — a seeded summary suppresses the W5f-2d
-    // auto-discovery trigger, so the CLI lane's live proxy catalog would
-    // never be fetched. The Grok library comes from the Grok CLI's own
-    // catalog endpoint, never from release-pinned constants.
+    assert!(grok.models.contains(&"grok-4.6".to_owned()));
     assert!(
-        grok.models.is_empty(),
-        "grok-oauth boots inventory-empty; discovery is the only truth"
+        grok.model_details
+            .iter()
+            .all(|detail| detail.source == Some(haider_rpc::ModelDetailSourceWire::Static))
     );
-    assert!(grok.model_details.is_empty());
-    // Kimi parity: a discovery-only lane is honestly UNAVAILABLE until its
-    // authenticated catalog speaks — never a fake seeded Available.
-    assert_eq!(grok.availability, ProviderAvailabilityWire::Unavailable);
-    assert_eq!(
-        grok.availability_reason.as_deref(),
-        Some("provider model inventory is unavailable")
+    assert_eq!(grok.inventory, haider_rpc::ModelInventoryWire::Static);
+    assert_eq!(grok.availability, ProviderAvailabilityWire::Available);
+}
+
+/// 973: replacing an account clears the previous account's fetched rows,
+/// leaving the inventory unknown while the profile keeps its default. A
+/// configure that re-submits the UNCHANGED default must not be refused; a NEW
+/// default outside the stated inventory still is.
+/// MUTATION CHECK: drop the unchanged-default carve-out in
+/// `configured_profiles`; the re-submission below fails with "default model
+/// `discovered-default` is not in the configured model inventory".
+#[test]
+fn unknown_inventory_keeps_an_unchanged_default_but_refuses_a_new_one() {
+    let store = MemoryProviderStore::default();
+    let source = model_source([]);
+    let mut registry =
+        ProviderRegistry::new(store, Vec::new(), source).expect("empty provider registry");
+    let input = |models: Vec<String>, default_model: &str| ProviderConfigureInput {
+        provider: "custom-reset".to_owned(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("http://127.0.0.1:18124/v1".to_owned()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models,
+        default_model: Some(default_model.to_owned()),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        trust: None,
+    };
+    registry
+        .configure(input(
+            vec!["discovered-default".to_owned()],
+            "discovered-default",
+        ))
+        .expect("create on the stated inventory");
+    registry.replace_discovered_models(
+        "custom-reset".to_owned(),
+        vec![discovered("discovered-default", true, None)],
+        1,
+    );
+    // The account change clears the fetched rows; the default survives.
+    registry.clear_discovered_models("custom-reset");
+    let kept = registry
+        .configure(input(Vec::new(), "discovered-default"))
+        .expect("an unchanged default is not re-validated against an unknown inventory");
+    assert_eq!(kept.default_model.as_deref(), Some("discovered-default"));
+    let error = registry
+        .configure(input(Vec::new(), "invented-default"))
+        .expect_err("a new default outside the stated inventory is refused");
+    assert!(
+        error
+            .message
+            .contains("is not in the configured model inventory")
     );
 }
 
@@ -1854,13 +2071,10 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     .expect("registry");
     let current = || {
         registry
-            .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
+            .summary(HAIDER_CODE_PROVIDER_NAME, &|_| true)
             .expect("summary")
     };
-    assert_eq!(
-        current().inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
-    );
+    assert_eq!(current().inventory, haider_rpc::ModelInventoryWire::Static);
     source.unavailable(HAIDER_CODE_PROVIDER_NAME, "catalog transport failed".into());
     let unavailable = current();
     assert!(matches!(
@@ -1869,13 +2083,13 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     ));
     assert_eq!(
         unavailable.availability,
-        haider_rpc::ProviderAvailabilityWire::Unavailable
+        haider_rpc::ProviderAvailabilityWire::Available
     );
+    assert_eq!(unavailable.availability_reason, None);
     assert_eq!(
-        unavailable.availability_reason.as_deref(),
-        Some("catalog transport failed")
+        unavailable.default_model.as_deref(),
+        Some("deepseek-v4-flash")
     );
-    assert!(unavailable.default_model.is_none());
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
@@ -1919,12 +2133,9 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     assert_eq!(stale.models, ["deepseek-v4-flash"]);
     assert_eq!(
         stale.availability,
-        haider_rpc::ProviderAvailabilityWire::Unavailable
+        haider_rpc::ProviderAvailabilityWire::Available
     );
-    assert_eq!(
-        stale.availability_reason.as_deref(),
-        Some("temporary outage")
-    );
+    assert_eq!(stale.availability_reason, None);
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
@@ -1937,7 +2148,10 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
         haider_rpc::ModelInventoryWire::Fetched { .. }
     ));
     assert!(!current().inventory.needs_refresh());
-    assert!(current().default_model.is_none());
+    assert_eq!(
+        current().default_model.as_deref(),
+        Some("deepseek-v4-flash")
+    );
     assert!(
         registry
             .set_default_model(HAIDER_CODE_PROVIDER_NAME, "Go")
@@ -1962,6 +2176,6 @@ fn upgrade_removes_persisted_public_seed_without_creating_aliases() {
             .summary(HAIDER_CODE_PROVIDER_NAME, &|_| true)
             .expect("summary")
             .inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
+        haider_rpc::ModelInventoryWire::Static
     );
 }

@@ -122,14 +122,15 @@ fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relog
     );
     let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
     clear_catalogs_after_account_change(&before, &accounts, &providers, &mut pending);
+    let models = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("summary")
+        .models;
     assert!(
-        providers
-            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
-            .expect("summary")
-            .models
-            .is_empty(),
-        "B must not see A's live inventory"
+        !models.contains(&"a-only".to_owned()),
+        "B must not see A's fetched row"
     );
+    assert_eq!(models.len(), 6, "provider-level static rows remain visible");
     assert_eq!(
         pending.next_ready(&HashSet::new()).as_deref(),
         Some(OPENAI_OAUTH_PROVIDER_NAME)
@@ -191,6 +192,59 @@ pub(super) fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
     }
     let store: Box<dyn StoreLike> = Box::new(Ephemeral(StdMutex::new(Vec::new())));
     AccountStore::new(store).unwrap_or_else(|error| panic!("accounts: {error:?}"))
+}
+
+#[test]
+fn subscription_availability_tracks_active_credential_health() {
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("subscription-health");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("add fixture credential");
+    assert!(provider_credential_ready_for_summary(&accounts)(
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+    ));
+    accounts
+        .set_status(&alias, CredentialStatus::Limited { until_ms: u64::MAX })
+        .expect("rate-limit credential");
+    assert!(
+        provider_credential_ready_for_summary(&accounts)(ANTHROPIC_OAUTH_PROVIDER_NAME),
+        "a temporary quota window keeps the subscription selectable"
+    );
+    accounts
+        .set_status(&alias, CredentialStatus::Expired)
+        .expect("expire credential");
+    assert!(!provider_credential_ready_for_summary(&accounts)(
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+    ));
+    accounts
+        .add(CredentialDescriptor {
+            alias: CredentialAlias::new("offline-descriptor"),
+            provider: BEDROCK_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "offline fixture".into(),
+            status: CredentialStatus::Expired,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("add offline fixture");
+    assert!(provider_credential_ready_for_summary(&accounts)(
+        BEDROCK_PROVIDER_NAME
+    ));
 }
 
 #[test]
@@ -618,12 +672,13 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
             .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
             .expect("summary");
         assert!(
-            summary.models.is_empty(),
+            !summary.models.contains(&previous.to_owned()),
             "{previous} must disappear at the switch boundary"
         );
+        assert_eq!(summary.models.len(), 6, "only static Lite rows remain");
         assert!(matches!(
             summary.inventory,
-            haider_rpc::ModelInventoryWire::NeverFetched
+            haider_rpc::ModelInventoryWire::Static
         ));
         assert_eq!(
             pending.next_ready(&HashSet::new()).as_deref(),
@@ -644,13 +699,291 @@ async fn account_switch_a_b_a_never_projects_the_previous_accounts_catalog() {
         vec![row("a-refetched")],
         3,
     );
-    assert_eq!(
+    let models = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("A summary after refetch")
+        .models;
+    assert!(models.contains(&"a-refetched".to_owned()));
+    assert_eq!(models.len(), 7);
+}
+
+#[tokio::test]
+async fn new_active_alias_clears_fetched_rows_but_inactive_replacement_does_not() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let providers = test_provider_registry();
+    let mut accounts = memory_accounts();
+    let descriptor = |alias: &str, identity: &str, active: bool| CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: identity.into(),
+        status: CredentialStatus::Ok,
+        active,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let row = |slug: &str| DiscoveredModel {
+        slug: slug.into(),
+        display_name: slug.into(),
+        context_window: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: Some(true),
+        extensions: None,
+    };
+    accounts
+        .add(descriptor("a", "identity-a", true))
+        .expect("A");
+    accounts
+        .add(descriptor("retired", "old", false))
+        .expect("retired");
+    providers.replace_discovered_models(OPENAI_OAUTH_PROVIDER_NAME.into(), vec![row("a-only")], 1);
+    let mut pending = AutomaticCatalogDiscoveryQueue::new(true);
+
+    let before = accounts.list().to_vec();
+    accounts
+        .replace(descriptor("retired", "new", false))
+        .expect("replace inactive");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    assert!(
         providers
             .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
-            .expect("A summary after refetch")
-            .models,
-        vec!["a-refetched"]
+            .expect("active summary")
+            .models
+            .contains(&"a-only".into())
     );
+
+    let before = accounts.list().to_vec();
+    accounts
+        .replace(descriptor("a", "identity-a", true))
+        .expect("same identity re-login");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    assert!(
+        providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("same identity summary")
+            .models
+            .contains(&"a-only".into())
+    );
+
+    let before = accounts.list().to_vec();
+    accounts
+        .add(descriptor("b", "identity-b", true))
+        .expect("new active B");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    let summary = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("B summary");
+    assert!(!summary.models.contains(&"a-only".into()));
+    assert_eq!(
+        summary.models.len(),
+        6,
+        "only static provider truth remains"
+    );
+    providers.models_unavailable(OPENAI_OAUTH_PROVIDER_NAME, "synthetic 403".into());
+    let failed = providers
+        .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+        .expect("failed B summary");
+    assert!(
+        !failed.models.contains(&"a-only".into()),
+        "failed B refresh cannot revive A"
+    );
+
+    providers.replace_discovered_models(OPENAI_OAUTH_PROVIDER_NAME.into(), vec![row("b-only")], 2);
+    let old_b_key = ProviderModelCacheKey::for_account(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        accounts
+            .get(&CredentialAlias::new("b"))
+            .expect("B descriptor"),
+    );
+    store
+        .put_provider_models(old_b_key.clone().into(), "[]".into(), None, 2)
+        .await
+        .expect("seed B cache");
+    let before = accounts.list().to_vec();
+    accounts
+        .replace(descriptor("b", "different-identity", true))
+        .expect("reimport other identity");
+    finish_catalog_account_mutation(&store, &before, &accounts, &providers, &mut pending).await;
+    assert!(
+        !providers
+            .summary(OPENAI_OAUTH_PROVIDER_NAME, &|_| true)
+            .expect("new identity summary")
+            .models
+            .contains(&"b-only".into())
+    );
+    assert!(
+        store
+            .provider_models(old_b_key.into())
+            .await
+            .expect("old B cache read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn fresh_anthropic_oauth_add_keeps_claude_selectable_after_models_403() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let providers = test_provider_registry();
+    providers.clear_discovered_models(ANTHROPIC_OAUTH_PROVIDER_NAME);
+    let accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let vault = Arc::new(MemoryVault::new());
+    let discoverer = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Err(CatalogError::Unavailable {
+                reason: "synthetic /v1/models (403)".into(),
+            })),
+        ])),
+    });
+    let broker_vault = vault.clone() as Arc<dyn Vault>;
+    let broker_snapshot = Arc::clone(&snapshot);
+    let (mut actor, broker) = start_account_actor_with_services(
+        AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: vault as Arc<dyn Vault>,
+            validator: Arc::new(ProviderCredentialValidator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management.clone()),
+            device_discovery: DeviceDiscoverySnapshot::new(false),
+            profile_id: "fresh-anthropic-oauth".into(),
+            default_model: "unused".into(),
+            providers,
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            reserved_aliases: HashSet::new(),
+            refresh_fences: RefreshFenceRegistry::default(),
+            source_registry: empty_source_registry(),
+            source_snapshot: empty_source_snapshot(),
+        },
+        |commands| {
+            CredentialBroker::new(
+                broker_vault,
+                OAuthProviderCatalog::default(),
+                broker_snapshot,
+                commands,
+            )
+        },
+        discoverer.clone() as Arc<dyn ProviderModelDiscoverer>,
+        Arc::new(UnreachableGcloud),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+    )
+    .expect("fresh subscription actor");
+
+    let bundle = haider_accounts::OAuthTokenBundleV1::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+        "https://claude.ai".into(),
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
+        None,
+        "Bearer".into(),
+        Zeroizing::new(b"synthetic-anthropic-access".to_vec()),
+        None,
+        u64::MAX - 1,
+        Some(u64::MAX),
+        vec!["user:inference".into()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "synthetic-subject".into(),
+            display_identity: "synthetic@example.invalid".into(),
+        },
+        1,
+    )
+    .expect("synthetic OAuth bundle");
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "fresh-anthropic-oauth-add".into(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+            display_alias: "fresh-claude".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                ANTHROPIC_OAUTH_PROVIDER_NAME,
+                "fresh-claude",
+                bundle,
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("fresh-anthropic-oauth-add"),
+                sink,
+            },
+        })))
+        .await
+        .expect("OAuth add handoff");
+    let added = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+        .await
+        .expect("OAuth add response deadline")
+        .expect("OAuth add response");
+    let WireFrame::Response {
+        body: ResponseBody::AccountAdd { descriptor },
+        ..
+    } = added
+    else {
+        panic!("unexpected OAuth add response: {added:?}");
+    };
+    broker
+        .resolve(&descriptor)
+        .await
+        .unwrap_or_else(|error| panic!("synthetic OAuth credential should resolve: {error:?}"));
+    tokio::time::timeout(Duration::from_secs(10), discoverer.started.notified())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "queued /v1/models request; current summary: {:?}",
+                management.read().expect("management view").providers
+            )
+        });
+    discoverer.release.notify_one();
+    let provider = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let view = management.read().expect("management view");
+            let provider = view
+                .providers
+                .into_iter()
+                .find(|row| row.provider == ANTHROPIC_OAUTH_PROVIDER_NAME)
+                .expect("Anthropic OAuth summary");
+            if matches!(
+                provider.inventory,
+                haider_rpc::ModelInventoryWire::Unavailable { .. }
+            ) {
+                break provider;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed model-list publication");
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(provider.models.contains(&"claude-fable-5-1".into()));
+    assert!(provider.model_details.iter().any(|row| {
+        row.name == "claude-fable-5-1"
+            && row.source == Some(haider_rpc::ModelDetailSourceWire::Static)
+    }));
+    assert!(
+        discoverer
+            .seen
+            .lock()
+            .expect("recorded discovery")
+            .iter()
+            .any(|(source, token, _)| {
+                source.endpoint().ends_with("/v1/models")
+                    && token.as_deref() == Some("synthetic-anthropic-access")
+            })
+    );
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
 }
 
 fn identity_for(profile: &str, command: &str) -> LoginIdentity {
@@ -1236,6 +1569,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "llama-fixture".to_owned(),
                 display_name: None,
                 context_window: Some(131_072),
@@ -1246,6 +1580,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "llama-other".to_owned(),
                 display_name: None,
                 context_window: Some(65_536),
@@ -1333,6 +1668,97 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     );
 }
 
+/// Catalogs that declare no window (Anthropic subscription and API, Gemini,
+/// DeepSeek) still give the daemon a compaction threshold: the projection
+/// falls back to the single pinned limits table. Anthropic's 1M windows for
+/// Opus 5.5 and Sonnet 4.6 are the documented default without a beta header
+/// (platform.claude.com/docs/en/build-with-claude/context-windows, checked
+/// 2026-09-25).
+/// MUTATION CHECK: drop the `static_model_limits` fallback in
+/// `model_detail_wire`; every window below becomes None and no automatic
+/// compaction threshold exists for these sessions.
+#[tokio::test]
+async fn undeclared_catalog_windows_still_yield_a_daemon_compaction_threshold() {
+    let windowless = |slug: &str| haider_provider::DiscoveredModel {
+        slug: slug.to_owned(),
+        display_name: slug.to_owned(),
+        context_window: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        use_responses_lite: None,
+        extensions: None,
+    };
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let cases = [
+        // A fetched Anthropic subscription row with no window (the remote
+        // metadata replaces the static row) and a static-only row.
+        (ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-opus-5-5", 1_000_000_u64),
+        (ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-sonnet-4-6", 1_000_000),
+        (ANTHROPIC_PROVIDER_NAME, "claude-sonnet-4-6", 1_000_000),
+        (haider_provider::GEMINI_PROVIDER_NAME, "gemini-3.7-flash", 1_048_576),
+        (haider_provider::DEEPSEEK_PROVIDER_NAME, "deepseek-v4-flash", 1_000_000),
+    ];
+    for provider in [
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        ANTHROPIC_PROVIDER_NAME,
+        haider_provider::GEMINI_PROVIDER_NAME,
+        haider_provider::DEEPSEEK_PROVIDER_NAME,
+    ] {
+        let models = cases
+            .iter()
+            // anthropic-oauth sonnet-4-6 stays a static-only row.
+            .filter(|(case_provider, model, _)| {
+                *case_provider == provider
+                    && !(provider == ANTHROPIC_OAUTH_PROVIDER_NAME && *model == "claude-sonnet-4-6")
+            })
+            .map(|(_, model, _)| windowless(model))
+            .collect::<Vec<_>>();
+        model_source.replace(
+            provider.to_owned(),
+            ProviderInventory::Fetched {
+                models,
+                fetched_at_ms: 1,
+            },
+        );
+    }
+    let registry = ProviderRegistry::new(
+        Box::new(TestProviderStore::default()) as Box<dyn ProviderRegistryStoreLike>,
+        initial_provider_profiles(
+            &cases
+                .iter()
+                .map(|(provider, _, _)| (*provider).to_owned())
+                .collect(),
+            "claude-opus-5-5",
+        ),
+        model_source,
+    )
+    .expect("provider registry");
+    let summaries = registry.summaries(&|_| true);
+    let factory = AccountsProviderFactory::new_with_management(
+        Arc::new(StdMutex::new(Vec::new())),
+        ManagementSnapshot::new(0, Vec::new(), summaries),
+        VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    for (provider, model, expected_window) in cases {
+        let window = factory.model_context_window(provider, model);
+        assert_eq!(
+            window,
+            Some(expected_window),
+            "{provider}/{model} must project its pinned window"
+        );
+        let reserved = haider_provider::static_model_limits(provider, model).max_output_tokens;
+        let threshold = haider_core::context_soft_threshold_tokens(expected_window, reserved);
+        assert!(
+            threshold.is_some_and(|tokens| tokens > 0 && tokens < expected_window),
+            "{provider}/{model} has an automatic compaction threshold: {threshold:?}"
+        );
+    }
+}
+
 /// MUTATION CHECK: skip the active-credential proof, accept an equal/smaller
 /// target window, or forget to build the promotion lane. Expected runtime
 /// failure: an unusable target resolves or the valid larger target disappears.
@@ -1350,6 +1776,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         models: vec!["model-small".to_owned(), "model-large".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "model-small".to_owned(),
                 display_name: None,
                 context_window: Some(32_000),
@@ -1360,6 +1787,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "model-large".to_owned(),
                 display_name: None,
                 context_window: Some(128_000),
@@ -1490,6 +1918,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
         semantic_progress_timeout_ms: None,
         models: vec!["llama3.1:8b".to_owned()],
         model_details: vec![ModelDetailWire {
+            source: None,
             name: "llama3.1:8b".to_owned(),
             display_name: None,
             context_window: None,
@@ -7596,6 +8025,82 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
     store.close().await.expect("close");
 }
 
+#[tokio::test]
+async fn recovered_authenticated_custom_catalog_without_account_has_no_durable_row() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let mut providers = ProviderRegistry::new(provider_store, Vec::new(), model_source)
+        .expect("empty provider registry");
+    let input = ProviderConfigureInput {
+        provider: "auth-router".into(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("https://router.example.invalid/v1".into()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: vec!["remote-model".into()],
+        default_model: Some("remote-model".into()),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        trust: None,
+    };
+    let (request_json, request_digest) = command_json(&ProviderConfigureIdentity {
+        input: input.clone(),
+        expected_revision: 0,
+    })
+    .expect("configure identity");
+    let recovery = ProviderConfigureRecovery {
+        input,
+        previous_auth_requirement: None,
+        discovered_models: Some(vec![DiscoveredModel {
+            slug: "remote-model".into(),
+            display_name: "Remote Model".into(),
+            context_window: Some(10_000),
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            use_responses_lite: None,
+            extensions: None,
+        }]),
+        discovered_etag: Some("synthetic-etag".into()),
+        revision_unchanged: false,
+        revision_unchanged_response: None,
+    };
+    store
+        .management_claim_receipt::<ProviderReceipt>(
+            "recover-auth-router".into(),
+            PROVIDER_CONFIGURE_METHOD.into(),
+            request_digest,
+            request_json,
+            Some(serde_json::to_string(&recovery).expect("recovery JSON")),
+            Some(0),
+        )
+        .await
+        .expect("claim");
+    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
+        .await
+        .expect("reconcile");
+    assert!(
+        store
+            .provider_models("auth-router".into())
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        providers
+            .summary("auth-router", &|_| false)
+            .expect("summary")
+            .models
+            .contains(&"remote-model".into())
+    );
+    store.close().await.expect("close");
+}
+
 struct UnusedIdentityVerifier;
 
 #[async_trait::async_trait]
@@ -8554,9 +9059,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             body: ResponseBody::ProviderModelsRefresh { provider, revision },
         } => {
             assert_eq!(request_id.as_str(), "refresh-models");
-            assert_eq!(revision, 1);
-            assert_eq!(provider.models, vec!["frontier-refresh"]);
-            assert_eq!(provider.default_model, None);
+            assert_eq!(revision, 2);
+            assert!(provider.models.contains(&"frontier-refresh".to_owned()));
+            assert!(provider.models.contains(&"gpt-6-astra".to_owned()));
+            assert_eq!(provider.default_model.as_deref(), Some("gpt-6-astra"));
         }
         other => panic!("unexpected refresh response: {other:?}"),
     }
@@ -8581,13 +9087,14 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert_eq!(cached_models[0].slug, "frontier-refresh");
     assert_eq!(cached.etag.as_deref(), Some(r#"W/"refresh-etag""#));
     let view = management.read().expect("management view");
-    assert_eq!(view.revision, 1);
+    assert_eq!(view.revision, 2);
     let summary = view
         .providers
         .iter()
         .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
         .expect("refreshed provider");
-    assert_eq!(summary.models, vec!["frontier-refresh"]);
+    assert!(summary.models.contains(&"frontier-refresh".to_owned()));
+    assert!(summary.models.contains(&"gpt-6-astra".to_owned()));
     assert_eq!(
         summary.inventory.fetched_at_ms(),
         Some(cached.fetched_at_ms)
@@ -8617,7 +9124,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
     assert!(matches!(
         frame,
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 2, .. },
             ..
         }
     ));
@@ -8643,7 +9150,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         Some(touched.fetched_at_ms),
         "304 refresh must republish the cache timestamp without a revision bump"
     );
-    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    assert_eq!(store.management_revision().await.expect("revision"), 2);
     let seen = discoverer.seen.lock().expect("seen lock").clone();
     assert_eq!(
         seen.get(1).and_then(|(_, _, etag)| etag.as_deref()),
@@ -8699,7 +9206,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("cache remains"),
         before_unavailable
     );
-    assert_eq!(store.management_revision().await.expect("revision"), 2);
+    assert_eq!(store.management_revision().await.expect("revision"), 3);
     let failed_view = management.read().expect("failure snapshot");
     let failed_provider = failed_view
         .providers
@@ -8765,7 +9272,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("post-panic response deadline")
             .expect("post-panic response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 4, .. },
             ..
         }
     ));
@@ -8802,7 +9309,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             .expect("draining response deadline")
             .expect("draining response"),
         WireFrame::Response {
-            body: ResponseBody::ProviderModelsRefresh { revision: 3, .. },
+            body: ResponseBody::ProviderModelsRefresh { revision: 4, .. },
             ..
         }
     ));
@@ -10011,7 +10518,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     let management = ManagementSnapshot::new(
         0,
         accounts.list().to_vec(),
-        providers.summaries(&provider_has_credential(&accounts)),
+        providers.summaries(&provider_credential_ready_for_summary(&accounts)),
     );
     let native = Arc::new(StubAccountClaudeNative::with_bytes(
         CLAUDE_READ_THROUGH_FIXTURE,
@@ -12003,6 +12510,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
         models: vec!["gpt-5.5".to_owned()],
         model_details: vec![
             ModelDetailWire {
+                source: None,
                 name: "gpt-5.5".to_owned(),
                 display_name: None,
                 context_window: Some(400_000),
@@ -12013,6 +12521,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
                 supports_vision: None,
             },
             ModelDetailWire {
+                source: None,
                 name: "gpt-5.6-sol".to_owned(),
                 display_name: None,
                 context_window: Some(400_000),
@@ -12212,6 +12721,7 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
 struct ScriptedGcloud {
     responses: StdMutex<std::collections::VecDeque<Result<Vec<u8>, String>>>,
     calls: std::sync::atomic::AtomicUsize,
+    account_id: StdMutex<Option<String>>,
 }
 
 impl ScriptedGcloud {
@@ -12230,9 +12740,17 @@ impl ScriptedGcloud {
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn set_account_id(&self, account_id: &str) {
+        *self.account_id.lock().expect("account id") = Some(account_id.into());
+    }
 }
 
 impl crate::gcloud::GcloudAccessTokenSource for ScriptedGcloud {
+    fn active_account_id(&self) -> Result<Option<String>, HaiderError> {
+        Ok(self.account_id.lock().expect("account id").clone())
+    }
+
     fn print_access_token(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, HaiderError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self
@@ -12621,7 +13139,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     let management = ManagementSnapshot::new(
         0,
         Vec::new(),
-        providers.summaries(&provider_has_credential(&accounts)),
+        providers.summaries(&provider_credential_ready_for_summary(&accounts)),
     );
     let before = management
         .read()
@@ -12639,6 +13157,8 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     let gcloud = Arc::new(ScriptedGcloud::default());
     gcloud.push_token(b"GCLOUD_IMPORT_TOKEN_31ab");
     gcloud.push_token(b"GCLOUD_REIMPORT_TOKEN_42cd");
+    gcloud.push_token(b"GCLOUD_OTHER_ACCOUNT_TOKEN_53de");
+    gcloud.set_account_id("synthetic-account@example.invalid");
     let (sink, mut frames) = channel_sink();
     let mut catalog_discoveries = AutomaticCatalogDiscoveryQueue::new(false);
     let job = |command_id: &str, request_id: &str| DeviceImportJob {
@@ -12667,6 +13187,14 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
     .await;
     assert!(catalog_discoveries.is_empty());
     let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    let first_cache_key = ProviderModelCacheKey::for_account(
+        "vertex",
+        accounts.get(&alias).expect("first vertex account"),
+    );
+    store
+        .put_provider_models(first_cache_key.clone().into(), "[]".into(), None, 1)
+        .await
+        .expect("seed vertex cache");
     match frames.try_recv().expect("import response") {
         WireFrame::Response {
             body: ResponseBody::AccountImportDevice { descriptor, .. },
@@ -12738,6 +13266,59 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
             .filter(|descriptor| descriptor.provider == "vertex")
             .count(),
         1
+    );
+    assert_eq!(
+        ProviderModelCacheKey::for_account(
+            "vertex",
+            accounts.get(&alias).expect("reimported vertex")
+        ),
+        first_cache_key,
+        "a rotating access token from the same gcloud account keeps the catalog"
+    );
+    assert!(
+        store
+            .provider_models(first_cache_key.clone().into())
+            .await
+            .expect("same account cache read")
+            .is_some()
+    );
+    gcloud.set_account_id("other-account@example.invalid");
+    handle_device_import(
+        &store,
+        &mut accounts,
+        Arc::clone(&vault),
+        &snapshot,
+        Some(&management),
+        &providers,
+        &mut catalog_discoveries,
+        &HashSet::new(),
+        &RefreshFenceRegistry::default(),
+        gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+        job("gcloud-import-3", "req-3"),
+    )
+    .await;
+    assert!(matches!(
+        frames.try_recv(),
+        Ok(WireFrame::Response {
+            body: ResponseBody::AccountImportDevice { .. },
+            ..
+        })
+    ));
+    assert_ne!(
+        ProviderModelCacheKey::for_account(
+            "vertex",
+            accounts.get(&alias).expect("other vertex account")
+        ),
+        first_cache_key,
+        "changing the gcloud account must re-key its catalog"
+    );
+    assert!(
+        store
+            .provider_models(first_cache_key.into())
+            .await
+            .expect("replaced cache read")
+            .is_none()
     );
     store.close().await.expect("close store");
 }
@@ -13024,6 +13605,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         semantic_progress_timeout_ms: None,
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![ModelDetailWire {
+            source: None,
             name: "llama-fixture".to_owned(),
             display_name: None,
             context_window: Some(131_072),
@@ -15226,7 +15808,7 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
             .summary(HAIDER_CODE_PROVIDER_NAME, &|_| false)
             .expect("public")
             .inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
+        haider_rpc::ModelInventoryWire::Static
     );
     let (sink, mut frames) = channel_sink();
     begin_provider_models_refresh(

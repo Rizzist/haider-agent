@@ -52,6 +52,7 @@ fn provider_summary(
         model_details: models
             .iter()
             .map(|slug| haider_rpc::ModelDetailWire {
+                source: None,
                 name: (*slug).to_owned(),
                 display_name: None,
                 context_window: None,
@@ -133,6 +134,53 @@ fn an_unpinned_identity_follows_the_imported_active_account() {
         !model.identity_pinned,
         "a bootstrap is not a user choice — later daemon truth may still move it"
     );
+}
+
+#[test]
+fn fresh_oauth_login_adopts_static_model_after_catalog_403() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let seed_provider = model.identity.provider.clone();
+
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![oauth_descriptor("anthropic-oauth", "work", true)],
+            revision: Some(1),
+            sources: Vec::new(),
+        },
+    );
+    assert_eq!(model.identity.provider, seed_provider);
+
+    let mut summary = provider_summary(
+        "anthropic-oauth",
+        &["claude-fable-5-1", "claude-sonnet-4-5"],
+        "claude-fable-5-1",
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "GET /v1/models returned (403)".to_owned(),
+    };
+    for detail in &mut summary.model_details {
+        detail.source = Some(haider_rpc::ModelDetailSourceWire::Static);
+    }
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 1,
+        },
+    );
+
+    assert_eq!(model.identity.provider, "anthropic-oauth");
+    assert_eq!(model.identity.account, "work");
+    assert_eq!(model.identity.model_short, "claude-fable-5-1");
+    assert!(!model.identity_pinned);
+    model.open_model_picker(String::new());
+    assert!(model.model_picker_rows().iter().any(|row| {
+        row.provider == "anthropic-oauth" && row.model == "claude-fable-5-1" && row.selectable
+    }));
 }
 
 /// MUTATION CHECK (W5f-2): make `bootstrap_identity_from_daemon` ignore

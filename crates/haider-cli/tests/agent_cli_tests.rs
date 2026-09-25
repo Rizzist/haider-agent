@@ -833,13 +833,31 @@ fn agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs() {
 #[test]
 fn agent_spawn_provider_only_resolves_model_through_daemon_session_authority() {
     let profile = Profile::new(report_script("DAEMON_RESOLVED_MODEL_REPORT"));
-    // Publish a discovered catalog before startup; xAI has no seeded default.
-    // The injected daemon factory routes the published pair to the fake script.
+    // Authenticated inventories are account-scoped. Seed a synthetic active
+    // descriptor and its matching catalog before startup; xAI has no seeded
+    // default. The injected daemon factory routes the pair to the fake script.
+    let descriptor = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("xai-fixture"),
+        provider: "xai".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "synthetic xAI account".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let mut descriptors = serde_json::to_vec_pretty(&vec![descriptor.clone()])
+        .expect("synthetic account descriptors");
+    descriptors.push(b'\n');
+    std::fs::write(profile.profile.join("accounts.json"), descriptors)
+        .expect("seed active synthetic account");
     {
         let store = haider_store::Store::open(&profile.profile).expect("catalog store");
         store
             .put_provider_models(
-                "xai",
+                haider_store::ProviderModelCacheKey::for_account("xai", &descriptor).as_str(),
                 r#"[{"slug":"grok-4","display_name":"Grok 4","supported_efforts":[],"visible":true}]"#,
                 None,
                 u64::try_from(

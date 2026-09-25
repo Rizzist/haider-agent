@@ -1093,13 +1093,14 @@ async fn session_create_accepts_gemini_when_account_active() {
 /// The e2e builder: accounts-backed RESOLUTION (active descriptor → vault
 /// secret) with a fake provider adapter, recording what it was handed.
 struct FakeAccountBuilder {
+    provider_id: &'static str,
     fake: Arc<haider_provider::FakeProvider>,
     built: StdMutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl haider_daemon::AccountProviderBuilder for FakeAccountBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::from(["fake".to_owned()])
+        std::collections::BTreeSet::from([self.provider_id.to_owned()])
     }
 
     fn build(
@@ -1119,12 +1120,169 @@ impl haider_daemon::AccountProviderBuilder for FakeAccountBuilder {
     }
 }
 
+#[derive(Default)]
+struct ForbiddenCatalog {
+    requested: StdMutex<Vec<haider_provider::CatalogSource>>,
+}
+
+#[async_trait::async_trait]
+impl haider_daemon::ProviderModelDiscoverer for ForbiddenCatalog {
+    async fn discover(
+        &self,
+        source: haider_provider::CatalogSource,
+        _access_token: Option<&str>,
+        _etag: Option<&str>,
+    ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
+        self.requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(source);
+        Err(haider_provider::CatalogError::Unavailable {
+            reason: "provider does not serve a model list to this credential (403)".into(),
+        })
+    }
+}
+
+struct AccountScopedCatalog;
+
+#[async_trait::async_trait]
+impl haider_daemon::ProviderModelDiscoverer for AccountScopedCatalog {
+    async fn discover(
+        &self,
+        source: haider_provider::CatalogSource,
+        access_token: Option<&str>,
+        _etag: Option<&str>,
+    ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
+        assert_eq!(source, haider_provider::CatalogSource::XaiApi);
+        match access_token {
+            Some("synthetic-account-a") => Ok(haider_provider::DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "a-only".into(),
+                    display_name: "A only".into(),
+                    context_window: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    use_responses_lite: None,
+                    extensions: None,
+                }],
+                etag: None,
+            }),
+            Some("synthetic-account-b") => Err(haider_provider::CatalogError::Unavailable {
+                reason: "synthetic account B /v1/models (403)".into(),
+            }),
+            other => panic!("unexpected catalog credential: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn newly_active_alias_never_projects_previous_account_after_failed_refresh() {
+    let root = test_root("hac-active-catalog-");
+    let config = DaemonConfig::new(
+        "profile-active-catalog",
+        root.path().join("store"),
+        root.path(),
+    );
+    let fixture = AccountFixture::for_provider("xai", Vec::new());
+    let mut dependencies = fixture.dependencies();
+    dependencies.accounts.model_discoverer = Some(Arc::new(AccountScopedCatalog));
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = control_client(&config).await;
+
+    let stage_a = stage_secret(&mut client, "active-a", "synthetic-account-a").await;
+    let a = expect_descriptor(
+        request(
+            &mut client,
+            "login-active-a",
+            login_body_for_provider("command-active-a", "xai", &stage_a, Some("a"), None),
+        )
+        .await,
+    );
+    assert!(a.active);
+    // The RPC harness disables automatic discovery. Explicitly fetch A's
+    // catalog, then exercise the same account-change boundary as production.
+    let refreshed_a = request(
+        &mut client,
+        "refresh-active-a",
+        RequestBody::ProviderModelsRefresh {
+            provider: "xai".into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed_a else {
+        panic!("A refresh failed: {refreshed_a:?}");
+    };
+    assert!(provider.models.contains(&"a-only".into()));
+
+    let stage_b = stage_secret(&mut client, "active-b", "synthetic-account-b").await;
+    let b = expect_descriptor(
+        request(
+            &mut client,
+            "login-active-b",
+            login_body_for_provider("command-active-b", "xai", &stage_b, Some("b"), None),
+        )
+        .await,
+    );
+    assert!(b.active);
+    let listed = request(
+        &mut client,
+        "list-active-b",
+        RequestBody::ProviderList {
+            provider: Some("xai".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list after B login: {listed:?}");
+    };
+    assert!(!providers[0].models.contains(&"a-only".into()));
+
+    // The fake catalog returns 403 for B. A's row must stay absent both
+    // before and after this failed refresh.
+    let refreshed_b = request(
+        &mut client,
+        "refresh-active-b",
+        RequestBody::ProviderModelsRefresh {
+            provider: "xai".into(),
+        },
+    )
+    .await;
+    let ResponseBody::Error { .. } = refreshed_b else {
+        panic!("XAI's failed refresh must return a provider error: {refreshed_b:?}");
+    };
+    let after_failure = request(
+        &mut client,
+        "list-after-b-failure",
+        RequestBody::ProviderList {
+            provider: Some("xai".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = after_failure else {
+        panic!("provider.list after B failure: {after_failure:?}");
+    };
+    let provider = &providers[0];
+    assert!(!provider.models.contains(&"a-only".into()));
+    assert!(matches!(
+        provider.inventory,
+        haider_rpc::ModelInventoryWire::Unavailable { .. }
+    ));
+
+    task.shutdown_handle().request("test complete");
+    task.join()
+        .await
+        .unwrap_or_else(|error| panic!("daemon joins: {error:?}"));
+}
+
 // MUTATION CHECK (R6/R10 next-turn pickup): make the accounts-backed factory
 // resolve anything but the ACTIVE descriptor's vault secret (or stop
 // stamping `account_alias`). Expected failure: the builder-observed
 // alias/secret assertions or the Usage-envelope account assertion below.
 #[tokio::test]
-async fn committed_login_is_picked_up_by_the_next_fake_turn() {
+async fn fresh_login_survives_forbidden_catalog_and_runs_a_fake_turn() {
     use haider_protocol::EventPayload;
     use haider_provider::{FakeProvider, FakeStep};
 
@@ -1157,17 +1315,20 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
         },
     ]));
     let builder = Arc::new(FakeAccountBuilder {
+        provider_id: "haider-code",
         fake: fake.clone(),
         built: StdMutex::new(Vec::new()),
     });
+    let catalog = Arc::new(ForbiddenCatalog::default());
     let vault = Arc::new(MemoryVault::default());
-    let validator = ScriptedValidator::for_provider("fake", Vec::new());
+    let validator = ScriptedValidator::for_provider("haider-code", Vec::new());
     let dependencies = DaemonDependencies {
         provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
         accounts: AccountsDependencies {
             vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
             validator: validator.clone(),
             descriptor_store: None,
+            model_discoverer: Some(catalog.clone()),
             ..AccountsDependencies::default()
         },
         ..DaemonDependencies::default()
@@ -1175,8 +1336,8 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
     let task = ready_with_dependencies(&config, dependencies).await;
     let mut client = control_client(&config).await;
 
-    // /login for the fake provider (fake validator success writes the
-    // MemoryVault + descriptor).
+    // A fresh private profile receives an account before any model-list
+    // result; the fake inference adapter records the next turn.
     let reference = stage_secret(&mut client, "stage-e2e", "sk-e2e-fake-key").await;
     let descriptor = expect_descriptor(
         request(
@@ -1184,7 +1345,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
             "req-e2e-login",
             RequestBody::AccountLoginApi {
                 command_id: CommandId::new("command-e2e-login"),
-                provider: "fake".into(),
+                provider: "haider-code".into(),
                 alias: Some("e2e".into()),
                 vault_reference: reference,
                 validation_model: None,
@@ -1192,6 +1353,74 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
             },
         )
         .await,
+    );
+
+    let listed = request(
+        &mut client,
+        "req-e2e-list",
+        RequestBody::ProviderList {
+            provider: Some("haider-code".into()),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderList { providers, .. } = listed else {
+        panic!("provider.list after login: {listed:?}");
+    };
+    let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.provider == "haider-code")
+    else {
+        panic!("Haider Code row missing");
+    };
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        provider
+            .models
+            .iter()
+            .any(|model| model == "deepseek-v4-flash")
+    );
+    assert!(
+        provider
+            .model_details
+            .iter()
+            .any(|row| row.name == "deepseek-v4-flash"
+                && row.source == Some(haider_rpc::ModelDetailSourceWire::Static))
+    );
+
+    let refreshed = request(
+        &mut client,
+        "req-e2e-refresh",
+        RequestBody::ProviderModelsRefresh {
+            provider: "haider-code".into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed else {
+        panic!("forbidden model list must be informational: {refreshed:?}");
+    };
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        matches!(provider.inventory, haider_rpc::ModelInventoryWire::Unavailable { ref reason } if reason.contains("(403)"))
+    );
+    assert!(
+        provider
+            .models
+            .iter()
+            .any(|model| model == "deepseek-v4-flash")
+    );
+    assert!(
+        catalog
+            .requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|source| source.endpoint().ends_with("/v1/models"))
     );
 
     // Next logical turn: create + attach + submit, then read the run to its
@@ -1203,8 +1432,8 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
         RequestBody::SessionCreate {
             command_id: CommandId::new("command-e2e-create"),
             cwd: workspace_text,
-            provider: "fake".into(),
-            model: "fake-model".into(),
+            provider: "haider-code".into(),
+            model: "deepseek-v4-flash".into(),
             max_tokens: 64,
         },
     )

@@ -130,6 +130,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::provider_model_cache_key::ACCOUNT_SCOPED_PREFIX;
+
 #[path = "event_text_cas.rs"]
 mod event_text_cas;
 
@@ -4543,6 +4545,42 @@ impl Store {
                 })
             })
             .transpose()
+    }
+
+    /// Sweep catalog rows that cannot be read by any current descriptor.
+    /// `account:<len>:` was an unreleased key format; authenticated bare
+    /// provider rows predate account scoping and are likewise never read.
+    pub fn prune_provider_model_caches(
+        &self,
+        keep_account_keys: &[String],
+        authenticated_providers: &[String],
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let keys = {
+            let mut statement = transaction
+                .prepare("SELECT provider FROM provider_models")
+                .map_err(map_sqlite_error)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite_error)?
+        };
+        let keep: HashSet<&str> = keep_account_keys.iter().map(String::as_str).collect();
+        let legacy: HashSet<&str> = authenticated_providers.iter().map(String::as_str).collect();
+        for key in keys {
+            let unread_account =
+                key.starts_with(ACCOUNT_SCOPED_PREFIX) || key.starts_with("account:");
+            if (unread_account && !keep.contains(key.as_str())) || legacy.contains(key.as_str()) {
+                transaction
+                    .execute("DELETE FROM provider_models WHERE provider = ?1", [&key])
+                    .map_err(map_sqlite_error)?;
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)
     }
 
     /// Replaces one provider's last-known model catalog.

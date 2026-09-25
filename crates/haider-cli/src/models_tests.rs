@@ -150,3 +150,21 @@ fn legacy_flat_seed_cannot_override_never_fetched_provenance() {
     assert!(view.default_model.is_none());
     assert_eq!(view.availability, "unavailable");
 }
+
+#[test]
+fn cli_preserves_static_rows_when_subscription_catalog_returns_403() {
+    let summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider": "anthropic-oauth", "api_family": "anthropic_messages",
+        "models": ["claude-fable-5-1"],
+        "model_details": [{"name":"claude-fable-5-1","context_window":1000000,"source":"static"}],
+        "inventory": {"state":"unavailable","reason":"catalog returned 403"},
+        "default_model": "claude-fable-5-1", "availability": "available", "enabled": true
+    }))
+    .expect("summary");
+    let view = provider_view(summary, &[], 100);
+    assert_eq!(view.availability, "available");
+    assert_eq!(view.default_model.as_deref(), Some("claude-fable-5-1"));
+    let value = serde_json::to_value(&view).expect("CLI JSON");
+    assert_eq!(value["models"][0]["source"], "static");
+    assert_eq!(value["models"][0]["context_window"], 1_000_000);
+}

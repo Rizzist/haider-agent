@@ -168,7 +168,7 @@ fun SessionPickerSheet(
                         option.models.forEach { model ->
                             PickerRow(
                                 label = ModelNames.short(model.id),
-                                secondary = model.id,
+                                secondary = model.source?.let { "${model.id} · $it" } ?: model.id,
                                 selected = model.id == currentModel && option.id == currentProvider,
                                 enabled = option.available,
                                 onClick = { submitted = true; onSelectModel(option.id, model.id) },

@@ -62,6 +62,8 @@ struct ProviderView {
 struct ModelView {
     model: String,
     context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<haider_rpc::ModelDetailSourceWire>,
     supported_efforts: Vec<String>,
     default_effort: Option<String>,
     supported_speeds: Vec<String>,
@@ -376,11 +378,7 @@ fn provider_view(
 ) -> ProviderView {
     let mut provider = provider;
     provider.inventory = provider.inventory.at_time(now_ms);
-    if matches!(
-        provider.inventory,
-        haider_rpc::ModelInventoryWire::NeverFetched
-            | haider_rpc::ModelInventoryWire::Unavailable { .. }
-    ) {
+    if !provider.has_known_models() {
         provider.models.clear();
         provider.model_details.clear();
         provider.default_model = None;
@@ -454,6 +452,7 @@ fn model_view(model: String) -> ModelView {
     ModelView {
         model,
         context_window: None,
+        source: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
@@ -465,6 +464,7 @@ fn model_detail_view(detail: ModelDetailWire) -> ModelView {
     ModelView {
         model: detail.name,
         context_window: detail.context_window,
+        source: detail.source,
         supported_efforts: detail.supported_efforts,
         default_effort: detail.default_effort,
         supported_speeds: detail.supported_speeds,
@@ -520,7 +520,16 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
             let context = model
                 .context_window
                 .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
-            text.push_str(&format!("  {}  context_window={}\n", model.model, context));
+            let source = model
+                .source
+                .filter(|source| *source != haider_rpc::ModelDetailSourceWire::Unknown)
+                .map_or_else(String::new, |source| {
+                    format!("  source={}", source.as_str())
+                });
+            text.push_str(&format!(
+                "  {}  context_window={}{}\n",
+                model.model, context, source
+            ));
         }
     }
     let stdout = io::stdout();

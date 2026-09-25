@@ -219,6 +219,49 @@ fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
     );
 }
 
+#[test]
+fn catalog_prune_bounds_replaced_and_removed_accounts_and_unread_legacy_rows() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let live = "account-v2:live";
+    for key in [
+        live,
+        "account-v2:replaced",
+        "account-v2:removed-custom-provider",
+        "account:12:openai-oauth:old",
+        "openai-oauth",
+        "public-provider",
+    ] {
+        store
+            .put_provider_models(key, "[]", None, 1)
+            .expect("seed row");
+    }
+    store
+        .prune_provider_model_caches(&[live.into()], &["openai-oauth".into()])
+        .expect("prune");
+    for key in [
+        "account-v2:replaced",
+        "account-v2:removed-custom-provider",
+        "account:12:openai-oauth:old",
+        "openai-oauth",
+    ] {
+        assert!(
+            store.provider_models(key).expect("pruned read").is_none(),
+            "{key}"
+        );
+    }
+    for key in [live, "public-provider"] {
+        assert!(
+            store.provider_models(key).expect("retained read").is_some(),
+            "{key}"
+        );
+    }
+    store
+        .prune_provider_model_caches(&[], &[])
+        .expect("remove last account");
+    assert!(store.provider_models(live).expect("removed read").is_none());
+}
+
 /// The production migration rejects impossible pre-epoch timestamps.
 ///
 /// MUTATION CHECK: delete `CHECK (fetched_at_ms >= 0)` from migration v8.
