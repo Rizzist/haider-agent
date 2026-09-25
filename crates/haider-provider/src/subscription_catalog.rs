@@ -84,6 +84,7 @@ fn static_row(provider: &str, id: &str, priority: i64) -> DiscoveredModel {
         slug: id.to_owned(),
         display_name: id.to_owned(),
         context_window: crate::static_model_limits(provider, id).context_window,
+        max_output_tokens: None,
         description: None,
         default_effort: None,
         supported_efforts: Vec::new(),

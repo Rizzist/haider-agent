@@ -44,6 +44,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             name: "claude-opus-5".into(),
             display_name: None,
             context_window: Some(1_000_000),
+            max_output_tokens: Some(128_000),
             supported_efforts: ["low", "medium", "high", "xhigh", "max"]
                 .map(str::to_owned)
                 .to_vec(),
@@ -57,6 +58,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             name: "claude-sonnet-5".into(),
             display_name: None,
             context_window: Some(1_000_000),
+            max_output_tokens: Some(128_000),
             supported_efforts: ["low", "medium", "high", "xhigh", "max"]
                 .map(str::to_owned)
                 .to_vec(),

@@ -2004,6 +2004,91 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
     assert_ne!(last.used_tokens, 1_020);
 }
 
+/// 973 output cap: a provider that rejects `max_tokens` as too large and
+/// states its maximum gets exactly ONE retry at that maximum. A second
+/// rejection surfaces as the ordinary provider error — never a loop.
+/// MUTATION CHECK: drop the one-shot flag. Expected runtime failure: the
+/// repeated-rejection run makes three requests instead of two.
+#[tokio::test]
+async fn oversized_max_tokens_retries_once_at_the_provider_stated_maximum() {
+    let anthropic_rejection = "max_tokens: 30000 > 16000, which is the maximum allowed number \
+                               of output tokens for claude-test";
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: anthropic_rejection.into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut retry_config = config();
+    retry_config.max_tokens = 30_000;
+    let handle = HarnessActor::spawn(retry_config, provider.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("output-limit-retry"),
+            messages: vec![Message::user_text("write a large file")],
+        })
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_tokens, 30_000);
+    assert_eq!(
+        requests[1].max_tokens, 16_000,
+        "retry uses the stated maximum"
+    );
+
+    let repeated = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: "max_tokens is too large: 30000. This model supports at most 16384 \
+                      completion tokens, whereas you provided 30000."
+                .into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut repeated_config = config();
+    repeated_config.max_tokens = 30_000;
+    let handle = HarnessActor::spawn(
+        repeated_config,
+        repeated.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("output-limit-repeated"),
+            messages: vec![Message::user_text("write a large file")],
+        })
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(
+        outcome.state,
+        RunState::Errored,
+        "the second rejection surfaces"
+    );
+    let requests = repeated.requests();
+    assert_eq!(requests.len(), 2, "exactly one retry");
+    assert_eq!(requests[1].max_tokens, 16_384);
+}
+
 /// MUTATION CHECK: route ContextExceeded through generic retry or omit the
 /// one-shot guard. Expected runtime failure: no CompactionIntent is durable,
 /// the retry lacks the summary, or the double-overflow case makes >2 calls.
@@ -2950,6 +3035,22 @@ fn malformed_tool_steps(call_id: &str, arguments: &str) -> Vec<FakeStep> {
     ]
 }
 
+fn output_limited_tool_steps(call_id: &str, arguments: &str) -> Vec<FakeStep> {
+    vec![
+        FakeStep::EmitToolCallStart {
+            call_id: call_id.into(),
+            name: "inspect".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: call_id.into(),
+            fragment: arguments.into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+    ]
+}
+
 async fn toolrepair_run(
     cfg: HarnessConfig,
     script: Vec<FakeStep>,
@@ -3092,6 +3193,198 @@ async fn malformed_tool_json_is_durable_invalid_result_with_one_repair_continuat
             .iter()
             .any(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
     );
+}
+
+#[tokio::test]
+async fn output_limited_tool_is_not_executed_and_gets_one_split_retry() {
+    let partial = format!("{{\"payload\":\"{}", "x".repeat(20_000));
+    let mut script = output_limited_tool_steps("limited-1", &partial);
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "limited-1".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "valid-2".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"chunk": "small"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "valid-2".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(calls, 1, "only the complete retry may dispatch");
+    let result = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { call_id, result } if call_id == "limited-1" => Some(result),
+            _ => None,
+        })
+        .expect("durable output-limit result");
+    let data = serde_json::to_value(result.data.as_ref().expect("typed data"))
+        .expect("serialize output-limit data");
+    assert_eq!(data["kind"], "output_limit_truncation");
+    assert_eq!(data["repaired"], true);
+    assert_eq!(
+        result
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subcode
+            .as_str(),
+        "output-limit-truncation"
+    );
+    assert!(result.preview.contains("not executed"));
+    assert!(result.preview.contains("Split large content"));
+    assert!(!result.preview.contains("malformed"));
+    assert!(events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::ToolCall { call_id, args, status: ToolStatus::Failed, .. },
+            ..
+        }) if call_id == "limited-1" && args == serde_json::Value::String(partial.clone())
+    )));
+}
+
+#[tokio::test]
+async fn third_consecutive_output_limited_tool_returns_a_typed_error_and_run_continues() {
+    let mut script = output_limited_tool_steps("limited-1", "{\"payload\":");
+    script.extend(output_limited_tool_steps("limited-2", "{\"payload\":"));
+    script.push(FakeStep::EmitToolCall {
+        call_id: "complete-on-third".into(),
+        name: "inspect".into(),
+        args: serde_json::json!({"chunk": "small"}),
+    });
+    script.extend(output_limited_tool_steps("limited-3", "{\"payload\":"));
+    script.push(FakeStep::ExpectToolResult {
+        call_id: "limited-3".into(),
+    });
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        calls, 1,
+        "the completed call in the truncated response executes"
+    );
+    let result = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { call_id, result } if call_id == "limited-3" => Some(result),
+            _ => None,
+        })
+        .expect("typed repeated truncation result");
+    assert_eq!(
+        result
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subcode
+            .as_str(),
+        "output-limit-truncation-repeated"
+    );
+    assert!(result.preview.contains("output_limit_truncation_repeated"));
+    assert!(result.preview.contains("Split large content"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn output_truncation_does_not_consume_the_malformed_call_strike() {
+    let mut script = output_limited_tool_steps("limited-first", "{\"payload\":");
+    script.extend(malformed_tool_steps("bad-second", "{broken"));
+    script.extend([
+        FakeStep::EmitToolCall {
+            call_id: "valid-third".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"chunk": "small"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "valid-third".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn resumed_output_truncation_uses_the_same_third_call_policy() {
+    let mut script = output_limited_tool_steps("limited-before-1", "{");
+    script.extend(output_limited_tool_steps("limited-before-2", "{"));
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (_, events, _, _) = toolrepair_run(config(), script).await;
+    let run_id = events[0].run_id.clone().expect("run id");
+    let attempt = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            completed_extension(event, haider_core::ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND)
+                .then_some(index)
+        })
+        .nth(1)
+        .expect("third request epoch marker");
+    let mut prefix = events[..=attempt].to_vec();
+    let store = Arc::new(MemoryStore::new());
+    StoreHandle::append(store.as_ref(), &mut prefix)
+        .await
+        .expect("restore prefix");
+    let mut replay = output_limited_tool_steps("limited-after-restart", "{");
+    replay.push(FakeStep::ExpectToolResult {
+        call_id: "limited-after-restart".into(),
+    });
+    replay.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let provider = Arc::new(FakeProvider::new(replay));
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let outcome = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id,
+            messages: vec![Message::user_text("continue")],
+            checkpoint: RouteWaitCheckpoint {
+                response_epoch: 2,
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("resume")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 2);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert!(events.iter().any(|event| matches!(typed(event),
+        EventPayload::ToolResult { call_id, result }
+            if call_id == "limited-after-restart" && result.presentation.as_ref()
+                .is_some_and(|presentation| presentation.subcode.as_str() == "output-limit-truncation-repeated")
+    )));
+    handle.stop().await.expect("stop");
 }
 
 #[tokio::test]

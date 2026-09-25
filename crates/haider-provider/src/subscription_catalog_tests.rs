@@ -25,6 +25,12 @@ fn subscription_fallbacks_have_distinct_ids_and_limit_metadata() {
                 row.slug
             );
             assert_eq!(row.context_window, limit.context_window);
+            // Every maintained row has a sourced limit, never the 8,192 guess.
+            assert!(
+                limit.output_limit_sourced,
+                "unsourced limit for {}",
+                row.slug
+            );
         }
     }
     assert!(subscription_static_models("custom").is_empty());
@@ -43,8 +49,15 @@ fn subscription_fallbacks_have_distinct_ids_and_limit_metadata() {
         ),
         ("openai-oauth", "gpt-5.6-sol", Some(1_050_000), 128_000),
         ("openai-oauth", "gpt-6-sol", Some(1_050_000), 128_000),
-        ("kimi-oauth", "kimi-for-coding", Some(1_048_576), 32_768),
-        ("grok-oauth", "grok-4.6", Some(500_000), 32_768),
+        // Kimi and Haider Code publish no output ceiling: the shared default
+        // budget is their sourced maximum. xAI documents 128,000.
+        (
+            "kimi-oauth",
+            "kimi-for-coding",
+            Some(1_048_576),
+            crate::DEFAULT_OUTPUT_LIMIT,
+        ),
+        ("grok-oauth", "grok-4.6", Some(500_000), 128_000),
     ] {
         let limits = static_model_limits(provider, model);
         assert_eq!(

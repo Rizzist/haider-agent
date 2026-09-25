@@ -330,6 +330,7 @@ is §4.1.
 | `session_provider_rebind_v1` | `session.provider.rebind` |
 | `session_account_select_v1` | exact `session.create.account_alias` pin |
 | `session_create_admission_v1` | daemon resolution of create provider/default model and initial tuning |
+| `model_output_limits_v1` | model-row output maxima, `session.create.max_tokens=0` derivation, `session.select_model.max_tokens` and its `output_budget` response |
 | `session_model_select_v1` | `session.select_model` |
 | `session_rename_v1` | `session.rename`, `SessionSummary.title` |
 | `session_workspace_set_v1` | receipt-backed `session.workspace.set`; additive `workspace_unavailable` and `workspace_selected` raw facts |
@@ -1321,8 +1322,11 @@ explicit availability disambiguates it. Provider `endpoint`,
 `availability_reason`, and `default_model` are absent when undeclared/unknown;
 empty `models`, `model_details`, `auth_methods`, effort ladders, or speed lists
 mean the provider declares none in an available snapshot. `context_window`,
-`default_effort`, and `supports_thinking_type` absence means not declared;
-clients hold no replacement capability tables.
+`default_effort`, and `supports_thinking_type` absence means not declared.
+`max_output_tokens` is additive: current daemons project the provider catalog
+declaration or a pinned provider/model fallback, bounded by the known context
+window and adapter maximum; absence means an older daemon. Clients hold no
+replacement capability tables.
 
 `supports_vision` states whether the pair accepts image attachments. It is the
 daemon's projection of the adapter's own `capabilities().vision` — the fact the
@@ -1775,6 +1779,37 @@ and `crates/haider-store/src/event_store.rs:5876-5946`).
 |---|---|---|
 | Request | `session.create` | `command_id: CommandId`, `cwd: String`, `provider: String`, `model: String`, `max_tokens: u64`, `permission_overrides: Option<SessionPermissionOverridesV1>`, `cache_policy: Option<CachePolicySettingsV1>`, `interaction_mode: SessionInteractionModeV1` |
 | Success response | `SessionCreate` (`method: "session.create"`) | `session_id: SessionId`, `created_seq: u64`, `worker_generation: u64`, `metadata: SessionMetadataV1`; the metadata carries the same `interaction_mode: SessionInteractionModeV1` |
+
+When `model_output_limits_v1` is advertised, `max_tokens: 0` is a derivation
+sentinel: after provider/model resolution the daemon persists and returns the
+smaller of its 30,000-token default and the resolved model maximum. Positive
+values remain exact client overrides and values above the row's explicit
+ceiling receive a typed `model_output_limit` error. The explicit ceiling is
+the row maximum when that maximum is sourced (catalog declaration or a cited
+table row); when the row maximum is only the unverified 8,192 fallback, the
+ceiling is 384,000, strictly below a known context window (see
+`docs/output-token-limits.md`). A client must negotiate the feature before
+sending zero.
+
+The created metadata records `max_tokens_source`: `{"kind":"derived"}` for a
+zero request or `{"kind":"user_set","requested":N}` for a positive one
+(absent on metadata written before 973; readers treat the legacy client
+defaults 4,096, 8,192 and 30,000 as derived and any other value as user-set).
+Every `session.select_model` re-applies that source to the newly selected
+model: a derived budget becomes `min(30,000, new maximum)` silently; a
+user-set budget becomes `min(requested, new explicit ceiling)`, and when that clamps
+the response's `output_budget.clamped` carries `{requested,
+max_output_tokens}` for the client to show as a notice. A model switch never
+fails on the output budget. With `model_output_limits_v1`, a
+`session.select_model` request may carry `max_tokens`: `0` returns the
+session to the derived budget, a positive value becomes the user-set budget
+(refused with typed `model_output_limit` when it exceeds the selected model's
+maximum). Selecting the session's current model with `max_tokens` changes
+only the budget. The response's additive `output_budget` is
+`{max_tokens, source, clamped?}`. CLI: `haider session <id> config
+--max-output-tokens <n|auto>`; `haider run --max-output-tokens N` sets it on
+the headless session (`haider run --max-tokens N` is the cumulative run token
+budget, unchanged since 0.0.972).
 
 The exact enum strings are `"interactive"` and `"autonomous"`.
 `interactive` is the serde default and is omitted on the wire; that is a

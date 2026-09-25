@@ -17,8 +17,7 @@ use haider_provider::{
     KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME,
     OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
     OPENAI_SUBSCRIPTION_RESPONSES_URL, ProviderErrorKind, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS,
-    XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin,
-    model_servable_by_endpoint,
+    XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin, model_servable_by_endpoint,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -1232,6 +1231,7 @@ fn offline_model(_provider: &str, slug: &str) -> DiscoveredModel {
         slug: slug.to_owned(),
         display_name: slug.to_owned(),
         context_window: None,
+        max_output_tokens: None,
         description: None,
         default_effort: None,
         supported_efforts: Vec::new(),
@@ -1298,17 +1298,25 @@ fn model_detail_wire(
     } else {
         Vec::new()
     };
+    // The catalog's declaration wins; otherwise the single pinned limits
+    // table supplies the window. Anthropic (subscription and API), Gemini and
+    // DeepSeek lists carry none, and both the daemon's compaction threshold
+    // and the TUI meter read this field.
+    let context_window = model
+        .context_window
+        .or(haider_provider::static_model_limits(provider, &model.slug).context_window);
+    let max_output_tokens = haider_provider::model_output_limit(
+        provider,
+        &model.slug,
+        model.max_output_tokens,
+        context_window,
+    );
     ModelDetailWire {
         source: Some(source),
         name: model.slug.clone(),
         display_name: Some(model.display_name),
-        // The catalog's declaration wins; otherwise the single pinned limits
-        // table supplies the window. Anthropic (subscription and API),
-        // Gemini and DeepSeek lists carry none, and both the daemon's
-        // compaction threshold and the TUI meter read this field.
-        context_window: model
-            .context_window
-            .or_else(|| haider_provider::static_model_limits(provider, &model.slug).context_window),
+        context_window,
+        max_output_tokens: Some(max_output_tokens),
         supported_efforts,
         default_effort,
         supported_speeds,

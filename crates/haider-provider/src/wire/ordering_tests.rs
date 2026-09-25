@@ -235,13 +235,18 @@ fn message_delta_preserves_truncated_tool_arguments_for_actor_validation() {
         .collect();
     assert_eq!(args, fragments.concat());
     assert!(serde_json::from_str::<Value>(&args).is_err());
+    // The stopped first call has complete valid JSON and remains executable.
+    // The second call is open and must not acquire an End.
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+            .filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "first"))
             .count(),
-        2
+        1
     );
+    assert!(!events.iter().any(|event| matches!(event,
+        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "second"
+    )));
     assert_eq!(events.last(), Some(&finish(FinishReason::MaxTokens)));
 }
 

@@ -53,6 +53,7 @@ fn windowed_summary(
                 name: (*slug).to_owned(),
                 display_name: None,
                 context_window: *window,
+                max_output_tokens: Some(30_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),

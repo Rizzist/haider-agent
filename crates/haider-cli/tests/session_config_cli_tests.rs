@@ -85,6 +85,43 @@ fn config_flag_vocabulary_is_exact() {
     assert!(parse_options(&args(&["--help"])).expect("parses").is_none());
 }
 
+/// D1 (973 output cap): `--max-output-tokens <n|auto>` is an explicit per-session
+/// output budget. `auto` returns to the model-derived budget (wire `0`); a
+/// bare budget change needs both the model-select and output-limit features.
+#[test]
+fn max_output_tokens_flag_sets_or_derives_the_session_budget() {
+    let options = parse_options(&args(&["--max-output-tokens", "12000"]))
+        .expect("parses")
+        .expect("not help");
+    assert_eq!(options.max_tokens, Some(12_000));
+    assert!(options.mutates());
+    let features = options.required_features();
+    assert!(features.contains(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1));
+    assert!(features.contains(haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1));
+    assert_eq!(
+        parse_options(&args(&["--max-output-tokens", "auto"]))
+            .expect("parses")
+            .expect("not help")
+            .max_tokens,
+        Some(0)
+    );
+    for bad in ["0", "-5", "lots", "--json"] {
+        assert!(
+            parse_options(&args(&["--max-output-tokens", bad])).is_err(),
+            "{bad} is not a budget"
+        );
+    }
+    assert_eq!(
+        parse_options(&args(&[
+            "--max-output-tokens",
+            "1",
+            "--max-output-tokens",
+            "2"
+        ])),
+        Err("duplicate --max-output-tokens flag".to_owned())
+    );
+}
+
 /// MUTATION CHECK: drop a setter's feature precondition. Expected RUNTIME
 /// failure: the required set loses the feature the daemon must serve.
 #[test]

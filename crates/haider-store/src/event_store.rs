@@ -142,6 +142,10 @@ mod event_store_append_tests;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound the reusable WAL allocation after a checkpoint/reset cycle.
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1_024 * 1_024;
+/// The original 1,000-page budget bounds each automatic WAL checkpoint to
+/// roughly 4 MiB plus the committing transaction. The compact journal keeps
+/// ordinary turns below this budget for multiple turns.
+const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1_000;
 const REPLAY_PAGE_SIZE: usize = 1_024;
 /// Keep the complete current `prepare_cached` census without the previous 2x
 /// headroom. This cache is an optimization only; eviction reparses SQL and
@@ -151,6 +155,21 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
 /// pattern is indexed and serialized, so a 512 KiB ceiling retains the hot
 /// B-tree path without pinning SQLite's 2 MiB default page cache at idle.
 const SQLITE_PAGE_CACHE_KIB: i64 = -512;
+/// Keep statement journals and temporary B-trees in memory (`2` = MEMORY).
+/// Group commits nest a savepoint per request, so a turn's batch can modify
+/// more than SQLite's 64 KiB in-memory statement-journal budget. With the
+/// desktop default (file), that spill is an unlinked `etilqs_*` file whose
+/// pages still reach the disk: 72–320 KiB on otherwise 4–8 KiB turns. These
+/// journals only support statement/savepoint rollback, never crash recovery,
+/// so WAL durability is unchanged. Android's bundled SQLite already compiles
+/// with `SQLITE_TEMP_STORE=3` (always memory).
+const SQLITE_TEMP_STORE_MEMORY: i64 = 2;
+/// File-backed temp store (`1`) for work whose statement journals, sorters
+/// and temporary tables scale with the profile instead of one turn: schema
+/// migrations and open-time backfills/sweeps, and whole-session deletes.
+/// Memory temp storage has no size bound, so these spill to disk above
+/// SQLite's in-memory budget instead of holding a profile-sized copy in RAM.
+const SQLITE_TEMP_STORE_FILE: i64 = 1;
 const CACHE_DIAGNOSTIC_KEY_FILE: &str = "cache-diagnostic.key";
 /// A v25 upgrade may need old graph facts, but profile open must never retain
 /// an unbounded copy of the journal. `envelope_weight_bytes` conservatively
@@ -771,6 +790,9 @@ pub struct SessionCreateCommand {
     pub provider: String,
     pub model: String,
     pub max_tokens: u64,
+    /// Whether `max_tokens` was derived or user-set; `None` leaves legacy
+    /// classification to readers (`SessionOutputBudgetSourceV1::classify`).
+    pub max_tokens_source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
     pub permission_overrides: Option<SessionPermissionOverridesV1>,
     /// Creation-time effort selection (G3). `None` — the wire `session.create`
     /// path — means the provider default; delegation passes the parent's
@@ -1077,6 +1099,10 @@ pub struct SessionSelectModelCommand {
     /// it (a concurrent explicit selection wins). Explicit selections pass
     /// `None` — the user's latest word is unconditional.
     pub expected_pair: Option<(String, String)>,
+    /// Output budget resolved by the daemon for the selected model. `None`
+    /// (the automatic pair-switch path, which has no validated model row)
+    /// keeps the stored budget unchanged.
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub event_id: EventId,
     pub device_id: DeviceId,
 }
@@ -1089,6 +1115,9 @@ pub struct SelectedModel {
     pub model: String,
     pub selected_seq: u64,
     pub worker_generation: u64,
+    /// Budget committed with this selection; absent in pre-973 receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
 }
 
 /// Result of the atomic metadata-update/event/receipt transaction.
@@ -2383,6 +2412,7 @@ impl Store {
         } = lease;
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection_with(&database_path, synchronous)?;
+        set_temp_store(&connection, SQLITE_TEMP_STORE_FILE)?;
         let migration = migrations::migrate(&mut connection)?;
         migrations::ensure_event_authority_triggers(&mut connection)?;
         let publication_pending = boot_publication_pending(&connection)?;
@@ -2412,6 +2442,7 @@ impl Store {
         let worker_generation = next_worker_generation(&mut connection)?;
         backfill_workflow_graph_journals(&mut connection, &cas, worker_generation)?;
         let graph_telemetry = rebuild_graph_telemetry_cache(&connection)?;
+        set_temp_store(&connection, SQLITE_TEMP_STORE_MEMORY)?;
 
         Ok(Self {
             root,
@@ -4963,30 +4994,9 @@ impl Store {
     /// daemon; this store operation owns only referentially complete removal.
     pub fn delete_session(&self, session_id: &SessionId) -> StoreResult<()> {
         let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite_error)?;
-        require_session(&transaction, session_id)?;
-        for statement in [
-            "DELETE FROM run_heads WHERE session_id = ?1",
-            "DELETE FROM run_head_sessions WHERE session_id = ?1",
-            "DELETE FROM session_projection_checkpoints WHERE session_id = ?1",
-            "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
-            "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
-            "DELETE FROM workflow_node_states WHERE session_id = ?1",
-            "DELETE FROM workflow_graph_instances WHERE session_id = ?1",
-            "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
-            "DELETE FROM menu_resolutions WHERE session_id = ?1",
-            "DELETE FROM branches WHERE session_id = ?1",
-            "DELETE FROM delegations WHERE parent_session_id = ?1 OR child_session_id = ?1",
-            "DELETE FROM events WHERE session_id = ?1",
-            "DELETE FROM sessions WHERE id = ?1",
-        ] {
-            transaction
-                .execute(statement, [session_id.as_str()])
-                .map_err(map_sqlite_error)?;
-        }
-        transaction.commit().map_err(map_sqlite_error)?;
+        with_file_temp_store(&mut connection, |connection| {
+            delete_session_rows(connection, session_id)
+        })?;
         self.invalidate_graph_reduction(session_id);
         Ok(())
     }
@@ -8619,6 +8629,7 @@ impl Store {
             account_alias,
             model: command.model.clone(),
             max_tokens: command.max_tokens,
+            max_tokens_source: command.max_tokens_source,
             system_prompt_version: Some(command.system_prompt_version.clone()),
             permission_overrides: command.permission_overrides,
             interaction_mode,
@@ -9768,6 +9779,16 @@ impl Store {
                 false,
             ));
         }
+        if command
+            .output_budget
+            .is_some_and(|budget| budget.max_tokens == 0)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "model selection output budget must be positive",
+                false,
+            ));
+        }
 
         let mut connection = self.connection()?;
         let transaction = connection
@@ -9824,6 +9845,10 @@ impl Store {
         }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
+        if let Some(budget) = command.output_budget {
+            metadata.max_tokens = budget.max_tokens;
+            metadata.max_tokens_source = Some(budget.source);
+        }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -9878,6 +9903,7 @@ impl Store {
             model: command.model.clone(),
             selected_seq: envelopes[0].seq,
             worker_generation: self.worker_generation,
+            output_budget: command.output_budget,
         };
         finalize_command_receipt(
             &transaction,
@@ -13030,6 +13056,11 @@ impl Store {
     /// The first row is always returned when `limit > 0`, even when that one
     /// envelope exceeds `byte_budget`. This preserves forward progress while
     /// bounding ordinary pages by `byte_budget` plus at most one decoded row.
+    /// Pending rows are read in global journal commit order (the `events`
+    /// rowid), as before v33, so one busy session whose id sorts first cannot
+    /// starve other sessions under `limit`. Within a session this is its
+    /// sequence order. The transient outbox is small, so the sort is cheap and
+    /// the outbox keeps its primary-key-only storage.
     pub fn pending_hook_dispatches_bounded(
         &self,
         limit: usize,
@@ -13050,7 +13081,7 @@ impl Store {
                  FROM hook_dispatch_outbox AS o
                  JOIN events AS e
                    ON e.session_id = o.session_id AND e.seq = o.seq
-                 ORDER BY o.rowid ASC
+                 ORDER BY e.rowid ASC
                  LIMIT ?1",
             )
             .map_err(map_sqlite_error)?;
@@ -25555,7 +25586,9 @@ fn same_session_batch(envelopes: &[RawEnvelope]) -> StoreResult<(SessionId, u64)
 }
 
 /// Opens the profile's long-lived journal connection with the required pragmas
-/// (WAL, configured synchronous policy, foreign keys, busy timeout).
+/// (busy timeout, foreign keys, WAL with its size limit and checkpoint
+/// interval, page-cache ceiling, in-memory temp store, configured synchronous
+/// policy). [`open_connection_with`] is the single place they are set.
 #[cfg(test)]
 fn open_connection(path: &Path) -> StoreResult<Connection> {
     open_connection_with(path, configured_store_synchronous()?)
@@ -25576,12 +25609,67 @@ fn open_connection_with(path: &Path, synchronous: StoreSynchronous) -> StoreResu
         .pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)
         .map_err(map_sqlite_error)?;
     connection
+        .pragma_update(None, "wal_autocheckpoint", WAL_AUTO_CHECKPOINT_PAGES)
+        .map_err(map_sqlite_error)?;
+    connection
         .pragma_update(None, "cache_size", SQLITE_PAGE_CACHE_KIB)
+        .map_err(map_sqlite_error)?;
+    connection
+        .pragma_update(None, "temp_store", SQLITE_TEMP_STORE_MEMORY)
         .map_err(map_sqlite_error)?;
     connection
         .pragma_update(None, "synchronous", synchronous.pragma_value())
         .map_err(map_sqlite_error)?;
     Ok(connection)
+}
+
+/// Switches where SQLite keeps statement journals, sorters and temporary
+/// tables. Must run outside a transaction; it drops TEMP objects.
+fn set_temp_store(connection: &Connection, mode: i64) -> StoreResult<()> {
+    connection
+        .pragma_update(None, "temp_store", mode)
+        .map_err(map_sqlite_error)
+}
+
+/// Runs profile-sized bulk work with a file-backed temp store, then restores
+/// the per-turn in-memory setting even when the work fails.
+fn with_file_temp_store<T>(
+    connection: &mut Connection,
+    work: impl FnOnce(&mut Connection) -> StoreResult<T>,
+) -> StoreResult<T> {
+    set_temp_store(connection, SQLITE_TEMP_STORE_FILE)?;
+    let outcome = work(connection);
+    let restored = set_temp_store(connection, SQLITE_TEMP_STORE_MEMORY);
+    let value = outcome?;
+    restored?;
+    Ok(value)
+}
+/// Deletes every row one session owns in a single transaction.
+fn delete_session_rows(connection: &mut Connection, session_id: &SessionId) -> StoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    require_session(&transaction, session_id)?;
+    for statement in [
+        "DELETE FROM run_heads WHERE session_id = ?1",
+        "DELETE FROM run_head_sessions WHERE session_id = ?1",
+        "DELETE FROM session_projection_checkpoints WHERE session_id = ?1",
+        "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
+        "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
+        "DELETE FROM workflow_node_states WHERE session_id = ?1",
+        "DELETE FROM workflow_graph_instances WHERE session_id = ?1",
+        "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
+        "DELETE FROM menu_resolutions WHERE session_id = ?1",
+        "DELETE FROM branches WHERE session_id = ?1",
+        "DELETE FROM delegations WHERE parent_session_id = ?1 OR child_session_id = ?1",
+        "DELETE FROM events WHERE session_id = ?1",
+        "DELETE FROM sessions WHERE id = ?1",
+    ] {
+        transaction
+            .execute(statement, [session_id.as_str()])
+            .map_err(map_sqlite_error)?;
+    }
+    transaction.commit().map_err(map_sqlite_error)
 }
 
 fn configured_store_synchronous() -> StoreResult<StoreSynchronous> {
@@ -28558,7 +28646,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v31 and reopen.
+    /// v23's run-head backfill remains untouched through v33 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -28595,6 +28683,9 @@ mod run_head_projection_tests {
              DROP TABLE workflow_graph_instances;
              ALTER TABLE profile_meta DROP COLUMN boot_publication_pending;
              ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
+             DROP TABLE provider_view_request_history;
+             DROP TABLE provider_view_history_blocks;
+             DROP TABLE provider_view_history_segments;
              DROP TABLE provider_view_gc;
              DROP TABLE provider_view_blocks;
              DROP TABLE provider_view_requests;
@@ -28609,7 +28700,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 31);
+            assert_eq!(store.schema_version().expect("schema version"), 33);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))
@@ -29245,8 +29336,8 @@ mod store_synchronous_tests {
         );
         assert_eq!(
             queried_i64_pragma(&connection, "wal_autocheckpoint"),
-            1_000,
-            "the existing 1000-frame autocheckpoint must remain unchanged"
+            WAL_AUTO_CHECKPOINT_PAGES,
+            "every store connection must retain the bounded checkpoint interval"
         );
 
         connection
@@ -29313,6 +29404,86 @@ mod store_synchronous_tests {
             queried_i64_pragma(&connection, "cache_size"),
             SQLITE_PAGE_CACHE_KIB,
             "every store connection must install the measured page-cache ceiling"
+        );
+    }
+
+    /// MUTATION CHECK: removing the `temp_store` pragma (desktop default
+    /// FILE) must fail the MEMORY pin, and the savepoint below would again
+    /// spill its statement journal to an unlinked temporary file.
+    #[test]
+    fn statement_journals_stay_in_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut connection = open_connection_with(
+            &dir.path().join("temp-store.sqlite"),
+            StoreSynchronous::Normal,
+        )
+        .expect("open store");
+        assert_eq!(
+            queried_i64_pragma(&connection, "temp_store"),
+            SQLITE_TEMP_STORE_MEMORY,
+            "every store connection must keep statement journals in memory"
+        );
+        connection
+            .execute_batch(
+                "CREATE TABLE savepoint_pressure (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+            )
+            .expect("create pressure table");
+        let payload = vec![0x5A_u8; 2 * 1_024];
+        for id in 0..256_i64 {
+            connection
+                .execute(
+                    "INSERT INTO savepoint_pressure(id, payload) VALUES (?1, ?2)",
+                    params![id, payload.as_slice()],
+                )
+                .expect("seed pressure row");
+        }
+        // A savepoint rewriting ~128 existing pages exceeds SQLite's 64 KiB
+        // in-memory statement-journal budget; rollback must still restore it.
+        let mut transaction = connection.transaction().expect("begin");
+        {
+            let savepoint = transaction.savepoint().expect("savepoint");
+            savepoint
+                .execute("UPDATE savepoint_pressure SET payload = zeroblob(2048)", [])
+                .expect("rewrite rows");
+            savepoint.finish().expect("roll back savepoint");
+        }
+        let preserved: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM savepoint_pressure WHERE payload = ?1",
+                params![payload.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count preserved rows");
+        transaction.commit().expect("commit");
+        assert_eq!(preserved, 256, "savepoint rollback must restore every page");
+    }
+
+    /// MUTATION CHECK: skip the restore in `with_file_temp_store` or at the
+    /// end of `Store::open`, or drop the file-backed switch. Expected runtime
+    /// failure: a pragma pin below reports the wrong temp store.
+    #[test]
+    fn bulk_work_uses_a_file_temp_store_and_restores_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut connection = store.connection().expect("connection");
+        assert_eq!(
+            queried_i64_pragma(&connection, "temp_store"),
+            SQLITE_TEMP_STORE_MEMORY,
+            "open-time bulk work must hand back the per-turn in-memory setting"
+        );
+        let failed: StoreResult<()> = with_file_temp_store(&mut connection, |connection| {
+            assert_eq!(
+                queried_i64_pragma(connection, "temp_store"),
+                SQLITE_TEMP_STORE_FILE,
+                "bulk work spills temporary storage to disk"
+            );
+            Err(store_error(ErrorCode::Internal, "bulk work failed", false))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            queried_i64_pragma(&connection, "temp_store"),
+            SQLITE_TEMP_STORE_MEMORY,
+            "a failed bulk operation still restores the in-memory setting"
         );
     }
 

@@ -412,6 +412,8 @@ pub struct HeadlessRunRequest {
     pub provider: Option<String>,
     /// Explicit model override. `None` follows the selected provider summary.
     pub model: Option<String>,
+    /// Per-response output budget. Zero asks a supporting daemon to derive
+    /// the effective value from the resolved provider/model row.
     pub max_tokens: u64,
     pub budget: RunBudgetV1,
     pub seed: Option<u64>,
@@ -2931,6 +2933,11 @@ async fn run_headless_inner(
         !request.attachments.is_empty(),
         request.trust_hooks,
     );
+    if request.max_tokens == 0 && resume_run_id.is_none() && existing_session_id.is_none() {
+        ensure
+            .required_features
+            .insert(haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1.to_owned());
+    }
     let pinned_headless = resume_run_id.is_some()
         || request.journal_pin
         || request.detached
@@ -3214,7 +3221,7 @@ async fn run_headless_inner(
             cwd: created_metadata.cwd.clone(),
             provider: provider.clone(),
             model: model.clone(),
-            max_output_tokens: request.max_tokens,
+            max_output_tokens: created_metadata.max_tokens,
             effort: session_config.effort.clone(),
             fast: session_config.fast.unwrap_or(false),
             seed: request.seed,

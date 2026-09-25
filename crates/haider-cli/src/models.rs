@@ -64,6 +64,7 @@ struct ModelView {
     context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<haider_rpc::ModelDetailSourceWire>,
+    max_output_tokens: Option<u64>,
     supported_efforts: Vec<String>,
     default_effort: Option<String>,
     supported_speeds: Vec<String>,
@@ -453,6 +454,7 @@ fn model_view(model: String) -> ModelView {
         model,
         context_window: None,
         source: None,
+        max_output_tokens: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
@@ -465,6 +467,7 @@ fn model_detail_view(detail: ModelDetailWire) -> ModelView {
         model: detail.name,
         context_window: detail.context_window,
         source: detail.source,
+        max_output_tokens: detail.max_output_tokens,
         supported_efforts: detail.supported_efforts,
         default_effort: detail.default_effort,
         supported_speeds: detail.supported_speeds,
@@ -520,6 +523,9 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
             let context = model
                 .context_window
                 .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
+            let output = model
+                .max_output_tokens
+                .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string());
             let source = model
                 .source
                 .filter(|source| *source != haider_rpc::ModelDetailSourceWire::Unknown)
@@ -527,8 +533,8 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
                     format!("  source={}", source.as_str())
                 });
             text.push_str(&format!(
-                "  {}  context_window={}{}\n",
-                model.model, context, source
+                "  {}  context_window={}  max_output_tokens={}{}\n",
+                model.model, context, output, source
             ));
         }
     }

@@ -44,6 +44,7 @@ fn picker_keeps_403_subscription_static_row_selectable() {
         name: "claude-fable-5-1".into(),
         display_name: None,
         context_window: Some(1_000_000),
+        max_output_tokens: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),

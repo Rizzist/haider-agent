@@ -82,6 +82,7 @@ fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionM
         account_alias: None,
         model: model.to_owned(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         system_prompt_version: Some("test-v1".into()),
         permission_overrides: None,
         interaction_mode: SessionInteractionModeV1::Interactive,
