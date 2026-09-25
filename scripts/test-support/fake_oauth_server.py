@@ -59,7 +59,8 @@ LOOPBACK_REDIRECT_HOSTS = {"localhost", "127.0.0.1"}
 
 class FakeOAuthState:
     def __init__(self, script: dict | None = None):
-        self.lock = threading.Lock()
+        # Re-entrant, and never held across a socket write (see _send).
+        self.lock = threading.RLock()
         self.script = {
             "identity": dict(DEFAULT_IDENTITY),
             "profile_statuses": [],
@@ -117,6 +118,11 @@ def profile_document(identity: dict) -> dict:
 def make_handler(state: FakeOAuthState):
     class Handler(BaseHTTPRequestHandler):
         server_version = "haider-fake-oauth/1"
+        # A real provider speaks HTTP/1.1; an HTTP/1.0 302 makes clients
+        # follow the redirect with HTTP/1.0, which the daemon's strict
+        # browser-callback parser (rightly) rejects. Every reply sets
+        # Content-Length and Connection: close.
+        protocol_version = "HTTP/1.1"
 
         def log_message(self, *_args):  # quiet; /__log is the record
             pass
@@ -152,10 +158,12 @@ def make_handler(state: FakeOAuthState):
                 return self._profile()
             if url.path == "/__state":
                 with state.lock:
-                    return self._send(200, dict(state.script))
+                    snapshot = dict(state.script)
+                return self._send(200, snapshot)
             if url.path == "/__log":
                 with state.lock:
-                    return self._send(200, list(state.log))
+                    snapshot = list(state.log)
+                return self._send(200, snapshot)
             return self._send(404, {"error": "not_found"})
 
         def do_POST(self):

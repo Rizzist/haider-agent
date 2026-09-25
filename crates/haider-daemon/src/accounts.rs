@@ -7256,6 +7256,12 @@ async fn handle_oauth_add(
         );
         return;
     }
+    // The source rows are derived from descriptor status: republish them so
+    // a dead row that was just re-logged no longer reads "revoked · relogin
+    // required" until the next restart or source scan.
+    if let Ok(registry) = source_registry.lock() {
+        publish_source_snapshot(source_snapshot, &registry, accounts);
+    }
     finalize_oauth_commit(
         store,
         accounts,

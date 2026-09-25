@@ -125,6 +125,29 @@ class FakeOAuthServerTests(unittest.TestCase):
         self.assertNotIn(token, log)
         self.assertNotIn("fake-rt-", log)
 
+    def test_inspection_endpoints_never_wedge_the_server(self):
+        # Regression: /__log and /__state once sent their reply while holding
+        # the state lock, deadlocking every later request.
+        for _ in range(3):
+            self.assertEqual(call(f"{self.origin}/__log")[0], 200)
+            self.assertEqual(call(f"{self.origin}/__state")[0], 200)
+        status, _, _ = call(f"{self.origin}/__control", json.dumps({"retry_after": 0}).encode(),
+                            {"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.login()[0], 200)
+
+    def test_replies_are_http_1_1(self):
+        # Clients follow the authorize 302 with the reply's HTTP version; the
+        # daemon's loopback callback accepts only HTTP/1.1.
+        import http.client
+        host, port = self.server.server_address
+        connection = http.client.HTTPConnection(host, port, timeout=5)
+        connection.request("GET", "/__state")
+        response = connection.getresponse()
+        self.assertEqual(response.version, 11)
+        response.read()
+        connection.close()
+
     def test_non_loopback_bind_is_refused(self):
         with self.assertRaises(SystemExit):
             fake_oauth_server.serve("0.0.0.0", 0)
