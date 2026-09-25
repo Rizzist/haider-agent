@@ -138,6 +138,25 @@ pub(crate) fn store_error(
     HaiderError::new(code, message, retryable)
 }
 
+/// `details.durable_run_state` value on the refusal the journal returns when
+/// a worker appends anything but `Cancelled` to a run that is durably
+/// `cancelling` (the user's cancellation won the race to the journal).
+pub const DURABLY_CANCELLING_DETAIL: &str = "cancelling";
+
+/// Whether `error` is the journal's "run is durably cancelling; only
+/// Cancelled may follow" refusal. A worker that receives it lost a race with
+/// a committed cancellation and must settle the turn as cancelled.
+#[must_use]
+pub fn is_durably_cancelling_refusal(error: &HaiderError) -> bool {
+    error.code == ErrorCode::RunNotActive
+        && error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("durable_run_state"))
+            .and_then(serde_json::Value::as_str)
+            == Some(DURABLY_CANCELLING_DETAIL)
+}
+
 /// Current wall-clock time as Unix milliseconds.
 pub(crate) fn now_ms() -> StoreResult<u64> {
     use std::time::{SystemTime, UNIX_EPOCH};

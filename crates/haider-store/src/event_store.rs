@@ -23466,11 +23466,15 @@ fn validate_worker_run_transitions(
                 && next != RunState::Cancelled
                 && !budget_terminal_wins
             {
-                return Err(store_error(
+                let mut refusal = store_error(
                     ErrorCode::RunNotActive,
                     format!("worker run {run_id} is durably cancelling; only Cancelled may follow"),
                     false,
-                ));
+                );
+                refusal.details = Some(serde_json::json!({
+                    "durable_run_state": crate::DURABLY_CANCELLING_DETAIL,
+                }));
+                return Err(refusal);
             }
             states.insert(run_id.clone(), (next, 0, accepted_branch));
         }

@@ -69,6 +69,10 @@ pub const PRESENCE_IDLE_TIMEOUT: Duration = Duration::from_secs(CU_PRESENCE_IDLE
 /// after this long so the machine cannot grow without bound.
 pub const STOPPED_LEASE_RETENTION: Duration = Duration::from_secs(600);
 
+/// Upper bound the daemon waits for a surface to take capturable UI off
+/// screen before a model-facing capture. Missing acks never block capture.
+pub const CONCEAL_ACK_TIMEOUT: Duration = Duration::from_millis(600);
+
 /// Upper bound the daemon waits for an overlay to acknowledge a pointer
 /// command before the input is posted (the overlay moves its Stop badge out
 /// of the way of a synthetic click). Missing acks never block control.
@@ -246,6 +250,12 @@ pub enum PresenceCommand {
         surface: PresenceSurface,
         reason: PresenceEndReason,
     },
+    /// A model-facing capture is about to run and this surface reported
+    /// `capture_excluded: false`: take any capturable UI off screen, then
+    /// answer [`PresenceEvent::Ack`] with `seq`.
+    Conceal { surface: PresenceSurface, seq: u64 },
+    /// The capture finished; restore what `Conceal` removed.
+    Reveal { surface: PresenceSurface },
 }
 
 impl PresenceCommand {
@@ -255,7 +265,9 @@ impl PresenceCommand {
             Self::Show { surface, .. }
             | Self::Pointer { surface, .. }
             | Self::Stopping { surface }
-            | Self::Hide { surface, .. } => *surface,
+            | Self::Hide { surface, .. }
+            | Self::Conceal { surface, .. }
+            | Self::Reveal { surface } => *surface,
         }
     }
 }
@@ -288,12 +300,23 @@ pub enum PresenceRefusal {
     Stopped,
 }
 
+/// One run's presence. A run may drive several surfaces (e.g. a desktop
+/// screenshot, then a phone tap); each is tracked separately so Stop on any
+/// of them stops the run and run end retires all of them.
 #[derive(Debug, Clone)]
 struct Lease {
-    surface: PresenceSurface,
-    last_activity: Instant,
+    /// Surface -> time of its latest activity.
+    surfaces: BTreeMap<PresenceSurface, Instant>,
+    /// Surface of the action most recently begun (what `finish` refreshes).
+    current: PresenceSurface,
     in_flight: u32,
-    stopped: bool,
+    stopped_at: Option<Instant>,
+}
+
+impl Lease {
+    const fn stopped(&self) -> bool {
+        self.stopped_at.is_some()
+    }
 }
 
 /// Session-scoped presence state. `K` identifies one run (the daemon uses
@@ -335,19 +358,17 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         point: Option<PresencePoint>,
         now: Instant,
     ) -> Result<(u64, Vec<PresenceCommand>), PresenceRefusal> {
-        if let Some(lease) = self.leases.get(&key)
-            && lease.stopped
-        {
+        if self.leases.get(&key).is_some_and(Lease::stopped) {
             return Err(PresenceRefusal::Stopped);
         }
-        let lease = self.leases.entry(key).or_insert(Lease {
-            surface,
-            last_activity: now,
+        let lease = self.leases.entry(key).or_insert_with(|| Lease {
+            surfaces: BTreeMap::new(),
+            current: surface,
             in_flight: 0,
-            stopped: false,
+            stopped_at: None,
         });
-        lease.surface = surface;
-        lease.last_activity = now;
+        lease.surfaces.insert(surface, now);
+        lease.current = surface;
         lease.in_flight = lease.in_flight.saturating_add(1);
         let mut commands = Vec::with_capacity(2);
         if self.shown.insert(surface) {
@@ -371,48 +392,73 @@ impl<K: Ord + Clone> PresenceMachine<K> {
     pub fn finish_action(&mut self, key: &K, now: Instant) {
         if let Some(lease) = self.leases.get_mut(key) {
             lease.in_flight = lease.in_flight.saturating_sub(1);
-            lease.last_activity = now;
+            let current = lease.current;
+            if let Some(last) = lease.surfaces.get_mut(&current) {
+                *last = now;
+            }
         }
     }
 
-    /// The run ended (normally or cancelled). Drops the lease and hides the
-    /// surface once no active lease still needs it.
+    /// The run ended (normally or cancelled). Drops the lease and hides
+    /// every surface it used once no other active lease still needs it.
     pub fn end(&mut self, key: &K, reason: PresenceEndReason) -> Vec<PresenceCommand> {
         let Some(lease) = self.leases.remove(key) else {
             return Vec::new();
         };
-        self.hide_if_unused(lease.surface, reason)
+        lease
+            .surfaces
+            .into_keys()
+            .flat_map(|surface| self.hide_if_unused(surface, reason))
+            .collect()
     }
 
-    /// Expires idle leases and reclaims stale stopped ones.
+    /// Expires idle surfaces and reclaims stale stopped leases.
     pub fn tick(&mut self, now: Instant) -> Vec<PresenceCommand> {
         let idle_timeout = self.idle_timeout;
-        let mut expired_surfaces = BTreeSet::new();
+        let mut expired = BTreeSet::new();
         self.leases.retain(|_, lease| {
-            let quiet = now.saturating_duration_since(lease.last_activity);
-            if lease.stopped {
-                return quiet < STOPPED_LEASE_RETENTION;
+            if let Some(stopped_at) = lease.stopped_at {
+                return now.saturating_duration_since(stopped_at) < STOPPED_LEASE_RETENTION;
             }
-            if lease.in_flight == 0 && quiet >= idle_timeout {
-                expired_surfaces.insert(lease.surface);
-                return false;
-            }
-            true
+            let (in_flight, current) = (lease.in_flight, lease.current);
+            lease.surfaces.retain(|surface, last| {
+                let busy = in_flight > 0 && *surface == current;
+                let idle = now.saturating_duration_since(*last) >= idle_timeout;
+                if idle && !busy {
+                    expired.insert(*surface);
+                    false
+                } else {
+                    true
+                }
+            });
+            !lease.surfaces.is_empty() || lease.in_flight > 0
         });
-        expired_surfaces
+        expired
             .into_iter()
             .flat_map(|surface| self.hide_if_unused(surface, PresenceEndReason::Idle))
             .collect()
     }
 
-    /// The human pressed Stop on `surface`. Every active lease on it is
-    /// marked stopped (further actions are refused) and returned so the
-    /// caller can cancel the in-flight action and the run.
+    /// The human pressed Stop on `surface`. Every active run that uses it is
+    /// marked stopped (further actions on ANY surface are refused) and
+    /// returned so the caller can cancel the in-flight action and the run.
+    /// The pressed surface and every other surface only those runs used are
+    /// hidden.
     pub fn stop(&mut self, surface: PresenceSurface) -> (Vec<K>, Vec<PresenceCommand>) {
+        self.stop_at(surface, Instant::now())
+    }
+
+    pub fn stop_at(
+        &mut self,
+        surface: PresenceSurface,
+        now: Instant,
+    ) -> (Vec<K>, Vec<PresenceCommand>) {
         let mut stopped = Vec::new();
+        let mut touched = BTreeSet::new();
         for (key, lease) in &mut self.leases {
-            if lease.surface == surface && !lease.stopped {
-                lease.stopped = true;
+            if !lease.stopped() && lease.surfaces.contains_key(&surface) {
+                lease.stopped_at = Some(now);
+                touched.extend(lease.surfaces.keys().copied());
                 stopped.push(key.clone());
             }
         }
@@ -424,6 +470,10 @@ impl<K: Ord + Clone> PresenceMachine<K> {
                 reason: PresenceEndReason::Stopped,
             });
         }
+        touched.remove(&surface);
+        for other in touched {
+            commands.extend(self.hide_if_unused(other, PresenceEndReason::Stopped));
+        }
         (stopped, commands)
     }
 
@@ -434,7 +484,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
 
     #[must_use]
     pub fn is_stopped(&self, key: &K) -> bool {
-        self.leases.get(key).is_some_and(|lease| lease.stopped)
+        self.leases.get(key).is_some_and(Lease::stopped)
     }
 
     /// Whether any lease (active or stopped) remains, i.e. whether a caller
@@ -452,7 +502,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         let still_used = self
             .leases
             .values()
-            .any(|lease| lease.surface == surface && !lease.stopped);
+            .any(|lease| !lease.stopped() && lease.surfaces.contains_key(&surface));
         if !still_used && self.shown.remove(&surface) {
             vec![PresenceCommand::Hide { surface, reason }]
         } else {

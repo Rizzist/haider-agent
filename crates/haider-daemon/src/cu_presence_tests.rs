@@ -15,6 +15,7 @@ struct Recorded {
 struct FakeRenderer {
     recorded: Arc<Recorded>,
     acks: bool,
+    capturable: bool,
 }
 
 impl PresenceRenderer for FakeRenderer {
@@ -25,12 +26,23 @@ impl PresenceRenderer for FakeRenderer {
     fn acknowledges_pointers(&self) -> bool {
         self.acks
     }
+    fn capturable(&self) -> bool {
+        self.capturable
+    }
     fn close(&mut self) {
         self.recorded.closed.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 fn presence_with(surface: PresenceSurface, acks: bool) -> (Arc<CuPresence>, Arc<Recorded>) {
+    presence_with_capturable(surface, acks, false)
+}
+
+fn presence_with_capturable(
+    surface: PresenceSurface,
+    acks: bool,
+    capturable: bool,
+) -> (Arc<CuPresence>, Arc<Recorded>) {
     let presence = CuPresence::new(Duration::from_millis(200), Duration::from_millis(20));
     let recorded = Arc::new(Recorded::default());
     let factory_record = Arc::clone(&recorded);
@@ -42,6 +54,7 @@ fn presence_with(surface: PresenceSurface, acks: bool) -> (Arc<CuPresence>, Arc<
             Some(Box::new(FakeRenderer {
                 recorded: Arc::clone(&factory_record),
                 acks,
+                capturable,
             }) as Box<dyn PresenceRenderer>)
         }),
     );
@@ -348,4 +361,123 @@ async fn dropping_a_lease_without_close_still_retires_presence() {
     }
     assert!(!presence.is_shown(PresenceSurface::Screen));
     assert_eq!(recorded.closed.load(Ordering::SeqCst), 1);
+}
+
+/// Verifier finding (191a8d60): Stop released the pointer ack before the
+/// in-flight token flipped, so a click waiting on the ack could run.
+/// MUTATION CHECK: flip the token after `dispatch` and drop the post-wait
+/// `is_stopped` re-check. Expected runtime failure: the waiting `begin`
+/// returns Ok (the click would execute) or its token is not yet cancelled.
+#[tokio::test]
+async fn stop_during_the_pointer_ack_wait_refuses_the_click_and_cancels_its_token() {
+    for _ in 0..50 {
+        let (presence, recorded) = presence_with(PresenceSurface::Screen, true);
+        let (stop, stops) = counting_hook();
+        let lease = Arc::new(PresenceLease::new(
+            Arc::clone(&presence),
+            "s/ack-race".into(),
+            stop,
+        ));
+        let token = haider_tools::ComputerCancelToken::new();
+        let waiting = tokio::spawn({
+            let lease = Arc::clone(&lease);
+            let token = token.clone();
+            async move {
+                let result = lease.begin_computer(&click(), None, &token).await.map(drop);
+                // What the dispatcher checks right before `execute`.
+                (result, token.is_cancelled())
+            }
+        });
+        // Deterministically wait until the click is parked on its ack.
+        while !recorded
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, PresenceCommand::Pointer { .. }))
+        {
+            tokio::task::yield_now().await;
+        }
+        let sink = recorded.sink.lock().unwrap().clone().expect("sink");
+        sink(PresenceEvent::Stop);
+        let (result, cancelled_on_resume) = waiting.await.expect("join");
+        assert_eq!(
+            result,
+            Err(PresenceRefusal::Stopped),
+            "the parked click is refused"
+        );
+        assert!(
+            cancelled_on_resume,
+            "its token was already cancelled when it resumed"
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Verifier finding (191a8d60), daemon side of the same-run two-surface bug.
+#[tokio::test]
+async fn desktop_stop_reaches_a_run_that_moved_on_to_the_phone() {
+    let presence = CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let (stop, stops) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/two".into(), stop);
+    drop(
+        lease
+            .begin_computer(&click(), None, &haider_tools::ComputerCancelToken::new())
+            .await
+            .expect("screen"),
+    );
+    drop(
+        lease
+            .begin_mobile(
+                &MobileAction::Tap {
+                    element_id: None,
+                    x: Some(1),
+                    y: Some(1),
+                },
+                &haider_tools::MobileCancelToken::new(),
+            )
+            .await
+            .expect("phone"),
+    );
+    assert_eq!(presence.stop(PresenceSurface::Screen), 1);
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
+    assert!(lease.is_stopped());
+    assert!(!presence.is_shown(PresenceSurface::Screen));
+    assert!(!presence.is_shown(PresenceSurface::Phone));
+}
+
+/// Verifier finding (191a8d60), Linux: a capturable indicator (the
+/// notification popup) is concealed around every model-facing capture and
+/// revealed afterwards; an excluded overlay (macOS/Windows) is left alone.
+#[tokio::test]
+async fn capturable_indicators_are_concealed_around_model_captures_only() {
+    for capturable in [true, false] {
+        let (presence, recorded) =
+            presence_with_capturable(PresenceSurface::Screen, false, capturable);
+        let (stop, _) = counting_hook();
+        let lease = PresenceLease::new(Arc::clone(&presence), "s/conceal".into(), stop);
+        // As in the dispatcher, the screenshot action stays in flight (so it
+        // cannot idle out) for the whole conceal -> capture -> reveal span.
+        let action = lease
+            .begin_computer(
+                &ComputerAction::Screenshot,
+                None,
+                &haider_tools::ComputerCancelToken::new(),
+            )
+            .await
+            .expect("begin");
+        // Nobody acks: the bounded wait elapses, the capture proceeds.
+        let guard = lease.conceal_for_capture().await;
+        assert_eq!(guard.is_some(), capturable);
+        drop(guard);
+        drop(action);
+        let commands = recorded.commands.lock().unwrap().clone();
+        let concealed = commands
+            .iter()
+            .any(|command| matches!(command, PresenceCommand::Conceal { .. }));
+        let revealed = commands
+            .iter()
+            .any(|command| matches!(command, PresenceCommand::Reveal { .. }));
+        assert_eq!((concealed, revealed), (capturable, capturable));
+    }
 }

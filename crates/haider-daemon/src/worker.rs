@@ -13957,6 +13957,26 @@ pub(crate) struct BrokerToolFactory;
 pub(crate) struct InjectedComputerBrokerToolFactory {
     backend: Arc<dyn ComputerBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
+    /// Per-test presence controller, so a test's Stop can never reach runs
+    /// of other tests executing in the same process.
+    presence: Arc<crate::cu_presence::CuPresence>,
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+impl InjectedComputerBrokerToolFactory {
+    /// Uses `presence` (e.g. with fake renderers) instead of a fresh one.
+    pub(crate) fn with_presence(mut self, presence: Arc<crate::cu_presence::CuPresence>) -> Self {
+        self.presence = presence;
+        self
+    }
+}
+
+#[cfg(test)]
+fn isolated_test_presence() -> Arc<crate::cu_presence::CuPresence> {
+    crate::cu_presence::CuPresence::new(
+        haider_tools::presence::PRESENCE_IDLE_TIMEOUT,
+        std::time::Duration::from_secs(1),
+    )
 }
 
 #[cfg(test)]
@@ -13975,6 +13995,7 @@ impl BrokerToolFactory {
         InjectedComputerBrokerToolFactory {
             backend,
             screenshot_redaction: Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            presence: isolated_test_presence(),
         }
     }
 
@@ -13989,6 +14010,7 @@ impl BrokerToolFactory {
         InjectedComputerBrokerToolFactory {
             backend,
             screenshot_redaction,
+            presence: isolated_test_presence(),
         }
     }
 
@@ -16491,6 +16513,7 @@ impl TurnToolFactory for AndroidToolFactory {
             )),
             crate::mobile_transport::platform_mobile_backend(),
             Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            Arc::clone(crate::cu_presence::global()),
         )
         .await
     }
@@ -16560,6 +16583,7 @@ impl TurnToolFactory for BrokerToolFactory {
             haider_tools::platform_computer_backend(),
             crate::mobile_transport::platform_mobile_backend(),
             redaction,
+            Arc::clone(crate::cu_presence::global()),
         )
         .await
     }
@@ -16616,6 +16640,7 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
             Arc::clone(&self.backend),
             haider_tools::platform_mobile_backend(),
             Arc::clone(&self.screenshot_redaction),
+            Arc::clone(&self.presence),
         )
         .await
     }
@@ -16672,6 +16697,7 @@ impl TurnToolFactory for InjectedMobileBrokerToolFactory {
             Arc::new(haider_tools::UnavailableComputerBackend::new("mobile-test")),
             Arc::clone(&self.backend),
             Arc::new(haider_tools::PassthroughScreenshotRedaction),
+            isolated_test_presence(),
         )
         .await
     }
@@ -16687,6 +16713,7 @@ async fn create_broker_tool_dispatcher(
     computer: Arc<dyn ComputerBackend>,
     mobile: Arc<dyn MobileBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
+    presence: Arc<crate::cu_presence::CuPresence>,
 ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
     let session_id = context.store.session_id().clone();
     let durable_terminal_failure = durable_read_only_terminal_failure(
@@ -16793,6 +16820,7 @@ async fn create_broker_tool_dispatcher(
         event_ids: Arc::clone(&context.event_ids),
     };
     let cu_presence = crate::cu_presence::PresenceLease::for_run(
+        presence,
         context.store.hub().clone(),
         session_id.clone(),
         context.run_id.clone(),
@@ -23221,10 +23249,15 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     let intent = broker
                         .authorize_computer(operation, &policy)
                         .await?;
-                    // Stop pressed: refuse before prepare/dispatch, exactly
-                    // like a failed preflight (nothing reaches the OS).
+                    // Stop pressed: refuse before prepare/dispatch (nothing
+                    // reaches the OS) and let the turn cancellation that Stop
+                    // submitted settle the turn, exactly like ESC.
                     if self.cu_presence.is_stopped() {
-                        return Err(ToolError::Computer(ComputerError::Cancelled));
+                        return Ok(presence_stopped_result(
+                            cancel,
+                            computer_failure_result(&ComputerError::Cancelled),
+                        )
+                        .await);
                     }
                     match self
                         .computer
@@ -23313,8 +23346,23 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             broker
                                 .journal_computer_outcome(&intent, EffectOutcome::Cancelled)
                                 .await?;
-                            return Err(ToolError::Computer(ComputerError::Cancelled));
+                            return Ok(presence_stopped_result(
+                                cancel,
+                                computer_failure_result(&ComputerError::Cancelled),
+                            )
+                            .await);
                         }
+                    };
+                    // A capturable indicator (Linux notification popup) is
+                    // taken off screen for the model-facing capture.
+                    let _revealed_after_capture = if matches!(
+                        operation.action(),
+                        haider_protocol::computer::ComputerAction::Screenshot
+                            | haider_protocol::computer::ComputerAction::Inspect { .. }
+                    ) {
+                        self.cu_presence.conceal_for_capture().await
+                    } else {
+                        None
                     };
                     match self.computer.execute(operation.action(), &action_cancel).await {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
@@ -23554,7 +23602,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     let action_cancel = MobileCancelToken::new();
                     let intent = broker.authorize_mobile(operation, &policy).await?;
                     if self.cu_presence.is_stopped() {
-                        return Err(ToolError::Mobile(MobileError::Cancelled));
+                        return Ok(presence_stopped_result(
+                            cancel,
+                            mobile_failure_result(&MobileError::Cancelled),
+                        )
+                        .await);
                     }
                     self.mobile
                         .prepare(operation.action(), &action_cancel)
@@ -23573,7 +23625,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             broker
                                 .journal_mobile_outcome(&intent, EffectOutcome::Cancelled)
                                 .await?;
-                            return Err(ToolError::Mobile(MobileError::Cancelled));
+                            return Ok(presence_stopped_result(
+                                cancel,
+                                mobile_failure_result(&MobileError::Cancelled),
+                            )
+                            .await);
                         }
                     };
                     match self
@@ -24437,6 +24493,25 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         error,
         serde_json::Value::Null,
     ))
+}
+
+/// How long a Stop-refused CU action waits for the run's own turn
+/// cancellation (which Stop submitted) before settling as a tool result.
+const PRESENCE_STOP_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Settles a CU action refused because the human pressed Stop.
+///
+/// The core treats an `Err` from the dispatcher as a fatal store error, not
+/// a cancellation; ESC never reaches that path because the turn's cancel
+/// token wins the core's biased select first. Stop, by contrast, refuses the
+/// action before its turn cancellation lands, and returning `Err` then left
+/// the run stuck in `cancelling` (live repro, 973-cu-presence 3-repair). So
+/// wait for the turn cancellation Stop already submitted: the core drops
+/// this future and settles the turn exactly like ESC. Only if it never
+/// arrives, report a `Cancelled` tool result instead of an error.
+async fn presence_stopped_result(cancel: &CancelToken, cancelled: BoundedResult) -> BoundedResult {
+    let _ = tokio::time::timeout(PRESENCE_STOP_CANCEL_GRACE, cancel.cancelled()).await;
+    cancelled
 }
 
 fn computer_failure_result(error: &ComputerError) -> BoundedResult {

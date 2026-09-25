@@ -89,25 +89,26 @@ class AccessibilityPresenceOverlay(
         notifications().cancel(NOTIFICATION_ID)
     }
 
-    override suspend fun <T> withHidden(block: suspend () -> T): T {
-        val hidden = withContext(Dispatchers.Main.immediate) {
-            if (!shown) return@withContext false
-            pointerLayer.visibility = View.INVISIBLE
-            chip.visibility = View.INVISIBLE
-            awaitCommittedFrame(pointerLayer)
-            true
-        }
-        return try {
-            block()
-        } finally {
-            if (hidden) {
-                withContext(Dispatchers.Main.immediate) {
-                    pointerLayer.visibility = View.VISIBLE
-                    chip.visibility = View.VISIBLE
+    override suspend fun <T> withHidden(block: suspend () -> T): T = shieldCapture(
+        hide = {
+            withContext(Dispatchers.Main.immediate) {
+                if (shown) {
+                    pointerLayer.visibility = View.INVISIBLE
+                    chip.visibility = View.INVISIBLE
                 }
+                shown
             }
-        }
-    }
+        },
+        awaitHiddenFrame = { withContext(Dispatchers.Main.immediate) { awaitCommittedFrame(pointerLayer) } },
+        // Idempotent: views are VISIBLE whenever they are not being shielded.
+        restore = {
+            withContext(Dispatchers.Main.immediate) {
+                pointerLayer.visibility = View.VISIBLE
+                chip.visibility = View.VISIBLE
+            }
+        },
+        capture = block,
+    )
 
     private suspend fun awaitCommittedFrame(view: View) {
         // Two vsyncs: one to draw the invisible state, one for it to reach the compositor.

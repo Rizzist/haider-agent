@@ -226,6 +226,22 @@ impl Overlay {
                 let _ = self.draw_badge("…");
             }
             PresenceCommand::Hide { .. } => self.hide(),
+            // Only sent when WDA_EXCLUDEFROMCAPTURE was refused.
+            PresenceCommand::Conceal { seq, .. } => {
+                self.pointer.hide();
+                self.ring.hide();
+                self.badge.hide();
+                emit(&PresenceEvent::Ack { seq });
+            }
+            PresenceCommand::Reveal { .. } => {
+                if self.visible {
+                    let (x, y) = self.badge_origin(self.badge_at_top);
+                    self.badge.show_at(x, y);
+                    if let Some(position) = self.position {
+                        self.place_pointer(position);
+                    }
+                }
+            }
         }
     }
 

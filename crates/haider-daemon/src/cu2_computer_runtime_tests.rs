@@ -1719,9 +1719,12 @@ async fn presence_stop_cancels_the_in_flight_action_and_the_run() {
         entered: Notify::new(),
     });
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
-    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory::with_computer_backend(
-        Arc::clone(&backend) as Arc<dyn ComputerBackend>,
-    ));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
@@ -1757,7 +1760,7 @@ async fn presence_stop_cancels_the_in_flight_action_and_the_run() {
 
     // The human presses Stop on the overlay.
     assert!(
-        crate::cu_presence::global().stop(haider_tools::presence::PresenceSurface::Screen) >= 1,
+        presence.stop(haider_tools::presence::PresenceSurface::Screen) >= 1,
         "the running computer-use run holds a screen presence lease"
     );
 
@@ -1799,4 +1802,406 @@ async fn presence_stop_cancels_the_in_flight_action_and_the_run() {
     assert!(wait_cancelled, "the in-flight wait is journaled Cancelled");
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
+}
+
+/// A Screen renderer that records pointer commands but never acknowledges
+/// them, so every click parks in the bounded pointer-ack wait.
+struct SilentOverlay {
+    pointers: Arc<AtomicUsize>,
+}
+
+impl crate::cu_presence::PresenceRenderer for SilentOverlay {
+    fn send(&mut self, command: &haider_tools::presence::PresenceCommand) -> bool {
+        if matches!(
+            command,
+            haider_tools::presence::PresenceCommand::Pointer { .. }
+        ) {
+            self.pointers.fetch_add(1, Ordering::SeqCst);
+        }
+        true
+    }
+    fn acknowledges_pointers(&self) -> bool {
+        true
+    }
+}
+
+/// Verifier finding (191a8d60) + the live "~60 s cancelling" hang: Stop
+/// pressed while a click is parked on its pointer ack. The click must never
+/// execute and the run must reach `Cancelled` promptly (the live repro sat in
+/// `cancelling` until daemon shutdown).
+/// MUTATION CHECK: remove the post-ack `is_stopped` re-check. Expected
+/// runtime failure: the backend records the click.
+#[tokio::test]
+async fn presence_stop_during_a_parked_click_never_clicks_and_cancels_the_run() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut steps = Vec::new();
+    for index in 0..4 {
+        if index > 0 {
+            steps.push(FakeStep::ExpectToolResult {
+                call_id: format!("parked-{}", index - 1),
+            });
+        }
+        steps.push(FakeStep::EmitToolCall {
+            call_id: format!("parked-{index}"),
+            name: "computer".into(),
+            args: if index == 0 {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "left_click", "x": 3, "y": 4})
+            },
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
+    let backend = Arc::new(FakeComputerBackend::new(large_png_fixture()));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let pointers = Arc::new(AtomicUsize::new(0));
+    presence.register_renderer(
+        haider_tools::presence::PresenceSurface::Screen,
+        Arc::new({
+            let pointers = Arc::clone(&pointers);
+            move |_sink| {
+                Some(Box::new(SilentOverlay {
+                    pointers: Arc::clone(&pointers),
+                })
+                    as Box<dyn crate::cu_presence::PresenceRenderer>)
+            }
+        }),
+    );
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("presence-parked-session");
+    let run_id = RunId::new("presence-parked-run");
+    let device_id = DeviceId::new("presence-parked-device");
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    // Pointers: screenshot (no ack wait) then the first click, which parks.
+    timeout(Duration::from_secs(8), async {
+        while pointers.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the first click reaches its pointer-ack wait");
+    assert!(presence.stop(haider_tools::presence::PresenceSurface::Screen) >= 1);
+
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    let clicked = backend
+        .actions
+        .lock()
+        .expect("actions lock")
+        .iter()
+        .any(|action| matches!(action, ComputerAction::LeftClick { .. }));
+    assert!(!clicked, "no click reached the OS after Stop");
+    assert!(events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Effect(EffectPhase::Outcome {
+            outcome: EffectOutcome::Cancelled,
+            ..
+        }))
+    )));
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+/// Live 3-repair trial 1: Stop landed BETWEEN provider rounds (the previous
+/// computer action had completed and the provider was preparing the next
+/// request), and the run sat in `cancelling`. Drive exactly that moment —
+/// either through the presence Stop or through the same internal turn
+/// cancellation directly — and require a prompt `Cancelled`.
+async fn cancel_between_rounds(via_presence: bool) {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "between-0".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "screenshot"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "between-0".into(),
+        },
+        FakeStep::Delay { ms: 5_000 },
+        FakeStep::EmitToolCall {
+            call_id: "between-1".into(),
+            name: "computer".into(),
+            args: serde_json::json!({"action": "left_click", "x": 3, "y": 4}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]));
+    let backend = Arc::new(FakeComputerBackend::new(large_png_fixture()));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let tag = if via_presence { "presence" } else { "direct" };
+    let session_id = SessionId::new(format!("between-{tag}-session"));
+    let run_id = RunId::new(format!("between-{tag}-run"));
+    let device_id = DeviceId::new(format!("between-{tag}-device"));
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    // Wait for the screenshot's tool result, then let the next provider
+    // round start (it sits in its 5 s delay).
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let events = store.read(&session_id, 0, 4096).await.expect("journal");
+            if events.iter().any(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::ToolResult { ref call_id, .. }) if call_id == "between-0"
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("screenshot settles");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if via_presence {
+        assert_eq!(
+            presence.stop(haider_tools::presence::PresenceSurface::Screen),
+            1
+        );
+    } else {
+        let request_json = format!(r#"{{"run":"{run_id}"}}"#);
+        hub.cancel_internal_turn(TurnCancelCommand {
+            command_id: format!("between-{tag}-cancel"),
+            request_digest: crate::delegation::digest_bytes(request_json.as_bytes()),
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: run_id.clone(),
+            cancelling_event_id: EventId::new(format!("between-{tag}-cancelling")),
+            device_id,
+        })
+        .await
+        .expect("cancel");
+    }
+    wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    let clicked = backend
+        .actions
+        .lock()
+        .expect("actions lock")
+        .iter()
+        .any(|action| matches!(action, ComputerAction::LeftClick { .. }));
+    assert!(!clicked, "no click after the cancellation");
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+#[tokio::test]
+async fn presence_stop_between_provider_rounds_cancels_promptly() {
+    cancel_between_rounds(true).await;
+}
+
+#[tokio::test]
+async fn direct_turn_cancel_between_provider_rounds_cancels_promptly() {
+    cancel_between_rounds(false).await;
+}
+
+/// Fires a cancellation from INSIDE the completing action, so it lands while
+/// the core is settling the tool result and opening the next provider round —
+/// the exact window of live 3-repair trial 1 (`cancelling` 2 ms after
+/// `provider_round_terminal`).
+struct CancelOnReturnBackend {
+    fire: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[async_trait]
+impl ComputerBackend for CancelOnReturnBackend {
+    async fn execute(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<ComputerOutput> {
+        cancel.check()?;
+        if matches!(action, ComputerAction::LeftClick { .. })
+            && let Some(fire) = self.fire.lock().expect("fire lock").take()
+        {
+            fire();
+        }
+        Ok(match action {
+            ComputerAction::Screenshot => ComputerOutput::ScreenshotPng(large_png_fixture()),
+            _ => ComputerOutput::Confirmed {
+                action: "confirmed".into(),
+            },
+        })
+    }
+}
+
+async fn cancel_while_settling(via_presence: bool, iteration: usize) {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut steps = Vec::new();
+    for index in 0..5 {
+        if index > 0 {
+            steps.push(FakeStep::ExpectToolResult {
+                call_id: format!("settle-{}", index - 1),
+            });
+        }
+        steps.push(FakeStep::EmitToolCall {
+            call_id: format!("settle-{index}"),
+            name: "computer".into(),
+            args: if index == 0 {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "left_click", "x": 3, "y": 4})
+            },
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
+    let presence =
+        crate::cu_presence::CuPresence::new(Duration::from_secs(30), Duration::from_secs(1));
+    let backend = Arc::new(CancelOnReturnBackend {
+        fire: Mutex::new(None),
+    });
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(
+        BrokerToolFactory::with_computer_backend(Arc::clone(&backend) as Arc<dyn ComputerBackend>)
+            .with_presence(Arc::clone(&presence)),
+    );
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let tag = format!("{}-{iteration}", if via_presence { "p" } else { "d" });
+    let session_id = SessionId::new(format!("settle-{tag}-session"));
+    let run_id = RunId::new(format!("settle-{tag}-run"));
+    let device_id = DeviceId::new(format!("settle-{tag}-device"));
+    let fire: Box<dyn FnOnce() + Send> = if via_presence {
+        let presence = Arc::clone(&presence);
+        Box::new(move || {
+            presence.stop(haider_tools::presence::PresenceSurface::Screen);
+        })
+    } else {
+        let hub = hub.clone();
+        let (session_id, run_id, device_id) =
+            (session_id.clone(), run_id.clone(), device_id.clone());
+        let generation = store.worker_generation();
+        Box::new(move || {
+            tokio::spawn(async move {
+                let request_json = format!(r#"{{"run":"{run_id}"}}"#);
+                let _ = hub
+                    .cancel_internal_turn(TurnCancelCommand {
+                        command_id: format!("settle-cancel-{run_id}"),
+                        request_digest: crate::delegation::digest_bytes(request_json.as_bytes()),
+                        request_json,
+                        session_id,
+                        worker_generation: generation,
+                        run_id: run_id.clone(),
+                        cancelling_event_id: EventId::new(format!("settle-cancelling-{run_id}")),
+                        device_id,
+                    })
+                    .await;
+            });
+        })
+    };
+    *backend.fire.lock().expect("fire lock") = Some(fire);
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    wait_for_run_state(&store, &session_id, &run_id, RunState::Cancelled).await;
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn presence_stop_while_an_action_settles_cancels_promptly() {
+    for iteration in 0..10 {
+        cancel_while_settling(true, iteration).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_turn_cancel_while_an_action_settles_cancels_promptly() {
+    for iteration in 0..10 {
+        cancel_while_settling(false, iteration).await;
+    }
 }

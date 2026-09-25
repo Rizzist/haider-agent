@@ -408,6 +408,21 @@ impl Overlay {
                 self.stop_text.setStringValue(&NSString::from_str("…"));
             }
             PresenceCommand::Hide { .. } => self.hide(),
+            // Only sent in the evidence-only capturable mode.
+            PresenceCommand::Conceal { seq, .. } => {
+                self.pointer.orderOut(None);
+                self.ring.orderOut(None);
+                self.badge.orderOut(None);
+                emit(&PresenceEvent::Ack { seq });
+            }
+            PresenceCommand::Reveal { .. } => {
+                if self.visible {
+                    self.badge.orderFrontRegardless();
+                    if self.position.is_some() {
+                        self.pointer.orderFrontRegardless();
+                    }
+                }
+            }
         }
     }
 

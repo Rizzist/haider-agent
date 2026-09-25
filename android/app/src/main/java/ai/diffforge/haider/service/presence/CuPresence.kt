@@ -1,9 +1,12 @@
 package ai.diffforge.haider.service.presence
 
 import android.os.SystemClock
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 /**
@@ -43,4 +46,29 @@ object CuPresence {
 /** Keeps overlay pixels out of MediaProjection captures. */
 interface CaptureShield {
     suspend fun <T> withHidden(block: suspend () -> T): T
+}
+
+/** Upper bound on waiting for the hidden overlay frame to reach the compositor. */
+const val CAPTURE_SHIELD_FRAME_WAIT_MS = 250L
+
+/**
+ * Runs [capture] with the overlay hidden, and ALWAYS restores it: [restore] runs in `finally`
+ * under [NonCancellable], so cancelling the capture at any point (while hiding, while waiting for
+ * the hidden frame, during the capture itself) can never strand an invisible indicator. [restore]
+ * must be idempotent. The frame wait is bounded by [frameWaitMs] because a frame-commit callback
+ * is not guaranteed for an invisible view.
+ */
+suspend fun <T> shieldCapture(
+    hide: suspend () -> Boolean,
+    awaitHiddenFrame: suspend () -> Unit,
+    restore: suspend () -> Unit,
+    capture: suspend () -> T,
+    frameWaitMs: Long = CAPTURE_SHIELD_FRAME_WAIT_MS,
+): T {
+    try {
+        if (hide()) withTimeoutOrNull(frameWaitMs) { awaitHiddenFrame() }
+        return capture()
+    } finally {
+        withContext(NonCancellable) { restore() }
+    }
 }

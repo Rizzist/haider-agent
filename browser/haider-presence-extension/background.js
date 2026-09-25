@@ -85,16 +85,38 @@ async function onMessage(message) {
   return undefined;
 }
 
+export const NATIVE_HOST = "ai.diffforge.haider.browser";
+
+/**
+ * Makes a missing daemon connection visible instead of silently dropping
+ * every message: a red "!" badge and tooltip on the toolbar icon, plus the
+ * diagnostic trail. The native host itself is webextract-2's deliverable.
+ */
+function reportHostProblem(message) {
+  console.error("haider-presence: native host unavailable:", message);
+  send({ event: "error", surface: "browser", message: `native host ${NATIVE_HOST} unavailable: ${message}` });
+  chrome.action?.setBadgeText({ text: "!" }).catch(() => {});
+  chrome.action?.setBadgeBackgroundColor({ color: "#E5484D" }).catch(() => {});
+  chrome.action
+    ?.setTitle({ title: `Haider: cannot reach the Haider daemon (${message})` })
+    .catch(() => {});
+}
+
 function connectHost() {
   try {
-    port = chrome.runtime.connectNative("ai.diffforge.haider.browser");
-    port.onMessage.addListener((message) => onMessage(message));
-    port.onDisconnect.addListener(() => {
-      port = null;
-    });
-  } catch (_) {
+    port = chrome.runtime.connectNative(NATIVE_HOST);
+  } catch (error) {
     port = null;
+    reportHostProblem(String(error));
+    return;
   }
+  port.onMessage.addListener((message) => onMessage(message));
+  port.onDisconnect.addListener(() => {
+    // Chrome reports a host that is missing, not allowed or crashed here.
+    const reason = chrome.runtime.lastError?.message || "disconnected";
+    port = null;
+    reportHostProblem(reason);
+  });
 }
 
 // Self-test (proof harness only): loaded unpacked with a `selftest.json`

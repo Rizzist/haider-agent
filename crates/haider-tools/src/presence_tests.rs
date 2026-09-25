@@ -217,6 +217,90 @@ fn stop_marks_every_lease_on_the_surface_refuses_further_actions_and_hides() {
     assert!(matches!(commands[0], PresenceCommand::Show { .. }));
 }
 
+/// Verifier finding (191a8d60): one run that drives the screen and then the
+/// phone must stay stoppable from BOTH indicators, and its end must retire
+/// both. MUTATION CHECK: store a single surface per lease again. Expected
+/// runtime failure: `stop(Screen)` returns no run / end leaves Screen shown.
+#[test]
+fn one_run_on_two_surfaces_is_stoppable_from_either_and_its_end_hides_both() {
+    let now = Instant::now();
+    let begin = |machine: &mut PresenceMachine<String>, surface| {
+        machine
+            .begin_action(key("r1"), surface, PresenceMark::Click, None, now)
+            .expect("begin");
+        machine.finish_action(&key("r1"), now);
+    };
+    // Stop pressed on the desktop badge after the run moved to the phone.
+    let mut machine = PresenceMachine::<String>::default();
+    begin(&mut machine, PresenceSurface::Screen);
+    begin(&mut machine, PresenceSurface::Phone);
+    let (stopped, commands) = machine.stop(PresenceSurface::Screen);
+    assert_eq!(
+        stopped,
+        vec![key("r1")],
+        "the desktop Stop still reaches the run"
+    );
+    assert!(commands.contains(&PresenceCommand::Hide {
+        surface: PresenceSurface::Screen,
+        reason: PresenceEndReason::Stopped,
+    }));
+    assert!(
+        commands.contains(&PresenceCommand::Hide {
+            surface: PresenceSurface::Phone,
+            reason: PresenceEndReason::Stopped,
+        }),
+        "the stopped run's phone indicator retires too"
+    );
+    assert_eq!(
+        machine.begin_action(
+            key("r1"),
+            PresenceSurface::Phone,
+            PresenceMark::Click,
+            None,
+            now
+        ),
+        Err(PresenceRefusal::Stopped),
+        "no surface of a stopped run may act"
+    );
+    // Stop pressed on the phone works the same way.
+    let mut machine = PresenceMachine::<String>::default();
+    begin(&mut machine, PresenceSurface::Screen);
+    begin(&mut machine, PresenceSurface::Phone);
+    assert_eq!(machine.stop(PresenceSurface::Phone).0, vec![key("r1")]);
+    assert!(!machine.is_shown(PresenceSurface::Screen));
+    // A normal run end hides every surface the run used.
+    let mut machine = PresenceMachine::<String>::default();
+    begin(&mut machine, PresenceSurface::Screen);
+    begin(&mut machine, PresenceSurface::Phone);
+    let hidden = machine.end(&key("r1"), PresenceEndReason::RunEnded);
+    assert_eq!(hidden.len(), 2, "both surfaces retire: {hidden:?}");
+    assert!(
+        !machine.is_shown(PresenceSurface::Screen) && !machine.is_shown(PresenceSurface::Phone)
+    );
+    // Idle retires each surface on its own clock.
+    let mut machine = PresenceMachine::<String>::new(Duration::from_secs(30));
+    begin(&mut machine, PresenceSurface::Screen);
+    machine
+        .begin_action(
+            key("r1"),
+            PresenceSurface::Phone,
+            PresenceMark::Click,
+            None,
+            now + Duration::from_secs(20),
+        )
+        .expect("begin");
+    machine.finish_action(&key("r1"), now + Duration::from_secs(20));
+    assert_eq!(
+        machine.tick(now + Duration::from_secs(31)),
+        vec![PresenceCommand::Hide {
+            surface: PresenceSurface::Screen,
+            reason: PresenceEndReason::Idle,
+        }]
+    );
+    assert!(machine.is_shown(PresenceSurface::Phone));
+    assert_eq!(machine.stop(PresenceSurface::Phone).0, vec![key("r1")]);
+}
+
 #[test]
 fn stopped_leases_are_reclaimed_if_their_run_never_ends() {
     let mut machine = PresenceMachine::<String>::default();
@@ -230,7 +314,7 @@ fn stopped_leases_are_reclaimed_if_their_run_never_ends() {
             now,
         )
         .expect("begin");
-    machine.stop(PresenceSurface::Screen);
+    machine.stop_at(PresenceSurface::Screen, now);
     assert!(machine.tick(now + Duration::from_secs(60)).is_empty());
     assert!(
         machine.has_leases(),
@@ -258,6 +342,23 @@ fn wire_vocabulary_round_trips_and_rejects_unknown_fields() {
         command
     );
     assert!(parse_command_line("   ").is_none());
+    let conceal = PresenceCommand::Conceal {
+        surface: PresenceSurface::Screen,
+        seq: 9,
+    };
+    let line = serde_json::to_string(&conceal).expect("encode");
+    assert_eq!(line, r#"{"op":"conceal","surface":"screen","seq":9}"#);
+    assert_eq!(
+        parse_command_line(&line).expect("line").expect("parse"),
+        conceal
+    );
+    assert_eq!(
+        serde_json::to_string(&PresenceCommand::Reveal {
+            surface: PresenceSurface::Screen
+        })
+        .expect("encode"),
+        r#"{"op":"reveal","surface":"screen"}"#
+    );
     assert!(
         parse_command_line(r#"{"op":"hide","surface":"screen","reason":"idle","x":1}"#)
             .expect("line")

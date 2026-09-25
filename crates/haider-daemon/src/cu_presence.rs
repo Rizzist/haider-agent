@@ -20,8 +20,9 @@
 use haider_protocol::computer::ComputerAction;
 use haider_protocol::mobile::MobileAction;
 use haider_tools::presence::{
-    POINTER_ACK_TIMEOUT, PRESENCE_IDLE_TIMEOUT, PresenceCommand, PresenceEndReason, PresenceEvent,
-    PresenceMachine, PresenceMark, PresencePoint, PresenceRefusal, PresenceSurface,
+    CONCEAL_ACK_TIMEOUT, POINTER_ACK_TIMEOUT, PRESENCE_IDLE_TIMEOUT, PresenceCommand,
+    PresenceEndReason, PresenceEvent, PresenceMachine, PresenceMark, PresencePoint,
+    PresenceRefusal, PresenceSurface,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +47,12 @@ pub(crate) trait PresenceRenderer: Send {
     fn acknowledges_pointers(&self) -> bool {
         false
     }
+    /// Whether this renderer's UI can appear in the model's screenshots, so
+    /// it must be concealed around each capture (Linux notification, or a
+    /// helper whose OS refused capture exclusion).
+    fn capturable(&self) -> bool {
+        false
+    }
     /// Retires the renderer after its final `Hide`.
     fn close(&mut self) {}
 }
@@ -68,6 +75,8 @@ pub(crate) struct CuPresence {
     factories: StdMutex<BTreeMap<PresenceSurface, RendererFactory>>,
     ticker_running: AtomicBool,
     tick_interval: Duration,
+    /// Conceal acks use their own sequence space, disjoint from pointers.
+    next_conceal_seq: std::sync::atomic::AtomicU64,
     me: Weak<CuPresence>,
 }
 
@@ -83,6 +92,7 @@ impl CuPresence {
             factories: StdMutex::new(BTreeMap::new()),
             ticker_running: AtomicBool::new(false),
             tick_interval,
+            next_conceal_seq: std::sync::atomic::AtomicU64::new(1 << 62),
             me: me.clone(),
         })
     }
@@ -165,25 +175,59 @@ impl CuPresence {
     pub(crate) fn stop(&self, surface: PresenceSurface) -> usize {
         let mut state = lock(&self.state);
         let (keys, commands) = state.machine.stop(surface);
-        let hooks: Vec<(StopHook, Option<StopHook>)> = keys
-            .iter()
-            .filter_map(|key| {
-                state
-                    .hooks
-                    .get(key)
-                    .map(|hooks| (Arc::clone(&hooks.stop), hooks.in_flight.clone()))
-            })
-            .collect();
+        let mut run_hooks = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if let Some(hooks) = state.hooks.get(key) {
+                // Flip the in-flight action's token BEFORE `dispatch` below
+                // releases any pending pointer acknowledgement: an action
+                // waiting on that ack must observe cancellation the moment
+                // it resumes, never a window in which it could execute.
+                if let Some(in_flight) = &hooks.in_flight {
+                    in_flight();
+                }
+                run_hooks.push(Arc::clone(&hooks.stop));
+            }
+        }
         self.dispatch(&mut state, commands);
         drop(state);
-        for (stop, in_flight) in &hooks {
-            if let Some(in_flight) = in_flight {
-                in_flight();
-            }
+        for stop in &run_hooks {
             stop();
         }
         tracing::info!(surface = ?surface, runs = keys.len(), "computer-use presence Stop pressed");
         keys.len()
+    }
+
+    /// Asks a capturable renderer on `surface` to take its UI off screen
+    /// before a model-facing capture. `None` when nothing needs concealing.
+    pub(crate) fn conceal(&self, surface: PresenceSurface) -> Option<oneshot::Receiver<()>> {
+        let mut state = lock(&self.state);
+        if !state
+            .renderers
+            .get(&surface)
+            .is_some_and(|renderer| renderer.capturable())
+        {
+            return None;
+        }
+        let seq = self.next_conceal_seq.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        state.acks.insert(seq, sender);
+        let sent = state
+            .renderers
+            .get_mut(&surface)
+            .is_some_and(|renderer| renderer.send(&PresenceCommand::Conceal { surface, seq }));
+        if !sent {
+            state.acks.remove(&seq);
+            return None;
+        }
+        Some(receiver)
+    }
+
+    /// Restores what [`Self::conceal`] removed.
+    pub(crate) fn reveal(&self, surface: PresenceSurface) {
+        let mut state = lock(&self.state);
+        if let Some(renderer) = state.renderers.get_mut(&surface) {
+            let _ = renderer.send(&PresenceCommand::Reveal { surface });
+        }
     }
 
     pub(crate) fn is_stopped(&self, key: &str) -> bool {
@@ -363,16 +407,17 @@ impl PresenceLease {
         }
     }
 
-    /// Lease on the daemon-wide controller whose Stop cancels `run_id`
+    /// Lease on `presence` (the daemon-wide [`global`] in production) whose Stop cancels `run_id`
     /// through the hub's receipt-backed turn cancellation.
     pub(crate) fn for_run(
+        presence: Arc<CuPresence>,
         hub: crate::session_hub::SessionHub,
         session_id: haider_protocol::ids::SessionId,
         run_id: haider_protocol::ids::RunId,
     ) -> Self {
         let key = format!("{session_id}/{run_id}");
         let stop = run_cancel_hook(hub, session_id, run_id);
-        Self::new(Arc::clone(global()), key, stop)
+        Self::new(presence, key, stop)
     }
 
     async fn begin(
@@ -394,6 +439,11 @@ impl PresenceLease {
         if let Some(ack) = ack {
             // Bounded: a slow or dead overlay never blocks control.
             let _ = tokio::time::timeout(POINTER_ACK_TIMEOUT, ack).await;
+            // Stop may have landed while we waited (it also releases the
+            // ack): re-check so a stopped run's click is never posted.
+            if self.presence.is_stopped(&self.key) {
+                return Err(PresenceRefusal::Stopped);
+            }
         }
         Ok(guard)
     }
@@ -436,6 +486,16 @@ impl PresenceLease {
         .map(Some)
     }
 
+    /// Conceals capturable presence UI (Linux notification popup) for the
+    /// duration of one model-facing screenshot; the guard reveals it again.
+    pub(crate) async fn conceal_for_capture(&self) -> Option<RevealGuard> {
+        let ack = self.presence.conceal(PresenceSurface::Screen)?;
+        let _ = tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack).await;
+        Some(RevealGuard {
+            presence: Arc::clone(&self.presence),
+        })
+    }
+
     /// Whether the human already stopped this run. Checked right after
     /// authorization so a stopped run never even dispatches another action.
     pub(crate) fn is_stopped(&self) -> bool {
@@ -453,6 +513,17 @@ impl PresenceLease {
             PresenceEndReason::RunEnded
         };
         self.presence.end(&self.key, reason);
+    }
+}
+
+/// Reveals concealed presence UI when the capture is over.
+pub(crate) struct RevealGuard {
+    presence: Arc<CuPresence>,
+}
+
+impl Drop for RevealGuard {
+    fn drop(&mut self) {
+        self.presence.reveal(PresenceSurface::Screen);
     }
 }
 
@@ -512,11 +583,15 @@ mod overlay {
     use haider_tools::presence::{PresenceCommand, PresenceEvent, presence_helper_command};
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     pub(super) struct OverlayProcess {
         child: Option<Child>,
         stdin: Option<ChildStdin>,
+        /// Set from the helper's `Ready`: its UI can enter screenshots.
+        capturable: Arc<AtomicBool>,
     }
 
     pub(super) fn spawn(sink: EventSink) -> Option<OverlayProcess> {
@@ -542,13 +617,23 @@ mod overlay {
         };
         let stdin = child.stdin.take();
         let stdout = child.stdout.take()?;
+        let capturable = Arc::new(AtomicBool::new(false));
+        let reader_capturable = Arc::clone(&capturable);
         let reader = std::thread::Builder::new()
             .name("cu-presence-events".into())
             .spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
                     match serde_json::from_str::<PresenceEvent>(line.trim()) {
-                        Ok(event) => sink(event),
+                        Ok(event) => {
+                            if let PresenceEvent::Ready {
+                                capture_excluded, ..
+                            } = &event
+                            {
+                                reader_capturable.store(!capture_excluded, Ordering::Release);
+                            }
+                            sink(event);
+                        }
                         Err(error) => tracing::debug!(?error, "unparseable presence overlay event"),
                     }
                 }
@@ -561,6 +646,7 @@ mod overlay {
         Some(OverlayProcess {
             child: Some(child),
             stdin,
+            capturable,
         })
     }
 
@@ -579,6 +665,10 @@ mod overlay {
 
         fn acknowledges_pointers(&self) -> bool {
             true
+        }
+
+        fn capturable(&self) -> bool {
+            self.capturable.load(Ordering::Acquire)
         }
 
         fn close(&mut self) {

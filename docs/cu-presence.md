@@ -38,8 +38,11 @@ accepted run).
   it. The constant lives in `haider_protocol::computer` and is mirrored by the
   TUI and the Android controller (`CU_PRESENCE_IDLE_MS`).
 
-Surfaces are independent: stopping the phone does not stop a concurrent
-desktop run, and vice versa.
+Surfaces are tracked per run. One run may drive several surfaces (for
+example a desktop screenshot, then a phone tap): Stop on ANY surface that run
+uses stops the whole run and retires every indicator only that run needed,
+and run end retires all of them. Idle expiry is per surface. A different run
+that only uses another surface is not affected.
 
 ## 2. Stop, end to end
 
@@ -68,6 +71,23 @@ failed preflight), and an action already past that point is refused before
 `execute` (`PresenceRefusal::Stopped` → journaled `Cancelled`); either way
 nothing of a stopped run reaches the OS. A new run may control the surface
 again.
+
+**Race hardening (3-repair).**
+* Stop flips the in-flight action's cancel token *before* releasing any pending
+  pointer acknowledgement, and an action re-checks `is_stopped` after its ack
+  wait, so a click parked on its ack can never be posted after Stop.
+* A Stop-refused action does not return an error to the core (an error there
+  is a fatal store error, not a cancellation). It waits, bounded to 10 s, for
+  the turn cancellation Stop submitted, and otherwise settles as a `Cancelled`
+  tool result.
+* Pre-existing turn-cancel race, fixed at the source: when a cancellation
+  (Stop *or* Esc) is committed while a just-finished tool's result is being
+  settled, the journal refuses the settlement ("durably cancelling; only
+  Cancelled may follow"). The actor used to route that refusal to `Errored`,
+  which the journal also refuses, stranding the run in `cancelling` until
+  daemon shutdown. The refusal now carries
+  `details.durable_run_state = "cancelling"` and the actor settles it as
+  `Cancelled`.
 
 **Focus.** Stop never needs keyboard focus and never takes it from the app
 being driven: the macOS badge is a non-activating `NSPanel` owned by an
@@ -127,7 +147,8 @@ badge with red live dot and red **Stop** button) is rasterised once in
 | --- | --- | --- |
 | macOS | every panel sets `NSWindowSharingNone`; the backend captures with `CGDisplayCreateImage`, which omits sharing-none windows | yes — verified live on macOS 26 (Darwin 25.6): with the overlay on screen (window server lists it at level 1000, sharing state 0) the model-facing CAS image contains neither pointer nor badge, and `screencapture` omits it too |
 | Windows | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on every overlay window (Windows 10 2004+), which Windows documents as excluding the window from capture | by the OS contract on 2004+ — **not runtime-verified here** (cross-compiled and Clippy-checked only); `ready.capture_excluded=false` is reported when the OS refuses |
-| Linux | no pointer overlay (below) | n/a |
+| Linux | no pointer overlay; the notification popup is concealed (closed) around each model-facing capture (below) | no — best effort, see below |
+| any helper reporting `capture_excluded:false` | the daemon sends `conceal` before each `screenshot`/`inspect` and waits ≤ 600 ms for the ack, then `reveal` afterwards | best effort (the helper takes its UI off screen) |
 
 The overlay is click-through everywhere except the badge (`ignoresMouseEvents`
 / `WS_EX_TRANSPARENT`).
@@ -154,11 +175,29 @@ this and keeps sharing-none.
   repainting exposed areas in time and is not deterministic.
 * **Implemented fallback (both)**: a resident desktop notification
   (`org.freedesktop.Notifications`) titled "Haider is controlling this
-  screen", updated with the latest action, with a **Stop** action wired to the
-  same Stop path. Honest limit: a notification popup is an ordinary window and
-  can appear in a screenshot taken while it is on screen (it is posted with
-  low urgency so desktops retire the popup into the notification list, where
-  Stop remains available). No agent pointer is drawn on Linux.
+  screen", updated with the latest action.
+  * The helper calls `GetCapabilities` first. Actions are optional in the
+    freedesktop spec: only when the server advertises `actions` does the
+    notification carry a **Stop** button (wired to the same Stop path). When
+    it does not, the notification body says how to stop instead ("press Esc
+    in the Haider TUI session, or for a headless run use `haider run --stop
+    <run-id>`"), the helper reports `ready.platform =
+    "linux-notification-no-actions"` and logs the degraded state. The TUI
+    header's `esc stop` chip is always there.
+  * Screenshots: the popup is an ordinary window. The helper reports
+    `capture_excluded:false`, so the daemon asks it to `conceal` before every
+    model-facing `screenshot`/`inspect`: it closes the notification, waits
+    200 ms for the desktop to retire the popup, acks, and re-posts it on
+    `reveal`. This is best effort: a desktop that animates the popup out more
+    slowly, or keeps closed notifications on screen, can still leak it into a
+    capture; the model then sees Haider's own notification (not user data).
+    The notification is also briefly absent from the list during a capture.
+* **What Linux guarantees**: a visible "Haider is controlling this screen"
+  notification (on a desktop with a notification server), a Stop that reaches
+  the run from the notification when the server supports actions and from
+  the TUI (Esc) or CLI otherwise, and best-effort absence from model
+  screenshots. There is **no agent pointer** on Linux. Nothing here has run
+  on a real Linux desktop; it is compile/Clippy-checked only.
 
 ## 4. Android
 
@@ -178,16 +217,20 @@ request that operates the screen raises/refreshes it; `presence.end` from the
 daemon or 30 s of silence retires it. Stop hides it, latches mutating requests
 off (`rejected: stopped_by_user`) until `presence.end` or 10 s, and emits
 `{"type":"presence.stop"}` as an APK push; the daemon routes that push to
-`CuPresence::stop(Phone)`. When the phone lease hides for any reason other
-than Stop the daemon sends the `presence.end` request (old APKs answer
-`unsupported_request`, which is ignored).
+`CuPresence::stop(Phone)`. Whenever the phone indicator hides (run end,
+idle, or Stop from any surface) the daemon sends the `presence.end` request
+(old APKs answer `unsupported_request`, which is ignored); a stopped run can
+start no further actions on the daemon side regardless of the APK latch.
 
 Capture exclusion: MediaProjection records accessibility overlays, so the
 `screen.capture` handler runs the capture inside
 `CuPresence.withOverlayHidden`: both overlay views go `INVISIBLE`, the helper
-waits two vsyncs plus the view's frame-commit callback (API 29+), and only
-then does `ScreenCaptureService` create its virtual display (the first frame
-it receives is composed after the hidden frame). The views are restored
+waits two vsyncs plus the view's frame-commit callback (API 29+, bounded to
+250 ms because a commit callback is not guaranteed for an invisible view),
+and only then does `ScreenCaptureService` create its virtual display. The
+sequencing lives in `shieldCapture`, which restores the views in `finally`
+under `NonCancellable`, so cancelling at any point (while hiding, during the
+frame wait, during the capture) can never strand an invisible chip. The views are restored
 afterwards. On the 16 KiB/API 35 targets this is a ~2–3 frame hide.
 
 Transport note: the only APK capability transport in the tree today is the
@@ -212,9 +255,15 @@ remote-debugging launch.**
   (`chrome.tabs.group` + `chrome.tabGroups.update({title:"Haider",
   color:"orange"})`).
 
-`browser/haider-presence-extension/` implements the presence half and is
-proven on this Mac (Chrome 153, see evidence). webextract-2 owns the
-transport and must:
+**Ownership.** This lane ships only the extension's presence half
+(`browser/haider-presence-extension/`: tab group, `chrome.debugger` attach,
+infobar Cancel → `stop`, `nativeMessaging` permission, and a visible red "!"
+badge plus tooltip when the native host cannot be reached). It was exercised
+in a throwaway Chrome 153 profile through the extension's own self-test; **no
+Haider-driven browser run exists yet**. The native messaging host, the
+daemon-side browser renderer and the dispatcher hook below are
+**webextract-2 deliverables** and do not exist in this tree. webextract-2
+must:
 
 1. **Install/load** the extension (enterprise policy, Chrome Web Store, or for
    development `Extensions.loadUnpacked` over `--remote-debugging-pipe
@@ -262,8 +311,11 @@ unchanged.
 
 * Windows overlay is compile/Clippy-checked by cross-compilation only; it has
   not run on Windows here.
-* Linux has no pointer overlay (see §3); the notification popup can appear in
-  screenshots while visible.
+* Linux has no pointer overlay (see §3); the notification Stop button needs a
+  server with `actions`; concealing the popup around captures is best effort;
+  none of it has run on a real Linux desktop.
+* Browser: presence half only; no native host / browser renderer / dispatcher
+  hook (webextract-2), so no Haider-driven browser run.
 * Multi-display: the desktop backends capture the main display; the badge is
   placed on the main screen.
 * Android: controller behaviour is proven by JVM tests and the overlay code

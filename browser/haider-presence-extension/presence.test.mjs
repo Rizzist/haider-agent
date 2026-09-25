@@ -25,3 +25,20 @@ test("agent tabs are grouped under an orange Haider label", () => {
   assert.equal(GROUP_TITLE, "Haider");
   assert.equal(GROUP_COLOR, "orange");
 });
+
+test("the manifest grants what the background worker uses (verifier finding 191a8d60)", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const manifest = JSON.parse(await readFile(new URL("./manifest.json", import.meta.url), "utf8"));
+  const background = await readFile(new URL("./background.js", import.meta.url), "utf8");
+  for (const [api, permission] of [
+    ["chrome.runtime.connectNative", "nativeMessaging"],
+    ["chrome.debugger.", "debugger"],
+    ["chrome.tabGroups.", "tabGroups"],
+    ["chrome.storage.", "storage"],
+  ]) {
+    if (background.includes(api)) {
+      assert.ok(manifest.permissions.includes(permission), `${api} needs "${permission}"`);
+    }
+  }
+  assert.ok(manifest.action, "chrome.action (host-error badge) needs an action entry");
+});

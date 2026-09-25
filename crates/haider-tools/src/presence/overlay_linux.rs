@@ -56,20 +56,39 @@ fn emit(event: &PresenceEvent) {
     let _ = stdout.flush();
 }
 
+/// Where to stop when the notification server offers no action buttons.
+const FALLBACK_STOP_HINT: &str = "To stop: press Esc in the Haider TUI session, or for a headless run use `haider run --stop <run-id>`.";
+/// Time for the desktop to retire a closed popup before a capture starts.
+const CONCEAL_SETTLE: Duration = Duration::from_millis(200);
+
 struct Notifier {
     connection: zbus::Connection,
     id: u32,
     label: String,
     last_update: Option<Instant>,
+    last_body: String,
+    /// `GetCapabilities` advertised "actions": the Stop button can exist.
+    actions_supported: bool,
 }
 
 impl Notifier {
     async fn notify(&mut self, body: &str) {
+        self.last_body = body.to_owned();
+        let body = if self.actions_supported {
+            body.to_owned()
+        } else {
+            format!("{body}\n{FALLBACK_STOP_HINT}")
+        };
+        let body = body.as_str();
         let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
         hints.insert("resident", Value::from(true));
         hints.insert("urgency", Value::from(0u8));
         hints.insert("category", Value::from("device"));
-        let actions = vec![STOP_ACTION, "Stop"];
+        let actions = if self.actions_supported {
+            vec![STOP_ACTION, "Stop"]
+        } else {
+            Vec::new()
+        };
         let reply = self
             .connection
             .call_method(
@@ -150,8 +169,40 @@ async fn run_async() -> i32 {
         Ok(proxy) => proxy.receive_signal("ActionInvoked").await.ok(),
         Err(_) => None,
     };
+    // Actions are optional in the freedesktop spec: ask before promising a
+    // Stop button (GetCapabilities -> as).
+    let actions_supported = match connection
+        .call_method(
+            Some(DESTINATION),
+            PATH,
+            Some(INTERFACE),
+            "GetCapabilities",
+            &(),
+        )
+        .await
+        .and_then(|reply| reply.body().deserialize::<Vec<String>>())
+    {
+        Ok(capabilities) => capabilities
+            .iter()
+            .any(|capability| capability == "actions"),
+        Err(error) => {
+            emit(&PresenceEvent::Error {
+                message: format!("notification server GetCapabilities failed: {error}"),
+            });
+            false
+        }
+    };
+    if !actions_supported {
+        emit(&PresenceEvent::Error {
+            message: "notification server has no action buttons; Stop is available only via the Haider TUI (Esc) or `haider run --stop`".into(),
+        });
+    }
     emit(&PresenceEvent::Ready {
-        platform: "linux-notification".into(),
+        platform: if actions_supported {
+            "linux-notification".into()
+        } else {
+            "linux-notification-no-actions".into()
+        },
         capture_excluded: false,
     });
     let mut notifier = Notifier {
@@ -159,6 +210,8 @@ async fn run_async() -> i32 {
         id: 0,
         label: "Haider is controlling this screen".into(),
         last_update: None,
+        last_body: String::new(),
+        actions_supported,
     };
     let mut visible = false;
     let mut stopping = false;
@@ -172,7 +225,12 @@ async fn run_async() -> i32 {
                             notifier.label = label;
                             visible = true;
                             stopping = false;
-                            notifier.notify("Haider is using your mouse and keyboard. Choose Stop to cancel the run.").await;
+                            let body = if notifier.actions_supported {
+                                "Haider is using your mouse and keyboard. Choose Stop to cancel the run."
+                            } else {
+                                "Haider is using your mouse and keyboard."
+                            };
+                            notifier.notify(body).await;
                         }
                         PresenceCommand::Pointer { seq, mark, point, .. } => {
                             emit(&PresenceEvent::Ack { seq });
@@ -189,6 +247,19 @@ async fn run_async() -> i32 {
                         PresenceCommand::Hide { .. } => {
                             visible = false;
                             notifier.close().await;
+                        }
+                        // The popup is an ordinary window: close it around a
+                        // model-facing capture, then post it again.
+                        PresenceCommand::Conceal { seq, .. } => {
+                            notifier.close().await;
+                            tokio::time::sleep(CONCEAL_SETTLE).await;
+                            emit(&PresenceEvent::Ack { seq });
+                        }
+                        PresenceCommand::Reveal { .. } => {
+                            if visible && !stopping {
+                                let body = notifier.last_body.clone();
+                                notifier.notify(&body).await;
+                            }
                         }
                     },
                     Some(Err(message)) => emit(&PresenceEvent::Error {

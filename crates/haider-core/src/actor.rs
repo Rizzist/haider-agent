@@ -11127,6 +11127,15 @@ impl HarnessActor {
                 self.cancelled_outcome_with_items(run_id, message, reasoning, tools)
                     .await
             }
+            // A committed cancellation won the race to the journal (e.g. the
+            // user pressed Esc/Stop while a finished tool's result was being
+            // settled): the refused append IS the cancellation, not a
+            // failure. Settling it as Errored is itself refused, which used
+            // to strand the run in `cancelling` until daemon shutdown.
+            DriveError::Store(ref error) if haider_store::is_durably_cancelling_refusal(error) => {
+                self.cancelled_outcome_with_items(run_id, message, reasoning, tools)
+                    .await
+            }
             other => {
                 self.errored_outcome_with_items(
                     run_id,
