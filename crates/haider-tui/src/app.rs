@@ -7970,7 +7970,9 @@ impl AppModel {
         if self.fleet.kill_armed.as_ref() != Some(&agent) {
             let label = self.fleet_member_label(&agent);
             self.fleet.kill_armed = Some(agent);
-            self.flash = Some(format!("· destroy {label}? press d again to confirm"));
+            self.flash = Some(format!(
+                "· destroy {label} only? its subagents keep running — press d again to confirm"
+            ));
             return;
         }
         self.fleet.kill_armed = None;
@@ -8000,7 +8002,11 @@ impl AppModel {
             self.requests.push(AppRequest::AgentCancel {
                 agent: agent.as_str().to_owned(),
             });
-            self.flash = Some(format!("· cancelling {label} — waiting for daemon truth"));
+            // Owner decision 2026-09-25: agent.cancel stops this subagent
+            // only; say so rather than implying its subtree stops too.
+            self.flash = Some(format!(
+                "· cancelling {label} only — its subagents keep running · waiting for daemon truth"
+            ));
         } else {
             self.flash = Some(self.stale_daemon_note("destroying a subagent"));
         }

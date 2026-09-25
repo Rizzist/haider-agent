@@ -10331,7 +10331,7 @@ fn render_fleet(
                 if model.fleet.kill_armed.as_ref() == Some(&node.agent_id) {
                     lines.push(Line::styled(
                         format!(
-                            "  destroy {}? press d again to confirm · esc cancels",
+                            "  destroy {} only (its subagents keep running)? press d again to confirm · esc cancels",
                             fleet::callsign(node)
                         ),
                         theme.err_style(),
@@ -10342,7 +10342,7 @@ fn render_fleet(
                         Hit::FleetKill(node.agent_id.as_str().to_owned()),
                     ));
                     lines.push(Line::styled(
-                        "  ✕ destroy this subagent (d)",
+                        "  ✕ destroy this subagent only (d) · its subagents keep running",
                         theme.dim_style(),
                     ));
                 }
@@ -16038,6 +16038,26 @@ fn item_lines<'a>(
             {
                 lines.push(Line::styled(
                     format!("  {}", budget.summary()),
+                    theme.gold_style(),
+                ));
+            } else if let Some(marker) =
+                haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                // Owner decision 2026-09-25: Esc stops the main thread only;
+                // say plainly what is still running and how to stop it.
+                lines.push(Line::styled(
+                    format!("  ⧗ {}", marker.summary()),
+                    theme.gold_style(),
+                ));
+            } else if let Some(result) =
+                haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                lines.push(Line::styled(
+                    format!("  ↩ {}", result.summary_line()),
                     theme.gold_style(),
                 ));
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {

@@ -937,6 +937,12 @@ pub struct HeadlessRunStopResult {
     pub run_id: RunId,
     pub status: CancelStatus,
     pub terminal_seq: Option<u64>,
+    /// Non-default stop scope echoed by the daemon (`main`/`subagents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<haider_rpc::RunStopScopeWire>,
+    /// What happened to the run's subagents; absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<haider_rpc::SubagentStopSummaryWire>,
 }
 
 /// Failure before a correlated final result could be produced.
@@ -2333,11 +2339,14 @@ pub async fn headless_run_status(
     }
 }
 
-/// Idempotently requests durable cancellation by run id.
+/// Idempotently requests durable cancellation by run id. `scope` `All`
+/// (`haider run --stop`) stops the run and every subagent in its tree;
+/// `Main` stops only the run; `Subagents` stops only its subagents.
 pub async fn stop_headless_run(
     profile: &ResolvedProfile,
     ensure: EnsureOptions,
     run_id: RunId,
+    scope: haider_rpc::RunStopScopeWire,
 ) -> Result<HeadlessRunStopResult, HeadlessRunError> {
     match lifecycle_request(
         profile,
@@ -2345,6 +2354,7 @@ pub async fn stop_headless_run(
         RequestBody::HeadlessRunStop {
             command_id: CommandId::new(command_id("headless-stop")),
             run_id,
+            scope,
         },
         "headless.run.stop",
     )
@@ -2355,11 +2365,15 @@ pub async fn stop_headless_run(
             run_id,
             status,
             terminal_seq,
+            scope,
+            subagents,
         } => Ok(HeadlessRunStopResult {
             session_id,
             run_id,
             status,
             terminal_seq,
+            scope,
+            subagents,
         }),
         ResponseBody::Error {
             code,

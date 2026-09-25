@@ -63,6 +63,10 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "delegation_stop.rs"]
+mod stop;
+pub(crate) use stop::{SubagentStopSummary, SubagentTreeRoot};
+
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHILD_NUDGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
@@ -1463,33 +1467,15 @@ impl DelegationHandle {
                 Ok(completion)
             }
             haider_platform::BoundedWait::Completed(Ok(ChildWaitWake::ParentCancelled(record))) => {
-                let budget = match budget {
-                    Some(budget) => budget,
-                    None => self.child_wait_budget(&record, None).await?,
-                };
-                let handoff = self
-                    .begin_terminal_mirror_handoff(
-                        &record,
-                        &budget,
-                        CancelCause::Parent,
-                        "collector",
-                    )
+                // Owner decision 2026-09-25: stopping the parent stops only
+                // the parent. The waited-on child keeps running in the
+                // background and its result is delivered to the parent
+                // session when it finishes.
+                self.detach_parent_run_children(&record.parent_session_id, &record.parent_run_id)
                     .await?;
-                let terminal_deadline = instant_from_unix_deadline(handoff.deadline_at_ms);
-                let _cancel_issued = self
-                    .cancel_subtree_before(&record, CancelCause::Parent, terminal_deadline)
-                    .await?;
-                let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror, terminal_deadline)
-                    .await?;
-                report_child_settlement_outcome(settlement);
-                if chip_mirror.child_run_terminal {
-                    self.complete_terminal_mirror_handoff(&record, handoff)
-                        .await?;
-                }
                 Err(HaiderError::new(
                     ErrorCode::RunNotActive,
-                    "parent cancelled while waiting for local child",
+                    "parent stopped while waiting for local child; the child continues in the background",
                     false,
                 ))
             }
@@ -1794,82 +1780,6 @@ impl DelegationHandle {
             .mark_delegation_collected(ticket.manifest.agent.clone())
             .await
             .map(|_| ())
-    }
-
-    pub(crate) async fn cancel_ticket(
-        &self,
-        ticket: &DeferredTicket,
-        run_deadline: Option<tokio::time::Instant>,
-    ) -> Result<(), HaiderError> {
-        let Some(record) = self.hub.delegation(ticket.manifest.agent.clone()).await? else {
-            return Ok(());
-        };
-        let budget = self.child_wait_budget(&record, run_deadline).await?;
-        let handoff = self
-            .begin_terminal_mirror_handoff(
-                &record,
-                &budget,
-                CancelCause::Parent,
-                "cleanup_fallback",
-            )
-            .await?;
-        // This cleanup hook runs inside parent terminalization, so waiting for
-        // the child here would deadlock the cancellation handoff. The active
-        // collector normally performs the flush. The detached wake is safe to
-        // lose because `handoff` is already durable in the child journal and
-        // startup recovery replays it until a completion fact is committed.
-        let coordinator = self.clone();
-        tokio::spawn(async move {
-            match coordinator
-                .reconcile_terminal_mirror_handoff(record.clone(), handoff)
-                .await
-            {
-                Ok(()) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        agent = %record.agent_id,
-                        ?error,
-                        "terminal child metrics flush failed"
-                    );
-                }
-            }
-        });
-        Ok(())
-    }
-
-    /// Cancel every child established in this run, including handles no
-    /// longer present in a blocking collector's in-memory map.
-    pub(crate) async fn cancel_parent_run_descendants(
-        &self,
-        parent_session_id: &SessionId,
-        parent_run_id: &RunId,
-        run_deadline: Option<tokio::time::Instant>,
-    ) -> Result<(), HaiderError> {
-        let mut pending = self
-            .hub
-            .delegations_for_parent_run(parent_session_id.clone(), parent_run_id.clone())
-            .await?;
-        while let Some(record) = pending.pop() {
-            if record.report.is_none() {
-                self.cancel_ticket(
-                    &DeferredTicket {
-                        id: record.agent_id.as_str().to_owned(),
-                        manifest: record.manifest,
-                    },
-                    run_deadline,
-                )
-                .await?;
-            } else {
-                // A terminal direct child may have left its own descendants
-                // detached. Continue through that child to reach them.
-                pending.extend(
-                    self.hub
-                        .delegations_for_parent_run(record.child_session_id, record.child_run_id)
-                        .await?,
-                );
-            }
-        }
-        Ok(())
     }
 
     /// Reconcile one journal-derived cancellation mirror after startup.
@@ -3278,6 +3188,9 @@ impl DelegationHandle {
         }
     }
 
+    /// Legacy cancellation handoff writer, retained for the recovery tests
+    /// that pin how pre-2026-09-25 pending handoffs are replayed.
+    #[cfg(all(test, unix))]
     async fn begin_terminal_mirror_handoff(
         &self,
         record: &DelegationRecord,

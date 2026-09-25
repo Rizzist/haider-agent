@@ -1364,3 +1364,681 @@ fn agent_spawn_provider_without_published_default_retains_native_rejection() {
     assert!(rejected["result"].is_null());
     profile.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Owner decision 2026-09-25 (973-LANES.md "subagent stop semantics"):
+// `run --stop` stops the run AND every subagent in its tree (session walk,
+// later child runs included, monitors removed); `--stop-main` stops only the
+// run (subagents keep running, a waited-on child's result is delivered
+// later); `--stop-subagents` stops only the tree; `agent cancel <id>` stops
+// that subagent only; `agent cancel <session> --all` stops the whole tree.
+
+const STOP_OBSERVATION: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+struct DelegationRow {
+    depth: i64,
+    agent: String,
+    child_session: String,
+    parent_session: String,
+    terminal: Option<i64>,
+    state: Option<String>,
+}
+
+impl Profile {
+    fn seed_models(&self, models: &[&str]) {
+        let models = models
+            .iter()
+            .map(|slug| json!({"slug":slug,"display_name":slug,"supported_efforts":[],"visible":true}))
+            .collect::<Vec<_>>();
+        let fetched_at = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("time fits");
+        haider_store::Store::open(&self.profile)
+            .expect("catalog store")
+            .put_provider_models("fake", &Value::Array(models).to_string(), None, fetched_at)
+            .expect("publish fake model routes");
+    }
+
+    fn db(&self) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_with_flags(
+            self.profile.join("store.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read-only store");
+        connection
+            .busy_timeout(Duration::from_secs(10))
+            .expect("busy timeout");
+        connection
+    }
+
+    fn delegations(&self) -> Vec<DelegationRow> {
+        let connection = self.db();
+        let mut statement = connection
+            .prepare(
+                "SELECT d.depth, d.agent_id, d.child_session_id, d.parent_session_id, h.terminal, h.state_json
+                 FROM delegations d LEFT JOIN run_heads h
+                   ON h.session_id = d.child_session_id AND h.run_id = d.child_run_id
+                 ORDER BY d.depth, d.created_at_ms",
+            )
+            .expect("delegation query");
+        statement
+            .query_map([], |row| {
+                let state: Option<String> = row.get(5)?;
+                Ok(DelegationRow {
+                    depth: row.get(0)?,
+                    agent: row.get(1)?,
+                    child_session: row.get(2)?,
+                    parent_session: row.get(3)?,
+                    terminal: row.get(4)?,
+                    state: state.and_then(|state| {
+                        serde_json::from_str::<Value>(&state)
+                            .ok()
+                            .and_then(|value| value["state"].as_str().map(str::to_owned))
+                    }),
+                })
+            })
+            .expect("delegation rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode delegation rows")
+    }
+
+    /// Nonterminal run heads of a session (original and later runs).
+    fn live_runs(&self, session: &str) -> Vec<(String, String)> {
+        let connection = self.db();
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id, state_json FROM run_heads WHERE session_id = ?1 AND terminal = 0",
+            )
+            .expect("run head query");
+        statement
+            .query_map([session], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("run heads")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode run heads")
+    }
+
+    fn row(&self, depth: i64) -> DelegationRow {
+        self.delegations()
+            .into_iter()
+            .find(|row| row.depth == depth)
+            .unwrap_or_else(|| panic!("no delegation at depth {depth}"))
+    }
+
+    fn start_run(&self, model: &str, prompt: &str) -> (String, String) {
+        let output = self.run(&[
+            "run",
+            "--start",
+            "--provider",
+            "fake",
+            "--model",
+            model,
+            "--json",
+            "-p",
+            prompt,
+        ]);
+        assert!(
+            output.status.success(),
+            "run --start: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: Value = serde_json::from_slice(&output.stdout).expect("run --start JSON");
+        (
+            field(&body, "run_id").to_owned(),
+            field(&body, "session_id").to_owned(),
+        )
+    }
+
+    fn finish_run(&self, model: &str, prompt: &str) -> (String, String) {
+        let output = self.run(&[
+            "run",
+            "--provider",
+            "fake",
+            "--model",
+            model,
+            "--json",
+            "-p",
+            prompt,
+        ]);
+        assert!(
+            output.status.success(),
+            "run: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: Value = serde_json::from_slice(&output.stdout).expect("run JSON");
+        (
+            field(&body, "run_id").to_owned(),
+            field(&body, "session_id").to_owned(),
+        )
+    }
+
+    fn stop_run(&self, flag: &str, run_id: &str) -> Value {
+        let output = self.run(&["run", flag, run_id, "--json"]);
+        assert!(
+            output.status.success(),
+            "{flag}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("stop JSON")
+    }
+
+    fn run_state(&self, session: &str, run_id: &str) -> Option<String> {
+        self.db()
+            .query_row(
+                "SELECT state_json FROM run_heads WHERE session_id = ?1 AND run_id = ?2",
+                [session, run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|state| {
+                serde_json::from_str::<Value>(&state)
+                    .ok()
+                    .and_then(|value| value["state"].as_str().map(str::to_owned))
+            })
+    }
+
+    /// A long `agent wait` keeps a client attached (so the ephemeral daemon
+    /// never idles out) and doubles as the "wait resolves" observer.
+    fn holder(&self, parent_session: &str, agent: &str) -> std::process::Child {
+        self.command(&[
+            "agent",
+            "wait",
+            parent_session,
+            agent,
+            "--json",
+            "--timeout",
+            "180s",
+            "--no-spawn",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("agent wait holder")
+    }
+
+    fn journal_kinds(&self, session: &str) -> Vec<Value> {
+        self.journal(session)
+            .into_iter()
+            .filter_map(|event| {
+                let item = &event["payload"]["item"];
+                (item["item"] == "extension").then(|| item.clone())
+            })
+            .collect()
+    }
+
+    fn monitor_count(&self, session: &str) -> usize {
+        let output = self.run(&["status", "--json", "--no-spawn"]);
+        assert!(output.status.success());
+        let status: Value = serde_json::from_slice(&output.stdout).expect("status");
+        let endpoint = PathBuf::from(field(&status["daemon"], "socket_path"));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("RPC runtime")
+            .block_on(async {
+                let connection =
+                    haider_client::connect(&endpoint, haider_client::ClientConfig::default())
+                        .await
+                        .expect("monitor list connection");
+                let response = connection
+                    .client
+                    .request(haider_rpc::RequestBody::MonitorList {
+                        session_id: haider_protocol::ids::SessionId::new(session),
+                    })
+                    .await
+                    .expect("monitor.list");
+                let _ = connection.client.close();
+                match response {
+                    haider_rpc::ResponseBody::MonitorList { receipt } => match receipt.outcome {
+                        haider_rpc::MonitorListOutcomeWire::Listed { monitors } => monitors.len(),
+                        other => panic!("monitor list rejected: {other:?}"),
+                    },
+                    other => panic!("expected monitor list, got {other:?}"),
+                }
+            })
+    }
+}
+
+fn wait_for(what: &str, bound: Duration, mut probe: impl FnMut() -> bool) {
+    let deadline = Instant::now() + bound;
+    while Instant::now() < deadline {
+        if probe() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    panic!("timed out after {bound:?} waiting for {what}");
+}
+
+fn holder_exit(mut holder: std::process::Child, bound: Duration) -> (Option<i32>, Value) {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(status) = holder.try_wait().expect("holder status") {
+            let mut stdout = String::new();
+            use std::io::Read as _;
+            holder
+                .stdout
+                .take()
+                .expect("holder stdout")
+                .read_to_string(&mut stdout)
+                .expect("holder output");
+            return (
+                status.code(),
+                serde_json::from_str(&stdout).unwrap_or(Value::String(stdout)),
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = holder.kill();
+            let _ = holder.wait();
+            panic!("agent wait did not resolve within {bound:?}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn spawn_step(call_id: &str, task: &str, model: &str, background: bool) -> Value {
+    let mut args =
+        json!({"task":task,"prompt":format!("do {task}"),"model":model,"provider":"fake"});
+    if background {
+        args["background"] = Value::Bool(true);
+    }
+    json!({"step":"emit_tool_call","call_id":call_id,"name":"spawn_subagent","args":args})
+}
+
+fn steps_after_call(call_id: &str, text: &str) -> [Value; 4] {
+    [
+        json!({"step":"finish","reason":"tool_use"}),
+        json!({"step":"expect_tool_result","call_id":call_id}),
+        json!({"step":"emit_text","text":text}),
+        json!({"step":"finish","reason":"end_turn"}),
+    ]
+}
+
+/// Owner decision: `--stop-main` stops the main run only. A background child
+/// and the foreground child the run was waiting on both keep running; the
+/// waited-on child's result is delivered to the session when it finishes,
+/// the durable "still running" marker is journalled, and `agent wait` on the
+/// waited-on child resolves with its real report.
+///
+/// MUTATION CHECK: restore the worker's cancel cascade
+/// (`detach_outstanding_deferred` -> cancel) or drop the delivery watcher.
+/// Expected runtime failure: B/C are cancelled, or no delivered result.
+#[test]
+fn run_stop_main_leaves_children_running_and_delivers_waited_on_result() {
+    let root = json!([
+        spawn_step("spawn-b", "background b", "fake-b", true),
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"spawn-b"},
+        spawn_step("spawn-c", "waited c", "fake-c", false),
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"spawn-c"},
+        {"step":"emit_text","text":"root done"},
+        {"step":"finish","reason":"end_turn"}
+    ]);
+    let profile = Profile::new(json!({"by_model": {
+        "fake-model": root,
+        "fake-b": [{"step":"hang"}],
+        "fake-c": [{"step":"delay","ms":8000},{"step":"emit_text","text":"C_REPORT_AFTER_MAIN_STOP"},{"step":"finish","reason":"end_turn"}],
+    }}));
+    profile.seed_models(&["fake-model", "fake-b", "fake-c"]);
+    let (run_id, session) = profile.start_run("fake-model", "spawn b then wait on c");
+    wait_for("both children", STOP_OBSERVATION, || {
+        profile.delegations().len() == 2
+    });
+    let rows = profile.delegations();
+    let (b, c) = (rows[0].clone(), rows[1].clone());
+    let holder = profile.holder(&session, &b.agent);
+    let stopped = profile.stop_run("--stop-main", &run_id);
+    assert_eq!(stopped["result"]["status"], "accepted", "{stopped}");
+    assert_eq!(stopped["result"]["scope"], "main", "{stopped}");
+    assert_eq!(
+        stopped["result"]["subagents"]["still_running"], 2,
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["result"]["subagents"]["cancelled_runs"], 0,
+        "{stopped}"
+    );
+    wait_for("main run cancelled", STOP_OBSERVATION, || {
+        profile.run_state(&session, &run_id).as_deref() == Some("cancelled")
+    });
+    // The waited-on child finishes on its own and its result is delivered.
+    wait_for("delivered result", STOP_OBSERVATION, || {
+        profile
+            .journal_kinds(&session)
+            .iter()
+            .any(|item| item["kind"] == "detached_child_result_v1")
+    });
+    let kinds = profile.journal_kinds(&session);
+    let marker = kinds
+        .iter()
+        .find(|item| item["kind"] == "subagents_still_running_v1")
+        .expect("still-running marker");
+    assert_eq!(marker["data"]["still_running"], 2, "{marker}");
+    let delivered = kinds
+        .iter()
+        .find(|item| item["kind"] == "detached_child_result_v1")
+        .expect("delivered result");
+    assert_eq!(delivered["data"]["agent"], c.agent.as_str());
+    assert_eq!(delivered["data"]["state"], "done");
+    assert_eq!(delivered["data"]["summary"], "C_REPORT_AFTER_MAIN_STOP");
+    let waited = profile.json(
+        &[
+            "agent",
+            "wait",
+            &session,
+            &c.agent,
+            "--json",
+            "--timeout",
+            "10s",
+            "--no-spawn",
+        ],
+        "haider.agent.wait.v1",
+        0,
+    );
+    assert_eq!(waited["result"]["state"], "done", "{waited}");
+    assert_eq!(
+        waited["result"]["report"]["summary"],
+        "C_REPORT_AFTER_MAIN_STOP"
+    );
+    // The background child is still streaming long after the main stop.
+    let b_row = profile
+        .delegations()
+        .into_iter()
+        .find(|row| row.agent == b.agent)
+        .expect("b row");
+    assert_eq!(b_row.terminal, Some(0), "{b_row:?}");
+    assert!(!profile.live_runs(&b.child_session).is_empty());
+    // Explicit stop-all ends it and the attached wait resolves.
+    let all = profile.json(
+        &["agent", "cancel", &session, "--all", "--json", "--no-spawn"],
+        "haider.agent.cancel.v1",
+        0,
+    );
+    assert!(
+        all["result"]["stopped"]["cancelled_runs"].as_u64() >= Some(1),
+        "{all}"
+    );
+    let (code, _) = holder_exit(holder, STOP_OBSERVATION);
+    assert_eq!(code, Some(130));
+    profile.stop();
+}
+
+/// Owner decision: `agent cancel <id>` stops that subagent only; its own
+/// background child keeps running until an explicit `--all`.
+///
+/// MUTATION CHECK: restore the `manual_ancestor` subtree sweep in
+/// `agent_cancel`. Expected runtime failure: G is cancelled with C.
+#[test]
+fn named_agent_cancel_stops_only_that_subagent() {
+    let root = [
+        vec![spawn_step("spawn-c", "child c", "fake-c", true)],
+        steps_after_call("spawn-c", "root done").to_vec(),
+    ]
+    .concat();
+    let child = [
+        vec![spawn_step("spawn-g", "grandchild g", "fake-g", true)],
+        vec![
+            json!({"step":"finish","reason":"tool_use"}),
+            json!({"step":"expect_tool_result","call_id":"spawn-g"}),
+            json!({"step":"hang"}),
+        ],
+    ]
+    .concat();
+    let profile = Profile::new(json!({"by_model": {
+        "fake-model": root, "fake-c": child, "fake-g": [{"step":"hang"}],
+    }}));
+    profile.seed_models(&["fake-model", "fake-c", "fake-g"]);
+    let (_run, session) = profile.finish_run("fake-model", "spawn c in background");
+    wait_for("grandchild", STOP_OBSERVATION, || {
+        profile.delegations().len() == 2
+    });
+    let (c, g) = (profile.row(1), profile.row(2));
+    wait_for("c second request live", STOP_OBSERVATION, || {
+        !profile.live_runs(&c.child_session).is_empty()
+    });
+    let holder = profile.holder(&g.parent_session, &g.agent);
+    let cancelled = profile.json(
+        &[
+            "agent",
+            "cancel",
+            &session,
+            &c.agent,
+            "--json",
+            "--no-spawn",
+        ],
+        "haider.agent.cancel.v1",
+        0,
+    );
+    assert_eq!(cancelled["result"]["status"], "accepted", "{cancelled}");
+    wait_for("c cancelled", STOP_OBSERVATION, || {
+        profile.row(1).state.as_deref() == Some("cancelled")
+    });
+    thread::sleep(Duration::from_secs(5));
+    let g_now = profile.row(2);
+    assert_eq!(
+        g_now.terminal,
+        Some(0),
+        "grandchild must keep running: {g_now:?}"
+    );
+    let all = profile.json(
+        &["agent", "cancel", &session, "--all", "--json", "--no-spawn"],
+        "haider.agent.cancel.v1",
+        0,
+    );
+    assert!(
+        all["result"]["stopped"]["cancelled_runs"].as_u64() >= Some(1),
+        "{all}"
+    );
+    wait_for("g cancelled", STOP_OBSERVATION, || {
+        profile.row(2).state.as_deref() == Some("cancelled")
+    });
+    let (code, waited) = holder_exit(holder, STOP_OBSERVATION);
+    assert_eq!(code, Some(130), "{waited}");
+    profile.stop();
+}
+
+/// B1 (7-final): a child restarted by `agent message` spawns a background
+/// grandchild in its LATER run. `run --stop` on the (already terminal) root
+/// run must reach it through the session walk, and an attached `agent wait`
+/// on the grandchild must resolve. Fails on 4d04da69 (G kept streaming).
+#[test]
+fn run_stop_reaches_messaged_childs_grandchild_and_agent_wait_resolves() {
+    let root = [
+        vec![spawn_step("spawn-c", "child c", "fake-c", false)],
+        steps_after_call("spawn-c", "root done").to_vec(),
+    ]
+    .concat();
+    let child = [
+        vec![
+            json!({"step":"emit_text","text":"c first report"}),
+            json!({"step":"finish","reason":"end_turn"}),
+            spawn_step("spawn-g", "grandchild g", "fake-g", true),
+        ],
+        steps_after_call("spawn-g", "c second report").to_vec(),
+    ]
+    .concat();
+    let profile = Profile::new(json!({"by_model": {
+        "fake-model": root, "fake-c": child, "fake-g": [{"step":"hang"}],
+    }}));
+    profile.seed_models(&["fake-model", "fake-c", "fake-g"]);
+    let (run_id, session) = profile.finish_run("fake-model", "spawn c");
+    let c = profile.row(1);
+    profile.json(
+        &[
+            "agent",
+            "message",
+            &session,
+            &c.agent,
+            "spawn g in background",
+            "--json",
+            "--no-spawn",
+        ],
+        "haider.agent.message.v1",
+        0,
+    );
+    wait_for("grandchild", STOP_OBSERVATION, || {
+        profile.delegations().len() == 2
+    });
+    let g = profile.row(2);
+    let holder = profile.holder(&g.parent_session, &g.agent);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        profile.row(2).terminal,
+        Some(0),
+        "g streams before the stop"
+    );
+    let stopped = profile.stop_run("--stop", &run_id);
+    assert_eq!(stopped["result"]["status"], "already_terminal", "{stopped}");
+    assert!(
+        stopped["result"]["subagents"]["cancelled_runs"].as_u64() >= Some(1),
+        "{stopped}"
+    );
+    let started = Instant::now();
+    wait_for("g cancelled", Duration::from_secs(15), || {
+        profile.row(2).state.as_deref() == Some("cancelled")
+    });
+    eprintln!(
+        "B1 grandchild cancelled {:?} after run --stop",
+        started.elapsed()
+    );
+    let (code, waited) = holder_exit(holder, STOP_OBSERVATION);
+    assert_eq!(code, Some(130), "{waited}");
+    profile.stop();
+}
+
+/// Multi-level relay through LATER runs: C is woken by its own timer monitor
+/// and spawns G in that monitor-woken run; G is woken the same way and
+/// spawns H. `run --stop` on the terminal root run cancels H and removes the
+/// monitors still registered in the tree, so nothing wakes back up.
+#[test]
+fn run_stop_reaches_monitor_woken_relay_and_removes_descendant_monitors() {
+    let timer = |call_id: &str, interval_ms: u64, occurrence: &str| {
+        json!({"step":"emit_tool_call","call_id":call_id,"name":"monitor","args":{
+            "operation":"register","source":{"kind":"timer","interval_ms":interval_ms},
+            "action":{"report":true},"occurrence":occurrence}})
+    };
+    let root = [
+        vec![spawn_step("spawn-c", "child c", "fake-c", false)],
+        steps_after_call("spawn-c", "root done").to_vec(),
+    ]
+    .concat();
+    let relay = |me: &str, next_call: &str, next_task: &str, next_model: &str| -> Value {
+        Value::Array(
+            [
+                vec![
+                    // A delegated child must discover `monitor` before use.
+                    json!({"step":"emit_tool_call","call_id":format!("{me}-discover"),"name":"list_tools","args":{"filter":"monitor"}}),
+                    json!({"step":"finish","reason":"tool_use"}),
+                    json!({"step":"expect_tool_result","call_id":format!("{me}-discover")}),
+                    timer(&format!("{me}-wake"), 1_000, "once"),
+                    timer(&format!("{me}-keeper"), 3_600_000, "every"),
+                    json!({"step":"finish","reason":"tool_use"}),
+                    json!({"step":"expect_tool_result","call_id":format!("{me}-wake")}),
+                    json!({"step":"expect_tool_result","call_id":format!("{me}-keeper")}),
+                    json!({"step":"emit_text","text":format!("{me} first report")}),
+                    json!({"step":"finish","reason":"end_turn"}),
+                    spawn_step(next_call, next_task, next_model, true),
+                ],
+                steps_after_call(next_call, &format!("{me} woke and relayed")).to_vec(),
+            ]
+            .concat(),
+        )
+    };
+    let profile = Profile::new(json!({"by_model": {
+        "fake-model": root,
+        "fake-c": relay("c", "spawn-g", "grandchild g", "fake-g"),
+        "fake-g": relay("g", "spawn-h", "great-grandchild h", "fake-h"),
+        "fake-h": [{"step":"hang"}],
+    }}));
+    let mut profile = profile;
+    profile.tool_exposure = None;
+    profile.seed_models(&["fake-model", "fake-c", "fake-g", "fake-h"]);
+    let (run_id, _session) = profile.finish_run("fake-model", "start the relay");
+    wait_for("three-level relay", Duration::from_secs(90), || {
+        profile.delegations().len() == 3
+    });
+    let (c, g, h) = (profile.row(1), profile.row(2), profile.row(3));
+    assert_eq!(g.parent_session, c.child_session);
+    assert_eq!(h.parent_session, g.child_session);
+    let holder = profile.holder(&h.parent_session, &h.agent);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        profile.row(3).terminal,
+        Some(0),
+        "h streams before the stop"
+    );
+    assert!(profile.monitor_count(&c.child_session) >= 1);
+    assert!(profile.monitor_count(&g.child_session) >= 1);
+    let stopped = profile.stop_run("--stop", &run_id);
+    assert!(
+        stopped["result"]["subagents"]["cancelled_runs"].as_u64() >= Some(1),
+        "{stopped}"
+    );
+    assert!(
+        stopped["result"]["subagents"]["monitors_removed"].as_u64() >= Some(2),
+        "{stopped}"
+    );
+    wait_for("h cancelled", Duration::from_secs(15), || {
+        profile.row(3).state.as_deref() == Some("cancelled")
+    });
+    assert_eq!(profile.monitor_count(&c.child_session), 0);
+    assert_eq!(profile.monitor_count(&g.child_session), 0);
+    let (code, waited) = holder_exit(holder, STOP_OBSERVATION);
+    assert_eq!(code, Some(130), "{waited}");
+    assert!(profile.live_runs(&c.child_session).is_empty());
+    assert!(profile.live_runs(&g.child_session).is_empty());
+    profile.stop();
+}
+
+/// Owner decision: `--stop-subagents` stops every subagent of the run and
+/// leaves the run itself going; `--stop-main` then ends it.
+#[test]
+fn run_stop_subagents_leaves_main_running() {
+    let root = json!([
+        spawn_step("spawn-b", "background b", "fake-b", true),
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"spawn-b"},
+        {"step":"hang"}
+    ]);
+    let profile = Profile::new(json!({"by_model": {
+        "fake-model": root, "fake-b": [{"step":"hang"}],
+    }}));
+    profile.seed_models(&["fake-model", "fake-b"]);
+    let (run_id, session) = profile.start_run("fake-model", "spawn b and keep working");
+    wait_for("child b", STOP_OBSERVATION, || {
+        profile.delegations().len() == 1
+    });
+    let b = profile.row(1);
+    wait_for("b live", STOP_OBSERVATION, || {
+        !profile.live_runs(&b.child_session).is_empty()
+    });
+    let stopped = profile.stop_run("--stop-subagents", &run_id);
+    assert_eq!(stopped["result"]["scope"], "subagents", "{stopped}");
+    assert_eq!(
+        stopped["result"]["subagents"]["cancelled_runs"], 1,
+        "{stopped}"
+    );
+    wait_for("b cancelled", STOP_OBSERVATION, || {
+        profile.row(1).state.as_deref() == Some("cancelled")
+    });
+    thread::sleep(Duration::from_secs(3));
+    let main = profile.run_state(&session, &run_id);
+    assert!(
+        !matches!(main.as_deref(), Some("cancelled" | "done" | "errored")),
+        "main must keep running: {main:?}"
+    );
+    let ended = profile.stop_run("--stop-main", &run_id);
+    assert_eq!(ended["result"]["status"], "accepted", "{ended}");
+    wait_for("main cancelled", STOP_OBSERVATION, || {
+        profile.run_state(&session, &run_id).as_deref() == Some("cancelled")
+    });
+    profile.stop();
+}

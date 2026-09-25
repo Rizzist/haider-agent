@@ -1167,6 +1167,17 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn delegations_for_parent_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<DelegationRecord>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.delegations_for_parent_session(&session_id))
+        })
+        .await
+    }
+
     pub async fn delegation_descendants(
         &self,
         session_id: SessionId,

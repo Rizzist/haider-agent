@@ -1204,6 +1204,11 @@ async fn run_inner(
                     .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
                     .await
             }
+            RecoveredWork::DetachedChildren(recovered) => {
+                crate::delegation::DelegationHandle::new(hub.clone())
+                    .rearm_detached_deliveries(&recovered.session_id, &recovered.run_id)
+                    .await
+            }
         };
         if let Err(error) = result {
             let _ = worker_manager.shutdown().await;

@@ -93,7 +93,8 @@ pub(crate) enum RunAction {
     Execute,
     Start,
     Status(RunId),
-    Stop(RunId),
+    /// `--stop` (all), `--stop-main` or `--stop-subagents`.
+    Stop(RunId, haider_rpc::RunStopScopeWire),
     Replay(RunId),
 }
 
@@ -170,14 +171,23 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 action = RunAction::Status(parse_run_id(value, "--status")?);
             }
             "--status" => return Err("only one lifecycle action may be requested".into()),
-            "--stop" if action == RunAction::Execute => {
+            flag @ ("--stop" | "--stop-main" | "--stop-subagents")
+                if action == RunAction::Execute =>
+            {
                 index += 1;
                 let value = rest
                     .get(index)
-                    .ok_or_else(|| "--stop requires a run id".to_owned())?;
-                action = RunAction::Stop(parse_run_id(value, "--stop")?);
+                    .ok_or_else(|| format!("{flag} requires a run id"))?;
+                let scope = match flag {
+                    "--stop-main" => haider_rpc::RunStopScopeWire::Main,
+                    "--stop-subagents" => haider_rpc::RunStopScopeWire::Subagents,
+                    _ => haider_rpc::RunStopScopeWire::All,
+                };
+                action = RunAction::Stop(parse_run_id(value, flag)?, scope);
             }
-            "--stop" => return Err("only one lifecycle action may be requested".into()),
+            "--stop" | "--stop-main" | "--stop-subagents" => {
+                return Err("only one lifecycle action may be requested".into());
+            }
             "--replay" if action == RunAction::Execute => {
                 index += 1;
                 let value = rest
@@ -451,7 +461,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     if !prompt_required && prompt.is_some() {
         return Err("status, stop, and replay do not accept a prompt".into());
     }
-    if matches!(&action, RunAction::Status(_) | RunAction::Stop(_)) && timeout.is_some() {
+    if matches!(&action, RunAction::Status(_) | RunAction::Stop(..)) && timeout.is_some() {
         return Err("status and stop do not accept --timeout".into());
     }
     if !prompt_required
@@ -723,8 +733,8 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 }
             };
         }
-        RunAction::Stop(run_id) => {
-            return match stop_headless_run(&profile, lifecycle_ensure, run_id).await {
+        RunAction::Stop(run_id, scope) => {
+            return match stop_headless_run(&profile, lifecycle_ensure, run_id, scope).await {
                 Ok(stopped) => match write_lifecycle_value(
                     io::stdout().lock(),
                     options.output,
@@ -1105,7 +1115,16 @@ Permission options:\n\
 \n\
 Use --session ID to submit an ordinary turn to an existing native session.\n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
---timeout <duration>, --start, --status, --stop, and --replay.";
+--timeout <duration>, --start, --status, --stop, --stop-main, --stop-subagents,\n\
+and --replay.\n\
+\n\
+Stopping a run:\n\
+  --stop RUN             Stop the run AND every subagent in its tree, however deep\n\
+                         (including subagents started by messaged or monitor-woken\n\
+                         child turns); their monitors are removed\n\
+  --stop-main RUN        Stop only the run; its subagents keep running and a\n\
+                         subagent it was waiting on delivers its result later\n\
+  --stop-subagents RUN   Stop only the subagents in the run's tree; the run continues";
 
 pub(crate) fn read_stdin_prompt_from(mut input: impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();

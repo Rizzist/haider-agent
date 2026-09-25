@@ -23912,12 +23912,23 @@ impl ToolDispatcher for BrokerToolDispatcher {
         Ok(())
     }
 
-    async fn cancel_outstanding_deferred(&self, run_id: &RunId) -> Result<(), HaiderError> {
-        // The live map only tracks blocking collectors. The journal owns the
-        // full turn's children, including background and wait_ms detachments.
-        self.delegation
-            .cancel_parent_run_descendants(&self.session_id, run_id, self.run_deadline)
+    async fn detach_outstanding_deferred(&self, run_id: &RunId) -> Result<(), HaiderError> {
+        // Owner decision 2026-09-25: a main-thread stop never cancels its
+        // subagents. The live map only tracked blocking collectors; the
+        // journal owns every child of the turn, and the coordinator arms
+        // result delivery for waited-on children and records the
+        // still-running marker.
+        self.deferred.lock().await.clear();
+        // Bookkeeping failure must never turn a user stop into an error: the
+        // children are untouched either way.
+        if let Err(error) = self
+            .delegation
+            .detach_parent_run_children(&self.session_id, run_id)
             .await
+        {
+            tracing::warn!(%run_id, ?error, "detached-subagent bookkeeping after a main-only stop failed");
+        }
+        Ok(())
     }
 
     async fn cancel(&self) -> Result<(), HaiderError> {

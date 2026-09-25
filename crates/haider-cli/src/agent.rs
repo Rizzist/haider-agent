@@ -109,6 +109,13 @@ impl Options {
                     break;
                 }
                 "--json" if !options.json => options.json = true,
+                "--all"
+                    if family == "agent"
+                        && verb == "cancel"
+                        && !options.flags.contains_key("--all") =>
+                {
+                    options.flags.insert("--all".into(), String::new());
+                }
                 "--no-spawn" if !options.no_spawn => options.no_spawn = true,
                 "--timeout" | "--command-id" | "--task" | "--prompt" | "--provider" | "--model"
                 | "--agent-type" | "--cwd" | "--workflow" | "--trigger" => {
@@ -143,6 +150,7 @@ impl Options {
             ("agent", "spawn") => usize::from(!options.flags.contains_key("--prompt")),
             ("workflow", "run") => 1 + usize::from(!options.flags.contains_key("--prompt")),
             ("agent", "message") => 3,
+            ("agent", "cancel") if options.flags.contains_key("--all") => 1,
             ("agent", "cancel" | "wait") => 2,
             ("workflow", "list") => 0,
             _ => 1,
@@ -327,7 +335,7 @@ pub(crate) async fn command(family: &str, args: &[String]) -> ExitCode {
         .unwrap_or(args.len())];
     if flag_args.iter().any(|arg| arg == "--help" || arg == "-h") {
         let help = if family == "agent" {
-            "haider agent spawn <prompt> [--task NAME] [--provider NAME] [--model NAME] [--agent-type ID] [--cwd PATH]\nhaider agent list <parent-session-id>\nhaider agent message <parent-session-id> <agent-id> <message>\nhaider agent cancel <parent-session-id> <agent-id>\nhaider agent wait <parent-session-id> <agent-id> [--timeout DURATION]\nAll verbs: [--json] [--no-spawn] [--timeout DURATION]. Mutations: [--command-id ID]. Spawn also accepts --prompt/-p and --workflow ID --trigger REASON."
+            "haider agent spawn <prompt> [--task NAME] [--provider NAME] [--model NAME] [--agent-type ID] [--cwd PATH]\nhaider agent list <parent-session-id>\nhaider agent message <parent-session-id> <agent-id> <message>\nhaider agent cancel <parent-session-id> <agent-id>   (stops that subagent only; its children keep running)\nhaider agent cancel <parent-session-id> --all        (stops every subagent in the session's tree)\nhaider agent wait <parent-session-id> <agent-id> [--timeout DURATION]\nAll verbs: [--json] [--no-spawn] [--timeout DURATION]. Mutations: [--command-id ID]. Spawn also accepts --prompt/-p and --workflow ID --trigger REASON."
         } else {
             "haider workflow run <workflow-id> <prompt> --trigger REASON [--provider NAME] [--model NAME] [--cwd PATH]\nhaider workflow status <child-session-id>\nhaider workflow list\nAll verbs: [--json] [--no-spawn] [--timeout DURATION]. Run also accepts --prompt/-p and --command-id ID."
         };
@@ -389,6 +397,31 @@ async fn execute(options: &Options) -> Result<(Value, u8), Failure> {
             {
                 ResponseBody::SessionFleet { snapshot } => Ok((json!(snapshot), 0)),
                 _ => Err(Failure::protocol("session.fleet response mismatch")),
+            }
+        }
+        ("agent", "cancel") if options.flags.contains_key("--all") => {
+            // Owner decision 2026-09-25: the explicit "stop all" — every
+            // subagent in the session's tree, however deep, including
+            // children started by messaged or monitor-woken child turns.
+            connection.require(haider_rpc::FEATURE_AGENT_CANCEL_V1)?;
+            let session_id = SessionId::new(&options.positional[0]);
+            let worker_generation = connection.control(&session_id, deadline).await?;
+            match connection
+                .request(
+                    RequestBody::AgentCancelAll {
+                        command_id: CommandId::new(options.command_id()),
+                        session_id,
+                        worker_generation,
+                    },
+                    deadline,
+                )
+                .await?
+            {
+                ResponseBody::AgentCancelAll {
+                    session_id,
+                    stopped,
+                } => Ok((json!({"session_id":session_id,"stopped":stopped}), 0)),
+                _ => Err(Failure::protocol("agent.cancel_all response mismatch")),
             }
         }
         ("agent", "message" | "cancel") => {

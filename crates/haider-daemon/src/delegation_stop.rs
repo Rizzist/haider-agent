@@ -1,0 +1,768 @@
+//! Subagent stop semantics (owner decision 2026-09-25, 973-LANES.md).
+//!
+//! * Stopping the main thread (TUI Esc, `turn.cancel`, `run --stop-main`)
+//!   stops ONLY the main thread. Its subagents keep running. A foreground
+//!   subagent the stopped turn was waiting on is detached: it continues in
+//!   the background and its result is delivered to the parent session when
+//!   it finishes (steered into an active parent run, otherwise journalled as
+//!   a prompt-visible note that never starts provider work by itself). A
+//!   durable "N subagents still running" marker records what the stop left.
+//! * Cancelling one named subagent stops that subagent only: its original
+//!   run plus any later active run, and its own monitors. Its children keep
+//!   running.
+//! * Stop-all (`run --stop`, `run --stop-subagents`, `agent cancel --all`)
+//!   walks the delegation tree by SESSION, so children spawned in later runs
+//!   (messaged `run-child-message-*` runs, monitor-woken subturns) are
+//!   reached. It is unbounded in depth, cycle-safe through a seen-set, removes
+//!   every descendant session's monitors, and repeats until a pass finds
+//!   nothing live.
+
+use super::*;
+use haider_protocol::subagent_stop::{
+    DETACHED_RESULT_SUMMARY_MAX_BYTES, DetachedChildResultV1, DetachedChildStateV1,
+    STILL_RUNNING_AGENT_LIST_MAX, StillRunningAgentV1, SubagentsStillRunningV1, bounded_summary,
+};
+use std::sync::LazyLock;
+
+const DETACHED_DELIVERY_POLL: Duration = Duration::from_millis(250);
+
+/// In-process guard so one detached child has at most one delivery watcher.
+/// Durable dedupe is the deterministic delivery event id.
+static DETACHED_WATCHERS: LazyLock<std::sync::Mutex<HashSet<AgentId>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Where a stop-all walk starts.
+#[derive(Clone)]
+pub(crate) enum SubagentTreeRoot {
+    /// Every child spawned by one run (its tree).
+    Run {
+        session_id: SessionId,
+        run_id: RunId,
+    },
+    /// Every child of one session, from any of its runs.
+    Session(SessionId),
+}
+
+/// Outcome of a stop-all walk or a main-only detach.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SubagentStopSummary {
+    pub(crate) cancelled_runs: u64,
+    pub(crate) sessions: u64,
+    pub(crate) monitors_removed: u64,
+    pub(crate) still_running: u64,
+}
+
+impl SubagentStopSummary {
+    pub(crate) fn wire(self) -> haider_rpc::SubagentStopSummaryWire {
+        haider_rpc::SubagentStopSummaryWire {
+            cancelled_runs: self.cancelled_runs,
+            sessions: self.sessions,
+            monitors_removed: self.monitors_removed,
+            still_running: self.still_running,
+        }
+    }
+}
+
+fn is_background_record(record: &DelegationRecord) -> bool {
+    record
+        .manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("background"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+impl DelegationHandle {
+    /// Nonterminal runs of a session that a cancel can still move: every run
+    /// that is neither terminal nor already cancelling, including queued and
+    /// later (messaged or monitor-woken) runs.
+    pub(crate) async fn live_session_runs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<RunId>, HaiderError> {
+        let snapshot = self.child_session_snapshot(session_id).await?;
+        let mut runs = snapshot
+            .states
+            .into_iter()
+            .filter(|(_, state)| !state.is_terminal() && *state != RunState::Cancelling)
+            .map(|(run_id, _)| run_id)
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(runs)
+    }
+
+    async fn tree_roots(
+        &self,
+        root: &SubagentTreeRoot,
+    ) -> Result<Vec<DelegationRecord>, HaiderError> {
+        match root {
+            SubagentTreeRoot::Run { session_id, run_id } => {
+                self.hub
+                    .delegations_for_parent_run(session_id.clone(), run_id.clone())
+                    .await
+            }
+            SubagentTreeRoot::Session(session_id) => {
+                self.hub
+                    .delegations_for_parent_session(session_id.clone())
+                    .await
+            }
+        }
+    }
+
+    /// Visits every descendant delegation below `root`, by session, exactly
+    /// once. Unbounded depth; a revisited child session (a corrupt cycle)
+    /// is skipped rather than looping.
+    async fn walk_tree(
+        &self,
+        root: &SubagentTreeRoot,
+    ) -> Result<Vec<DelegationRecord>, HaiderError> {
+        let mut pending = self.tree_roots(root).await?;
+        pending.reverse();
+        let mut seen = HashSet::new();
+        let (SubagentTreeRoot::Session(session_id) | SubagentTreeRoot::Run { session_id, .. }) =
+            root;
+        seen.insert(session_id.clone());
+        let mut visited = Vec::new();
+        while let Some(record) = pending.pop() {
+            if !seen.insert(record.child_session_id.clone()) {
+                continue;
+            }
+            let mut children = self
+                .hub
+                .delegations_for_parent_session(record.child_session_id.clone())
+                .await?;
+            children.reverse();
+            pending.extend(children);
+            visited.push(record);
+        }
+        Ok(visited)
+    }
+
+    /// Number of subagents in the tree with at least one live run.
+    pub(crate) async fn live_subagent_count(
+        &self,
+        root: &SubagentTreeRoot,
+    ) -> Result<u64, HaiderError> {
+        let mut live = 0_u64;
+        for record in self.walk_tree(root).await? {
+            if !self
+                .live_session_runs(&record.child_session_id)
+                .await?
+                .is_empty()
+            {
+                live = live.saturating_add(1);
+            }
+        }
+        Ok(live)
+    }
+
+    /// Stop-all: cancels every live run of every descendant session and
+    /// removes those sessions' monitors, repeating until one pass cancels
+    /// nothing (closing races with concurrent spawns). The root session's
+    /// own runs are never touched here.
+    pub(crate) async fn stop_subagent_tree(
+        &self,
+        root: SubagentTreeRoot,
+        command_prefix: &str,
+    ) -> Result<SubagentStopSummary, HaiderError> {
+        let mut summary = SubagentStopSummary::default();
+        let mut monitors_cleared = HashSet::<SessionId>::new();
+        loop {
+            let visited = self.walk_tree(&root).await?;
+            summary.sessions = summary
+                .sessions
+                .max(u64::try_from(visited.len()).unwrap_or(u64::MAX));
+            let mut cancelled_this_pass = 0_u64;
+            for record in &visited {
+                // Monitors first: a monitor must not wake a session the
+                // same pass is about to stop.
+                if monitors_cleared.insert(record.child_session_id.clone()) {
+                    summary.monitors_removed = summary.monitors_removed.saturating_add(
+                        self.hub
+                            .inner_monitor()
+                            .remove_all_for_stop(
+                                &self.hub,
+                                &record.child_session_id,
+                                command_prefix,
+                            )
+                            .await,
+                    );
+                }
+                for run_id in self.live_session_runs(&record.child_session_id).await? {
+                    let command = stop_cancel_command(
+                        &self.hub,
+                        record,
+                        &run_id,
+                        command_prefix,
+                        "stop_all",
+                    )?;
+                    match self.hub.cancel_internal_turn(command).await {
+                        Ok(cancelled)
+                            if cancelled.status
+                                == haider_core::TurnCancellationStatus::Accepted =>
+                        {
+                            cancelled_this_pass = cancelled_this_pass.saturating_add(1);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                agent = %record.agent_id,
+                                run = %run_id,
+                                ?error,
+                                "stop-all could not cancel a subagent run"
+                            );
+                        }
+                    }
+                }
+            }
+            summary.cancelled_runs = summary.cancelled_runs.saturating_add(cancelled_this_pass);
+            if cancelled_this_pass == 0 {
+                break;
+            }
+        }
+        summary.still_running = 0;
+        Ok(summary)
+    }
+
+    /// Stops ONE named subagent: its original run (the receipt-bearing
+    /// `primary` command supplied by the caller), every later live run, and
+    /// its own monitors. Its children are deliberately left running.
+    pub(crate) async fn cancel_single_subagent(
+        &self,
+        record: &DelegationRecord,
+        primary: TurnCancelCommand,
+        command_prefix: &str,
+    ) -> Result<haider_core::CancelledTurn, HaiderError> {
+        let monitors_removed = self
+            .hub
+            .inner_monitor()
+            .remove_all_for_stop(&self.hub, &record.child_session_id, command_prefix)
+            .await;
+        let mut primary_result = self.hub.cancel_internal_turn(primary).await?;
+        for run_id in self.live_session_runs(&record.child_session_id).await? {
+            if run_id == record.child_run_id {
+                continue;
+            }
+            let command =
+                stop_cancel_command(&self.hub, record, &run_id, command_prefix, "manual")?;
+            let cancelled = self.hub.cancel_internal_turn(command).await?;
+            // The original run finished earlier; report the later run this
+            // request actually stopped.
+            if primary_result.status == haider_core::TurnCancellationStatus::AlreadyTerminal
+                && cancelled.status == haider_core::TurnCancellationStatus::Accepted
+            {
+                primary_result = cancelled;
+            }
+        }
+        tracing::debug!(
+            agent = %record.agent_id,
+            monitors_removed,
+            "named subagent cancelled without its children"
+        );
+        Ok(primary_result)
+    }
+
+    /// Main-only stop of `parent_run_id`: never cancels a child. Arms result
+    /// delivery for every foreground child the run had not collected, and
+    /// journals the durable still-running marker when subagents live on.
+    pub(crate) async fn detach_parent_run_children(
+        &self,
+        parent_session_id: &SessionId,
+        parent_run_id: &RunId,
+    ) -> Result<u64, HaiderError> {
+        let direct = self
+            .hub
+            .delegations_for_parent_run(parent_session_id.clone(), parent_run_id.clone())
+            .await?;
+        let Some(first) = direct.first().cloned() else {
+            return Ok(0);
+        };
+        let mut agents = Vec::new();
+        for record in &direct {
+            let live = !self
+                .live_session_runs(&record.child_session_id)
+                .await?
+                .is_empty();
+            let original = self.session_progress(record).await?.state;
+            let deliver = record.report.is_none()
+                && !is_background_record(record)
+                && !matches!(original, Some(RunState::Cancelling | RunState::Cancelled));
+            if deliver {
+                self.arm_detached_delivery(record.clone());
+            }
+            if live || deliver {
+                agents.push(StillRunningAgentV1 {
+                    agent: record.agent_id.clone(),
+                    task: record.task.clone(),
+                    result_pending: deliver,
+                });
+            }
+        }
+        let still_running = self
+            .live_subagent_count(&SubagentTreeRoot::Run {
+                session_id: parent_session_id.clone(),
+                run_id: parent_run_id.clone(),
+            })
+            .await?;
+        if still_running == 0 {
+            return Ok(0);
+        }
+        let event_id = format!(
+            "subagents-still-running-{}",
+            &stable_digest(&[parent_session_id.as_str(), parent_run_id.as_str()])[..24]
+        );
+        if self.session_has_event(parent_session_id, &event_id).await? {
+            return Ok(still_running);
+        }
+        let agents_truncated = agents.len() > STILL_RUNNING_AGENT_LIST_MAX;
+        agents.truncate(STILL_RUNNING_AGENT_LIST_MAX);
+        let marker = SubagentsStillRunningV1 {
+            parent_session_id: parent_session_id.clone(),
+            stopped_run_id: parent_run_id.clone(),
+            still_running,
+            agents,
+            agents_truncated,
+        };
+        let item = marker.to_extension_item().map_err(internal_serialization)?;
+        let mut envelope = [parent_fact_envelope(
+            &first,
+            &event_id,
+            haider_protocol::EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(event_id.clone()),
+                item,
+            }),
+            PromptRender::Verbatim,
+            self.hub.device_id(),
+            self.hub.worker_generation(),
+        )?];
+        if let Err(error) = self.hub.append(&mut envelope).await {
+            // A concurrent detach of the same run may have committed the
+            // identical marker first (event ids are unique).
+            if !self.session_has_event(parent_session_id, &event_id).await? {
+                return Err(error);
+            }
+        }
+        Ok(still_running)
+    }
+
+    /// Startup recovery: re-arms result delivery for every child a main-only
+    /// stop detached from this run and that has not been delivered yet.
+    pub(crate) async fn rearm_detached_deliveries(
+        &self,
+        parent_session_id: &SessionId,
+        parent_run_id: &RunId,
+    ) -> Result<(), HaiderError> {
+        for record in self
+            .hub
+            .delegations_for_parent_run(parent_session_id.clone(), parent_run_id.clone())
+            .await?
+        {
+            if record.report.is_some() || is_background_record(&record) {
+                continue;
+            }
+            let original = self.session_progress(&record).await?.state;
+            if !matches!(original, Some(RunState::Cancelling | RunState::Cancelled)) {
+                self.arm_detached_delivery(record);
+            }
+        }
+        Ok(())
+    }
+
+    fn arm_detached_delivery(&self, record: DelegationRecord) {
+        {
+            let mut watchers = DETACHED_WATCHERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !watchers.insert(record.agent_id.clone()) {
+                return;
+            }
+        }
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            let agent = record.agent_id.clone();
+            if let Err(error) = coordinator.deliver_detached_result(record).await {
+                tracing::warn!(%agent, ?error, "detached subagent result was not delivered");
+            }
+            DETACHED_WATCHERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&agent);
+        });
+    }
+
+    async fn deliver_detached_result(&self, record: DelegationRecord) -> Result<(), HaiderError> {
+        let event_id = format!(
+            "detached-child-result-{}",
+            &stable_digest(&[record.parent_session_id.as_str(), record.agent_id.as_str()])[..24]
+        );
+        if self
+            .session_has_event(&record.parent_session_id, &event_id)
+            .await?
+        {
+            return Ok(());
+        }
+        let ticket = DeferredTicket {
+            id: record.agent_id.as_str().to_owned(),
+            manifest: record.manifest.clone(),
+        };
+        let mut mirror = self.load_chip_mirror(&ticket).await?;
+        let current = loop {
+            let Some(current) = self.hub.delegation(record.agent_id.clone()).await? else {
+                return Ok(());
+            };
+            self.mirror_child_chip_states(&current, &mut mirror).await?;
+            if mirror.child_run_terminal {
+                break current;
+            }
+            tokio::time::sleep(DETACHED_DELIVERY_POLL).await;
+        };
+        // The same bounded terminal tail a collector runs: flush the child's
+        // final chip and metrics projection into the parent.
+        let settlement = self
+            .mirror_until_child_terminal(
+                &current,
+                &mut mirror,
+                tokio::time::Instant::now() + self.settlement_tail_timeout,
+            )
+            .await?;
+        report_child_settlement_outcome(settlement);
+        let (report, chip) = match current.report.clone() {
+            Some(report) => {
+                let chip = if report.verified == ReportVerification::Red {
+                    ChipState::Error
+                } else {
+                    ChipState::Done
+                };
+                (report, chip)
+            }
+            None => {
+                let Some(completion) = self.derive_terminal_report(&current).await? else {
+                    return Ok(());
+                };
+                let stored = self
+                    .hub
+                    .record_delegation_report(current.agent_id.clone(), completion.report.clone())
+                    .await?;
+                (stored.report.unwrap_or(completion.report), completion.chip)
+            }
+        };
+        let state = match self.session_progress(&current).await?.state {
+            Some(RunState::Done) => DetachedChildStateV1::Done,
+            Some(RunState::Cancelled) => DetachedChildStateV1::Cancelled,
+            _ => DetachedChildStateV1::Errored,
+        };
+        let (summary, summary_truncated) =
+            bounded_summary(&report.summary, DETACHED_RESULT_SUMMARY_MAX_BYTES);
+        let delivered = DetachedChildResultV1 {
+            agent: current.agent_id.clone(),
+            task: current.task.clone(),
+            stopped_run_id: current.parent_run_id.clone(),
+            state,
+            verified: report.verified.clone(),
+            summary,
+            summary_truncated,
+        };
+        let steered = self.steer_detached_result(&current, &delivered).await;
+        let item = delivered
+            .to_extension_item()
+            .map_err(internal_serialization)?;
+        let device = self.hub.device_id();
+        let generation = self.hub.worker_generation();
+        let result_item = format!("{event_id}-child-result");
+        let mut envelopes = [
+            parent_fact_envelope(
+                &current,
+                &format!("{event_id}-report"),
+                haider_protocol::EventPayload::AgentReport(report.clone()),
+                PromptRender::Omit,
+                device.clone(),
+                generation,
+            )?,
+            parent_fact_envelope(
+                &current,
+                &format!("{event_id}-chip"),
+                haider_protocol::EventPayload::AgentChipState {
+                    agent: current.agent_id.clone(),
+                    chip,
+                },
+                PromptRender::Omit,
+                device.clone(),
+                generation,
+            )?,
+            parent_fact_envelope(
+                &current,
+                &format!("{result_item}-started"),
+                haider_protocol::EventPayload::Item(ItemEvent::Started {
+                    item_id: ItemId::new(result_item.clone()),
+                    item: TurnItem::ChildResult {
+                        report: report.clone(),
+                    },
+                }),
+                PromptRender::Omit,
+                device.clone(),
+                generation,
+            )?,
+            parent_fact_envelope(
+                &current,
+                &format!("{result_item}-completed"),
+                haider_protocol::EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new(result_item),
+                    item: TurnItem::ChildResult { report },
+                }),
+                PromptRender::Omit,
+                device.clone(),
+                generation,
+            )?,
+            // Exactly one prompt copy: the durable steer owns it when the
+            // result reached an active run; otherwise this fact does.
+            parent_fact_envelope(
+                &current,
+                &event_id,
+                haider_protocol::EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new(event_id.clone()),
+                    item,
+                }),
+                if steered {
+                    PromptRender::Omit
+                } else {
+                    PromptRender::Verbatim
+                },
+                device,
+                generation,
+            )?,
+        ];
+        self.hub.append(&mut envelopes).await?;
+        if current.state != DelegationState::Collected {
+            self.hub
+                .mark_delegation_collected(current.agent_id.clone())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Durable steer into the parent's active run (the task-completion S1
+    /// seam). Returns false when no run can take it; a stray admission from
+    /// a lost race is cancelled so delivery never starts provider work.
+    async fn steer_detached_result(
+        &self,
+        record: &DelegationRecord,
+        delivered: &DetachedChildResultV1,
+    ) -> bool {
+        let active = match self.active_parent_run(&record.parent_session_id).await {
+            Ok(Some(active)) => active,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(agent = %record.agent_id, ?error, "active parent run scan failed");
+                return false;
+            }
+        };
+        let (run_id, branch_id) = active;
+        let text = delivered.model_note();
+        let identity = stable_digest(&[record.agent_id.as_str(), run_id.as_str()]);
+        let identity = &identity[..24];
+        let Ok(request_json) = serde_json::to_string(&serde_json::json!({
+            "session_id": record.parent_session_id,
+            "run_id": run_id,
+            "agent": record.agent_id,
+            "text": text,
+            "mode": DeliveryMode::Steer,
+            "delivery_path": "detached_child_result",
+        })) else {
+            return false;
+        };
+        let accepted = match self
+            .hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("detached-result-steer-{identity}"),
+                request_digest: digest_bytes(request_json.as_bytes()),
+                request_json,
+                session_id: record.parent_session_id.clone(),
+                worker_generation: self.hub.worker_generation(),
+                branch_id,
+                run_id,
+                agent_id: record.parent_agent_id.clone(),
+                text: text.clone(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+                queued_event_id: EventId::new(format!("detached-result-queued-{identity}")),
+                user_event_id: EventId::new(format!("detached-result-user-{identity}")),
+                active_event_id: EventId::new(format!("detached-result-active-{identity}")),
+                device_id: self.hub.device_id(),
+            })
+            .await
+        {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(agent = %record.agent_id, ?error, "detached result steer was not accepted");
+                return false;
+            }
+        };
+        if accepted.disposition != haider_core::TurnAdmissionDisposition::SteerPending {
+            let Ok(request_json) = serde_json::to_string(&serde_json::json!({
+                "session_id": record.parent_session_id,
+                "run_id": accepted.run_id,
+                "reason": "detached-result-steer-race",
+            })) else {
+                return false;
+            };
+            let cancel = TurnCancelCommand {
+                command_id: format!("detached-result-race-cancel-{identity}"),
+                request_digest: digest_bytes(request_json.as_bytes()),
+                request_json,
+                session_id: record.parent_session_id.clone(),
+                worker_generation: self.hub.worker_generation(),
+                run_id: accepted.run_id.clone(),
+                cancelling_event_id: EventId::new(format!(
+                    "detached-result-race-cancelling-{identity}"
+                )),
+                device_id: self.hub.device_id(),
+            };
+            if let Err(error) = self.hub.cancel_internal_turn(cancel).await {
+                tracing::warn!(agent = %record.agent_id, ?error, "stray detached-result admission was not cancelled");
+            }
+            return false;
+        }
+        if let Err(error) = self.hub.submit_internal_nudge(accepted, text).await {
+            tracing::warn!(agent = %record.agent_id, ?error, "detached result steer wake was not delivered");
+        }
+        true
+    }
+
+    /// Latest parent run a steer can reach: nonterminal, not cancelling and
+    /// not merely queued.
+    async fn active_parent_run(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(RunId, Option<BranchId>)>, HaiderError> {
+        let mut cursor = 0;
+        let mut states = HashMap::<RunId, (RunState, Option<BranchId>, u64)>::new();
+        loop {
+            let page = self
+                .hub
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                let Some(run_id) = envelope.run_id.clone() else {
+                    continue;
+                };
+                if let Ok(haider_protocol::EventPayload::RunState(state)) =
+                    envelope.payload.decode_event()
+                {
+                    states.insert(run_id, (state, envelope.branch_id, envelope.seq));
+                }
+            }
+        }
+        Ok(states
+            .into_iter()
+            .filter(|(_, (state, _, _))| {
+                !state.is_terminal() && *state != RunState::Cancelling && *state != RunState::Queued
+            })
+            .max_by_key(|(_, (_, _, seq))| *seq)
+            .map(|(run_id, (_, branch_id, _))| (run_id, branch_id)))
+    }
+
+    async fn session_has_event(
+        &self,
+        session_id: &SessionId,
+        event_id: &str,
+    ) -> Result<bool, HaiderError> {
+        let mut cursor = 0;
+        loop {
+            let page = self
+                .hub
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Delegation,
+                    session_id,
+                    cursor,
+                    256,
+                )
+                .await?;
+            if page.is_empty() {
+                return Ok(false);
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            if page
+                .iter()
+                .any(|envelope| envelope.event_id.as_str() == event_id)
+            {
+                return Ok(true);
+            }
+        }
+    }
+}
+
+/// Receipt-backed cancel of one subagent run under a stop request.
+fn stop_cancel_command(
+    hub: &SessionHub,
+    record: &DelegationRecord,
+    run_id: &RunId,
+    command_prefix: &str,
+    reason: &str,
+) -> Result<TurnCancelCommand, HaiderError> {
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "session_id": record.child_session_id,
+        "run_id": run_id,
+        "agent": record.agent_id,
+        "reason": reason,
+    }))
+    .map_err(internal_serialization)?;
+    let identity = stable_digest(&[
+        command_prefix,
+        record.child_session_id.as_str(),
+        run_id.as_str(),
+    ]);
+    let identity = &identity[..32];
+    Ok(TurnCancelCommand {
+        command_id: format!("{command_prefix}-{reason}-{identity}"),
+        request_digest: digest_bytes(request_json.as_bytes()),
+        request_json,
+        session_id: record.child_session_id.clone(),
+        worker_generation: hub.worker_generation(),
+        run_id: run_id.clone(),
+        cancelling_event_id: EventId::new(format!("subagent-stop-cancelling-{identity}")),
+        device_id: hub.device_id(),
+    })
+}
+
+/// A parent-session fact scoped to the delegating run's branch and agent.
+fn parent_fact_envelope(
+    record: &DelegationRecord,
+    event_id: &str,
+    payload: haider_protocol::EventPayload,
+    prompt: PromptRender,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    let payload = serde_json::to_value(payload).map_err(internal_serialization)?;
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: record.parent_session_id.clone(),
+        branch_id: record.parent_branch_id.clone(),
+        run_id: Some(record.parent_run_id.clone()),
+        agent_id: record.parent_agent_id.clone(),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt,
+        },
+        payload: payload.into(),
+    })
+}

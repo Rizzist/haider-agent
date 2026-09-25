@@ -2132,10 +2132,13 @@ pub trait ToolDispatcher: Send + Sync {
         Ok(())
     }
 
-    /// Cancels every child still owned by this turn. The actor invokes this
-    /// only on a real turn cancellation, never when a durable child-wait
-    /// checkpoint is quietly parked for restart.
-    async fn cancel_outstanding_deferred(&self, _run_id: &RunId) -> Result<(), HaiderError> {
+    /// Releases every child still owned by this turn WITHOUT cancelling it
+    /// (owner decision 2026-09-25: stopping the main thread stops only the
+    /// main thread). Implementations arrange later delivery of a waited-on
+    /// child's result. The actor invokes this only on a real turn
+    /// cancellation, never when a durable child-wait checkpoint is quietly
+    /// parked for restart.
+    async fn detach_outstanding_deferred(&self, _run_id: &RunId) -> Result<(), HaiderError> {
         Ok(())
     }
 
@@ -11069,7 +11072,7 @@ impl HarnessActor {
     ) -> TurnOutcome {
         let mut cleanup_error = None;
         if let Some(dispatcher) = self.dispatcher.as_ref() {
-            if let Err(error) = dispatcher.cancel_outstanding_deferred(run_id).await {
+            if let Err(error) = dispatcher.detach_outstanding_deferred(run_id).await {
                 cleanup_error = Some(error);
             }
             // P1-1: a cancel/close failure cannot turn a committed user
@@ -13367,6 +13370,7 @@ fn background_spawn_result(
             "collect": agent_wait_command(parent_session_id, agent),
             "list": agent_list_command(parent_session_id),
             "cancel": agent_cancel_command(parent_session_id, agent),
+            "cancel_all": haider_protocol::subagent_stop::agent_cancel_all_command(parent_session_id),
         })
         .to_string(),
         truncated: false,

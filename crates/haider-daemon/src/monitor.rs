@@ -2284,6 +2284,53 @@ impl MonitorService {
         }
     }
 
+    /// Durably removes every monitor registered by one session. Explicit
+    /// subagent stops use this so no timer, file, task or agent monitor can
+    /// wake a stopped subagent into a new run (owner decision 2026-09-25).
+    /// Each removal is receipt-backed under a command id derived from
+    /// `command_prefix`, so a retried stop replays instead of re-removing.
+    pub(crate) async fn remove_all_for_stop(
+        &self,
+        hub: &SessionHub,
+        session: &SessionId,
+        command_prefix: &str,
+    ) -> u64 {
+        let listed = self.client_list(hub, session.clone()).await;
+        let haider_rpc::MonitorListOutcomeWire::Listed { monitors } = listed.outcome else {
+            return 0;
+        };
+        let mut removed = 0_u64;
+        for monitor in monitors {
+            let command_id = haider_rpc::CommandId::new(format!(
+                "{command_prefix}-monitor-{}",
+                &stable_digest(&[session.as_str(), &monitor.monitor_id])[..24]
+            ));
+            let receipt = self
+                .client_remove(
+                    hub,
+                    command_id,
+                    session.clone(),
+                    hub.worker_generation(),
+                    monitor.monitor_id.clone(),
+                )
+                .await;
+            match receipt.outcome {
+                haider_rpc::MonitorRemoveOutcomeWire::Removed { .. } => {
+                    removed = removed.saturating_add(1);
+                }
+                outcome => {
+                    tracing::warn!(
+                        %session,
+                        monitor = %monitor.monitor_id,
+                        ?outcome,
+                        "stopped subagent monitor was not removed"
+                    );
+                }
+            }
+        }
+        removed
+    }
+
     pub(crate) async fn client_register(
         &self,
         hub: &SessionHub,

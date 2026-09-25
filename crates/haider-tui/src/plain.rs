@@ -687,6 +687,18 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             {
                 out.push_str(&budget.summary());
                 out.push('\n');
+            } else if let Some(marker) =
+                haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                out.push_str(&format!("⧗ {}\n", marker.summary()));
+            } else if let Some(result) =
+                haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                out.push_str(&format!("↩ {}\n", result.summary_line()));
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 out.push_str(&label);
                 out.push('\n');

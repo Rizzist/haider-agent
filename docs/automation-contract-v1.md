@@ -802,6 +802,7 @@ haider agent spawn "inspect the failing tests" --task investigation --json
 haider agent list <parent-session-id> --json
 haider agent message <parent-session-id> <agent-id> "inspect the new failure" --json
 haider agent cancel <parent-session-id> <agent-id> --json
+haider agent cancel <parent-session-id> --all --json
 haider agent wait <parent-session-id> <agent-id> --timeout 30s --json
 haider workflow list --json
 haider workflow run child-implement-verify "implement and verify the fix" \
@@ -817,6 +818,17 @@ the accepted `session_id` and `run_id` in `result`; retain these coordinates
 and inspect the session instead of blindly retrying. Explicit cancellation
 uses `agent cancel`. Closing a successful spawn command leaves its child owned
 by the daemon. The ordinary durable delegation lifetime budget still applies.
+
+Stop semantics (owner decision 2026-09-25): `agent cancel <parent> <agent>`
+stops that subagent only (its original run, any later messaged or
+monitor-woken run, and its own monitors); its children keep running.
+`agent cancel <parent> --all` stops every subagent in the parent session's
+tree, however deep, and removes their monitors; the parent's own runs are not
+touched. Stopping a main run is separate: `haider run --stop <run>` stops the
+run and its whole subagent tree, `--stop-main` stops only the run (subagents
+keep running; a waited-on subagent's result is delivered to the session when
+it finishes), and `--stop-subagents` stops only the tree. The TUI's Esc is a
+main-only stop.
 
 Spawn/run accept `--provider`, `--model`, `--agent-type`, `--task`, and
 `--cwd`; `--prompt`/`-p` can replace the positional prompt. Omitted provider
@@ -940,7 +952,7 @@ must tolerate additive fields. Human output is not a parsing contract.
 | agent spawn / workflow run | Parent `session_id`/`run_id`, actual `agent_id`, `child_session_id`/`child_run_id`, and durable `manifest`. |
 | agent list | Native `SessionFleetSnapshot`, including `roots`, bounds, truncation and rollup. |
 | agent message | Native `receipt`, including delivery kind and child run coordinates. Running children receive steer; idle children receive a queued fresh turn. |
-| agent cancel | Native `agent.cancel` fields: `agent`, child session/run, status and optional terminal sequence. Acceptance is not terminal completion. |
+| agent cancel | Native `agent.cancel` fields: `agent`, child session/run, status and optional terminal sequence. When the original run already finished, the fields name the later run that was stopped. Acceptance is not terminal completion. With `--all`: `session_id` and `stopped` (`cancelled_runs`, `sessions`, `monitors_removed`, `still_running`). |
 | agent wait | Parent/agent/child coordinates, terminal `state`, child `terminal_seq`, `report`, `report_source`, and nullable parent `child_result_seq`. |
 | workflow status | `session_id`, native `graph` status and nullable typed `activation`. A built-in graph need not have a typed Loom activation. |
 | workflow list | `workflows`: native workflow catalog entries. |

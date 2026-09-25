@@ -4695,6 +4695,35 @@ impl HubConnection {
                 self.agent_cancel(request_id, command_id, session_id, worker_generation, agent)
                     .await
             }
+            RequestBody::AgentCancelAll {
+                command_id,
+                session_id,
+                worker_generation,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "stopping all subagents requires a control attachment to the parent session",
+                        false,
+                        None,
+                    );
+                }
+                self.agent_cancel_all(request_id, command_id, session_id, worker_generation)
+                    .await
+            }
             RequestBody::TurnSubmitWithBranch {
                 command_id,
                 session_id,
@@ -6650,7 +6679,11 @@ impl HubConnection {
                 }
                 self.headless_run_status(request_id, run_id).await
             }
-            RequestBody::HeadlessRunStop { command_id, run_id } => {
+            RequestBody::HeadlessRunStop {
+                command_id,
+                run_id,
+                scope,
+            } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
                         request_id,
@@ -6660,7 +6693,8 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.headless_run_stop(request_id, command_id, run_id).await
+                self.headless_run_stop(request_id, command_id, run_id, scope)
+                    .await
             }
             RequestBody::WorkflowGraphState {
                 session_id,
@@ -14851,23 +14885,10 @@ impl HubConnection {
             );
         }
 
-        let mut pending = vec![record.clone()];
-        let mut subtree = Vec::new();
-        while let Some(current) = pending.pop() {
-            match self
-                .hub
-                .delegations_for_parent_run(
-                    current.child_session_id.clone(),
-                    current.child_run_id.clone(),
-                )
-                .await
-            {
-                Ok(children) => pending.extend(children),
-                Err(error) => return self.respond_turn_error(request_id, error),
-            }
-            subtree.push(current);
-        }
-
+        // Owner decision 2026-09-25: cancelling a named subagent stops that
+        // subagent only (its original run, any later messaged or
+        // monitor-woken run, and its own monitors). Its children keep
+        // running; `agent.cancel_all` is the explicit tree stop.
         let target_command = match agent_cancel_command(
             &record,
             command_id.as_str(),
@@ -14878,40 +14899,18 @@ impl HubConnection {
             Ok(command) => command,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
-        let cancelled = match self.hub.cancel_internal_turn(target_command).await {
+        let prefix = format!(
+            "agent-cancel-{}",
+            &crate::delegation::stable_digest(&[command_id.as_str(), record.agent_id.as_str()])
+                [..24]
+        );
+        let cancelled = match crate::delegation::DelegationHandle::new(self.hub.clone())
+            .cancel_single_subagent(&record, target_command, &prefix)
+            .await
+        {
             Ok(cancelled) => cancelled,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
-
-        if cancelled.status == TurnCancellationStatus::Accepted {
-            for descendant in subtree.into_iter().rev() {
-                if descendant.agent_id == record.agent_id {
-                    continue;
-                }
-                let descendant_command_id = format!(
-                    "{}-ancestor-{}",
-                    command_id.as_str(),
-                    descendant.agent_id.as_str()
-                );
-                let command = match agent_cancel_command(
-                    &descendant,
-                    &descendant_command_id,
-                    "manual_ancestor",
-                    worker_generation,
-                    self.hub.device_id(),
-                ) {
-                    Ok(command) => command,
-                    Err(error) => return self.respond_turn_error(request_id, error),
-                };
-                if let Err(error) = self.hub.cancel_internal_turn(command).await {
-                    tracing::warn!(
-                        agent = %descendant.agent_id,
-                        ?error,
-                        "manual child cancellation descendant sweep will be reconciled by the cancelled parent"
-                    );
-                }
-            }
-        }
 
         self.send(WireFrame::Response {
             request_id,
@@ -14924,6 +14923,52 @@ impl HubConnection {
                     TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
                 },
                 terminal_seq: cancelled.terminal_seq,
+            },
+        })
+    }
+
+    /// `agent.cancel_all`: stops every subagent in the session's delegation
+    /// tree, however deep and through later child runs, and removes those
+    /// subagents' monitors. The session's own runs are untouched.
+    async fn agent_cancel_all(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "agent-cancel-all command id must not be empty",
+                false,
+                None,
+            );
+        }
+        let prefix = format!(
+            "agent-cancel-all-{}",
+            &crate::delegation::stable_digest(&[
+                command_id.as_str(),
+                session_id.as_str(),
+                &worker_generation.to_string(),
+            ])[..24]
+        );
+        let stopped = match crate::delegation::DelegationHandle::new(self.hub.clone())
+            .stop_subagent_tree(
+                crate::delegation::SubagentTreeRoot::Session(session_id.clone()),
+                &prefix,
+            )
+            .await
+        {
+            Ok(stopped) => stopped,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::AgentCancelAll {
+                session_id,
+                stopped: stopped.wire(),
             },
         })
     }
@@ -15822,13 +15867,9 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
-        // A child detached by wait_ms is no longer in the parent's active
-        // collector. Sweep durable descendants on every explicit user cancel,
-        // even if the parent worker has not reached its cancellation cleanup.
-        crate::delegation::DelegationHandle::new(self.hub.clone())
-            .cancel_parent_run_descendants(&cancelled.session_id, &cancelled.run_id, None)
-            .await
-            .map_err(SessionHubError::Store)?;
+        // Owner decision 2026-09-25: turn.cancel (TUI Esc) stops only the
+        // main thread. Its subagents keep running; the worker's cancellation
+        // cleanup detaches them and records the still-running marker.
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::TurnCancel {
@@ -16024,17 +16065,33 @@ impl HubConnection {
         })
     }
 
+    /// `headless.run.stop` (owner decision 2026-09-25): the default `all`
+    /// scope stops the run and every subagent in its tree, however deep and
+    /// through later child runs; `main` stops only the run (its subagents keep
+    /// running and a waited-on child's result is delivered later);
+    /// `subagents` stops only the tree and leaves the run going.
     async fn headless_run_stop(
         &self,
         request_id: RequestId,
         command_id: CommandId,
         run_id: haider_protocol::ids::RunId,
+        scope: haider_rpc::RunStopScopeWire,
     ) -> Result<(), SessionHubError> {
+        use haider_rpc::RunStopScopeWire as Scope;
         if command_id.as_str().is_empty() {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
                 "headless stop command id must not be empty",
+                false,
+                None,
+            );
+        }
+        if matches!(scope, Scope::Unknown) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "headless stop scope must be all, main or subagents",
                 false,
                 None,
             );
@@ -16048,21 +16105,46 @@ impl HubConnection {
                 None,
             );
         };
-        if found.state.is_terminal() {
-            // A completed parent can still own detached children. An explicit
-            // stop closes that subtree even though the parent run itself is
-            // already terminal.
-            crate::delegation::DelegationHandle::new(self.hub.clone())
-                .cancel_parent_run_descendants(&found.session_id, &run_id, None)
+        let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
+        let tree = crate::delegation::SubagentTreeRoot::Run {
+            session_id: found.session_id.clone(),
+            run_id: run_id.clone(),
+        };
+        let prefix = format!(
+            "run-stop-{}",
+            &crate::delegation::stable_digest(&[command_id.as_str(), run_id.as_str()])[..24]
+        );
+        let echo_scope = (!scope.is_all()).then_some(scope);
+        let mut subagents = crate::delegation::SubagentStopSummary::default();
+        if matches!(scope, Scope::All | Scope::Subagents) {
+            // Subagents first, so the main run's own stop cleanup finds no
+            // live child to detach and delivers no cancelled results.
+            subagents = delegation
+                .stop_subagent_tree(tree.clone(), &prefix)
                 .await
                 .map_err(SessionHubError::Store)?;
+        }
+        if matches!(scope, Scope::Subagents) || found.state.is_terminal() {
+            if matches!(scope, Scope::Main) {
+                subagents.still_running = delegation
+                    .live_subagent_count(&tree)
+                    .await
+                    .map_err(SessionHubError::Store)?;
+            }
+            let terminal = found.state.is_terminal();
             return self.send(WireFrame::Response {
                 request_id,
                 body: ResponseBody::HeadlessRunStop {
                     session_id: found.session_id,
                     run_id,
-                    status: CancelStatus::AlreadyTerminal,
-                    terminal_seq: Some(found.state_seq),
+                    status: if terminal {
+                        CancelStatus::AlreadyTerminal
+                    } else {
+                        CancelStatus::Accepted
+                    },
+                    terminal_seq: terminal.then_some(found.state_seq),
+                    scope: echo_scope,
+                    subagents: Some(subagents.wire()),
                 },
             });
         }
@@ -16106,10 +16188,26 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
-        crate::delegation::DelegationHandle::new(self.hub.clone())
-            .cancel_parent_run_descendants(&cancelled.session_id, &cancelled.run_id, None)
-            .await
-            .map_err(SessionHubError::Store)?;
+        if matches!(scope, Scope::All) {
+            // A second walk closes the window in which the run spawned a
+            // child between the first pass and its own cancellation.
+            let again = delegation
+                .stop_subagent_tree(tree, &prefix)
+                .await
+                .map_err(SessionHubError::Store)?;
+            subagents.cancelled_runs = subagents
+                .cancelled_runs
+                .saturating_add(again.cancelled_runs);
+            subagents.sessions = subagents.sessions.max(again.sessions);
+            subagents.monitors_removed = subagents
+                .monitors_removed
+                .saturating_add(again.monitors_removed);
+        } else {
+            subagents.still_running = delegation
+                .live_subagent_count(&tree)
+                .await
+                .map_err(SessionHubError::Store)?;
+        }
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::HeadlessRunStop {
@@ -16120,6 +16218,8 @@ impl HubConnection {
                     TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
                 },
                 terminal_seq: cancelled.terminal_seq,
+                scope: echo_scope,
+                subagents: Some(subagents.wire()),
             },
         })
     }

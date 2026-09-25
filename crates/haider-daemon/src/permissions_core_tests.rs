@@ -1306,7 +1306,8 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
             | RecoveredWork::ChildWait(_)
             | RecoveredWork::AdmissionRetry(_)
             | RecoveredWork::WorkflowContinuation(_)
-            | RecoveredWork::DelegationMirror(_) => None,
+            | RecoveredWork::DelegationMirror(_)
+            | RecoveredWork::DetachedChildren(_) => None,
         })
         .collect::<Vec<_>>();
     recovered_menus.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
@@ -1659,17 +1660,18 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Union full-pack pin: 971 redaction, 972 task_outcome/output ergonomics,
     // 972-ax-testrun, the typed `tool_script` DAG schema, and handle sources. The
     // default instruct-pipe pack is unchanged: the large orchestration schema
-    // remains discovery-only until explicitly promoted.
+    // remains discovery-only until explicitly promoted. +123 bytes: the
+    // spawn_subagent description states the 2026-09-25 stop semantics.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_063;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_186;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_014;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_137;
     #[cfg(target_os = "windows")]
     // `tool_script` nests the platform-specific `process_exec` schema, so
     // Windows carries the historical 3-byte command-description delta twice.
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_010;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_133;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_008;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_131;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

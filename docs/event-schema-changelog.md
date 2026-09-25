@@ -21,12 +21,65 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — subagent handles and stop semantics
+
+Owner decision 2026-09-25 (973-LANES.md, "subagent stop semantics"). All
+changes are additive; `schema_version` remains 1.
+
+- `spawn_subagent` gains optional `background` (return a durable handle at
+  once; the immediate result preview carries `status: "child_spawned"`, the
+  ids and `collect`/`list`/`cancel`/`cancel_all` CLI commands) and `wait_ms`
+  (bounds only the parent's observation, at most 86 400 000; never the child's
+  life). Both are omitted from recorded arguments when absent.
+- `tool_result.result.data` gains kind `child_still_running` (fields `agent`,
+  `parent_session_id`, `child_session_id`, `child_run_id`, `progress`,
+  `latest_progress_at_ms`, `wait_limit_ms`, `collect`), returned when a
+  `wait_ms` observation ends before the child; the child keeps running and is
+  collected with `haider agent wait`. Like `tools_discovered`, `data` is an
+  optional field produced only by this or a newer daemon.
+- Monitor sources gain `task` (`task_id`) and `agent` (`agent_id`), and
+  monitor events gain `task`/`agent` (`payload`, a completion digest), in the
+  tool vocabulary and on the wire (`MonitorSourceWire`,
+  `MonitorEventPayloadWire`; old clients decode them as `unknown`).
+- Stopping the main thread stops ONLY the main thread (TUI Esc,
+  `turn.cancel`, `haider run --stop-main`). Its subagents keep running; a
+  foreground subagent the stopped turn was waiting on continues in the
+  background. New extension item kinds on the parent session:
+  - `subagents_still_running_v1` — journalled by such a stop when subagents
+    live on: `parent_session_id`, `stopped_run_id`, `still_running` (live
+    subagents in the tree), bounded `agents` (`agent`, `task`,
+    `result_pending`) and `agents_truncated`; rendered to the next prompt as a
+    bounded user note.
+  - `detached_child_result_v1` — the detached waited-on child's result when it
+    finishes: `agent`, `task`, `stopped_run_id`, `state`
+    (`done`/`errored`/`cancelled`), `verified`, bounded `summary`,
+    `summary_truncated`. It is accompanied by the ordinary `agent_report`,
+    `agent_chip_state` and `child_result` item. It is steered into an active
+    parent run when one exists (the extension then has prompt=omit); otherwise
+    it is a prompt-visible note. Delivery never starts provider work.
+- RPC: `headless.run.stop` gains optional request `scope`
+  (`all` default and omitted, `main`, `subagents`); the response gains
+  optional `scope` (echo of a non-default scope) and `subagents`
+  (`cancelled_runs`, `sessions`, `monitors_removed`, `still_running`).
+  `haider run --stop` = `all`: the run plus every subagent in its tree,
+  however deep, found by session so children started in later child runs
+  (messaged `run-child-message-*` or monitor-woken) are included; their
+  monitors are removed. `--stop-main` = `main`; `--stop-subagents` =
+  `subagents`. An older daemon ignores `scope` (historical behaviour).
+- RPC: new method `agent.cancel_all` (`command_id`, `session_id`,
+  `worker_generation`) → `{session_id, stopped}`; `haider agent cancel
+  <session> --all`. It stops every subagent in the session's tree and removes
+  their monitors; the session's own runs are untouched.
+- `agent.cancel` now stops only the named subagent (its original run, any
+  later live run, and its own monitors). Its children keep running; this
+  replaces the former recursive descendant sweep.
+
 ### v0.0.973 — autonomy limits become explicit opt-ins
 
 Owner rule (2026-09-23): no DEFAULT cap stops productive automated work;
 limits exist only as explicit opt-ins, alongside cancellation and real
-no-progress detection. No field or kind is added or removed; `schema_version`
-remains 1 and the RPC method pin is unchanged.
+no-progress detection. This part adds or removes no field or kind;
+`schema_version` remains 1.
 
 - `tool_script` `limits` (`OrchestrationLimitsV1`): `child_attempts`,
   `script_wall_ms`, `child_wall_ms` and `no_progress_ms` are absent by default

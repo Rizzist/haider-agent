@@ -4465,6 +4465,16 @@ impl SessionHub {
             .await
     }
 
+    pub(crate) async fn delegations_for_parent_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<haider_core::DelegationRecord>, HaiderError> {
+        self.inner
+            .store
+            .delegations_for_parent_session(session_id)
+            .await
+    }
+
     pub(crate) async fn delegation_descendants(
         &self,
         session_id: SessionId,

@@ -108,7 +108,7 @@ impl EffectOperation for SpawnSubagent {
 pub fn spawn_subagent_manifest() -> ToolManifest {
     ToolManifest {
         name: "spawn_subagent".into(),
-        description: "Delegate a local child under AgentSpawn policy. By default wait for its report; background=true returns a durable handle immediately and wait_ms bounds only the observation. Use haider agent wait/list/message/cancel on the returned parent session and child id. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.".into(),
+        description: "Delegate a local child under AgentSpawn policy. By default wait for its report; background=true returns a durable handle immediately and wait_ms bounds only the observation. Use haider agent wait/list/message/cancel on the returned parent session and child id; cancel stops only that child, cancel <session> --all stops every subagent, and stopping this turn leaves children running. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.".into(),
         effects: vec![EffectClass::AgentSpawn],
         dispatch: DispatchMode::Deferred,
         input_schema: serde_json::json!({

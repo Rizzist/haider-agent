@@ -353,8 +353,6 @@ use crate::worker::{
     WorkerManager, WorkerToolContext,
 };
 use async_trait::async_trait;
-#[cfg(unix)]
-use haider_core::DeferredTicket;
 use haider_core::{
     BranchCreateCommand, CancelToken, EventIdGenerator, SessionCreateCommand, SqliteStoreHandle,
     StoreHandle, ToolDispatchResult, TurnAcceptCommand, TurnAdmissionDisposition,
@@ -4061,6 +4059,10 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                 .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
                 .await
                 .expect("recover delegation mirror"),
+            RecoveredWork::DetachedChildren(recovered) => DelegationHandle::new(hub.clone())
+                .rearm_detached_deliveries(&recovered.session_id, &recovered.run_id)
+                .await
+                .expect("re-arm detached deliveries"),
         }
     }
     assert!(recovered_parent && recovered_child);
@@ -4328,8 +4330,10 @@ async fn unanswered_delegated_question_returns_child_still_running() {
             .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
     );
 
-    // Completing the parent did not cancel its detached child. An explicit
-    // user cancel of that completed run must still reach the descendant.
+    // Completing the parent did not cancel its detached child. Owner
+    // decision 2026-09-25: turn.cancel of that completed run is a main-only
+    // stop and leaves the child running (this assertion previously required
+    // the opposite cascade); the explicit stop-all walk reaches it.
     let mut control = UdsControlClient::connect(harness.hub.clone()).await;
     control.attach_control(harness.parent_session.clone()).await;
     let status = control
@@ -4340,6 +4344,30 @@ async fn unanswered_delegated_question_returns_child_still_running() {
         )
         .await;
     assert_eq!(status, haider_rpc::CancelStatus::AlreadyTerminal);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !typed_payloads(
+            &harness
+                .store
+                .read(&harness.child.child_session_id, 0, 1024)
+                .await
+                .expect("detached child journal"),
+        )
+        .iter()
+        .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled))),
+        "a main-only stop must not cancel the detached child"
+    );
+    let stopped = crate::delegation::DelegationHandle::new(harness.hub.clone())
+        .stop_subagent_tree(
+            crate::delegation::SubagentTreeRoot::Run {
+                session_id: harness.parent_session.clone(),
+                run_id: harness.child.parent_run_id.clone(),
+            },
+            "test-stop-all",
+        )
+        .await
+        .expect("stop-all walk");
+    assert_eq!(stopped.cancelled_runs, 1);
     wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
         *state == RunState::Cancelled
     })
@@ -4353,7 +4381,12 @@ async fn unanswered_delegated_question_returns_child_still_running() {
 
 #[tokio::test]
 #[cfg(unix)]
-async fn cancelling_parent_after_wait_ms_detach_cancels_child() {
+async fn cancelling_parent_after_wait_ms_detach_leaves_child_running() {
+    // Owner decision 2026-09-25 (973-LANES.md "subagent stop semantics"):
+    // turn.cancel (TUI Esc) stops ONLY the main thread. This test previously
+    // asserted the opposite cascade (`..._cancels_child`); it now pins that
+    // the wait_ms-detached child keeps running and that the stop journals
+    // the durable still-running marker with the child's result owed.
     let harness = start_parked_child_with_wait_budgets(
         "detached-cancel",
         ParkedChildMode::ParentWaitTimeoutHang,
@@ -4393,92 +4426,73 @@ async fn cancelling_parent_after_wait_ms_detach_cancels_child() {
         )
         .await;
     assert_eq!(status, haider_rpc::CancelStatus::Accepted);
-    wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
-        *state == RunState::Cancelled
-    })
+    wait_for_state_within(
+        &harness.store,
+        &harness.parent_session,
+        Duration::from_secs(30),
+        |state| *state == RunState::Cancelled,
+    )
     .await;
+    let marker = timeout(Duration::from_secs(30), async {
+        loop {
+            let marker = typed_payloads(
+                &harness
+                    .store
+                    .read(&harness.parent_session, 0, 1024)
+                    .await
+                    .expect("parent journal"),
+            )
+            .into_iter()
+            .find_map(|payload| match payload {
+                EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                    haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                        &item,
+                    )
+                }
+                _ => None,
+            });
+            if let Some(marker) = marker {
+                break marker;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("still-running marker journalled by the main-only stop");
+    assert_eq!(marker.still_running, 1);
+    assert_eq!(marker.agents.len(), 1);
+    assert_eq!(marker.agents[0].agent, harness.child.agent_id);
+    assert!(marker.agents[0].result_pending);
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let child_live = harness
+        .store
+        .read(&harness.child.child_session_id, 0, 1024)
+        .await
+        .expect("child journal")
+        .iter()
+        .rev()
+        .find_map(|envelope| match envelope.payload.decode_event() {
+            Ok(EventPayload::RunState(state)) => Some(state),
+            _ => None,
+        })
+        .is_some_and(|state| !state.is_terminal() && state != RunState::Cancelling);
+    assert!(
+        child_live,
+        "the detached child must keep running after a main-only stop"
+    );
     control.close().await;
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
     harness.store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: send the exhausted path through `bounded_wait(0, cancel)`
-/// instead of its nonblocking persist-before-wake enqueue. Expected runtime
-/// failure: Tokio never polls the cancellation future and the child remains
-/// InputRequired rather than reaching Cancelled and the following Idle fence.
-#[tokio::test]
-#[cfg(unix)]
-async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
-    let harness = start_parked_child(
-        "expired-cancel",
-        ParkedChildMode::Complete,
-        Duration::from_secs(30),
-    )
-    .await;
-    let ticket = DeferredTicket {
-        id: harness.child.agent_id.as_str().to_owned(),
-        manifest: harness.child.manifest.clone(),
-    };
-    timeout(
-        // Registry #94: the production run deadline is already zero. The
-        // outer 250ms covers only one local journal append and nonblocking
-        // actor enqueue; it grants no extra child-wait budget.
-        Duration::from_millis(250),
-        DelegationHandle::new(harness.hub.clone())
-            .cancel_ticket(&ticket, Some(tokio::time::Instant::now())),
-    )
-    .await
-    .expect("expired cleanup handoff returns without extending the run deadline")
-    .expect("expired cleanup handoff is durably owned");
+// Owner decision 2026-09-25: the parent-cleanup cancellation path
+// (`cancel_ticket` / "cleanup_fallback" handoff) was removed — a stopped
+// parent detaches its children instead of cancelling them — so the former
+// `expired_cancellation_handoff_reaps_live_child_without_restart` pin has no
+// production path left. Recovery of a legacy pending handoff stays pinned by
+// `cancellation_mirror_handoff_survives_crash_until_durable_completion`.
 
-    wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
-        *state == RunState::Cancelled
-    })
-    .await;
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let events = harness
-                .store
-                .read(&harness.child.child_session_id, 0, 1024)
-                .await
-                .expect("expired cancellation child journal");
-            let cancelled = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(payload, EventPayload::RunState(RunState::Cancelled))
-                })
-            });
-            let idle = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(
-                        payload,
-                        EventPayload::SessionState(
-                            haider_protocol::state::SessionState::Idle { .. }
-                        )
-                    )
-                })
-            });
-            if cancelled
-                .zip(idle)
-                .is_some_and(|(cancelled, idle)| idle > cancelled)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("zero-remaining cancellation reaps the live child without restart");
-
-    harness.manager.shutdown().await.expect("manager shutdown");
-    harness.hub.shutdown().await.expect("hub shutdown");
-    harness.store.close().await.expect("store close");
-}
-
-/// MUTATION CHECK: remove the nudge step or allow a second nudge. Expected
-/// runtime failure: the exact durable nudge count is not one. MUTATION CHECK:
-/// remove the grace cancellation. Expected runtime failure: the parent never
-/// reaches Done with the stall-reason report.
 #[tokio::test]
 #[cfg(unix)]
 async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() {
@@ -5032,12 +5046,19 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: remove the coordinator's cancellation sweep or the bound
-/// around terminal mirroring's first wait. Expected runtime failure: the
-/// parent reaches Cancelled while its child remains Streaming, or the mirror
-/// task exceeds its production bound below.
+/// Owner decision 2026-09-25 (973-LANES.md "subagent stop semantics"): this
+/// test previously required a parent cancel to cancel the waited-on child
+/// through the `cleanup_fallback` handoff. A parent stop now DETACHES the
+/// child: the parent cancel still completes inside the same bound, the
+/// child keeps running, and the durable still-running marker is journalled.
+/// The explicit stop-all walk then cancels the child, whose terminal metrics
+/// still mirror to the parent through the detached-delivery watcher.
+///
+/// MUTATION CHECK: restore the cancel cascade in `detach_outstanding_deferred`
+/// or drop the watcher's terminal mirror tail. Expected runtime failure: the
+/// child is Cancelled by the parent stop, or no terminal metrics mirror.
 #[tokio::test]
-async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
+async fn cancel_while_waiting_on_child_detaches_it_within_bound() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -5114,54 +5135,66 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     .await
     .expect("parent cancellation completes inside the terminal-mirror bound")
     .expect("cancel parent");
-    timeout(
-        // Registry #94: the production cleanup fallback journals and owns a
-        // 1s terminal tail; 250ms contains executor/store scheduling only.
-        Duration::from_millis(1_250),
-        async {
-            loop {
-                let events = store
-                    .read(&child.child_session_id, 0, 1024)
-                    .await
-                    .expect("production fallback handoff journal");
-                let mut pending = std::collections::HashSet::new();
-                let mut completed = std::collections::HashSet::new();
-                for event in events {
-                    let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                        event.payload.decode_event()
-                    else {
-                        continue;
-                    };
-                    let Some(handoff) =
-                        crate::delegation::DelegationMirrorHandoff::from_item(&item)
-                    else {
-                        continue;
-                    };
-                    if handoff.source != "cleanup_fallback" {
-                        continue;
-                    }
-                    match handoff.phase {
-                        crate::delegation::DelegationMirrorHandoffPhase::Pending => {
-                            pending.insert(handoff.handoff_id);
-                        }
-                        crate::delegation::DelegationMirrorHandoffPhase::Completed => {
-                            completed.insert(handoff.handoff_id);
-                        }
-                    }
-                }
-                if pending.iter().any(|id| completed.contains(id)) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        },
-    )
-    .await
-    .expect("production cleanup mirror commits completion inside its bound");
     wait_for_state(&store, &parent_session, |state| {
         *state == RunState::Cancelled
     })
     .await;
+    let marker = timeout(Duration::from_secs(5), async {
+        loop {
+            let found = store
+                .read(&parent_session, 0, 1024)
+                .await
+                .expect("parent journal")
+                .iter()
+                .find_map(|event| match event.payload.decode_event() {
+                    Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                        haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                            &item,
+                        )
+                    }
+                    _ => None,
+                });
+            if let Some(found) = found {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("main-only stop journals the still-running marker");
+    assert_eq!(marker.still_running, 1);
+    assert!(
+        marker
+            .agents
+            .iter()
+            .any(|agent| agent.agent == child.agent_id && agent.result_pending)
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !store
+            .read(&child.child_session_id, 0, 1024)
+            .await
+            .expect("child journal")
+            .iter()
+            .any(|event| event.payload.decode_event().is_ok_and(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::RunState(RunState::Cancelling | RunState::Cancelled)
+                )
+            })),
+        "a parent stop must not cancel the waited-on child"
+    );
+    let stopped = crate::delegation::DelegationHandle::new(hub.clone())
+        .stop_subagent_tree(
+            crate::delegation::SubagentTreeRoot::Run {
+                session_id: parent_session.clone(),
+                run_id: RunId::new("w6c-cancel-parent-run"),
+            },
+            "w6c-stop-all",
+        )
+        .await
+        .expect("explicit stop-all");
+    assert_eq!(stopped.cancelled_runs, 1);
     wait_for_state(&store, &child.child_session_id, |state| {
         *state == RunState::Cancelled
     })
@@ -5910,6 +5943,10 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
                 .await
                 .expect("recover delegation mirror"),
+            RecoveredWork::DetachedChildren(recovered) => DelegationHandle::new(hub.clone())
+                .rearm_detached_deliveries(&recovered.session_id, &recovered.run_id)
+                .await
+                .expect("re-arm detached deliveries"),
             RecoveredWork::RouteWait(recovered) => manager_handle
                 .recover_route_wait(
                     recovered.accepted,

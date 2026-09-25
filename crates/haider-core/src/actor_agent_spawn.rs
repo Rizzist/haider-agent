@@ -62,8 +62,9 @@ impl HarnessActor {
         }
         if result.is_err() {
             // A recovered ticket need not inhabit the new dispatcher's live
-            // map. Its collector owns cancellation and the original accepted
-            // run's bounded terminal/reap tail, including durable handoff.
+            // map. Its collector detaches the child (owner decision
+            // 2026-09-25: a stopped parent never cancels its subagents) and
+            // arms delivery of the child's result to this session.
             if let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) {
                 let cleanup = CancelToken::new();
                 cleanup.cancel();
@@ -76,7 +77,7 @@ impl HarnessActor {
                         let _ = dispatcher.collect_deferred(ticket, &cleanup).await;
                     }
                 }
-                let _ = dispatcher.cancel_outstanding_deferred(run_id).await;
+                let _ = dispatcher.detach_outstanding_deferred(run_id).await;
             }
         }
         match result {

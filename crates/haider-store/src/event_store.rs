@@ -7776,6 +7776,18 @@ impl Store {
         rows.into_iter().map(decode_delegation).collect()
     }
 
+    /// Every delegation whose parent is `session_id`, across ALL of that
+    /// session's runs (its original run, messaged `run-child-message-*` runs
+    /// and monitor-woken subturns). Stop-all walks descendants through this
+    /// session relation so later-run children are never missed.
+    pub fn delegations_for_parent_session(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<Vec<DelegationRecord>> {
+        let connection = self.connection()?;
+        delegations_for_parent_session_limited(&connection, session_id, usize::MAX)
+    }
+
     /// Returns a deterministic, bounded breadth-first subtree rooted at a
     /// session. Every edge comes from the durable delegation relation, so a
     /// daemon restart observes the same terminal and live history.

@@ -510,8 +510,8 @@ force selector.
 | `turn.submit`, `turn.submit_from_cli`, `turn.submit_with_hook_trust` | `TurnSubmit` or `TurnSubmitOnBranch` | durable receipt |
 | `headless.run.start` | `HeadlessRunStart` | durable receipt with a run-scoped execution pin |
 | `headless.run.status` | `HeadlessRunStatus` | journal-derived lifecycle snapshot by run id |
-| `headless.run.stop` | `HeadlessRunStop` | idempotent durable cancellation by run id |
-| `turn.cancel` | `TurnCancel` | durable receipt |
+| `headless.run.stop` | `HeadlessRunStop` | idempotent durable cancellation by run id; optional `scope` `all` (default: run plus its whole subagent tree), `main` (run only) or `subagents` (tree only) |
+| `turn.cancel` | `TurnCancel` | durable receipt; stops the main thread only — its subagents keep running |
 | `queue.remove` | `QueueRemove` | revision-fenced durable mutation |
 | `queue.promote_steer` | `QueuePromoteSteer` | revision-fenced durable mutation followed by Steer delivery |
 | `run.retry` | `RunRetry` | durable receipt |
@@ -526,6 +526,8 @@ force selector.
 | `session.select_fast` | `SessionSelectFast` | durable receipt |
 | `session.diagnostic` | `SessionDiagnostic` | durable receipt |
 | `agent.message` | `AgentMessage` | durable receipt |
+| `agent.cancel` | `AgentCancel` | durable receipt; stops the named subagent only (original and later runs, its own monitors) |
+| `agent.cancel_all` | `AgentCancelAll` | durable per-run receipts; stops every subagent in the session's tree and removes their monitors |
 | `shell.exec` | `ShellExec` | durable acceptance; terminal bytes/status are item events |
 | `tools.inventory` | `ToolsInventory` | snapshot |
 | `monitor.list` | `MonitorList` | typed snapshot receipt |
@@ -2908,6 +2910,31 @@ daemon; disconnect does not cancel the run.
 `headless.run.status` and `headless.run.stop` resolve the run id daemon-side,
 so terminal runs remain addressable after the starting process exits. Stop is
 idempotent and distinguishes accepted cancellation from already-terminal.
+
+Subagent stop semantics (owner decision 2026-09-25):
+
+- `turn.cancel` (the TUI's Esc) and `headless.run.stop` with `scope: "main"`
+  (`haider run --stop-main`) stop only the main thread. Subagents keep
+  running. A foreground subagent the stopped turn was waiting on continues in
+  the background; when it finishes its result is delivered to the session
+  (steered into an active run, otherwise journalled as a prompt-visible
+  `detached_child_result_v1` note that never starts provider work), with the
+  ordinary `child_result` item so `agent wait` resolves. The stop journals a
+  `subagents_still_running_v1` marker ("main thread stopped — N subagents
+  still running") whenever subagents live on.
+- `headless.run.stop` with the default scope `all` (`haider run --stop`)
+  stops the run and every subagent in its tree, however deep. The tree is
+  walked by session, so children started by a subagent's later runs (a
+  messaged `run-child-message-*` run or a monitor-woken subturn) are reached;
+  every live run of each descendant session is cancelled, their monitors are
+  removed, and the walk repeats until a pass finds nothing live. `scope:
+  "subagents"` (`--stop-subagents`) does the same without stopping the run.
+  The response's `subagents` object reports `cancelled_runs`, `sessions`,
+  `monitors_removed` and `still_running`.
+- `agent.cancel` stops the named subagent only: its original run, any later
+  live run and its own monitors. Its children keep running.
+  `agent.cancel_all` (`haider agent cancel <session> --all`) is the explicit
+  whole-tree stop for a session.
 
 Token and cost accounting is last-snapshot-wins per physical request ordinal.
 All request kinds, including compaction/cache-lifecycle traffic, participate.

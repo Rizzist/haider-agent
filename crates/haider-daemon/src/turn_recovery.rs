@@ -129,6 +129,14 @@ pub(crate) enum RecoveredWork {
     AdmissionRetry(Box<RecoveredAdmissionRetry>),
     WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
     DelegationMirror(Box<RecoveredDelegationMirror>),
+    /// A main-only stop detached this run's children; re-arm delivery of
+    /// their results (owner decision 2026-09-25).
+    DetachedChildren(RecoveredDetachedChildren),
+}
+
+pub(crate) struct RecoveredDetachedChildren {
+    pub(crate) session_id: SessionId,
+    pub(crate) run_id: RunId,
 }
 
 pub(crate) struct RecoveredQueued {
@@ -233,6 +241,11 @@ struct RunReduction {
     latest_provider_response_seq: Option<u64>,
     #[serde(default)]
     delegation_mirror_handoffs: HashMap<String, DelegationMirrorHandoff>,
+    /// Detached waited-on children whose result delivery is still owed
+    /// (owner decision 2026-09-25). Keeps a terminal run in recovery scope
+    /// until every delivery fact is journalled.
+    #[serde(default)]
+    detached_pending: std::collections::BTreeSet<String>,
     route_replay_epoch: u64,
     #[serde(default)]
     route_replay_events: Vec<StreamEvent>,
@@ -442,6 +455,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             reductions.retain(|_, reduction| {
                 reduction.branch_mismatch
                     || !reduction.delegation_mirror_handoffs.is_empty()
+                    || !reduction.detached_pending.is_empty()
                     || !reduction
                         .state
                         .as_ref()
@@ -542,6 +556,12 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                         handoff: handoff.clone(),
                     },
                 )));
+            }
+            if !reduction.detached_pending.is_empty() {
+                recovered.push(RecoveredWork::DetachedChildren(RecoveredDetachedChildren {
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                }));
             }
             if state.is_terminal() {
                 continue;
@@ -1496,6 +1516,26 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 }
                 Ok(None) => {}
                 Err(_) => reduction.provider_request_attempt_corrupt = true,
+            }
+            if let Some(marker) =
+                haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(&item)
+            {
+                reduction.detached_pending.extend(
+                    marker
+                        .agents
+                        .iter()
+                        .filter(|agent| agent.result_pending)
+                        .map(|agent| agent.agent.as_str().to_owned()),
+                );
+                reduction.open_items.remove(&item_id);
+                return;
+            }
+            if let Some(delivered) =
+                haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(&item)
+            {
+                reduction.detached_pending.remove(delivered.agent.as_str());
+                reduction.open_items.remove(&item_id);
+                return;
             }
             if let Some(handoff) = DelegationMirrorHandoff::from_item(&item) {
                 match handoff.phase {
