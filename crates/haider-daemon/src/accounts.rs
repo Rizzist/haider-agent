@@ -8464,9 +8464,8 @@ async fn match_unprobed_legacy_anthropic_row(
         ANTHROPIC_OAUTH_PROVIDER_NAME,
         bundle.account_identity.as_ref(),
     )?;
-    if incoming.stable_account_id().is_none() {
-        return None;
-    }
+    // Only a verified incoming identity can be matched to another row.
+    incoming.stable_account_id()?;
     let probes = accounts
         .list()
         .iter()

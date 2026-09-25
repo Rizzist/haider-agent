@@ -6428,10 +6428,13 @@ fn default_flow_ttl_is_at_least_ten_minutes() {
     assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
 }
 
+/// One scripted profile answer: status, extra headers, body.
+type ScriptedProfileResponse = (u16, Vec<(&'static str, String)>, String);
+
 /// A scripted `/api/oauth/profile` stand-in: answers each request with the
 /// next `(status, headers, body)` and counts requests.
 async fn scripted_profile_server(
-    script: Vec<(u16, Vec<(&'static str, String)>, String)>,
+    script: Vec<ScriptedProfileResponse>,
 ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -6463,7 +6466,7 @@ async fn scripted_profile_server(
 }
 
 async fn anthropic_login_against_profile(
-    script: Vec<(u16, Vec<(&'static str, String)>, String)>,
+    script: Vec<ScriptedProfileResponse>,
 ) -> (OAuthTokenBundleV1, usize) {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let (profile, hits) = scripted_profile_server(script).await;
