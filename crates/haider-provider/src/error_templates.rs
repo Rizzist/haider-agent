@@ -730,13 +730,17 @@ pub(crate) struct SlotEvidence<'a> {
 
 const MAX_UNCAPTURED_REQUEST_ID_BYTES: usize = 64;
 
+/// Both branches apply the same shape policy as the structured
+/// `provider_request_id` field (`safe_request_id`): a header that field
+/// rejects (for example one carrying an account marker) is never published
+/// through a template either.
 fn request_id_corroborated(value: &str, evidence: &SlotEvidence<'_>) -> bool {
+    if crate::error_detail::safe_request_id(value).is_none() {
+        return false;
+    }
     match evidence.captured_request_id {
         Some(captured) => captured == value,
-        None => {
-            value.len() <= MAX_UNCAPTURED_REQUEST_ID_BYTES
-                && crate::error_detail::safe_request_id(value).is_some()
-        }
+        None => value.len() <= MAX_UNCAPTURED_REQUEST_ID_BYTES,
     }
 }
 
@@ -927,6 +931,12 @@ mod tests {
             ..SlotEvidence::default()
         };
         assert!(request_id_corroborated("req_captured01", &captured));
+        // F1: a captured header the structured field rejects is not published.
+        let account = SlotEvidence {
+            captured_request_id: Some("req_account_quillv6x"),
+            ..SlotEvidence::default()
+        };
+        assert!(!request_id_corroborated("req_account_quillv6x", &account));
         assert!(!request_id_corroborated("req_other01", &captured));
         assert!(request_id_corroborated(
             "req_other01",

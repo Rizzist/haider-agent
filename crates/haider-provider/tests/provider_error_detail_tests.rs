@@ -192,6 +192,19 @@ fn identity_slots_publish_only_corroborated_values() {
         other.presentation.detail.ends_with(WITHHELD),
         "request id mismatch"
     );
+    // F1 (verify6): a captured header that the structured request-id field
+    // rejects (account marker) must not be published through the template.
+    let account = overloaded.replace("req_captured01", "req_account_quillv6x");
+    let captured_account =
+        replay_openai_http_error(503, None, body("server_error", &account).as_bytes())
+            .with_http_metadata(503, Some("req_account_quillv6x"));
+    assert!(captured_account.presentation.provider_request_id.is_none());
+    assert!(
+        captured_account.presentation.detail.ends_with(WITHHELD),
+        "{}",
+        captured_account.presentation.detail
+    );
+    assert!(!shareable_text(&captured_account).contains("quillv6x"));
     let long = overloaded.replace("req_captured01", &format!("req_{}", "a".repeat(70)));
     let uncaptured = replay_openai_http_error(503, None, body("server_error", &long).as_bytes());
     assert!(
