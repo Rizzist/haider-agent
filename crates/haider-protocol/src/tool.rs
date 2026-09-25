@@ -288,6 +288,18 @@ pub enum ToolResultData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repaired: Option<bool>,
     },
+    /// The provider stopped because the response-token limit was reached
+    /// while this tool call's arguments were still open. The actor records
+    /// the raw partial bytes for diagnosis but never executes the call.
+    OutputLimitTruncation {
+        tool: String,
+        message: String,
+        /// Whether the actor sent the ordinary split-write continuation.
+        /// A repeated truncation reports false and remains a tool error,
+        /// never a malformed-call strike or a run terminal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repaired: Option<bool>,
+    },
     FsSearch {
         matches: Vec<FsSearchMatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

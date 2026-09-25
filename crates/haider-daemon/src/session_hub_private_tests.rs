@@ -92,6 +92,225 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     }
 }
 
+#[test]
+fn session_output_limit_validation_is_exact_and_typed() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = crate::model_select::ValidatedModelSelection {
+        provider: "anthropic-oauth".into(),
+        model: "claude-fable-5-1".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+        context_window: Some(1_000_000),
+        max_output_tokens: 128_000,
+        explicit_max_output_tokens: 128_000,
+    };
+
+    let derived = super::rpc::resolve_session_output_limit(0, &selection).expect("derived default");
+    assert_eq!(derived.max_tokens, 30_000);
+    assert_eq!(derived.source, SessionOutputBudgetSourceV1::Derived);
+    // A SOURCED 8,192 row (e.g. Gemini 2.0): the explicit ceiling is exact.
+    let smaller = crate::model_select::ValidatedModelSelection {
+        max_output_tokens: 8_192,
+        explicit_max_output_tokens: 8_192,
+        ..selection.clone()
+    };
+    assert_eq!(
+        super::rpc::resolve_session_output_limit(0, &smaller)
+            .expect("model-bounded default")
+            .max_tokens,
+        8_192
+    );
+    assert!(
+        matches!(
+            super::rpc::resolve_session_output_limit(30_000, &smaller),
+            Err((
+                _,
+                haider_rpc::ErrorData::ModelOutputLimit {
+                    requested: 30_000,
+                    max_output_tokens: 8_192,
+                    ..
+                }
+            ))
+        ),
+        "an explicit request above the model maximum receives a typed refusal"
+    );
+    let exact = super::rpc::resolve_session_output_limit(128_000, &selection)
+        .expect("exact explicit limit");
+    assert_eq!(exact.max_tokens, 128_000);
+    assert_eq!(
+        exact.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 128_000 }
+    );
+    let (message, data) = super::rpc::resolve_session_output_limit(128_001, &selection)
+        .expect_err("over-limit refusal");
+    assert!(message.contains("claude-fable-5-1"));
+    assert!(message.contains("128000"));
+    assert!(matches!(
+        data,
+        haider_rpc::ErrorData::ModelOutputLimit {
+            requested: 128_001,
+            max_output_tokens: 128_000,
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
+}
+
+/// D1: a model switch re-applies the STORED budget. Derived (recorded, or a
+/// legacy client default) re-derives; user-set (recorded, or a legacy
+/// non-default value) clamps with a typed notice and never refuses.
+#[test]
+fn model_switch_reapplies_derived_and_user_set_budgets() {
+    use haider_protocol::output_budget::{OutputBudgetClampV1, SessionOutputBudgetSourceV1};
+    let gpt_4o = crate::model_select::ValidatedModelSelection {
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+        context_window: Some(128_000),
+        max_output_tokens: 16_384,
+        explicit_max_output_tokens: 16_384,
+    };
+    let custom = crate::model_select::ValidatedModelSelection {
+        provider: "custom973".into(),
+        model: "custom-unknown".into(),
+        inventory_status: haider_rpc::ModelInventoryStatusWire::Unlisted,
+        context_window: None,
+        max_output_tokens: 8_192,
+        explicit_max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+    };
+    let metadata = |max_tokens, source| {
+        let mut metadata: haider_protocol::session::SessionMetadataV1 =
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/workspace",
+                "provider": "anthropic-oauth",
+                "model": "claude-fable-5-1",
+                "max_tokens": max_tokens,
+                "created_at_ms": 1_u64,
+            }))
+            .expect("metadata fixture");
+        metadata.max_tokens_source = source;
+        metadata
+    };
+
+    for current in [
+        metadata(30_000, Some(SessionOutputBudgetSourceV1::Derived)),
+        metadata(30_000, None),
+        metadata(4_096, None),
+    ] {
+        let budget = super::rpc::reapply_session_output_budget(&current, &gpt_4o);
+        assert_eq!(budget.max_tokens, 16_384);
+        assert_eq!(budget.source, SessionOutputBudgetSourceV1::Derived);
+        assert_eq!(budget.clamped, None);
+        assert_eq!(
+            super::rpc::reapply_session_output_budget(&current, &custom).max_tokens,
+            8_192
+        );
+    }
+
+    let user = metadata(
+        30_000,
+        Some(SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }),
+    );
+    let budget = super::rpc::reapply_session_output_budget(&user, &gpt_4o);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert_eq!(
+        budget.clamped,
+        Some(OutputBudgetClampV1 {
+            requested: 30_000,
+            max_output_tokens: 16_384
+        })
+    );
+    let legacy_override = metadata(12_000, None);
+    let budget = super::rpc::reapply_session_output_budget(&legacy_override, &gpt_4o);
+    assert_eq!(budget.max_tokens, 12_000);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 12_000 },
+        "a legacy non-default value is the user's own"
+    );
+    assert_eq!(budget.clamped, None);
+    let legacy_large = metadata(20_000, None);
+    let budget = super::rpc::reapply_session_output_budget(&legacy_large, &gpt_4o);
+    assert_eq!(budget.max_tokens, 16_384);
+    assert!(budget.clamped.is_some());
+    // S1: an unverified 8,192 guess does not clamp the user's own budget.
+    let budget = super::rpc::reapply_session_output_budget(&legacy_large, &custom);
+    assert_eq!(budget.max_tokens, 20_000);
+    assert_eq!(budget.clamped, None);
+}
+
+/// S1: when the row maximum is only the unverified 8,192 fallback, an
+/// explicit budget up to `MAX_OUTPUT_LIMIT` (strictly below a known context
+/// window) is admitted; the derived default still follows the guess.
+#[test]
+fn unverified_fallback_rows_admit_larger_explicit_budgets() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = |provider: &str, model: &str, context_window: Option<u64>| {
+        let max_output_tokens =
+            haider_provider::model_output_limit(provider, model, None, context_window);
+        crate::model_select::ValidatedModelSelection {
+            provider: provider.into(),
+            model: model.into(),
+            inventory_status: haider_rpc::ModelInventoryStatusWire::Unlisted,
+            context_window,
+            max_output_tokens,
+            explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
+                provider,
+                model,
+                max_output_tokens,
+                context_window,
+            ),
+        }
+    };
+    for custom in [
+        selection("custom973", "custom-unknown", None),
+        selection("anthropic", "claude-sonnet-4-20250514", None),
+        selection("gemini", "gemini-9-unlisted", None),
+        selection("openai", "gpt-unknown", None),
+    ] {
+        assert_eq!(
+            custom.max_output_tokens,
+            haider_provider::UNKNOWN_OUTPUT_LIMIT
+        );
+        let derived = super::rpc::resolve_session_output_limit(0, &custom).expect("derived");
+        assert_eq!(derived.max_tokens, haider_provider::UNKNOWN_OUTPUT_LIMIT);
+        let explicit = super::rpc::resolve_session_output_limit(30_000, &custom)
+            .expect("explicit budget above the unverified guess");
+        assert_eq!(explicit.max_tokens, 30_000);
+        assert_eq!(
+            explicit.source,
+            SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }
+        );
+        assert_eq!(
+            super::rpc::resolve_session_output_limit(haider_provider::MAX_OUTPUT_LIMIT, &custom)
+                .expect("up to the adapter maximum")
+                .max_tokens,
+            haider_provider::MAX_OUTPUT_LIMIT
+        );
+        assert!(matches!(
+            super::rpc::resolve_session_output_limit(
+                haider_provider::MAX_OUTPUT_LIMIT + 1,
+                &custom
+            ),
+            Err((
+                _,
+                haider_rpc::ErrorData::ModelOutputLimit {
+                    max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+                    ..
+                }
+            ))
+        ));
+    }
+    // A known context window still bounds the explicit ceiling strictly below it.
+    let windowed = selection("custom973", "custom-unknown", Some(64_000));
+    assert_eq!(windowed.explicit_max_output_tokens, 32_000);
+    assert!(super::rpc::resolve_session_output_limit(32_000, &windowed).is_ok());
+    assert!(super::rpc::resolve_session_output_limit(32_001, &windowed).is_err());
+    // A sourced row keeps its exact maximum.
+    let sourced = selection("anthropic", "claude-sonnet-4-5", Some(200_000));
+    assert_eq!(sourced.explicit_max_output_tokens, 64_000);
+    assert!(super::rpc::resolve_session_output_limit(64_001, &sourced).is_err());
+}
+
 /// The attachment replay preflight must keep immutable-blob validation out of
 /// an idempotent retry while still entering the fused acceptance transaction
 /// that repairs a legacy first-turn receipt with no title.
@@ -358,6 +577,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -659,6 +879,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -783,6 +1004,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: None,
             effort: None,
             fast: false,
@@ -3954,6 +4176,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
         provider: "fake".into(),
         model: "fake-model".into(),
         max_tokens: 4096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,
@@ -5318,6 +5541,7 @@ pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCre
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4_096,
+        max_tokens_source: None,
         permission_overrides: None,
         effort: None,
         fast: false,

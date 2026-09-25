@@ -487,6 +487,92 @@ fn context_exceeded_http_and_sse_fixtures_are_distinct_from_max_tokens() {
     }));
 }
 
+#[test]
+fn max_tokens_keeps_partial_tool_open_for_actor_classification() {
+    let wire = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_partial","type":"message","role":"assistant","content":[],"model":"claude-fable-5-1","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_partial","name":"fs_write","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"large.html\",\"content\":\""}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":4096}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+    let items = replay_anthropic_sse(wire);
+
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallStart { call_id, name })
+            if call_id == "toolu_partial" && name == "fs_write"
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallArgsDelta { call_id, .. }) if call_id == "toolu_partial"
+    )));
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "toolu_partial"
+    )));
+    assert!(matches!(
+        items.last(),
+        Some(Ok(StreamEvent::Finish {
+            reason: FinishReason::MaxTokens
+        }))
+    ));
+}
+
+#[test]
+fn usage_only_delta_does_not_release_a_held_tool_end() {
+    let wire = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"held\",\"name\":\"fs_read\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"x\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let items = replay_anthropic_sse(wire);
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::Finish {
+            reason: FinishReason::MaxTokens
+        })
+    )));
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. })))
+    );
+}
+
+#[test]
+fn max_tokens_keeps_a_completed_tool_call_and_drops_only_the_open_one() {
+    let wire = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"complete\",\"name\":\"fs_read\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"x\\\"}\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"open\",\"name\":\"fs_write\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let items = replay_anthropic_sse(wire);
+    assert_eq!(items.iter().filter(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "complete")).count(), 1);
+    assert!(
+        !items.iter().any(
+            |item| matches!(item, Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "open")
+        )
+    );
+}
+
 #[tokio::test]
 async fn capability_table_is_model_specific_and_conservative_for_unknown_ids() {
     let cases = [

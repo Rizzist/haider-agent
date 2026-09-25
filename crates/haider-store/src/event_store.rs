@@ -769,6 +769,9 @@ pub struct SessionCreateCommand {
     pub provider: String,
     pub model: String,
     pub max_tokens: u64,
+    /// Whether `max_tokens` was derived or user-set; `None` leaves legacy
+    /// classification to readers (`SessionOutputBudgetSourceV1::classify`).
+    pub max_tokens_source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
     pub permission_overrides: Option<SessionPermissionOverridesV1>,
     /// Creation-time effort selection (G3). `None` — the wire `session.create`
     /// path — means the provider default; delegation passes the parent's
@@ -1075,6 +1078,10 @@ pub struct SessionSelectModelCommand {
     /// it (a concurrent explicit selection wins). Explicit selections pass
     /// `None` — the user's latest word is unconditional.
     pub expected_pair: Option<(String, String)>,
+    /// Output budget resolved by the daemon for the selected model. `None`
+    /// (the automatic pair-switch path, which has no validated model row)
+    /// keeps the stored budget unchanged.
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub event_id: EventId,
     pub device_id: DeviceId,
 }
@@ -1087,6 +1094,9 @@ pub struct SelectedModel {
     pub model: String,
     pub selected_seq: u64,
     pub worker_generation: u64,
+    /// Budget committed with this selection; absent in pre-973 receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
 }
 
 /// Result of the atomic metadata-update/event/receipt transaction.
@@ -8581,6 +8591,7 @@ impl Store {
             account_alias,
             model: command.model.clone(),
             max_tokens: command.max_tokens,
+            max_tokens_source: command.max_tokens_source,
             system_prompt_version: Some(command.system_prompt_version.clone()),
             permission_overrides: command.permission_overrides,
             interaction_mode,
@@ -9730,6 +9741,16 @@ impl Store {
                 false,
             ));
         }
+        if command
+            .output_budget
+            .is_some_and(|budget| budget.max_tokens == 0)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "model selection output budget must be positive",
+                false,
+            ));
+        }
 
         let mut connection = self.connection()?;
         let transaction = connection
@@ -9786,6 +9807,10 @@ impl Store {
         }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
+        if let Some(budget) = command.output_budget {
+            metadata.max_tokens = budget.max_tokens;
+            metadata.max_tokens_source = Some(budget.source);
+        }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -9840,6 +9865,7 @@ impl Store {
             model: command.model.clone(),
             selected_seq: envelopes[0].seq,
             worker_generation: self.worker_generation,
+            output_budget: command.output_budget,
         };
         finalize_command_receipt(
             &transaction,

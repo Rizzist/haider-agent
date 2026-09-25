@@ -62,8 +62,9 @@
       "inventory_age": "<volatile>",
       "models": [
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "anthropic.claude-fable-5",
           "supported_efforts": [
             "low",
@@ -76,8 +77,9 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "anthropic.claude-opus-5",
           "supported_efforts": [
             "low",
@@ -90,8 +92,9 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "anthropic.claude-opus-4-8",
           "supported_efforts": [
             "low",
@@ -104,8 +107,9 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "anthropic.claude-opus-4-7",
           "supported_efforts": [
             "low",
@@ -118,8 +122,9 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "anthropic.claude-sonnet-5",
           "supported_efforts": [
             "low",
@@ -132,8 +137,9 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 200000,
           "default_effort": null,
+          "max_output_tokens": 64000,
           "model": "anthropic.claude-haiku-4-5",
           "supported_efforts": [],
           "supported_speeds": [],
@@ -351,8 +357,9 @@
       "inventory_age": "<volatile>",
       "models": [
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "claude-fable-5",
           "supported_efforts": [
             "low",
@@ -365,8 +372,9 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "claude-opus-5",
           "supported_efforts": [
             "low",
@@ -379,8 +387,9 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 1000000,
           "default_effort": "high",
+          "max_output_tokens": 128000,
           "model": "claude-sonnet-5",
           "supported_efforts": [
             "low",
@@ -393,16 +402,18 @@
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 200000,
           "default_effort": null,
+          "max_output_tokens": 64000,
           "model": "claude-sonnet-4-5@20250929",
           "supported_efforts": [],
           "supported_speeds": [],
           "supports_thinking_type": null
         },
         {
-          "context_window": null,
+          "context_window": 200000,
           "default_effort": null,
+          "max_output_tokens": 64000,
           "model": "claude-haiku-4-5@20251001",
           "supported_efforts": [],
           "supported_speeds": [],

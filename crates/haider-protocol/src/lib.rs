@@ -37,6 +37,7 @@ pub mod loom;
 pub mod menu;
 pub mod mobile;
 pub mod orchestration;
+pub mod output_budget;
 pub mod peer;
 pub mod permission;
 pub mod pipe;

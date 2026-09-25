@@ -441,6 +441,7 @@ async fn seed_recovered_checkpoint(
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            max_tokens_source: None,
             permission_overrides: Some(haider_protocol::session::SessionPermissionOverridesV1 {
                 auto_allow: true,
                 ..Default::default()

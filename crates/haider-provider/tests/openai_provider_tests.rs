@@ -317,12 +317,15 @@ fn lk9_chat_unknown_extra_fields_are_ignored() {
 }
 
 #[test]
-fn responses_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
+fn responses_max_tokens_surfaces_partial_tool_without_an_end() {
     let wire = br#"event: response.output_item.added
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_partial","call_id":"call_partial","name":"write_file","arguments":""}}
 
 event: response.function_call_arguments.delta
 data: {"type":"response.function_call_arguments.delta","item_id":"fc_partial","output_index":0,"delta":"{\"path\":"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_partial","output_index":0,"arguments":"{\"path\":"}
 
 event: response.incomplete
 data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0}}}}
@@ -331,7 +334,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
 
     let items = replay_openai_responses_sse(wire);
 
-    assert_no_tool_events(&items, "call_partial");
+    assert_partial_tool_without_end(&items, "call_partial", "{\"path\":");
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {
@@ -342,6 +345,24 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
 
 /// MUTATION CHECK: classify `context_length_exceeded` as InvalidRequest.
 /// Expected runtime failure: forced compaction cannot distinguish overflow.
+/// An output-limit terminal surfaces the open call's Start and argument bytes
+/// for actor classification but never an executable End.
+fn assert_partial_tool_without_end(items: &[ProviderStreamItem], call_id: &str, args: &str) {
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallStart { call_id: actual, .. }) if actual == call_id
+    )));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallArgsDelta { call_id: actual, args_fragment })
+            if actual == call_id && args_fragment == args
+    )));
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id: actual }) if actual == call_id
+    )));
+}
+
 #[test]
 fn context_exceeded_http_fixture_has_a_distinct_non_retryable_kind() {
     let error = replay_openai_http_error(
@@ -355,7 +376,7 @@ fn context_exceeded_http_fixture_has_a_distinct_non_retryable_kind() {
 }
 
 #[test]
-fn chat_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
+fn chat_max_tokens_surfaces_partial_tool_without_an_end() {
     let wire = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_partial","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}
 
 data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
@@ -366,7 +387,7 @@ data: [DONE]
 
     let items = replay_openai_chat_sse(wire);
 
-    assert_no_tool_events(&items, "call_partial");
+    assert_partial_tool_without_end(&items, "call_partial", "{\"path\":");
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {
@@ -914,12 +935,12 @@ fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
 
 #[tokio::test]
 async fn native_capability_doc_is_model_specific() {
-    let reasoning = native_provider("gpt-5.6-test").capabilities().await;
-    let classic = native_provider("gpt-4o-test").capabilities().await;
+    let reasoning = native_provider("gpt-5.6-sol").capabilities().await;
+    let classic = native_provider("gpt-4o").capabilities().await;
 
     assert_eq!(reasoning.provider, "openai");
     assert_eq!(reasoning.thinking_visible, FeatureResolve::Native);
-    assert_eq!(reasoning.context_limit, 1_000_000);
+    assert_eq!(reasoning.context_limit, 1_050_000);
     assert_eq!(classic.thinking_visible, FeatureResolve::Unsupported);
     assert_eq!(classic.context_limit, 128_000);
 }
@@ -986,24 +1007,6 @@ fn streamed_overloaded_error_is_retryable_overload() {
     assert_eq!(error.kind, ProviderErrorKind::Overloaded);
     assert!(error.retryable);
     assert!(!error.message.contains("private overload detail"));
-}
-
-fn assert_no_tool_events(items: &[ProviderStreamItem], call_id: &str) {
-    assert!(
-        !items.iter().any(|item| matches!(
-            item,
-            Ok(StreamEvent::ToolCallStart {
-                call_id: actual,
-                ..
-            } | StreamEvent::ToolCallArgsDelta {
-                call_id: actual,
-                ..
-            } | StreamEvent::ToolCallEnd {
-                call_id: actual,
-            }) if actual == call_id
-        )),
-        "partial tool call `{call_id}` crossed the adapter boundary"
-    );
 }
 
 #[test]

@@ -66,7 +66,7 @@ object AppContainer {
             java.io.File(context.filesDir, "haider/ui-cache/display"),
             java.io.File(context.filesDir, "haider/profiles/default/workspace").path,
             if (fixture) "fake" else "anthropic",
-            if (fixture) "fake-model" else context.getString(R.string.daemon_default_model), 8192)
+            if (fixture) "fake-model" else context.getString(R.string.daemon_default_model), 0)
     }
     var accountsFactory: (Context) -> AccountsRepository = { context ->
         (daemon(context) as ai.diffforge.haider.transport.rpc.RpcDaemonService).accounts
