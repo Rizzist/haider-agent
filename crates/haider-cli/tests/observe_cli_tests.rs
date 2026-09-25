@@ -115,6 +115,7 @@ fn digest(
         task_outcome: None,
         task_outcome_version: None,
         orchestration: None,
+        request_budget: None,
         active_branch_id: Some(BranchId::new("branch-review")),
         branches: vec![BranchDescriptor {
             branch_id: BranchId::new("branch-review"),
@@ -950,6 +951,10 @@ fn session_depth_preserves_pending_follow_ups_in_json_and_text() {
         park_reason: Some(haider_protocol::completion::CompletionParkReason::RequestRepair),
     };
     observed.pending_follow_ups.push(pending.clone());
+    observed.request_budget = Some(haider_protocol::request_budget::RequestBudgetV1 {
+        tranche: 5,
+        hard_cap: 5,
+    });
     let document = SessionDocument {
         schema: "haider.observe.v1",
         kind: "session",
@@ -959,10 +964,23 @@ fn session_depth_preserves_pending_follow_ups_in_json_and_text() {
         document.session.json()["pending_follow_ups"],
         serde_json::json!([pending])
     );
+    assert_eq!(
+        document.session.json()["request_budget"],
+        serde_json::json!({"tranche": 5, "hard_cap": 5})
+    );
+    golden(
+        "observe_session_budget.txt",
+        &format!(
+            "{}\n",
+            document.session.request_budget.expect("cap").status_label()
+        ),
+    );
+    assert!(session_human_text(&document).contains("request cap 5 (tranche 5)\n"));
     assert!(session_human_text(&document).contains(
         "pending follow-up: monitor:stable-report — attempt 1 — Reconcile the harmless marker"
     ));
     let empty = depth_view(digest("empty", ObserveRunStateWire::Idle, None));
+    assert!(empty.json().get("request_budget").is_none());
     assert!(
         empty.json().get("pending_follow_ups").is_none(),
         "older empty snapshots keep their wire shape"

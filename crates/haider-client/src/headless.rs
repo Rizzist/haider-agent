@@ -2123,7 +2123,7 @@ pub async fn run_headless_with_session_config_event_mode_and_interrupts(
 }
 
 /// Submits a new ordinary turn in an existing native session. The session's
-/// workspace, model, permissions and request ceiling remain authoritative.
+/// workspace, model, permissions and any request policy remain authoritative.
 /// Run pins/budget continuation use their separate lifecycle entry points.
 /// Streaming modes emit only the new run's correlated envelopes; prior session
 /// history is replayed internally without re-emitting old terminal records.

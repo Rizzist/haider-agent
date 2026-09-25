@@ -1854,7 +1854,8 @@ provider lockdown or workspace containment. The exact autonomous resolutions in
 
 A changed workflow-state digest is progress, not recurrence. An autonomous
 external turn may therefore continue through every declared stage while its
-run deadline, maximum cost, and provider-request ceiling permit it. The daemon
+run deadline, maximum cost, and any explicitly configured provider-request
+ceiling permit it. The daemon
 rebinds the active typed node and exact CAS inputs at each logical provider
 request. Repeating the same digest remains fail-closed because the journal
 cannot distinguish no progress from an ambiguous crash/replay at that point.
@@ -3050,8 +3051,10 @@ Absence laws:
 
 - A missing `headless_run_v1`, or missing `run_budget_v1` when any limit is
   present, fails feature negotiation before session creation or submission.
-- Omitted token/cost/time budget fields are unbounded. Omitted `request_budget` selects tranche 32 / hard cap 64; a present policy requires `0 < tranche <= hard_cap`. A present zero is invalid. `seed: 0`
-  remains present and is not treated as omission.
+- Omitted token/cost/time budget fields and an omitted `request_budget` are
+  unbounded. A present request policy requires `0 < tranche <= hard_cap`; a
+  present zero is invalid. `seed: 0` remains present and is not treated as
+  omission.
 - A missing budget `decision` means the exhaustion fact was written by an
   older daemon. A present unavailable-pricing or unavailable-usage reason
   carries provider/model identity and never substitutes a zero projection.
@@ -3696,21 +3699,45 @@ quota, toggle-boundary, and subagent rules.
 
 ### Request tranches and continuation (v0.0.970)
 
-The actor counts logical requests, excluding transport retries. Defaults are
-32 for the soft tranche and 64 for the hard cap. `RunBudgetV1.request_budget`
-overrides this per run; `spawn_subagent.request_budget` pins it for each child
-in its durable manifest coordinates. A run pin takes precedence over the child
-pin, then defaults apply. These counts are independent of token/cost/time
-limits and require no provider usage report.
+Request-count limits are opt-in. With no request policy, interactive turns,
+headless runs, delegated children, and workflow continuations may make as many
+logical provider requests as completion requires. `RunBudgetV1.request_budget`
+pins a headless run; `spawn_subagent.request_budget` pins each child in its
+durable manifest coordinates. A run pin takes precedence over the child pin,
+and omission at both levels remains unbounded. The convenience values used
+when only `--max-requests N` is supplied use tranche `min(32, N)`; with only
+`--request-tranche N`, the hard cap is 64. API and manifest policies supply
+both `tranche` and `hard_cap` as a complete `RequestBudgetV1` object; omitting
+the object leaves the request count unbounded.
+Logical counts exclude transport retries, are independent of token/cost/time
+limits, and require no provider usage report.
 
-`provider_request_budget_v1` extension items contain `used`, `budget` (tranche
-and hard cap), `phase` (`progress`, `soft_bound`, `hard_bound`), and a typed
+When a request policy is present, `provider_request_budget_v1` extension items
+contain `used`, `budget` (tranche and hard cap), `phase` (`progress`,
+`soft_bound`, `hard_bound`), and a typed
 `continuation` with session/run/branch/agent coordinates. Progress shares the
 provider-attempt append; the soft note is committed once before the first
 post-tranche logical request and included in actual model input. Hard-bound
 Started/Completed, `run_failed` with `request_budget_exceeded`, and `errored`
 commit in one append. Completed tools and partial text remain journal truth.
 Recovery restores consumed requests and the existing warning from that journal.
+The transcript TUI and plain renderer suppress progress telemetry; bound
+checkpoints remain visible and raw JSON/JSONL retains all opted-in policy facts.
+
+Independently of any request policy, a `loop_suspected_v1` extension item
+(`run_id`, `guard`, `repeated_calls`, `stop_after`, optional `tool`, `label`)
+is a non-terminal, model-visible steer. It is committed once per streak when
+30 consecutive tool calls repeat an earlier call and normalized result of the
+same turn (`guard: "repeated_tool_calls"`), or when 100 consecutive calls
+repeat an earlier (tool, arguments) pair with no new pair in between, whatever
+the results (`guard: "repeated_actions"`). Assistant text resets neither
+streak. Computer-use/mobile-use screen steps (screenshot, UI tree, swipe,
+scroll, tap, key on the registered `computer`/`mobile` tools) are exempt from
+the action-level count while the observed screen changes. It is rendered as a transcript line. After 30 (respectively 100) more
+repeats with no new call, the turn ends with `loop_limit` (CLI exit 70). The
+`run_failed` payload's `presentation.loop_limit` object carries the typed
+details (`loop` tag plus counts); see `docs/jsonl-run-contract-v1.md`, "Loop
+guards", for the fingerprint rules and accepted residuals.
 
 `haider run --resume RUN_ID` requires `request_budget_v1` and starts a new turn
 in the same session with a fresh request allowance. It pins

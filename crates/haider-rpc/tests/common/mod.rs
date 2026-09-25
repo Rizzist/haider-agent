@@ -1413,6 +1413,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     task_outcome: None,
                     task_outcome_version: None,
                     orchestration: None,
+                    request_budget: None,
                     active_branch_id: None,
                     branches: Vec::new(),
                     main_head_node_id: None,

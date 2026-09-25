@@ -1660,17 +1660,19 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Union full-pack pin: 971 redaction, 972 task_outcome/output ergonomics,
     // 972-ax-testrun, and the frozen typed `tool_script` DAG schema. The
     // default instruct-pipe pack is unchanged: the large orchestration schema
-    // remains discovery-only until explicitly promoted.
+    // remains discovery-only until explicitly promoted. The full pack lost
+    // six bytes when the optional spawn_subagent.request_budget description
+    // changed from 154 to 148 bytes; only its description is in this pin.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_403;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_397;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_354;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_348;
     #[cfg(target_os = "windows")]
     // `tool_script` nests the platform-specific `process_exec` schema, so
     // Windows carries the historical 3-byte command-description delta twice.
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_350;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_344;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_348;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 43_342;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

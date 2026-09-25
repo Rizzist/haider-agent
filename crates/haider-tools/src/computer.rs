@@ -734,7 +734,7 @@ pub fn computer_manifest() -> ToolManifest {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let description = "Observe and control the local desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
     ToolManifest {
-        name: "computer".into(),
+        name: haider_protocol::computer::COMPUTER_TOOL_NAME.into(),
         description: description.into(),
         effects: vec![EffectClass::ScreenObserve, EffectClass::ScreenControl],
         dispatch: DispatchMode::Await,

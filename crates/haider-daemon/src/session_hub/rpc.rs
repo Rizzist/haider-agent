@@ -1323,6 +1323,7 @@ struct ObservedRun {
     state: RunState,
     task_outcome: Option<TaskOutcomeV1>,
     orchestration: Option<haider_protocol::orchestration::OrchestrationRunDigestV1>,
+    request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     seq: u64,
     branch_id: Option<BranchId>,
 }
@@ -1407,6 +1408,7 @@ struct ObserveFoldSnapshot {
     run_id: Option<RunId>,
     task_outcome: Option<TaskOutcomeV1>,
     orchestration: Option<haider_protocol::orchestration::OrchestrationRunDigestV1>,
+    request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     active_branch_id: Option<BranchId>,
     branches: Vec<haider_protocol::branch::BranchDescriptor>,
     main_head_node_id: Option<haider_protocol::ids::NodeId>,
@@ -1493,6 +1495,7 @@ impl ObserveFold {
         let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
         let task_outcome = selected.and_then(|(_, run)| run.task_outcome.clone());
         let orchestration = selected.and_then(|(_, run)| run.orchestration.clone());
+        let request_budget = selected.and_then(|(_, run)| run.request_budget);
         let mut branches = self
             .projection
             .branches
@@ -1514,6 +1517,7 @@ impl ObserveFold {
             run_id,
             task_outcome,
             orchestration,
+            request_budget,
             active_branch_id,
             branches,
             main_head_node_id: self.projection.main_head_node_id.clone(),
@@ -1767,6 +1771,7 @@ impl ObserveFoldSnapshot {
             task_outcome: self.task_outcome.clone(),
             task_outcome_version: self.task_outcome.as_ref().map(|_| 1),
             orchestration: self.orchestration.clone(),
+            request_budget: self.request_budget,
             active_branch_id: self.active_branch_id.clone(),
             branches: self.branches.clone(),
             main_head_node_id: self.main_head_node_id.clone(),
@@ -2969,12 +2974,14 @@ impl ObserveProjection {
                         .runs
                         .get(&run_id)
                         .and_then(|run| run.orchestration.clone());
+                    let request_budget = self.runs.get(&run_id).and_then(|run| run.request_budget);
                     self.runs.insert(
                         run_id,
                         ObservedRun {
                             state,
                             task_outcome,
                             orchestration,
+                            request_budget,
                             seq,
                             branch_id,
                         },
@@ -3130,6 +3137,15 @@ impl ObserveProjection {
                 }
             }
             EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                if let (Some(run_id), Some(status)) = (
+                    run_id.as_ref(),
+                    haider_protocol::request_budget::RequestBudgetStatusV1::from_extension_item(
+                        &item,
+                    ),
+                ) && let Some(run) = self.runs.get_mut(run_id)
+                {
+                    run.request_budget = Some(status.budget);
+                }
                 if let Some(footprint) = ContextFootprint::from_extension_item(&item) {
                     self.footprint = Some(footprint);
                 }
@@ -3181,6 +3197,7 @@ impl ObserveProjection {
         let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
         let task_outcome = selected.and_then(|(_, run)| run.task_outcome.clone());
         let orchestration = selected.and_then(|(_, run)| run.orchestration.clone());
+        let request_budget = selected.and_then(|(_, run)| run.request_budget);
         let title = self.title.unwrap_or_else(|| {
             metadata
                 .as_ref()
@@ -3212,6 +3229,7 @@ impl ObserveProjection {
             task_outcome_version: task_outcome.as_ref().map(|_| 1),
             task_outcome,
             orchestration,
+            request_budget,
             active_branch_id,
             branches,
             main_head_node_id: self.main_head_node_id,

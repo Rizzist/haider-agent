@@ -86,6 +86,9 @@ use haider_protocol::ids::{
     RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolArgumentsFinalizedV1, ToolStatus, TurnItem};
+use haider_protocol::loop_guard::{
+    LOOP_SUSPECTED_EXTENSION_KIND, LoopGuardKindV1, LoopLimitV1, LoopSuspectedV1, ToolLoopGuardV1,
+};
 use haider_protocol::menu::{
     ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -635,10 +638,6 @@ mod actor_ceiling;
 #[path = "actor_journalview_tests.rs"]
 mod actor_journalview_tests;
 
-// Two soft tranches cover the reported 53-round solved benchmark with 11
-// requests of headroom, while preserving a finite guard against runaway work.
-const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 64;
-
 /// Profile-scoped secret used only for diagnostic prefix fingerprints.
 /// Custom debug output is deliberately redacted so a config dump cannot
 /// disclose the key that protects short prompt components from guessing.
@@ -694,7 +693,1399 @@ pub struct PreviousCacheRequest {
     pub breakpoint_hashes: CacheBreakpointHashesV1,
     pub cache_domain_hash: Option<String>,
 }
+/// Consecutive provider continuations allowed without a new semantic result.
 const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
+
+/// Tracks distinct work within one turn for the loop guards. Request
+/// ordinals, generated call IDs, usage, opaque replay state, and the
+/// synthesized MaxTokens nudge do not prove progress. Fingerprints compare
+/// normalized content (`continuation_fingerprint`), recognizing repeats after
+/// other work.
+///
+/// Three guards read this state:
+/// - continuations: consecutive MaxTokens/PauseTurn finishes without progress
+///   ([`HarnessConfig::max_continuations_per_turn`]); new assistant text, a
+///   new call fingerprint or a new provider-side result is progress;
+/// - repeated tool calls: consecutive calls whose (tool, arguments, result)
+///   fingerprint was already seen; only a new call fingerprint resets it;
+/// - repeated actions: consecutive calls whose (tool, arguments) was already
+///   seen, whatever the result; only a new (tool, arguments) resets it.
+///
+/// The last two are configured by [`HarnessConfig::tool_loop_guard`].
+/// Assistant text never resets them: narration is not an action.
+#[derive(Default)]
+struct ContinuationProgress {
+    consecutive_without_progress: usize,
+    seen: HashSet<blake3::Hash>,
+    progress_in_response: bool,
+    /// Same (tool, arguments, result).
+    repeated_calls: RepeatStreak,
+    /// Same (tool, arguments), any result.
+    repeated_actions: RepeatStreak,
+    /// Last outcome fingerprint per (tool, arguments) fingerprint, so a
+    /// screen observation can be compared with the previous identical call.
+    last_outcome: HashMap<blake3::Hash, blake3::Hash>,
+    /// The latest computer/mobile screen observation repeated the previous
+    /// identical observation (or produced no reading): the screen is not
+    /// changing, so screen steps count toward the action guard again.
+    ui_screen_stale: bool,
+}
+
+/// One consecutive-repeat streak and its steer state.
+#[derive(Default)]
+struct RepeatStreak {
+    count: usize,
+    /// Streak length when the `loop_suspected` steer was issued.
+    suspected_at: Option<usize>,
+    last_tool: Option<String>,
+}
+
+impl RepeatStreak {
+    fn record(&mut self, new: bool, tool: &str) {
+        if new {
+            *self = Self::default();
+        } else {
+            self.count = self.count.saturating_add(1);
+            self.last_tool = Some(tool.to_owned());
+        }
+    }
+
+    /// The steer always precedes the limit, and the limit needs
+    /// `stop_after_suspected` further repeats after the steer, so a batch of
+    /// parallel repeats cannot skip the warning.
+    fn verdict(
+        &mut self,
+        kind: LoopGuardKindV1,
+        suspect_after: usize,
+        stop_after_suspected: usize,
+        run_id: &RunId,
+    ) -> ToolLoopVerdict {
+        let repeated = self.count;
+        match self.suspected_at {
+            Some(at) if repeated >= at.saturating_add(stop_after_suspected) => {
+                ToolLoopVerdict::Limit(match kind {
+                    LoopGuardKindV1::RepeatedActions => LoopLimitV1::RepeatedActions {
+                        repeated_calls: repeated,
+                        suspect_after,
+                        stop_after_suspected,
+                    },
+                    LoopGuardKindV1::RepeatedToolCalls | LoopGuardKindV1::Unknown => {
+                        LoopLimitV1::RepeatedToolCalls {
+                            repeated_calls: repeated,
+                            suspect_after,
+                            stop_after_suspected,
+                        }
+                    }
+                })
+            }
+            None if repeated >= suspect_after => {
+                self.suspected_at = Some(repeated);
+                ToolLoopVerdict::Suspected(vec![LoopSuspectedV1 {
+                    run_id: run_id.clone(),
+                    repeated_calls: repeated,
+                    stop_after: stop_after_suspected,
+                    tool: self.last_tool.clone(),
+                    guard: kind,
+                }])
+            }
+            _ => ToolLoopVerdict::Continue,
+        }
+    }
+}
+
+/// What the tool-loop guards require before the next request.
+#[derive(Debug, PartialEq, Eq)]
+enum ToolLoopVerdict {
+    Continue,
+    /// Issue these non-terminal `loop_suspected_v1` steers (one per guard
+    /// that crossed its threshold at this boundary).
+    Suspected(Vec<LoopSuspectedV1>),
+    /// End the turn with `loop_limit`.
+    Limit(LoopLimitV1),
+}
+
+impl ContinuationProgress {
+    fn begin_response(&mut self) {
+        self.progress_in_response = false;
+    }
+
+    fn fingerprint(kind: &[u8], parts: &[&[u8]]) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(kind);
+        for part in parts {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        hasher.finalize()
+    }
+
+    /// Records one progress fingerprint; returns whether it was new. New
+    /// content resets only the continuation guard.
+    fn observe(&mut self, kind: &[u8], parts: &[&[u8]]) -> bool {
+        let new = self.seen.insert(Self::fingerprint(kind, parts));
+        if new {
+            self.consecutive_without_progress = 0;
+            self.progress_in_response = true;
+        }
+        new
+    }
+
+    /// One completed call: `args` is the canonical argument form and
+    /// `outcome` the normalized result parts. `ui` is set only for a typed
+    /// computer/mobile screen step (`continuation_fingerprint::ui_step`),
+    /// with whether the result carried a reading (an image for screenshots).
+    ///
+    /// Screen steps are exempt from the action-level guard while the screen
+    /// changes: an observation whose outcome differs from the previous
+    /// identical observation, and navigation (swipe/scroll/tap/key) while the
+    /// latest observation was such a change. They never reset the action
+    /// streak, and the result-level guard still counts them, so identical
+    /// screenshots (stuck at the end of a list) stop at 60.
+    fn observe_call(
+        &mut self,
+        kind: &[u8],
+        name: &str,
+        args: &str,
+        outcome: &[&[u8]],
+        ui: Option<(crate::continuation_fingerprint::UiStep, bool)>,
+    ) {
+        use crate::continuation_fingerprint::UiStep;
+        let action_fingerprint =
+            Self::fingerprint(b"action", &[kind, name.as_bytes(), args.as_bytes()]);
+        let outcome_fingerprint = Self::fingerprint(b"outcome", outcome);
+        let action = self.seen.insert(action_fingerprint);
+        let previous = self
+            .last_outcome
+            .insert(action_fingerprint, outcome_fingerprint);
+        let screen_step_exempt = match ui {
+            Some((UiStep::Observe { .. }, reading)) => {
+                let changed = reading && previous != Some(outcome_fingerprint);
+                self.ui_screen_stale = !changed;
+                changed
+            }
+            Some((UiStep::Navigate, _)) => !self.ui_screen_stale,
+            None => false,
+        };
+        if !screen_step_exempt {
+            self.repeated_actions.record(action, name);
+        }
+        let mut all = Vec::with_capacity(outcome.len() + 2);
+        all.push(name.as_bytes());
+        all.push(args.as_bytes());
+        all.extend_from_slice(outcome);
+        let call = self.observe(kind, &all);
+        self.repeated_calls.record(call, name);
+    }
+
+    fn observe_assistant_text(&mut self, blocks: &[Block]) {
+        let mut content = String::new();
+        for block in blocks {
+            if let Block::Text { text } = block {
+                content.push_str(&text.to_owned_string());
+            }
+        }
+        let content = crate::continuation_fingerprint::assistant_text(&content);
+        if !content.is_empty() {
+            self.observe(b"assistant_text", &[content.as_bytes()]);
+        }
+    }
+
+    fn observe_local_tools(&mut self, blocks: &[Block], results: &[Message]) {
+        for block in blocks {
+            let Block::ToolCall {
+                call_id,
+                name,
+                args,
+            } = block
+            else {
+                continue;
+            };
+            for result in results {
+                if let Some(Block::ToolResult {
+                    preview,
+                    truncated,
+                    images,
+                    ..
+                }) = result.tool_result_for(call_id)
+                {
+                    let ui = crate::continuation_fingerprint::ui_step(name, args).map(|step| {
+                        let reading = match step {
+                            crate::continuation_fingerprint::UiStep::Observe {
+                                screenshot: true,
+                            } => !images.is_empty(),
+                            _ => true,
+                        };
+                        (step, reading)
+                    });
+                    let args = crate::continuation_fingerprint::arguments(args);
+                    let preview = crate::continuation_fingerprint::result(preview);
+                    let images = serde_json::to_string(images).unwrap_or_default();
+                    self.observe_call(
+                        b"local_tool_result",
+                        name,
+                        &args,
+                        &[preview.as_bytes(), &[*truncated as u8], images.as_bytes()],
+                        ui,
+                    );
+                }
+            }
+        }
+    }
+
+    fn observe_server_tool(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        preview: &str,
+        is_error: bool,
+    ) {
+        let args = crate::continuation_fingerprint::arguments(args);
+        let preview = crate::continuation_fingerprint::result(preview);
+        self.observe_call(
+            b"server_tool_result",
+            name,
+            &args,
+            &[preview.as_bytes(), &[is_error as u8]],
+            None,
+        );
+    }
+
+    fn charge(&mut self) -> usize {
+        if !self.progress_in_response {
+            self.consecutive_without_progress = self.consecutive_without_progress.saturating_add(1);
+        }
+        self.consecutive_without_progress
+    }
+
+    /// Checked before each new logical request. A limit from either guard
+    /// wins; otherwise every guard that crossed its steer threshold steers.
+    fn tool_loop_verdict(&mut self, guard: ToolLoopGuardV1, run_id: &RunId) -> ToolLoopVerdict {
+        let calls = self.repeated_calls.verdict(
+            LoopGuardKindV1::RepeatedToolCalls,
+            guard.suspect_after,
+            guard.stop_after_suspected,
+            run_id,
+        );
+        let actions = self.repeated_actions.verdict(
+            LoopGuardKindV1::RepeatedActions,
+            guard.action_suspect_after,
+            guard.action_stop_after_suspected,
+            run_id,
+        );
+        match (calls, actions) {
+            (limit @ ToolLoopVerdict::Limit(_), _) | (_, limit @ ToolLoopVerdict::Limit(_)) => {
+                limit
+            }
+            (ToolLoopVerdict::Suspected(mut first), ToolLoopVerdict::Suspected(second)) => {
+                first.extend(second);
+                ToolLoopVerdict::Suspected(first)
+            }
+            (steer @ ToolLoopVerdict::Suspected(_), ToolLoopVerdict::Continue)
+            | (ToolLoopVerdict::Continue, steer @ ToolLoopVerdict::Suspected(_)) => steer,
+            (ToolLoopVerdict::Continue, ToolLoopVerdict::Continue) => ToolLoopVerdict::Continue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod continuation_progress_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    /// One provider response in a simulated turn, mirroring the fake-provider
+    /// probes (`proof_adversarial.py`, `proof_extended_opus.py`).
+    enum Step {
+        Server {
+            query: String,
+            preview: String,
+        },
+        Text(String),
+        /// A local `fs_read` answered with `contents`, then `tool_use`.
+        Local {
+            path: String,
+            contents: String,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        /// `loop_limit` after this many provider attempts.
+        Stopped {
+            attempts: usize,
+            repeated_calls: bool,
+        },
+        /// The script ran to its end marker.
+        Completed { attempts: usize, suspected: usize },
+    }
+
+    /// Replays responses through the guards in the actor's order: before each
+    /// request the repeated-call verdict, after each MaxTokens/PauseTurn the
+    /// no-progress charge.
+    fn simulate(rounds: Vec<(Vec<Step>, FinishReason)>) -> Outcome {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("loop-guard-sim");
+        let mut progress = ContinuationProgress::default();
+        let mut attempts = 0;
+        let mut suspected = 0;
+        let mut call = 0;
+        for (steps, finish) in rounds {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => {
+                    for note in &notes {
+                        assert_eq!(
+                            note.stop_after,
+                            match note.guard {
+                                LoopGuardKindV1::RepeatedActions =>
+                                    guard.action_stop_after_suspected,
+                                _ => guard.stop_after_suspected,
+                            }
+                        );
+                    }
+                    suspected += notes.len();
+                }
+                ToolLoopVerdict::Limit(_) => {
+                    return Outcome::Stopped {
+                        attempts,
+                        repeated_calls: true,
+                    };
+                }
+            }
+            attempts += 1;
+            progress.begin_response();
+            let mut text = Vec::new();
+            for step in steps {
+                call += 1;
+                match step {
+                    Step::Server { query, preview } => progress.observe_server_tool(
+                        "web_search",
+                        &serde_json::json!({"query": query}),
+                        &preview,
+                        false,
+                    ),
+                    Step::Text(content) => text.push(Block::Text {
+                        text: content.into(),
+                    }),
+                    Step::Local { path, contents } => {
+                        let call_id = format!("call-{call}");
+                        let block = Block::ToolCall {
+                            call_id: call_id.clone(),
+                            name: "fs_read".into(),
+                            args: serde_json::json!({"path": path}),
+                        };
+                        let result = Message::tool_result(call_id, contents, false);
+                        progress.observe_local_tools(&[block], &[result]);
+                    }
+                }
+            }
+            progress.observe_assistant_text(&text);
+            if matches!(finish, FinishReason::MaxTokens | FinishReason::PauseTurn)
+                && progress.charge() > DEFAULT_MAX_CONTINUATIONS_PER_TURN
+            {
+                return Outcome::Stopped {
+                    attempts,
+                    repeated_calls: false,
+                };
+            }
+        }
+        Outcome::Completed {
+            attempts,
+            suspected,
+        }
+    }
+
+    fn server(query: &str, preview: String) -> (Vec<Step>, FinishReason) {
+        (
+            vec![Step::Server {
+                query: query.to_owned(),
+                preview,
+            }],
+            FinishReason::PauseTurn,
+        )
+    }
+
+    fn text(content: String, finish: FinishReason) -> (Vec<Step>, FinishReason) {
+        (vec![Step::Text(content)], finish)
+    }
+
+    /// A local read (tool_use round) followed by a continuation finish.
+    fn local(path: &str, finish: FinishReason) -> Vec<(Vec<Step>, FinishReason)> {
+        vec![
+            (
+                vec![Step::Local {
+                    path: path.to_owned(),
+                    contents: if path.starts_with("part-") {
+                        format!("Work item {path}: distinct successful file contents.")
+                    } else {
+                        "same stable file contents".to_owned()
+                    },
+                }],
+                FinishReason::ToolUse,
+            ),
+            (Vec::new(), finish),
+        ]
+    }
+
+    fn mixed_case(n: usize) -> String {
+        "same repeated answer"
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| {
+                if (n >> (i % 16)) & 1 == 1 {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                }
+            })
+            .collect()
+    }
+
+    const PERMUTED: [&str; 6] = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+
+    /// The 30-round scripts of the round-3 and round-4 probes, plus end marker.
+    fn case(kind: &str) -> Vec<(Vec<Step>, FinishReason)> {
+        let pause = FinishReason::PauseTurn;
+        let mut rounds = Vec::new();
+        for n in 1..=30usize {
+            let ab = if n % 2 == 1 { "A" } else { "B" };
+            match kind {
+                // Round 3 (`9-verify3/proof_adversarial.py`).
+                "alternating_ab" => rounds.push(server(ab, format!("same result {ab}"))),
+                "local_alternating_ab" => rounds.extend(local(&format!("{ab}.txt"), pause)),
+                "query_whitespace" => rounds.push(server(
+                    &format!("same topic{}", " ".repeat(n)),
+                    "same result".into(),
+                )),
+                "preview_timestamp" => rounds.push(server(
+                    "same topic",
+                    format!("same result; time=2026-09-24T00:00:{n:02}Z"),
+                )),
+                "preview_id" => {
+                    rounds.push(server("same topic", format!("same result; request_id={n}")))
+                }
+                "text_whitespace" => {
+                    rounds.push(text(format!("same answer{}", " ".repeat(n)), pause))
+                }
+                "text_blank" => rounds.push(text(" ".repeat(n), pause)),
+                "text_repeat" => rounds.push(text("same answer".into(), pause)),
+                "provider_repeat" => rounds.push(server("same topic", "same result".into())),
+                // Round 4 (`12-verify4-opus/proof_extended_opus.py`): stuck.
+                "punctuation_only" => {
+                    rounds.push(text(format!("same answer{}", ".".repeat(n)), pause))
+                }
+                "punct_alternating" => rounds.push(text(
+                    format!("same answer{}", if n % 2 == 1 { "!" } else { "?" }),
+                    pause,
+                )),
+                "case_only" => rounds.push(text(mixed_case(n), pause)),
+                "confusable_result" => rounds.push(server(
+                    "same topic",
+                    format!(
+                        "same result {}",
+                        (0..8)
+                            .map(|i| if (n >> i) & 1 == 1 { 'а' } else { 'a' })
+                            .collect::<String>()
+                    ),
+                )),
+                "reordered_list_result" => {
+                    let mut items = PERMUTED;
+                    items.rotate_left(n % 6);
+                    items.swap(0, (n / 6) % 6);
+                    rounds.push(server("same topic", format!("Found: {}", items.join(", "))));
+                }
+                "latency_ms_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result; took {}ms", 100 + n),
+                )),
+                "latency_seconds_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result (finished in {n}.{}2s)", n % 10),
+                )),
+                "nonce_free_text_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result; nonce {:06}", (n * 7919) % 1_000_003),
+                )),
+                "time_only_log_result" => {
+                    rounds.push(server("same topic", format!("[12:00:{n:02}] same result")))
+                }
+                "http_date_result" => rounds.push(server(
+                    "same topic",
+                    format!("Date: Thu, 24 Sep 2026 12:00:{n:02} GMT; same result"),
+                )),
+                "bare_epoch_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result at {}", 1_727_136_000 + n),
+                )),
+                "attempt_counter_text" => rounds.push(text(
+                    format!("Retrying the same search (attempt {n})."),
+                    pause,
+                )),
+                "max_tokens_repeat_text" => rounds.push(text(
+                    "same truncated answer".into(),
+                    FinishReason::MaxTokens,
+                )),
+                "max_tokens_latency_text" => rounds.push(text(
+                    format!("same truncated answer, took {n}ms"),
+                    FinishReason::MaxTokens,
+                )),
+                "query_case_only" => rounds.push(server(&mixed_case(n), "same result".into())),
+                "query_punct_only" => rounds.push(server(
+                    &format!("same topic{}", "?".repeat(n)),
+                    "same result".into(),
+                )),
+                "local_same_file_ab_mixed" => {
+                    rounds.extend(local(&format!("{ab}.txt"), FinishReason::MaxTokens))
+                }
+                // Digit-only changes of an identical call: no progress by rule.
+                "fp_count_progress" => {
+                    rounds.push(server("same topic", format!("Completed files: {n}")))
+                }
+                "fp_changed_contents" => rounds.push(server(
+                    "same topic",
+                    format!("contents of state.txt: stage {n} done"),
+                )),
+                "fp_new_text_each" => rounds.push(text(
+                    format!("Completed distinct work item {n} with new analysis."),
+                    pause,
+                )),
+                "fp_commit_hash_only" => {
+                    rounds.push(server("same topic", format!("HEAD is now {n:040x}")))
+                }
+                // Real progress: must keep going.
+                "short_hex_id_result" => rounds.push(server(
+                    "same topic",
+                    format!("same result; etag {:x}", 0x00a0_b0c0 + n),
+                )),
+                "fp_build_log_new_lines" => rounds.push(server(
+                    "same topic",
+                    (1..=n)
+                        .map(|i| format!("   Compiling crate{i} v0.1.{i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )),
+                "fp_new_file_contents" => rounds.extend(local(&format!("part-{n}.txt"), pause)),
+                "fp_hash_letters" => rounds.push(server(
+                    "same topic",
+                    format!(
+                        "HEAD is now {}",
+                        blake3::hash(n.to_string().as_bytes()).to_hex()
+                    ),
+                )),
+                "fp_digit_path_only" => rounds.push(server(
+                    "same topic",
+                    format!("wrote src/mod{n}/part{n}x.rs"),
+                )),
+                "fp_path_with_digits" => rounds.push(server(
+                    "same topic",
+                    format!("wrote /tmp/out/run{n}/chunk{n}file"),
+                )),
+                _ => panic!("unknown case {kind}"),
+            }
+        }
+        rounds.push(text(
+            "PROBE_REACHED_END_AFTER_30".into(),
+            FinishReason::EndTurn,
+        ));
+        rounds
+    }
+
+    fn stopped(attempts: usize) -> Outcome {
+        Outcome::Stopped {
+            attempts,
+            repeated_calls: false,
+        }
+    }
+
+    #[test]
+    fn round_three_adversarial_repeats_stop_after_ninth_no_progress_continuation() {
+        for (kind, attempts) in [
+            ("alternating_ab", 11),
+            ("local_alternating_ab", 20),
+            ("query_whitespace", 10),
+            ("preview_timestamp", 10),
+            ("preview_id", 10),
+            ("text_whitespace", 10),
+            ("text_blank", 9),
+            ("text_repeat", 10),
+            ("provider_repeat", 10),
+        ] {
+            assert_eq!(simulate(case(kind)), stopped(attempts), "{kind}");
+        }
+    }
+
+    /// Every stuck-loop row of the round-4 extended probe ends in loop_limit.
+    #[test]
+    fn round_four_incidental_noise_stops() {
+        for kind in [
+            "punctuation_only",
+            "punct_alternating",
+            "case_only",
+            "confusable_result",
+            "reordered_list_result",
+            "latency_ms_result",
+            "latency_seconds_result",
+            "nonce_free_text_result",
+            "time_only_log_result",
+            "http_date_result",
+            "bare_epoch_result",
+            "attempt_counter_text",
+            "max_tokens_repeat_text",
+            "max_tokens_latency_text",
+            "query_case_only",
+            "query_punct_only",
+            "local_same_file_ab_mixed",
+            // Ruling: an identical call whose result changes only in digits
+            // is not progress (indistinguishable from a clock or counter).
+            "fp_count_progress",
+            "fp_changed_contents",
+            "fp_new_text_each",
+            "fp_commit_hash_only",
+        ] {
+            assert!(
+                matches!(
+                    simulate(case(kind)),
+                    Outcome::Stopped {
+                        repeated_calls: false,
+                        ..
+                    }
+                ),
+                "{kind}: {:?}",
+                simulate(case(kind))
+            );
+        }
+    }
+
+    /// Real progress (and the accepted letter-changing residual) keeps going.
+    #[test]
+    fn round_four_real_progress_keeps_going() {
+        for (kind, attempts) in [
+            ("short_hex_id_result", 31),
+            ("fp_build_log_new_lines", 31),
+            ("fp_new_file_contents", 61),
+            ("fp_hash_letters", 31),
+            ("fp_digit_path_only", 31),
+            ("fp_path_with_digits", 31),
+        ] {
+            assert_eq!(
+                simulate(case(kind)),
+                Outcome::Completed {
+                    attempts,
+                    suspected: 0
+                },
+                "{kind}"
+            );
+        }
+    }
+
+    fn identical_reads(count: usize) -> Vec<(Vec<Step>, FinishReason)> {
+        let mut rounds = Vec::new();
+        for _ in 0..count {
+            rounds.push((
+                vec![Step::Local {
+                    path: "A.txt".into(),
+                    contents: "same stable file contents".into(),
+                }],
+                FinishReason::ToolUse,
+            ));
+        }
+        rounds.push(text("PROBE_REACHED_END".into(), FinishReason::EndTurn));
+        rounds
+    }
+
+    #[test]
+    fn identical_tool_use_loop_is_steered_at_thirty_repeats_and_stopped_at_sixty() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("identical-reads");
+        let mut progress = ContinuationProgress::default();
+        let mut steer_at = None;
+        let mut limit_at = None;
+        for request in 1..=101usize {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => {
+                    assert!(steer_at.is_none(), "one steer per loop");
+                    let [note] = notes.as_slice() else {
+                        panic!("one steer: {notes:?}");
+                    };
+                    assert_eq!(note.repeated_calls, 30);
+                    assert_eq!(note.guard, LoopGuardKindV1::RepeatedToolCalls);
+                    assert_eq!(note.tool.as_deref(), Some("fs_read"));
+                    steer_at = Some(request);
+                }
+                ToolLoopVerdict::Limit(details) => {
+                    assert_eq!(
+                        details,
+                        LoopLimitV1::RepeatedToolCalls {
+                            repeated_calls: 60,
+                            suspect_after: 30,
+                            stop_after_suspected: 30,
+                        }
+                    );
+                    limit_at = Some(request);
+                    break;
+                }
+            }
+            progress.begin_response();
+            let block = Block::ToolCall {
+                call_id: format!("loop-{request}"),
+                name: "fs_read".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            };
+            let result = Message::tool_result(
+                format!("loop-{request}"),
+                "same stable file contents",
+                false,
+            );
+            progress.observe_local_tools(&[block], &[result]);
+        }
+        // Call 1 is new; calls 2..=31 are the first 30 repeats, so the steer
+        // precedes request 32; calls 32..=61 are 30 more, so request 62 stops.
+        assert_eq!(steer_at, Some(32));
+        assert_eq!(limit_at, Some(62));
+        assert_eq!(
+            simulate(identical_reads(100)),
+            Outcome::Stopped {
+                attempts: 61,
+                repeated_calls: true
+            }
+        );
+        assert_eq!(
+            simulate(identical_reads(40)),
+            Outcome::Completed {
+                attempts: 41,
+                suspected: 1
+            }
+        );
+    }
+
+    fn read_call(progress: &mut ContinuationProgress, path: &str, contents: &str, n: usize) {
+        let block = Block::ToolCall {
+            call_id: format!("c{n}"),
+            name: "fs_read".into(),
+            args: serde_json::json!({"path": path}),
+        };
+        progress.observe_local_tools(
+            &[block],
+            &[Message::tool_result(format!("c{n}"), contents, false)],
+        );
+    }
+
+    #[test]
+    fn text_never_resets_the_repeat_streaks_but_a_new_call_does() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("reset");
+        let mut progress = ContinuationProgress::default();
+        for n in 0..=30 {
+            read_call(&mut progress, "A.txt", "same", n);
+        }
+        assert!(matches!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Suspected(_)
+        ));
+        for n in 31..=50 {
+            read_call(&mut progress, "A.txt", "same", n);
+        }
+        // New assistant text is continuation progress only (addendum 2):
+        // it must not unlock a stuck call loop.
+        progress.observe_assistant_text(&[Block::Text {
+            text: "The file never changes; trying the build log instead.".into(),
+        }]);
+        assert_eq!(progress.consecutive_without_progress, 0);
+        assert_eq!(progress.repeated_calls.count, 50);
+        assert_eq!(progress.repeated_actions.count, 50);
+        for n in 51..=60 {
+            read_call(&mut progress, "A.txt", "same", n);
+        }
+        assert!(matches!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Limit(LoopLimitV1::RepeatedToolCalls {
+                repeated_calls: 60,
+                ..
+            })
+        ));
+        // A new (tool, arguments) resets both streaks and re-arms the steers.
+        read_call(&mut progress, "B.txt", "other", 61);
+        assert_eq!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Continue
+        );
+        assert_eq!(progress.repeated_calls.suspected_at, None);
+        assert_eq!(progress.repeated_actions.count, 0);
+        // A new result for a repeated call resets only the result streak.
+        read_call(&mut progress, "B.txt", "other, changed", 62);
+        assert_eq!(progress.repeated_calls.count, 0);
+        assert_eq!(progress.repeated_actions.count, 1);
+    }
+
+    /// 14-verify5 long600 (a): an identical call with letter-novel narration
+    /// each round is stopped by the result-level guard (steer 30, stop 60).
+    #[test]
+    fn narration_does_not_unlock_an_identical_call_loop() {
+        const WORDS: [&str; 6] = ["amber", "basil", "cedar", "delta", "ember", "fable"];
+        let mut every_round = Vec::new();
+        let mut every_25th = Vec::new();
+        for n in 1..=600usize {
+            let sentence = format!(
+                "Retrying with the {} {} {} idea.",
+                WORDS[n % 6],
+                WORDS[(n / 6) % 6],
+                WORDS[(n / 36) % 6]
+            );
+            let call = Step::Local {
+                path: "A.txt".into(),
+                contents: "same stable file contents".into(),
+            };
+            every_round.push((
+                vec![Step::Text(sentence.clone()), call],
+                FinishReason::ToolUse,
+            ));
+            let call = Step::Local {
+                path: "A.txt".into(),
+                contents: "same stable file contents".into(),
+            };
+            let steps = if n % 25 == 0 {
+                vec![Step::Text(sentence), call]
+            } else {
+                vec![call]
+            };
+            every_25th.push((steps, FinishReason::ToolUse));
+        }
+        for rounds in [every_round, every_25th] {
+            assert_eq!(
+                simulate(rounds),
+                Outcome::Stopped {
+                    attempts: 61,
+                    repeated_calls: true
+                }
+            );
+        }
+    }
+
+    /// A distinct 12-letter tag (no digits, so masking never merges two).
+    fn letter_tag(n: usize) -> String {
+        blake3::hash(n.to_string().as_bytes()).as_bytes()[..12]
+            .iter()
+            .map(|byte| char::from(b'a' + byte % 26))
+            .collect()
+    }
+
+    /// Identical (tool, arguments) with a result that changes every call
+    /// (letters-only etag noise, or a genuinely growing log).
+    fn identical_call_changing_result(rounds: usize) -> Vec<(Vec<Step>, FinishReason)> {
+        let mut script: Vec<_> = (1..=rounds)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: "status.txt".into(),
+                        contents: format!("status: same; etag {}", letter_tag(n)),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .collect();
+        script.push(text("PROBE_REACHED_END".into(), FinishReason::EndTurn));
+        script
+    }
+
+    /// 14-verify5 long600 (b): the action guard steers after 100 repeated
+    /// (tool, arguments) calls and stops after 200, whatever the results.
+    #[test]
+    fn identical_call_with_letter_noise_is_steered_at_100_and_stopped_at_200() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("letter-noise");
+        let mut progress = ContinuationProgress::default();
+        let mut steer = None;
+        let mut limit = None;
+        for request in 1..=600usize {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => {
+                    assert!(steer.is_none(), "one steer per loop");
+                    let [note] = notes.as_slice() else {
+                        panic!("one steer: {notes:?}");
+                    };
+                    assert_eq!(note.guard, LoopGuardKindV1::RepeatedActions);
+                    assert_eq!(note.repeated_calls, 100);
+                    assert_eq!(note.stop_after, 100);
+                    steer = Some(request);
+                }
+                ToolLoopVerdict::Limit(details) => {
+                    assert_eq!(
+                        details,
+                        LoopLimitV1::RepeatedActions {
+                            repeated_calls: 200,
+                            suspect_after: 100,
+                            stop_after_suspected: 100,
+                        }
+                    );
+                    limit = Some(request);
+                    break;
+                }
+            }
+            read_call(
+                &mut progress,
+                "status.txt",
+                &format!("status: same; etag {}", letter_tag(request)),
+                request,
+            );
+            assert_eq!(progress.repeated_calls.count, 0, "every result is new");
+        }
+        assert_eq!(steer, Some(102));
+        assert_eq!(limit, Some(202));
+        assert_eq!(
+            simulate(identical_call_changing_result(600)),
+            Outcome::Stopped {
+                attempts: 201,
+                repeated_calls: true
+            }
+        );
+        // A 150-poll of a changing resource is steered once and completes.
+        assert_eq!(
+            simulate(identical_call_changing_result(150)),
+            Outcome::Completed {
+                attempts: 151,
+                suspected: 1
+            }
+        );
+    }
+
+    #[test]
+    fn distinct_work_and_cycles() {
+        let distinct: Vec<_> = (1..=200usize)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: format!("part-{n}.txt"),
+                        contents: format!("Work item {n}: distinct contents."),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .chain([text("END".into(), FinishReason::EndTurn)])
+            .collect();
+        assert_eq!(
+            simulate(distinct),
+            Outcome::Completed {
+                attempts: 201,
+                suspected: 0
+            }
+        );
+        // An A,B,C cycle repeats (tool, arguments) and results after round 3.
+        let cycle: Vec<_> = (0..150usize)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: ["A.txt", "B.txt", "C.txt"][n % 3].into(),
+                        contents: "same stable file contents".into(),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .collect();
+        assert_eq!(
+            simulate(cycle),
+            Outcome::Stopped {
+                attempts: 63,
+                repeated_calls: true
+            }
+        );
+        // The same cycle with letter-noise results is bounded by the action
+        // guard instead.
+        let noisy_cycle: Vec<_> = (0..600usize)
+            .map(|n| {
+                (
+                    vec![Step::Local {
+                        path: ["A.txt", "B.txt", "C.txt"][n % 3].into(),
+                        contents: format!("etag {}", letter_tag(n)),
+                    }],
+                    FinishReason::ToolUse,
+                )
+            })
+            .collect();
+        assert_eq!(
+            simulate(noisy_cycle),
+            Outcome::Stopped {
+                attempts: 203,
+                repeated_calls: true
+            }
+        );
+    }
+
+    #[test]
+    fn parallel_repeat_batch_is_steered_before_it_is_stopped() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("batch");
+        let mut progress = ContinuationProgress::default();
+        let batch = |progress: &mut ContinuationProgress, start: usize| {
+            let blocks: Vec<Block> = (start..start + 50)
+                .map(|n| Block::ToolCall {
+                    call_id: format!("p{n}"),
+                    name: "fs_read".into(),
+                    args: serde_json::json!({"path": "A.txt"}),
+                })
+                .collect();
+            let results: Vec<Message> = (start..start + 50)
+                .map(|n| Message::tool_result(format!("p{n}"), "same", false))
+                .collect();
+            progress.observe_local_tools(&blocks, &results);
+        };
+        batch(&mut progress, 0);
+        let ToolLoopVerdict::Suspected(notes) = progress.tool_loop_verdict(guard, &run_id) else {
+            panic!("steer first");
+        };
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].repeated_calls, 49);
+        assert_eq!(notes[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        batch(&mut progress, 50);
+        assert_eq!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Limit(LoopLimitV1::RepeatedToolCalls {
+                repeated_calls: 99,
+                suspect_after: 30,
+                stop_after_suspected: 30,
+            })
+        );
+    }
+
+    /// One local call with an optional screenshot image (by content address).
+    fn tool_call(
+        progress: &mut ContinuationProgress,
+        tool: &str,
+        args: serde_json::Value,
+        preview: &str,
+        image: Option<String>,
+        n: usize,
+    ) {
+        let call_id = format!("ui-{n}");
+        let block = Block::ToolCall {
+            call_id: call_id.clone(),
+            name: tool.into(),
+            args,
+        };
+        let images = image
+            .map(|artifact| {
+                vec![haider_protocol::tool::ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{artifact}")),
+                    media_type: "image/png".into(),
+                    width: 1080,
+                    height: 2400,
+                    byte_len: 4096,
+                }]
+            })
+            .unwrap_or_default();
+        progress.observe_local_tools(
+            &[block],
+            &[Message::tool_result_with_images(
+                call_id, preview, false, images,
+            )],
+        );
+    }
+
+    fn swipe_args() -> serde_json::Value {
+        serde_json::json!({"action": "swipe", "from": {"x": 540, "y": 1800}, "to": {"x": 540, "y": 600}})
+    }
+
+    fn screenshot_args() -> serde_json::Value {
+        serde_json::json!({"action": "screenshot"})
+    }
+
+    /// Runs `calls` one per provider request; returns the first terminal
+    /// verdict with its request number, and the number of steers.
+    fn drive(
+        calls: usize,
+        mut call: impl FnMut(&mut ContinuationProgress, usize),
+    ) -> (Option<(usize, LoopLimitV1)>, Vec<LoopSuspectedV1>) {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("ui");
+        let mut progress = ContinuationProgress::default();
+        let mut steers = Vec::new();
+        for request in 1..=calls + 1 {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => steers.extend(notes),
+                ToolLoopVerdict::Limit(details) => return (Some((request, details)), steers),
+            }
+            if request <= calls {
+                call(&mut progress, request);
+            }
+        }
+        (None, steers)
+    }
+
+    /// Repair 7 ruling: 300 pages of mobile swipe + screenshot (identical
+    /// arguments, genuinely changing screenshots) is productive scrolling.
+    #[test]
+    fn mobile_swipe_screenshot_paging_300_pages_completes() {
+        let (stop, steers) = drive(600, |progress, request| {
+            let page = request.div_ceil(2);
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some(format!("page-{page}")),
+                    request,
+                );
+            }
+        });
+        assert_eq!(stop, None);
+        assert!(steers.is_empty(), "{steers:?}");
+        // Computer-use scroll + screenshot pages the same way.
+        let scroll = serde_json::json!({"action": "scroll", "x": 500, "y": 400, "direction": "down", "amount": 5});
+        let (stop, steers) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(
+                    progress,
+                    "computer",
+                    scroll.clone(),
+                    "scroll completed",
+                    None,
+                    request,
+                );
+            } else {
+                tool_call(
+                    progress,
+                    "computer",
+                    screenshot_args(),
+                    "screenshot",
+                    Some(format!("desk-{request}")),
+                    request,
+                );
+            }
+        });
+        assert_eq!(stop, None);
+        assert!(steers.is_empty(), "{steers:?}");
+    }
+
+    /// Identical screenshots (stuck at the end of a list) are still caught by
+    /// the result-level guard: steer before request 32, stop before 62.
+    #[test]
+    fn stuck_at_end_of_list_identical_screenshots_stop_at_61() {
+        let (stop, steers) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                "screenshot captured",
+                Some("list-end".into()),
+                request,
+            );
+        });
+        assert_eq!(
+            stop,
+            Some((
+                62,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        // Swipe + identical screenshot: both repeat, so the stop comes sooner.
+        let (stop, _) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some("list-end".into()),
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((
+                _,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    /// A screen-step exemption needs the typed tool identity: the same
+    /// action strings inside another tool's arguments are ordinary calls,
+    /// and letter-noise on text tools still stops at 201 attempts.
+    #[test]
+    fn screen_step_exemption_is_typed_and_letter_noise_still_stops() {
+        for tool in ["process_exec", "fs_read", "mobile_screenshot"] {
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    screenshot_args(),
+                    &format!("status same; etag {}", letter_tag(request)),
+                    Some(letter_tag(request)),
+                    request,
+                );
+            });
+            assert!(
+                matches!(
+                    stop,
+                    Some((
+                        202,
+                        LoopLimitV1::RepeatedActions {
+                            repeated_calls: 200,
+                            ..
+                        }
+                    ))
+                ),
+                "{tool}: {stop:?}"
+            );
+        }
+        // An argument shape the mobile parser rejects is not a screen step.
+        let (stop, _) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                serde_json::json!({"action": "screenshot", "spoof": true}),
+                "error",
+                Some(letter_tag(request)),
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        // A screenshot without an image is not a reading: counted.
+        let (stop, _) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                &format!("capture failed {}", letter_tag(request)),
+                None,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(
+            simulate(identical_call_changing_result(600)),
+            Outcome::Stopped {
+                attempts: 201,
+                repeated_calls: true
+            }
+        );
+    }
+
+    /// Mixed computer-use + text cycle: changing screenshots are exempt, but
+    /// the identical text call with letter noise still reaches the action
+    /// limit after 200 of its own repeats; screen steps never reset it.
+    #[test]
+    fn mixed_screen_and_text_cycle_still_bounds_the_text_loop() {
+        let (stop, steers) = drive(1200, |progress, request| {
+            let round = request.div_ceil(3);
+            match request % 3 {
+                1 => tool_call(
+                    progress,
+                    "fs_read",
+                    serde_json::json!({"path": "status.txt"}),
+                    &format!("status same; etag {}", letter_tag(request)),
+                    None,
+                    request,
+                ),
+                2 => tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request),
+                _ => tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some(format!("frame-{round}")),
+                    request,
+                ),
+            }
+        });
+        // fs_read repeat #200 is call 3*200+1 = 601; the next request stops.
+        assert_eq!(
+            stop,
+            Some((
+                602,
+                LoopLimitV1::RepeatedActions {
+                    repeated_calls: 200,
+                    suspect_after: 100,
+                    stop_after_suspected: 100,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedActions);
+        assert_eq!(steers[0].tool.as_deref(), Some("fs_read"));
+        // Once the screen stops changing, screen steps count again.
+        let (stop, _) = drive(1200, |progress, request| match request % 3 {
+            1 => tool_call(
+                progress,
+                "fs_read",
+                serde_json::json!({"path": "status.txt"}),
+                &format!("status same; etag {}", letter_tag(request)),
+                None,
+                request,
+            ),
+            2 => tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request),
+            _ => tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                "screenshot captured",
+                Some("frozen".into()),
+                request,
+            ),
+        });
+        assert!(
+            matches!(stop, Some((request, LoopLimitV1::RepeatedActions { .. })) if request < 300),
+            "{stop:?}"
+        );
+    }
+
+    /// A parallel batch that crosses both steer thresholds at once gets both
+    /// steers, and each guard still needs its own further repeats to stop.
+    #[test]
+    fn parallel_batch_crossing_both_thresholds_steers_for_both() {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("batch-both");
+        let mut progress = ContinuationProgress::default();
+        let blocks: Vec<Block> = (0..101)
+            .map(|n| Block::ToolCall {
+                call_id: format!("q{n}"),
+                name: "fs_read".into(),
+                args: serde_json::json!({"path": "A.txt"}),
+            })
+            .collect();
+        let results: Vec<Message> = (0..101)
+            .map(|n| Message::tool_result(format!("q{n}"), "same", false))
+            .collect();
+        progress.observe_local_tools(&blocks, &results);
+        let ToolLoopVerdict::Suspected(notes) = progress.tool_loop_verdict(guard, &run_id) else {
+            panic!("steers before any stop");
+        };
+        let kinds: Vec<_> = notes.iter().map(|note| note.guard).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LoopGuardKindV1::RepeatedToolCalls,
+                LoopGuardKindV1::RepeatedActions
+            ]
+        );
+        assert_eq!(
+            progress.tool_loop_verdict(guard, &run_id),
+            ToolLoopVerdict::Continue
+        );
+    }
+}
 /// Maximum time a provider-stream text, reasoning, or tool-argument delta may
 /// remain in memory before it is journaled. Contiguous deltas for one item and
 /// one variant coalesce during this window; every semantic boundary flushes
@@ -960,11 +2351,9 @@ pub struct HarnessConfig {
     pub interaction_policy: InteractionResolutionPolicy,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
-    /// Hard ceiling on provider requests made by one logical turn.
-    pub max_provider_requests_per_turn: usize,
-    /// Warn the model once after this many logical requests. Transport retries
-    /// do not spend another request. A fresh continuation turn resets the budget.
-    pub provider_request_tranche: usize,
+    /// Optional logical provider-request policy for one turn. Absence is
+    /// unbounded; transport retries never spend another logical request.
+    pub provider_request_budget: Option<RequestBudgetV1>,
     /// Headless workspace for durable pre/post tree receipts at the hard cap.
     /// Embedders without a workspace leave this absent.
     pub ceiling_workspace: Option<std::path::PathBuf>,
@@ -987,8 +2376,15 @@ pub struct HarnessConfig {
     /// cumulative baseline. Keep each durable response snapshot request-local
     /// while retaining cumulative accounting inside the actor.
     pub recovery_request_local_usage: bool,
-    /// Independent guard against providers repeatedly exhausting output.
+    /// Maximum consecutive MaxTokens/PauseTurn finishes without distinct
+    /// assistant content or a new completed local/provider-side tool result.
     pub max_continuations_per_turn: usize,
+    /// Tool-loop guards: consecutive calls that repeat an earlier call and
+    /// result (30/30 by default), or an earlier (tool, arguments) pair
+    /// whatever the result (100/100), first receive a typed
+    /// `loop_suspected_v1` steer and later end in `loop_limit`. Assistant
+    /// text resets neither. `None` disables both (opt-out).
+    pub tool_loop_guard: Option<ToolLoopGuardV1>,
     /// Maximum number of submissions parked behind the active turn.
     pub deferred_command_capacity: usize,
     /// Daemon supervisors close/reconcile their effect broker before writing
@@ -1100,8 +2496,7 @@ impl HarnessConfig {
             interaction_policy: InteractionResolutionPolicy::default(),
             command_capacity: 8,
             broadcast_capacity: 128,
-            max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
-            provider_request_tranche: 32,
+            provider_request_budget: None,
             ceiling_workspace: None,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
@@ -1110,6 +2505,7 @@ impl HarnessConfig {
             provider_request_attempt_recorder: None,
             recovery_request_local_usage: false,
             max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
+            tool_loop_guard: Some(ToolLoopGuardV1::default()),
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
             prompt_retraction_enabled: false,
@@ -3691,7 +5087,7 @@ impl HarnessActor {
         // Recovery reuses the durable warning, including its exact prompt text.
         // Only recovery pays for a journal scan; fresh turns start with no note.
         let mut soft_bound_emitted = false;
-        if restore_budget {
+        if restore_budget && self.config.provider_request_budget.is_some() {
             match self.restore_request_budget(&run_id).await {
                 Ok((used, note)) => {
                     provider_request_count = provider_request_count.max(used);
@@ -3705,7 +5101,7 @@ impl HarnessActor {
                 Err(error) => return self.errored_state_outcome(&run_id, error).await,
             }
         }
-        let mut continuation_count = 0usize;
+        let mut continuation_progress = ContinuationProgress::default();
         let (workspace_before, mut pending_workspace_receipt) = match self
             .prepare_ceiling_workspace(&run_id, restore_budget, &cancel)
             .await
@@ -3891,12 +5287,15 @@ impl HarnessActor {
             }
         }
         'requests: loop {
-            if provider_attempt == 0 {
-                let budget = self.request_budget();
+            continuation_progress.begin_response();
+            if provider_attempt == 0
+                && let Some(budget) = self.config.provider_request_budget
+            {
                 if !soft_bound_emitted && provider_request_count >= budget.tranche {
                     let status = self.request_budget_status(
                         &run_id,
                         provider_request_count,
+                        budget,
                         RequestBudgetPhaseV1::SoftBound,
                     );
                     if let Err(error) = self.commit_request_budget_note(&run_id, &status).await {
@@ -3915,6 +5314,7 @@ impl HarnessActor {
                     let status = self.request_budget_status(
                         &run_id,
                         provider_request_count,
+                        budget,
                         RequestBudgetPhaseV1::HardBound,
                     );
                     let mut error = request_budget_error(&status);
@@ -3946,6 +5346,40 @@ impl HarnessActor {
                             error,
                         )
                         .await;
+                }
+            }
+            if provider_attempt == 0
+                && let Some(guard) = self.config.tool_loop_guard
+            {
+                match continuation_progress.tool_loop_verdict(guard, &run_id) {
+                    ToolLoopVerdict::Continue => {}
+                    ToolLoopVerdict::Suspected(notes) => {
+                        for note in notes {
+                            if let Err(error) =
+                                self.commit_loop_suspected_note(&run_id, &note).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            messages.push(Message::user_text(note.model_note()));
+                        }
+                    }
+                    ToolLoopVerdict::Limit(details) => {
+                        if let Err(error) = self
+                            .commit_pending_thinking(&run_id, &mut thinking_pending)
+                            .await
+                        {
+                            return self.errored_state_outcome(&run_id, error).await;
+                        }
+                        return self
+                            .errored_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                tool_loop_limit_error(details),
+                            )
+                            .await;
+                    }
                 }
             }
             // The exhausted logical cap takes precedence over route refresh:
@@ -4635,13 +6069,20 @@ impl HarnessActor {
                         cache: request_attempt_data,
                         response_epoch: replay.response_epoch,
                         workspace_receipt: pending_workspace_receipt.take(),
-                        request_budget: (provider_attempt == 1).then(|| {
-                            self.request_budget_status(
-                                &run_id,
-                                provider_request_count,
-                                RequestBudgetPhaseV1::Progress,
-                            )
-                        }),
+                        // Progress is recorded once per logical request
+                        // (first attempt) and only under an explicit policy.
+                        request_budget: self
+                            .config
+                            .provider_request_budget
+                            .filter(|_| provider_attempt == 1)
+                            .map(|budget| {
+                                self.request_budget_status(
+                                    &run_id,
+                                    provider_request_count,
+                                    budget,
+                                    RequestBudgetPhaseV1::Progress,
+                                )
+                            }),
                     },
                     &mut thinking_pending,
                 )
@@ -6332,6 +7773,9 @@ impl HarnessActor {
                         let (name, args) = server_calls
                             .remove(&call_id)
                             .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null));
+                        let result_preview = preview.clone();
+                        let result_name = name.clone();
+                        let result_args = args.clone();
                         async {
                             self.complete_text(&run_id, &mut message, false).await?;
                             self.complete_text(&run_id, &mut reasoning, true).await?;
@@ -6368,6 +7812,12 @@ impl HarnessActor {
                                 &run_id, &call_id, name, args, status, &result,
                             )
                             .await?;
+                            continuation_progress.observe_server_tool(
+                                &result_name,
+                                &result_args,
+                                &result_preview,
+                                is_error,
+                            );
                             Ok(None)
                         }
                         .await
@@ -6963,6 +8413,7 @@ impl HarnessActor {
                                     .await;
                             }
                         }
+                        continuation_progress.observe_assistant_text(&assistant_blocks);
                         let current_assistant_message_index = if !assistant_blocks.is_empty() {
                             let index = messages.len();
                             messages
@@ -7026,6 +8477,10 @@ impl HarnessActor {
                                     .await;
                             }
                             provider_attempt = 0;
+                            if let Some(index) = current_assistant_message_index {
+                                continuation_progress
+                                    .observe_local_tools(&messages[index].blocks, &tool_results);
+                            }
                             messages.append(&mut tool_results);
                             thinking_pending = true;
                             replay.reset_for_next_request();
@@ -7034,11 +8489,11 @@ impl HarnessActor {
                             continue 'requests;
                         }
                         // W-B (LW2): `pause_turn` shares the MaxTokens
-                        // continuation machinery (checkpoint + cap), but the
+                        // continuation machinery (checkpoint + no-progress cap), but the
                         // paused assistant message is resent UNCHANGED — no
                         // synthesized user nudge joins the conversation.
                         if reason == FinishReason::MaxTokens || reason == FinishReason::PauseTurn {
-                            continuation_count = continuation_count.saturating_add(1);
+                            let continuation_count = continuation_progress.charge();
                             if continuation_count > self.config.max_continuations_per_turn {
                                 return self
                                     .errored_outcome_with_items(
@@ -11642,26 +13097,16 @@ impl HarnessActor {
         Ok(())
     }
 
-    fn request_budget(&self) -> RequestBudgetV1 {
-        RequestBudgetV1 {
-            // Preserve embedders that only override the old hard-cap field.
-            tranche: self
-                .config
-                .provider_request_tranche
-                .min(self.config.max_provider_requests_per_turn),
-            hard_cap: self.config.max_provider_requests_per_turn,
-        }
-    }
-
     fn request_budget_status(
         &self,
         run_id: &RunId,
         used: usize,
+        budget: RequestBudgetV1,
         phase: RequestBudgetPhaseV1,
     ) -> RequestBudgetStatusV1 {
         RequestBudgetStatusV1 {
             used,
-            budget: self.request_budget(),
+            budget,
             phase,
             continuation: RequestBudgetContinuationV1 {
                 session_id: self.config.session_id.clone(),
@@ -11687,6 +13132,34 @@ impl HarnessActor {
         self.commit_extension_marker(
             run_id,
             PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
+            data,
+            prompt_verbatim_render(),
+        )
+        .await
+    }
+
+    async fn commit_loop_suspected_note(
+        &mut self,
+        run_id: &RunId,
+        note: &LoopSuspectedV1,
+    ) -> Result<(), HaiderError> {
+        let TurnItem::Extension { data, .. } = note.to_extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot encode loop_suspected note: {error}"),
+                false,
+            )
+        })?
+        else {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "loop_suspected note is not an extension item",
+                false,
+            ));
+        };
+        self.commit_extension_marker(
+            run_id,
+            LOOP_SUSPECTED_EXTENSION_KIND,
             data,
             prompt_verbatim_render(),
         )
@@ -13438,17 +14911,49 @@ fn request_budget_error(status: &RequestBudgetStatusV1) -> HaiderError {
     error
 }
 
-fn continuation_limit_error(count: usize, limit: usize) -> HaiderError {
-    let mut error = HaiderError::new(
-        ErrorCode::LoopLimit,
-        format!("provider continuation limit exceeded at continuation {count} (limit {limit})"),
-        false,
-    );
-    error.details = Some(serde_json::json!({
-        "continuation_count": count,
-        "continuation_limit": limit,
-    }));
+/// `loop_limit` with typed details in both `HaiderError::details` and the
+/// presentation that `run_failed` and `haider.run.v1` carry.
+fn loop_limit_error(message: String, details: LoopLimitV1) -> HaiderError {
+    let mut error = HaiderError::new(ErrorCode::LoopLimit, message, false);
+    error.details = serde_json::to_value(details).ok();
+    error.presentation = Some(presentation_for_haider_error(&error).with_loop_limit(details));
     error
+}
+
+fn tool_loop_limit_error(details: LoopLimitV1) -> HaiderError {
+    let message = match details {
+        LoopLimitV1::RepeatedActions {
+            repeated_calls,
+            suspect_after,
+            stop_after_suspected,
+        } => format!(
+            "repeated tool-call loop limit exceeded: {repeated_calls} consecutive tool calls repeated earlier calls with the same arguments, with no new call in between (loop_suspected after {suspect_after}, limit after {stop_after_suspected} more)"
+        ),
+        LoopLimitV1::RepeatedToolCalls {
+            repeated_calls,
+            suspect_after,
+            stop_after_suspected,
+        } => format!(
+            "repeated tool-call loop limit exceeded: {repeated_calls} consecutive tool calls repeated earlier calls and results (loop_suspected after {suspect_after}, limit after {stop_after_suspected} more)"
+        ),
+        LoopLimitV1::NoProgressContinuations {
+            continuation_count,
+            continuation_limit,
+        } => return continuation_limit_error(continuation_count, continuation_limit),
+    };
+    loop_limit_error(message, details)
+}
+
+fn continuation_limit_error(count: usize, limit: usize) -> HaiderError {
+    loop_limit_error(
+        format!(
+            "provider no-progress continuation limit exceeded at consecutive continuation {count} (limit {limit})"
+        ),
+        LoopLimitV1::NoProgressContinuations {
+            continuation_count: count,
+            continuation_limit: limit,
+        },
+    )
 }
 
 fn submit_busy_error(capacity: usize) -> HaiderError {

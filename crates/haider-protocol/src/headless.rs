@@ -23,7 +23,7 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunBudgetV1 {
     /// Logical provider requests per turn; transport retries do not consume
-    /// this budget. Absence selects the ordinary 32/64 request policy.
+    /// this budget. Absence leaves provider-request count unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_budget: Option<crate::request_budget::RequestBudgetV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

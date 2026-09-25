@@ -314,8 +314,9 @@ pub trait ProviderFactory: Send + Sync {
     /// ephemeral cache resources when a session switches wire families.
     async fn reconcile_cache_scope(&self, _session_id: &SessionId, _provider: &str) {}
 
-    /// Integration-test seam for proving the actor's request-loop budget
-    /// through the real daemon. Production factories keep the core default.
+    /// Integration-test seam for proving an explicit actor request-loop cap
+    /// through the real daemon. Production factories return `None`, leaving
+    /// any run or child pin in force (no pin means unbounded).
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
@@ -8459,6 +8460,25 @@ async fn refresh_context_economy_from_journal(
     Ok(economy)
 }
 
+/// Applies the test-only hard-cap override while preserving a pinned tranche.
+/// Production turns use the pin unchanged and have no request cap when absent.
+fn request_budget_with_test_override(
+    pinned: Option<haider_protocol::request_budget::RequestBudgetV1>,
+    override_limit: Option<usize>,
+) -> Option<haider_protocol::request_budget::RequestBudgetV1> {
+    override_limit
+        .map(|limit| haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: pinned
+                .map_or(
+                    haider_protocol::request_budget::OPT_IN_DEFAULT_TRANCHE,
+                    |pin| pin.tranche,
+                )
+                .min(limit),
+            hard_cap: limit,
+        })
+        .or(pinned)
+}
+
 /// Assembles and starts one accepted turn: provider resolution (R6 pinning —
 /// this is the once-per-logical-turn call), committed-history compilation
 /// (R4), tool dispatcher creation, harness registration under the lease, and
@@ -9355,38 +9375,43 @@ async fn start_turn(
     config.interaction_policy =
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
-    config.ceiling_workspace = headless
-        .as_ref()
-        .map(|_| std::path::PathBuf::from(&metadata.cwd));
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
     config.turn_ordinal = accepted.turn_ordinal;
     config.provider_request_ordinals = Some(request_ordinals.clone());
     config.provider_request_attempt_recorder = Some(provider_request_attempt_recorder.clone());
     config.recovery_request_local_usage = admission_retry;
-    // A run pin overrides the child's frozen policy; absent both, the core
-    // supplies its ordinary 32-request tranche and 64-request hard ceiling.
+    // A run pin overrides the child's frozen policy. Absent both, provider
+    // requests are unbounded; explicit token, cost, time, cancellation, and
+    // non-request-count loop guards remain independent.
     let child_request_budget = delegation_record
         .as_ref()
         .map(|record| record.manifest.request_budget())
         .transpose()
         .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?
         .flatten();
-    if let Some(budget) = headless
+    let pinned_request_budget = headless
         .as_ref()
         .and_then(|context| context.spec.budget.request_budget)
-        .or(child_request_budget)
-    {
+        .or(child_request_budget);
+    if let Some(budget) = pinned_request_budget {
         budget
             .validate()
             .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
-        config.provider_request_tranche = budget.tranche;
-        config.max_provider_requests_per_turn = budget.hard_cap;
     }
-    if let Some(limit) = dependencies
-        .provider_factory
-        .max_provider_requests_per_turn_override()
-    {
-        config.max_provider_requests_per_turn = limit;
+    // The test-factory override changes the ceiling, preserving a pinned
+    // tranche when possible (the seam's pre-973 behavior).
+    let request_budget = request_budget_with_test_override(
+        pinned_request_budget,
+        dependencies
+            .provider_factory
+            .max_provider_requests_per_turn_override(),
+    );
+    if let Some(budget) = request_budget {
+        config.provider_request_budget = Some(budget);
+        // Hard-cap workspace receipts exist only for capped headless runs.
+        config.ceiling_workspace = headless
+            .as_ref()
+            .map(|_| std::path::PathBuf::from(&metadata.cwd));
     }
     config.reserved_output_tokens = metadata.max_tokens;
     if let Some(window) = config.context_window

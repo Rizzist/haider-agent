@@ -7,6 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Registered name of the native `computer` tool. The daemon routes exactly
+/// this name to the computer backend, so it is the tool's typed identity.
+pub const COMPUTER_TOOL_NAME: &str = "computer";
+
 /// One point in the model-visible screenshot coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
