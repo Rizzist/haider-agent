@@ -6427,3 +6427,148 @@ fn registered_redirects_match_provider_clients_and_others_stay_hardened() {
 fn default_flow_ttl_is_at_least_ten_minutes() {
     assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
 }
+
+/// A scripted `/api/oauth/profile` stand-in: answers each request with the
+/// next `(status, headers, body)` and counts requests.
+async fn scripted_profile_server(
+    script: Vec<(u16, Vec<(&'static str, String)>, String)>,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind profile");
+    let address = listener.local_addr().expect("profile address");
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    tokio::spawn(async move {
+        for (status, headers, body) in script {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            assert!(text.starts_with("GET /profile "));
+            assert!(text.contains(&format!("Bearer {ACCESS_SENTINEL}")));
+            counter.fetch_add(1, Ordering::SeqCst);
+            write_http(&mut stream, status, &headers, body.as_bytes()).await;
+        }
+    });
+    (address, hits)
+}
+
+async fn anthropic_login_against_profile(
+    script: Vec<(u16, Vec<(&'static str, String)>, String)>,
+) -> (OAuthTokenBundleV1, usize) {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let (profile, hits) = scripted_profile_server(script).await;
+    let mut registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_identity_endpoint(format!("http://{profile}/profile"))
+        .expect("test identity endpoint");
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    registration.identity_mode = RuntimeIdentityMode::TokenEndpointGrant {
+        display_identity: "Claude Max subscription".into(),
+    };
+    registration.scopes = SCOPES.split_ascii_whitespace().map(str::to_owned).collect();
+    let body = serde_json::json!({
+        "access_token": ACCESS_SENTINEL,
+        "refresh_token": REFRESH_SENTINEL,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": SCOPES
+    })
+    .to_string();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let bundle =
+        token_bundle_from_response(&client, &registration, body.as_bytes(), b"nonce", 1, None)
+            .await
+            .expect("a successful token exchange never fails on the profile");
+    (bundle, hits.load(Ordering::SeqCst))
+}
+
+fn email_less_profile() -> String {
+    serde_json::json!({
+        "account": {"uuid": "account-uuid-973", "display_name": "No Email"},
+        "organization": {"uuid": "organization-uuid-973", "organization_type": "claude_max"}
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn anthropic_profile_retries_429_and_5xx_and_accepts_missing_email() {
+    let (bundle, hits) = anthropic_login_against_profile(vec![
+        (503, vec![], "busy".into()),
+        (429, vec![("Retry-After", "0".into())], "slow down".into()),
+        (200, vec![], email_less_profile()),
+    ])
+    .await;
+    assert_eq!(hits, 3, "two transient failures then success");
+    let identity = bundle.account_identity.as_ref().expect("identity");
+    assert_eq!(
+        identity.account_id.as_deref(),
+        Some("account=account-uuid-973;organization=organization-uuid-973")
+    );
+    assert_eq!(identity.email, None, "email is informational only");
+    assert!(identity.verified);
+}
+
+#[tokio::test]
+async fn anthropic_profile_outage_saves_unverified_identity_after_bounded_retries() {
+    let started = std::time::Instant::now();
+    let (bundle, hits) = anthropic_login_against_profile(vec![
+        (503, vec![("Retry-After", "600".into())], "down".into()),
+        (500, vec![], "down".into()),
+        (502, vec![], "down".into()),
+        (200, vec![], email_less_profile()),
+    ])
+    .await;
+    assert_eq!(hits, 3, "retries are bounded to three attempts");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "Retry-After is capped"
+    );
+    let identity = bundle.account_identity.as_ref().expect("identity");
+    assert!(!identity.verified);
+    assert!(
+        identity
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("anthropic:"))
+    );
+    let principal = haider_protocol::credential::AccountPrincipal::new(
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        Some(identity),
+    )
+    .expect("principal");
+    assert!(principal.identity_unverified());
+    assert_eq!(principal.stable_account_id(), None, "never deduplicated");
+    assert_eq!(bundle.access_token(), ACCESS_SENTINEL.as_bytes());
+}
+
+#[tokio::test]
+async fn anthropic_profile_rejection_is_not_retried_but_login_still_saves() {
+    let (bundle, hits) = anthropic_login_against_profile(vec![
+        (403, vec![], "forbidden".into()),
+        (200, vec![], email_less_profile()),
+    ])
+    .await;
+    assert_eq!(hits, 1, "4xx other than 429 is not retried");
+    let identity = bundle.account_identity.as_ref().expect("identity");
+    assert!(!identity.verified);
+    assert!(
+        haider_protocol::credential::AccountPrincipal::new(
+            haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+            Some(identity)
+        )
+        .is_some_and(haider_protocol::credential::AccountPrincipal::identity_unverified)
+    );
+}

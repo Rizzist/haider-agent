@@ -54,19 +54,24 @@ use zeroize::Zeroizing;
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 
 pub(super) struct UnavailableProbeBackoff {
-    account_alias: Option<String>,
     account_fingerprint: String,
     next_probe: std::time::Instant,
     next_delay: Duration,
 }
 
+/// Probe backoff key: `(provider, explicit account alias)`. Keying by the
+/// alias too means alternating pinned and default sessions each keep their
+/// own schedule instead of resetting one shared entry on every switch.
+pub(super) type ProbeBackoffKey = (String, Option<String>);
+
+pub(super) fn probe_backoff_key(provider: &str, account_alias: Option<&str>) -> ProbeBackoffKey {
+    (provider.to_owned(), account_alias.map(str::to_owned))
+}
+
 impl UnavailableProbeBackoff {
-    fn permit(&mut self, account_alias: Option<&str>, account_fingerprint: &str) -> bool {
+    fn permit(&mut self, account_fingerprint: &str) -> bool {
         let now = std::time::Instant::now();
-        if self.account_alias.as_deref() != account_alias
-            || self.account_fingerprint != account_fingerprint
-        {
-            self.account_alias = account_alias.map(str::to_owned);
+        if self.account_fingerprint != account_fingerprint {
             self.account_fingerprint = account_fingerprint.to_owned();
             self.next_probe = now + Duration::from_secs(30);
             self.next_delay = Duration::from_secs(60);
@@ -80,10 +85,9 @@ impl UnavailableProbeBackoff {
         true
     }
 
-    fn new(account_alias: Option<&str>, account_fingerprint: &str) -> Self {
+    fn new(account_fingerprint: &str) -> Self {
         let now = std::time::Instant::now();
         Self {
-            account_alias: account_alias.map(str::to_owned),
             account_fingerprint: account_fingerprint.to_owned(),
             next_probe: now + Duration::from_secs(30),
             next_delay: Duration::from_secs(60),
@@ -91,8 +95,10 @@ impl UnavailableProbeBackoff {
     }
 }
 
+/// The catalog cache is provider-scoped, so a recovered catalog clears every
+/// alias's backoff for that provider.
 fn retain_backoff_until_catalog_recovers(
-    probes: &mut std::collections::HashMap<String, UnavailableProbeBackoff>,
+    probes: &mut std::collections::HashMap<ProbeBackoffKey, UnavailableProbeBackoff>,
     provider: &str,
     inventory: &haider_rpc::ModelInventoryWire,
 ) {
@@ -103,7 +109,7 @@ fn retain_backoff_until_catalog_recovers(
             | haider_rpc::ModelInventoryWire::Static
             | haider_rpc::ModelInventoryWire::Configured
     ) {
-        probes.remove(provider);
+        probes.retain(|(probe_provider, _), _| probe_provider != provider);
     }
 }
 
@@ -113,24 +119,47 @@ mod unavailable_probe_backoff_tests {
 
     #[test]
     fn unavailable_probe_is_bounded_and_resets_on_account_change() {
-        let mut state = UnavailableProbeBackoff::new(Some("first"), "snapshot-1");
-        assert!(!state.permit(Some("first"), "snapshot-1"));
+        let mut state = UnavailableProbeBackoff::new("snapshot-1");
+        assert!(!state.permit("snapshot-1"));
         state.next_probe = std::time::Instant::now() - Duration::from_secs(1);
-        assert!(state.permit(Some("first"), "snapshot-1"));
+        assert!(state.permit("snapshot-1"));
         assert_eq!(state.next_delay, Duration::from_secs(120));
-        assert!(!state.permit(Some("first"), "snapshot-1"));
-        assert!(state.permit(Some("second"), "snapshot-1"));
+        assert!(!state.permit("snapshot-1"));
+        assert!(state.permit("snapshot-2"));
         assert_eq!(state.next_delay, Duration::from_secs(60));
-        assert!(state.permit(Some("second"), "snapshot-2"));
+    }
+
+    #[test]
+    fn alternating_pinned_and_default_aliases_keep_separate_backoff() {
+        let mut probes = std::collections::HashMap::new();
+        let pinned = probe_backoff_key("openai-oauth", Some("member"));
+        let default = probe_backoff_key("openai-oauth", None);
+        probes.insert(pinned.clone(), UnavailableProbeBackoff::new("snapshot"));
+        probes.insert(default.clone(), UnavailableProbeBackoff::new("snapshot"));
+        // Alternating callers no longer reset each other's schedule.
+        for _ in 0..3 {
+            assert!(
+                probes
+                    .get_mut(&pinned)
+                    .is_some_and(|state| !state.permit("snapshot"))
+            );
+            assert!(
+                probes
+                    .get_mut(&default)
+                    .is_some_and(|state| !state.permit("snapshot"))
+            );
+        }
     }
 
     #[test]
     fn successful_call_with_unavailable_result_keeps_probe_backoff() {
         let mut probes = std::collections::HashMap::new();
-        probes.insert(
-            "openai-oauth".to_owned(),
-            UnavailableProbeBackoff::new(Some("member"), "snapshot"),
-        );
+        let member = probe_backoff_key("openai-oauth", Some("member"));
+        let default = probe_backoff_key("openai-oauth", None);
+        let other = probe_backoff_key("anthropic-oauth", None);
+        for key in [&member, &default, &other] {
+            probes.insert(key.clone(), UnavailableProbeBackoff::new("snapshot"));
+        }
         retain_backoff_until_catalog_recovers(
             &mut probes,
             "openai-oauth",
@@ -138,24 +167,29 @@ mod unavailable_probe_backoff_tests {
                 reason: "synthetic outage".to_owned(),
             },
         );
-        assert!(probes.contains_key("openai-oauth"));
+        assert!(probes.contains_key(&member));
         assert!(
             probes
-                .get_mut("openai-oauth")
-                .is_some_and(|state| !state.permit(Some("member"), "snapshot"))
+                .get_mut(&member)
+                .is_some_and(|state| !state.permit("snapshot"))
         );
         retain_backoff_until_catalog_recovers(
             &mut probes,
             "openai-oauth",
             &haider_rpc::ModelInventoryWire::NeverFetched,
         );
-        assert!(probes.contains_key("openai-oauth"));
+        assert!(probes.contains_key(&member));
         retain_backoff_until_catalog_recovers(
             &mut probes,
             "openai-oauth",
             &haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 },
         );
-        assert!(!probes.contains_key("openai-oauth"));
+        assert!(!probes.contains_key(&member));
+        assert!(!probes.contains_key(&default));
+        assert!(
+            probes.contains_key(&other),
+            "other providers keep their backoff"
+        );
     }
 }
 
@@ -10603,12 +10637,12 @@ impl HubConnection {
                 .to_hex()
                 .to_string();
             if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
-                let allowed = match probes.entry(provider.to_owned()) {
+                let allowed = match probes.entry(probe_backoff_key(provider, account_alias)) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        entry.get_mut().permit(account_alias, &fingerprint)
+                        entry.get_mut().permit(&fingerprint)
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(UnavailableProbeBackoff::new(account_alias, &fingerprint));
+                        entry.insert(UnavailableProbeBackoff::new(&fingerprint));
                         true
                     }
                 };
@@ -10617,7 +10651,7 @@ impl HubConnection {
                 }
             }
         } else if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
-            probes.remove(provider);
+            probes.retain(|(probe_provider, _), _| probe_provider != provider);
         }
         let refreshed = match facade
             .refresh_provider_models(

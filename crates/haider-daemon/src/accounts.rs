@@ -1768,6 +1768,7 @@ async fn run_account_actor(
         &mut accounts,
         vault.as_ref(),
         &refresh_fences,
+        &linked_account_aliases(&source_registry),
         IdentityUpgradeScope::Startup,
     );
     identities_changed |= upgrade_legacy_anthropic_identities(
@@ -1971,6 +1972,7 @@ async fn run_account_actor(
                     &mut pending_catalog_discoveries,
                     &reserved_aliases,
                     &refresh_fences,
+                    &linked_account_aliases(&source_registry),
                     *job,
                     None,
                     OAuthCommitResponse::ImportLegacy,
@@ -2261,6 +2263,7 @@ async fn run_account_actor(
                     &mut pending_catalog_discoveries,
                     &reserved_aliases,
                     &refresh_fences,
+                    &linked_account_aliases(&source_registry),
                     Arc::clone(&gcloud),
                     Arc::clone(&claude_native),
                     *job,
@@ -2503,6 +2506,7 @@ async fn run_account_actor(
                         &mut pending_catalog_discoveries,
                         &reserved_aliases,
                         &refresh_fences,
+                        &linked_account_aliases(&source_registry),
                         &descriptor,
                         &expected,
                         Arc::clone(&claude_native),
@@ -2763,10 +2767,8 @@ fn is_legacy_anthropic_row(row: &CredentialDescriptor, scope: IdentityUpgradeSco
         && row.auth_method == AuthMethod::OAuth
         && identity_upgrade_permitted(row, scope)
         && row
-            .account_identity
-            .as_ref()
-            .and_then(|identity| identity.account_id.as_deref())
-            .is_some_and(|id| id.starts_with("anthropic:"))
+            .principal()
+            .is_some_and(AccountPrincipal::identity_unverified)
 }
 
 /// The row's own still-valid access token, the only credential its profile
@@ -2844,17 +2846,23 @@ fn apply_legacy_anthropic_identity(
     accounts.set_identity(alias, Some(identity)).is_ok()
 }
 
+/// Linked aliases (`linked_aliases`, from the credential source registry)
+/// are skipped: their source file owns the token and startup reconciliation
+/// rewrites the row from it, so the upgrade would only write a short-lived
+/// Haider vault copy of a source-owned credential.
 fn upgrade_legacy_openai_identities(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
     refresh_fences: &RefreshFenceRegistry,
+    linked_aliases: &HashSet<String>,
     scope: IdentityUpgradeScope,
 ) -> bool {
     let aliases = accounts
         .list()
         .iter()
         .filter(|row| {
-            row.provider == OPENAI_OAUTH_PROVIDER_NAME
+            !linked_aliases.contains(row.alias.as_str())
+                && row.provider == OPENAI_OAUTH_PROVIDER_NAME
                 && row.auth_method == AuthMethod::OAuth
                 && identity_upgrade_permitted(row, scope)
                 && !row
@@ -2907,6 +2915,22 @@ fn upgrade_legacy_openai_identities(
         }
     }
     changed
+}
+
+/// Account aliases currently linked to an enrolled credential source.
+fn linked_account_aliases(
+    source_registry: &Arc<StdMutex<CredentialSourceRegistry>>,
+) -> HashSet<String> {
+    source_registry
+        .lock()
+        .map(|registry| {
+            registry
+                .records()
+                .iter()
+                .filter_map(|record| record.account_alias.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn adoption_notice(
@@ -6955,7 +6979,27 @@ async fn handle_oauth_add(
         );
         return;
     }
-    if resume && accounts.get(&requested_alias).is_some() {
+    // A staged bundle means the interrupted attempt targeted ANOTHER alias
+    // (identity match or a different-account retarget); that attempt must be
+    // replayed below, never finalized as if it had rewritten the requested
+    // alias.
+    let staged_elsewhere = if resume {
+        match resolve_optional_vault_secret(Arc::clone(&vault), &staging_alias).await {
+            Ok(staged) => staged.is_some(),
+            Err(error) => {
+                respond_error(
+                    &route,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                );
+                return;
+            }
+        }
+    } else {
+        false
+    };
+    if resume && !staged_elsewhere && accounts.get(&requested_alias).is_some() {
         if let Err(error) = promote_linked_alias_to_haider_oauth(
             source_registry,
             source_snapshot,
@@ -7079,13 +7123,44 @@ async fn handle_oauth_add(
             accounts,
             vault.as_ref(),
             refresh_fences,
+            &linked_account_aliases(source_registry),
             IdentityUpgradeScope::Live,
         )
     {
         refresh_resolver_snapshot(snapshot, accounts);
         let _ = publish_next_management_revision(store, snapshot, management, accounts).await;
     }
-    let alias = oauth_alias_for_identity(accounts, &identity.provider, &requested_alias, &bundle);
+    let mut alias =
+        oauth_alias_for_identity(accounts, &identity.provider, &requested_alias, &bundle);
+    if alias == requested_alias
+        && identity.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
+        && let Some(matched) = match_unprobed_legacy_anthropic_row(
+            accounts,
+            vault.as_ref(),
+            &ProductionLegacyAnthropicProfile,
+            &requested_alias,
+            &bundle,
+        )
+        .await
+    {
+        alias = matched;
+    }
+    if alias == requested_alias
+        && relogin_is_different_account(accounts, &identity.provider, &requested_alias, &bundle)
+    {
+        // Re-login through X authenticated a provably different account that
+        // no row holds yet. X (its label, token and pinned sessions) stays
+        // untouched; the new account gets its own alias and becomes active.
+        alias =
+            match next_free_account_alias_excluding(accounts, &identity.provider, reserved_aliases)
+            {
+                Ok(alias) => alias,
+                Err(error) => {
+                    respond_management_error(&route, &error);
+                    return;
+                }
+            };
+    }
     if reserved_aliases.contains(alias.as_str()) {
         respond_error(
             &route,
@@ -7261,6 +7336,7 @@ async fn handle_device_import(
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
+    linked_aliases: &HashSet<String>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
     job: DeviceImportJob,
@@ -7325,6 +7401,7 @@ async fn handle_device_import(
         pending_catalog_discoveries,
         reserved_aliases,
         refresh_fences,
+        linked_aliases,
         OAuthImportJob {
             command_id: job.command_id,
             source: source.to_owned(),
@@ -7557,6 +7634,7 @@ async fn handle_oauth_import_heal(
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
+    linked_aliases: &HashSet<String>,
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
@@ -7804,6 +7882,7 @@ async fn handle_oauth_import_heal(
         pending_catalog_discoveries,
         reserved_aliases,
         refresh_fences,
+        linked_aliases,
         OAuthImportJob {
             command_id: command_id.clone(),
             source: source.clone(),
@@ -7889,6 +7968,7 @@ async fn handle_oauth_import(
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
+    linked_aliases: &HashSet<String>,
     job: OAuthImportJob,
     preloaded_material: Option<OAuthImportMaterial>,
     response_kind: OAuthCommitResponse,
@@ -7974,6 +8054,7 @@ async fn handle_oauth_import(
             accounts,
             vault.as_ref(),
             refresh_fences,
+            linked_aliases,
             IdentityUpgradeScope::Live,
         )
     {
@@ -8339,17 +8420,107 @@ fn oauth_import_retarget(
     next_free_account_alias(accounts, alias.as_str()).ok()
 }
 
+/// Interactive re-login counterpart of [`oauth_import_retarget`]: the
+/// requested alias exists and holds a stable account coordinate that the
+/// incoming grant provably does not share. Rows without a stable coordinate
+/// (Kimi, Antigravity, unverified Claude rows, workspace-only OpenAI rows)
+/// are never provably different, so their re-login still updates in place.
+fn relogin_is_different_account(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+    requested_alias: &CredentialAlias,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+) -> bool {
+    let Some(incoming) = AccountPrincipal::new(provider, bundle.account_identity.as_ref()) else {
+        return false;
+    };
+    accounts
+        .get(requested_alias)
+        .and_then(CredentialDescriptor::principal)
+        .is_some_and(|current| current.provably_different_account(incoming))
+}
+
+/// A Claude row with an unverified identity whose live-scope upgrade was
+/// skipped (it is `Expired`/`Revoked`, e.g. the refresh that would have
+/// healed it failed) may still hold an unexpired access token. Probe that
+/// row's OWN token read-only; when it names the incoming account, the login
+/// is routed into that row, which the ordinary re-login write then upgrades
+/// (generation bump + fence advance, so a racing refresh commits stale).
+/// Rows whose token is also dead cannot be identified; they are re-logged
+/// in place through their alias instead (TUI dead-row action).
+async fn match_unprobed_legacy_anthropic_row(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    profile: &dyn LegacyAnthropicProfileSource,
+    requested_alias: &CredentialAlias,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+) -> Option<CredentialAlias> {
+    let incoming = AccountPrincipal::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        bundle.account_identity.as_ref(),
+    )?;
+    if incoming.stable_account_id().is_none() {
+        return None;
+    }
+    let probes = accounts
+        .list()
+        .iter()
+        .filter(|row| {
+            row.alias != *requested_alias
+                && row.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
+                && row.auth_method == AuthMethod::OAuth
+                && !identity_upgrade_permitted(row, IdentityUpgradeScope::Live)
+                && row
+                    .principal()
+                    .is_some_and(AccountPrincipal::identity_unverified)
+        })
+        .filter_map(|row| {
+            legacy_anthropic_access_token(vault, &row.alias).map(|token| (row.alias.clone(), token))
+        })
+        .collect::<Vec<_>>();
+    let identities =
+        futures_util::future::join_all(probes.iter().map(|(alias, token)| async move {
+            let identity =
+                tokio::time::timeout(LEGACY_PROFILE_PROBE_BUDGET, profile.identity(token))
+                    .await
+                    .ok()
+                    .flatten();
+            (alias.clone(), identity)
+        }))
+        .await;
+    let mut matches = identities.into_iter().filter_map(|(alias, identity)| {
+        let identity = identity?;
+        AccountPrincipal::new(ANTHROPIC_OAUTH_PROVIDER_NAME, Some(&identity))
+            .is_some_and(|probed| probed.same_account(incoming))
+            .then_some(alias)
+    });
+    let first = matches.next()?;
+    // Several dead rows of one account: leave them for explicit removal.
+    matches.next().is_none().then_some(first)
+}
+
 /// `base`, else the first free `base-N` (N ≥ 2).
 fn next_free_account_alias(
     accounts: &AccountStore<Box<dyn StoreLike>>,
     base: &str,
 ) -> Result<CredentialAlias, HaiderError> {
+    next_free_account_alias_excluding(accounts, base, &HashSet::new())
+}
+
+/// [`next_free_account_alias`] that also skips aliases reserved by pending
+/// removal cleanup.
+fn next_free_account_alias_excluding(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    base: &str,
+    reserved: &HashSet<String>,
+) -> Result<CredentialAlias, HaiderError> {
     let mut candidate = base.to_owned();
     let mut suffix = 1_u32;
-    while accounts
-        .list()
-        .iter()
-        .any(|descriptor| descriptor.alias.as_str() == candidate)
+    while reserved.contains(&candidate)
+        || accounts
+            .list()
+            .iter()
+            .any(|descriptor| descriptor.alias.as_str() == candidate)
     {
         suffix = suffix.checked_add(1).ok_or_else(|| {
             HaiderError::new(

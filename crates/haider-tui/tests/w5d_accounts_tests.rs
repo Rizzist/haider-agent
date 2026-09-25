@@ -510,7 +510,7 @@ fn expired_and_revoked_rows_refuse_selection_locally() {
     assert!(model.accounts.pending_select.is_none());
     assert_eq!(
         model.accounts.message.as_deref(),
-        Some("· `billing-key` unusable — ↑/↓ choose live; /login re-authenticates")
+        Some("· `billing-key` unusable — ↑/↓ choose live · x removes it; /login adds a new key")
     );
     // And it renders the additive status vocabulary (identity MASKED —
     // the P1 default).

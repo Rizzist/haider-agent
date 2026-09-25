@@ -1,8 +1,8 @@
 # tuivirt golden · accounts_dead_switch_prompt · 118x36
 00|ACCOUNTS — auth is harness-owned · the ADE reads this list                                                            |
    ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×50; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×60
-01|· `anthropic-dead` unusable — ↑/↓ choose live; /login re-authenticates                                                |
-   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×70; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×48
+01|· `anthropic-dead` unusable — enter again re-logs it in place · ↑/↓ choose live                                       |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×79; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
 02|                                                                                                                      |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
 03|openai-oauth                                                                                                          |

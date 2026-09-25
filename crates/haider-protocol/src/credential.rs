@@ -196,6 +196,19 @@ mod identity_tests {
         assert!(!different(&user_a, &workspace_only));
         assert!(!different(&user_a, &no_id));
         let anthropic = |identity| AccountPrincipal::new("anthropic-oauth", Some(identity));
+        // A synthetic grant-hash id (pre-973, or profile unavailable) is a
+        // token lineage, not an account: it never proves a difference.
+        let legacy = identity(Some("anthropic:0123456789abcdef"));
+        let verified = identity(Some("account=a;organization=o"));
+        assert!(matches!(
+            (anthropic(&legacy), anthropic(&verified)),
+            (Some(left), Some(right))
+                if left.identity_unverified()
+                    && !right.identity_unverified()
+                    && !left.provably_different_account(right)
+                    && !right.provably_different_account(left)
+                    && !left.same_account(right)
+        ));
         let (member_a, member_b) = (
             identity(Some("account=a;organization=o")),
             identity(Some("account=b;organization=o")),
@@ -274,10 +287,33 @@ impl<'a> AccountPrincipal<'a> {
     /// (ID-token subject plus workspace) qualifies there. Older OpenAI rows
     /// that stored the workspace alone have no stable coordinate until their
     /// user subject is recovered.
+    ///
+    /// A Claude row whose id is the synthetic `anthropic:<grant hash>`
+    /// placeholder (pre-973 rows, and rows saved while the profile endpoint
+    /// was unavailable) has no stable coordinate either: that hash names a
+    /// token lineage, not an account, so it can never prove two rows differ.
     #[must_use]
     pub fn stable_account_id(self) -> Option<&'a str> {
         let id = self.identity.account_id.as_deref()?;
+        if self.identity_unverified() {
+            return None;
+        }
         (self.provider != OPENAI_OAUTH_PROVIDER || id.starts_with("user:")).then_some(id)
+    }
+
+    /// Whether this Claude record still carries the synthetic
+    /// `anthropic:<grant hash>` placeholder instead of a profile-verified
+    /// `account=…;organization=…` coordinate. Such a row is never
+    /// identity-deduplicated; it is upgraded when its own token can reach the
+    /// profile endpoint, or re-logged in place through its alias.
+    #[must_use]
+    pub fn identity_unverified(self) -> bool {
+        self.provider == ANTHROPIC_OAUTH_PROVIDER
+            && self
+                .identity
+                .account_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(ANTHROPIC_UNVERIFIED_ID_PREFIX))
     }
 
     /// Same provider and same stable account. OpenAI requires a user-level
@@ -312,6 +348,10 @@ impl<'a> AccountPrincipal<'a> {
 
 /// Provider id whose OAuth account id is a shared workspace, not a user.
 const OPENAI_OAUTH_PROVIDER: &str = "openai-oauth";
+/// Provider id whose unverified rows carry a synthetic grant-hash id.
+const ANTHROPIC_OAUTH_PROVIDER: &str = "anthropic-oauth";
+/// Prefix of the synthetic Claude id (see [`AccountPrincipal::identity_unverified`]).
+pub const ANTHROPIC_UNVERIFIED_ID_PREFIX: &str = "anthropic:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

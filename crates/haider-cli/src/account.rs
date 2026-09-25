@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use haider_client::{ClientError, EnsureError, EnsureOptions, ProfileEnv, resolve_profile};
-use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
+use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
 use haider_rpc::{
     AccountSourceWire, Capability, CapabilitySet, ClientKind, CommandId, ErrorData,
@@ -122,6 +122,12 @@ struct AccountView {
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<haider_protocol::credential::AccountIdentity>,
     created: Option<u64>,
+    /// Human-hint inputs only; never serialized, so the JSON schema is
+    /// unchanged.
+    #[serde(skip)]
+    active: bool,
+    #[serde(skip)]
+    usable: bool,
 }
 
 impl AccountView {
@@ -1444,6 +1450,11 @@ fn account_view(descriptor: CredentialDescriptor) -> AccountView {
         },
         identity: descriptor.account_identity,
         created: descriptor.created_at_ms,
+        active: descriptor.active,
+        usable: matches!(
+            descriptor.status,
+            CredentialStatus::Ok | CredentialStatus::Limited { .. }
+        ),
     }
 }
 
@@ -1486,9 +1497,47 @@ fn ambiguous_email_bridge<'a>(
         .map(|(candidate, _)| candidate)
 }
 
+/// Which row of a duplicate group to keep: the active row, then a usable
+/// one, then the first listed — the same rule the TUI applies when it keeps
+/// the just-signed-in (active) row.
+fn keep_rank(account: &AccountView) -> (bool, bool) {
+    (!account.active, !account.usable)
+}
+
+fn same_duplicate_group(
+    document: &AccountsDocument,
+    left: &AccountView,
+    right: &AccountView,
+) -> bool {
+    let (Some(left_principal), Some(right_principal)) = (left.principal(), right.principal())
+    else {
+        return false;
+    };
+    if !left_principal.same_account(right_principal) {
+        return false;
+    }
+    // An email-only row whose email names several stable accounts is a
+    // review case, never a removable duplicate.
+    let exact_ids = || {
+        left.identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref())
+            .zip(
+                right
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.account_id.as_deref()),
+            )
+            .is_some_and(|(left, right)| left == right)
+    };
+    (ambiguous_email_bridge(document, left).is_none()
+        && ambiguous_email_bridge(document, right).is_none())
+        || exact_ids()
+}
+
 fn render_human(document: &AccountsDocument) -> String {
     let mut text = String::new();
-    for (index, account) in document.accounts.iter().enumerate() {
+    for account in &document.accounts {
         text.push_str(&format!(
             "{}  provider={}  identity={}  created={}\n",
             account.alias,
@@ -1505,34 +1554,56 @@ fn render_human(document: &AccountsDocument) -> String {
         let Some(principal) = account.principal() else {
             continue;
         };
-        let ambiguous_bridge = ambiguous_email_bridge(document, account);
-        let canonical = document.accounts[..index].iter().find(|prior| {
-            prior
-                .principal()
-                .is_some_and(|prior| prior.same_account(principal))
-                && (ambiguous_bridge.is_none()
-                    || prior
-                        .identity
-                        .as_ref()
-                        .and_then(|identity| identity.account_id.as_deref())
-                        .zip(
-                            account
-                                .identity
-                                .as_ref()
-                                .and_then(|identity| identity.account_id.as_deref()),
-                        )
-                        .is_some_and(|(left, right)| left == right))
-        });
-        if let Some(canonical) = canonical {
+        if principal.identity_unverified() {
+            text.push_str(&unverified_hint(document, account));
+            continue;
+        }
+        let keep = document
+            .accounts
+            .iter()
+            .filter(|candidate| {
+                candidate.alias == account.alias
+                    || same_duplicate_group(document, candidate, account)
+            })
+            .min_by_key(|candidate| keep_rank(candidate))
+            .filter(|keep| keep.alias != account.alias);
+        if let Some(keep) = keep {
             text.push_str(&format!(
                 "  matching identity already kept as `{}`; remove this duplicate explicitly with `haider account remove {} --confirm`\n",
-                canonical.alias, account.alias
+                keep.alias, account.alias
             ));
-        } else if ambiguous_bridge.is_some_and(|bridge| bridge.alias == account.alias) {
+        } else if ambiguous_email_bridge(document, account)
+            .is_some_and(|bridge| bridge.alias == account.alias)
+        {
             text.push_str("  email matches multiple account IDs; review these accounts and remove duplicates explicitly\n");
         }
     }
     text
+}
+
+/// A Claude row still on the synthetic grant-hash id cannot be compared, so
+/// every other row of its provider is a suspected duplicate.
+fn unverified_hint(document: &AccountsDocument, account: &AccountView) -> String {
+    let others = document
+        .accounts
+        .iter()
+        .filter(|other| other.alias != account.alias && other.provider == account.provider)
+        .map(|other| format!("`{}`", other.alias))
+        .collect::<Vec<_>>();
+    let verify = if account.usable {
+        "it is verified automatically while its token works"
+    } else {
+        "re-login it in place from `/accounts` (enter twice on the row) to verify it"
+    };
+    if others.is_empty() {
+        format!("  identity unverified; {verify}\n")
+    } else {
+        format!(
+            "  identity unverified; suspected duplicate of {}; {verify}, or remove it explicitly with `haider account remove {} --confirm`\n",
+            others.join(", "),
+            account.alias
+        )
+    }
 }
 
 fn write_human(document: &AccountsDocument) -> ExitCode {

@@ -1070,10 +1070,26 @@ fn legacy_openai_workspace_row_upgrades_from_its_own_id_token() {
             .and_then(|row| row.account_identity.as_ref())
             .and_then(|identity| identity.account_id.clone())
     };
+    // A row linked to an enrolled source is explicitly skipped: its source
+    // owns the token and reconciliation rewrites the row from it.
+    let linked = HashSet::from(["openai-legacy-a".to_owned()]);
+    assert!(!upgrade_legacy_openai_identities(
+        &mut accounts,
+        &vault,
+        &fences,
+        &linked,
+        IdentityUpgradeScope::Live,
+    ));
+    assert_eq!(
+        coordinate(&accounts, "openai-legacy-a").as_deref(),
+        Some("shared-team")
+    );
+    assert_eq!(fences.current(&CredentialAlias::new("openai-legacy-a")), 0);
     assert!(upgrade_legacy_openai_identities(
         &mut accounts,
         &vault,
         &fences,
+        &HashSet::new(),
         IdentityUpgradeScope::Live,
     ));
     let user_a = haider_provider::openai_user_account_coordinate("user-a", Some("shared-team"));
@@ -1091,6 +1107,7 @@ fn legacy_openai_workspace_row_upgrades_from_its_own_id_token() {
         &mut accounts,
         &vault,
         &fences,
+        &HashSet::new(),
         IdentityUpgradeScope::Startup,
     ));
     let user_b = haider_provider::openai_user_account_coordinate("user-b", Some("shared-team"));
@@ -10914,6 +10931,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
+        &HashSet::new(),
         Arc::new(UnreachableGcloud),
         native_service,
         DeviceImportJob {
@@ -13624,6 +13642,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
+        &HashSet::new(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
         Arc::new(PlatformClaudeNativeCredentialStore::default()),
         job("gcloud-import-1", "req-1"),
@@ -13675,6 +13694,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &mut catalog_discoveries,
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
+        &HashSet::new(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
         Arc::new(PlatformClaudeNativeCredentialStore::default()),
         job("gcloud-import-2", "req-2"),
@@ -16420,4 +16440,391 @@ async fn public_catalog_refresh_bypasses_credentials_and_keeps_provider_failures
     }
     while tasks.join_next().await.is_some() {}
     store.close().await.expect("close");
+}
+
+fn claude_relogin_bundle(
+    access_token: &[u8],
+    account_id: &str,
+    expires_at_unix_ms: u64,
+) -> haider_accounts::OAuthTokenBundleV1 {
+    let identity = if account_id.starts_with("anthropic:") {
+        AccountIdentity {
+            email: None,
+            display_name: Some("Claude Max subscription".to_owned()),
+            account_id: Some(account_id.to_owned()),
+            plan: None,
+            issuer: Some("https://claude.ai".to_owned()),
+            captured_at: 1,
+            verified: false,
+        }
+    } else {
+        stable_test_identity(&format!("{account_id}@example.test"), Some(account_id))
+    };
+    haider_accounts::OAuthTokenBundleV1::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+        "https://claude.ai".to_owned(),
+        "test-audience".to_owned(),
+        None,
+        "Bearer".to_owned(),
+        Zeroizing::new(access_token.to_vec()),
+        Some(Zeroizing::new(b"synthetic-refresh".to_vec())),
+        expires_at_unix_ms,
+        None,
+        vec!["user:inference".to_owned()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: blake3::hash(account_id.as_bytes()).to_hex().to_string(),
+            display_identity: identity.summary(),
+        },
+        1,
+    )
+    .expect("synthetic Claude bundle")
+    .with_account_identity(identity)
+}
+
+async fn claude_relogin(
+    commands: &mpsc::Sender<AccountCommand>,
+    sink: &Arc<dyn FrameSink>,
+    frames: &mut mpsc::UnboundedReceiver<WireFrame>,
+    command_id: &str,
+    requested: &str,
+    bundle: haider_accounts::OAuthTokenBundleV1,
+) -> CredentialDescriptor {
+    commands
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: command_id.to_owned(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+            display_alias: requested.to_owned(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                ANTHROPIC_OAUTH_PROVIDER_NAME,
+                requested,
+                bundle,
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new(format!("request-{command_id}")),
+                sink: Arc::clone(sink),
+            },
+        })))
+        .await
+        .expect("send synthetic re-login");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("re-login deadline")
+        .expect("re-login response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountAdd { descriptor },
+            ..
+        } => descriptor,
+        other => panic!("unexpected re-login response: {other:?}"),
+    }
+}
+
+fn snapshot_row(snapshot: &AccountsSnapshot, alias: &str) -> CredentialDescriptor {
+    snapshot
+        .lock()
+        .expect("account snapshot")
+        .iter()
+        .find(|row| row.alias.as_str() == alias)
+        .cloned()
+        .unwrap_or_else(|| panic!("row `{alias}` missing"))
+}
+
+/// Adjudicated 973 rule: re-login through alias X that authenticates a
+/// provably different account never rewrites X. Same identity updates X in
+/// place; a different identity that another row holds updates that row; an
+/// unknown different identity gets `next_free_account_alias` and becomes the
+/// active row. X's token, identity and label (what its pinned sessions
+/// resolve through) are untouched in both retarget cases.
+#[tokio::test]
+async fn claude_relogin_with_a_different_account_never_replaces_the_requested_alias() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, _management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    let far = u64::MAX - 1;
+    let account_a = "account=a;organization=o";
+    let account_b = "account=b;organization=o";
+    let account_c = "account=c;organization=o";
+    for (command, alias, token, account) in [
+        ("seed-a", "work", b"access-a1".as_slice(), account_a),
+        ("seed-b", "personal", b"access-b1".as_slice(), account_b),
+    ] {
+        let saved = claude_relogin(
+            &commands,
+            &sink,
+            &mut frames,
+            command,
+            alias,
+            claude_relogin_bundle(token, account, far),
+        )
+        .await;
+        assert_eq!(saved.alias.as_str(), alias);
+    }
+    let pinned = CredentialAlias::new("work");
+    let pinned_secret = || {
+        vault
+            .resolve(&pinned)
+            .expect("pinned alias secret")
+            .expose_secret()
+            .to_vec()
+    };
+    let before_row = snapshot_row(&snapshot, "work");
+    let before_secret = pinned_secret();
+
+    // Different identity that another row holds: that row is updated.
+    let saved = claude_relogin(
+        &commands,
+        &sink,
+        &mut frames,
+        "relogin-work-as-b",
+        "work",
+        claude_relogin_bundle(b"access-b2", account_b, far),
+    )
+    .await;
+    assert_eq!(saved.alias.as_str(), "personal");
+    assert!(saved.active);
+    assert_eq!(
+        haider_accounts::OAuthTokenBundleV1::decode(
+            vault
+                .resolve(&CredentialAlias::new("personal"))
+                .expect("personal secret")
+                .expose_secret()
+        )
+        .expect("decode personal")
+        .access_token(),
+        b"access-b2"
+    );
+    assert_eq!(pinned_secret(), before_secret, "X's token is untouched");
+    assert_eq!(
+        snapshot_row(&snapshot, "work").account_identity,
+        before_row.account_identity
+    );
+
+    // Different identity that no row holds: saved to the next free alias,
+    // made active, X untouched.
+    let saved = claude_relogin(
+        &commands,
+        &sink,
+        &mut frames,
+        "relogin-work-as-c",
+        "work",
+        claude_relogin_bundle(b"access-c1", account_c, far),
+    )
+    .await;
+    assert_eq!(saved.alias.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
+    assert!(saved.active);
+    assert_eq!(
+        saved
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref()),
+        Some(account_c)
+    );
+    {
+        let rows = snapshot.lock().expect("account snapshot");
+        assert_eq!(rows.len(), 3, "exactly one new row");
+        assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+    }
+    assert_eq!(pinned_secret(), before_secret, "X's token is untouched");
+    let after_row = snapshot_row(&snapshot, "work");
+    assert_eq!(after_row.account_identity, before_row.account_identity);
+    assert_eq!(after_row.identity, before_row.identity);
+    assert_eq!(after_row.label, before_row.label);
+    assert_eq!(after_row.status, before_row.status);
+
+    // Same identity: X is updated in place and selected.
+    let saved = claude_relogin(
+        &commands,
+        &sink,
+        &mut frames,
+        "relogin-work-as-a",
+        "work",
+        claude_relogin_bundle(b"access-a2", account_a, far),
+    )
+    .await;
+    assert_eq!(saved.alias.as_str(), "work");
+    assert!(saved.active);
+    assert_ne!(pinned_secret(), before_secret);
+    assert_eq!(snapshot.lock().expect("account snapshot").len(), 3);
+
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+/// A dead pre-973 Claude row (synthetic `anthropic:` id, expired token) can
+/// never be identified, so it is never "provably different": re-login
+/// through its alias upgrades it in place instead of adding a duplicate.
+/// An identity-less re-login (profile unavailable) also stays in place.
+#[tokio::test]
+async fn dead_legacy_claude_row_relogin_upgrades_in_place() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, _management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    // Expired access token: no live profile probe can run for this row.
+    let seeded = claude_relogin(
+        &commands,
+        &sink,
+        &mut frames,
+        "seed-legacy",
+        "anthropic-oauth-2",
+        claude_relogin_bundle(b"dead-access", "anthropic:0123456789abcdef", 1),
+    )
+    .await;
+    assert_eq!(seeded.alias.as_str(), "anthropic-oauth-2");
+    let saved = claude_relogin(
+        &commands,
+        &sink,
+        &mut frames,
+        "relogin-legacy",
+        "anthropic-oauth-2",
+        claude_relogin_bundle(
+            b"fresh-access",
+            "account=owner;organization=o",
+            u64::MAX - 1,
+        ),
+    )
+    .await;
+    assert_eq!(saved.alias.as_str(), "anthropic-oauth-2");
+    assert_eq!(
+        saved
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref()),
+        Some("account=owner;organization=o"),
+        "the legacy row is upgraded to the verified coordinate"
+    );
+    // A verified row re-logged while the profile is unavailable keeps its
+    // alias: an unverified identity never proves a different account.
+    let saved = claude_relogin(
+        &commands,
+        &sink,
+        &mut frames,
+        "relogin-unverified",
+        "anthropic-oauth-2",
+        claude_relogin_bundle(
+            b"fresh-access-2",
+            "anthropic:fedcba9876543210",
+            u64::MAX - 1,
+        ),
+    )
+    .await;
+    assert_eq!(saved.alias.as_str(), "anthropic-oauth-2");
+    assert_eq!(snapshot.lock().expect("account snapshot").len(), 1);
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+/// A fresh Claude login whose identity matches an unverified row that the
+/// live upgrade skipped (`Expired`/`Revoked`) is routed into that row when
+/// the row's OWN token still proves the identity; dead-token rows and
+/// ambiguous matches are never guessed.
+#[tokio::test]
+async fn fresh_claude_login_reaches_a_skipped_legacy_row_only_by_its_own_probe() {
+    struct FakeProfile;
+    #[async_trait::async_trait]
+    impl LegacyAnthropicProfileSource for FakeProfile {
+        async fn identity(&self, access_token: &[u8]) -> Option<AccountIdentity> {
+            let account = match access_token {
+                b"legacy-owner" | b"legacy-owner-again" => "account=owner;organization=o",
+                b"legacy-other" => "account=other;organization=o",
+                _ => return None,
+            };
+            Some(stable_test_identity("x@example.test", Some(account)))
+        }
+    }
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    let seed = |accounts: &mut AccountStore<Box<dyn StoreLike>>,
+                alias: &str,
+                token: &[u8],
+                expires: u64,
+                status: CredentialStatus| {
+        let bundle = claude_relogin_bundle(token, "anthropic:0123456789abcdef", expires);
+        vault
+            .put(
+                &CredentialAlias::new(alias),
+                &bundle.encode().expect("encode"),
+            )
+            .expect("seed secret");
+        let mut descriptor = oauth_descriptor_for(
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            &CredentialAlias::new(alias),
+            &bundle,
+            false,
+        );
+        descriptor.status = status;
+        accounts.add(descriptor).expect("seed row");
+    };
+    let far = u64::MAX - 1;
+    seed(
+        &mut accounts,
+        "claude-expired",
+        b"legacy-owner",
+        far,
+        CredentialStatus::Expired,
+    );
+    seed(
+        &mut accounts,
+        "claude-other",
+        b"legacy-other",
+        far,
+        CredentialStatus::Revoked,
+    );
+    seed(
+        &mut accounts,
+        "claude-dead",
+        b"legacy-owner",
+        1,
+        CredentialStatus::Revoked,
+    );
+    let incoming = claude_relogin_bundle(b"fresh", "account=owner;organization=o", far);
+    let requested = CredentialAlias::new("anthropic-oauth");
+    assert_eq!(
+        match_unprobed_legacy_anthropic_row(&accounts, &vault, &FakeProfile, &requested, &incoming)
+            .await
+            .as_ref()
+            .map(CredentialAlias::as_str),
+        Some("claude-expired")
+    );
+    // An unverified incoming identity is never matched.
+    let unverified = claude_relogin_bundle(b"fresh", "anthropic:ffffffffffffffff", far);
+    assert!(
+        match_unprobed_legacy_anthropic_row(
+            &accounts,
+            &vault,
+            &FakeProfile,
+            &requested,
+            &unverified
+        )
+        .await
+        .is_none()
+    );
+    // Two provable matches are left for explicit removal, not guessed.
+    seed(
+        &mut accounts,
+        "claude-expired-2",
+        b"legacy-owner-again",
+        far,
+        CredentialStatus::Expired,
+    );
+    assert!(
+        match_unprobed_legacy_anthropic_row(&accounts, &vault, &FakeProfile, &requested, &incoming)
+            .await
+            .is_none()
+    );
 }

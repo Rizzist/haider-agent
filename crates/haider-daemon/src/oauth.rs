@@ -4714,6 +4714,39 @@ struct TokenResponse {
     id_token: Option<SecretJson>,
 }
 
+/// Backoff before each retry of a transient identity-endpoint failure
+/// (transport error, 429, 5xx). Three attempts in total; a `Retry-After`
+/// hint is honoured up to [`IDENTITY_ENDPOINT_MAX_RETRY_DELAY`].
+const IDENTITY_ENDPOINT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(1000)];
+const IDENTITY_ENDPOINT_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// The identity recorded when a Claude grant succeeded but its profile could
+/// not be read: the pre-973 synthetic `anthropic:<grant hash>` form, with
+/// `verified = false`. It is never identity-deduplicated
+/// (`AccountPrincipal::identity_unverified`), and the daemon's legacy
+/// upgrade pass replaces it from the row's own token once the profile
+/// endpoint answers (startup, and every later Claude login).
+fn unverified_grant_identity(
+    registration: &OAuthProviderRegistration,
+    identity: &OAuthIdentityV1,
+    captured_at: u64,
+) -> AccountIdentity {
+    let suffix = identity.subject_hash.chars().take(16).collect::<String>();
+    AccountIdentity {
+        email: None,
+        display_name: Some(identity.display_identity.clone()),
+        account_id: Some(format!(
+            "{}{suffix}",
+            haider_protocol::credential::ANTHROPIC_UNVERIFIED_ID_PREFIX
+        )),
+        plan: None,
+        issuer: Some(registration.issuer.clone()),
+        captured_at,
+        verified: false,
+    }
+}
+
 /// Fetches and parses a provider's authenticated identity document (today:
 /// Claude's OAuth profile, see [`haider_provider::ANTHROPIC_OAUTH_PROFILE_URL`]).
 ///
@@ -4736,28 +4769,64 @@ async fn account_identity_from_endpoint(
     let mut authorization = reqwest::header::HeaderValue::from_bytes(&authorization)
         .map_err(|_| OAuthPublicError::new("invalid_token_response", false))?;
     authorization.set_sensitive(true);
-    let mut request = client
-        .get(endpoint)
-        .header(reqwest::header::AUTHORIZATION, authorization)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::CACHE_CONTROL, "no-cache")
-        .header(reqwest::header::CONNECTION, "close");
-    for &(name, value) in source
-        .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
-        .map_or(&[][..], |endpoint| endpoint.headers)
-    {
-        request = request.header(name, value);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|_| OAuthPublicError::new("identity_endpoint_unavailable", true))?;
-    if response.status().is_redirection() {
-        return Err(OAuthPublicError::new("identity_redirect_rejected", false));
-    }
-    if !response.status().is_success() {
-        return Err(OAuthPublicError::new("identity_endpoint_rejected", false));
-    }
+    let mut attempt = 0_usize;
+    let response = loop {
+        let mut request = client
+            .get(endpoint.clone())
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .header(reqwest::header::CONNECTION, "close");
+        for &(name, value) in source
+            .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
+            .map_or(&[][..], |endpoint| endpoint.headers)
+        {
+            request = request.header(name, value);
+        }
+        let outcome = match request.send().await {
+            Err(_) => Err((
+                OAuthPublicError::new("identity_endpoint_unavailable", true),
+                None,
+            )),
+            Ok(response) if response.status().is_redirection() => {
+                return Err(OAuthPublicError::new("identity_redirect_rejected", false));
+            }
+            Ok(response) if response.status().is_success() => Ok(response),
+            // Rate limiting and server faults are transient: retry them with
+            // a bounded backoff before degrading the login.
+            Ok(response)
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error() =>
+            {
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                Err((
+                    OAuthPublicError::new("identity_endpoint_unavailable", true),
+                    retry_after,
+                ))
+            }
+            Ok(_) => return Err(OAuthPublicError::new("identity_endpoint_rejected", false)),
+        };
+        match outcome {
+            Ok(response) => break response,
+            Err((error, retry_after)) => {
+                let Some(&delay) = IDENTITY_ENDPOINT_RETRY_DELAYS.get(attempt) else {
+                    return Err(error);
+                };
+                attempt += 1;
+                tokio::time::sleep(
+                    retry_after
+                        .unwrap_or(delay)
+                        .min(IDENTITY_ENDPOINT_MAX_RETRY_DELAY),
+                )
+                .await;
+            }
+        }
+    };
     let bytes = bounded_response(response).await?;
     let mut account_identity = source
         .and_then(|source| {
@@ -4893,17 +4962,32 @@ async fn token_bundle_from_response(
         // because the flow independently verified this exact ID token.
         account_identity.verified = true;
     }
-    if account_identity.is_none()
-        && let Some((endpoint_identity, endpoint_account)) = account_identity_from_endpoint(
+    if account_identity.is_none() {
+        match account_identity_from_endpoint(
             client,
             registration,
             response.access_token.0.as_slice(),
             now,
         )
-        .await?
-    {
-        identity = endpoint_identity;
-        account_identity = Some(endpoint_account);
+        .await
+        {
+            Ok(Some((endpoint_identity, endpoint_account))) => {
+                identity = endpoint_identity;
+                account_identity = Some(endpoint_account);
+            }
+            Ok(None) => {}
+            // The token exchange itself succeeded: an unreadable profile is
+            // no reason to fail the login. Save the account WITHOUT identity
+            // dedupe, marked unverified, and upgrade it later.
+            Err(error) => {
+                tracing::warn!(
+                    provider = %registration.provider_id,
+                    code = error.code,
+                    "OAuth identity endpoint unavailable; saving account with unverified identity"
+                );
+                account_identity = Some(unverified_grant_identity(registration, &identity, now));
+            }
+        }
     }
     let expires_at = now
         .checked_add(response.expires_in.saturating_mul(1000))

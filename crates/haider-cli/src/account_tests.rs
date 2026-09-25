@@ -98,6 +98,8 @@ fn ambiguous_email_bridge_has_review_hint_without_false_removal_advice() {
             verified: false,
         }),
         created: None,
+        active: false,
+        usable: true,
     };
     let document = AccountsDocument {
         schema: ACCOUNTS_SCHEMA,
@@ -120,6 +122,97 @@ fn ambiguous_email_bridge_has_review_hint_without_false_removal_advice() {
     };
     let text = render_human(&document);
     assert!(text.contains("remove this duplicate"));
+}
+
+fn claude_view(alias: &str, account_id: &str, active: bool, usable: bool) -> AccountView {
+    AccountView {
+        alias: alias.to_owned(),
+        provider: "anthropic-oauth".to_owned(),
+        auth_kind: "oauth",
+        identity: Some(haider_protocol::credential::AccountIdentity {
+            email: None,
+            display_name: Some("Claude".to_owned()),
+            account_id: Some(account_id.to_owned()),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+        created: None,
+        active,
+        usable,
+    }
+}
+
+#[test]
+fn duplicate_hint_keeps_the_active_then_live_row() {
+    let same = "account=a;organization=o";
+    // The first-listed row is dead; the just-signed-in active row is later.
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            claude_view("old-dead", same, false, false),
+            claude_view("fresh", same, true, true),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains(
+        "matching identity already kept as `fresh`; remove this duplicate explicitly with `haider account remove old-dead --confirm`"
+    ));
+    assert!(!text.contains("haider account remove fresh"), "{text}");
+
+    // Without an active row, a usable one is kept over a dead one.
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            claude_view("old-dead", same, false, false),
+            claude_view("live", same, false, true),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains("already kept as `live`"));
+    assert!(!text.contains("haider account remove live"), "{text}");
+    // JSON output stays exactly the documented schema.
+    let json = serde_json::to_value(&document).expect("json");
+    assert!(json["accounts"][0].get("active").is_none());
+    assert!(json["accounts"][0].get("usable").is_none());
+}
+
+#[test]
+fn unverified_claude_rows_are_flagged_as_suspected_duplicates() {
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            claude_view(
+                "anthropic-oauth-2",
+                "anthropic:0123456789abcdef",
+                false,
+                false,
+            ),
+            claude_view("anthropic-oauth-3", "account=a;organization=o", true, true),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains(
+        "identity unverified; suspected duplicate of `anthropic-oauth-3`; re-login it in place from `/accounts` (enter twice on the row) to verify it, or remove it explicitly with `haider account remove anthropic-oauth-2 --confirm`"
+    ), "{text}");
+    assert!(
+        !text.contains("haider account remove anthropic-oauth-3"),
+        "{text}"
+    );
+    let alone = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![claude_view(
+            "anthropic-oauth",
+            "anthropic:0123456789abcdef",
+            true,
+            true,
+        )],
+    };
+    assert!(
+        render_human(&alone)
+            .contains("identity unverified; it is verified automatically while its token works")
+    );
 }
 
 fn codex_candidate() -> haider_rpc::DeviceCredentialCandidateWire {

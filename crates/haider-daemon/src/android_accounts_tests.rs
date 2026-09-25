@@ -44,6 +44,7 @@ async fn android_recovered_import_healing_never_reads_or_rotates_source_credenti
             &mut AutomaticCatalogDiscoveryQueue::new(true),
             &HashSet::new(),
             &fences,
+            &HashSet::new(),
             &descriptor,
             &expected,
             native.clone()
@@ -87,6 +88,7 @@ async fn android_recovered_import_healing_never_reads_or_rotates_source_credenti
         &mut AutomaticCatalogDiscoveryQueue::new(true),
         &HashSet::new(),
         &fences,
+        &HashSet::new(),
         &descriptor,
         &expected,
         native.clone(),

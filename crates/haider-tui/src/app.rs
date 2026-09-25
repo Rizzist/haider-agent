@@ -369,6 +369,9 @@ pub struct AccountsState {
     pub pending_select: Option<String>,
     /// W10b: an armed removal awaiting Enter (x armed it; esc disarms).
     pub pending_remove: Option<String>,
+    /// 973: an unusable OAuth row whose in-place re-login the notice offered;
+    /// Enter on that same row again opens the re-login card (↑/↓/esc disarm).
+    pub pending_relogin: Option<String>,
     /// Keyboard highlight over the flattened selectable rows (W5
     /// accessibility extension — separately goldened).
     pub cursor: usize,
@@ -730,6 +733,19 @@ impl AccountsState {
         self.rows.push(row);
         self.rows = group_account_rows(std::mem::take(&mut self.rows));
     }
+}
+
+/// OAuth providers whose sign-in can re-login an existing alias in place,
+/// with the card title for that flow.
+fn oauth_relogin_title(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "openai-oauth" => "OpenAI — ChatGPT",
+        "anthropic-oauth" => "Anthropic — Claude",
+        "kimi-oauth" => "Kimi — Moonshot",
+        "grok-oauth" => "Grok — xAI",
+        GOOGLE_ANTIGRAVITY_PROVIDER => "Google Antigravity",
+        _ => return None,
+    })
 }
 
 /// `/accounts` display order: provider groups in first-seen order, snapshot
@@ -11564,6 +11580,7 @@ impl AppModel {
         // rows the daemon is about to replace.
         self.accounts.scroll.set(0);
         self.accounts.pending_replace = None;
+        self.accounts.pending_relogin = None;
         self.switch_surface(Screen::Accounts);
         self.requests.push(AppRequest::AccountsRefresh);
         // Local-login detection rides screen entry. The report is
@@ -11617,9 +11634,34 @@ impl AppModel {
             haider_protocol::credential::CredentialStatus::Expired
             | haider_protocol::credential::CredentialStatus::Revoked
             | haider_protocol::credential::CredentialStatus::NeedsAttention { .. } => {
-                self.accounts.message = Some(format!(
-                    "· `{alias}` unusable — ↑/↓ choose live; /login re-authenticates"
-                ));
+                // `/login` always adds a fresh alias (and only OpenAI/Claude
+                // can then match it back by identity), so the honest recovery
+                // for a dead OAuth row is an in-place re-login through ITS
+                // alias: a second Enter opens it. API-key rows have no login.
+                let relogin = row.method == haider_protocol::credential::AuthMethod::OAuth
+                    && oauth_relogin_title(&row.provider).is_some();
+                if relogin && self.accounts.pending_relogin.as_deref() == Some(alias) {
+                    let provider = row.provider.clone();
+                    self.accounts.pending_relogin = None;
+                    self.open_oauth_relogin(&provider, alias.to_owned());
+                    self.dirty = true;
+                    return;
+                }
+                let oauth = row.method == haider_protocol::credential::AuthMethod::OAuth;
+                self.accounts.pending_relogin = relogin.then(|| alias.to_owned());
+                self.accounts.message = Some(if relogin {
+                    format!(
+                        "· `{alias}` unusable — enter again re-logs it in place · ↑/↓ choose live"
+                    )
+                } else if oauth {
+                    format!(
+                        "· `{alias}` unusable — ↑/↓ choose live · x removes it; /login adds a new alias"
+                    )
+                } else {
+                    format!(
+                        "· `{alias}` unusable — ↑/↓ choose live · x removes it; /login adds a new key"
+                    )
+                });
                 self.dirty = true;
                 return;
             }
@@ -12535,18 +12577,11 @@ impl AppModel {
         if self.oauth_add.is_some() || self.custom_add.is_some() {
             return;
         }
-        let title = match provider {
-            "openai-oauth" => "OpenAI — ChatGPT",
-            "anthropic-oauth" => "Anthropic — Claude",
-            "kimi-oauth" => "Kimi — Moonshot",
-            "grok-oauth" => "Grok — xAI",
-            GOOGLE_ANTIGRAVITY_PROVIDER => "Google Antigravity",
-            _ => {
-                self.accounts.message = Some(format!(
-                    "· re-login is not available for {provider}; add it again"
-                ));
-                return;
-            }
+        let Some(title) = oauth_relogin_title(provider) else {
+            self.accounts.message = Some(format!(
+                "· re-login is not available for {provider}; add it again"
+            ));
+            return;
         };
         self.oauth_attempt_seq += 1;
         let attempt = self.oauth_attempt_seq;
@@ -12615,7 +12650,11 @@ impl AppModel {
             .as_ref()
             .is_some_and(|card| card.attempt == attempt)
         {
-            self.oauth_add = None;
+            let requested = self
+                .oauth_add
+                .take()
+                .map(|card| card.alias)
+                .unwrap_or_default();
             // P1 MASK LAW: the receipt is transient chrome with no key
             // loop of its own, so the identity rides it MASKED-ALWAYS
             // (one authority — `mask_identity`); the durable, revealable
@@ -12626,7 +12665,47 @@ impl AppModel {
                 descriptor.alias,
                 crate::format::mask_identity(&descriptor.identity)
             );
-            if let Some(principal) = descriptor.principal() {
+            // The daemon may save under another alias than the card asked
+            // for: an identity match, or a re-login through `requested` that
+            // authenticated a different account (which never rewrites it).
+            let saved = descriptor.alias.as_str();
+            if !requested.is_empty() && requested != saved {
+                let existed = self.accounts.rows.iter().any(|row| row.alias == saved);
+                let target = if existed {
+                    format!("updated existing `{saved}`")
+                } else {
+                    format!("saved as new alias `{saved}`")
+                };
+                match self.accounts.rows.iter().find(|row| row.alias == requested) {
+                    Some(row) => {
+                        let attention = !matches!(
+                            row.status,
+                            haider_protocol::credential::CredentialStatus::Ok
+                                | haider_protocol::credential::CredentialStatus::Limited { .. }
+                        );
+                        message.push_str(&format!(
+                            " · a different account than `{requested}`: {target} (now active) · `{requested}` unchanged{}",
+                            if attention {
+                                " and still needs attention"
+                            } else {
+                                ""
+                            }
+                        ));
+                    }
+                    None if existed => {
+                        message.push_str(&format!(" · same account: {target} (now active)"));
+                    }
+                    None => {}
+                }
+            }
+            if descriptor
+                .principal()
+                .is_some_and(haider_protocol::credential::AccountPrincipal::identity_unverified)
+            {
+                message.push_str(
+                    " · identity unverified (profile unavailable); not deduplicated until it verifies",
+                );
+            } else if let Some(principal) = descriptor.principal() {
                 // An email-only row whose email names several stable accounts
                 // is flagged for review, never offered as a removable duplicate.
                 let ambiguous_email = descriptor.account_identity.as_ref().is_some_and(
@@ -13957,6 +14036,11 @@ impl AppModel {
                 self.accounts.message = None;
                 self.dirty = true;
             }
+            KeyCode::Esc if self.accounts.pending_relogin.is_some() => {
+                self.accounts.pending_relogin = None;
+                self.accounts.message = None;
+                self.dirty = true;
+            }
             KeyCode::Esc => self.exit_accounts(),
             KeyCode::Char('x') => {
                 if let Some(alias) = self
@@ -13988,11 +14072,13 @@ impl AppModel {
                 self.dirty = true;
             }
             KeyCode::Up => {
+                self.accounts.pending_relogin = None;
                 self.accounts.cursor = self.accounts.cursor.saturating_sub(1);
                 self.accounts.follow_cursor.set(true);
                 self.dirty = true;
             }
             KeyCode::Down => {
+                self.accounts.pending_relogin = None;
                 let total = self.accounts.rows.len();
                 if total > 0 {
                     self.accounts.cursor = (self.accounts.cursor + 1).min(total - 1);

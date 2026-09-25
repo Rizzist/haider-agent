@@ -225,7 +225,10 @@ impl OAuthIdentitySource for AnthropicOAuthIdentitySource {
         #[derive(Deserialize)]
         struct ProfileAccount {
             uuid: String,
-            email: String,
+            // Informational only: the dedupe key is account + organization
+            // uuid, so an account without an email still identifies.
+            #[serde(default)]
+            email: Option<String>,
             #[serde(default)]
             display_name: Option<String>,
             #[serde(default)]
@@ -244,11 +247,10 @@ impl OAuthIdentitySource for AnthropicOAuthIdentitySource {
             AccountIdentity::sanitized_field(value).ok_or(IdentityError::ClaimsMalformed)
         };
         let account_id = required(&profile.account.uuid)?;
-        let email = required(&profile.account.email)?;
         let organization_id = required(&profile.organization.uuid)?;
         let optional = |value: Option<&str>| value.and_then(AccountIdentity::sanitized_field);
         Ok(Some(AccountIdentity {
-            email: Some(email),
+            email: optional(profile.account.email.as_deref()),
             display_name: optional(profile.account.display_name.as_deref())
                 .or_else(|| optional(profile.account.full_name.as_deref())),
             account_id: Some(anthropic_stable_account_coordinate(
@@ -386,6 +388,36 @@ mod tests {
             Some("user:6:user-1;workspace:6:acct-1")
         );
         assert!(!identity.verified);
+    }
+
+    #[test]
+    fn anthropic_profile_email_is_optional_but_uuids_are_required() {
+        let parse = |document: &str| {
+            AnthropicOAuthIdentitySource.identity_from_endpoint_document(document.as_bytes(), 7)
+        };
+        let identity = parse(
+            r#"{"account":{"uuid":"acct-1"},"organization":{"uuid":"org-1","organization_type":"claude_max"}}"#,
+        )
+        .expect("email-less profile parses")
+        .expect("identity");
+        assert_eq!(identity.email, None);
+        assert_eq!(
+            identity.account_id.as_deref(),
+            Some("account=acct-1;organization=org-1")
+        );
+        assert_eq!(
+            identity.summary(),
+            "account=acct-1;organization=org-1 · claude_max"
+        );
+        let blank_email =
+            parse(r#"{"account":{"uuid":"acct-1","email":"  "},"organization":{"uuid":"org-1"}}"#)
+                .expect("blank email parses")
+                .expect("identity");
+        assert_eq!(blank_email.email, None);
+        assert!(
+            parse(r#"{"account":{"email":"a@example.test"},"organization":{"uuid":"o"}}"#).is_err()
+        );
+        assert!(parse(r#"{"account":{"uuid":"a"},"organization":{"uuid":" "}}"#).is_err());
     }
 
     #[test]
