@@ -204,7 +204,9 @@ fn multiline_quote_state_is_per_stream_and_survives_empty_lines() {
     });
     assert_eq!(
         super::redact_process_output(&chunks).expect("chunks"),
-        "password=[REDACTED:password]\nnotice \"\n\n[REDACTED:password] after\n"
+        // The empty stdout line is inside the open value, so it renders its
+        // marker too; stderr's quote is independent and stays visible.
+        "password=[REDACTED:password]\nnotice \"\n[REDACTED:password]\n[REDACTED:password] after\n"
     );
 }
 
