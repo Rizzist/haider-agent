@@ -947,15 +947,30 @@ pub(crate) mod debug_fake_oauth {
     const FAKEABLE_PROVIDERS: [&str; 1] = [haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME];
 
     /// `Some(origin)` only for an `http://<ipv4 loopback>:<port>` value.
+    ///
+    /// The literal authority is checked on the RAW input: `Url` normalizes a
+    /// scheme-default port away (`:80` parses as "no port"), so an explicit
+    /// port cannot be read back from the parsed URL. The authority must be a
+    /// strict dotted-quad `127.x.y.z` (std `Ipv4Addr` parsing: no shorthand,
+    /// no leading zeros, no hostnames) followed by an explicit decimal port.
     pub(crate) fn parse_origin(value: &str) -> Option<Url> {
+        let rest = value.strip_prefix("http://")?;
+        let authority = rest.strip_suffix('/').unwrap_or(rest);
+        let (host, port) = authority.split_once(':')?;
+        let ip = host.parse::<std::net::Ipv4Addr>().ok()?;
+        let port_is_explicit = !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0);
+        if !ip.is_loopback() || !port_is_explicit {
+            return None;
+        }
         let url = Url::parse(value).ok()?;
-        let loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback());
+        let parsed_loopback = matches!(url.host(), Some(url::Host::Ipv4(parsed)) if parsed == ip);
         (url.scheme() == "http"
-            && loopback
-            && url.port().is_some()
+            && parsed_loopback
             && url.username().is_empty()
             && url.password().is_none()
-            && matches!(url.path(), "" | "/")
+            && url.path() == "/"
             && url.query().is_none()
             && url.fragment().is_none())
         .then_some(url)
