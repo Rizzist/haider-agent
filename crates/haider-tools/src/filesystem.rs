@@ -1160,25 +1160,28 @@ fn apply_edit_changes_with(
             }));
         }
         // The same text `str::replace`/`replacen` produce — left-to-right,
-        // non-overlapping matches, the replacement never re-scanned — applied
-        // one occurrence at a time so each replacement's span is measured
-        // exactly where it lands.
+        // non-overlapping matches, the replacement never re-scanned. A
+        // single-location edit is measured where it lands (its span is what
+        // numbers a transcript's diff); a multi-occurrence `replace_all` is
+        // applied in ONE linear pass and records no span (973 repair 5: a
+        // transcript never numbers it, and per-occurrence spans made the
+        // apply quadratic and the tool result grow with the count).
         let positions: Vec<usize> = if edit.replace_all {
             edited.match_indices(&edit.old).map(|(at, _)| at).collect()
         } else {
             edited.find(&edit.old).into_iter().collect()
         };
-        let delta = edit.new.len() as isize - edit.old.len() as isize;
-        for (occurrence, at) in positions.into_iter().enumerate() {
-            let at = at.saturating_add_signed(delta * occurrence as isize);
+        if let [at] = positions.as_slice() {
             spans.replace(
                 &mut edited,
-                at,
+                *at,
                 &edit.old,
                 &edit.new,
                 u32::try_from(index).unwrap_or(u32::MAX),
-                u32::try_from(occurrence).unwrap_or(u32::MAX),
+                0,
             );
+        } else {
+            spans.replace_all(&mut edited, &positions, &edit.old, &edit.new);
         }
         replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
     }

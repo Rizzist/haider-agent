@@ -185,15 +185,20 @@ pub struct ToolFileEffect {
     pub path: String,
     pub absolute_path: String,
     pub bytes: u64,
-    /// Where each replacement of an edit landed, measured by the tool WHILE
-    /// applying it (973-tui-toolview). Additive and optional: omitted when
-    /// empty, ignored by older readers, absent in older journals — and a
-    /// reader without spans shows no line numbers rather than inferring them.
+    /// Where each SINGLE-LOCATION replacement of an edit landed, measured by
+    /// the tool WHILE applying it (973-tui-toolview). A `replace_all` that
+    /// matched more than once records no span (repair 5): no reader numbers
+    /// such an edit, and one span per occurrence grew the result with the
+    /// match count. Additive and optional: omitted when empty, ignored by
+    /// older readers, absent in older journals — and a reader without a span
+    /// for an edit shows no line numbers rather than inferring them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edit_spans: Vec<EditSpanV1>,
 }
 
-/// One applied replacement of an edit call, in application order.
+/// One applied single-location replacement of an edit call, in application
+/// order (a multi-occurrence `replace_all` has none — see
+/// [`ToolFileEffect::edit_spans`]).
 ///
 /// Line numbers are 1-based and counted in `'\n'` bytes (a CRLF file counts
 /// the same lines; a final line without a newline is still a line). A side
@@ -205,7 +210,8 @@ pub struct ToolFileEffect {
 pub struct EditSpanV1 {
     /// Index of the requested edit (`edits[i]`, or 0 for a single edit).
     pub edit_index: u32,
-    /// Which occurrence of a `replace_all` edit, left to right (0 otherwise).
+    /// Always 0 since repair 5 (a span is only recorded for an edit that
+    /// replaced exactly once); kept for wire compatibility.
     pub occurrence: u32,
     /// First line of the replaced text in the PRE-edit file.
     #[serde(default, skip_serializing_if = "Option::is_none")]

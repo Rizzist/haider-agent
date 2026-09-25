@@ -105,25 +105,107 @@ fn a_deleted_line_boundary_is_measured_on_both_sides() {
     );
 }
 
+/// Repair 5: a `replace_all` that matched several times records NO span
+/// (no reader numbers it, and per-occurrence spans grew the result with the
+/// match count); one that matched once is a single-location edit and keeps
+/// its span — and a later edit in the same call is still measured through
+/// the multi-occurrence edit's changes.
 #[test]
-fn replace_all_records_every_occurrence_in_order() {
+fn replace_all_records_a_span_only_for_a_single_location() {
     let (text, spans) = apply(
         "x\ny\nx\nx\n",
         vec![FsEditChange::new("x", "X\nX").replace_all(true)],
     );
     assert_eq!(text, "X\nX\ny\nX\nX\nX\nX\n");
-    let lines: Vec<(u32, Option<u32>, Option<u32>)> = spans
-        .iter()
-        .map(|span| (span.occurrence, span.old_start_line, span.new_start_line))
-        .collect();
-    assert_eq!(
-        lines,
-        vec![
-            (0, Some(1), Some(1)),
-            (1, Some(3), Some(4)),
-            (2, Some(4), Some(6))
-        ]
+    assert!(spans.is_empty(), "{spans:?}");
+    let (text, spans) = apply(
+        "x\ny\nx\nx\n",
+        vec![FsEditChange::new("y", "Y").replace_all(true)],
     );
+    assert_eq!(text, "x\nY\nx\nx\n");
+    assert_eq!(spans, vec![span(0, Some(2), 1, Some(2), 1)]);
+    let (text, spans) = apply(
+        "x\ny\nx\nx\nz\n",
+        vec![
+            FsEditChange::new("x", "X\nX").replace_all(true),
+            edit("z", "Z"),
+        ],
+    );
+    assert_eq!(text, "X\nX\ny\nX\nX\nX\nX\nZ\n");
+    assert_eq!(spans, vec![span(1, Some(5), 1, Some(8), 1)]);
+}
+
+/// Repair 5: a many-occurrence `replace_all` is one linear pass. The
+/// per-occurrence tracker took 51.6 s for 32k occurrences in a debug build
+/// (verify 5); the bound here is loose enough for a loaded debug machine and
+/// three orders of magnitude under that.
+#[test]
+fn a_32k_occurrence_replace_all_applies_in_linear_time() {
+    let original: String = (0..32_768).map(|n| format!("a{n}\n")).collect();
+    let started = std::time::Instant::now();
+    let (text, replacements, spans) = apply_fs_edit_text(
+        &FsEdit::many(
+            "f.txt",
+            vec![
+                FsEditChange::new("a", "AB").replace_all(true),
+                edit("AB32767\n", "last\n"),
+            ],
+        ),
+        original.clone(),
+    )
+    .expect("valid edit");
+    let elapsed = started.elapsed();
+    assert_eq!(replacements, 32_769);
+    assert_eq!(
+        text,
+        original.replace('a', "AB").replace("AB32767\n", "last\n")
+    );
+    // Only the single-location edit has a span, and it is measured through
+    // all 32k earlier replacements.
+    assert_eq!(spans, vec![span(1, None, 1, Some(32_768), 1)]);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "32k occurrences took {elapsed:?}"
+    );
+    // Doubling the work roughly doubles the time — not quadruples it.
+    let bigger: String = (0..131_072).map(|n| format!("a{n}\n")).collect();
+    let started = std::time::Instant::now();
+    apply_fs_edit_text(
+        &FsEdit::many(
+            "f.txt",
+            vec![FsEditChange::new("a", "AB").replace_all(true)],
+        ),
+        bigger,
+    )
+    .expect("valid edit");
+    let four_times = started.elapsed();
+    assert!(
+        four_times < elapsed * 8 + std::time::Duration::from_millis(250),
+        "4x the occurrences took {four_times:?} vs {elapsed:?}: not linear"
+    );
+}
+
+/// Repair 5: the edit's tool result stays small whatever the match count —
+/// the wire carries no per-occurrence spans.
+#[test]
+fn a_many_occurrence_edit_puts_no_spans_on_the_wire() {
+    let original = "a\n".repeat(32_768);
+    let (_, _, spans) = apply_fs_edit_text(
+        &FsEdit::many("f.txt", vec![FsEditChange::new("a", "b").replace_all(true)]),
+        original,
+    )
+    .expect("valid edit");
+    let effect = haider_protocol::tool::ToolFileEffect {
+        kind: haider_protocol::tool::ToolFileEffectKind::Edit,
+        name: "f.txt".into(),
+        path: "f.txt".into(),
+        absolute_path: "/w/f.txt".into(),
+        bytes: 65_536,
+        edit_spans: spans,
+    };
+    let json = serde_json::to_string(&effect).unwrap();
+    assert!(json.len() < 256, "{} bytes: {json}", json.len());
+    assert!(!json.contains("edit_spans"), "{json}");
 }
 
 #[test]
@@ -364,8 +446,24 @@ fn check_call(original: &str, call: &[(String, String, bool)], stats: &mut [usiz
     };
     let (oracle_text, truths) = oracle(original, call);
     assert_eq!(text, oracle_text, "the tool's text and the oracle's agree");
-    assert_eq!(spans.len(), truths.len(), "one span per replacement");
-    for (span, (key, truth)) in spans.iter().zip(&truths) {
+    // Repair 5: exactly the single-location replacements carry a span — an
+    // edit whose only replacement is occurrence 0 — in application order.
+    let single: Vec<&(Key, Truth)> = truths
+        .iter()
+        .filter(|((edit, _), _)| {
+            truths
+                .iter()
+                .filter(|((other, _), _)| other == edit)
+                .count()
+                == 1
+        })
+        .collect();
+    assert_eq!(
+        spans.len(),
+        single.len(),
+        "one span per single-location edit: {original:?} {call:?} {spans:?}"
+    );
+    for (span, (key, truth)) in spans.iter().zip(single) {
         assert_eq!((span.edit_index, span.occurrence), *key);
         if let Some(line) = span.old_start_line {
             stats[0] += 1;

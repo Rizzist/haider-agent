@@ -242,6 +242,192 @@ impl SpanTracker {
         });
     }
 
+    /// Apply one MULTI-occurrence `replace_all` in a single linear pass
+    /// (973 repair 5): `text` is rebuilt once with a running offset, and the
+    /// provenance map is updated by one merge sweep instead of one region
+    /// scan and one `replace_range` per occurrence — which made a
+    /// 32k-occurrence edit take most of a minute.
+    ///
+    /// No span is recorded for such an edit: a transcript never numbers a
+    /// multi-occurrence edit, and one span per occurrence made the tool
+    /// result grow with the occurrence count. The provenance map still
+    /// changes exactly as `positions.len()` successive [`Self::replace`]
+    /// calls would change it, so every LATER replacement in the call is
+    /// measured as before.
+    ///
+    /// `positions` are the byte offsets of the matches in `text` as it is
+    /// now — sorted, non-overlapping, each followed by `old`.
+    pub fn replace_all(&mut self, text: &mut String, positions: &[usize], old: &str, new: &str) {
+        if positions.is_empty() {
+            return;
+        }
+        let old_len = old.len();
+        let delta = new.len() as isize - old_len as isize;
+
+        // Every earlier insertion an occurrence touches is no longer intact;
+        // one after `k` whole occurrences moves by `k * delta`.
+        for span in &mut self.pending {
+            if !span.alive {
+                continue;
+            }
+            let (start, end) = (span.cur_start, span.cur_end);
+            let passed = positions.partition_point(|&at| at + old_len <= start);
+            let touched = positions
+                .get(passed)
+                .is_some_and(|&at| if start == end { at < start } else { at < end });
+            if touched {
+                span.alive = false;
+            } else {
+                let shift = delta * passed as isize;
+                span.cur_start = start.saturating_add_signed(shift);
+                span.cur_end = end.saturating_add_signed(shift);
+            }
+        }
+
+        // The provenance map, swept once in pre-edit coordinates. `Swept`
+        // regions keep their pre-edit extent plus how many of THIS edit's
+        // occurrences they swallowed (their length changes by that many
+        // `delta`s).
+        #[derive(Clone, Copy)]
+        struct Swept {
+            start: usize,
+            end: usize,
+            orig_start: usize,
+            orig_end: usize,
+            occurrences: usize,
+        }
+        let overlaps = |region: &Produced, at: usize, end: usize| {
+            if region.cur_len() == 0 {
+                at <= region.cur_start && region.cur_start <= end
+            } else {
+                region.cur_start < end && region.cur_end > at
+            }
+        };
+        let mut out: Vec<Swept> = Vec::with_capacity(self.produced.len() + positions.len());
+        // Whether `out`'s last region is one of this edit's unions, which a
+        // following occurrence may reach into.
+        let mut last_is_union = false;
+        let mut next = 0usize;
+        // Σ (original − current length) of the regions already swept.
+        let mut shift: isize = 0;
+        let keep = |region: &Produced| Swept {
+            start: region.cur_start,
+            end: region.cur_end,
+            orig_start: region.orig_start,
+            orig_end: region.orig_end,
+            occurrences: 0,
+        };
+        for &at in positions {
+            let end = at + old_len;
+            // Regions wholly before this occurrence stay as they are.
+            while let Some(region) = self.produced.get(next) {
+                if overlaps(region, at, end) || region.cur_start >= end {
+                    break;
+                }
+                out.push(keep(region));
+                shift += region.orig_len() as isize - region.cur_len() as isize;
+                last_is_union = false;
+                next += 1;
+            }
+            // The union, exactly as successive `replace` calls form it: this
+            // occurrence, the previous union when the occurrence reaches into
+            // it, and every region overlapping the occurrence's own range.
+            let shift_before = shift;
+            let mut union = Swept {
+                start: at,
+                end,
+                orig_start: usize::MAX,
+                orig_end: 0,
+                occurrences: 1,
+            };
+            // The merged regions' extreme edges, when any merged.
+            let mut merged: Option<(usize, usize)> = None;
+            if last_is_union && let Some(previous) = out.last().copied() {
+                let now_len = (previous.end - previous.start) as isize
+                    + delta * previous.occurrences as isize;
+                let reaches = if now_len == 0 {
+                    at <= previous.end
+                } else {
+                    at < previous.end
+                };
+                if reaches {
+                    out.pop();
+                    merged = Some((previous.start, previous.end));
+                    union.orig_start = previous.orig_start;
+                    union.orig_end = previous.orig_end;
+                    union.occurrences += previous.occurrences;
+                }
+            }
+            while let Some(region) = self.produced.get(next) {
+                if !overlaps(region, at, end) {
+                    break;
+                }
+                merged = Some(
+                    merged.map_or((region.cur_start, region.cur_end), |(lo, hi)| {
+                        (lo.min(region.cur_start), hi.max(region.cur_end))
+                    }),
+                );
+                union.orig_start = union.orig_start.min(region.orig_start);
+                union.orig_end = union.orig_end.max(region.orig_end);
+                shift += region.orig_len() as isize - region.cur_len() as isize;
+                next += 1;
+            }
+            if let Some((lo, hi)) = merged {
+                union.start = union.start.min(lo);
+                union.end = union.end.max(hi);
+            }
+            // An edge no merged region supplies is original text, mapped
+            // through the regions before it (`to_original`).
+            if merged.is_none_or(|(lo, _)| lo > at) {
+                union.orig_start = union
+                    .orig_start
+                    .min(at.checked_add_signed(shift_before).unwrap_or(0));
+            }
+            if merged.is_none_or(|(_, hi)| hi < end) {
+                union.orig_end = union
+                    .orig_end
+                    .max(end.checked_add_signed(shift).unwrap_or(0));
+            }
+            union.orig_end = union.orig_end.max(union.orig_start);
+            out.push(union);
+            last_is_union = true;
+        }
+        out.extend(self.produced[next..].iter().map(keep));
+
+        // Back to post-edit coordinates.
+        let mut swallowed = 0usize;
+        self.produced = out
+            .into_iter()
+            .map(|region| {
+                let moved = delta * swallowed as isize;
+                let len =
+                    (region.end - region.start) as isize + delta * region.occurrences as isize;
+                swallowed += region.occurrences;
+                let cur_start = region.start.saturating_add_signed(moved);
+                Produced {
+                    cur_start,
+                    cur_end: cur_start.saturating_add_signed(len),
+                    orig_start: region.orig_start,
+                    orig_end: region.orig_end,
+                }
+            })
+            .collect();
+
+        // The text, once.
+        let mut edited = String::with_capacity(
+            text.len()
+                .saturating_add_signed(delta * positions.len() as isize),
+        );
+        let mut cursor = 0usize;
+        for &at in positions {
+            edited.push_str(&text[cursor..at]);
+            edited.push_str(new);
+            cursor = at + old_len;
+        }
+        edited.push_str(&text[cursor..]);
+        *text = edited;
+    }
+
     /// The spans, in application order, against the final `text`.
     #[must_use]
     pub fn finish(self, text: &str) -> Vec<EditSpanV1> {
@@ -260,5 +446,186 @@ impl SpanTracker {
                 new_line_count: span.new_line_count,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    //! `replace_all` must leave the tracker exactly as the per-occurrence
+    //! `replace` path did (973 repair 5) — minus the multi-occurrence spans
+    //! it deliberately no longer records — so every later replacement in
+    //! the call is measured exactly as before.
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                usize::try_from(self.next() % n as u64).unwrap_or(0)
+            }
+        }
+    }
+
+    const PIECES: [&str; 7] = ["a", "b", "ab", "\n", "a\n", "", "ba"];
+
+    fn piece(rng: &mut Rng, max: usize) -> String {
+        (0..rng.below(max + 1))
+            .map(|_| PIECES[rng.below(PIECES.len())])
+            .collect()
+    }
+
+    /// (cur start, cur end, orig start, orig end) per produced region.
+    type Regions = Vec<(usize, usize, usize, usize)>;
+    /// (alive, cur start, cur end) per recorded span.
+    type Live = Vec<(bool, usize, usize)>;
+
+    fn state(tracker: &SpanTracker) -> (Regions, Live) {
+        (
+            tracker
+                .produced
+                .iter()
+                .map(|r| (r.cur_start, r.cur_end, r.orig_start, r.orig_end))
+                .collect(),
+            tracker
+                .pending
+                .iter()
+                .map(|p| {
+                    (
+                        p.alive,
+                        if p.alive { p.cur_start } else { 0 },
+                        if p.alive { p.cur_end } else { 0 },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn single(
+        tracker: &mut SpanTracker,
+        text: &mut String,
+        old: &str,
+        new: &str,
+        index: u32,
+    ) -> bool {
+        let hits: Vec<usize> = text.match_indices(old).map(|(at, _)| at).collect();
+        if old.is_empty() || hits.len() != 1 {
+            return false;
+        }
+        tracker.replace(text, hits[0], old, new, index, 0);
+        true
+    }
+
+    #[test]
+    fn a_batch_replace_all_leaves_the_tracker_as_per_occurrence_replaces_did() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut compared = 0usize;
+        for _ in 0..300_000 {
+            let original = piece(&mut rng, 14);
+            let mut text = original.clone();
+            let mut tracker = SpanTracker::new(&original);
+            // A few single-location edits first: regions and live spans.
+            for index in 0..rng.below(4) {
+                let current = text.clone();
+                if current.is_empty() {
+                    break;
+                }
+                let at = rng.below(current.len());
+                let len = 1 + rng.below(3.min(current.len() - at));
+                let old = current[at..at + len].to_owned();
+                let new = piece(&mut rng, 2);
+                single(
+                    &mut tracker,
+                    &mut text,
+                    &old,
+                    &new,
+                    u32::try_from(index).unwrap_or(0),
+                );
+            }
+            let old = piece(&mut rng, 2);
+            let new = piece(&mut rng, 3);
+            if old.is_empty() {
+                continue;
+            }
+            let positions: Vec<usize> = text.match_indices(&old).map(|(at, _)| at).collect();
+            if positions.len() < 2 {
+                continue;
+            }
+            // Per occurrence, the pre-repair way.
+            let mut sequential = tracker.clone();
+            let mut sequential_text = text.clone();
+            let delta = new.len() as isize - old.len() as isize;
+            for (occurrence, at) in positions.iter().enumerate() {
+                let at = at.saturating_add_signed(delta * occurrence as isize);
+                sequential.replace(
+                    &mut sequential_text,
+                    at,
+                    &old,
+                    &new,
+                    9,
+                    u32::try_from(occurrence).unwrap_or(0),
+                );
+            }
+            // The batch.
+            let mut batch = tracker.clone();
+            let mut batch_text = text.clone();
+            batch.replace_all(&mut batch_text, &positions, &old, &new);
+            assert_eq!(batch_text, sequential_text, "{original:?} {old:?}->{new:?}");
+            assert_eq!(batch_text, text.replace(&old, &new));
+            // The sequential run also pushed one span per occurrence; the
+            // batch records none. Compare everything else.
+            let (regions_seq, mut pending_seq) = state(&sequential);
+            pending_seq.truncate(tracker.pending.len());
+            let (regions_batch, pending_batch) = state(&batch);
+            assert_eq!(
+                regions_batch,
+                regions_seq,
+                "regions: {original:?} text={text:?} {old:?}->{new:?} before={:?}",
+                state(&tracker)
+            );
+            assert_eq!(
+                pending_batch, pending_seq,
+                "pending: {original:?} text={text:?} {old:?}->{new:?}"
+            );
+            // And a later single edit is measured identically.
+            if !batch_text.is_empty() {
+                let at = rng.below(batch_text.len());
+                let len = 1 + rng.below(2.min(batch_text.len() - at));
+                let later_old = batch_text[at..at + len].to_owned();
+                let later_new = piece(&mut rng, 2);
+                let mut seq_text = sequential_text.clone();
+                if single(&mut batch, &mut batch_text, &later_old, &later_new, 10) {
+                    assert!(single(
+                        &mut sequential,
+                        &mut seq_text,
+                        &later_old,
+                        &later_new,
+                        10
+                    ));
+                    let seq_spans = sequential.finish(&seq_text);
+                    let batch_spans = batch.finish(&batch_text);
+                    let seq_kept: Vec<_> = seq_spans
+                        .into_iter()
+                        .filter(|s| s.edit_index != 9)
+                        .collect();
+                    assert_eq!(
+                        batch_spans, seq_kept,
+                        "later spans: {original:?} {old:?}->{new:?} then {later_old:?}->{later_new:?}"
+                    );
+                }
+            }
+            compared += 1;
+        }
+        assert!(
+            compared > 20_000,
+            "the sweep compared real batches: {compared}"
+        );
     }
 }

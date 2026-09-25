@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const TRANSCRIPT_OVERSCAN_ROWS: u64 = 2;
+/// The main session transcript's [`crate::app::ScrollAnchor::surface`].
+const SESSION_SURFACE: &str = "session";
 const TRANSCRIPT_CACHE_ENTRIES: usize = 96;
 const TRANSCRIPT_EAGER_ENTRIES: usize = 64;
 const EXTREME_ENTRY_BYTES: usize = 64 * 1024;
@@ -78,6 +80,18 @@ struct EntryMarks {
     /// Index of the row's `⎿` result line — every row's click route into
     /// the full-detail view.
     result: Option<usize>,
+}
+
+/// What [`TranscriptLayoutCache::reconcile`] had to do this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relayout {
+    /// Nothing that moves a row start.
+    None,
+    /// The reader's disclosure (focus, collapse/expand, fold) or the path
+    /// context changed: every entry was re-measured at the same width.
+    Disclosure,
+    /// Width, theme, or the entries themselves changed.
+    Other,
 }
 
 #[derive(Debug, Default)]
@@ -162,7 +176,9 @@ impl TranscriptLayoutCache {
         Arc::clone(&self.runs)
     }
 
-    fn reconcile(&mut self, projection: &SessionProjection, ctx: LayoutCtx<'_>) {
+    /// Bring the cache up to date with this frame's inputs, and say what
+    /// kind of re-layout that took.
+    fn reconcile(&mut self, projection: &SessionProjection, ctx: LayoutCtx<'_>) -> Relayout {
         let (theme_key, width, phase) = (ctx.theme.key, ctx.width, ctx.phase);
         // A disclosure change is a LAYOUT change: a collapsed row is two
         // rows where an expanded one was twelve, so every cached row start
@@ -185,10 +201,24 @@ impl TranscriptLayoutCache {
             && projection_changed
             && source.len() > self.source_len;
         if !layout_changed && !projection_changed && !phase_changed {
-            return;
+            return Relayout::None;
         }
-
+        // Only the reader's disclosure (or the path context) changed: the
+        // same entries at the same width and theme, re-measured. Those are
+        // the re-layouts a content anchor must survive (973 repair 5); a
+        // resize or theme switch keeps its pinned raw-offset behaviour.
+        let disclosure_only = self.initialized
+            && self.width == width
+            && self.theme == Some(theme_key)
+            && !entries_mutated
+            && !projection_changed;
+        let mut relayout = Relayout::None;
         if layout_changed || entries_mutated || (projection_changed && !append_only) {
+            relayout = if layout_changed && disclosure_only {
+                Relayout::Disclosure
+            } else {
+                Relayout::Other
+            };
             self.entries.clear();
             self.corrections.clear();
             self.seed_estimates(projection, ctx);
@@ -223,6 +253,7 @@ impl TranscriptLayoutCache {
         self.source_ptr = source.as_ptr() as usize;
         self.source_len = source.len();
         self.phase = phase;
+        relayout
     }
 
     fn seed_estimates(&mut self, projection: &SessionProjection, ctx: LayoutCtx<'_>) {
@@ -715,6 +746,7 @@ fn wrapped_lines_height(lines: &[Line<'_>], width: u16) -> u16 {
 
 /// Select only the contiguous transcript slice intersecting the viewport
 /// plus a two-row overscan. Returned scroll coordinates remain global.
+#[derive(Clone, Copy)]
 struct TranscriptViewport<'a> {
     prefix: &'a [Line<'static>],
     suffix: &'a [Line<'static>],
@@ -890,6 +922,182 @@ fn resolve_tool_reveal(
     model.sticky_suppressed.set(true);
 }
 
+/// The content anchor this frame must honour, if any (973 repair 5):
+///
+/// - a restore the full-detail view armed when it closed — unless the
+///   reducer has moved the offset since (a jump to the bottom, say);
+/// - the last frame's own anchor, when the cache re-measured every entry
+///   for a disclosure change (a focus, a collapse, a fold) under an offset
+///   nothing else moved: the bottom-relative offset would otherwise point
+///   at whatever the new height estimates put there.
+fn frame_anchor(
+    model: &AppModel,
+    surface: &str,
+    relayout: Relayout,
+) -> Option<crate::app::ScrollAnchor> {
+    let offset = model.scroll_back.get();
+    if let Some(restore) = model.scroll_restore.borrow_mut().take()
+        && restore.surface == surface
+        && restore.scroll_back == offset
+    {
+        return Some(restore);
+    }
+    if relayout != Relayout::Disclosure || offset == 0 {
+        return None;
+    }
+    model
+        .scroll_anchor
+        .borrow()
+        .clone()
+        .filter(|anchor| anchor.surface == surface && anchor.scroll_back == offset)
+}
+
+/// The bottom offset that puts `anchor`'s content on the top row against
+/// THIS frame's geometry (973 repair 5). The anchor entry and every entry a
+/// viewport below it can show are measured first, so the offset is exact
+/// where the reader looks rather than estimated; entries further down keep
+/// their estimates, which move the offset and the content together.
+/// `None` when the anchor no longer names this transcript's content.
+fn anchored_scroll_back(
+    cache: &mut TranscriptLayoutCache,
+    projection: &SessionProjection,
+    ctx: LayoutCtx<'_>,
+    anchor: &crate::app::ScrollAnchor,
+    prefix_rows: u64,
+    suffix_rows: u64,
+    viewport_height: u16,
+) -> Option<u64> {
+    let top = match anchor.entry {
+        None => anchor.row.min(prefix_rows.checked_sub(1)?),
+        Some(index) => {
+            let entries = projection.entries();
+            let entry = entries.get(index)?;
+            if let Some(item) = &anchor.item {
+                match entry {
+                    TranscriptEntry::Item(block) if block.item_id.as_str() == item => {}
+                    _ => return None,
+                }
+            }
+            let mut uncovered = anchor
+                .row
+                .saturating_add(u64::from(viewport_height))
+                .saturating_add(TRANSCRIPT_OVERSCAN_ROWS);
+            let mut at = index;
+            while at < entries.len() && uncovered > 0 {
+                cache.materialize(projection, ctx, at, None);
+                uncovered = uncovered
+                    .saturating_sub(cache.entries.get(&at).map_or(0, |entry| entry.height));
+                at += 1;
+            }
+            let height = cache.entries.get(&index).map_or(0, |entry| entry.height);
+            prefix_rows
+                .saturating_add(cache.row_start(projection, index))
+                .saturating_add(anchor.row.min(height.saturating_sub(1)))
+        }
+    };
+    let total = prefix_rows
+        .saturating_add(cache.total_rows)
+        .saturating_add(suffix_rows);
+    let max = total.saturating_sub(u64::from(viewport_height));
+    Some(max.saturating_sub(top.min(max)))
+}
+
+/// The content on the top row of a painted frame, as an anchor — `None`
+/// while following the bottom (973 repair 5).
+fn scroll_anchor_at(
+    cache: &TranscriptLayoutCache,
+    projection: &SessionProjection,
+    surface: &str,
+    prefix_rows: u64,
+    scroll: u64,
+    scroll_back: u64,
+) -> Option<crate::app::ScrollAnchor> {
+    if scroll_back == 0 {
+        return None;
+    }
+    if scroll < prefix_rows {
+        return Some(crate::app::ScrollAnchor {
+            surface: surface.to_owned(),
+            entry: None,
+            item: None,
+            row: scroll,
+            scroll_back,
+        });
+    }
+    let row = scroll - prefix_rows;
+    if row >= cache.total_rows || projection.entries().is_empty() {
+        return None;
+    }
+    let index = cache.entry_at_row(projection, row);
+    let inside = row.checked_sub(cache.row_start(projection, index))?;
+    let item = match projection.entries().get(index)? {
+        TranscriptEntry::Item(block) => Some(block.item_id.as_str().to_owned()),
+        _ => None,
+    };
+    Some(crate::app::ScrollAnchor {
+        surface: surface.to_owned(),
+        entry: Some(index),
+        item,
+        row: inside,
+        scroll_back,
+    })
+}
+
+/// A transcript viewport laid out for the frame, honouring `anchor` when
+/// one is set: the offset is re-derived from the anchor after every
+/// measuring pass until the content it names sits on the top row of the
+/// window the pass painted (973 repair 5).
+fn anchored_viewport(
+    model: &AppModel,
+    cache: &mut TranscriptLayoutCache,
+    projection: &SessionProjection,
+    ctx: LayoutCtx<'_>,
+    viewport: TranscriptViewport<'_>,
+    anchor: Option<&crate::app::ScrollAnchor>,
+) -> (Vec<Line<'static>>, u64, u64, u64) {
+    let prefix_rows = u64::from(wrapped_lines_height(viewport.prefix, viewport.width));
+    let suffix_rows = u64::from(wrapped_lines_height(viewport.suffix, viewport.width));
+    let mut laid = virtualized_transcript_lines(
+        cache,
+        projection,
+        ctx,
+        TranscriptViewport {
+            scroll_back: model.scroll_back.get(),
+            ..viewport
+        },
+    );
+    let Some(anchor) = anchor else {
+        return laid;
+    };
+    for _ in 0..VIEWPORT_PASSES {
+        let Some(offset) = anchored_scroll_back(
+            cache,
+            projection,
+            ctx,
+            anchor,
+            prefix_rows,
+            suffix_rows,
+            viewport.height,
+        ) else {
+            break;
+        };
+        if offset == model.scroll_back.get() {
+            break;
+        }
+        model.scroll_back.set(offset);
+        laid = virtualized_transcript_lines(
+            cache,
+            projection,
+            ctx,
+            TranscriptViewport {
+                scroll_back: offset,
+                ..viewport
+            },
+        );
+    }
+    laid
+}
+
 /// A tool call whose outcome is known. Only settled calls fold — a live row
 /// is exactly what the reader is watching.
 pub(crate) const fn settled_tool(status: haider_protocol::item::ToolStatus) -> bool {
@@ -899,13 +1107,52 @@ pub(crate) const fn settled_tool(status: haider_protocol::item::ToolStatus) -> b
     )
 }
 
+/// The transcript lines for one viewport, SELF-CONSISTENT (973 repair 5).
+///
+/// One pass picks its window from the geometry it starts with, then
+/// measures the entries it shows — and a measured height that differs from
+/// its estimate moves the bottom-anchored window. A pass whose window moved
+/// under it painted rows from one window at another's offset: blank rows
+/// under the tail, and click targets a row away from the glyphs they sit
+/// on. The pass therefore repeats (measured entries stay cached, so this
+/// converges in one or two more) until the window it painted is the window
+/// it ends on.
 fn virtualized_transcript_lines(
     cache: &mut TranscriptLayoutCache,
     projection: &SessionProjection,
     ctx: LayoutCtx<'_>,
     viewport: TranscriptViewport<'_>,
 ) -> (Vec<Line<'static>>, u64, u64, u64) {
-    let TranscriptViewport {
+    let mut pass = virtualized_pass(cache, projection, ctx, &viewport);
+    for _ in 0..VIEWPORT_PASSES {
+        if pass.start_scroll == pass.scroll {
+            break;
+        }
+        pass = virtualized_pass(cache, projection, ctx, &viewport);
+    }
+    (pass.lines, pass.base, pass.total, pass.scroll)
+}
+
+/// Extra passes [`virtualized_transcript_lines`] may take to converge.
+const VIEWPORT_PASSES: usize = 4;
+
+struct ViewportPass {
+    lines: Vec<Line<'static>>,
+    base: u64,
+    total: u64,
+    /// The scroll row the pass chose its window for.
+    start_scroll: u64,
+    /// The scroll row its measurements ended on.
+    scroll: u64,
+}
+
+fn virtualized_pass(
+    cache: &mut TranscriptLayoutCache,
+    projection: &SessionProjection,
+    ctx: LayoutCtx<'_>,
+    viewport: &TranscriptViewport<'_>,
+) -> ViewportPass {
+    let &TranscriptViewport {
         prefix,
         suffix,
         scroll_back,
@@ -919,6 +1166,7 @@ fn virtualized_transcript_lines(
     let total = suffix_base.saturating_add(suffix_rows);
     let max_scroll = total.saturating_sub(u64::from(viewport_height));
     let scroll = max_scroll.saturating_sub(scroll_back.min(max_scroll));
+    let start_scroll = scroll;
     let wanted_start = scroll.saturating_sub(TRANSCRIPT_OVERSCAN_ROWS);
     let wanted_end = scroll
         .saturating_add(u64::from(viewport_height))
@@ -984,7 +1232,13 @@ fn virtualized_transcript_lines(
         .saturating_add(suffix_rows);
     let max_scroll = total.saturating_sub(u64::from(viewport_height));
     let scroll = max_scroll.saturating_sub(scroll_back.min(max_scroll));
-    (lines, base, total, scroll)
+    ViewportPass {
+        lines,
+        base,
+        total,
+        start_scroll,
+        scroll,
+    }
 }
 
 /// Register the visible portion of every durable image row. Geometry uses
@@ -6409,7 +6663,7 @@ fn render_session(
         runs: transcript_runs.as_ref(),
         paths: &tool_paths,
     };
-    transcript_cache.reconcile(&model.projection, layout_ctx);
+    let relayout = transcript_cache.reconcile(&model.projection, layout_ctx);
     // The origin is context chrome, not conversation content. On the short
     // session rung it must shed before replayed assistant text: otherwise a
     // 90x10 cold attach can be perfectly caught up while the only historical
@@ -6465,9 +6719,24 @@ fn render_session(
     if transcript_area.height > 1 && (!transcript_cache.entries.is_empty() || !tail.is_empty()) {
         tail.push(Line::default());
     }
-    let total = origin_rows.saturating_add(transcript_cache.total_rows.saturating_add(u64::from(
-        wrapped_lines_height(&tail, transcript_area.width),
-    )));
+    let tail_rows = u64::from(wrapped_lines_height(&tail, transcript_area.width));
+    // 973 repair 5: a re-layout under an untouched offset, or a closing
+    // detail view, puts the same CONTENT back on the top row.
+    let mut anchor = frame_anchor(model, SESSION_SURFACE, relayout);
+    if let Some(offset) = anchor.as_ref().and_then(|anchor| {
+        anchored_scroll_back(
+            &mut transcript_cache,
+            &model.projection,
+            layout_ctx,
+            anchor,
+            origin_rows,
+            tail_rows,
+            transcript_area.height,
+        )
+    }) {
+        model.scroll_back.set(offset);
+    }
+    let total = origin_rows.saturating_add(transcript_cache.total_rows.saturating_add(tail_rows));
     let max_scroll_rows = total.saturating_sub(u64::from(transcript_area.height));
     let max_scroll = max_scroll_rows;
     // RENDER is the single scroll authority (review r3 P2-2): the frame
@@ -6480,6 +6749,7 @@ fn render_session(
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
+    let anchored_offset = model.scroll_back.get();
     // B2b-m3: resolve an armed tree jump IN THIS FRAME — node → display
     // entry → wrapped row, every step through the renderer's width-keyed
     // geometry. A resize invalidates the cache before this lookup, so the
@@ -6532,24 +6802,39 @@ fn render_session(
             .scroll_back
             .set(max_scroll_rows.saturating_sub(row.min(max_scroll_rows)));
     }
-    let scroll_back = model.scroll_back.get();
-    let (visible_lines, visible_base, visible_total, scroll) = virtualized_transcript_lines(
+    // A reveal or a jump this frame chose a NEW place; the anchor names
+    // the old one and must not pull the view back to it.
+    if anchor.is_some() && model.scroll_back.get() != anchored_offset {
+        anchor = None;
+    }
+    let (visible_lines, visible_base, visible_total, scroll) = anchored_viewport(
+        model,
         &mut transcript_cache,
         &model.projection,
         layout_ctx,
         TranscriptViewport {
             prefix: &origin_prefix,
             suffix: &tail,
-            scroll_back,
+            scroll_back: model.scroll_back.get(),
             height: transcript_area.height,
             width: transcript_area.width,
         },
+        anchor.as_ref(),
     );
     let corrected_max = visible_total.saturating_sub(u64::from(transcript_area.height));
     model.scroll_max.set(corrected_max);
     model
         .scroll_back
         .set(model.scroll_back.get().min(corrected_max));
+    let scroll_back = model.scroll_back.get();
+    *model.scroll_anchor.borrow_mut() = scroll_anchor_at(
+        &transcript_cache,
+        &model.projection,
+        SESSION_SURFACE,
+        origin_rows,
+        corrected_max.saturating_sub(scroll_back.min(corrected_max)),
+        scroll_back,
+    );
     // D4: an open `plan` proposal owns the transcript area — the full
     // markdown document renders here (scrolled), while the decision menu
     // keeps the composer band through the ordinary blocking-menu path.
@@ -11072,7 +11357,8 @@ fn render_subagent(
         runs: transcript_runs.as_ref(),
         paths: &tool_paths,
     };
-    transcript_cache.reconcile(&chip.transcript, layout_ctx);
+    let relayout = transcript_cache.reconcile(&chip.transcript, layout_ctx);
+    let surface = format!("chip:{}", chip.agent);
     let mut tail: Vec<Line<'static>> = Vec::new();
     // Session parity: the tail is up for the WHOLE running turn, not just the
     // THINKING beat. Judged on `display` (the badge's truth), NOT the raw
@@ -11103,12 +11389,26 @@ fn render_subagent(
     if !prefix.is_empty() || !transcript_cache.entries.is_empty() || !tail.is_empty() {
         tail.push(Line::default());
     }
-    let total = u64::from(wrapped_lines_height(&prefix, transcript_area.width))
+    let prefix_rows = u64::from(wrapped_lines_height(&prefix, transcript_area.width));
+    let tail_rows = u64::from(wrapped_lines_height(&tail, transcript_area.width));
+    // 973 repair 5: the session transcript's content anchoring, here too.
+    let mut anchor = frame_anchor(model, &surface, relayout);
+    if let Some(offset) = anchor.as_ref().and_then(|anchor| {
+        anchored_scroll_back(
+            &mut transcript_cache,
+            &chip.transcript,
+            layout_ctx,
+            anchor,
+            prefix_rows,
+            tail_rows,
+            transcript_area.height,
+        )
+    }) {
+        model.scroll_back.set(offset);
+    }
+    let total = prefix_rows
         .saturating_add(transcript_cache.total_rows)
-        .saturating_add(u64::from(wrapped_lines_height(
-            &tail,
-            transcript_area.width,
-        )));
+        .saturating_add(tail_rows);
     let max_scroll = total.saturating_sub(u64::from(transcript_area.height));
     model.scroll_max.set(max_scroll);
     // Drag-autoscroll edges (QoL wave), as on the session transcript.
@@ -11116,15 +11416,20 @@ fn render_subagent(
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
+    let anchored_offset = model.scroll_back.get();
     resolve_tool_reveal(
         model,
         &transcript_cache,
         &chip.transcript,
-        u64::from(wrapped_lines_height(&prefix, transcript_area.width)),
+        prefix_rows,
         max_scroll,
         transcript_area.height,
     );
-    let (visible_lines, visible_base, visible_total, scroll) = virtualized_transcript_lines(
+    if anchor.is_some() && model.scroll_back.get() != anchored_offset {
+        anchor = None;
+    }
+    let (visible_lines, visible_base, visible_total, scroll) = anchored_viewport(
+        model,
         &mut transcript_cache,
         &chip.transcript,
         layout_ctx,
@@ -11135,12 +11440,21 @@ fn render_subagent(
             height: transcript_area.height,
             width: transcript_area.width,
         },
+        anchor.as_ref(),
     );
     let corrected_max = visible_total.saturating_sub(u64::from(transcript_area.height));
     model.scroll_max.set(corrected_max);
     model
         .scroll_back
         .set(model.scroll_back.get().min(corrected_max));
+    *model.scroll_anchor.borrow_mut() = scroll_anchor_at(
+        &transcript_cache,
+        &chip.transcript,
+        &surface,
+        prefix_rows,
+        corrected_max.saturating_sub(model.scroll_back.get().min(corrected_max)),
+        model.scroll_back.get(),
+    );
     frame.render_widget(
         Paragraph::new(Text::from(visible_lines))
             .wrap(Wrap { trim: false })
@@ -11150,7 +11464,6 @@ fn render_subagent(
             )),
         transcript_area,
     );
-    let prefix_rows = u64::from(wrapped_lines_height(&prefix, transcript_area.width));
     image_reveal_hits(
         &transcript_cache,
         &chip.transcript,
@@ -15782,6 +16095,10 @@ fn tool_disclosure_lines<'a>(
                 && let Some(text) = run.subline.as_deref()
                 && let Some(segments) = tf::subline_segments(text, cells)
             {
+                // The elbow speaks for the run's LATEST call, so it is that
+                // call's door into the full-detail view (973 repair 5: it
+                // looked like every other `⎿` line and opened nothing).
+                marks.result = Some(lines.len());
                 lines.push(tool_line(&segments, theme));
             }
             return;
@@ -16301,11 +16618,19 @@ fn tool_row_hits(
         }
         // 973 repair: EVERY row's `⎿` result line is a click route into the
         // same full-detail view (shell, read, write, edit alike), so a click
-        // and ⌃O expand the same way and Esc returns the same way.
+        // and ⌃O expand the same way and Esc returns the same way. A fold
+        // head's elbow is its latest member's (repair 5).
         if let Some(offset) = entry.result_row
             && let Some(rect) = row_rect(start.saturating_add(offset))
         {
-            hits.push((rect, Hit::ToolDetail(item_id.clone())));
+            let door = match ctx.role(index) {
+                FoldRole::Head(run) => match projection.entries().get(run.last()) {
+                    Some(TranscriptEntry::Item(latest)) => latest.item_id.as_str().to_owned(),
+                    _ => item_id.clone(),
+                },
+                _ => item_id.clone(),
+            };
+            hits.push((rect, Hit::ToolDetail(door)));
         }
         if let Some(offset) = entry.summary_row
             && let Some(rect) = row_rect(start.saturating_add(offset))

@@ -4194,6 +4194,37 @@ pub struct ToolDetailView {
     /// The wrapped body of the last paint, reused while its key holds
     /// (973 repair: a scroll re-slices it instead of re-diffing).
     pub layout: std::cell::RefCell<Option<DetailLayout>>,
+    /// Where the transcript under the view stood when it opened — the
+    /// CONTENT the top row showed, not a raw row offset (973 repair 5).
+    /// Closing hands it back to the renderer, which puts that content on
+    /// the top row again against whatever geometry the frame then has.
+    pub return_to: Option<ScrollAnchor>,
+}
+
+/// A content-anchored transcript position (973-tui-toolview repair 5).
+///
+/// `scroll_back` counts rows up from the BOTTOM, and the transcript layout
+/// cache only ESTIMATES the height of history it has not measured. Any
+/// re-measure below the viewport therefore moves the content a raw offset
+/// points at. The anchor names the content instead: the entry on the top
+/// row and the wrapped row inside it. The renderer publishes one every
+/// frame and re-derives `scroll_back` from it when the geometry was re-laid
+/// out under an untouched offset, and when the full-detail view closes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollAnchor {
+    /// Which transcript it belongs to: `session`, or `chip:<agent>`.
+    pub surface: String,
+    /// The display entry on the top row; `None` for the prefix rows above
+    /// entry 0 (the origin line, a chip's metrics).
+    pub entry: Option<usize>,
+    /// That entry's item id, when it has one: a later mutation that put a
+    /// different item at the index invalidates the anchor rather than
+    /// landing on the wrong content.
+    pub item: Option<String>,
+    /// The wrapped row, inside the entry (or the prefix), on the top row.
+    pub row: u64,
+    /// The bottom offset this anchor was painted at.
+    pub scroll_back: u64,
 }
 
 /// Everything the full-detail body is a function of.
@@ -5536,6 +5567,14 @@ pub struct AppModel {
     /// the model cannot know which wrapped row an entry lands on — and
     /// clears it only when it LANDS, exactly as `pending_jump` does.
     pub pending_tool_reveal: std::cell::RefCell<Option<String>>,
+    /// The content on the transcript's top row as of the LAST frame, while
+    /// scrolled back (973 repair 5) — renderer-written, the `scroll_max`
+    /// frame-feedback discipline. `None` while following the bottom.
+    pub scroll_anchor: std::cell::RefCell<Option<ScrollAnchor>>,
+    /// A one-shot "put this content back on the top row" (973 repair 5),
+    /// armed when the full-detail view closes and resolved by the next
+    /// frame against its own geometry.
+    pub scroll_restore: std::cell::RefCell<Option<ScrollAnchor>>,
     /// Tool-row disclosure states read from the profile at boot, keyed by
     /// session id (verify 1, F3). Consulted the FIRST time a session is
     /// opened in this process; its own slot is authoritative afterwards.
@@ -6045,6 +6084,8 @@ impl Default for AppModel {
             tasks_line_expanded: false,
             tasks_line_page: 0,
             pending_tool_reveal: std::cell::RefCell::new(None),
+            scroll_anchor: std::cell::RefCell::new(None),
+            scroll_restore: std::cell::RefCell::new(None),
             persisted_tool_rows: std::collections::BTreeMap::new(),
             session_last_models: std::collections::HashMap::new(),
             session_kinds: std::collections::HashMap::new(),
@@ -16664,18 +16705,35 @@ impl AppModel {
         if !self.tool_row_ids().iter().any(|id| id == item_id) {
             return false;
         }
+        // The last frame's anchor is where the reader is — unless the
+        // offset moved since that frame painted (then there is no content
+        // position to promise yet, and the raw offset stands).
+        let return_to = self
+            .scroll_anchor
+            .borrow()
+            .clone()
+            .filter(|anchor| anchor.scroll_back == self.scroll_back.get());
         self.tool_detail = Some(ToolDetailView {
             item_id: item_id.to_owned(),
+            return_to,
             ..ToolDetailView::default()
         });
         self.dirty = true;
         true
     }
 
-    /// Close the full-detail view. The transcript was never touched while
-    /// it was open, so the reader is back exactly where they were.
+    /// Close the full-detail view and put the reader back EXACTLY where
+    /// they were (owner: "Esc back identical"): the content that was on the
+    /// transcript's top row returns to it, whatever the layout cache
+    /// re-measured underneath meanwhile (973 repair 5).
     pub fn close_tool_detail(&mut self) {
-        if self.tool_detail.take().is_some() {
+        if let Some(view) = self.tool_detail.take() {
+            // Stamped with the offset as of the close, so a gesture that
+            // moves it before the next frame (a jump to the bottom) wins.
+            *self.scroll_restore.borrow_mut() = view.return_to.map(|anchor| ScrollAnchor {
+                scroll_back: self.scroll_back.get(),
+                ..anchor
+            });
             self.dirty = true;
         }
     }
@@ -18490,6 +18548,8 @@ impl AppModel {
         self.tasks_line_expanded = false;
         self.tasks_line_page = 0;
         *self.pending_tool_reveal.borrow_mut() = None;
+        *self.scroll_anchor.borrow_mut() = None;
+        *self.scroll_restore.borrow_mut() = None;
         self.auto_resuming = false;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
@@ -19749,8 +19809,12 @@ impl AppModel {
                 self.toolfold.set_focus(Some(&item_id));
                 self.toolfold.toggle_fold(&item_id);
             }
+            // The door opens the view and changes NOTHING else (973 repair
+            // 5): moving the focus here re-laid the transcript out under the
+            // view (a focused member unfolds its run, a new disclosure
+            // revision re-seeds the height estimates), so Esc came back to
+            // a different screen than the one the reader clicked on.
             Hit::ToolDetail(item_id) => {
-                self.toolfold.set_focus(Some(&item_id));
                 self.open_tool_detail(&item_id);
             }
             Hit::ToolDetailClose => self.close_tool_detail(),
