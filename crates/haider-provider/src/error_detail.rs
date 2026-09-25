@@ -3,7 +3,7 @@
 //! text may reach a durable [`haider_protocol::error::ErrorPresentation`].
 //!
 //! Policy (orchestrator ruling 2, lane 973-provider-error-detail):
-//! - [`classify_provider_prose`] publishes provider prose only when it matches
+//! - [`classify_provider_prose_with`] publishes provider prose only when it matches
 //!   a known template (`crate::error_templates`) whole; the rendering carries
 //!   only typed-safe slots and is safe on every surface.
 //! - Unknown prose is never published on a shareable surface. Shareable
@@ -35,7 +35,17 @@ pub(crate) enum ProviderProse {
 }
 
 /// Classifies raw provider prose. Blank prose returns `None`.
+#[cfg(test)]
 pub(crate) fn classify_provider_prose(raw: &str) -> Option<ProviderProse> {
+    classify_provider_prose_with(raw, &crate::error_templates::SlotEvidence::default())
+}
+
+/// Classifies raw provider prose against the templates, using the request
+/// evidence gathered so far. Blank prose returns `None`.
+pub(crate) fn classify_provider_prose_with(
+    raw: &str,
+    evidence: &crate::error_templates::SlotEvidence<'_>,
+) -> Option<ProviderProse> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -43,7 +53,9 @@ pub(crate) fn classify_provider_prose(raw: &str) -> Option<ProviderProse> {
     if raw == PROVIDER_DETAIL_WITHHELD {
         return Some(ProviderProse::Withheld);
     }
-    if let Some(rendered) = crate::error_templates::render_known_provider_message(raw) {
+    if let Some(rendered) =
+        crate::error_templates::render_known_provider_message_with(raw, evidence)
+    {
         return Some(ProviderProse::Known(rendered));
     }
     let local_raw = local_raw_detail(raw);

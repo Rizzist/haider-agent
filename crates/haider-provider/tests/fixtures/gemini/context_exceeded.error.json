@@ -5,7 +5,7 @@
   "presentation": {
     "subcode": "context-exceeded",
     "title": "Context window exceeded",
-    "detail": "The input token count exceeds the maximum number of tokens for this model.",
+    "detail": "The request does not fit the active model context window. · details withheld",
     "provider_http_status": 400,
     "scope": "session",
     "allowed_actions": ["choose_model", "retry"]

@@ -290,9 +290,16 @@ Provider error prose is untrusted account data. A `RunFailed` presentation's
 - a **known template** rendering (`haider-provider/src/error_templates.rs`):
   the whole message matched an anchored template for a known Anthropic,
   OpenAI/Codex, Gemini, DeepSeek or ACP error, and only typed slots vary
-  (catalog-shaped model id, integers, parameter names from a closed set,
-  URLs reduced to an allowlisted public host, account ids and keys rendered
-  as `[REDACTED]`); or
+  and every slot value is corroborated or typed: `{model}` must equal the
+  model id Haider requested (or a release-seeded Bedrock/Vertex catalog id),
+  `{tool_call_id}` must be a tool-call id present in the request,
+  `{request_id}` must equal the captured request-id header (or, when none was
+  captured, pass the request-id shape policy and be at most 64 bytes),
+  `{param}` names come from a closed list with numeric indices of at most 4
+  digits, `{int}` is at most 12 digits (comma grouping such as `40,000`
+  allowed), URLs are reduced to an allowlisted public host, and account ids
+  and keys render as `[REDACTED]`. An uncorroborated slot makes the whole
+  message unknown; or
 - the provider-class default explanation followed by ` · details withheld`.
 
 When the prose matched no template, its raw text (credential redactor
@@ -306,11 +313,22 @@ only)"**. Surfaces:
 | TUI error card, recovery-menu card, plain renderer | owner-local | shown |
 | `haider run --output print` stderr | owner-local | shown |
 | `haider run --output json` / `--output jsonl` stdout (and stderr in those modes) | shareable | stripped from every envelope and from `error.presentation` |
+| `haider run --replay <run-id>` (`haider.run.replay.v1`) and SDK `headless_run_events` | shareable | stripped (every headless event ledger strips on record) |
+| Session pipe/sidecar rows (`profile/pipe/*.pipe`) | peer/model readable | stripped |
 | Rust SDK `HeadlessRunResult` (`events`, `failure.presentation`) | shareable | stripped; only the explicitly typed `provider_raw_detail_local` field carries it |
 | `haider export` (masked and unmasked, every format) | shareable | stripped |
 | Recovery menus, sub-agent/delegation results, session transcript and pipe rows, RunFailed `message` | model/peer visible | never present (built from `detail` / public message only) |
-| Lockdown turns | templates only | stripped |
+| Lockdown turns, including a failed manual `/compact` | templates only | stripped |
 | Android / mobile chat projection | detail only | not rendered |
+
+**Raw event-frame surfaces (owner-UID only).** The following deliver journal
+envelopes as the daemon stores them, so they carry `provider_raw_detail`
+verbatim: the RPC `WireFrame::Event` live attach and the descendant stream,
+`session.read`, `haider events`, `haider session <id> --watch`, and the SDK
+`observe_stream_*` family. Every daemon endpoint refuses a peer whose UID is
+not the owner's, so these are owner-local surfaces; treat their output like
+the local journal and do not paste it into shared places. `haider run
+--replay` reads the same frames but strips the field before writing JSON.
 
 Serialized `ProviderError` values (for example the idle-timeout
 extension's `cause`) never carry the raw text: it is not a serialized field

@@ -5,7 +5,7 @@
   "presentation": {
     "subcode": "provider-overloaded",
     "title": "Provider is overloaded",
-    "detail": "The model is temporarily overloaded. Please try again later.",
+    "detail": "The provider is temporarily unable to serve this request. · details withheld",
     "provider_http_status": 503,
     "scope": "turn",
     "allowed_actions": ["retry"]

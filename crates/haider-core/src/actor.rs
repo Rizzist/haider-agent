@@ -2793,6 +2793,10 @@ pub struct HarnessActor {
     /// when providers interleave item kinds.
     pending_item_delta: Option<PendingItemDelta>,
     pending_item_delta_deadline: Option<tokio::time::Instant>,
+    /// What the latest provider request carried (model id, tool-call ids):
+    /// the only values a provider error template may echo in its
+    /// `{model}` / `{tool_call_id}` slots.
+    provider_slot_evidence: haider_provider::ProviderSlotEvidence,
 }
 
 /// See [`HarnessActor::plan`].
@@ -2878,6 +2882,7 @@ impl HarnessActor {
                 next_node: 0,
                 next_menu: 0,
                 tree_head_initialized: false,
+                provider_slot_evidence: haider_provider::ProviderSlotEvidence::default(),
                 tree_head: None,
                 deferred_commands: VecDeque::new(),
                 pending_nudges: Vec::new(),
@@ -4327,6 +4332,8 @@ impl HarnessActor {
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
+            self.provider_slot_evidence =
+                haider_provider::ProviderSlotEvidence::from_request(&provider_request);
             let projected_input_tokens =
                 estimate_if_budget_guarded(self.config.provider_budget_guard.as_deref(), || {
                     estimate_provider_request_input_tokens(
@@ -5603,7 +5610,8 @@ impl HarnessActor {
                         }
                         continue 'requests;
                     }
-                    Err(error) => {
+                    Err(mut error) => {
+                        error.corroborate_slots(&self.provider_slot_evidence);
                         if let Err(budget_error) = release_provider_budget_request(
                             self.config.provider_budget_guard.as_ref(),
                             &run_id,
@@ -11063,6 +11071,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        provider_error.corroborate_slots(&self.provider_slot_evidence);
         if let Some(error) = self.latched_terminal_failure().await {
             return self
                 .errored_outcome_with_items(run_id, message, reasoning, tools, error)

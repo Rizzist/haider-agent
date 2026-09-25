@@ -2814,6 +2814,51 @@ pub struct ProviderError {
     /// serialized error already carries its public message.
     #[serde(skip)]
     message_untrusted: bool,
+    /// Process-local: the provider prose behind `presentation.detail` and the
+    /// evidence gathered so far, so a later corroboration step (captured
+    /// request id, requested model, request tool-call ids) can re-decide
+    /// between a template rendering and "details withheld". Never serialized.
+    #[serde(skip)]
+    prose_state: Option<Box<ProseState>>,
+}
+
+/// What Haider itself sent for a failed provider request; see
+/// [`ProviderError::corroborate_slots`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderSlotEvidence {
+    pub requested_model: Option<String>,
+    pub tool_call_ids: Vec<String>,
+}
+
+impl ProviderSlotEvidence {
+    /// Model id and every tool-call id the request carries.
+    #[must_use]
+    pub fn from_request(request: &TurnRequest) -> Self {
+        let tool_call_ids = request
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                Block::ToolCall { call_id, .. } | Block::ToolResult { call_id, .. } => {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            requested_model: Some(request.model.clone()),
+            tool_call_ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProseState {
+    prose: String,
+    default_detail: String,
+    raw_from_prose: bool,
+    evidence: ProviderSlotEvidence,
+    captured_request_id: Option<String>,
 }
 
 impl PartialEq for ProviderError {
@@ -2912,6 +2957,7 @@ impl ProviderError {
             idle_timeout: None,
             provider_raw_detail: None,
             message_untrusted: false,
+            prose_state: None,
         }
     }
 
@@ -2926,12 +2972,93 @@ impl ProviderError {
 
     #[must_use]
     pub fn with_http_metadata(mut self, status: u16, request_id: Option<&str>) -> Self {
+        let captured = request_id.map(str::to_owned);
         let request_id = request_id.and_then(crate::error_detail::safe_request_id);
         self.presentation = self
             .presentation
             .with_http_status(status)
             .with_request_id(request_id);
+        if let Some(state) = self.prose_state.as_mut() {
+            state.captured_request_id = captured;
+            self.redecide_prose();
+        }
         self
+    }
+
+    /// Re-decides a template rendering with what Haider sent for the failed
+    /// request: `{model}` and `{tool_call_id}` slots publish only values
+    /// equal to the requested model or a tool-call id in the request.
+    /// Without this call such templates stay withheld (fail closed).
+    pub fn corroborate_slots(&mut self, evidence: &ProviderSlotEvidence) {
+        if let Some(state) = self.prose_state.as_mut() {
+            state.evidence = evidence.clone();
+            self.redecide_prose();
+        }
+    }
+
+    fn redecide_prose(&mut self) {
+        use crate::error_detail::ProviderProse;
+        let Some(state) = self.prose_state.as_ref() else {
+            return;
+        };
+        let evidence = crate::error_templates::SlotEvidence {
+            requested_model: state.evidence.requested_model.as_deref(),
+            tool_call_ids: &state.evidence.tool_call_ids,
+            captured_request_id: state.captured_request_id.as_deref(),
+        };
+        let Some(prose) =
+            crate::error_detail::classify_provider_prose_with(&state.prose, &evidence)
+        else {
+            return;
+        };
+        let withheld = format!(
+            "{} · {}",
+            state.default_detail,
+            haider_protocol::error::PROVIDER_DETAIL_WITHHELD
+        );
+        let raw_from_prose = state.raw_from_prose;
+        let (detail, local_raw) = match prose {
+            ProviderProse::Known(rendered) => (rendered, None),
+            ProviderProse::Unknown { local_raw } => (withheld, Some(local_raw)),
+            ProviderProse::Withheld => (withheld, None),
+        };
+        if raw_from_prose {
+            self.provider_raw_detail = local_raw;
+        }
+        self.replace_detail(&detail);
+    }
+
+    /// Owner-local raw text that is not the published prose itself (for
+    /// example an ACP stderr tail next to a known RPC message); later
+    /// corroboration never discards it.
+    pub(crate) fn with_local_raw_detail(mut self, raw: String) -> Self {
+        self.provider_raw_detail = Some(raw);
+        if let Some(state) = self.prose_state.as_mut() {
+            state.raw_from_prose = false;
+        }
+        self
+    }
+
+    fn replace_detail(&mut self, detail: &str) {
+        let mut presentation = ErrorPresentation::new(
+            self.presentation.subcode.as_str(),
+            &self.presentation.title,
+            detail,
+            self.presentation.scope,
+            self.presentation.allowed_actions.clone(),
+        );
+        presentation.provider_http_status = self.presentation.provider_http_status;
+        presentation
+            .provider_request_id
+            .clone_from(&self.presentation.provider_request_id);
+        presentation
+            .provider_error_type
+            .clone_from(&self.presentation.provider_error_type);
+        presentation.retry_after_ms = self.presentation.retry_after_ms;
+        presentation.reset_at_ms = self.presentation.reset_at_ms;
+        presentation.opened_within_ms = self.presentation.opened_within_ms;
+        presentation.budget_ms = self.presentation.budget_ms;
+        self.presentation = presentation;
     }
 
     #[must_use]
@@ -2975,42 +3102,18 @@ impl ProviderError {
     /// leaves the existing presentation untouched.
     #[must_use]
     pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
-        use crate::error_detail::ProviderProse;
-        let Some(prose) = crate::error_detail::classify_provider_prose(detail) else {
+        let prose = detail.trim();
+        if prose.is_empty() {
             return self;
-        };
-        let withheld = || {
-            format!(
-                "{} · {}",
-                self.presentation.detail,
-                haider_protocol::error::PROVIDER_DETAIL_WITHHELD
-            )
-        };
-        let (detail, local_raw) = match prose {
-            ProviderProse::Known(rendered) => (rendered, None),
-            ProviderProse::Unknown { local_raw } => (withheld(), Some(local_raw)),
-            ProviderProse::Withheld => (withheld(), None),
-        };
-        self.provider_raw_detail = local_raw;
-        let mut presentation = ErrorPresentation::new(
-            self.presentation.subcode.as_str(),
-            &self.presentation.title,
-            &detail,
-            self.presentation.scope,
-            self.presentation.allowed_actions.clone(),
-        );
-        presentation.provider_http_status = self.presentation.provider_http_status;
-        presentation
-            .provider_request_id
-            .clone_from(&self.presentation.provider_request_id);
-        presentation
-            .provider_error_type
-            .clone_from(&self.presentation.provider_error_type);
-        presentation.retry_after_ms = self.presentation.retry_after_ms;
-        presentation.reset_at_ms = self.presentation.reset_at_ms;
-        presentation.opened_within_ms = self.presentation.opened_within_ms;
-        presentation.budget_ms = self.presentation.budget_ms;
-        self.presentation = presentation;
+        }
+        self.prose_state = Some(Box::new(ProseState {
+            prose: prose.to_owned(),
+            default_detail: self.presentation.detail.clone(),
+            raw_from_prose: true,
+            evidence: ProviderSlotEvidence::default(),
+            captured_request_id: None,
+        }));
+        self.redecide_prose();
         self
     }
 }
@@ -4751,7 +4854,7 @@ mod e2_contract_tests {
     #[test]
     fn e2a_provider_429_presentation_carries_retry_metadata_and_safe_explanation() {
         // A known template (ruling 2): unknown prose would be withheld.
-        const DETAIL: &str = "Rate limit exceeded";
+        const DETAIL: &str = "Resource has been exhausted (e.g. check quota).";
         const SECRET: &str = "RAW_SECRET_MUST_NEVER_RENDER_98c4";
         let body = format!(
             r#"{{"error":{{"type":"rate_limit_error","message":"{DETAIL}"}},"api_key":"{SECRET}"}}"#

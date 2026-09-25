@@ -6,8 +6,9 @@
 use haider_provider::acp::client::{ACP_STDERR_TAIL_BYTES, AcpError, StderrRing};
 use haider_provider::acp::wire::JsonRpcError;
 use haider_provider::{
-    ProviderError, ProviderErrorKind, deadline_exhausted_error, replay_anthropic_http_error,
-    replay_gemini_http_error, replay_openai_http_error, replay_openai_responses_sse,
+    ProviderError, ProviderErrorKind, ProviderSlotEvidence, deadline_exhausted_error,
+    replay_anthropic_http_error, replay_gemini_http_error, replay_openai_http_error,
+    replay_openai_responses_sse,
 };
 use std::time::Duration;
 
@@ -66,7 +67,6 @@ const MUST_SHOW: &[&str] = &[
     "Unsupported parameter: 'temperature' is not supported with this model.",
     "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
     "Unknown parameter: 'service_tier'.",
-    "The model `gpt-9-fixture` does not exist or you do not have access to it.",
     "Your authentication token has been invalidated. Please try signing in again.",
     "This organization has been disabled.",
     "Your account is not active, please check your billing details on our website.",
@@ -74,11 +74,11 @@ const MUST_SHOW: &[&str] = &[
     "The caller does not have permission",
     "Please reduce the length of the messages or completion.",
     "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.",
-    "max_tokens: 100000 > 64000, which is the maximum allowed number of output tokens for claude-fixture",
     "API key not valid. Please pass a valid API key.",
     "User location is not supported for the API use.",
     "Request contains an invalid argument.",
-    "Rate limit exceeded",
+    "Resource has been exhausted (e.g. check quota).",
+    "prompt is too long: 40,000 tokens > 1,000,000 maximum",
     "Invalid JSON payload received. Unknown name \"thinking_budget\" at 'generation_config': Cannot find field.",
 ];
 
@@ -132,17 +132,71 @@ fn template_slots_render_only_typed_safe_values() {
         ),
     ] {
         let json = body("rate_limit_error", prose);
-        let detail = replay_openai_http_error(429, None, json.as_bytes())
-            .presentation
-            .detail;
-        assert_eq!(detail, expected);
+        let mut error = replay_openai_http_error(429, None, json.as_bytes());
+        error.corroborate_slots(&requested("gpt-4o"));
+        assert_eq!(error.presentation.detail, expected);
     }
     let gemini = "models/gemini-9.9-fixture is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.";
-    assert_eq!(
-        replay_gemini_http_error(400, None, gemini_body(gemini).as_bytes())
-            .presentation
-            .detail,
-        gemini
+    let mut error = replay_gemini_http_error(400, None, gemini_body(gemini).as_bytes());
+    error.corroborate_slots(&requested("gemini-9.9-fixture"));
+    assert_eq!(error.presentation.detail, gemini);
+}
+
+fn requested(model: &str) -> ProviderSlotEvidence {
+    ProviderSlotEvidence {
+        requested_model: Some(model.to_owned()),
+        tool_call_ids: Vec::new(),
+    }
+}
+
+/// Ruling D: `{model}`, `{tool_call_id}` and `{request_id}` publish only
+/// values Haider can corroborate; otherwise the message stays withheld.
+#[test]
+fn identity_slots_publish_only_corroborated_values() {
+    let model_missing = "The model `gpt-9-fixture` does not exist or you do not have access to it.";
+    let json = body("invalid_request_error", model_missing);
+    let mut error = replay_openai_http_error(404, None, json.as_bytes());
+    assert!(error.presentation.detail.ends_with(WITHHELD), "no evidence");
+    assert_eq!(error.provider_raw_detail.as_deref(), Some(model_missing));
+    error.corroborate_slots(&requested("some-other-model"));
+    assert!(error.presentation.detail.ends_with(WITHHELD), "wrong model");
+    error.corroborate_slots(&requested("gpt-9-fixture"));
+    assert_eq!(error.presentation.detail, model_missing);
+    assert!(error.provider_raw_detail.is_none());
+
+    let orphan = "messages.2: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_fixture01. Each `tool_use` block must have a corresponding `tool_result` block in the next message.";
+    let json = body("invalid_request_error", orphan);
+    let mut error = replay_anthropic_http_error(400, None, json.as_bytes());
+    error.corroborate_slots(&ProviderSlotEvidence {
+        requested_model: Some("claude-fixture".into()),
+        tool_call_ids: vec!["toolu_other".into()],
+    });
+    assert!(
+        error.presentation.detail.ends_with(WITHHELD),
+        "unknown tool id"
+    );
+    error.corroborate_slots(&ProviderSlotEvidence {
+        requested_model: Some("claude-fixture".into()),
+        tool_call_ids: vec!["toolu_fixture01".into()],
+    });
+    assert_eq!(error.presentation.detail, orphan);
+
+    let overloaded = "That model is currently overloaded with other requests. You can retry your request, or contact us through our help center at help.openai.com if the error persists. (Please include the request ID req_captured01 in your message.)";
+    let json = body("server_error", overloaded);
+    let same = replay_openai_http_error(503, None, json.as_bytes())
+        .with_http_metadata(503, Some("req_captured01"));
+    assert_eq!(same.presentation.detail, overloaded);
+    let other = replay_openai_http_error(503, None, json.as_bytes())
+        .with_http_metadata(503, Some("req_different02"));
+    assert!(
+        other.presentation.detail.ends_with(WITHHELD),
+        "request id mismatch"
+    );
+    let long = overloaded.replace("req_captured01", &format!("req_{}", "a".repeat(70)));
+    let uncaptured = replay_openai_http_error(503, None, body("server_error", &long).as_bytes());
+    assert!(
+        uncaptured.presentation.detail.ends_with(WITHHELD),
+        "uncaptured > 64 bytes"
     );
 }
 
@@ -368,7 +422,7 @@ fn provider_route_status_matrix_retains_safe_identity() {
                 429,
                 "rate_limit_error",
                 ProviderErrorKind::RateLimited,
-                "Rate limit exceeded",
+                "Resource has been exhausted (e.g. check quota).",
             ),
             (
                 500,
@@ -508,11 +562,11 @@ fn acp_rpc_messages_render_from_templates_or_stay_local() {
     // template while the tail stays local.
     let tailed = AcpError::Rpc(JsonRpcError {
         code: -32000,
-        message: "Rate limit exceeded".into(),
+        message: "Internal error".into(),
         data: None,
     })
     .into_provider_error("org quillmere throttled");
-    assert_eq!(tailed.presentation.detail, "Rate limit exceeded");
+    assert_eq!(tailed.presentation.detail, "Internal error");
     assert!(!shareable_text(&tailed).contains("quillmere"));
     assert!(
         tailed

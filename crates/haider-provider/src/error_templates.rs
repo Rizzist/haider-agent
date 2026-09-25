@@ -10,19 +10,23 @@
 //!
 //! | slot           | accepted value                                           | rendered as          |
 //! |----------------|----------------------------------------------------------|----------------------|
-//! | `{model}`      | model-id shape with a catalog family prefix              | verbatim             |
-//! | `{int}`        | 1–12 ASCII digits                                        | verbatim             |
+//! | `{model}`      | equals the model id Haider requested (or a seeded catalog id) | verbatim        |
+//! | `{int}`        | 1–12 ASCII digits, optionally comma-grouped (`40,000`)   | verbatim             |
 //! | `{num}`        | decimal number                                           | verbatim             |
-//! | `{param}`      | dotted API parameter path, every segment in [`PARAMETER_NAMES`] | verbatim     |
+//! | `{param}`      | dotted path: closed-list names, numeric indices <= 4 digits | verbatim          |
 //! | `{url}`        | http(s) URL whose host is in the exact public-host allowlist | `scheme://host`  |
 //! | `{duration}`   | provider retry delay such as `2s`, `1.5s`, `6m0s`, `20ms` | verbatim            |
 //! | `{rate_unit}`  | closed set of OpenAI rate-limit units                     | verbatim             |
-//! | `{request_id}` | `req_…` id accepted by `safe_request_id`                  | verbatim             |
+//! | `{request_id}` | equals the captured request-id header; else `safe_request_id`, <= 64 B | verbatim |
 //! | `{api_version}`| `v1`, `v1beta`, `v1alpha`, `v1beta1`                      | verbatim             |
 //! | `{method}`     | closed set of Gemini RPC method names                     | verbatim             |
-//! | `{tool_call_id}` | provider tool-call id (`toolu_…`, `call_…`, `fc_…`)   | verbatim             |
+//! | `{tool_call_id}` | a tool-call id present in this request                 | verbatim             |
 //! | `{account_id}` | org/project/user id or UUID (account data)               | `[REDACTED]`         |
 //! | `{api_key}`    | a (masked) API key echo                                   | `[REDACTED]`         |
+//!
+//! Slot values must be corroborated by what Haider itself sent or captured
+//! ([`SlotEvidence`]); without evidence (for example a bare replay) a
+//! template with a `{model}` or `{tool_call_id}` slot does not match.
 //!
 //! Anything that matches no template is "unknown": shareable surfaces show
 //! the provider-class default explanation plus "details withheld", and the
@@ -58,11 +62,20 @@ const fn template(provenance: &'static str, text: &'static str) -> Template {
 const TEMPLATES: &[Template] = &[
     // ---- Capacity / overload -------------------------------------------
     template("Anthropic overloaded_error (HTTP 529)", "Overloaded"),
-    template("Generic HTTP reason phrase", "Service Unavailable"),
-    template("Generic HTTP reason phrase", "Bad Gateway"),
-    template("Generic HTTP reason phrase", "Gateway Timeout"),
     template(
-        "Generic HTTP reason phrase / Anthropic api_error",
+        "RFC 9110 standard reason phrase (proxy/gateway body)",
+        "Service Unavailable",
+    ),
+    template(
+        "RFC 9110 standard reason phrase (proxy/gateway body)",
+        "Bad Gateway",
+    ),
+    template(
+        "RFC 9110 standard reason phrase (proxy/gateway body)",
+        "Gateway Timeout",
+    ),
+    template(
+        "RFC 9110 standard 500 reason phrase (proxy/gateway body)",
         "Internal Server Error",
     ),
     template("Anthropic api_error", "Internal server error"),
@@ -73,10 +86,6 @@ const TEMPLATES: &[Template] = &[
     template(
         "Gemini UNAVAILABLE (HTTP 503)",
         "The service is currently unavailable.",
-    ),
-    template(
-        "Gemini UNAVAILABLE (HTTP 503), recorded fixture wording",
-        "The model is temporarily overloaded. Please try again later.",
     ),
     template("Gemini INTERNAL (HTTP 500)", "Internal error encountered."),
     template(
@@ -113,11 +122,10 @@ const TEMPLATES: &[Template] = &[
         "The service is overloaded. Please try again later.",
     ),
     // ---- Rate limits ---------------------------------------------------------
-    template("Generic HTTP 429 reason phrase", "Too Many Requests"),
-    template("Generic / ACP rate limit", "Rate limit exceeded"),
-    template("Generic / ACP rate limit", "Rate limit exceeded."),
-    template("Generic rate limit", "Rate limited"),
-    template("Generic rate limit", "Rate limit reached"),
+    template(
+        "RFC 6585 standard 429 reason phrase (proxy/gateway body)",
+        "Too Many Requests",
+    ),
     template("DeepSeek 429", "Rate Limit Reached"),
     template(
         "OpenAI 429 rate_limit_exceeded",
@@ -238,8 +246,14 @@ const TEMPLATES: &[Template] = &[
         "Gemini FAILED_PRECONDITION (HTTP 400) location",
         "User location is not supported for the API use without a billing account linked.",
     ),
-    template("Generic HTTP reason phrase", "Forbidden"),
-    template("Generic HTTP reason phrase", "Unauthorized"),
+    template(
+        "RFC 9110 standard reason phrase (proxy/gateway body)",
+        "Forbidden",
+    ),
+    template(
+        "RFC 9110 standard reason phrase (proxy/gateway body)",
+        "Unauthorized",
+    ),
     // ---- Authentication --------------------------------------------------------
     template("Anthropic 401 authentication_error", "invalid x-api-key"),
     template(
@@ -376,10 +390,6 @@ const TEMPLATES: &[Template] = &[
     template(
         "Gemini 400 INVALID_ARGUMENT token count",
         "The input token count exceeds the maximum number of tokens allowed ({int}).",
-    ),
-    template(
-        "Gemini 400 INVALID_ARGUMENT token count, recorded fixture wording",
-        "The input token count exceeds the maximum number of tokens for this model.",
     ),
     // ---- Request shape / parameters ---------------------------------------------------
     template(
@@ -602,32 +612,6 @@ pub(crate) const PARAMETER_NAMES: &[&str] = &[
     "parameters",
 ];
 
-/// Catalog model-family prefixes a `{model}` slot must start with (after an
-/// optional `models/` resource prefix). Anything else is not a model id.
-const MODEL_FAMILY_PREFIXES: &[&str] = &[
-    "gpt-",
-    "chatgpt-",
-    "codex-",
-    "o1",
-    "o3",
-    "o4",
-    "text-embedding-",
-    "computer-use-",
-    "claude-",
-    "anthropic.",
-    "gemini-",
-    "gemma-",
-    "learnlm-",
-    "deepseek-",
-    "grok-",
-    "kimi-",
-    "moonshot-",
-    "qwen",
-    "glm-",
-    "mistral-",
-    "llama-",
-];
-
 const RATE_UNITS: &[&str] = &[
     "tokens per min (TPM)",
     "requests per min (RPM)",
@@ -689,7 +673,7 @@ impl Slot {
     fn pattern(self) -> String {
         match self {
             Self::Model => r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}".to_owned(),
-            Self::Int => r"[0-9]{1,12}".to_owned(),
+            Self::Int => r"(?:[0-9]{1,3}(?:,[0-9]{3}){1,3}|[0-9]{1,12})".to_owned(),
             Self::Num => r"[0-9]{1,9}(?:\.[0-9]{1,9})?".to_owned(),
             Self::Param => r"[A-Za-z0-9_.\[\]]{1,96}".to_owned(),
             Self::Url => r#"https?://[^\s<>"'()`]{1,256}?"#.to_owned(),
@@ -698,7 +682,7 @@ impl Slot {
                     .to_owned()
             }
             Self::RateUnit => alternation(RATE_UNITS),
-            Self::RequestId => r"req[_-][A-Za-z0-9_-]{1,124}".to_owned(),
+            Self::RequestId => r"req[_-][A-Za-z0-9_-]{1,60}".to_owned(),
             Self::ApiVersion => alternation(API_VERSIONS),
             Self::Method => alternation(GEMINI_METHODS),
             Self::AccountId => r"[A-Za-z0-9_-]{1,96}".to_owned(),
@@ -708,24 +692,69 @@ impl Slot {
     }
 
     /// Returns the published rendering of a slot value, or `None` when the
-    /// value is not of the slot's type (the whole template then fails).
-    fn render(self, value: &str) -> Option<String> {
+    /// value is not of the slot's type or not corroborated by `evidence`
+    /// (the whole template then fails and the message is unknown).
+    fn render(self, value: &str, evidence: &SlotEvidence<'_>) -> Option<String> {
         match self {
-            Self::Model => model_id_shape(value).then(|| value.to_owned()),
+            Self::Model => model_corroborated(value, evidence).then(|| value.to_owned()),
             Self::Param => parameter_path(value).then(|| value.to_owned()),
             Self::Url => public_url_host(value),
-            Self::RequestId => crate::error_detail::safe_request_id(value).map(str::to_owned),
+            Self::RequestId => request_id_corroborated(value, evidence).then(|| value.to_owned()),
+            Self::ToolCallId => evidence
+                .tool_call_ids
+                .iter()
+                .any(|id| id == value)
+                .then(|| value.to_owned()),
+            Self::Int => {
+                (value.bytes().filter(u8::is_ascii_digit).count() <= 12).then(|| value.to_owned())
+            }
             Self::AccountId => account_id_shape(value).then(|| REDACTED.to_owned()),
             Self::ApiKey => Some(REDACTED.to_owned()),
-            Self::Int
-            | Self::Num
-            | Self::Duration
-            | Self::RateUnit
-            | Self::ApiVersion
-            | Self::Method
-            | Self::ToolCallId => Some(value.to_owned()),
+            Self::Num | Self::Duration | Self::RateUnit | Self::ApiVersion | Self::Method => {
+                Some(value.to_owned())
+            }
         }
     }
+}
+
+/// What Haider itself sent or captured for the failed request. Slot values
+/// that name a model, a tool call or a request id are published only when
+/// they equal one of these; the default (no evidence) corroborates nothing
+/// except a request id under the capped shape policy.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SlotEvidence<'a> {
+    pub(crate) requested_model: Option<&'a str>,
+    pub(crate) tool_call_ids: &'a [String],
+    pub(crate) captured_request_id: Option<&'a str>,
+}
+
+const MAX_UNCAPTURED_REQUEST_ID_BYTES: usize = 64;
+
+fn request_id_corroborated(value: &str, evidence: &SlotEvidence<'_>) -> bool {
+    match evidence.captured_request_id {
+        Some(captured) => captured == value,
+        None => {
+            value.len() <= MAX_UNCAPTURED_REQUEST_ID_BYTES
+                && crate::error_detail::safe_request_id(value).is_some()
+        }
+    }
+}
+
+/// The requested model id (with or without a `models/` resource prefix), or
+/// an id from a release-seeded offline catalog (Bedrock/Vertex).
+fn model_corroborated(value: &str, evidence: &SlotEvidence<'_>) -> bool {
+    let bare = |id: &str| id.strip_prefix("models/").unwrap_or(id).to_owned();
+    let value_bare = bare(value);
+    if evidence
+        .requested_model
+        .is_some_and(|requested| !requested.is_empty() && bare(requested) == value_bare)
+    {
+        return true;
+    }
+    crate::BEDROCK_SEED_MODELS
+        .iter()
+        .chain(crate::VERTEX_SEED_MODELS.iter())
+        .any(|seeded| *seeded == value_bare)
 }
 
 fn alternation(options: &[&str]) -> String {
@@ -739,29 +768,15 @@ fn alternation(options: &[&str]) -> String {
     )
 }
 
-/// A catalog-shaped model id: lower-case ASCII `[a-z0-9._:@-]`, at most 128
-/// bytes, optionally behind one `models/` resource prefix, starting with a
-/// known model family.
-fn model_id_shape(value: &str) -> bool {
-    let id = value.strip_prefix("models/").unwrap_or(value);
-    !id.is_empty()
-        && id.len() <= 128
-        && id.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
-        })
-        && MODEL_FAMILY_PREFIXES
-            .iter()
-            .any(|prefix| id.starts_with(prefix))
-}
+/// Array indices in a `{param}` path are at most this many digits.
+const MAX_INDEX_DIGITS: usize = 4;
 
 /// Every dot-separated segment is a known name (optionally followed by
 /// `[N]` indices) or a bare array index (`messages.0.content`).
 fn parameter_path(value: &str) -> bool {
     value.split('.').all(|segment| {
         if !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()) {
-            return true;
+            return segment.len() <= MAX_INDEX_DIGITS;
         }
         let name = segment.find('[').map_or(segment, |index| &segment[..index]);
         let indices = &segment[name.len()..];
@@ -771,7 +786,8 @@ fn parameter_path(value: &str) -> bool {
                     .strip_prefix('[')
                     .and_then(|index| index.strip_suffix(']'))
                     .is_some_and(|digits| {
-                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                        (1..=MAX_INDEX_DIGITS).contains(&digits.len())
+                            && digits.bytes().all(|byte| byte.is_ascii_digit())
                     })
             })
     })
@@ -833,6 +849,14 @@ static COMPILED: LazyLock<Vec<Compiled>> =
 /// Renders `message` from the first template it matches whole, with every
 /// slot validated by type; `None` means the message is unknown.
 pub(crate) fn render_known_provider_message(message: &str) -> Option<String> {
+    render_known_provider_message_with(message, &SlotEvidence::default())
+}
+
+/// [`render_known_provider_message`] with corroborating request evidence.
+pub(crate) fn render_known_provider_message_with(
+    message: &str,
+    evidence: &SlotEvidence<'_>,
+) -> Option<String> {
     let message = message.trim();
     if message.is_empty() || message.len() > 2048 {
         return None;
@@ -844,7 +868,7 @@ pub(crate) fn render_known_provider_message(message: &str) -> Option<String> {
         for (index, slot) in compiled.slots.iter().enumerate() {
             let value = captures.get(index + 1)?;
             rendered.push_str(&message[cursor..value.start()]);
-            rendered.push_str(&slot.render(value.as_str())?);
+            rendered.push_str(&slot.render(value.as_str(), evidence)?);
             cursor = value.end();
         }
         rendered.push_str(&message[cursor..]);
@@ -874,12 +898,56 @@ mod tests {
 
     #[test]
     fn slot_types_are_enforced() {
-        assert!(model_id_shape("gpt-4o"));
-        assert!(model_id_shape("models/gemini-2.5-pro"));
-        assert!(model_id_shape("claude-sonnet-4-5@20250929"));
-        assert!(!model_id_shape("quillmere"));
-        assert!(!model_id_shape("gpt-4o quillmere"));
-        assert!(!model_id_shape("Claude-Quill"));
+        let requested = SlotEvidence {
+            requested_model: Some("gpt-4o"),
+            ..SlotEvidence::default()
+        };
+        assert!(model_corroborated("gpt-4o", &requested));
+        assert!(!model_corroborated("gpt-4o-quillmere", &requested));
+        assert!(!model_corroborated("gpt-4o", &SlotEvidence::default()));
+        let gemini = SlotEvidence {
+            requested_model: Some("gemini-2.5-pro"),
+            ..SlotEvidence::default()
+        };
+        assert!(model_corroborated("models/gemini-2.5-pro", &gemini));
+        let ids = vec!["toolu_fixture01".to_owned()];
+        let tools = SlotEvidence {
+            tool_call_ids: &ids,
+            ..SlotEvidence::default()
+        };
+        assert_eq!(
+            Slot::ToolCallId
+                .render("toolu_fixture01", &tools)
+                .as_deref(),
+            Some("toolu_fixture01")
+        );
+        assert_eq!(Slot::ToolCallId.render("toolu_other", &tools), None);
+        let captured = SlotEvidence {
+            captured_request_id: Some("req_captured01"),
+            ..SlotEvidence::default()
+        };
+        assert!(request_id_corroborated("req_captured01", &captured));
+        assert!(!request_id_corroborated("req_other01", &captured));
+        assert!(request_id_corroborated(
+            "req_other01",
+            &SlotEvidence::default()
+        ));
+        assert!(!request_id_corroborated(
+            &format!("req_{}", "a".repeat(61)),
+            &SlotEvidence::default()
+        ));
+        assert!(parameter_path("messages.9999.content"));
+        assert!(!parameter_path("messages.10000.content"));
+        assert!(!parameter_path("tools[12345]"));
+        assert_eq!(
+            render_known_provider_message("prompt is too long: 40,000 tokens > 1,000,000 maximum")
+                .as_deref(),
+            Some("prompt is too long: 40,000 tokens > 1,000,000 maximum")
+        );
+        assert_eq!(
+            render_known_provider_message("prompt is too long: 4155550123999 tokens > 1 maximum"),
+            None
+        );
         assert!(parameter_path("temperature"));
         assert!(parameter_path("generation_config.thinking_config"));
         assert!(parameter_path(

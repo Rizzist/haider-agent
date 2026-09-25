@@ -1412,41 +1412,18 @@ impl HeadlessEventLedgerWriter {
         if self.error.is_some() {
             return;
         }
-        let estimate = envelope_weight_bytes(envelope);
-        let should_spill = match &self.state {
-            HeadlessEventLedgerState::Memory {
-                estimated_bytes, ..
-            } => {
-                self.spool_immediately
-                    || estimated_bytes.saturating_add(estimate)
-                        > HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES
-            }
-            HeadlessEventLedgerState::Spool(_) => false,
-        };
-        if should_spill {
-            self.spill_and_record(envelope, estimate);
-            return;
-        }
-        match &mut self.state {
-            HeadlessEventLedgerState::Memory {
-                events,
-                estimated_bytes,
-            } => {
-                events.push(envelope.clone());
-                *estimated_bytes = estimated_bytes.saturating_add(estimate);
-            }
-            HeadlessEventLedgerState::Spool(spool) => {
-                if let Err(error) = write_event_spool_record(spool, envelope, estimate) {
-                    self.error = Some(error.to_string());
-                }
-            }
-        }
+        self.record_owned(envelope.clone());
     }
 
-    fn record_owned(&mut self, envelope: RawEnvelope) {
+    /// Every retained or spooled headless ledger (run results, `--output
+    /// json` events, `haider run --replay`, SDK `headless_run_events`) is a
+    /// shareable surface: owner-local provider text is removed here, the one
+    /// path every ledger record takes.
+    fn record_owned(&mut self, mut envelope: RawEnvelope) {
         if self.error.is_some() {
             return;
         }
+        envelope.payload.strip_local_only_fields();
         let estimate = envelope_weight_bytes(&envelope);
         let should_spill = match &self.state {
             HeadlessEventLedgerState::Memory {

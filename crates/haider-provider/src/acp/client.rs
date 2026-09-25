@@ -343,11 +343,9 @@ impl AcpError {
         }
         let local = format!("{raw} Agent stderr tail: {tail}");
         match &self {
-            Self::Rpc(rpc) if known.is_some() => {
-                error = error.with_provider_detail(&rpc.message);
-                error.provider_raw_detail = Some(crate::error_detail::local_raw_detail(&local));
-                error
-            }
+            Self::Rpc(rpc) if known.is_some() => error
+                .with_provider_detail(&rpc.message)
+                .with_local_raw_detail(crate::error_detail::local_raw_detail(&local)),
             _ => error.with_provider_detail(&local),
         }
     }

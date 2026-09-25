@@ -95,6 +95,41 @@ fn memory_and_forced_spool_ledgers_serialize_to_identical_bytes() {
     );
 }
 
+/// `haider run --replay` and SDK `headless_run_events` serialize this ledger
+/// to shareable JSON: memory and spooled records both lose owner-local text.
+#[test]
+fn replay_ledgers_strip_owner_local_provider_detail() {
+    let run_failed = || {
+        spool_test_envelope(
+            1,
+            serde_json::json!({
+                "type": "run_failed",
+                "code": "provider_error",
+                "message": "PermissionDenied: OpenAI HTTP 403 returned a permission error",
+                "retryable": false,
+                "presentation": {
+                    "subcode": "permission-denied",
+                    "title": "Provider access denied",
+                    "detail": "The active account is not allowed to make this request. · details withheld",
+                    "scope": "account",
+                    "allowed_actions": ["switch_account"],
+                    "provider_raw_detail": "Denied for organization quillreplay.",
+                },
+            }),
+        )
+    };
+    for spool_immediately in [false, true] {
+        let mut writer = HeadlessEventLedgerWriter::new(spool_immediately);
+        writer.record(&run_failed());
+        writer.record_owned(run_failed());
+        let ledger = writer.finish(RunId::new("spool-run"), 2).expect("ledger");
+        let bytes = serde_json::to_vec(&ledger).expect("serialize ledger");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("quillreplay"), "{text}");
+        assert!(text.contains("details withheld"), "{text}");
+    }
+}
+
 #[test]
 fn threshold_spill_moves_the_complete_prefix_and_preserves_order() {
     let envelopes = vec![
