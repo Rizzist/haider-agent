@@ -5,7 +5,7 @@ use super::{
     HeadlessAttachment, HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode,
     HeadlessEventOutput, HeadlessFailureCode, HeadlessInterrupt, HeadlessOutcome, HeadlessReducer,
     HeadlessRunError, HeadlessRunEventStorage, HeadlessRunFailure, HeadlessSessionConfig,
-    HeadlessTerminalKind, headless_submit_body, load_attachment, load_pdf_attachment,
+    HeadlessTerminalKind, finalize, headless_submit_body, load_attachment, load_pdf_attachment,
     normalize_session_config_features, terminal_kind, try_take_pending_interrupt,
 };
 use haider_rpc::haider_protocol::EventPayload;
@@ -327,6 +327,72 @@ async fn durable_request_deadline_reason_wins_terminal_race_as_timeout() {
             ..
         })
     ));
+}
+
+/// Headless/SDK/JSONL output is a shareable surface: the owner-local raw
+/// provider text leaves every streamed/retained envelope and the failure
+/// presentation, and survives only in the explicitly typed local field.
+#[tokio::test]
+async fn owner_local_provider_detail_is_stripped_from_shareable_projections() {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let output = HeadlessEventOutput::new(sender, HeadlessEventMode::Stream);
+    let mut reducer = HeadlessReducer::new(SessionId::new("spool-session"), output);
+    reducer.run_id = Some(RunId::new("spool-run"));
+    let presentation = haider_rpc::haider_protocol::error::ErrorPresentation::new(
+        "permission-denied",
+        "Provider access denied",
+        "The active account is not allowed to make this request. · details withheld",
+        haider_rpc::haider_protocol::error::ErrorScope::Account,
+        [haider_rpc::haider_protocol::error::ErrorAction::SwitchAccount],
+    )
+    .with_provider_raw_detail(Some("Denied for organization quillmere."));
+    for (seq, payload) in [
+        (
+            1,
+            serde_json::to_value(EventPayload::RunFailed {
+                code: ErrorCode::ProviderError,
+                message: "PermissionDenied: OpenAI HTTP 403 returned a permission error".into(),
+                retryable: false,
+                presentation: Some(presentation),
+            })
+            .expect("run failure serializes"),
+        ),
+        (
+            2,
+            serde_json::to_value(EventPayload::RunState(RunState::Errored))
+                .expect("terminal state serializes"),
+        ),
+    ] {
+        assert_eq!(
+            reducer.apply(spool_test_envelope(seq, payload)).await,
+            ApplyStatus::Applied
+        );
+    }
+    let result = finalize(
+        reducer,
+        RunId::new("spool-run"),
+        "openai".into(),
+        "gpt-4o".into(),
+        Vec::new(),
+        None,
+    )
+    .expect("finalized run");
+    assert_eq!(
+        result.provider_raw_detail_local.as_deref(),
+        Some("Denied for organization quillmere.")
+    );
+    let failure = result.failure.expect("failure");
+    let failure_presentation = failure.presentation.expect("presentation");
+    assert!(failure_presentation.provider_raw_detail.is_none());
+    assert!(!failure.message.contains("quillmere"));
+    while let Ok(event) = receiver.try_recv() {
+        if let HeadlessEvent::Envelope(envelope) = event {
+            let mut bytes = Vec::new();
+            haider_rpc::haider_protocol::envelope::write_envelope_json(&mut bytes, &envelope)
+                .expect("json");
+            assert!(!String::from_utf8_lossy(&bytes).contains("quillmere"));
+        }
+    }
 }
 
 /// MUTATION CHECK: ignore the run-scoped trust bit or change ordinary turn

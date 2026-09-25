@@ -819,12 +819,12 @@ impl DaemonContextCompactor {
                 Ok(None) => {}
             }
         }
-        let code = if error.presentation.subcode.as_str() == "provider-timeout" {
-            ErrorCode::ProviderTimeout
-        } else {
-            ErrorCode::ProviderError
-        };
-        HaiderError::new(code, format!("{message}: {error}"), error.retryable)
+        // Same publication boundary as a turn's provider failure: public
+        // message, typed presentation (status, type, request id), and raw
+        // provider text only in the owner-local field.
+        let mut mapped = haider_core::provider_error_to_haider(error);
+        mapped.message = format!("{message}: {}", mapped.message);
+        mapped
     }
 
     async fn provider_open_error(&self, run_id: &RunId, error: ProviderError) -> HaiderError {

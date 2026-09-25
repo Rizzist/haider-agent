@@ -365,12 +365,17 @@ pub(crate) fn canonical_digest(
     }
 }
 
+/// Drafting failures use the provider publication boundary. The error is an
+/// RPC reply that may reach any paired client, so it carries no owner-local
+/// raw provider text.
 fn provider_draft_error(error: haider_provider::ProviderError) -> HaiderError {
-    HaiderError::new(
-        ErrorCode::Internal,
-        format!("AI Loom drafting failed: {}", error.message),
-        error.retryable,
-    )
+    let mut mapped = haider_core::provider_error_to_haider(error);
+    mapped.code = ErrorCode::Internal;
+    mapped.message = format!("AI Loom drafting failed: {}", mapped.message);
+    if let Some(presentation) = mapped.presentation.as_mut() {
+        presentation.strip_local_only();
+    }
+    mapped
 }
 
 fn strip_json_fence(text: &str) -> &str {

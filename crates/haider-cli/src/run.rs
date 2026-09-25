@@ -985,6 +985,16 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                     for line in provider_identity_lines(presentation) {
                         eprintln!("haider: {line}");
                     }
+                    // Print output is an owner-local surface (this machine's
+                    // terminal); JSON/JSONL never carry this field.
+                    if options.output == RunOutput::Print
+                        && let Some(raw) = &result.provider_raw_detail_local
+                    {
+                        eprintln!(
+                            "haider: {}: {raw}",
+                            haider_protocol::error::PROVIDER_RAW_DETAIL_LABEL
+                        );
+                    }
                 } else {
                     eprintln!("haider: {}", failure.message);
                 }
@@ -2195,11 +2205,21 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
             name: &task.name,
         })
         .collect();
+    // JSON output is shareable: the SDK already stripped owner-local fields;
+    // strip again so a caller-built result cannot leak them.
+    let shareable_presentation = result
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.presentation.clone())
+        .map(|mut presentation| {
+            presentation.strip_local_only();
+            presentation
+        });
     let error = result.failure.as_ref().map(|failure| RunJsonError {
         code: failure.code.as_str(),
         message: &failure.message,
         retryable: failure.retryable,
-        presentation: failure.presentation.as_ref(),
+        presentation: shareable_presentation.as_ref(),
     });
     serde_json::to_writer(
         &mut output,
@@ -2524,6 +2544,7 @@ mod tests {
             permission_denials: Vec::new(),
             terminal_seq: Some(7),
             background_tasks_running: Vec::new(),
+            provider_raw_detail_local: None,
             failure: Some(haider_client::HeadlessRunFailure {
                 code: HeadlessFailureCode::Run(ErrorCode::RequestBudgetExceeded),
                 message: message.into(),

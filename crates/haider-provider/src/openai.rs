@@ -6716,8 +6716,10 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
+/// Malformed-frame messages interpolate provider-controlled values (event
+/// names, ids, decoder text), so they are published only via templates.
 fn malformed(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+    ProviderError::new(ProviderErrorKind::MalformedFrame, message).with_untrusted_message()
 }
 
 fn stream_interrupted(message: impl Into<String>) -> ProviderError {

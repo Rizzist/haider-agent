@@ -8,7 +8,7 @@
       "presentation": {
         "subcode": "provider-overloaded",
         "title": "Provider is overloaded",
-        "detail": "private overload detail",
+        "detail": "The provider is temporarily unable to serve this request. · details withheld",
         "scope": "turn",
         "allowed_actions": ["retry"],
         "provider_error_type": "overloaded_error"

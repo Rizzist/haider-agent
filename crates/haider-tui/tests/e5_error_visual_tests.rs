@@ -116,7 +116,7 @@ fn rate_limit_menu() -> Menu {
         title: presentation.title.clone(),
         body: vec![
             presentation.detail.clone(),
-            "Provider HTTP status: 429".into(),
+            "HTTP 429".into(),
             "Request id: 8f3a2c1d9b7e5a42".into(),
             "Retry countdown: 134s (reset at Unix time 1134000 ms).".into(),
         ],
@@ -358,7 +358,7 @@ fn e5c_recovery_card_accent_facts_countdown_and_primary_affordance() {
     );
     // The daemon's baseline prose body is not double-rendered.
     assert!(
-        !rows.iter().any(|row| row.contains("Provider HTTP status")),
+        !rows.iter().any(|row| row.contains("Retry countdown")),
         "typed facts replace the baseline prose"
     );
     // The selected primary option explains itself with its typed detail.

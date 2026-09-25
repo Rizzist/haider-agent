@@ -8,7 +8,8 @@ use haider_tui::projection::SessionProjection;
 
 #[test]
 fn provider_400_detail_survives_journal_roundtrip_and_error_card_projection() {
-    let detail = "messages.2: tool_use ids were found without tool_result blocks immediately after: fixture-call";
+    // Exact Anthropic wording (ruling 2 renders only known templates).
+    let detail = "messages.2: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_fixture01. Each `tool_use` block must have a corresponding `tool_result` block in the next message.";
     let body = serde_json::json!({"error": {"type": "invalid_request_error", "message": detail}})
         .to_string();
     let error = replay_anthropic_http_error(400, None, body.as_bytes())

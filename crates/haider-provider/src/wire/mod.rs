@@ -2023,8 +2023,10 @@ pub(crate) fn is_anthropic_context_error(kind: &str, message: &str) -> bool {
         .any(|needle| message.to_ascii_lowercase().contains(needle)))
 }
 
+/// Malformed-frame messages interpolate provider-controlled values (event
+/// names, ids, decoder text), so they are published only via templates.
 fn malformed(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+    ProviderError::new(ProviderErrorKind::MalformedFrame, message).with_untrusted_message()
 }
 
 fn stream_interrupted(message: impl Into<String>) -> ProviderError {

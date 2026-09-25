@@ -283,17 +283,23 @@ impl AcpError {
         }
     }
 
-    /// Converts to the crate's terminal error type. Both the RPC/display
-    /// text and the bounded stderr tail are child-controlled, so neither
-    /// reaches `ProviderError.message` or the presentation except through the
-    /// `error_detail` publication policy.
+    /// Converts to the crate's terminal error type. The RPC error text and
+    /// the bounded stderr tail are child-controlled: the RPC message is
+    /// published only when it matches a known template, and everything else
+    /// reaches only the owner-local `provider_raw_detail`. The other variants'
+    /// texts are Haider-authored.
     pub fn into_provider_error(self, stderr_tail: &str) -> ProviderError {
         let kind = self.kind();
         let raw = self.to_string();
+        let known = match &self {
+            Self::Rpc(error) => {
+                crate::error_templates::render_known_provider_message(&error.message)
+            }
+            _ => None,
+        };
         let message = match &self {
             // Auth-method ids are protocol identifiers the operator needs
-            // verbatim (`gemini-api-key` would otherwise trip the credential
-            // label scrubber). Only short identifier-shaped ids are shown.
+            // verbatim. Only short identifier-shaped ids are shown.
             Self::AuthMethodUnavailable { advertised } => {
                 let ids = advertised
                     .iter()
@@ -314,22 +320,36 @@ impl AcpError {
                     }
                 )
             }
-            _ => crate::public_provider_message(kind, &raw),
+            Self::Rpc(_) => known.as_ref().map_or_else(
+                || crate::provider_default_detail(kind),
+                |known| format!("the ACP agent returned an error: {known}"),
+            ),
+            _ => raw.clone(),
         };
-        let error = ProviderError::new(kind, message);
-        if stderr_tail.is_empty() {
-            return error;
-        }
-        // Line breaks are framing in the stderr ring. Join its lines before
-        // the single provider-detail boundary so ordinary agent diagnostics
-        // can survive while control bytes still fail closed.
+        let mut error = ProviderError::new(kind, message);
+        // Line breaks are framing in the stderr ring; join its lines.
         let tail = stderr_tail
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join(" · ");
-        error.with_provider_detail(&format!("{raw} Agent stderr tail: {tail}"))
+        let child_text = matches!(self, Self::Rpc(_) | Self::AuthMethodUnavailable { .. });
+        if tail.is_empty() {
+            if child_text && known.is_none() {
+                error.provider_raw_detail = Some(crate::error_detail::local_raw_detail(&raw));
+            }
+            return error;
+        }
+        let local = format!("{raw} Agent stderr tail: {tail}");
+        match &self {
+            Self::Rpc(rpc) if known.is_some() => {
+                error = error.with_provider_detail(&rpc.message);
+                error.provider_raw_detail = Some(crate::error_detail::local_raw_detail(&local));
+                error
+            }
+            _ => error.with_provider_detail(&local),
+        }
     }
 }
 

@@ -660,6 +660,13 @@ pub struct HeadlessRunResult {
     /// Background tasks with a durable started fact and no completed fact
     /// when the run's terminal was observed (W-A decision 8).
     pub background_tasks_running: Vec<HeadlessBackgroundTask>,
+    /// OWNER-LOCAL ONLY: the terminal `RunFailed`'s raw provider text (see
+    /// `haider_protocol::error::ErrorPresentation::provider_raw_detail`).
+    /// Every other part of this result is shareable: `events` and
+    /// `failure.presentation` have the field stripped. Only owner-local
+    /// renderers (the CLI's print output) may display this value; Haider's
+    /// JSON/JSONL adapters never serialize it.
+    pub provider_raw_detail_local: Option<String>,
 }
 
 /// Lossless correlated journal stream for a headless run.
@@ -1663,6 +1670,9 @@ struct HeadlessReducer {
     event_count: usize,
     budget_exhausted: Option<RunBudgetExhaustedV1>,
     deadline_exceeded: bool,
+    /// Owner-local raw provider text removed from the last correlated
+    /// `RunFailed` before it entered any shareable projection.
+    run_failed_raw_detail: Option<(u64, String)>,
 }
 
 impl HeadlessReducer {
@@ -1686,6 +1696,7 @@ impl HeadlessReducer {
             event_count: 0,
             budget_exhausted: None,
             deadline_exceeded: false,
+            run_failed_raw_detail: None,
             output,
         }
     }
@@ -1700,7 +1711,7 @@ impl HeadlessReducer {
         self.output.emit(event);
     }
 
-    async fn apply(&mut self, envelope: RawEnvelope) -> ApplyStatus {
+    async fn apply(&mut self, mut envelope: RawEnvelope) -> ApplyStatus {
         if envelope.session_id != self.session_id || envelope.seq <= self.last_applied {
             return ApplyStatus::Duplicate;
         }
@@ -1712,7 +1723,20 @@ impl HeadlessReducer {
         }
 
         self.last_applied = envelope.seq;
+        // Headless results, JSON/JSONL output and SDK consumers are shareable
+        // surfaces: owner-local provider text leaves every envelope here,
+        // before it is retained, streamed or decoded.
+        let stripped_raw_detail = envelope.payload.strip_local_only_fields();
         let correlated = self.is_correlated(&envelope);
+        if correlated
+            && envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("run_failed")
+        {
+            self.run_failed_raw_detail = stripped_raw_detail.map(|raw| (envelope.seq, raw));
+        }
         if correlated {
             self.event_count = self.event_count.saturating_add(1);
         }
@@ -3405,6 +3429,7 @@ async fn run_headless_inner(
             failure: None,
             terminal_seq: None,
             background_tasks_running: Vec::new(),
+            provider_raw_detail_local: None,
         };
         if ensure.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
             teardown_owned_daemon_on_connection(profile, &mut connection, &daemon_ownership)
@@ -5088,6 +5113,7 @@ fn finalize(
         background_tasks,
         event_count,
         budget_exhausted,
+        run_failed_raw_detail,
         mut output,
         ..
     } = reducer;
@@ -5174,6 +5200,15 @@ fn finalize(
             error_code,
         }));
     }
+    // Only the RunFailed adjacent to the reported terminal owns raw text.
+    let provider_raw_detail_local = run_failed_raw_detail
+        .filter(|(failed_seq, _)| {
+            matches!(
+                failure.as_ref().map(|failure| &failure.code),
+                Some(HeadlessFailureCode::Run(_))
+            ) && terminal_seq.is_some_and(|seq| failed_seq.saturating_add(1) == seq)
+        })
+        .map(|(_, raw)| raw);
     let events = output.finish(run_id.clone(), event_count)?;
     let background_tasks_running = background_tasks
         .iter()
@@ -5200,6 +5235,7 @@ fn finalize(
         failure,
         terminal_seq,
         background_tasks_running,
+        provider_raw_detail_local,
     })
 }
 

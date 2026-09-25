@@ -25,6 +25,7 @@ mod effort;
 #[cfg(test)]
 mod effort_tests;
 mod error_detail;
+mod error_templates;
 mod gemini;
 mod idle;
 pub use idle::{ProviderIdleDeadline, ProviderIdleTimeout};
@@ -2776,8 +2777,10 @@ pub enum ProviderErrorKind {
     ConnectionConfiguration,
 }
 
-/// Typed failure yielded by a provider stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Typed failure yielded by a provider stream. Equality compares the
+/// serialized (wire/journal) fields only; the owner-local raw detail and the
+/// untrusted-message marker are process-local metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
@@ -2798,26 +2801,53 @@ pub struct ProviderError {
     pub timeout_reason: Option<ProviderTimeoutReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<ProviderIdleTimeout>,
+    /// OWNER-LOCAL ONLY: credential-redacted provider text that matched no
+    /// known template. Never serialized with the error (serialized provider
+    /// errors reach journal extensions and child/peer projections); core
+    /// moves it into the RunFailed presentation's `provider_raw_detail`,
+    /// which shareable surfaces strip.
+    #[serde(skip)]
+    pub provider_raw_detail: Option<String>,
+    /// `message` interpolates provider- or child-controlled values (frame
+    /// fields, decoder errors, agent-offered ids). Such a message is
+    /// published only when it matches a known template. Not serialized: a
+    /// serialized error already carries its public message.
+    #[serde(skip)]
+    message_untrusted: bool,
 }
+
+impl PartialEq for ProviderError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.message == other.message
+            && self.retryable == other.retryable
+            && self.retry_after_ms == other.retry_after_ms
+            && self.opened_within_ms == other.opened_within_ms
+            && self.budget_ms == other.budget_ms
+            && self.presentation == other.presentation
+            && self.timeout_reason == other.timeout_reason
+            && self.idle_timeout == other.idle_timeout
+    }
+}
+
+impl Eq for ProviderError {}
 
 impl ProviderError {
     pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
         Self::new_with_presentation(kind, message, provider_error_presentation(kind))
     }
 
-    /// The only message form core may persist in `RunFailed`. Adapter
-    /// messages can interpolate provider- or child-controlled text (frame
-    /// fields, decoder errors, ACP RPC prose), so the message passes the same
-    /// `error_detail` policy as presentation prose even when the structured
-    /// presentation has already been sanitized. Local timeout errors
-    /// (`timeout_reason` set by `deadline_exhausted_error`, the idle deadline
-    /// and the response-open budget) are Haider-authored templates carrying
-    /// only numeric telemetry such as `reason=deadline_exhausted
-    /// opened_within_ms=…`, which the opaque-value scrubber would mangle, so
-    /// they are kept verbatim.
+    /// The only message form core may persist in `RunFailed` (and the form
+    /// every shareable projection of a provider error uses). Haider-authored
+    /// adapter messages (fixed HTTP/stream templates, local timeout
+    /// telemetry) are published as written. A message marked untrusted
+    /// ([`Self::with_untrusted_message`]) is published only when it matches a
+    /// known provider template; otherwise the provider-class default
+    /// explanation replaces it and [`Self::local_message_detail`] keeps the
+    /// raw text for owner-local surfaces.
     #[must_use]
     pub fn public_message(&self) -> String {
-        if self.timeout_reason.is_some() {
+        if !self.message_untrusted || self.timeout_reason.is_some() {
             return self.to_string();
         }
         format!(
@@ -2825,6 +2855,44 @@ impl ProviderError {
             self.kind,
             public_provider_message(self.kind, &self.message)
         )
+    }
+
+    /// Marks `message` as carrying provider- or child-controlled text.
+    #[must_use]
+    pub fn with_untrusted_message(mut self) -> Self {
+        self.message_untrusted = true;
+        self
+    }
+
+    /// Owner-local raw text for this error: the unknown provider prose, or
+    /// an untrusted message that matched no template (credential-redacted).
+    #[must_use]
+    pub fn local_message_detail(&self) -> Option<String> {
+        self.provider_raw_detail.clone().or_else(|| {
+            (self.message_untrusted
+                && self.timeout_reason.is_none()
+                && crate::error_templates::render_known_provider_message(&self.message).is_none())
+            .then(|| crate::error_detail::local_raw_detail(&self.message))
+        })
+    }
+
+    /// A copy safe for serialization into journal extensions and other
+    /// shareable projections: the message is [`Self::public_message`]'s text
+    /// and no owner-local field survives.
+    #[must_use]
+    pub fn shareable(&self) -> Self {
+        let mut shareable = self.clone();
+        if self.message_untrusted && self.timeout_reason.is_none() {
+            shareable.message = public_provider_message(self.kind, &self.message);
+        }
+        shareable.message_untrusted = false;
+        shareable.provider_raw_detail = None;
+        shareable.presentation.strip_local_only();
+        shareable.idle_timeout = self
+            .idle_timeout
+            .as_ref()
+            .map(ProviderIdleTimeout::shareable);
+        shareable
     }
 
     fn new_with_presentation(
@@ -2842,6 +2910,8 @@ impl ProviderError {
             presentation,
             timeout_reason: None,
             idle_timeout: None,
+            provider_raw_detail: None,
+            message_untrusted: false,
         }
     }
 
@@ -2898,20 +2968,30 @@ impl ProviderError {
     /// Replaces only the operator-facing explanation while retaining the
     /// typed recovery contract and provider metadata. This is the single
     /// provider-prose boundary: adapters (including ACP stderr tails) pass
-    /// raw, untrusted prose here and the `error_detail` policy scrubs it.
-    /// If safety cannot be established, retain the provider-class default
-    /// explanation and append the fixed withheld notice. Blank prose
+    /// raw, untrusted prose here. Prose matching a known template renders
+    /// from it; anything else keeps the provider-class default explanation
+    /// plus the fixed withheld notice, and its credential-redacted raw text
+    /// is kept only in the owner-local `provider_raw_detail`. Blank prose
     /// leaves the existing presentation untouched.
     #[must_use]
     pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
-        let Some(detail) = crate::error_detail::sanitize_provider_error_detail(detail) else {
+        use crate::error_detail::ProviderProse;
+        let Some(prose) = crate::error_detail::classify_provider_prose(detail) else {
             return self;
         };
-        let detail = if detail == haider_protocol::error::PROVIDER_DETAIL_WITHHELD {
-            format!("{} · {detail}", self.presentation.detail)
-        } else {
-            detail
+        let withheld = || {
+            format!(
+                "{} · {}",
+                self.presentation.detail,
+                haider_protocol::error::PROVIDER_DETAIL_WITHHELD
+            )
         };
+        let (detail, local_raw) = match prose {
+            ProviderProse::Known(rendered) => (rendered, None),
+            ProviderProse::Unknown { local_raw } => (withheld(), Some(local_raw)),
+            ProviderProse::Withheld => (withheld(), None),
+        };
+        self.provider_raw_detail = local_raw;
         let mut presentation = ErrorPresentation::new(
             self.presentation.subcode.as_str(),
             &self.presentation.title,
@@ -3223,13 +3303,17 @@ impl fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-/// Scrubs a `ProviderError.message` candidate through the provider-detail
-/// policy. When safety cannot be established the provider-class default
-/// explanation replaces it, so raw text never survives as a fallback.
+/// Publishes a `ProviderError.message` candidate that carries provider- or
+/// child-controlled text: its known-template rendering, or else the
+/// provider-class default explanation, so raw text never survives.
 pub(crate) fn public_provider_message(kind: ProviderErrorKind, raw: &str) -> String {
-    crate::error_detail::sanitize_provider_error_detail(raw)
-        .filter(|detail| detail != haider_protocol::error::PROVIDER_DETAIL_WITHHELD)
-        .unwrap_or_else(|| provider_error_presentation(kind).detail)
+    crate::error_templates::render_known_provider_message(raw)
+        .unwrap_or_else(|| provider_default_detail(kind))
+}
+
+/// The provider-class default explanation shown when prose is withheld.
+pub(crate) fn provider_default_detail(kind: ProviderErrorKind) -> String {
+    provider_error_presentation(kind).detail
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -4666,7 +4750,8 @@ mod e2_contract_tests {
 
     #[test]
     fn e2a_provider_429_presentation_carries_retry_metadata_and_safe_explanation() {
-        const DETAIL: &str = "Rate limit reached for this account.";
+        // A known template (ruling 2): unknown prose would be withheld.
+        const DETAIL: &str = "Rate limit exceeded";
         const SECRET: &str = "RAW_SECRET_MUST_NEVER_RENDER_98c4";
         let body = format!(
             r#"{{"error":{{"type":"rate_limit_error","message":"{DETAIL}"}},"api_key":"{SECRET}"}}"#

@@ -2426,16 +2426,24 @@ pub const FACT_RANK_REQUEST: u8 = 4;
 pub const FACT_RANK_ERROR_TYPE: u8 = 5;
 
 /// The expanded error card's full-length provider identity lines (provider
-/// error type, then the unshortened request id), shared by the styled and
-/// plain renderers. Absent fields produce no line.
+/// error type, the unshortened request id, then the owner-local raw
+/// provider text), shared by the transcript card, recovery menus and the
+/// plain renderer so every TUI error surface shows the same facts. Absent
+/// fields produce no line.
 #[must_use]
 pub fn error_identity_lines(presentation: &ErrorPresentation) -> Vec<String> {
-    let mut lines = Vec::with_capacity(2);
+    let mut lines = Vec::with_capacity(3);
     if let Some(error_type) = &presentation.provider_error_type {
         lines.push(format!("Provider error type: {error_type}"));
     }
     if let Some(request_id) = &presentation.provider_request_id {
         lines.push(format!("Request id: {request_id}"));
+    }
+    if let Some(raw) = &presentation.provider_raw_detail {
+        lines.push(format!(
+            "{}: {raw}",
+            haider_protocol::error::PROVIDER_RAW_DETAIL_LABEL
+        ));
     }
     lines
 }
@@ -2645,6 +2653,15 @@ pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
     }
     out.push_str(" · actions: ");
     push_error_actions(&mut out, &presentation.allowed_actions);
+    // The TUI is an owner-local surface: unknown provider text is shown here
+    // (never in exports or shareable output, which strip the field).
+    if let Some(raw) = &presentation.provider_raw_detail {
+        let _ = write!(
+            out,
+            " · {}: {raw}",
+            haider_protocol::error::PROVIDER_RAW_DETAIL_LABEL
+        );
+    }
     out
 }
 

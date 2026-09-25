@@ -282,6 +282,41 @@ Detached submission ends at the accepted/started boundary and is outside this
 attached-run terminal guarantee; its terminal is consumed later through the
 detached status/events APIs.
 
+## Provider error detail: templates and owner-local raw text (v0.0.973)
+
+Provider error prose is untrusted account data. A `RunFailed` presentation's
+`detail` is always one of:
+
+- a **known template** rendering (`haider-provider/src/error_templates.rs`):
+  the whole message matched an anchored template for a known Anthropic,
+  OpenAI/Codex, Gemini, DeepSeek or ACP error, and only typed slots vary
+  (catalog-shaped model id, integers, parameter names from a closed set,
+  URLs reduced to an allowlisted public host, account ids and keys rendered
+  as `[REDACTED]`); or
+- the provider-class default explanation followed by ` · details withheld`.
+
+When the prose matched no template, its raw text (credential redactor
+applied, control/bidi characters removed, at most 2048 bytes) is kept in
+`presentation.provider_raw_detail`, labelled **"Provider detail (local
+only)"**. Surfaces:
+
+| Surface | Class | `provider_raw_detail` |
+|---|---|---|
+| Local journal (`store.sqlite` `run_failed` events) | owner-local | kept |
+| TUI error card, recovery-menu card, plain renderer | owner-local | shown |
+| `haider run --output print` stderr | owner-local | shown |
+| `haider run --output json` / `--output jsonl` stdout (and stderr in those modes) | shareable | stripped from every envelope and from `error.presentation` |
+| Rust SDK `HeadlessRunResult` (`events`, `failure.presentation`) | shareable | stripped; only the explicitly typed `provider_raw_detail_local` field carries it |
+| `haider export` (masked and unmasked, every format) | shareable | stripped |
+| Recovery menus, sub-agent/delegation results, session transcript and pipe rows, RunFailed `message` | model/peer visible | never present (built from `detail` / public message only) |
+| Lockdown turns | templates only | stripped |
+| Android / mobile chat projection | detail only | not rendered |
+
+Serialized `ProviderError` values (for example the idle-timeout
+extension's `cause`) never carry the raw text: it is not a serialized field
+of `ProviderError`, and messages that interpolate provider values are
+published only through templates.
+
 ## SIGINT cancellation
 
 For `haider run` and the reusable headless control attachment, the first

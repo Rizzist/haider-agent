@@ -8,11 +8,21 @@ const TITLE_LIMIT: usize = 96;
 const DETAIL_LIMIT: usize = 512;
 const REQUEST_ID_LIMIT: usize = 128;
 const PROVIDER_ERROR_TYPE_LIMIT: usize = 128;
+const PROVIDER_RAW_DETAIL_LIMIT: usize = 2048;
 
-/// Fixed public detail that replaces provider prose whenever it cannot be
-/// shown safely: the provider adapter's shape policy rejected it, or the turn
-/// ran under lockdown. Provider prose is untrusted and may echo account data.
+/// Fixed public detail suffix used whenever provider prose matched no known
+/// template (see `haider-provider`'s `error_templates`). Provider prose is
+/// untrusted and may echo account data, so shareable surfaces show the
+/// provider-class default explanation plus this notice instead.
 pub const PROVIDER_DETAIL_WITHHELD: &str = "details withheld";
+
+/// JSON key of [`ErrorPresentation::provider_raw_detail`]. Shareable
+/// projections remove every occurrence with [`strip_local_only_fields`].
+pub const PROVIDER_RAW_DETAIL_FIELD: &str = "provider_raw_detail";
+
+/// Human label every owner-local renderer (CLI print, TUI) uses for
+/// [`ErrorPresentation::provider_raw_detail`].
+pub const PROVIDER_RAW_DETAIL_LABEL: &str = "Provider detail (local only)";
 
 /// Stable, bounded machine-readable reason carried to every presentation
 /// surface. Values are lowercase ASCII kebab tokens; invalid producer input
@@ -137,6 +147,17 @@ pub struct ErrorPresentation {
     /// Provider's own error category, when its response supplied one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_error_type: Option<String>,
+    /// OWNER-LOCAL ONLY. The provider's raw error text when it matched no
+    /// known template (credentials already redacted, control and bidi
+    /// characters removed, bounded). It is kept in the owner's local journal
+    /// and shown by owner-local renderers (TUI, CLI print output). Every
+    /// shareable surface — `haider export` (masked or not), headless
+    /// `--output json|jsonl` and the SDK result, masked `session item`,
+    /// recovery menus, model/provider-visible text and lockdown turns —
+    /// removes it ([`Self::strip_local_only`] / [`strip_local_only_fields`])
+    /// and shows `detail` (the provider-class default + "details withheld").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_raw_detail: Option<String>,
 }
 
 impl ErrorPresentation {
@@ -189,6 +210,7 @@ impl ErrorPresentation {
             scope,
             allowed_actions,
             provider_error_type: None,
+            provider_raw_detail: None,
         }
     }
 
@@ -214,10 +236,21 @@ impl ErrorPresentation {
         self
     }
 
-    /// Replaces provider prose under lockdown while retaining a safe title
-    /// and the allowlisted structured provider fields.
-    pub fn withhold_provider_detail(&mut self) {
-        self.detail = format!("{} · {PROVIDER_DETAIL_WITHHELD}", self.title);
+    /// Attaches the owner-local raw provider text. Control characters become
+    /// spaces and invisible/bidi formatting characters are dropped so the
+    /// text cannot restyle or reorder a terminal line; the result is bounded.
+    #[must_use]
+    pub fn with_provider_raw_detail(mut self, raw: Option<&str>) -> Self {
+        self.provider_raw_detail = raw
+            .map(local_raw_text)
+            .filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// Removes every owner-local-only field before the presentation reaches
+    /// a shareable surface (export, headless/SDK output, menus, lockdown).
+    pub fn strip_local_only(&mut self) {
+        self.provider_raw_detail = None;
     }
 
     #[must_use]
@@ -279,6 +312,8 @@ struct RawErrorPresentation {
     allowed_actions: Vec<ErrorAction>,
     #[serde(default)]
     provider_error_type: Option<String>,
+    #[serde(default)]
+    provider_raw_detail: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ErrorPresentation {
@@ -300,6 +335,7 @@ impl<'de> Deserialize<'de> for ErrorPresentation {
             .map(|value| bounded_public_text(&value, REQUEST_ID_LIMIT))
             .filter(|value| !value.is_empty());
         presentation = presentation.with_provider_error_type(raw.provider_error_type.as_deref());
+        presentation = presentation.with_provider_raw_detail(raw.provider_raw_detail.as_deref());
         presentation.retry_after_ms = raw.retry_after_ms;
         presentation.reset_at_ms = raw.reset_at_ms;
         presentation.opened_within_ms = raw.opened_within_ms;
@@ -317,6 +353,66 @@ impl Default for ErrorPresentation {
             ErrorScope::Turn,
             [ErrorAction::None],
         )
+    }
+}
+
+fn local_raw_text(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|character| !invisible_format_character(*character))
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    bounded_public_text(cleaned.trim(), PROVIDER_RAW_DETAIL_LIMIT)
+}
+
+const fn invisible_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+/// Removes every [`PROVIDER_RAW_DETAIL_FIELD`] from a JSON value (at any
+/// depth) and returns the first removed text. Shareable projections of raw
+/// journal payloads (headless JSON/JSONL, SDK results, exports) call this so
+/// owner-local provider text never leaves the machine through them.
+pub fn strip_local_only_fields(value: &mut serde_json::Value) -> Option<String> {
+    let mut first = None;
+    strip_local_only_fields_into(value, &mut first);
+    first
+}
+
+fn strip_local_only_fields_into(value: &mut serde_json::Value, first: &mut Option<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if let Some(removed) = fields.remove(PROVIDER_RAW_DETAIL_FIELD)
+                && first.is_none()
+                && let serde_json::Value::String(text) = removed
+            {
+                *first = Some(text);
+            }
+            for child in fields.values_mut() {
+                strip_local_only_fields_into(child, first);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                strip_local_only_fields_into(child, first);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -593,6 +689,41 @@ mod tests {
             serde_json::to_value(ErrorCode::WorkflowUnfinished).expect("serialize code"),
             serde_json::json!("workflow_unfinished")
         );
+    }
+
+    #[test]
+    fn provider_raw_detail_is_local_only_and_strippable_everywhere() {
+        let presentation = ErrorPresentation::new(
+            "permission-denied",
+            "Provider access denied",
+            "The active account is not allowed to make this request. · details withheld",
+            ErrorScope::Account,
+            [ErrorAction::SwitchAccount],
+        )
+        .with_provider_raw_detail(Some("Denied for org quillmere\u{202e}\u{0007}\nretry"));
+        let raw = presentation.provider_raw_detail.clone().expect("raw kept");
+        assert_eq!(raw, "Denied for org quillmere  retry");
+        let mut payload = serde_json::json!({
+            "type": "run_failed",
+            "presentation": presentation,
+            "nested": [{"menu": {"presentation": {"provider_raw_detail": "second"}}}],
+        });
+        let decoded: ErrorPresentation =
+            serde_json::from_value(payload["presentation"].clone()).expect("round trip");
+        assert_eq!(decoded.provider_raw_detail.as_deref(), Some(raw.as_str()));
+        // Every occurrence is removed; one of them is returned.
+        assert!(strip_local_only_fields(&mut payload).is_some());
+        let text = payload.to_string();
+        assert!(
+            !text.contains("quillmere") && !text.contains("second"),
+            "{text}"
+        );
+        let mut stripped = decoded;
+        stripped.strip_local_only();
+        assert!(stripped.provider_raw_detail.is_none());
+        let long = ErrorPresentation::new("x", "t", "d", ErrorScope::Turn, [ErrorAction::None])
+            .with_provider_raw_detail(Some(&"🦀".repeat(4096)));
+        assert!(long.provider_raw_detail.expect("bounded").len() <= PROVIDER_RAW_DETAIL_LIMIT);
     }
 
     #[test]

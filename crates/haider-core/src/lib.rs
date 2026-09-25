@@ -45,9 +45,10 @@ pub use actor::{
     compaction_guard_tripped, context_soft_threshold_tokens, context_tier_threshold_tokens,
     envelopes_contain_terminal, estimate_provider_request_bytes_div_four,
     estimate_provider_request_input_tokens, peer_message_for_provider,
-    presentation_for_haider_error, register_turn_trace, registered_turn_trace, retry_backoff_ms,
-    retry_jittered_backoff_ms, sanitized_failure_message, tool_arguments_display_json,
-    turn_trace_for_envelopes, turn_trace_ordinal, unregister_turn_trace_for_envelopes,
+    presentation_for_haider_error, provider_error_to_haider, register_turn_trace,
+    registered_turn_trace, retry_backoff_ms, retry_jittered_backoff_ms, sanitized_failure_message,
+    tool_arguments_display_json, turn_trace_for_envelopes, turn_trace_ordinal,
+    unregister_turn_trace_for_envelopes,
 };
 pub use fake_store::MemoryStore;
 pub use haider_protocol::interaction::{

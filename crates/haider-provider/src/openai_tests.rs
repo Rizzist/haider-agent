@@ -243,18 +243,20 @@ async fn hostile_probe_and_http_error_body_sources_are_bounded() {
     assert!(reset_after_status.retryable);
 }
 
-/// Safe prose survives; credential values are scrubbed.
+/// Known provider messages render (ruling 2 templates); unknown prose,
+/// including anything carrying a credential, is withheld and kept only in
+/// the owner-local raw detail after the credential redactor.
 #[test]
 fn openai_http_errors_preserve_safe_provider_explanations() {
     let parsed = replay_openai_http_error(
         400,
         None,
-        br#"{"error":{"type":"invalid_request_error","message":"Unsupported parameter: service_tier"}}"#,
+        br#"{"error":{"type":"invalid_request_error","message":"Unsupported parameter: 'service_tier' is not supported with this model."}}"#,
     );
     assert_eq!(parsed.kind, ProviderErrorKind::InvalidRequest);
     assert_eq!(
         parsed.presentation.detail,
-        "Unsupported parameter: service_tier"
+        "Unsupported parameter: 'service_tier' is not supported with this model."
     );
 
     let plain = replay_openai_http_error(
@@ -274,13 +276,10 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
         None,
         br#"{"error":{"message":"Credential Bearer sk-provider-secret-value was rejected"}}"#,
     );
-    assert!(redacted.presentation.detail.contains("Credential"));
-    assert!(
-        !redacted
-            .presentation
-            .detail
-            .contains("sk-provider-secret-value")
-    );
+    assert!(redacted.presentation.detail.ends_with("details withheld"));
+    let raw = redacted.provider_raw_detail.expect("owner-local raw");
+    assert!(raw.contains("Credential"));
+    assert!(!raw.contains("sk-provider-secret-value"), "{raw}");
 
     // Opaque credentials remain absent from the public presentation.
     let redacted = replay_openai_http_error(
@@ -288,13 +287,10 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
         None,
         br#"{"error":{"message":"Credential Authorization: Bearer opaque-provider-token-value was rejected"}}"#,
     );
-    assert!(redacted.presentation.detail.contains("Credential"));
-    assert!(
-        !redacted
-            .presentation
-            .detail
-            .contains("opaque-provider-token-value")
-    );
+    assert!(redacted.presentation.detail.ends_with("details withheld"));
+    let raw = redacted.provider_raw_detail.expect("owner-local raw");
+    assert!(raw.contains("Credential"));
+    assert!(!raw.contains("opaque-provider-token-value"), "{raw}");
 
     // MUTATION CHECK: remove prose-based authentication classification. The
     // backend has historically returned this explanation under HTTP 400.
@@ -315,7 +311,7 @@ fn openai_http_errors_preserve_safe_provider_explanations() {
 #[test]
 fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
     let enveloped = replay_openai_responses_sse(
-        b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Unknown field: metadata\"}}}\n\n",
+        b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Unknown parameter: 'metadata'.\"}}}\n\n",
     );
     let error = enveloped
         .into_iter()
@@ -323,7 +319,7 @@ fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
         .expect("one stream item")
         .expect_err("response.failed is an error");
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-    assert_eq!(error.presentation.detail, "Unknown field: metadata");
+    assert_eq!(error.presentation.detail, "Unknown parameter: 'metadata'.");
 
     let raw = replay_openai_responses_sse(
         b"event: error\ndata: The service is overloaded. Please try again later.\n\n",
@@ -348,9 +344,11 @@ fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
         .expect("one compatible stream item")
         .expect_err("raw compatible error frame is an error");
     assert_eq!(error.kind, ProviderErrorKind::Overloaded);
+    // Not a known provider message: withheld publicly, kept locally.
+    assert!(error.presentation.detail.ends_with("details withheld"));
     assert_eq!(
-        error.presentation.detail,
-        "The compatible upstream is overloaded."
+        error.provider_raw_detail.as_deref(),
+        Some("The compatible upstream is overloaded.")
     );
 
     let invalidated = replay_openai_responses_sse(

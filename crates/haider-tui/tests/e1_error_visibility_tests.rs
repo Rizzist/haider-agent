@@ -165,6 +165,38 @@ fn provider_denial_plain_card_shows_message_type_and_full_request_id() {
 }
 
 #[test]
+fn provider_raw_detail_is_shown_locally_with_its_label() {
+    let mut projection = SessionProjection::default();
+    projection.apply(&EventPayload::RunFailed {
+        code: ErrorCode::ProviderError,
+        message: "PermissionDenied: OpenAI HTTP 403 returned a permission error".into(),
+        retryable: false,
+        presentation: Some(
+            ErrorPresentation::new(
+                "permission-denied",
+                "Provider access denied",
+                "The active account is not allowed to make this request. · details withheld",
+                ErrorScope::Account,
+                [ErrorAction::SwitchAccount],
+            )
+            .with_http_status(403)
+            .with_request_id(Some("req_fixture_local_raw"))
+            .with_provider_raw_detail(Some("Denied for organization quillmere.")),
+        ),
+    });
+    let rendered = render_plain(&projection, 0, None);
+    assert!(rendered.contains("details withheld"), "{rendered}");
+    assert!(
+        rendered.contains("Provider detail (local only): Denied for organization quillmere."),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Request id: req_fixture_local_raw"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn e4_incomplete_assistant_item_has_explicit_plain_label() {
     let mut projection = SessionProjection::default();
     projection.apply(&EventPayload::Item(ItemEvent::Completed {

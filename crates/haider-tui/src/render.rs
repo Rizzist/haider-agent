@@ -15238,7 +15238,12 @@ fn error_entry_lines<'a>(
     if budget == 0 {
         return;
     }
-    for logical in presentation.detail.split('\n') {
+    let identity = crate::projection::error_identity_lines(presentation);
+    for logical in presentation
+        .detail
+        .split('\n')
+        .chain(identity.iter().map(String::as_str))
+    {
         for row in wrap_body(logical, budget) {
             lines.push(Line::from(vec![
                 Span::raw(" "),

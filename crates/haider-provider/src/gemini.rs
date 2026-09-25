@@ -2722,9 +2722,9 @@ pub fn replay_gemini_http_error(
         format!("Gemini HTTP {status} returned {}", provider_kind_name(kind))
     };
     let mut error = ProviderError::new(kind, message);
-    if kind == ProviderErrorKind::InvalidRequest
-        && let Some(prose) = crate::error_detail::http_error_prose(body)
-    {
+    // Every class goes through the template boundary: known Gemini messages
+    // render, unknown prose stays owner-local.
+    if let Some(prose) = crate::error_detail::http_error_prose(body) {
         error = error.with_provider_detail(&prose);
     }
     error
@@ -2874,8 +2874,10 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
+/// Malformed-frame messages interpolate provider-controlled values (event
+/// names, ids, decoder text), so they are published only via templates.
 fn malformed(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+    ProviderError::new(ProviderErrorKind::MalformedFrame, message).with_untrusted_message()
 }
 
 fn stream_interrupted(message: impl Into<String>) -> ProviderError {
