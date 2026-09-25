@@ -3630,40 +3630,46 @@ fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::S
 /// Negotiates an explicit `max_tokens` request (`session.create`, or
 /// `session.select_model` carrying `max_tokens`) against the validated model
 /// row: zero derives the default budget bounded by the row maximum, a positive
-/// value is an exact user-set override, and an override above the row maximum
-/// is a typed refusal rather than a silent clamp — the user asked for that
-/// exact value in this request.
+/// value is an exact user-set override, and an override above the row's
+/// explicit ceiling is a typed refusal rather than a silent clamp — the user
+/// asked for that exact value in this request. The explicit ceiling equals the
+/// row maximum when that maximum is sourced; when it is only the unverified
+/// fallback guess, explicit values up to `MAX_OUTPUT_LIMIT` (strictly below a
+/// known context window) are admitted and the provider-stated one-shot retry
+/// is the backstop.
 pub(super) fn resolve_session_output_limit(
     requested: u64,
     selection: &crate::model_select::ValidatedModelSelection,
 ) -> Result<haider_protocol::output_budget::SessionOutputBudgetV1, (String, haider_rpc::ErrorData)>
 {
-    if requested > selection.max_output_tokens {
+    if requested > selection.explicit_max_output_tokens {
         return Err((
             format!(
                 "max_tokens {requested} exceeds model `{}` · `{}` output limit {}",
-                selection.model, selection.provider, selection.max_output_tokens
+                selection.model, selection.provider, selection.explicit_max_output_tokens
             ),
             haider_rpc::ErrorData::ModelOutputLimit {
                 provider: selection.provider.clone(),
                 model: selection.model.clone(),
                 requested,
-                max_output_tokens: selection.max_output_tokens,
+                max_output_tokens: selection.explicit_max_output_tokens,
                 context_window: selection.context_window,
             },
         ));
     }
     Ok(
-        haider_protocol::output_budget::SessionOutputBudgetSourceV1::from_request(requested)
-            .apply(selection.max_output_tokens),
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::from_request(requested).apply(
+            selection.max_output_tokens,
+            selection.explicit_max_output_tokens,
+        ),
     )
 }
 
 /// Re-applies a session's STORED budget to a newly selected model. A derived
 /// budget re-derives `min(default, new max)` silently; a user-set budget keeps
-/// the user's request and is clamped to the new maximum with a typed notice.
-/// Legacy metadata without a recorded source is classified first. Model
-/// switches therefore never fail on the output budget.
+/// the user's request and is clamped to the new explicit ceiling with a typed
+/// notice. Legacy metadata without a recorded source is classified first.
+/// Model switches therefore never fail on the output budget.
 pub(super) fn reapply_session_output_budget(
     current: &haider_protocol::session::SessionMetadataV1,
     selection: &crate::model_select::ValidatedModelSelection,
@@ -3672,7 +3678,10 @@ pub(super) fn reapply_session_output_budget(
         current.max_tokens_source,
         current.max_tokens,
     )
-    .apply(selection.max_output_tokens)
+    .apply(
+        selection.max_output_tokens,
+        selection.explicit_max_output_tokens,
+    )
 }
 
 impl HubConnection {

@@ -221,22 +221,24 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 )?);
             }
             "--max-requests" => return Err("duplicate --max-requests flag".into()),
-            "--max-tokens" if max_output_tokens.is_none() => {
+            // `--max-tokens` keeps its 0.0.972 meaning: the cumulative run
+            // token budget. The per-response output budget has its own flag.
+            "--max-tokens" if budget.max_tokens.is_none() => {
                 index += 1;
-                max_output_tokens = Some(parse_positive_u64(
+                budget.max_tokens = Some(parse_positive_u64(
                     rest.get(index).map(String::as_str),
                     "--max-tokens",
                 )?);
             }
             "--max-tokens" => return Err("duplicate --max-tokens flag".into()),
-            "--max-total-tokens" if budget.max_tokens.is_none() => {
+            "--max-output-tokens" if max_output_tokens.is_none() => {
                 index += 1;
-                budget.max_tokens = Some(parse_positive_u64(
+                max_output_tokens = Some(parse_positive_u64(
                     rest.get(index).map(String::as_str),
-                    "--max-total-tokens",
+                    "--max-output-tokens",
                 )?);
             }
-            "--max-total-tokens" => return Err("duplicate --max-total-tokens flag".into()),
+            "--max-output-tokens" => return Err("duplicate --max-output-tokens flag".into()),
             "--max-cost" if budget.max_cost_microusd.is_none() => {
                 index += 1;
                 budget.max_cost_microusd =
@@ -875,7 +877,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             request_model
         },
         // Zero is the feature-gated daemon sentinel for deriving the exact
-        // model-row limit. Explicit --max-tokens remains an exact override.
+        // model-row limit. Explicit --max-output-tokens is an exact override.
         max_tokens: options.max_output_tokens.unwrap_or(0),
         budget: options.budget.clone(),
         seed: options.seed,
@@ -1121,8 +1123,9 @@ Permission options:\n\
 \n\
 Use --session ID to submit an ordinary turn to an existing native session.\n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
---timeout <duration>, --start, --status, --stop, and --replay. --max-tokens N\n\
-sets the per-response output limit; --max-total-tokens N caps cumulative usage.";
+--timeout <duration>, --start, --status, --stop, and --replay.\n\
+Budgets: --max-tokens N caps the run's cumulative token usage (exit 77 when\n\
+exhausted); --max-output-tokens N sets the per-response output limit.";
 
 pub(crate) fn read_stdin_prompt_from(mut input: impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();
@@ -2429,7 +2432,7 @@ mod tests {
             vec![],
             vec!["--request-tranche", "40"],
             vec!["--max-requests", "80"],
-            vec!["--max-total-tokens", "1000"],
+            vec!["--max-tokens", "1000"],
             vec!["--max-cost", "0.50"],
             vec!["--max-time", "10s"],
         ] {

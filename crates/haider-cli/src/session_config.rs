@@ -33,7 +33,7 @@ pub(crate) struct ConfigOptions {
     /// the provider cache prefix, and the daemon refuses it without explicit
     /// consent. This flag IS that consent for headless callers.
     pub(crate) confirm_epoch: bool,
-    /// Per-response output budget: `Some(0)` (`--max-tokens auto`) returns to
+    /// Per-response output budget: `Some(0)` (`--max-output-tokens auto`) returns to
     /// the model-derived budget, `Some(n)` sets a user budget.
     pub(crate) max_tokens: Option<u64>,
 }
@@ -171,7 +171,7 @@ pub(crate) async fn session_config_command(session_id: &str, rest: &[String]) ->
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--max-tokens <n|auto>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] [--agent-type <id|none>] [--confirm-epoch]"
+                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--max-output-tokens <n|auto>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] [--agent-type <id|none>] [--confirm-epoch]"
             );
             return ExitCode::SUCCESS;
         }
@@ -245,9 +245,10 @@ pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ConfigOptions>, St
                 options.model = Some(required_value(rest, index, "--model", "a model id")?);
             }
             "--model" => return Err("duplicate --model flag".into()),
-            "--max-tokens" if options.max_tokens.is_none() => {
+            "--max-output-tokens" if options.max_tokens.is_none() => {
                 index += 1;
-                let value = required_value(rest, index, "--max-tokens", "a token count or auto")?;
+                let value =
+                    required_value(rest, index, "--max-output-tokens", "a token count or auto")?;
                 options.max_tokens = Some(if value == "auto" {
                     0
                 } else {
@@ -255,13 +256,14 @@ pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ConfigOptions>, St
                         Ok(tokens) if tokens > 0 => tokens,
                         _ => {
                             return Err(
-                                "--max-tokens requires a positive token count or auto".into()
+                                "--max-output-tokens requires a positive token count or auto"
+                                    .into(),
                             );
                         }
                     }
                 });
             }
-            "--max-tokens" => return Err("duplicate --max-tokens flag".into()),
+            "--max-output-tokens" => return Err("duplicate --max-output-tokens flag".into()),
             "--effort" if options.effort.is_none() => {
                 index += 1;
                 options.effort = Some(required_value(rest, index, "--effort", "a level")?);
@@ -367,7 +369,7 @@ async fn apply_mutations(
         return Err(ConfigError::AccountSelectionUnsupported);
     }
     if options.model.is_some() || options.max_tokens.is_some() {
-        // `--max-tokens` alone re-selects the current pair with a new budget.
+        // `--max-output-tokens` alone re-selects the current pair with a new budget.
         let (provider, model) = match options.model.as_deref() {
             Some(selector) => resolve_model_selector(selector, providers)?,
             None => {

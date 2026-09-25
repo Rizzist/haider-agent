@@ -9,6 +9,7 @@ fn known_subscription_models_have_large_static_limits() {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 128_000,
+            output_limit_sourced: true,
         }
     );
     assert_eq!(
@@ -37,6 +38,7 @@ fn known_subscription_models_have_large_static_limits() {
             StaticModelLimits {
                 context_window: Some(200_000),
                 max_output_tokens: 100_000,
+                output_limit_sourced: true,
             }
         );
     }
@@ -45,6 +47,7 @@ fn known_subscription_models_have_large_static_limits() {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 128_000,
+            output_limit_sourced: true,
         }
     );
     assert_eq!(
@@ -52,6 +55,7 @@ fn known_subscription_models_have_large_static_limits() {
         StaticModelLimits {
             context_window: Some(200_000),
             max_output_tokens: 64_000,
+            output_limit_sourced: true,
         }
     );
 }
@@ -102,6 +106,7 @@ fn conservative_context_fallbacks_match_adapter_capabilities() {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 384_000,
+            output_limit_sourced: true,
         }
     );
     assert_eq!(
@@ -109,6 +114,7 @@ fn conservative_context_fallbacks_match_adapter_capabilities() {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 384_000,
+            output_limit_sourced: true,
         },
         "deepseek-flash (V4.1-Flash) is a current documented ID"
     );
@@ -120,6 +126,32 @@ fn conservative_context_fallbacks_match_adapter_capabilities() {
         static_model_limits("deepseek", "deepseek-reasoner").context_window,
         None
     );
+}
+
+/// Gemini 3.x IDs with official model pages (checked 2026-09-25): 1,048,576
+/// input / 65,536 output. Antigravity's `-high` spelling shares the row.
+#[test]
+fn documented_gemini_3_rows_are_sourced() {
+    for model in [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-high",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+    ] {
+        assert_eq!(
+            static_model_limits("gemini", model),
+            StaticModelLimits {
+                context_window: Some(1_048_576),
+                max_output_tokens: 65_536,
+                output_limit_sourced: true,
+            },
+            "{model}"
+        );
+    }
+    assert!(!static_model_limits("gemini", "gemini-3.8-flash-tts").output_limit_sourced);
 }
 
 #[test]
@@ -140,9 +172,70 @@ fn projected_output_limit_prefers_the_catalog_and_respects_bounds() {
     );
     assert_eq!(
         model_output_limit("custom", "future-model", Some(64_000), Some(16_000)),
-        16_000,
-        "the output maximum never exceeds a known context window"
+        8_000,
+        "an output maximum that would reach a known context window is cut to half of it"
     );
+    assert_eq!(
+        model_output_limit("custom", "future-model", Some(15_999), Some(16_000)),
+        15_999,
+        "a maximum strictly below the window is kept"
+    );
+    assert_eq!(
+        model_output_limit("gemini", "gemini-3-pro-image-preview", None, Some(65_536)),
+        32_768
+    );
+}
+
+/// S1: an unverified fallback maximum is a guess, so explicit budgets may go
+/// up to the adapter maximum (strictly below a known window); a sourced row or
+/// a catalog declaration is exact.
+#[test]
+fn explicit_ceiling_lifts_only_the_unverified_fallback() {
+    use haider_provider::{UNKNOWN_OUTPUT_LIMIT, explicit_output_ceiling};
+    for (provider, model) in [
+        ("custom973", "custom-unknown"),
+        ("anthropic", "claude-sonnet-4-20250514"),
+        ("anthropic-oauth", "claude-3-7-sonnet-latest"),
+        ("gemini", "gemini-9-unlisted"),
+        ("openai", "gpt-unknown"),
+        ("deepseek", "deepseek-reasoner"),
+    ] {
+        assert!(!static_model_limits(provider, model).output_limit_sourced);
+        let projected = model_output_limit(provider, model, None, None);
+        assert_eq!(projected, UNKNOWN_OUTPUT_LIMIT, "{provider}/{model}");
+        assert_eq!(
+            explicit_output_ceiling(provider, model, projected, None),
+            MAX_OUTPUT_LIMIT,
+            "{provider}/{model}"
+        );
+        let windowed = model_output_limit(provider, model, None, Some(100_000));
+        assert_eq!(
+            explicit_output_ceiling(provider, model, windowed, Some(100_000)),
+            50_000,
+            "{provider}/{model} stays strictly below a known window"
+        );
+    }
+    // A catalog that declares a different limit for an unsourced row is exact.
+    let declared = model_output_limit("custom973", "custom-unknown", Some(16_000), None);
+    assert_eq!(
+        explicit_output_ceiling("custom973", "custom-unknown", declared, None),
+        16_000
+    );
+    // Sourced rows, including a sourced 8,192, are exact.
+    for (provider, model, context_window) in [
+        ("gemini", "gemini-2.0-flash", Some(1_048_576)),
+        ("openai", "gpt-4o", Some(128_000)),
+        ("anthropic", "claude-sonnet-4-5", Some(200_000)),
+        ("fake", "fake-model", None),
+    ] {
+        assert!(static_model_limits(provider, model).output_limit_sourced);
+        let projected = model_output_limit(provider, model, None, context_window);
+        assert_eq!(
+            explicit_output_ceiling(provider, model, projected, context_window),
+            projected,
+            "{provider}/{model}"
+        );
+    }
 }
 
 #[test]
@@ -171,6 +264,7 @@ fn first_party_subscription_rows_are_sourced_and_leave_the_unknown_fallback() {
             StaticModelLimits {
                 context_window,
                 max_output_tokens,
+                output_limit_sourced: true,
             },
             "{provider}/{model}"
         );
@@ -186,6 +280,7 @@ fn first_party_subscription_rows_are_sourced_and_leave_the_unknown_fallback() {
             StaticModelLimits {
                 context_window: None,
                 max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
+                output_limit_sourced: false,
             },
             "{provider}/{model} is truly unknown"
         );
@@ -251,5 +346,20 @@ fn provider_stated_output_limits_parse_only_lowering_invalid_requests() {
     assert_eq!(
         provider_stated_output_limit(&invalid("tool schema invalid"), 30_000),
         None
+    );
+    assert_eq!(
+        provider_stated_output_limit(
+            &invalid("This model supports at most 10 images per request."),
+            30_000
+        ),
+        None,
+        "`supports at most` counts only when a token unit follows the number"
+    );
+    assert_eq!(
+        provider_stated_output_limit(
+            &invalid("This endpoint supports at most 8,192 tokens of output."),
+            30_000
+        ),
+        Some(8_192)
     );
 }

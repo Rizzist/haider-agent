@@ -58,7 +58,14 @@ pub(crate) struct ValidatedModelSelection {
     pub(crate) model: String,
     pub(crate) inventory_status: ModelInventoryStatusWire,
     pub(crate) context_window: Option<u64>,
+    /// Projected row maximum: bounds derived budgets and is what `haider
+    /// models` shows.
     pub(crate) max_output_tokens: u64,
+    /// Largest explicit (user-set) budget admitted: equal to
+    /// `max_output_tokens` for a sourced row, larger when that maximum is
+    /// only the unverified fallback guess
+    /// (`haider_provider::explicit_output_ceiling`).
+    pub(crate) explicit_max_output_tokens: u64,
 }
 
 /// One agent-facing row projected from the same provider summary and model
@@ -532,12 +539,19 @@ impl ModelSelectionAuthority {
             detail.and_then(|detail| detail.max_output_tokens),
             context_window,
         );
+        let explicit_max_output_tokens = haider_provider::explicit_output_ceiling(
+            provider,
+            &resolved_model,
+            max_output_tokens,
+            context_window,
+        );
         Ok(ValidatedModelSelection {
             provider: provider.to_owned(),
             model: resolved_model,
             inventory_status,
             context_window,
             max_output_tokens,
+            explicit_max_output_tokens,
         })
     }
 

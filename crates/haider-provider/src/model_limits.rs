@@ -17,6 +17,11 @@ pub const UNKNOWN_OUTPUT_LIMIT: u64 = 8_192;
 pub struct StaticModelLimits {
     pub context_window: Option<u64>,
     pub max_output_tokens: u64,
+    /// `false` when `max_output_tokens` is only the unverified
+    /// [`UNKNOWN_OUTPUT_LIMIT`] guess (custom endpoints, older or unknown IDs).
+    /// Explicit user budgets may exceed an unsourced guess
+    /// (`output_budget::explicit_output_ceiling`); a sourced maximum is exact.
+    pub output_limit_sourced: bool,
 }
 
 #[must_use]
@@ -36,11 +41,13 @@ pub fn static_model_limits(provider: &str, model: &str) -> StaticModelLimits {
         "fake" => StaticModelLimits {
             context_window: None,
             max_output_tokens: haider_protocol::output_budget::DEFAULT_OUTPUT_LIMIT,
+            output_limit_sourced: true,
         },
         // Custom profiles and unlisted adapters: unverified local fallback.
         _ => StaticModelLimits {
             context_window: None,
             max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
+            output_limit_sourced: false,
         },
     }
 }
@@ -66,6 +73,7 @@ fn anthropic_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 128_000,
+            output_limit_sourced: true,
         }
     } else if model.contains("opus-4-5")
         || model.contains("sonnet-4-5")
@@ -78,6 +86,7 @@ fn anthropic_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(200_000),
             max_output_tokens: 64_000,
+            output_limit_sourced: true,
         }
     } else {
         // Unverified older/unknown Claude: the adapter uses its conservative
@@ -85,6 +94,7 @@ fn anthropic_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: None,
             max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
+            output_limit_sourced: false,
         }
     }
 }
@@ -97,6 +107,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(400_000),
             max_output_tokens: 128_000,
+            output_limit_sourced: true,
         }
     } else if ["gpt-5-chat-latest", "gpt-5.3-chat-latest"]
         .iter()
@@ -107,6 +118,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(128_000),
             max_output_tokens: 16_384,
+            output_limit_sourced: true,
         }
     } else if ["gpt-5.4-mini", "gpt-5.4-nano"]
         .iter()
@@ -117,6 +129,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(400_000),
             max_output_tokens: 128_000,
+            output_limit_sourced: true,
         }
     } else if [
         "gpt-5.6",
@@ -141,6 +154,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(1_050_000),
             max_output_tokens: 128_000,
+            output_limit_sourced: true,
         }
     } else if [
         "gpt-5",
@@ -168,6 +182,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(400_000),
             max_output_tokens: 128_000,
+            output_limit_sourced: true,
         }
     } else if ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"]
         .iter()
@@ -179,6 +194,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(1_047_576),
             max_output_tokens: 32_768,
+            output_limit_sourced: true,
         }
     } else if ["gpt-4o", "gpt-4o-mini"]
         .iter()
@@ -189,6 +205,7 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(128_000),
             max_output_tokens: 16_384,
+            output_limit_sourced: true,
         }
     } else if ["o3", "o3-mini", "o3-pro", "o4-mini"]
         .iter()
@@ -201,12 +218,14 @@ fn openai_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(200_000),
             max_output_tokens: 100_000,
+            output_limit_sourced: true,
         }
     } else {
         // Unverified unknown OpenAI model: no context claim, local output fallback.
         StaticModelLimits {
             context_window: None,
             max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
+            output_limit_sourced: false,
         }
     }
 }
@@ -225,6 +244,7 @@ fn gemini_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(65_536),
             max_output_tokens: 32_768,
+            output_limit_sourced: true,
         }
     } else if model.contains("-image")
         || model.contains("-tts")
@@ -235,11 +255,28 @@ fn gemini_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: None,
             max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
+            output_limit_sourced: false,
         }
-    } else if model.starts_with("gemini-3.5-flash")
-        || model.starts_with("gemini-3-flash-preview")
-        || model.starts_with("gemini-2.5")
+    } else if [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-pro",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-2.5",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
     {
+        // Checked 2026-09-25 (input 1,048,576 / output 65,536 on each page):
+        // https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
+        // https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
+        // https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash
+        // https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite
+        // https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview
+        // https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite
         // https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro
         // https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite
         // https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash
@@ -247,6 +284,7 @@ fn gemini_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(1_048_576),
             max_output_tokens: 65_536,
+            output_limit_sourced: true,
         }
     } else if model.starts_with("gemini-2.0") || model.starts_with("gemini-1.5") {
         // https://ai.google.dev/gemini-api/docs/models/gemini-2.0-flash
@@ -254,12 +292,14 @@ fn gemini_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(1_048_576),
             max_output_tokens: 8_192,
+            output_limit_sourced: true,
         }
     } else {
         // Unverified unknown Gemini model: conservative local fallback.
         StaticModelLimits {
             context_window: None,
             max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
+            output_limit_sourced: false,
         }
     }
 }
@@ -280,6 +320,7 @@ fn deepseek_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: Some(1_000_000),
             max_output_tokens: 384_000,
+            output_limit_sourced: true,
         }
     } else {
         // Unverified: `deepseek-chat`/`deepseek-reasoner` were retired
@@ -288,6 +329,7 @@ fn deepseek_limits(model: &str) -> StaticModelLimits {
         StaticModelLimits {
             context_window: None,
             max_output_tokens: UNKNOWN_OUTPUT_LIMIT,
+            output_limit_sourced: false,
         }
     }
 }
@@ -314,6 +356,7 @@ fn kimi_code_limits(model: &str) -> StaticModelLimits {
         } else {
             UNKNOWN_OUTPUT_LIMIT
         },
+        output_limit_sourced: context_window.is_some(),
     }
 }
 
@@ -345,6 +388,7 @@ fn xai_limits(model: &str) -> StaticModelLimits {
         } else {
             UNKNOWN_OUTPUT_LIMIT
         },
+        output_limit_sourced: context_window.is_some(),
     }
 }
 
@@ -372,5 +416,6 @@ fn haider_code_limits(model: &str) -> StaticModelLimits {
         } else {
             UNKNOWN_OUTPUT_LIMIT
         },
+        output_limit_sourced: context_window.is_some(),
     }
 }

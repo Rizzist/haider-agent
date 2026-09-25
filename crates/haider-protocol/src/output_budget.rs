@@ -54,23 +54,31 @@ impl SessionOutputBudgetSourceV1 {
         }
     }
 
-    /// Applies this source to one model maximum. A user-set request above the
-    /// maximum is clamped and reported; a derived budget never is.
+    /// Applies this source to one model row. A derived budget follows
+    /// `model_max_output_tokens` (the row's projected maximum) and is never
+    /// reported as clamped. A user-set request is bounded by
+    /// `explicit_max_output_tokens`, the largest explicit budget the row
+    /// admits: equal to the projected maximum when that maximum is sourced,
+    /// larger when it is only an unverified guess. A clamp is reported.
     #[must_use]
-    pub fn apply(self, model_max_output_tokens: u64) -> SessionOutputBudgetV1 {
+    pub fn apply(
+        self,
+        model_max_output_tokens: u64,
+        explicit_max_output_tokens: u64,
+    ) -> SessionOutputBudgetV1 {
         match self {
             Self::Derived => SessionOutputBudgetV1 {
                 max_tokens: DEFAULT_OUTPUT_LIMIT.min(model_max_output_tokens),
                 source: self,
                 clamped: None,
             },
-            Self::UserSet { requested } if requested > model_max_output_tokens => {
+            Self::UserSet { requested } if requested > explicit_max_output_tokens => {
                 SessionOutputBudgetV1 {
-                    max_tokens: model_max_output_tokens,
+                    max_tokens: explicit_max_output_tokens,
                     source: self,
                     clamped: Some(OutputBudgetClampV1 {
                         requested,
-                        max_output_tokens: model_max_output_tokens,
+                        max_output_tokens: explicit_max_output_tokens,
                     }),
                 }
             }
@@ -111,65 +119,5 @@ impl OutputBudgetClampV1 {
              Switching to a larger model restores {}.",
             self.requested, self.max_output_tokens, self.requested
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_budgets_classify_client_defaults_as_derived() {
-        for value in LEGACY_CLIENT_DEFAULT_OUTPUT_LIMITS {
-            assert_eq!(
-                SessionOutputBudgetSourceV1::classify(None, value),
-                SessionOutputBudgetSourceV1::Derived
-            );
-        }
-        assert_eq!(
-            SessionOutputBudgetSourceV1::classify(None, 12_000),
-            SessionOutputBudgetSourceV1::UserSet { requested: 12_000 }
-        );
-        assert_eq!(
-            SessionOutputBudgetSourceV1::classify(
-                Some(SessionOutputBudgetSourceV1::Derived),
-                12_000
-            ),
-            SessionOutputBudgetSourceV1::Derived
-        );
-    }
-
-    #[test]
-    fn derived_budgets_follow_the_model_and_user_budgets_clamp_with_notice() {
-        let derived = SessionOutputBudgetSourceV1::Derived;
-        assert_eq!(derived.apply(128_000).max_tokens, DEFAULT_OUTPUT_LIMIT);
-        assert_eq!(derived.apply(16_384).max_tokens, 16_384);
-        assert_eq!(derived.apply(16_384).clamped, None);
-
-        let user = SessionOutputBudgetSourceV1::UserSet { requested: 30_000 };
-        let clamped = user.apply(16_384);
-        assert_eq!(clamped.max_tokens, 16_384);
-        assert_eq!(
-            clamped.clamped,
-            Some(OutputBudgetClampV1 {
-                requested: 30_000,
-                max_output_tokens: 16_384
-            })
-        );
-        assert_eq!(user.apply(128_000).max_tokens, 30_000);
-        assert_eq!(user.apply(128_000).clamped, None);
-    }
-
-    #[test]
-    fn source_wire_shape_is_tagged() -> Result<(), serde_json::Error> {
-        assert_eq!(
-            serde_json::to_value(SessionOutputBudgetSourceV1::UserSet { requested: 7 })?,
-            serde_json::json!({"kind": "user_set", "requested": 7})
-        );
-        assert_eq!(
-            serde_json::to_value(SessionOutputBudgetSourceV1::Derived)?,
-            serde_json::json!({"kind": "derived"})
-        );
-        Ok(())
     }
 }

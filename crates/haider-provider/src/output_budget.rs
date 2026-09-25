@@ -16,7 +16,8 @@ pub const MAX_OUTPUT_LIMIT: u64 = 384_000;
 
 /// The output maximum projected for one provider/model row. A catalog's
 /// declared value wins over the pinned table; either is bounded by
-/// [`MAX_OUTPUT_LIMIT`] and by the row's context window when one is known.
+/// [`MAX_OUTPUT_LIMIT`] and kept strictly below the row's context window when
+/// one is known (at most half the window when it would otherwise reach it).
 #[must_use]
 pub fn model_output_limit(
     provider: &str,
@@ -27,9 +28,49 @@ pub fn model_output_limit(
     let max_output_tokens = declared
         .unwrap_or_else(|| static_model_limits(provider, model).max_output_tokens)
         .min(MAX_OUTPUT_LIMIT);
-    context_window.map_or(max_output_tokens, |context_window| {
-        max_output_tokens.min(context_window)
-    })
+    below_context_window(max_output_tokens, context_window)
+}
+
+/// The largest EXPLICIT per-response budget admitted for one row whose
+/// projected maximum is `projected_max` (from [`model_output_limit`]).
+///
+/// A catalog declaration or a sourced table row is exact, so it is also the
+/// explicit ceiling. When the projection is only the unverified
+/// [`crate::UNKNOWN_OUTPUT_LIMIT`] guess (custom endpoints, older Claude,
+/// unlisted Gemini, unknown IDs), that guess must not forbid a larger request
+/// the provider may well accept: an explicit budget may go up to
+/// [`MAX_OUTPUT_LIMIT`], still strictly below a known context window. The
+/// provider-stated one-shot retry ([`provider_stated_output_limit`]) is the
+/// backstop when the provider's real maximum is lower.
+///
+/// Daemon projections carry the projected value, not the raw declaration, so a
+/// catalog that declares exactly the fallback value for an unsourced row is
+/// treated as the guess; the retry covers that case too.
+#[must_use]
+pub fn explicit_output_ceiling(
+    provider: &str,
+    model: &str,
+    projected_max: u64,
+    context_window: Option<u64>,
+) -> u64 {
+    let unsourced_guess = !static_model_limits(provider, model).output_limit_sourced
+        && projected_max == model_output_limit(provider, model, None, context_window);
+    if unsourced_guess {
+        below_context_window(MAX_OUTPUT_LIMIT, context_window).max(projected_max)
+    } else {
+        projected_max
+    }
+}
+
+/// Keeps an output maximum strictly below a known context window: the worker
+/// refuses a reserve that is not smaller than the window, so a maximum that
+/// would reach it is cut to half the window, leaving room for input.
+#[must_use]
+fn below_context_window(max_output_tokens: u64, context_window: Option<u64>) -> u64 {
+    match context_window {
+        Some(context_window) if max_output_tokens >= context_window => (context_window / 2).max(1),
+        _ => max_output_tokens,
+    }
 }
 
 /// The output maximum a provider states when it rejects a request's
@@ -62,7 +103,7 @@ fn stated_output_limit(message: &str) -> Option<u64> {
         message,
         ", which is the maximum allowed number of output tokens",
     )
-    .or_else(|| number_after(message, "supports at most "))
+    .or_else(|| tokens_after(message, "supports at most "))
     .or_else(|| {
         message
             .find("valid range of max_tokens is [")
@@ -85,10 +126,23 @@ fn leading_number(text: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn number_after(message: &str, marker: &str) -> Option<u64> {
-    message
-        .find(marker)
-        .and_then(|start| leading_number(&message[start + marker.len()..]))
+/// The number after `marker`, only when a token unit follows it within the
+/// next two words ("16384 completion tokens", "8192 tokens"), so that e.g.
+/// "supports at most 10 images" never lowers the output budget.
+fn tokens_after(message: &str, marker: &str) -> Option<u64> {
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let number_len = rest
+        .find(|character: char| {
+            !(character.is_ascii_digit() || character == ',' || character == '_')
+        })
+        .unwrap_or(rest.len());
+    let number = leading_number(&rest[..number_len])?;
+    rest[number_len..]
+        .split_whitespace()
+        .take(2)
+        .any(|word| word.to_ascii_lowercase().starts_with("token"))
+        .then_some(number)
 }
 
 fn number_before(message: &str, marker: &str) -> Option<u64> {

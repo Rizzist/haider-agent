@@ -85,12 +85,12 @@ fn config_flag_vocabulary_is_exact() {
     assert!(parse_options(&args(&["--help"])).expect("parses").is_none());
 }
 
-/// D1 (973 output cap): `--max-tokens <n|auto>` is an explicit per-session
+/// D1 (973 output cap): `--max-output-tokens <n|auto>` is an explicit per-session
 /// output budget. `auto` returns to the model-derived budget (wire `0`); a
 /// bare budget change needs both the model-select and output-limit features.
 #[test]
-fn max_tokens_flag_sets_or_derives_the_session_budget() {
-    let options = parse_options(&args(&["--max-tokens", "12000"]))
+fn max_output_tokens_flag_sets_or_derives_the_session_budget() {
+    let options = parse_options(&args(&["--max-output-tokens", "12000"]))
         .expect("parses")
         .expect("not help");
     assert_eq!(options.max_tokens, Some(12_000));
@@ -99,7 +99,7 @@ fn max_tokens_flag_sets_or_derives_the_session_budget() {
     assert!(features.contains(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1));
     assert!(features.contains(haider_rpc::FEATURE_MODEL_OUTPUT_LIMITS_V1));
     assert_eq!(
-        parse_options(&args(&["--max-tokens", "auto"]))
+        parse_options(&args(&["--max-output-tokens", "auto"]))
             .expect("parses")
             .expect("not help")
             .max_tokens,
@@ -107,13 +107,18 @@ fn max_tokens_flag_sets_or_derives_the_session_budget() {
     );
     for bad in ["0", "-5", "lots", "--json"] {
         assert!(
-            parse_options(&args(&["--max-tokens", bad])).is_err(),
+            parse_options(&args(&["--max-output-tokens", bad])).is_err(),
             "{bad} is not a budget"
         );
     }
     assert_eq!(
-        parse_options(&args(&["--max-tokens", "1", "--max-tokens", "2"])),
-        Err("duplicate --max-tokens flag".to_owned())
+        parse_options(&args(&[
+            "--max-output-tokens",
+            "1",
+            "--max-output-tokens",
+            "2"
+        ])),
+        Err("duplicate --max-output-tokens flag".to_owned())
     );
 }
 

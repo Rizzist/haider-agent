@@ -689,3 +689,108 @@ async fn user_set_budget_clamps_with_notice_and_select_model_sets_budgets() {
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
 }
+
+/// S1 (973 output cap): an unknown custom model's 8,192 maximum is only the
+/// unverified fallback guess. The derived budget follows it, but an explicit
+/// `max_tokens` above it (here 30,000) is admitted as the user's own budget
+/// and the next turn requests exactly that value; only a value above the
+/// adapter maximum is refused. The provider-stated one-shot retry covers a
+/// provider whose real maximum is lower.
+/// MUTATION CHECK: bound explicit requests by `max_output_tokens` instead of
+/// `explicit_max_output_tokens`. Expected runtime failure: the 30,000 select
+/// is refused with `model_output_limit` (max 8,192).
+#[tokio::test]
+async fn explicit_budget_above_unverified_fallback_is_admitted() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let root = test_root("s1-fallback-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "s1-fallback",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(FakeProvider::new(text_turn("fake answer")));
+    let custom = Arc::new(FakeProvider::new(
+        [text_turn("derived answer"), text_turn("explicit answer")].concat(),
+    ));
+    let task = ready_with_dependencies(
+        &config,
+        routed_dependencies(&[("fake", fake.clone()), ("custom973", custom.clone())]),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "s1-fallback-client",
+        "s1-fallback-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    let (session_id, generation) =
+        create_with_budget_and_attach(&mut client, &config, &workspace, "fake", "fake-v1", 0).await;
+
+    let response = select_budget(
+        &mut client,
+        &config,
+        "s1-select-custom",
+        select_body(
+            "s1-select-custom",
+            &session_id,
+            generation,
+            "custom-unknown",
+            Some("custom973"),
+        ),
+    )
+    .await;
+    assert_eq!(committed_budget(&response).max_tokens, 8_192, "derived");
+    run_turn(&mut client, &config, &session_id, generation, "s1-derived").await;
+    assert_eq!(custom.requests()[0].max_tokens, 8_192);
+
+    let mut explicit = select_body(
+        "s1-explicit",
+        &session_id,
+        generation,
+        "custom-unknown",
+        None,
+    );
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut explicit {
+        *max_tokens = Some(30_000);
+    }
+    let response = select_budget(&mut client, &config, "s1-explicit", explicit).await;
+    let budget = committed_budget(&response);
+    assert_eq!(budget.max_tokens, 30_000);
+    assert_eq!(
+        budget.source,
+        SessionOutputBudgetSourceV1::UserSet { requested: 30_000 }
+    );
+    assert_eq!(budget.clamped, None);
+    run_turn(
+        &mut client,
+        &config,
+        &session_id,
+        generation,
+        "s1-explicit-turn",
+    )
+    .await;
+    assert_eq!(custom.requests()[1].max_tokens, 30_000);
+
+    let mut over = select_body("s1-over", &session_id, generation, "custom-unknown", None);
+    if let RequestBody::SessionSelectModel { max_tokens, .. } = &mut over {
+        *max_tokens = Some(haider_provider::MAX_OUTPUT_LIMIT + 1);
+    }
+    let response = select_budget(&mut client, &config, "s1-over", over).await;
+    let ResponseBody::Error { data, .. } = response else {
+        panic!("expected typed refusal, got {response:?}");
+    };
+    assert!(matches!(
+        data,
+        Some(ErrorData::ModelOutputLimit {
+            max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+            ..
+        })
+    ));
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}

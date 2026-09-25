@@ -1783,8 +1783,12 @@ and `crates/haider-store/src/event_store.rs:5876-5946`).
 When `model_output_limits_v1` is advertised, `max_tokens: 0` is a derivation
 sentinel: after provider/model resolution the daemon persists and returns the
 smaller of its 30,000-token default and the resolved model maximum. Positive
-values remain exact client overrides and values above the row limit receive a
-typed `model_output_limit` error. A client must negotiate the feature before
+values remain exact client overrides and values above the row's explicit
+ceiling receive a typed `model_output_limit` error. The explicit ceiling is
+the row maximum when that maximum is sourced (catalog declaration or a cited
+table row); when the row maximum is only the unverified 8,192 fallback, the
+ceiling is 384,000, strictly below a known context window (see
+`docs/output-token-limits.md`). A client must negotiate the feature before
 sending zero.
 
 The created metadata records `max_tokens_source`: `{"kind":"derived"}` for a
@@ -1793,7 +1797,7 @@ zero request or `{"kind":"user_set","requested":N}` for a positive one
 defaults 4,096, 8,192 and 30,000 as derived and any other value as user-set).
 Every `session.select_model` re-applies that source to the newly selected
 model: a derived budget becomes `min(30,000, new maximum)` silently; a
-user-set budget becomes `min(requested, new maximum)`, and when that clamps
+user-set budget becomes `min(requested, new explicit ceiling)`, and when that clamps
 the response's `output_budget.clamped` carries `{requested,
 max_output_tokens}` for the client to show as a notice. A model switch never
 fails on the output budget. With `model_output_limits_v1`, a
@@ -1803,7 +1807,9 @@ session to the derived budget, a positive value becomes the user-set budget
 maximum). Selecting the session's current model with `max_tokens` changes
 only the budget. The response's additive `output_budget` is
 `{max_tokens, source, clamped?}`. CLI: `haider session <id> config
---max-tokens <n|auto>`.
+--max-output-tokens <n|auto>`; `haider run --max-output-tokens N` sets it on
+the headless session (`haider run --max-tokens N` is the cumulative run token
+budget, unchanged since 0.0.972).
 
 The exact enum strings are `"interactive"` and `"autonomous"`.
 `interactive` is the serde default and is omitted on the wire; that is a

@@ -206,7 +206,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
                 "haider: unknown or incomplete command `{other}` \
                  (supports: --version, self-test, run (-p <prompt>|-|<prompt>) \
                  [--json|--output print|json|jsonl] [--timeout <dur>] \
-                 [--max-tokens <n>] [--max-total-tokens <n>] [--max-cost <usd>] [--max-time <dur>] [--seed <n>] \
+                 [--max-tokens <n>] [--max-output-tokens <n>] [--max-cost <usd>] [--max-time <dur>] [--seed <n>] \
                  [--request-tranche <n>] [--max-requests <n>] [--resume <run-id>] \
                  [--start] | run --status <run-id> | run --stop <run-id> | run --replay <run-id> \
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
