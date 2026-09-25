@@ -106,7 +106,11 @@ impl ContextMeter {
                 window,
                 auto_compact_at,
                 threshold_projected,
-                turns_to_threshold: (!threshold_projected)
+                // The daemon's turns estimate is measured against the
+                // SNAPSHOT's window: it applies only while that is the
+                // displayed window (never after a switch, never to an
+                // unknown window).
+                turns_to_threshold: (window.is_some() && snapshot_window == window)
                     .then_some(footprint.estimated_turns_to_threshold)
                     .flatten(),
                 estimated: footprint.truth == ContextFootprintTruth::Estimated,
@@ -274,6 +278,33 @@ mod tests {
         assert_eq!(meter.percent(), None);
         assert_eq!(meter.status_text(10), "20k tok · window unknown");
         assert!(!meter.status_text(10).contains("100%"));
+    }
+
+    /// 973-context-meter verify HOLD: a switch to an unknown-window model
+    /// before its first turn must not keep the previous model's turns
+    /// estimate (it was `≈1139 turns` from a 1M window).
+    #[test]
+    fn a_switch_to_an_unknown_window_drops_the_previous_turns_estimate() {
+        let mut snapshot = footprint(2_700, 50_000, 700, Some(1_000_000), 30_000);
+        snapshot.estimated_turns_to_threshold = Some(1_139);
+        let meter = ContextMeter::resolve(Some(&snapshot), 0, 0, false, cap);
+        assert_eq!(meter.window, None);
+        assert_eq!(meter.turns_to_threshold, None);
+        assert!(
+            !meter
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("turns")),
+            "{:?}",
+            meter.detail_lines()
+        );
+        // Nor across a switch to a KNOWN window (the estimate was measured
+        // against the old window).
+        let meter = ContextMeter::resolve(Some(&snapshot), 0, 200_000, true, cap);
+        assert_eq!(meter.turns_to_threshold, None);
+        // The same model keeps it.
+        let meter = ContextMeter::resolve(Some(&snapshot), 0, 1_000_000, true, cap);
+        assert_eq!(meter.turns_to_threshold, Some(1_139));
     }
 
     /// After a switch to a model the catalog lists WITHOUT a window, the

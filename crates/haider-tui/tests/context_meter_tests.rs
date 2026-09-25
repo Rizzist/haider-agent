@@ -331,6 +331,44 @@ fn a_model_switch_rebases_the_window_and_projects_the_trigger() {
     assert!(custom.contains("103k tok · window unknown"), "{custom}");
 }
 
+/// 973-context-meter verify HOLD (regression): switching to an
+/// unknown-window model before its first turn left the previous model's
+/// `≈N turns to auto-compaction` in the ⌃G panel.
+///
+/// MUTATION CHECK: take `turns_to_threshold` whenever the trigger is not
+/// projected. Expected runtime failure: the panel keeps `≈1139 turns`.
+#[test]
+fn a_switch_to_an_unknown_window_drops_the_turns_estimate_in_the_panel() {
+    let (mut model, _driver) = live_session(true);
+    let mut opus = snapshot(
+        2_700,
+        50_000,
+        700,
+        Some(1_000_000),
+        ContextFootprintTruth::Exact,
+    );
+    opus.estimated_turns_to_threshold = Some(1_139);
+    apply_footprint(&mut model, "fp-opus-turns", &opus);
+    assert!(
+        panel_rows(&mut model, 118, 36)
+            .iter()
+            .any(|row| row.contains("≈1139 turns"))
+    );
+
+    pick_model(&mut model, "my-custom-model");
+    let rows = panel_rows(&mut model, 118, 36);
+    assert!(
+        rows.iter().any(|row| row.contains("window unknown")),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("turns to auto-compaction")),
+        "stale turns estimate after the switch: {rows:#?}"
+    );
+}
+
 /// Models OUTSIDE the catalog (the daemon knows their window, the client
 /// has no row): the snapshot's window serves — but never across a switch.
 ///
@@ -414,6 +452,16 @@ fn a_compaction_snapshot_lowers_the_meter() {
     assert!(after.contains("compact at 85%"), "{after}");
 }
 
+fn panel_rows(model: &mut AppModel, width: u16, height: u16) -> Vec<String> {
+    let screen = model.screen;
+    model.screen = Screen::Session;
+    model.token_panel = true;
+    let rows = draw(model, width, height);
+    model.token_panel = false;
+    model.screen = screen;
+    rows
+}
+
 fn golden_case(model: &mut AppModel, label: &str, out: &mut String) {
     for (width, height) in [(118_u16, 36_u16), (80, 24)] {
         out.push_str(&format!("== {label} @ {width}x{height}\n"));
@@ -476,6 +524,22 @@ fn context_meter_golden() {
         ),
     );
     golden_case(&mut model, "claude-opus-5-5 · after a turn", &mut out);
+    let mut opus = snapshot(
+        2_700,
+        50_000,
+        700,
+        Some(1_000_000),
+        ContextFootprintTruth::Exact,
+    );
+    opus.estimated_turns_to_threshold = Some(1_139);
+    apply_footprint(&mut model, "fp-opus-2", &opus);
+    golden_case(&mut model, "claude-opus-5-5 · turns estimate", &mut out);
+    pick_model(&mut model, "my-custom-model");
+    golden_case(
+        &mut model,
+        "my-custom-model · after switch (unknown window)",
+        &mut out,
+    );
     pick_model(&mut model, "claude-sonnet-4-6");
     golden_case(&mut model, "claude-sonnet-4-6 · after switch", &mut out);
     model.identity.provider = "openai-oauth".to_owned();
