@@ -13,6 +13,10 @@
 //!   with no new (tool, arguments) in between. Only a new (tool, arguments)
 //!   resets it; a changing result does not. It bounds an identical call whose
 //!   result keeps changing only in letters (etags, request IDs, nonces).
+//!   Computer-use/mobile-use screen steps (screenshot, UI tree, swipe,
+//!   scroll, tap, key on the registered `computer`/`mobile` tools) are not
+//!   counted while the observed screen changes, so paging through changing
+//!   content is never capped; identical screens stay under the result guard.
 //!
 //! Assistant text never resets either streak: narration is not an action.
 //! This is not a request-count cap: productive calls never accumulate.
@@ -150,14 +154,17 @@ impl LoopSuspectedV1 {
             .tool
             .as_deref()
             .map_or_else(String::new, |tool| format!(" (last: {tool})"));
-        let what = match self.guard {
-            LoopGuardKindV1::RepeatedActions => "repeated earlier calls with the same arguments",
+        let (what, reset) = match self.guard {
+            LoopGuardKindV1::RepeatedActions => (
+                "repeated earlier calls with the same arguments",
+                "a new call",
+            ),
             LoopGuardKindV1::RepeatedToolCalls | LoopGuardKindV1::Unknown => {
-                "repeated earlier calls and results"
+                ("repeated earlier calls and results", "a new call or result")
             }
         };
         format!(
-            "loop suspected — {} consecutive tool calls {what}{tool}; the turn stops after {} more without a new call",
+            "loop suspected — {} consecutive tool calls {what}{tool}; the turn stops after {} more without {reset}",
             self.repeated_calls, self.stop_after
         )
     }
@@ -167,16 +174,18 @@ impl LoopSuspectedV1 {
     /// not reset the streak, so the note never suggests narrating.
     #[must_use]
     pub fn model_note(&self) -> String {
-        let what = match self.guard {
-            LoopGuardKindV1::RepeatedActions => {
-                "used a tool with the same arguments as an earlier call in this turn, with no new call in between (whatever the results were)"
-            }
-            LoopGuardKindV1::RepeatedToolCalls | LoopGuardKindV1::Unknown => {
-                "repeated calls you already made in this turn and returned the same results (ignoring numbers and whitespace)"
-            }
+        let (what, reset) = match self.guard {
+            LoopGuardKindV1::RepeatedActions => (
+                "used a tool with the same arguments as an earlier call in this turn, with no new call in between (whatever the results were)",
+                "a new call",
+            ),
+            LoopGuardKindV1::RepeatedToolCalls | LoopGuardKindV1::Unknown => (
+                "repeated calls you already made in this turn and returned the same results (ignoring numbers and whitespace)",
+                "a new call or a new result",
+            ),
         };
         format!(
-            "[loop_suspected_v1]\n{}\nYour last {} tool calls {what}. Writing more text does not change this count; only a different action does. Change approach now: call a different tool or use different arguments. If you are waiting for something slow, do not poll it with the same call: run it as a background task or use a wait/monitor tool (for example `monitor`) when one is available. If you cannot make progress, finish the turn and state what is blocking you. After {} more repeated calls without a new call, this turn stops with loop_limit. This note applies only to run_id.\n[/loop_suspected_v1]",
+            "[loop_suspected_v1]\n{}\nYour last {} tool calls {what}. Writing more text does not change this count; only a different action does. Change approach now: call a different tool or use different arguments. If you are waiting for something slow, do not poll it with the same call: run it as a background task or use a wait/monitor tool (for example `monitor`) when one is available. If you cannot make progress, finish the turn and state what is blocking you. After {} more repeated calls without {reset}, this turn stops with loop_limit. This note applies only to run_id.\n[/loop_suspected_v1]",
             serde_json::json!({
                 "type": LOOP_SUSPECTED_EXTENSION_KIND,
                 "run_id": self.run_id,
@@ -244,6 +253,8 @@ mod tests {
         assert!(!text.contains("explain in text"));
         assert!(text.contains("does not change this count"));
         assert!(text.contains("monitor"));
+        assert!(text.contains("without a new call or a new result"));
+        assert!(note.summary().ends_with("without a new call or result"));
         assert_eq!(
             ToolLoopGuardV1::default(),
             ToolLoopGuardV1 {
@@ -296,6 +307,7 @@ mod tests {
         };
         assert!(note.model_note().contains("same arguments"));
         assert!(note.summary().contains("same arguments"));
+        assert!(note.summary().ends_with("without a new call"));
         assert_eq!(
             serde_json::to_value(LoopLimitV1::RepeatedActions {
                 repeated_calls: 200,

@@ -3696,7 +3696,9 @@ is a non-terminal, model-visible steer. It is committed once per streak when
 same turn (`guard: "repeated_tool_calls"`), or when 100 consecutive calls
 repeat an earlier (tool, arguments) pair with no new pair in between, whatever
 the results (`guard: "repeated_actions"`). Assistant text resets neither
-streak. It is rendered as a transcript line. After 30 (respectively 100) more
+streak. Computer-use/mobile-use screen steps (screenshot, UI tree, swipe,
+scroll, tap, key on the registered `computer`/`mobile` tools) are exempt from
+the action-level count while the observed screen changes. It is rendered as a transcript line. After 30 (respectively 100) more
 repeats with no new call, the turn ends with `loop_limit` (CLI exit 70). The
 `run_failed` payload's `presentation.loop_limit` object carries the typed
 details (`loop` tag plus counts); see `docs/jsonl-run-contract-v1.md`, "Loop

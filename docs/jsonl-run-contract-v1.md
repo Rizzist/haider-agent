@@ -397,6 +397,21 @@ The three guards:
      keeps going; polling longer than 200 identical calls belongs to a
      background task or a `monitor` watch, not to a repeated call.
    - Cycles (A, B, C, A, B, C, ...) and parallel batches count call by call.
+   - **Screen steps are exempt while the screen changes.** A call to the
+     registered `computer` or `mobile` tool whose arguments parse through
+     that tool's typed operation parser is a screen step when it is a
+     screenshot, accessibility tree or inspect (observation) or a swipe,
+     scroll, tap/left-click or key (navigation). An observation whose result
+     (image content address or UI tree) differs from the previous identical
+     observation is not counted, and navigation is not counted while the
+     latest observation was such a change. Exempt steps neither count nor
+     reset the streak. Once an observation repeats the previous identical
+     one, screen steps count again. The result-level guard still counts
+     every screen step, so identical screenshots (stuck at the end of a list)
+     are steered before request 32 and stop before request 62. Unbounded
+     swipe + screenshot paging through changing content (for example 300
+     pages) is not stopped. The same action strings inside any other tool's
+     arguments are ordinary calls.
 
 Both call guards commit their steer before the next provider request. The
 `loop_suspected_v1` item carries `run_id`, `guard` (`repeated_tool_calls` or
@@ -441,6 +456,10 @@ Accepted residuals:
   when the repeats also repeat results) keeps resetting the streaks.
 - **Letter-only result noise** on an identical call is a new result, so the
   result-level guard does not count it; the action guard bounds it at 200.
+- **Changing screens.** Computer-use/mobile-use paging whose screenshots keep
+  changing is never stopped by a call guard, including a stuck app whose
+  screen changes only in pixels (a clock or animation). Other tools mixed into
+  such a loop are still counted.
 - **Digit-only result changes** on an identical call (`Completed files: N`,
   `stage N done`) are no new result, indistinguishable from a clock: such a loop
   stops after eight no-progress continuations or 60 repeated tool calls.

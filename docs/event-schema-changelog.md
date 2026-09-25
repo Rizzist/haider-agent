@@ -49,7 +49,9 @@ results (`guard: "repeated_actions"`). A missing `guard` means
 `repeated_tool_calls`. It is model-visible and rendered as a transcript line.
 If the streak continues for 30 (respectively 100) more calls without a new
 call, the turn ends with the existing `loop_limit` error code (CLI exit 70).
-Assistant text never resets these streaks.
+Assistant text never resets these streaks. Computer-use/mobile-use screen
+steps are exempt from the action-level count while the observed screen
+changes; the result-level count still applies to them.
 
 `ErrorPresentation` gains the additive optional field `loop_limit`, present only
 on `loop_limit` failures and tagged by `loop` (`no_progress_continuations`

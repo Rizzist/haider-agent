@@ -716,6 +716,13 @@ struct ContinuationProgress {
     repeated_calls: RepeatStreak,
     /// Same (tool, arguments), any result.
     repeated_actions: RepeatStreak,
+    /// Last outcome fingerprint per (tool, arguments) fingerprint, so a
+    /// screen observation can be compared with the previous identical call.
+    last_outcome: HashMap<blake3::Hash, blake3::Hash>,
+    /// The latest computer/mobile screen observation repeated the previous
+    /// identical observation (or produced no reading): the screen is not
+    /// changing, so screen steps count toward the action guard again.
+    ui_screen_stale: bool,
 }
 
 /// One consecutive-repeat streak and its steer state.
@@ -818,13 +825,44 @@ impl ContinuationProgress {
     }
 
     /// One completed call: `args` is the canonical argument form and
-    /// `outcome` the normalized result parts.
-    fn observe_call(&mut self, kind: &[u8], name: &str, args: &str, outcome: &[&[u8]]) {
-        let action = self.seen.insert(Self::fingerprint(
-            b"action",
-            &[kind, name.as_bytes(), args.as_bytes()],
-        ));
-        self.repeated_actions.record(action, name);
+    /// `outcome` the normalized result parts. `ui` is set only for a typed
+    /// computer/mobile screen step (`continuation_fingerprint::ui_step`),
+    /// with whether the result carried a reading (an image for screenshots).
+    ///
+    /// Screen steps are exempt from the action-level guard while the screen
+    /// changes: an observation whose outcome differs from the previous
+    /// identical observation, and navigation (swipe/scroll/tap/key) while the
+    /// latest observation was such a change. They never reset the action
+    /// streak, and the result-level guard still counts them, so identical
+    /// screenshots (stuck at the end of a list) stop at 60.
+    fn observe_call(
+        &mut self,
+        kind: &[u8],
+        name: &str,
+        args: &str,
+        outcome: &[&[u8]],
+        ui: Option<(crate::continuation_fingerprint::UiStep, bool)>,
+    ) {
+        use crate::continuation_fingerprint::UiStep;
+        let action_fingerprint =
+            Self::fingerprint(b"action", &[kind, name.as_bytes(), args.as_bytes()]);
+        let outcome_fingerprint = Self::fingerprint(b"outcome", outcome);
+        let action = self.seen.insert(action_fingerprint);
+        let previous = self
+            .last_outcome
+            .insert(action_fingerprint, outcome_fingerprint);
+        let screen_step_exempt = match ui {
+            Some((UiStep::Observe { .. }, reading)) => {
+                let changed = reading && previous != Some(outcome_fingerprint);
+                self.ui_screen_stale = !changed;
+                changed
+            }
+            Some((UiStep::Navigate, _)) => !self.ui_screen_stale,
+            None => false,
+        };
+        if !screen_step_exempt {
+            self.repeated_actions.record(action, name);
+        }
         let mut all = Vec::with_capacity(outcome.len() + 2);
         all.push(name.as_bytes());
         all.push(args.as_bytes());
@@ -864,6 +902,15 @@ impl ContinuationProgress {
                     ..
                 }) = result.tool_result_for(call_id)
                 {
+                    let ui = crate::continuation_fingerprint::ui_step(name, args).map(|step| {
+                        let reading = match step {
+                            crate::continuation_fingerprint::UiStep::Observe {
+                                screenshot: true,
+                            } => !images.is_empty(),
+                            _ => true,
+                        };
+                        (step, reading)
+                    });
                     let args = crate::continuation_fingerprint::arguments(args);
                     let preview = crate::continuation_fingerprint::result(preview);
                     let images = serde_json::to_string(images).unwrap_or_default();
@@ -872,6 +919,7 @@ impl ContinuationProgress {
                         name,
                         &args,
                         &[preview.as_bytes(), &[*truncated as u8], images.as_bytes()],
+                        ui,
                     );
                 }
             }
@@ -892,6 +940,7 @@ impl ContinuationProgress {
             name,
             &args,
             &[preview.as_bytes(), &[is_error as u8]],
+            None,
         );
     }
 
@@ -1689,6 +1738,310 @@ mod continuation_progress_tests {
                 suspect_after: 30,
                 stop_after_suspected: 30,
             })
+        );
+    }
+
+    /// One local call with an optional screenshot image (by content address).
+    fn tool_call(
+        progress: &mut ContinuationProgress,
+        tool: &str,
+        args: serde_json::Value,
+        preview: &str,
+        image: Option<String>,
+        n: usize,
+    ) {
+        let call_id = format!("ui-{n}");
+        let block = Block::ToolCall {
+            call_id: call_id.clone(),
+            name: tool.into(),
+            args,
+        };
+        let images = image
+            .map(|artifact| {
+                vec![haider_protocol::tool::ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:{artifact}")),
+                    media_type: "image/png".into(),
+                    width: 1080,
+                    height: 2400,
+                    byte_len: 4096,
+                }]
+            })
+            .unwrap_or_default();
+        progress.observe_local_tools(
+            &[block],
+            &[Message::tool_result_with_images(
+                call_id, preview, false, images,
+            )],
+        );
+    }
+
+    fn swipe_args() -> serde_json::Value {
+        serde_json::json!({"action": "swipe", "from": {"x": 540, "y": 1800}, "to": {"x": 540, "y": 600}})
+    }
+
+    fn screenshot_args() -> serde_json::Value {
+        serde_json::json!({"action": "screenshot"})
+    }
+
+    /// Runs `calls` one per provider request; returns the first terminal
+    /// verdict with its request number, and the number of steers.
+    fn drive(
+        calls: usize,
+        mut call: impl FnMut(&mut ContinuationProgress, usize),
+    ) -> (Option<(usize, LoopLimitV1)>, Vec<LoopSuspectedV1>) {
+        let guard = ToolLoopGuardV1::default();
+        let run_id = RunId::new("ui");
+        let mut progress = ContinuationProgress::default();
+        let mut steers = Vec::new();
+        for request in 1..=calls + 1 {
+            match progress.tool_loop_verdict(guard, &run_id) {
+                ToolLoopVerdict::Continue => {}
+                ToolLoopVerdict::Suspected(notes) => steers.extend(notes),
+                ToolLoopVerdict::Limit(details) => return (Some((request, details)), steers),
+            }
+            if request <= calls {
+                call(&mut progress, request);
+            }
+        }
+        (None, steers)
+    }
+
+    /// Repair 7 ruling: 300 pages of mobile swipe + screenshot (identical
+    /// arguments, genuinely changing screenshots) is productive scrolling.
+    #[test]
+    fn mobile_swipe_screenshot_paging_300_pages_completes() {
+        let (stop, steers) = drive(600, |progress, request| {
+            let page = request.div_ceil(2);
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some(format!("page-{page}")),
+                    request,
+                );
+            }
+        });
+        assert_eq!(stop, None);
+        assert!(steers.is_empty(), "{steers:?}");
+        // Computer-use scroll + screenshot pages the same way.
+        let scroll = serde_json::json!({"action": "scroll", "x": 500, "y": 400, "direction": "down", "amount": 5});
+        let (stop, steers) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(
+                    progress,
+                    "computer",
+                    scroll.clone(),
+                    "scroll completed",
+                    None,
+                    request,
+                );
+            } else {
+                tool_call(
+                    progress,
+                    "computer",
+                    screenshot_args(),
+                    "screenshot",
+                    Some(format!("desk-{request}")),
+                    request,
+                );
+            }
+        });
+        assert_eq!(stop, None);
+        assert!(steers.is_empty(), "{steers:?}");
+    }
+
+    /// Identical screenshots (stuck at the end of a list) are still caught by
+    /// the result-level guard: steer before request 32, stop before 62.
+    #[test]
+    fn stuck_at_end_of_list_identical_screenshots_stop_at_61() {
+        let (stop, steers) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                "screenshot captured",
+                Some("list-end".into()),
+                request,
+            );
+        });
+        assert_eq!(
+            stop,
+            Some((
+                62,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    suspect_after: 30,
+                    stop_after_suspected: 30,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedToolCalls);
+        // Swipe + identical screenshot: both repeat, so the stop comes sooner.
+        let (stop, _) = drive(600, |progress, request| {
+            if request % 2 == 1 {
+                tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request);
+            } else {
+                tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some("list-end".into()),
+                    request,
+                );
+            }
+        });
+        assert!(matches!(
+            stop,
+            Some((
+                _,
+                LoopLimitV1::RepeatedToolCalls {
+                    repeated_calls: 60,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    /// A screen-step exemption needs the typed tool identity: the same
+    /// action strings inside another tool's arguments are ordinary calls,
+    /// and letter-noise on text tools still stops at 201 attempts.
+    #[test]
+    fn screen_step_exemption_is_typed_and_letter_noise_still_stops() {
+        for tool in ["process_exec", "fs_read", "mobile_screenshot"] {
+            let (stop, _) = drive(600, |progress, request| {
+                tool_call(
+                    progress,
+                    tool,
+                    screenshot_args(),
+                    &format!("status same; etag {}", letter_tag(request)),
+                    Some(letter_tag(request)),
+                    request,
+                );
+            });
+            assert!(
+                matches!(
+                    stop,
+                    Some((
+                        202,
+                        LoopLimitV1::RepeatedActions {
+                            repeated_calls: 200,
+                            ..
+                        }
+                    ))
+                ),
+                "{tool}: {stop:?}"
+            );
+        }
+        // An argument shape the mobile parser rejects is not a screen step.
+        let (stop, _) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                serde_json::json!({"action": "screenshot", "spoof": true}),
+                "error",
+                Some(letter_tag(request)),
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        // A screenshot without an image is not a reading: counted.
+        let (stop, _) = drive(600, |progress, request| {
+            tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                &format!("capture failed {}", letter_tag(request)),
+                None,
+                request,
+            );
+        });
+        assert!(matches!(
+            stop,
+            Some((202, LoopLimitV1::RepeatedActions { .. }))
+        ));
+        assert_eq!(
+            simulate(identical_call_changing_result(600)),
+            Outcome::Stopped {
+                attempts: 201,
+                repeated_calls: true
+            }
+        );
+    }
+
+    /// Mixed computer-use + text cycle: changing screenshots are exempt, but
+    /// the identical text call with letter noise still reaches the action
+    /// limit after 200 of its own repeats; screen steps never reset it.
+    #[test]
+    fn mixed_screen_and_text_cycle_still_bounds_the_text_loop() {
+        let (stop, steers) = drive(1200, |progress, request| {
+            let round = request.div_ceil(3);
+            match request % 3 {
+                1 => tool_call(
+                    progress,
+                    "fs_read",
+                    serde_json::json!({"path": "status.txt"}),
+                    &format!("status same; etag {}", letter_tag(request)),
+                    None,
+                    request,
+                ),
+                2 => tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request),
+                _ => tool_call(
+                    progress,
+                    "mobile",
+                    screenshot_args(),
+                    "screenshot captured",
+                    Some(format!("frame-{round}")),
+                    request,
+                ),
+            }
+        });
+        // fs_read repeat #200 is call 3*200+1 = 601; the next request stops.
+        assert_eq!(
+            stop,
+            Some((
+                602,
+                LoopLimitV1::RepeatedActions {
+                    repeated_calls: 200,
+                    suspect_after: 100,
+                    stop_after_suspected: 100,
+                }
+            ))
+        );
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].guard, LoopGuardKindV1::RepeatedActions);
+        assert_eq!(steers[0].tool.as_deref(), Some("fs_read"));
+        // Once the screen stops changing, screen steps count again.
+        let (stop, _) = drive(1200, |progress, request| match request % 3 {
+            1 => tool_call(
+                progress,
+                "fs_read",
+                serde_json::json!({"path": "status.txt"}),
+                &format!("status same; etag {}", letter_tag(request)),
+                None,
+                request,
+            ),
+            2 => tool_call(progress, "mobile", swipe_args(), "\"ack\"", None, request),
+            _ => tool_call(
+                progress,
+                "mobile",
+                screenshot_args(),
+                "screenshot captured",
+                Some("frozen".into()),
+                request,
+            ),
+        });
+        assert!(
+            matches!(stop, Some((request, LoopLimitV1::RepeatedActions { .. })) if request < 300),
+            "{stop:?}"
         );
     }
 

@@ -175,6 +175,50 @@ pub(super) fn result(input: &str) -> String {
     lines.join("\n")
 }
 
+/// A computer-use or mobile-use screen step, recognized by the typed tool
+/// identity (the registered `computer`/`mobile` tool, whose arguments parse
+/// through that tool's own typed operation parser), never by an action string
+/// inside another tool's arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiStep {
+    /// Screenshot, accessibility tree or inspect: reads the screen state.
+    /// `screenshot` requires an image in the result to count as a reading.
+    Observe { screenshot: bool },
+    /// Swipe, scroll, tap/click or key navigation.
+    Navigate,
+}
+
+/// Classifies a local call as a screen observation or navigation step.
+pub(crate) fn ui_step(tool: &str, args: &Value) -> Option<UiStep> {
+    use haider_protocol::computer::{COMPUTER_TOOL_NAME, ComputerAction};
+    use haider_protocol::mobile::{MOBILE_TOOL_NAME, MobileAction};
+    if tool == COMPUTER_TOOL_NAME {
+        let operation = haider_tools::ComputerOperation::from_tool_args(args.clone()).ok()?;
+        return match operation.action() {
+            ComputerAction::Screenshot => Some(UiStep::Observe { screenshot: true }),
+            ComputerAction::Inspect { .. } => Some(UiStep::Observe { screenshot: false }),
+            ComputerAction::Scroll { .. }
+            | ComputerAction::Key { .. }
+            | ComputerAction::LeftClick { .. } => Some(UiStep::Navigate),
+            _ => None,
+        };
+    }
+    if tool == MOBILE_TOOL_NAME {
+        let operation = haider_tools::MobileOperation::from_tool_args(args.clone()).ok()?;
+        return match operation.action() {
+            MobileAction::Screenshot {} => Some(UiStep::Observe { screenshot: true }),
+            MobileAction::A11yTree {} | MobileAction::Inspect { .. } => {
+                Some(UiStep::Observe { screenshot: false })
+            }
+            MobileAction::Swipe { .. } | MobileAction::Tap { .. } | MobileAction::Key { .. } => {
+                Some(UiStep::Navigate)
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
