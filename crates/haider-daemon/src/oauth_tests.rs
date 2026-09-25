@@ -6572,3 +6572,94 @@ async fn anthropic_profile_rejection_is_not_retried_but_login_still_saves() {
         .is_some_and(haider_protocol::credential::AccountPrincipal::identity_unverified)
     );
 }
+
+/// The debug-only fake-OAuth hook accepts ONLY an `http://127.x.y.z:<port>`
+/// origin; anything else is refused (and would disable the provider).
+#[cfg(debug_assertions)]
+#[test]
+fn debug_fake_oauth_origin_is_numeric_loopback_only() {
+    use super::debug_fake_oauth::parse_origin;
+    assert!(parse_origin("http://127.0.0.1:43123").is_some());
+    assert!(parse_origin("http://127.0.0.1:43123/").is_some());
+    assert!(parse_origin("http://127.9.8.7:80").is_some());
+    for rejected in [
+        "https://127.0.0.1:43123",
+        "http://localhost:43123",
+        "http://[::1]:43123",
+        "http://10.0.0.1:43123",
+        "http://claude.ai:443",
+        "http://127.0.0.1",
+        "http://127.0.0.1:43123/oauth",
+        "http://127.0.0.1:43123/?x=1",
+        "http://user:pw@127.0.0.1:43123",
+        "http://127.0.0.1:43123/#frag",
+        "not a url",
+    ] {
+        assert!(
+            parse_origin(rejected).is_none(),
+            "{rejected} must be refused"
+        );
+    }
+}
+
+/// The hook rewrites every token-bearing endpoint AND the issuer, so a
+/// live-issued bundle can never validate against the fake registration.
+#[cfg(debug_assertions)]
+#[test]
+fn debug_fake_oauth_rewrites_endpoints_and_issuer() {
+    let live = OAuthProviderCatalog::default()
+        .registration(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)
+        .expect("anthropic registration");
+    assert_eq!(live.issuer, "https://claude.ai");
+    let origin = super::debug_fake_oauth::parse_origin("http://127.0.0.1:43123").expect("origin");
+    let fake = super::debug_fake_oauth::apply_origin((*live).clone(), &origin).expect("fake");
+    assert_eq!(fake.issuer, "http://127.0.0.1:43123");
+    assert_eq!(
+        fake.authorization_endpoint.as_str(),
+        "http://127.0.0.1:43123/oauth/authorize"
+    );
+    assert_eq!(
+        fake.token_endpoint.as_str(),
+        "http://127.0.0.1:43123/oauth/token"
+    );
+    assert_eq!(
+        fake.identity_endpoint.as_ref().map(Url::as_str),
+        Some("http://127.0.0.1:43123/api/oauth/profile")
+    );
+    assert_ne!(fake.issuer, live.issuer);
+}
+
+/// A bundle issued by another authority (e.g. a live Claude token while the
+/// registration points at a debug fake) never leaves the process on refresh.
+#[tokio::test]
+async fn refresh_never_sends_a_token_to_a_registration_that_did_not_issue_it() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    let descriptor = oauth_descriptor_for_test();
+    let expired = now_ms().expect("clock").saturating_sub(1);
+    let foreign = OAuthTokenBundleV1::new(
+        "fake-oauth".into(),
+        "https://claude.ai".into(),
+        AUDIENCE.into(),
+        Some("fake-api-resource".into()),
+        "Bearer".into(),
+        Zeroizing::new(b"ACCESS_FOREIGN_SENTINEL_51c0".to_vec()),
+        Some(Zeroizing::new(b"REFRESH_FOREIGN_SENTINEL_77e2".to_vec())),
+        expired,
+        Some(expired.saturating_add(3_600_000)),
+        SCOPES.split_ascii_whitespace().map(str::to_owned).collect(),
+        OAuthIdentityV1 {
+            subject_hash: "foreign-subject".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        1,
+    )
+    .expect("foreign bundle");
+    vault
+        .put(&descriptor.alias, &foreign.encode().expect("encode"))
+        .expect("seed");
+    let (broker, _snapshot, descriptor) = broker_for(&server, Arc::clone(&vault), descriptor);
+    let _ = broker.resolve(&descriptor).await;
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+}

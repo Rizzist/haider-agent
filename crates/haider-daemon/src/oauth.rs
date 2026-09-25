@@ -917,6 +917,99 @@ fn invalid_metadata() -> OAuthPublicError {
     OAuthPublicError::new("invalid_provider_metadata", false)
 }
 
+/// DEBUG/TEST BUILDS ONLY — the whole module is compiled out of release
+/// binaries (`debug_assertions` is off in the `release` and `ci` profiles).
+///
+/// `HAIDER_TEST_FAKE_OAUTH_ORIGIN=http://127.0.0.1:<port>` points the Claude
+/// (`anthropic-oauth`) registration at a local fake OAuth/profile server
+/// (`scripts/test-support/fake_oauth_server.py`, see
+/// `docs/testing/fake-oauth.md`) so real `haiderd` binaries can run
+/// end-to-end login/re-login tests.
+///
+/// Safety properties:
+/// - explicit opt-in: nothing changes unless the variable is set;
+/// - numeric IPv4 loopback `http://127.x.y.z:<port>` only, with no path,
+///   query, fragment or credentials; any other value disables the provider
+///   rather than falling back to the live endpoints;
+/// - the fake registration's ISSUER is the fake origin, so a bundle issued
+///   by the real provider (`https://claude.ai`) fails
+///   `validate_bundle_against`/issuer checks and is never refreshed, probed
+///   or otherwise sent to the fake server (and fake-issued bundles never
+///   reach the real token or profile endpoints).
+#[cfg(debug_assertions)]
+pub(crate) mod debug_fake_oauth {
+    use super::{OAuthProviderRegistration, Url};
+
+    pub(crate) const ORIGIN_ENV: &str = "HAIDER_TEST_FAKE_OAUTH_ORIGIN";
+    /// Providers the fake may stand in for: authorization-code providers whose
+    /// identity comes from the token grant plus a profile document (no
+    /// signed ID token a fake could not honestly produce).
+    const FAKEABLE_PROVIDERS: [&str; 1] = [haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME];
+
+    /// `Some(origin)` only for an `http://<ipv4 loopback>:<port>` value.
+    pub(crate) fn parse_origin(value: &str) -> Option<Url> {
+        let url = Url::parse(value).ok()?;
+        let loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback());
+        (url.scheme() == "http"
+            && loopback
+            && url.port().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && matches!(url.path(), "" | "/")
+            && url.query().is_none()
+            && url.fragment().is_none())
+        .then_some(url)
+    }
+
+    pub(super) fn apply(
+        registration: OAuthProviderRegistration,
+    ) -> Option<OAuthProviderRegistration> {
+        let Some(value) = std::env::var_os(ORIGIN_ENV) else {
+            return Some(registration);
+        };
+        if !FAKEABLE_PROVIDERS.contains(&registration.provider_id.as_str()) {
+            return Some(registration);
+        }
+        let Some(origin) = value.to_str().and_then(parse_origin) else {
+            eprintln!(
+                "haiderd: {ORIGIN_ENV} is not an http://127.x.y.z:<port> origin; {} OAuth is disabled",
+                registration.provider_id
+            );
+            return None;
+        };
+        apply_origin(registration, &origin)
+    }
+
+    pub(crate) fn apply_origin(
+        mut registration: OAuthProviderRegistration,
+        origin: &Url,
+    ) -> Option<OAuthProviderRegistration> {
+        let join = |path: &str| origin.join(path).ok();
+        registration.authorization_endpoint = join("/oauth/authorize")?;
+        registration.token_endpoint = join("/oauth/token")?;
+        registration.identity_endpoint = Some(join("/api/oauth/profile")?);
+        registration.issuer = origin.as_str().trim_end_matches('/').to_owned();
+        // Once per process: the catalog is rebuilt for legacy probes.
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| {
+            eprintln!(
+                "haiderd: TEST MODE — {} OAuth uses the fake server at {}",
+                registration.provider_id, registration.issuer
+            );
+        });
+        Some(registration)
+    }
+}
+
+/// The issuer this process's catalog uses for `provider` (the live issuer in
+/// release builds; the fake origin under the debug-only test hook). Legacy
+/// profile probes send a row's token only when its bundle carries it.
+pub(crate) fn catalog_issuer(provider: &str) -> Option<String> {
+    OAuthProviderCatalog::default()
+        .registration(provider)
+        .map(|registration| registration.issuer.clone())
+}
+
 /// One availability authority shared by RPC and the later management view.
 #[derive(Clone)]
 pub struct OAuthProviderCatalog {
@@ -977,6 +1070,8 @@ impl Default for OAuthProviderCatalog {
                 registration.flow_mode = metadata.flow_mode;
                 registration.auth_header_set = metadata.auth_header_set;
                 registration.refresh_policy = metadata.refresh_policy;
+                #[cfg(debug_assertions)]
+                let registration = debug_fake_oauth::apply(registration)?;
                 Some((registration.provider_id.clone(), Arc::new(registration)))
             })
             .collect::<HashMap<_, _>>();
@@ -6094,6 +6189,18 @@ impl CredentialBroker {
                 "OAuth registration is unavailable",
             ));
         };
+        // A refresh token is only ever sent to the registration that issued
+        // it (also what keeps a live token away from a debug fake issuer).
+        // `refresh_bundle_from_response` rejects this after the fact; the
+        // token must not leave the process in the first place.
+        if bundle.issuer != registration.issuer {
+            return Err(rotation_error(
+                descriptor,
+                haider_accounts::RotationTrigger::RefreshFailed,
+                false,
+                "OAuth token was issued by a different authority; sign in again",
+            ));
+        }
         let active_serialized_marker = bundle
             .refresh_rejected_until_unix_ms
             .is_some_and(|until| now_ms().is_none_or(|now| now < until));

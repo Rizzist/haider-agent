@@ -2775,7 +2775,14 @@ fn render_accounts(
         .as_ref()
         .filter(|_| model.accounts.pending_replace.is_none())
     {
-        lines.push(Line::styled(message.clone(), theme.gold_style()));
+        // Word-wrapped: a re-login/duplicate notice routinely exceeds the
+        // width, and the body paragraph does not wrap (a clipped notice hid
+        // WHICH alias was saved and that the old one still needs attention).
+        // One column stays free for the `⋮` scroll gutter.
+        let width = usize::from(area.width.saturating_sub(1)).max(1);
+        for chunk in wrap_words(message, width) {
+            lines.push(Line::styled(chunk, theme.gold_style()));
+        }
     }
     // 970 owner decision: `google-antigravity` ships ENABLED BY DEFAULT with
     // no policy gate and carries this STANDING disclosure instead — one
@@ -8939,6 +8946,42 @@ fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus)
 /// Round 4 — plain character wrap for /loom detail lines: the screen
 /// scrolls VERTICALLY with exact line math (no Paragraph wrap), so long
 /// job/pipe lines fold here instead of clipping.
+/// Greedy word wrap by terminal cells; a word wider than `width` falls back
+/// to [`wrap_plain`]'s cell folding.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        let needed = if current.is_empty() {
+            word.width()
+        } else {
+            current.width() + 1 + word.width()
+        };
+        if needed <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if word.width() > width {
+            let mut folded = wrap_plain(word, width);
+            current = folded.pop().unwrap_or_default();
+            lines.extend(folded);
+        } else {
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     // Round 5: fold by TERMINAL CELLS, not scalars — CJK/emoji are two

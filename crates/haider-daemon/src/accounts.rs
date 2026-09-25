@@ -2779,8 +2779,13 @@ fn legacy_anthropic_access_token(
 ) -> Option<Zeroizing<Vec<u8>>> {
     let secret = vault.resolve(alias).ok()?;
     let bundle = haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret()).ok()?;
-    (bundle.expires_at_unix_ms > unix_ms_after(Duration::ZERO))
-        .then(|| Zeroizing::new(bundle.access_token().to_vec()))
+    // The probe goes to the catalog's profile endpoint: only a token that
+    // catalog's issuer minted may be sent there (a live token never reaches a
+    // debug fake server, nor a fake token the live endpoint).
+    (bundle.expires_at_unix_ms > unix_ms_after(Duration::ZERO)
+        && crate::oauth::catalog_issuer(ANTHROPIC_OAUTH_PROVIDER_NAME).as_deref()
+            == Some(bundle.issuer.as_str()))
+    .then(|| Zeroizing::new(bundle.access_token().to_vec()))
 }
 
 async fn upgrade_legacy_anthropic_alias(

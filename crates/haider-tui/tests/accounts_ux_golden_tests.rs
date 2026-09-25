@@ -168,5 +168,18 @@ fn relogin_saved_elsewhere_names_the_saved_alias_and_the_untouched_row() {
             )),
             "{message}"
         );
+        // The notice is word-wrapped, not clipped: every clause is on screen
+        // even at 80 columns.
+        let frame = draw(&model, 80, 24);
+        let flat = frame
+            .rows
+            .iter()
+            .map(|row| row.trim_end())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("`anthropic-dead` unchanged and still needs attention"),
+            "{flat}"
+        );
     }
 }

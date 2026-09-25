@@ -16828,3 +16828,54 @@ async fn fresh_claude_login_reaches_a_skipped_legacy_row_only_by_its_own_probe()
             .is_none()
     );
 }
+
+/// A legacy profile probe sends a row's token only to the profile endpoint
+/// of the authority that issued it: a bundle from another issuer (a debug
+/// fake-OAuth token in a live process, or a live token under the fake) is
+/// never probed.
+#[tokio::test]
+async fn legacy_profile_probe_never_sends_a_token_across_issuers() {
+    struct CountingProfile(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl LegacyAnthropicProfileSource for CountingProfile {
+        async fn identity(&self, _access_token: &[u8]) -> Option<AccountIdentity> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(stable_test_identity(
+                "x@example.test",
+                Some("account=x;organization=o"),
+            ))
+        }
+    }
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("anthropic-foreign");
+    let mut bundle = claude_relogin_bundle(
+        b"foreign-access",
+        "anthropic:0123456789abcdef",
+        u64::MAX - 1,
+    );
+    bundle.issuer = "http://127.0.0.1:9".to_owned();
+    vault
+        .put(&alias, &bundle.encode().expect("encode"))
+        .expect("seed secret");
+    accounts
+        .add(oauth_descriptor_for(
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            &alias,
+            &bundle,
+            true,
+        ))
+        .expect("seed row");
+    let profile = CountingProfile(std::sync::atomic::AtomicUsize::new(0));
+    assert!(
+        !upgrade_legacy_anthropic_identities(
+            &mut accounts,
+            &vault,
+            &RefreshFenceRegistry::default(),
+            &profile,
+            IdentityUpgradeScope::Startup,
+        )
+        .await
+    );
+    assert_eq!(profile.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
